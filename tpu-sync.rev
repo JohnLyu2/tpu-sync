@@ -1,0 +1,4 @@
+# Pinned TPU Sync revision that the Lean model and docs/correspondence.md describe.
+# Bump deliberately: every bump invalidates line-number citations and may
+# invalidate modelling assumptions, so re-check the correspondence notes.
+b68161a16beb9e5244b7d606fa14c4676744d246

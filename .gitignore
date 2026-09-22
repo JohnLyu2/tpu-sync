@@ -1,0 +1,8 @@
+# Lean / Lake build output
+/.lake/
+/build/
+
+# Local working area: TPU Sync checkout, downloaded installers, experiments.
+# Nothing here is part of the project; the pinned TPU Sync revision lives in
+# docs/correspondence.md and tpu-sync.rev.
+/scratch/
