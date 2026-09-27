@@ -27,6 +27,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -34,13 +35,13 @@
 namespace tpu_raiden {
 namespace {
 
+using ::absl_testing::StatusIs;
 using ::testing::Ge;
 using ::testing::HasSubstr;
 using ::testing::IsEmpty;
 using ::testing::Le;
 using ::testing::Pair;
 using ::testing::UnorderedElementsAre;
-using ::testing::status::StatusIs;
 
 constexpr std::string_view kTestHookAlpha =
     hooks::kTransferRecvSessionPullRequest;
