@@ -28,6 +28,7 @@
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
@@ -598,6 +599,57 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedOutOfBoundsError) {
   absl::Status status = ws_source->PushWeightsResharded(request);
   EXPECT_FALSE(status.ok());
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedUnmappedScheduleKeysMissingGlobalIndicesFails) {
+  size_t num_layers = 1;
+  size_t num_shards = 1;
+  size_t slice_byte_size = 1024;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(12345);
+
+  // Host only has num_shards = 1 (local shard 0). Schedules contain keys
+  // {0, 1} broadcast from a 2-shard transfer. Key 1 is not among local shard
+  // indices while global_shard_indices_ is empty.
+  auto* schedules = request.mutable_shard_push_schedules();
+  auto* entry0 = (*schedules)[0].add_entries();
+  entry0->set_dst_peer(dest_peer);
+  entry0->set_dst_shard_idx(0);
+  entry0->set_src_offset_bytes(0);
+  entry0->set_dst_offset_bytes(0);
+  entry0->set_size_bytes(1024);
+  entry0->set_count(1);
+  entry0->set_layer_idx(0);
+
+  auto* entry1 = (*schedules)[1].add_entries();
+  entry1->set_dst_peer(dest_peer);
+  entry1->set_dst_shard_idx(1);
+  entry1->set_src_offset_bytes(0);
+  entry1->set_dst_offset_bytes(0);
+  entry1->set_size_bytes(1024);
+  entry1->set_count(1);
+  entry1->set_layer_idx(0);
+
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_TRUE(
+      absl::StrContains(status.message(), "global_shard_indices_ is empty"));
+  EXPECT_TRUE(absl::StrContains(status.message(), "num_shards_=1"));
 }
 
 TEST_F(WeightSynchronizerTest, PushWeightsReshardedInvalidLayerIndexError) {

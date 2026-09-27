@@ -4806,45 +4806,53 @@ class SenderScheduleSlicingAndPayloadCachingTest(absltest.TestCase):
           sender_push_schedule_protos={src_unit: shard_schedules},
       )
 
-      # Worker 0 (host 1 port 9000): should own shards [0, 1]
-      encoded0 = client._encode_start_transfer(
-          src_unit, plan, address="10.0.0.1:9000"
-      )
-      req0 = raiden_service_pb2.ControlRequest()
-      req0.ParseFromString(encoded0)
-      self.assertEqual(
-          set(req0.start_transfer_request.shard_push_schedules.keys()), {0, 1}
-      )
+      # Under full schedule broadcast without endpoint_to_shards, each worker
+      # receives all 8 sender schedules.
+      for ep in endpoints:
+        encoded = client._encode_start_transfer(src_unit, plan, address=ep)
+        req = raiden_service_pb2.ControlRequest()
+        req.ParseFromString(encoded)
+        self.assertEqual(
+            set(req.start_transfer_request.shard_push_schedules.keys()),
+            set(range(8)),
+        )
 
-      # Worker 1 (host 1 port 9001): should own shards [2, 3]
-      encoded1 = client._encode_start_transfer(
-          src_unit, plan, address="10.0.0.1:9001"
+      # When endpoint_to_shards is explicitly set, slicing is preserved.
+      plan_sliced = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          shard_push_schedules={src_unit: {}},
+          worker_data_addresses={
+              src_unit: shards,
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          sender_push_schedule_protos={src_unit: shard_schedules},
+          endpoint_to_shards={
+              "10.0.0.1:9000": {0, 1},
+              "10.0.0.1:9001": {2, 3},
+              "10.0.0.2:9000": {4, 5},
+              "10.0.0.2:9001": {6, 7},
+          },
       )
-      req1 = raiden_service_pb2.ControlRequest()
-      req1.ParseFromString(encoded1)
-      self.assertEqual(
-          set(req1.start_transfer_request.shard_push_schedules.keys()), {2, 3}
-      )
-
-      # Worker 2 (host 2 port 9000): should own shards [4, 5]
-      encoded2 = client._encode_start_transfer(
-          src_unit, plan, address="10.0.0.2:9000"
-      )
-      req2 = raiden_service_pb2.ControlRequest()
-      req2.ParseFromString(encoded2)
-      self.assertEqual(
-          set(req2.start_transfer_request.shard_push_schedules.keys()), {4, 5}
-      )
-
-      # Worker 3 (host 2 port 9001): should own shards [6, 7]
-      encoded3 = client._encode_start_transfer(
-          src_unit, plan, address="10.0.0.2:9001"
-      )
-      req3 = raiden_service_pb2.ControlRequest()
-      req3.ParseFromString(encoded3)
-      self.assertEqual(
-          set(req3.start_transfer_request.shard_push_schedules.keys()), {6, 7}
-      )
+      expected_slices = {
+          "10.0.0.1:9000": {0, 1},
+          "10.0.0.1:9001": {2, 3},
+          "10.0.0.2:9000": {4, 5},
+          "10.0.0.2:9001": {6, 7},
+      }
+      for ep, expected in expected_slices.items():
+        encoded = client._encode_start_transfer(
+            src_unit, plan_sliced, address=ep
+        )
+        req = raiden_service_pb2.ControlRequest()
+        req.ParseFromString(encoded)
+        self.assertEqual(
+            set(req.start_transfer_request.shard_push_schedules.keys()),
+            expected,
+        )
     finally:
       client.close()
 
@@ -5179,10 +5187,28 @@ class SenderScheduleSlicingAndPayloadCachingTest(absltest.TestCase):
           src_unit, plan, address="10.0.0.1:9001"
       )
 
-      self.assertEqual(owned0, {0, 1})
-      self.assertEqual(owned1, {2, 3, 4})
-      self.assertEqual(owned0 | owned1, set(range(5)))
-      self.assertEqual(len(owned0 & owned1), 0)
+      # When endpoint_to_shards is unset, full schedule broadcast is used
+      # (None).
+      self.assertIsNone(owned0)
+      self.assertIsNone(owned1)
+
+      # When endpoint_to_shards is set, per-worker slicing is preserved.
+      plan.endpoint_to_shards = {
+          "10.0.0.1:9000": {0, 1},
+          "10.0.0.1:9001": {2, 3, 4},
+      }
+      self.assertEqual(
+          client._get_worker_owned_shards(
+              src_unit, plan, address="10.0.0.1:9000"
+          ),
+          {0, 1},
+      )
+      self.assertEqual(
+          client._get_worker_owned_shards(
+              src_unit, plan, address="10.0.0.1:9001"
+          ),
+          {2, 3, 4},
+      )
     finally:
       client.close()
 
@@ -5222,15 +5248,49 @@ class SenderScheduleSlicingAndPayloadCachingTest(absltest.TestCase):
           src_unit, plan, address="10.0.0.1:9003"
       )
 
-      self.assertEqual(owned0, {0})
-      self.assertEqual(owned1, {1})
-      self.assertEqual(owned2, set())
-      self.assertEqual(owned3, set())
+      # When endpoint_to_shards is unset, full schedule broadcast is used
+      # (None).
+      self.assertIsNone(owned0)
+      self.assertIsNone(owned1)
+      self.assertIsNone(owned2)
+      self.assertIsNone(owned3)
+
+      # When endpoint_to_shards is set, per-worker slicing is preserved.
+      plan.endpoint_to_shards = {
+          "10.0.0.1:9000": {0},
+          "10.0.0.1:9001": {1},
+          "10.0.0.1:9002": set(),
+          "10.0.0.1:9003": set(),
+      }
+      self.assertEqual(
+          client._get_worker_owned_shards(
+              src_unit, plan, address="10.0.0.1:9000"
+          ),
+          {0},
+      )
+      self.assertEqual(
+          client._get_worker_owned_shards(
+              src_unit, plan, address="10.0.0.1:9001"
+          ),
+          {1},
+      )
+      self.assertEqual(
+          client._get_worker_owned_shards(
+              src_unit, plan, address="10.0.0.1:9002"
+          ),
+          set(),
+      )
+      self.assertEqual(
+          client._get_worker_owned_shards(
+              src_unit, plan, address="10.0.0.1:9003"
+          ),
+          set(),
+      )
     finally:
       client.close()
 
   def test_single_address_dispatch_preserves_slicing(self):
-    """Verifies that start_transfer with a single address preserves slicing."""
+    """Verifies start_transfer broadcasts schedules without endpoint_to_shards, and preserves slicing with explicit mapping."""
 
     class SingleAddrClient(raiden_controller.WorkerRpcClient):
 
@@ -5272,14 +5332,39 @@ class SenderScheduleSlicingAndPayloadCachingTest(absltest.TestCase):
           sender_push_schedule_protos={src_unit: {0: s0, 1: s1}},
       )
 
-      # Dispatch to single address directly
+      # Dispatch to single address directly without endpoint_to_shards:
+      # broadcasts all sender schedules ({0, 1}).
       asyncio.run(
           client.start_transfer(src_unit, plan, address="10.0.0.1:9001")
       )
-      self.assertEqual(len(client.dispatched_reqs), 1)
+      self.assertLen(client.dispatched_reqs, 1)
       addr, req = client.dispatched_reqs[0]
       self.assertEqual(addr, "10.0.0.1:9001")
-      # Worker 1 must only receive shard 1, not shard 0
+      self.assertEqual(
+          set(req.start_transfer_request.shard_push_schedules.keys()), {0, 1}
+      )
+
+      # With explicit endpoint_to_shards, dispatch preserves slicing.
+      client.dispatched_reqs.clear()
+      plan_sliced = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000", "10.0.0.1:8001"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          sender_push_schedule_protos={src_unit: {0: s0, 1: s1}},
+          endpoint_to_shards={"10.0.0.1:9001": {1}},
+      )
+      asyncio.run(
+          client.start_transfer(src_unit, plan_sliced, address="10.0.0.1:9001")
+      )
+      self.assertLen(client.dispatched_reqs, 1)
+      addr, req = client.dispatched_reqs[0]
+      self.assertEqual(addr, "10.0.0.1:9001")
       self.assertEqual(
           set(req.start_transfer_request.shard_push_schedules.keys()), {1}
       )

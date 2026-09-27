@@ -296,6 +296,72 @@ class JobEntityTest(absltest.TestCase):
         "Idle host 10.11.0.2:9000 must NOT receive an RPC transfer command",
     )
 
+  def test_multi_endpoint_proxy_without_endpoint_to_shards_broadcasts_all_schedules(
+      self,
+  ):
+    """Verifies multi-endpoint proxy without endpoint_to_shards broadcasts all schedules."""
+    endpoints = ["10.11.0.1:9000", "10.11.0.2:9000"]
+    entity = job_entity.JobEntity(
+        unit=self.src_unit,
+        shards=["10.11.0.1:8000", "10.11.0.2:8000"],
+        control_endpoints=endpoints,
+        control_pipe=self.pipe_stub,
+    )
+    self.addCleanup(entity.worker_rpc_client.close)
+
+    plan = controller_types.TransferPlan(
+        src_units=[self.src_unit],
+        dst_units=[self.dst_unit],
+        plan=None,
+        shard_push_schedules={
+            self.src_unit: {
+                0: [self._make_dummy_entry(shard_idx=0)],
+                1: [self._make_dummy_entry(shard_idx=1)],
+            }
+        },
+        worker_data_addresses={
+            self.src_unit: ["10.11.0.1:8000", "10.11.0.2:8000"],
+            self.dst_unit: ["10.11.0.3:8000"],
+        },
+        use_block_chunks=True,
+        is_sender=True,
+    )
+
+    self.assertIsNone(
+        entity.get_host_owned_shards(
+            plan, address="10.11.0.1:9000", unit=self.src_unit
+        )
+    )
+    self.assertIsNone(
+        entity.get_host_owned_shards(
+            plan, address="10.11.0.2:9000", unit=self.src_unit
+        )
+    )
+    self.assertTrue(
+        entity.is_payload_invariant_across_hosts(
+            plan, endpoints, unit=self.src_unit
+        )
+    )
+
+    asyncio.run(entity.start_transfer(plan))
+
+    dispatched = {ep: payload for ep, payload in self.pipe_stub.sent_requests}
+    self.assertIn("10.11.0.1:9000", dispatched)
+    self.assertIn("10.11.0.2:9000", dispatched)
+
+    for ep in endpoints:
+      req = raiden_service_pb2.ControlRequest()
+      req.ParseFromString(dispatched[ep])
+      self.assertEqual(
+          req.command, raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+      )
+      self.assertEqual(
+          set(req.start_transfer_request.shard_push_schedules.keys()),
+          {0, 1},
+          f"Host {ep} must receive all sender schedules under broadcast"
+          " contract",
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

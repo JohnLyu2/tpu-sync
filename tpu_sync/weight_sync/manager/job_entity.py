@@ -640,7 +640,22 @@ class JobEntity:
       address: Optional[str],
       unit: Optional[RaidenId] = None,
   ) -> Optional[set[int]]:
-    """Determines shard indices owned by a specific host endpoint attached to this entity."""
+    """Determines shard indices owned by a specific host endpoint attached to this entity.
+
+    When an explicit `endpoint_to_shards` mapping is present in `transfer_plan`,
+    returns the mapped shard indices. Otherwise, returns None (full schedule
+    broadcast), so each host receives all sender schedules and sends only the
+    shards it holds, keyed by its global shard indices.
+
+    Args:
+      transfer_plan: Active transfer plan containing endpoints and schedules.
+      address: Control plane RPC endpoint of the host worker.
+      unit: Target RaidenId unit, defaulting to self.unit.
+
+    Returns:
+      A set of global shard indices owned by the host, or None for full
+      schedule broadcast.
+    """
     if not address:
       return None
 
@@ -659,70 +674,7 @@ class JobEntity:
       if addr_clean in transfer_plan.endpoint_to_shards:
         return set(transfer_plan.endpoint_to_shards[addr_clean])
 
-    rep_id = getattr(target_id, "job_replica_id", "") or ""
-    endpoints = self.get_registered_endpoints(rep_id)
-    if not endpoints and hasattr(transfer_plan, "worker_rpc_addresses"):
-      rpc_addr = transfer_plan.worker_rpc_addresses.get(
-          target_id, transfer_plan.worker_rpc_addresses.get(self.unit, "")
-      )
-      if rpc_addr:
-        if isinstance(rpc_addr, (list, tuple)):
-          endpoints = [str(a).strip() for a in rpc_addr if str(a).strip()]
-        else:
-          endpoints = [a.strip() for a in str(rpc_addr).split(",") if a.strip()]
-
-    if not endpoints or len(endpoints) <= 1:
-      return None
-
-    norm_endpoints = []
-    for e in endpoints:
-      clean_e = e.strip()
-      if clean_e and clean_e not in norm_endpoints:
-        norm_endpoints.append(clean_e)
-
-    if addr_clean not in norm_endpoints:
-      return None
-    worker_idx = norm_endpoints.index(addr_clean)
-    num_workers = len(norm_endpoints)
-
-    num_shards = 0
-    data_shards = getattr(transfer_plan, "worker_data_addresses", {}).get(
-        target_id, []
-    )
-    if data_shards:
-      num_shards = len(data_shards)
-    if num_shards == 0:
-      cached_protos = getattr(
-          transfer_plan, "sender_push_schedule_protos", None
-      )
-      if (
-          cached_protos
-          and target_id in cached_protos
-          and cached_protos[target_id]
-      ):
-        num_shards = max(
-            len(cached_protos[target_id]),
-            max(cached_protos[target_id].keys()) + 1,
-        )
-    if num_shards == 0:
-      push_schedules = getattr(transfer_plan, "shard_push_schedules", {}).get(
-          target_id, {}
-      )
-      if push_schedules:
-        num_shards = max(
-            len(push_schedules),
-            max(push_schedules.keys()) + 1,
-        )
-
-    if num_shards <= 1:
-      return None
-
-    if num_shards < num_workers:
-      return {worker_idx} if worker_idx < num_shards else set()
-
-    start_shard = (worker_idx * num_shards) // num_workers
-    end_shard = ((worker_idx + 1) * num_shards) // num_workers
-    return set(range(start_shard, end_shard))
+    return None
 
   def is_payload_invariant_across_hosts(
       self,

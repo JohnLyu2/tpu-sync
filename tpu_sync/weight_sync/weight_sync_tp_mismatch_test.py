@@ -1263,7 +1263,7 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         ) from hang_err
 
       diag_msg = [f"Planned push schedule shards: {sorted(push_scheds.keys())}"]
-      total_untransmitted: set[int] = set()
+      total_transmitted: set[int] = set()
       for h_idx, (ws_src, held_shards_list) in enumerate(
           zip(ws_src_list, trainer_host_shards)
       ):
@@ -1271,19 +1271,26 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         assigned_shards = job_entity.get_host_owned_shards(
             transfer_plan, endpoint, unit=src_unit
         )
-        if assigned_shards is None:
-          raise RuntimeError(
-              f"get_host_owned_shards returned None for endpoint {endpoint}"
-          ) from hang_err
         held_shards = set(held_shards_list)
-        dropped_shards = assigned_shards - held_shards
-        total_untransmitted |= dropped_shards
-        diag_msg.append(
-            f"Host {h_idx} (endpoint {endpoint}) assigned shards"
-            f" {sorted(assigned_shards)} via get_host_owned_shards but holds"
-            f" {sorted(held_shards)}; dropped by Host {h_idx}:"
-            f" {sorted(dropped_shards)}"
-        )
+        if assigned_shards is None:
+          transmitted = held_shards & set(push_scheds.keys())
+          total_transmitted |= transmitted
+          diag_msg.append(
+              f"Host {h_idx} (endpoint {endpoint}) received all schedules "
+              f"(broadcast) and holds {sorted(held_shards)}; transmits: "
+              f"{sorted(transmitted)}"
+          )
+        else:
+          dropped_shards = assigned_shards - held_shards
+          transmitted = assigned_shards & held_shards
+          total_transmitted |= transmitted
+          diag_msg.append(
+              f"Host {h_idx} (endpoint {endpoint}) assigned shards "
+              f"{sorted(assigned_shards)} via get_host_owned_shards but holds "
+              f"{sorted(held_shards)}; dropped by Host {h_idx}: "
+              f"{sorted(dropped_shards)}"
+          )
+      total_untransmitted = set(push_scheds.keys()) - total_transmitted
       diag_msg.append(
           f"Total un-transmitted shards: {sorted(total_untransmitted)}"
       )
@@ -1329,17 +1336,8 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         req_id="pw_t2_contig",
     )
 
-  @absltest.expectedFailure
   def test_pathways_t2_mesh_2_2_2_torus_order(self):
-    """Pathways comparison: Trainer TP=2 mesh (2,2,2) with non-contiguous torus host shards.
-
-    Known issue: get_host_owned_shards assigns a contiguous shard slice to each
-    host endpoint, which mismatches torus-interleaved physical host shard
-    ownership.
-    Shards assigned to a host that are not staged in its local memory buffer are
-    silently skipped via `continue` in PushWeightsResharded, resulting in a hang
-    at transfer completion waiting for dropped shards.
-    """
+    """Pathways comparison: Trainer TP=2 mesh (2,2,2) with non-contiguous torus host shards."""
     self._run_pathways_transfer_test(
         trainer_mesh_shape=(2, 2, 2),
         trainer_mesh_axes=["fsdp", "context", "tensor"],

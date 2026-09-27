@@ -40,6 +40,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -883,6 +884,31 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         sorted_sliced_keys.push_back(sched_key);
       }
       std::sort(sorted_sliced_keys.begin(), sorted_sliced_keys.end());
+    }
+  }
+  if (global_shard_indices_.empty() && sorted_sliced_keys.empty()) {
+    std::vector<int32_t> offending_keys;
+    for (const auto& [sched_key, _] : schedules) {
+      bool in_local = false;
+      if (!local_shard_indices_.empty()) {
+        in_local =
+            std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                      static_cast<int>(sched_key)) !=
+            local_shard_indices_.end();
+      } else {
+        in_local =
+            (sched_key >= 0 && static_cast<size_t>(sched_key) < num_shards_);
+      }
+      if (!in_local) {
+        offending_keys.push_back(sched_key);
+      }
+    }
+    if (!offending_keys.empty()) {
+      std::sort(offending_keys.begin(), offending_keys.end());
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Received schedule keys not among local shard indices while "
+          "global_shard_indices_ is empty: [",
+          absl::StrJoin(offending_keys, ", "), "], num_shards_=", num_shards_));
     }
   }
   for (size_t i = 0; i < num_shards_; ++i) {
