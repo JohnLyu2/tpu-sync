@@ -37,6 +37,7 @@ _format_units = controller_types.format_units
 _is_variable_spec_identical = controller_types.is_variable_spec_identical
 _proto_to_nd_slice = controller_types.proto_to_nd_slice
 _raiden_id_from_proto = controller_types.raiden_id_from_proto
+_StageBroadcastGroup = controller_types.StageBroadcastGroup
 
 
 def to_physical(logical_shape, logical_mesh_shape, minor_to_major):
@@ -1022,7 +1023,15 @@ class ReshardPlanner:
           s_phys_mesh = registered_mesh_shapes.get(s_unit)
           s_mesh_axes = registered_mesh_axes.get(s_unit)
           s_host_subgrid = registered_host_subgrids.get(s_unit)
-        num_src_hosts = max(1, len(s_job_reps))
+        num_src_hosts = max(
+            1,
+            len(s_job_reps),
+            len({
+                u.job_replica_id
+                for u in src_units
+                if u.job_name == s_unit.job_name
+            }),
+        )
         for s_var in s_vars:
           s_nd_slices = computed_nd_slices.get(s_unit, {}).get(s_var.name)
           if not s_nd_slices:
@@ -1103,6 +1112,8 @@ class ReshardPlanner:
       global_sig_to_plan_id = {}
       variable_plans = {}
       variable_to_plan_id = {}
+      unit_ordered_vars_by_unit = {}
+      canonical_relay_plans = {}
       plan_classification_cache = {}
       plan_unit_counts_by_pid = {}
       plan_host_counts_by_pid = {}
@@ -1123,7 +1134,15 @@ class ReshardPlanner:
           src_phys_mesh_shape = registered_mesh_shapes.get(src_unit)
           src_mesh_axes = registered_mesh_axes.get(src_unit)
           src_host_subgrid = registered_host_subgrids.get(src_unit)
-        num_src_physical_hosts = max(1, len(src_job_replicas))
+        num_src_physical_hosts = max(
+            1,
+            len(src_job_replicas),
+            len({
+                u.job_replica_id
+                for u in src_units
+                if u.job_name == src_unit.job_name
+            }),
+        )
 
         unit_sig_map = src_sig_by_unit_and_name.get(src_unit, {})
         unit_nd_slices_map = computed_nd_slices.get(src_unit, {})
@@ -1338,7 +1357,7 @@ class ReshardPlanner:
           else:
             dst_targets, dst_targets_by_slice = dst_target_bundle
 
-          template_for_var = {}
+          canonical_template_for_var = {}
           tmpl_unit_counts = {}
           tmpl_host_counts = {}
           is_src_legacy = is_legacy_by_unit.get(src_unit, True)
@@ -1470,117 +1489,146 @@ class ReshardPlanner:
             if not active_slice_chunks:
               continue
 
-            template_entries = []
-            shard_dst_units_order = []
-            shard_dst_units_seen = set()
-
-            if len(active_slice_chunks) == 1:
-              only_key, converted_chunks = next(
-                  iter(active_slice_chunks.items())
-              )
-              if num_candidates > 1:
-                cand_cache_key = (dst_group_sig, only_key, num_candidates)
-                by_cand = slice_candidate_cache.get(cand_cache_key)
-                if by_cand is None:
-                  by_cand = {}
-                  for item in dst_targets_by_slice[only_key]:
-                    by_cand.setdefault(item[1] % num_candidates, []).append(
-                        item
-                    )
-                  slice_candidate_cache[cand_cache_key] = by_cand
-                matched_items = by_cand.get(candidate_rank)
-              else:
-                matched_items = dst_targets_by_slice[only_key]
-
-              if not matched_items:
-                continue
-
-              if len(matched_items) > 1:
-                shift = src_unit_idx % len(matched_items)
-                shifted_matched_items = (
-                    matched_items[shift:] + matched_items[:shift]
+            if dst_targets:
+              (
+                  _,
+                  _,
+                  is_canonical_legacy,
+                  _,
+                  canonical_shard_items,
+              ) = dst_targets[0]
+              for local_dst_idx, dst_slice, _ in canonical_shard_items:
+                converted_chunks = active_slice_chunks.get(
+                    (dst_slice, is_canonical_legacy)
                 )
-              else:
-                shifted_matched_items = matched_items
+                if not converted_chunks:
+                  continue
+                if num_candidates > 1:
+                  dst_global_idx = local_dst_idx
+                  if dst_global_idx % num_candidates != candidate_rank:
+                    continue
+                for chunk_desc in converted_chunks:
+                  canonical_template_for_var.setdefault(
+                      local_src_idx, []
+                  ).append((local_dst_idx, *chunk_desc))
 
-              num_c = len(converted_chunks)
-              first_chunk = converted_chunks[0]
-              for (
-                  _,
-                  _,
-                  local_dst_idx,
-                  dst_peer,
-                  d_u,
-                  d_h,
-              ) in shifted_matched_items:
-                if d_u is not None:
-                  tmpl_unit_counts[d_u] = tmpl_unit_counts.get(d_u, 0) + num_c
-                  if d_u not in shard_dst_units_seen:
-                    shard_dst_units_seen.add(d_u)
-                    shard_dst_units_order.append(d_u)
-                  if d_h:
-                    tmpl_host_counts[d_h] = tmpl_host_counts.get(d_h, 0) + num_c
-                if num_c == 1:
-                  template_entries.append(
-                      (dst_peer, local_dst_idx, *first_chunk)
+            if can_fast_path_direct:
+              template_entries = []
+              shard_dst_units_order = []
+              shard_dst_units_seen = set()
+
+              if len(active_slice_chunks) == 1:
+                only_key, converted_chunks = next(
+                    iter(active_slice_chunks.items())
+                )
+                if num_candidates > 1:
+                  cand_cache_key = (dst_group_sig, only_key, num_candidates)
+                  by_cand = slice_candidate_cache.get(cand_cache_key)
+                  if by_cand is None:
+                    by_cand = {}
+                    for item in dst_targets_by_slice[only_key]:
+                      by_cand.setdefault(item[1] % num_candidates, []).append(
+                          item
+                      )
+                    slice_candidate_cache[cand_cache_key] = by_cand
+                  matched_items = by_cand.get(candidate_rank)
+                else:
+                  matched_items = dst_targets_by_slice[only_key]
+
+                if not matched_items:
+                  continue
+
+                if len(matched_items) > 1:
+                  shift = src_unit_idx % len(matched_items)
+                  shifted_matched_items = (
+                      matched_items[shift:] + matched_items[:shift]
                   )
                 else:
-                  template_entries.extend(
-                      (dst_peer, local_dst_idx, *chunk_desc)
-                      for chunk_desc in converted_chunks
-                  )
-            else:
-              if len(dst_targets) > 1:
-                shift = src_unit_idx % len(dst_targets)
-                shifted_dst_targets = dst_targets[shift:] + dst_targets[:shift]
-              else:
-                shifted_dst_targets = dst_targets
-              for (
-                  dst_unit,
-                  dst_unit_idx,
-                  is_dst_legacy,
-                  num_dst_shards,
-                  dst_shard_items,
-              ) in shifted_dst_targets:
-                for local_dst_idx, dst_slice, dst_peer in dst_shard_items:
-                  converted_chunks = active_slice_chunks.get(
-                      (dst_slice, is_dst_legacy)
-                  )
-                  if not converted_chunks:
-                    continue
-                  if num_candidates > 1:
-                    dst_global_idx = (
-                        dst_unit_idx * num_dst_shards + local_dst_idx
-                    )
-                    if dst_global_idx % num_candidates != candidate_rank:
-                      continue
-                  num_c = len(converted_chunks)
-                  d_u = data_address_to_unit.get(dst_peer)
+                  shifted_matched_items = matched_items
+
+                num_c = len(converted_chunks)
+                first_chunk = converted_chunks[0]
+                for (
+                    _,
+                    _,
+                    local_dst_idx,
+                    dst_peer,
+                    d_u,
+                    d_h,
+                ) in shifted_matched_items:
                   if d_u is not None:
                     tmpl_unit_counts[d_u] = tmpl_unit_counts.get(d_u, 0) + num_c
                     if d_u not in shard_dst_units_seen:
                       shard_dst_units_seen.add(d_u)
                       shard_dst_units_order.append(d_u)
-                    d_h = data_address_to_host.get(dst_peer)
                     if d_h:
                       tmpl_host_counts[d_h] = (
                           tmpl_host_counts.get(d_h, 0) + num_c
                       )
-                  template_entries.extend(
-                      (dst_peer, local_dst_idx, *chunk_desc)
-                      for chunk_desc in converted_chunks
+                  if num_c == 1:
+                    template_entries.append(
+                        (dst_peer, local_dst_idx, *first_chunk)
+                    )
+                  else:
+                    template_entries.extend(
+                        (dst_peer, local_dst_idx, *chunk_desc)
+                        for chunk_desc in converted_chunks
+                    )
+              else:
+                if len(dst_targets) > 1:
+                  shift = src_unit_idx % len(dst_targets)
+                  shifted_dst_targets = (
+                      dst_targets[shift:] + dst_targets[:shift]
                   )
+                else:
+                  shifted_dst_targets = dst_targets
+                for (
+                    dst_unit,
+                    dst_unit_idx,
+                    is_dst_legacy,
+                    num_dst_shards,
+                    dst_shard_items,
+                ) in shifted_dst_targets:
+                  for local_dst_idx, dst_slice, dst_peer in dst_shard_items:
+                    converted_chunks = active_slice_chunks.get(
+                        (dst_slice, is_dst_legacy)
+                    )
+                    if not converted_chunks:
+                      continue
+                    if num_candidates > 1:
+                      dst_global_idx = (
+                          dst_unit_idx * num_dst_shards + local_dst_idx
+                      )
+                      if dst_global_idx % num_candidates != candidate_rank:
+                        continue
+                    num_c = len(converted_chunks)
+                    d_u = data_address_to_unit.get(dst_peer)
+                    if d_u is not None:
+                      tmpl_unit_counts[d_u] = (
+                          tmpl_unit_counts.get(d_u, 0) + num_c
+                      )
+                      if d_u not in shard_dst_units_seen:
+                        shard_dst_units_seen.add(d_u)
+                        shard_dst_units_order.append(d_u)
+                      d_h = data_address_to_host.get(dst_peer)
+                      if d_h:
+                        tmpl_host_counts[d_h] = (
+                            tmpl_host_counts.get(d_h, 0) + num_c
+                        )
+                    template_entries.extend(
+                        (dst_peer, local_dst_idx, *chunk_desc)
+                        for chunk_desc in converted_chunks
+                    )
 
-            if template_entries:
-              template_for_var[local_src_idx] = template_entries
-              unit_shard_plans_by_id.setdefault(local_src_idx, {})[
-                  plan_id
-              ] = template_entries
-              unit_shard_pid_dst_units[(local_src_idx, plan_id)] = (
-                  shard_dst_units_order
-              )
+              if template_entries:
+                unit_shard_plans_by_id.setdefault(local_src_idx, {})[
+                    plan_id
+                ] = template_entries
+                unit_shard_pid_dst_units[(local_src_idx, plan_id)] = (
+                    shard_dst_units_order
+                )
 
-          unit_plans_by_id[plan_id] = template_for_var
+          unit_plans_by_id[plan_id] = canonical_template_for_var
           if can_fast_path_direct:
             layers_tuple = unit_layers_tuple_by_pid.get(plan_id, ())
             if layers_tuple:
@@ -1594,6 +1642,7 @@ class ReshardPlanner:
 
         variable_plans[src_unit] = unit_plans_by_id
         variable_to_plan_id[src_unit] = dict(unit_var_to_plan_id)
+        unit_ordered_vars_by_unit[src_unit] = unit_ordered_vars
         if unit_shard_plans_by_id:
           sorted_local_idxs = sorted(unit_shard_plans_by_id.keys())
           computed_schedules[src_unit] = {
@@ -1641,6 +1690,43 @@ class ReshardPlanner:
             for l_idx in layers_tuple:
               h_layer_map[l_idx] = h_layer_map.get(l_idx, 0) + cnt
 
+      canonical_relay_plans = {}
+      all_plan_ids = set()
+      for u_plans in variable_plans.values():
+        all_plan_ids.update(u_plans.keys())
+
+      for pid in all_plan_ids:
+        blocks_by_dst: dict[tuple[int, int], list[int]] = {}
+        for u in src_units:
+          u_plans = variable_plans.get(u, {})
+          tuples_by_shard = u_plans.get(pid, {})
+          for local_src_idx, tuples_9 in tuples_by_shard.items():
+            for t9 in tuples_9:
+              local_dst_idx = t9[0]
+              dst_block_offset = t9[1]
+              size = t9[3]
+              dst_block_id = t9[5]
+              dst_stride = t9[7]
+              count = t9[8]
+              cur_end = dst_block_offset + (count - 1) * dst_stride + size
+              key = (local_dst_idx, dst_block_id)
+              if key not in blocks_by_dst:
+                blocks_by_dst[key] = [dst_block_offset, cur_end]
+              else:
+                cur = blocks_by_dst[key]
+                if dst_block_offset < cur[0]:
+                  cur[0] = dst_block_offset
+                if cur_end > cur[1]:
+                  cur[1] = cur_end
+
+        canonical_relay_plans[pid] = {}
+        for (local_dst_idx, dst_block_id), (min_off, max_end) in sorted(
+            blocks_by_dst.items(), key=lambda item: (item[0][0], item[0][1])
+        ):
+          canonical_relay_plans[pid].setdefault(local_dst_idx, []).append(
+              (min_off, max_end - min_off, dst_block_id)
+          )
+
     # Build rpc_addresses for local source workers
     rpc_addresses = dict(worker_endpoints)
     # Merge destination rpc addresses from metadata
@@ -1686,6 +1772,84 @@ class ReshardPlanner:
             vars_info,
             computed_expected_block_count,
         )
+    elif not shard_push_schedules and not can_fast_path_direct:
+      direct_schedules = {}
+      broadcast_groups = {}
+
+      all_ordered_vars = []
+      for u in src_units:
+        all_ordered_vars.extend(unit_ordered_vars_by_unit.get(u, []))
+      unique_layer_idxs = sorted(
+          dict.fromkeys(l_idx for l_idx, _ in all_ordered_vars)
+      )
+
+      layer_group_map: dict[int, list[int]] = {}
+      for l_idx in unique_layer_idxs:
+        lg_idx = l_idx // group_size if group_size > 1 else l_idx
+        layer_group_map.setdefault(lg_idx, []).append(l_idx)
+
+      total_seed_blocks = 0
+      dst_unit_layer_counts = {}
+      for lg_idx, l_indices in layer_group_map.items():
+        l_set = set(l_indices)
+        stage_ordered_vars_by_unit = {}
+        stage_blocks = 0
+        for u in src_units:
+          u_vars = [
+              (l_idx, pid)
+              for (l_idx, pid) in unit_ordered_vars_by_unit.get(u, [])
+              if l_idx in l_set
+          ]
+          stage_ordered_vars_by_unit[u] = u_vars
+          u_plans = variable_plans.get(u, {})
+          for l_idx, pid in u_vars:
+            tuples_by_shard = u_plans.get(pid, {})
+            layer_cnt = 0
+            for local_src_idx, tuples_9 in tuples_by_shard.items():
+              for t9 in tuples_9:
+                size = t9[3]
+                src_stride = t9[6]
+                dst_stride = t9[7]
+                count = t9[8]
+                is_contiguous = (count == 1) or (
+                    src_stride == size and dst_stride == size
+                )
+                push_count = 1 if is_contiguous else count
+                layer_cnt += push_count
+            stage_blocks += layer_cnt
+            for d_u in dst_units:
+              dst_unit_layer_counts.setdefault(d_u, {})[l_idx] = layer_cnt
+
+        total_seed_blocks += stage_blocks
+        stage_group = _StageBroadcastGroup(
+            pool_group=0,
+            layer_group_idx=lg_idx,
+            src_units=list(src_units),
+            dst_units=list(dst_units),
+            stage_ordered_vars_by_unit=stage_ordered_vars_by_unit,
+            canonical_variable_plans=variable_plans,
+            canonical_relay_plans=canonical_relay_plans,
+            data_addresses=dict(data_addresses),
+        )
+        broadcast_groups[(0, lg_idx)] = stage_group
+
+      computed_expected_block_count = total_seed_blocks
+      dst_unit_counts = {u: total_seed_blocks for u in dst_units}
+      dst_endpoint_counts = {}
+      dst_endpoint_layer_counts = {}
+      direct_dsts = []
+      vars_info = f"{num_vars} variable(s), " if num_vars > 0 else ""
+      logging.info(
+          "Transfer %s (uuid=%s): generated tree broadcast schedule for %s ->"
+          " %s (%s%d expected blocks, %d stage groups)",
+          req_id,
+          uuid,
+          _format_units(src_units),
+          _format_units(dst_units),
+          vars_info,
+          computed_expected_block_count,
+          len(broadcast_groups),
+      )
     else:
       # Group flat entries into slices for broadcast
       groups = {}
@@ -1808,4 +1972,5 @@ class ReshardPlanner:
         is_weight_sync=bool(num_vars > 0 or local_skip_tiling),
         variable_plans=variable_plans,
         variable_to_plan_id=variable_to_plan_id,
+        canonical_relay_plans=canonical_relay_plans,
     )

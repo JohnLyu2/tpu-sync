@@ -518,6 +518,72 @@ class ReshardPlannerTest(absltest.TestCase):
 
     self.assertGreater(multi_dest_vars_tested, 0)
 
+  def test_canonical_address_free_resharding_plan_invariant_to_n_samplers(self):
+    """Verifies that variable_plans stores address-free 9-tuples invariant to N samplers."""
+    num_src_units = 4
+    src_units = [
+        RaidenId("trainer", str(i), "weights", 0) for i in range(num_src_units)
+    ]
+    src_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=4, is_src=True
+    )
+    dst_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=4, is_src=False
+    )
+
+    plans_by_n = {}
+    relay_plans_by_n = {}
+    for num_samplers in (1, 4, 16, 64):
+      dst_units = [
+          RaidenId(f"rollout_{i}", "0", "weights", 0)
+          for i in range(num_samplers)
+      ]
+      planner_inputs = self._build_planner_inputs(
+          src_vars_by_unit={u: src_vars for u in src_units},
+          dst_vars_by_unit={u: dst_vars for u in dst_units},
+          src_phys_mesh=[1, 1, 4, 4, 2],
+          src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+          src_host_subgrid=[1, 1, 1, 4, 2],
+          dst_phys_mesh=[2, 8],
+          dst_mesh_axes=["x", "y"],
+          dst_host_subgrid=[1, 8],
+      )
+      sched = reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+          **planner_inputs
+      )
+
+      # 1. Verify 9-tuple shape and absence of concrete IP string
+      for u in src_units:
+        for pid, shard_dict in sched.variable_plans[u].items():
+          for s_idx, tuples_9 in shard_dict.items():
+            for t9 in tuples_9:
+              self.assertLen(t9, 9)
+              # Verify no address/string fields
+              for item in t9:
+                self.assertIsInstance(item, int)
+                self.assertNotIn(":", str(item))
+
+      # 2. Verify canonical relay plans structure
+      self.assertNotEmpty(sched.canonical_relay_plans)
+      for pid, local_shards in sched.canonical_relay_plans.items():
+        for local_dst_idx, blocks in local_shards.items():
+          for spec in blocks:
+            self.assertLen(spec, 3)
+            min_off, block_size, dst_block_id = spec
+            self.assertGreaterEqual(min_off, 0)
+            self.assertGreater(block_size, 0)
+            self.assertGreaterEqual(dst_block_id, 0)
+
+      plans_by_n[num_samplers] = sched.variable_plans
+      relay_plans_by_n[num_samplers] = sched.canonical_relay_plans
+
+    # 3. Exact equality of variable_plans and canonical_relay_plans across N=1, 4, 16, 64
+    base_plans = plans_by_n[1]
+    base_relay = relay_plans_by_n[1]
+    for n in (4, 16, 64):
+      self.assertEqual(plans_by_n[n], base_plans)
+      self.assertEqual(relay_plans_by_n[n], base_relay)
+
 
 if __name__ == "__main__":
   absltest.main()

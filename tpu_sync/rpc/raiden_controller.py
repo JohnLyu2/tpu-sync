@@ -1376,26 +1376,18 @@ class RaidenController:
               )
 
           if broadcast_groups:
-            shard_broadcast_groups = {}
-            for group_key, keys_and_targets in broadcast_groups.items():
-              src_unit, shard_idx = group_key[0], group_key[1]
-              shard_broadcast_groups.setdefault(
-                  (src_unit, shard_idx), []
-              ).append(keys_and_targets)
-
-            async def _execute_shard_broadcasts(groups_list):
-              await self._execute_slice_broadcast_pipeline(
-                  groups_list=groups_list,
-                  final_plan=final_plan,
-                  fanout_k=self.broadcast_k,
-                  req_id=req_id,
-                  dst_mem_type=dst_mem_type,
-                  dst_controller_address=dst_controller_address,
-                  src_controller_address=src_controller_address,
-              )
-
-            for groups_list in shard_broadcast_groups.values():
-              push_tasks.append(_execute_shard_broadcasts(groups_list))
+            groups_list = list(broadcast_groups.values())
+            push_tasks.append(
+                self._execute_slice_broadcast_pipeline(
+                    groups_list=groups_list,
+                    final_plan=final_plan,
+                    fanout_k=self.broadcast_k,
+                    req_id=req_id,
+                    dst_mem_type=dst_mem_type,
+                    dst_controller_address=dst_controller_address,
+                    src_controller_address=src_controller_address,
+                )
+            )
 
           if push_tasks:
             await asyncio.gather(*push_tasks)

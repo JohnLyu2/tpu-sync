@@ -21,6 +21,7 @@ py_library(
     srcs = ["broadcast_engine.py"],
     visibility = ["//visibility:public"],
     deps = [
+        ":controller_types",
         "//tpu_sync/api:common",
         "@com_google_absl_py//absl/logging",
     ],
@@ -31,6 +32,7 @@ py_test(
     srcs = ["broadcast_engine_test.py"],
     deps = [
         ":broadcast_engine",
+        ":controller_types",
         "//tpu_sync/api:common",
         "//tpu_sync/rpc:raiden_controller",
         "@com_google_absl_py//absl/testing:absltest",

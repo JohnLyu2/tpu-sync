@@ -22,6 +22,7 @@ from absl.testing import absltest
 from tpu_sync.api.common import RaidenId
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.weight_sync.manager import broadcast_engine
+from tpu_sync.weight_sync.manager import controller_types
 
 
 class RecordingWorkerRpcClient(raiden_controller.WeightSyncWorkerRpcClient):
@@ -589,7 +590,7 @@ class BroadcastEngineTest(absltest.TestCase):
         )
     )
 
-    # Find the relay's forward transfer plan 
+    # Find the relay's forward transfer plan
     # (where relay is sender, dst is receiver)
     relay_forward_plans = [
         plan
@@ -718,6 +719,129 @@ class BroadcastEngineTest(absltest.TestCase):
     self.assertEqual(relay_schedules[1][0][5], 1)
 
     self.assertEqual(relay_plan.expected_block_count, 2)
+
+  def test_stage_broadcast_group_whole_block_sampler_relay(self) -> None:
+    """Verifies 1-to-1 whole-block sampler relays across 2 trainers and 4 samplers."""
+    rpc_client = RecordingWorkerRpcClient()
+    engine = broadcast_engine.BroadcastEngine(worker_rpc_client=rpc_client)
+
+    train_0 = RaidenId("trainer", "0", "weights", 0)
+    train_1 = RaidenId("trainer", "1", "weights", 0)
+    src_units = [train_0, train_1]
+    dst_units = [RaidenId("sampler", str(i), "weights", 0) for i in range(4)]
+
+    data_addresses = {
+        train_0: ["10.0.0.1:8000"],
+        train_1: ["10.0.0.2:8000"],
+        **{u: [f"10.0.1.{i}:8000"] for i, u in enumerate(dst_units)},
+    }
+    worker_rpc_addresses = {
+        train_0: "10.0.0.1:9000",
+        train_1: "10.0.0.2:9000",
+        **{u: f"10.0.1.{i}:9000" for i, u in enumerate(dst_units)},
+    }
+
+    # Two trainers each contribute half of a 1024-byte block (512 bytes each)
+    # 9-tuple: (local_dst_idx, dst_block_offset, src_block_offset, size, src_block_id, dst_block_id, src_stride, dst_stride, count)
+    canonical_var_plans = {
+        train_0: {100: {0: [(0, 0, 0, 512, 0, 0, 512, 512, 1)]}},
+        train_1: {100: {0: [(0, 512, 0, 512, 0, 0, 512, 512, 1)]}},
+    }
+    # Whole-block relay specification: (min_offset=0, block_size=1024, dst_block_id=0)
+    canonical_relay = {100: {0: [(0, 1024, 0)]}}
+
+    stage_group = controller_types.StageBroadcastGroup(
+        pool_group=0,
+        layer_group_idx=0,
+        src_units=src_units,
+        dst_units=dst_units,
+        stage_ordered_vars_by_unit={
+            train_0: [(0, 100)],
+            train_1: [(0, 100)],
+        },
+        canonical_variable_plans=canonical_var_plans,
+        canonical_relay_plans=canonical_relay,
+        data_addresses=data_addresses,
+    )
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=src_units,
+        dst_units=dst_units,
+        plan=None,
+        worker_data_addresses=data_addresses,
+        worker_rpc_addresses=worker_rpc_addresses,
+        is_weight_sync=True,
+    )
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=[stage_group],
+            final_plan=final_plan,
+            fanout_k=2,
+            req_id="req_stage_relay_test",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards={
+                u: data_addresses[u] for u in src_units + dst_units
+            },
+        )
+    )
+
+    # 1. Verify Trainer -> Seed Samplers (dst_units[0] and dst_units[1])
+    # Both train_0 and train_1 must have pushed to each seed sampler.
+    for seed in (dst_units[0], dst_units[1]):
+      seed_receiver_calls = [
+          plan
+          for target_id, plan in rpc_client.invocations
+          if target_id == seed and set(plan.src_units) == set(src_units)
+      ]
+      self.assertLen(seed_receiver_calls, 1)
+      self.assertEqual(seed_receiver_calls[0].expected_block_count, 2)
+
+    # 2. Verify Sampler -> Sampler Relay transfers
+    # With fanout_k=2 and 4 samplers:
+    # dst_units[0] relays to dst_units[2], dst_units[1] relays to dst_units[3].
+    relay_sender_calls = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id in dst_units and plan.src_units[0] in dst_units
+    ]
+    self.assertNotEmpty(relay_sender_calls)
+    for relay_plan in relay_sender_calls:
+      s_u = relay_plan.src_units[0]
+      sched = relay_plan.shard_push_schedules[s_u]
+      for s_idx, entries in sched.items():
+        for entry in entries:
+          (
+              dst_peer,
+              local_dst_idx,
+              dst_block_offset,
+              src_block_offset,
+              size,
+              src_block_id,
+              dst_block_id,
+              src_stride,
+              dst_stride,
+              count,
+              layer_idx,
+              pool_group,
+          ) = entry
+          # Verify 1-to-1 whole-block relay invariants:
+          self.assertEqual(count, 1, "Relay transfers must have count = 1")
+          self.assertEqual(size, 1024, "Whole-block size must be 1024")
+          self.assertEqual(dst_block_offset, 0)
+          self.assertEqual(src_block_offset, 0)
+          self.assertEqual(src_block_id, 0)
+          self.assertEqual(dst_block_id, 0)
+          self.assertEqual(src_stride, 1024)
+          self.assertEqual(dst_stride, 1024)
+
+    # 3. Verify all 4 samplers received the stage
+    receivers = {
+        plan.dst_units[0]
+        for target_id, plan in rpc_client.invocations
+        if target_id == plan.dst_units[0] and target_id in dst_units
+    }
+    self.assertEqual(receivers, set(dst_units))
 
 
 if __name__ == "__main__":

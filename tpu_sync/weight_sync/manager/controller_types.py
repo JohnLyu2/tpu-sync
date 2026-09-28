@@ -229,6 +229,32 @@ class _CachedTransferSchedule:
   variable_to_plan_id: dict[Any, dict[int, int]] = dataclasses.field(
       default_factory=dict
   )
+  # Deduplicated canonical relay plans mapping plan_id to local destination
+  # shard index to list of whole-block specifications:
+  # {plan_id: {local_dst_idx: [(min_offset, block_size, dst_block_id)]}}
+  canonical_relay_plans: dict[int, dict[int, list[tuple[int, int, int]]]] = (
+      dataclasses.field(default_factory=dict)
+  )
+
+
+@dataclasses.dataclass
+class StageBroadcastGroup:
+  """A stage-level broadcast group for pipelined multi-hop tree broadcast.
+
+  Instead of unpacking and duplicating millions of micro-slice tuples across
+  all destination units and trainer shards, a StageBroadcastGroup retains the
+  address-free canonical resharding plan and canonical relay plan for all
+  variables in a pipeline stage group.
+  """
+
+  pool_group: int
+  layer_group_idx: int
+  src_units: list[RaidenId]
+  dst_units: list[RaidenId]
+  stage_ordered_vars_by_unit: dict[RaidenId, list[tuple[int, int]]]
+  canonical_variable_plans: dict[RaidenId, dict[int, dict[int, list[Any]]]]
+  canonical_relay_plans: dict[int, dict[int, list[tuple[int, int, int]]]]
+  data_addresses: dict[RaidenId, list[str]]
 
 
 @dataclasses.dataclass
