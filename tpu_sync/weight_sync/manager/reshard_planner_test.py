@@ -135,6 +135,7 @@ class ReshardPlannerTest(absltest.TestCase):
       dst_phys_mesh: list[int],
       dst_mesh_axes: list[str],
       dst_host_subgrid: list[int],
+      broadcast_host_ratio: float = 0.0,
   ) -> dict[str, Any]:
     lock = threading.Lock()
     src_units = list(src_vars_by_unit.keys())
@@ -206,7 +207,7 @@ class ReshardPlannerTest(absltest.TestCase):
         registered_shards=registered_shards,
         computed_phys_meshes={},
         worker_endpoints=worker_endpoints,
-        broadcast_k=64,
+        broadcast_host_ratio=broadcast_host_ratio,
         lock=lock,
     )
 
@@ -332,7 +333,7 @@ class ReshardPlannerTest(absltest.TestCase):
           head_groups.setdefault(key, []).append(val)
     head_direct_schedules, head_broadcast_groups = (
         reshard_planner.BroadcastEngine.partition_direct_and_broadcast_groups(
-            head_groups, broadcast_k=64, group_size=1
+            head_groups, n_seed=64, group_size=1
         )
     )
     self.assertEqual(
@@ -583,6 +584,200 @@ class ReshardPlannerTest(absltest.TestCase):
     for n in (4, 16, 64):
       self.assertEqual(plans_by_n[n], base_plans)
       self.assertEqual(relay_plans_by_n[n], base_relay)
+
+  def test_compute_bandwidth_matched_seed(self):
+    # 0.0 disables tree broadcast and forces Direct P2P (returns max(1, num_dst_units))
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(
+            broadcast_host_ratio=0.0,
+            num_src_hosts=32,
+            num_dst_hosts_per_unit=2,
+            num_dst_units=16,
+        ),
+        16,
+    )
+    # Bandwidth matching: H_train=32, H_sample=2 -> 32/2 = 16
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(
+            broadcast_host_ratio=1.0,
+            num_src_hosts=32,
+            num_dst_hosts_per_unit=2,
+            num_dst_units=16,
+        ),
+        16,
+    )
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(
+            broadcast_host_ratio=0.5,
+            num_src_hosts=32,
+            num_dst_hosts_per_unit=2,
+            num_dst_units=16,
+        ),
+        8,
+    )
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(
+            broadcast_host_ratio=2.0,
+            num_src_hosts=32,
+            num_dst_hosts_per_unit=2,
+            num_dst_units=16,
+        ),
+        32,
+    )
+    # Floor behavior with minimum 1
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(
+            broadcast_host_ratio=0.01,
+            num_src_hosts=32,
+            num_dst_hosts_per_unit=2,
+            num_dst_units=16,
+        ),
+        1,
+    )
+    # Validation errors
+    with self.assertRaisesRegex(
+        ValueError, "broadcast_host_ratio must be non-negative"
+    ):
+      reshard_planner.compute_bandwidth_matched_seed(
+          broadcast_host_ratio=-1.0,
+          num_src_hosts=32,
+          num_dst_hosts_per_unit=2,
+          num_dst_units=16,
+      )
+    with self.assertRaisesRegex(ValueError, "num_src_hosts must be positive"):
+      reshard_planner.compute_bandwidth_matched_seed(
+          broadcast_host_ratio=1.0,
+          num_src_hosts=0,
+          num_dst_hosts_per_unit=2,
+          num_dst_units=16,
+      )
+    with self.assertRaisesRegex(
+        ValueError, "num_dst_hosts_per_unit must be positive"
+    ):
+      reshard_planner.compute_bandwidth_matched_seed(
+          broadcast_host_ratio=1.0,
+          num_src_hosts=32,
+          num_dst_hosts_per_unit=0,
+          num_dst_units=16,
+      )
+    with self.assertRaisesRegex(
+        ValueError, "num_dst_units must be non-negative"
+    ):
+      reshard_planner.compute_bandwidth_matched_seed(
+          broadcast_host_ratio=1.0,
+          num_src_hosts=32,
+          num_dst_hosts_per_unit=2,
+          num_dst_units=-1,
+      )
+
+  def test_make_plan_cache_key_includes_broadcast_host_ratio(self):
+    src = [RaidenId("t", "0", "v", 0)]
+    dst = [RaidenId("s", "0", "v", 0)]
+    key1 = reshard_planner.ReshardPlanner.make_plan_cache_key(
+        src_units=src, dst_units=dst, broadcast_host_ratio=1.0
+    )
+    key2 = reshard_planner.ReshardPlanner.make_plan_cache_key(
+        src_units=src, dst_units=dst, broadcast_host_ratio=2.0
+    )
+    self.assertNotEqual(key1, key2)
+    self.assertEqual(key1[-1], 1.0)
+    self.assertEqual(key2[-1], 2.0)
+
+  def test_compute_transfer_schedule_empty_src_units_raises(self):
+    with self.assertRaisesRegex(ValueError, "src_units must not be empty"):
+      reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+          src_units=[],
+          dst_units=[RaidenId("s", "0", "v", 0)],
+          dst_metadata=[],
+          entities={},
+          registered_variables={},
+          registered_global_shapes={},
+          registered_mesh_shapes={},
+          registered_mesh_axes={},
+          registered_host_subgrids={},
+          registered_layouts={},
+          registered_itemsizes={},
+          registered_shards={RaidenId("s", "0", "v", 0): ["10.0.0.1:8000"]},
+          computed_phys_meshes={},
+          worker_endpoints={},
+          broadcast_host_ratio=0.0,
+          lock=threading.Lock(),
+      )
+
+  def test_compute_transfer_schedule_empty_dst_raises(self):
+    with self.assertRaisesRegex(
+        ValueError, "dst_metadata or dst_units must not be empty"
+    ):
+      reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+          src_units=[RaidenId("t", "0", "v", 0)],
+          dst_units=[],
+          dst_metadata=[],
+          entities={},
+          registered_variables={},
+          registered_global_shapes={},
+          registered_mesh_shapes={},
+          registered_mesh_axes={},
+          registered_host_subgrids={},
+          registered_layouts={},
+          registered_itemsizes={},
+          registered_shards={RaidenId("t", "0", "v", 0): ["10.0.0.1:8000"]},
+          computed_phys_meshes={},
+          worker_endpoints={},
+          broadcast_host_ratio=0.0,
+          lock=threading.Lock(),
+      )
+
+  def test_compute_transfer_schedule_multi_unit_fsdp_seed_count(self):
+    """Verifies that total src hosts across multiple 1-shard units scale N_seed."""
+    src_units = [
+        RaidenId("fsdp_trainer", str(i), "weights", 0) for i in range(8)
+    ]
+    dst_units = [
+        RaidenId("fsdp_sampler", str(i), "weights", 0) for i in range(4)
+    ]
+    src_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=8, is_src=True
+    )
+    dst_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=8, is_src=False
+    )
+    src_vars_by_unit = {u: src_vars for u in src_units}
+    dst_vars_by_unit = {u: dst_vars for u in dst_units}
+
+    inputs_r0125 = self._build_planner_inputs(
+        src_vars_by_unit=src_vars_by_unit,
+        dst_vars_by_unit=dst_vars_by_unit,
+        src_phys_mesh=[1, 1, 1],
+        src_mesh_axes=["tp", "tp_wo", "tp_out"],
+        src_host_subgrid=[1, 1, 1],
+        dst_phys_mesh=[1, 1, 1],
+        dst_mesh_axes=["tp", "tp_wo", "tp_out"],
+        dst_host_subgrid=[1, 1, 1],
+        broadcast_host_ratio=0.125,
+    )
+    for u in src_units:
+      inputs_r0125["registered_shards"][u] = [f"10.0.0.{u.job_replica_id}:8000"]
+      inputs_r0125["entities"][u] = job_entity.JobEntity(
+          unit=u, shards=inputs_r0125["registered_shards"][u]
+      )
+    for j, _ in enumerate(dst_units):
+      inputs_r0125["dst_metadata"][j].shards[:] = [f"10.1.0.{j}:8000"]
+
+    sched_r0125 = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **inputs_r0125
+        )
+    )
+    self.assertEqual(sched_r0125.n_seed, 1)
+
+    inputs_r025 = dict(inputs_r0125)
+    inputs_r025["broadcast_host_ratio"] = 0.25
+    sched_r025 = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **inputs_r025
+        )
+    )
+    self.assertEqual(sched_r025.n_seed, 2)
 
 
 if __name__ == "__main__":

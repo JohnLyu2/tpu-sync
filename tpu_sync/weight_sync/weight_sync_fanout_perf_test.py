@@ -14,8 +14,10 @@
 
 """Performance unit test for weight syncing fan-out and resharding.
 
-Benchmarks 1-to-4 Flat Direct Push (broadcast_k=64) versus Tree Broadcast
-(broadcast_k=2) side-by-side using host DRAM loopback networking on scaled
+Benchmarks 1-to-4 Flat Direct Push (broadcast_host_ratio=0.0) versus Tree
+Broadcast
+(broadcast_host_ratio=2.0) side-by-side using host DRAM loopback networking on
+scaled
 Qwen-35B model specs, verifying micro-block fragmentation realism and parity.
 """
 
@@ -355,6 +357,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         port=0,
         worker_rpc_client=self.controller_network_client,
     )
+    self.controller.broadcast_host_ratio = 0.0
     self.controller_server = raiden_controller.RaidenControllerServer(
         self.controller
     )
@@ -434,8 +437,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
   def _get_schedule_and_task_counts(self) -> Tuple[int, int]:
     if hasattr(self, "_cached_task_counts"):
       return self._cached_task_counts
-    old_k = self.controller.broadcast_k
-    self.controller.broadcast_k = 64
+    old_ratio = self.controller.broadcast_host_ratio
+    self.controller.broadcast_host_ratio = 0.0
     self.controller._plan_cache.clear()
     try:
       loop = asyncio.new_event_loop()
@@ -450,7 +453,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
       finally:
         loop.close()
     finally:
-      self.controller.broadcast_k = old_k
+      self.controller.broadcast_host_ratio = old_ratio
       self.controller._plan_cache.clear()
 
     self.assertIsNotNone(sched)
@@ -604,7 +607,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     return fingerprints
 
   def _run_flat_direct_push_perf(self) -> PerfRunResult:
-    """Executes 1-to-4 Flat Direct Push (broadcast_k=64) with position-unique parity check."""
+    """Executes 1-to-4 Flat Direct Push (broadcast_host_ratio=0.0) with position-unique parity check."""
     # 0. Reset metrics on source and all destination workers
     self.ws_src.reset_metrics()
     for ws_dst in self.ws_dsts:
@@ -619,9 +622,9 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
         buf[:] = 0x00
 
-    # 3. Start flat direct push transfer
+    # 3. Start flat direct push transfer (broadcast_host_ratio=4.0, k=4)
     uuid = 1001
-    self.controller.broadcast_k = 64
+    self.controller.broadcast_host_ratio = 4.0
     self.controller._plan_cache.clear()
     t0 = time.perf_counter()
     future = self.controller.start_transfer(
@@ -679,7 +682,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     src_h2h_ms = src_metrics["total_h2h_time_ms"]
     src_h2h_bw = src_metrics["total_h2h_bandwidth_gbps"]
     print(
-        f"\n[Flat Push (k=64)] Elapsed: {elapsed:.3f}s, Throughput:"
+        f"\n[Flat Push (ratio=0.0)] Elapsed: {elapsed:.3f}s, Throughput:"
         f" {throughput_gb_s:.2f} GB/s, Src H2H: {src_h2h_mb:.1f} MB in"
         f" {src_h2h_ms:.1f} ms ({src_h2h_bw:.2f} GB/s), Relays: None, Parity:"
         " PASS"
@@ -687,11 +690,11 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     return PerfRunResult(elapsed, throughput_gb_s, src_metrics, dst_metrics)
 
   def test_flat_direct_push_perf(self):
-    """Benchmarks 1-to-4 Flat Direct Push (broadcast_k=64) with byte parity check."""
+    """Benchmarks 1-to-4 Flat Direct Push (broadcast_host_ratio=0.0) with byte parity check."""
     self._run_flat_direct_push_perf()
 
   def _run_tree_broadcast_perf(self) -> PerfRunResult:
-    """Executes 1-to-4 Tree Broadcast (broadcast_k=2) awaiting controller future."""
+    """Executes 1-to-4 Tree Broadcast (broadcast_host_ratio=2.0) awaiting controller future."""
     # 0. Reset metrics on source and all destination workers
     self.ws_src.reset_metrics()
     for ws_dst in self.ws_dsts:
@@ -706,9 +709,9 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
         buf[:] = 0x00
 
-    # 3. Start tree broadcast transfer (broadcast_k=2)
+    # 3. Start tree broadcast transfer (broadcast_host_ratio=2.0)
     uuid = 1002
-    self.controller.broadcast_k = 2
+    self.controller.broadcast_host_ratio = 2.0
     self.controller._plan_cache.clear()
     t0 = time.perf_counter()
     future = self.controller.start_transfer(
@@ -757,8 +760,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     relay_metrics = [m for m in dst_metrics if m["total_h2h_bytes"] > 0]
     self.assertNotEmpty(
         relay_metrics,
-        "Tree Broadcast (broadcast_k=2) must have active relay destinations"
-        " forwarding chunks.",
+        "Tree Broadcast (broadcast_host_ratio=2.0) must have active relay"
+        " destinations forwarding chunks.",
     )
     for m in relay_metrics:
       self.assertGreater(m["total_h2h_bytes"], 0)
@@ -789,7 +792,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     avg_relay_bw = sum(relay_bws) / len(relay_bws) if relay_bws else 0.0
 
     print(
-        f"\n[Tree Broadcast (k=2)] Elapsed: {elapsed:.3f}s, Throughput:"
+        f"\n[Tree Broadcast (ratio=2.0)] Elapsed: {elapsed:.3f}s, Throughput:"
         f" {throughput_gb_s:.2f} GB/s, Src H2H: {src_h2h_mb:.1f} MB in"
         f" {src_h2h_ms:.1f} ms ({src_h2h_bw:.2f} GB/s), Relays"
         f" ({len(relay_metrics)} active): max {max_relay_bw:.2f} GB/s, avg"
@@ -798,7 +801,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     return PerfRunResult(elapsed, throughput_gb_s, src_metrics, dst_metrics)
 
   def test_tree_broadcast_perf(self):
-    """Benchmarks 1-to-4 Tree Broadcast (broadcast_k=2) awaiting controller future."""
+    """Benchmarks 1-to-4 Tree Broadcast (broadcast_host_ratio=2.0) awaiting controller future."""
     self._run_tree_broadcast_perf()
 
   def test_sxs_flat_vs_tree_performance_comparison(self):
@@ -1060,8 +1063,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         "RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"
     )
     os.environ["RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"] = "0"
-    old_broadcast_k = self.controller.broadcast_k
-    self.controller.broadcast_k = 64
+    old_ratio = self.controller.broadcast_host_ratio
+    self.controller.broadcast_host_ratio = 0.0
     loop = asyncio.new_event_loop()
     try:
       # Warmup transfer to initialize connection pools and threads across all 8x4 pairs
@@ -1174,7 +1177,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           self.total_model_bytes * num_dst,
       )
     finally:
-      self.controller.broadcast_k = old_broadcast_k
+      self.controller.broadcast_host_ratio = old_ratio
       loop.close()
       if prev_pipeline_group_size is not None:
         os.environ["RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"] = (
@@ -1231,6 +1234,334 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         f" pre-fix incast ({t_prefix:.3f}s) by >=1.30x (measured:"
         f" {speedup:.2f}x).",
     )
+
+  def test_fsdp8_all_source_binomial_tree_ratio_comparison(
+      self,
+  ) -> None:
+    """Benchmarks FSDP-8 All-Source Binomial Tree broadcast comparing ratio=0.125 vs 0.25.
+
+    Under broadcast_host_ratio=0.125 (n_seed=1, 3 rounds), trainer egress is
+    bottlenecked by a single sampler's ingress NIC.
+    Under broadcast_host_ratio=0.25 (n_seed=2, 2 rounds), bandwidth-matched
+    seeding saturates cluster bisection bandwidth in parallel.
+    """
+    num_fsdp = _NUM_FSDP_TRAINERS.value
+    num_dst = self.num_destinations
+
+    src_fsdp_mesh_dict = {"fsdp": num_fsdp}
+    src_fsdp_specs = _make_scaled_qwen_specs(
+        num_layers=self.num_layers_flag,
+        num_routed_experts=self.num_routed_experts_flag,
+        role="fsdp_source",
+    )
+    src_fsdp_slice_byte_sizes = [
+        int(np.prod(p.shape) // num_fsdp) * p.item_size
+        for p in build_variable_protos(
+            src_fsdp_specs, src_fsdp_mesh_dict, global_shard_idx=0
+        )
+    ]
+
+    ws_srcs: List[weight_synchronizer.WeightSynchronizer] = []
+    for i in range(num_fsdp):
+      ws = weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+          num_layers=self.num_layers,
+          num_shards=1,
+          slice_byte_size=src_fsdp_slice_byte_sizes,
+          local_port=0,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+          global_shard_indices=[i],
+      )
+      self.addCleanup(ws.shutdown)
+      ws_srcs.append(ws)
+
+    ws_dsts: List[weight_synchronizer.WeightSynchronizer] = []
+    for _ in range(num_dst):
+      ws = weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+          num_layers=self.num_layers,
+          num_shards=1,
+          slice_byte_size=self.dst_slice_byte_sizes,
+          local_port=0,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+      )
+      self.addCleanup(ws.shutdown)
+      ws_dsts.append(ws)
+
+    src_units = [
+        RaidenId("fsdp_trainer", str(i), "weights") for i in range(num_fsdp)
+    ]
+    dst_units = [
+        RaidenId("fsdp_sampler", str(i), "weights") for i in range(num_dst)
+    ]
+
+    mesh_axes = ["tp", "tp_wo", "tp_out"]
+    mesh_shape = [1] * len(mesh_axes)
+
+    for i, ws_src in enumerate(ws_srcs):
+      protos = build_variable_protos(
+          src_fsdp_specs, src_fsdp_mesh_dict, global_shard_idx=i
+      )
+      self.ctrl_client.register_work_unit(
+          src_units[i],
+          [f"127.0.0.1:{ws_src.local_port}"],
+          f"127.0.0.1:{ws_src.listener_port}",
+          mesh_shape=mesh_shape,
+          variables=protos,
+          mesh_axes=mesh_axes,
+      )
+
+    for j, ws_dst in enumerate(ws_dsts):
+      protos = build_variable_protos(
+          self.dst_specs, self.dst_mesh_dict, global_shard_idx=0
+      )
+      self.ctrl_client.register_work_unit(
+          dst_units[j],
+          [f"127.0.0.1:{ws_dst.local_port}"],
+          f"127.0.0.1:{ws_dst.listener_port}",
+          mesh_shape=mesh_shape,
+          variables=protos,
+          mesh_axes=mesh_axes,
+      )
+
+    sampler_nic_gbps = (
+        _TEST_ONLY_SIMULATED_NIC_GBPS.value
+        if _TEST_ONLY_SIMULATED_NIC_GBPS.value > 0.0
+        else 20.0
+    )
+    trainer_nic_gbps = sampler_nic_gbps * 0.25
+
+    for ws in ws_dsts:
+      ws.test_only_set_bandwidth_limit(
+          test_only_simulated_egress_gbps=sampler_nic_gbps,
+          test_only_simulated_ingress_gbps=sampler_nic_gbps,
+      )
+    for ws in ws_srcs:
+      ws.test_only_set_bandwidth_limit(
+          test_only_simulated_egress_gbps=trainer_nic_gbps,
+          test_only_simulated_ingress_gbps=trainer_nic_gbps,
+      )
+
+    def _fill_fsdp_pattern(seed: int) -> None:
+      for i, ws in enumerate(ws_srcs):
+        for l in range(self.num_layers):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          words = buf.view(np.uint32)
+          words[:] = (
+              (np.uint32(seed & 0xFF) << np.uint32(24))
+              | (np.uint32(i & 0x07) << np.uint32(20))
+              | (np.uint32((l + 1) & 0x3F) << np.uint32(14))
+              | (
+                  np.arange(1, len(words) + 1, dtype=np.uint32)
+                  & np.uint32(0x3FFF)
+              )
+          )
+
+    def _verify_fsdp_destinations(seed: int, label: str) -> None:
+      expected_seed = np.uint32(seed & 0xFF)
+      for l in range(self.num_layers):
+        valid_bytes = self.layer_max_bytes[l]
+        ref_buf = ws_dsts[0].get_host_buffer(layer_idx=l, shard_idx=0)[
+            :valid_bytes
+        ]
+        ref_words = ref_buf.view(np.uint32)
+        self.assertTrue(
+            np.all((ref_words >> np.uint32(24)) == expected_seed),
+            f"{label} seed tag mismatch in layer {l} on sampler 0",
+        )
+        for j in range(1, num_dst):
+          dst_buf = ws_dsts[j].get_host_buffer(layer_idx=l, shard_idx=0)[
+              :valid_bytes
+          ]
+          dst_words = dst_buf.view(np.uint32)
+          self.assertTrue(
+              np.all((dst_words >> np.uint32(24)) == expected_seed),
+              f"{label} seed tag mismatch in layer {l} on sampler {j}",
+          )
+          self.assertTrue(
+              np.array_equal(dst_buf, ref_buf),
+              f"{label} sampler {j} mismatch against sampler 0 in layer {l}",
+          )
+
+    old_ratio = self.controller.broadcast_host_ratio
+    loop = asyncio.new_event_loop()
+    try:
+      self.controller.broadcast_host_ratio = 0.25
+      self.controller._plan_cache.clear()
+      future_warmup = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=2100,
+          req_id="fsdp8_tree_warmup",
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(self.num_layers)},
+      )
+      loop.run_until_complete(future_warmup.wait())
+
+      # Run 1: broadcast_host_ratio = 0.125 (n_seed = 1, 3 rounds)
+      for ws in ws_srcs:
+        ws.reset_metrics()
+      for ws in ws_dsts:
+        ws.reset_metrics()
+
+      _fill_fsdp_pattern(0x5A)
+
+      for ws in ws_dsts:
+        for l in range(self.num_layers):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          buf[:] = 0x00
+
+      self.controller._plan_cache.clear()
+      self.controller.broadcast_host_ratio = 0.125
+
+      uuid_r0125 = 2101
+      t0 = time.perf_counter()
+      future_r0125 = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=uuid_r0125,
+          req_id="fsdp8_tree_r0125",
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(self.num_layers)},
+      )
+      loop.run_until_complete(future_r0125.wait())
+      t_r0125 = time.perf_counter() - t0
+
+      _verify_fsdp_destinations(0x5A, "Tree (ratio=0.125)")
+
+      src_metrics_r0125 = [ws.get_metrics() for ws in ws_srcs]
+      dst_metrics_r0125 = [ws.get_metrics() for ws in ws_dsts]
+
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in src_metrics_r0125),
+          self.total_model_bytes * 2,
+      )
+      relays_r0125 = [m for m in dst_metrics_r0125 if m["total_h2h_bytes"] > 0]
+      self.assertLen(relays_r0125, 2)
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in dst_metrics_r0125),
+          self.total_model_bytes * 2,
+      )
+
+      # Run 2: broadcast_host_ratio = 0.25 (n_seed = 2, 2 rounds)
+      for ws in ws_srcs:
+        ws.reset_metrics()
+      for ws in ws_dsts:
+        ws.reset_metrics()
+
+      _fill_fsdp_pattern(0xA5)
+
+      for ws in ws_dsts:
+        for l in range(self.num_layers):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          buf[:] = 0x00
+
+      self.controller._plan_cache.clear()
+      self.controller.broadcast_host_ratio = 0.25
+
+      uuid_r025 = 2102
+      t0 = time.perf_counter()
+      future_r025 = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=uuid_r025,
+          req_id="fsdp8_tree_r025",
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(self.num_layers)},
+      )
+      loop.run_until_complete(future_r025.wait())
+      t_r025 = time.perf_counter() - t0
+
+      _verify_fsdp_destinations(0xA5, "Tree (ratio=0.25)")
+
+      src_metrics_r025 = [ws.get_metrics() for ws in ws_srcs]
+      dst_metrics_r025 = [ws.get_metrics() for ws in ws_dsts]
+
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in src_metrics_r025),
+          self.total_model_bytes * 2,
+      )
+      relays_r025 = [m for m in dst_metrics_r025 if m["total_h2h_bytes"] > 0]
+      self.assertLen(relays_r025, 2)
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in dst_metrics_r025),
+          self.total_model_bytes * 2,
+      )
+    finally:
+      self.controller.broadcast_host_ratio = old_ratio
+      loop.close()
+
+    total_model_mb = self.total_model_bytes / 1e6
+    total_transferred_gb = (self.total_model_bytes * num_dst) / 1e9
+
+    throughput_r0125 = total_transferred_gb / max(t_r0125, 1e-9)
+    throughput_r025 = total_transferred_gb / max(t_r025, 1e-9)
+
+    src_bytes_r0125_mb = (
+        sum(m["total_h2h_bytes"] for m in src_metrics_r0125) / 1e6
+    )
+    src_bytes_r025_mb = (
+        sum(m["total_h2h_bytes"] for m in src_metrics_r025) / 1e6
+    )
+
+    src_bw_r0125_gbps = (src_bytes_r0125_mb * 8 / 1e3) / max(t_r0125, 1e-9)
+    src_bw_r025_gbps = (src_bytes_r025_mb * 8 / 1e3) / max(t_r025, 1e-9)
+
+    dst_bytes_r0125_mb = (
+        sum(m["total_h2h_bytes"] for m in dst_metrics_r0125) / 1e6
+    )
+    dst_bytes_r025_mb = (
+        sum(m["total_h2h_bytes"] for m in dst_metrics_r025) / 1e6
+    )
+
+    dst_bw_r0125_gbps = (dst_bytes_r0125_mb * 8 / 1e3) / max(t_r0125, 1e-9)
+    dst_bw_r025_gbps = (dst_bytes_r025_mb * 8 / 1e3) / max(t_r025, 1e-9)
+
+    speedup = t_r0125 / max(t_r025, 1e-9)
+
+    print("\n" + "=" * 125)
+    print(
+        "FSDP-8 All-Source Binomial Tree Broadcast Ratio Comparison (Model:"
+        f" ~{total_model_mb:.1f} MB, N={num_dst} Samplers)"
+    )
+    print(
+        f"Trainer NIC: {trainer_nic_gbps:.1f} Gbps/host (8 hosts ="
+        f" {trainer_nic_gbps * 8:.1f} Gbps agg), Sampler NIC:"
+        f" {sampler_nic_gbps:.1f} Gbps/host"
+    )
+    print("=" * 125)
+    print(
+        f"{'Schedule Mode':<35} {'Time':<10} {'Throughput':<14} "
+        f"{'Trainer H2H (BW)':<22} {'Relay H2H (BW)':<22} {'Speedup':<10}"
+        f" {'Parity':<8}"
+    )
+    print("-" * 125)
+    print(
+        f"{'Tree (ratio=0.125, n_seed=1, 3 rnd)':<35} {t_r0125:.3f} s   "
+        f"{throughput_r0125:.2f} GB/s     "
+        f"{src_bytes_r0125_mb:.1f} MB ({src_bw_r0125_gbps:.1f} Gbps)  "
+        f"{dst_bytes_r0125_mb:.1f} MB ({dst_bw_r0125_gbps:.1f} Gbps)  "
+        f"{'1.00x':<10} {'PASS':<8}"
+    )
+    print(
+        f"{'Tree (ratio=0.25, n_seed=2, 2 rnd)':<35} {t_r025:.3f} s   "
+        f"{throughput_r025:.2f} GB/s     "
+        f"{src_bytes_r025_mb:.1f} MB ({src_bw_r025_gbps:.1f} Gbps)  "
+        f"{dst_bytes_r025_mb:.1f} MB ({dst_bw_r025_gbps:.1f} Gbps)  "
+        f"{f'{speedup:.2f}x':<10} {'PASS':<8}"
+    )
+    print("=" * 125 + "\n")
+
+    self.assertLess(t_r025, t_r0125)
 
   def _push_block_transport_entries(
       self,

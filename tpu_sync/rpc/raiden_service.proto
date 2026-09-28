@@ -215,6 +215,15 @@ message StartTransferRequest {
   // destined for this receiver for each layer/tensor. Used to trigger pipelined
   // per-layer H2D upon completion of all chunks for a layer.
   map<int32, int64> expected_layer_chunk_counts = 21;
+  optional int32 broadcast_round = 22;
+  repeated BroadcastRoundDestinationsProto broadcast_round_destinations = 23;
+}
+
+// Round-grouped destination targets for tree-based broadcast logging and audit.
+message BroadcastRoundDestinationsProto {
+  int32 round_idx = 1;
+  repeated string dst_units = 2;
+  repeated string dst_peers = 3;
 }
 
 // One tag class's slice of a multi-tag byte-span transfer.

@@ -1231,6 +1231,24 @@ class JobEntity:
     start_req.uuid = int(uuid_val or 0)
     start_req.req_id = str(req_id_val or "")
     start_req.skip_d2h = skip_d2h_val
+    if getattr(transfer_plan, "broadcast_round", None) is not None:
+      start_req.broadcast_round = int(transfer_plan.broadcast_round)
+
+    round_dests = getattr(transfer_plan, "broadcast_round_destinations", None)
+    if isinstance(round_dests, dict):
+      target_dests = round_dests.get(target_id, [])
+    elif isinstance(round_dests, list):
+      target_dests = round_dests
+    else:
+      target_dests = []
+
+    for rd in target_dests:
+      rd_proto = start_req.broadcast_round_destinations.add()
+      rd_proto.round_idx = int(getattr(rd, "round_idx", 0))
+      dst_units_val = getattr(rd, "dst_units", [])
+      rd_proto.dst_units.extend(str(u) for u in dst_units_val)
+      dst_peers_val = getattr(rd, "dst_peers", [])
+      rd_proto.dst_peers.extend(str(p) for p in dst_peers_val)
     req.start_transfer_request.CopyFrom(start_req)
     serialized_bytes = req.SerializeToString()
     if payload_cache is not None:

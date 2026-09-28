@@ -266,11 +266,15 @@ class _HopTask:
       sender: RaidenId,
       receiver: RaidenId,
       dst_indices: list[int],
+      round_idx: int = 0,
+      child_order: int = 0,
   ) -> None:
     self.group = group
     self.sender = sender
     self.receiver = receiver
     self.dst_indices = dst_indices
+    self.round_idx = round_idx
+    self.child_order = child_order
     self.children: list[_HopTask] = []
 
 
@@ -340,7 +344,7 @@ class BroadcastEngine:
   def partition_direct_and_broadcast_groups(
       cls,
       groups: dict[tuple[Any, ...], list[tuple[Any, ...]]],
-      broadcast_k: int,
+      n_seed: int,
       group_size: int = 1,
   ) -> tuple[
       dict[RaidenId, dict[int, list[Any]]], dict[tuple[Any, ...], list[Any]]
@@ -355,7 +359,7 @@ class BroadcastEngine:
     for key, targets in groups.items():
       unique_dst_units = set(t[0] for t in targets)
       is_tree_broadcast = (
-          len(unique_dst_units) > 1 and len(unique_dst_units) > broadcast_k
+          len(unique_dst_units) > 1 and len(unique_dst_units) > n_seed
       )
       if not is_tree_broadcast:
         (
@@ -427,7 +431,7 @@ class BroadcastEngine:
       self,
       groups_list: list[list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]]],
       final_plan: Any,
-      fanout_k: int,
+      n_seed: int,
       req_id: str,
       dst_mem_type: int,
       registered_shards: dict[RaidenId, list[str]],
@@ -435,8 +439,8 @@ class BroadcastEngine:
       src_controller_address: Optional[str] = None,
   ) -> None:
     """Executes a pipelined multi-hop tree broadcast across multiple groups."""
-    if fanout_k <= 0:
-      raise ValueError(f"fanout_k must be >= 1, got {fanout_k}")
+    if n_seed <= 0:
+      raise ValueError(f"n_seed must be >= 1, got {n_seed}")
 
     coalesced_groups_list = _coalesce_pipeline_groups(
         groups_list, target_stages=8
@@ -490,36 +494,105 @@ class BroadcastEngine:
     }
     transfers_in_progress: dict[asyncio.Task[None], _HopTask] = {}
 
-    # Build deterministic balanced k-ary trees for each group
+    # Build deterministic All-Source Binomial Tree for each group.
+    worker_round_destinations: dict[
+        RaidenId, dict[int, tuple[list[str], list[str]]]
+    ] = collections.defaultdict(
+        lambda: collections.defaultdict(lambda: ([], []))
+    )
+
     for g in groups:
       dst_units = g.pending_dst_units
       n = len(dst_units)
       if n == 0:
         continue
 
-      k_seed = min(fanout_k, n)
-      level_1_hops: list[_HopTask] = []
-      for i in range(k_seed):
-        d = dst_units[i]
-        hop = _HopTask(g, g.primary_src_unit, d, g.dst_unit_to_indices[d])
-        ready_queue[g.primary_src_unit].append(hop)
-        level_1_hops.append(hop)
+      sender_child_count: dict[RaidenId, int] = collections.defaultdict(int)
+      populated_hops: list[_HopTask] = []
+      next_idx = 0
+      round_idx = 0
 
-      prev_level_hops = level_1_hops
-      next_idx = k_seed
+      def _record_hop_destinations(
+          s: RaidenId, d: RaidenId, r: int, cur_g: _GroupBroadcastState = g
+      ) -> None:
+        u_str = str(d)
+        dests = worker_round_destinations[s][r]
+        seen_pairs = set(zip(dests[0], dests[1]))
+        added = False
+        if cur_g.stage_group is not None:
+          peers = cur_g.stage_group.data_addresses.get(d, [])
+          for peer in peers:
+            if peer and (u_str, peer) not in seen_pairs:
+              seen_pairs.add((u_str, peer))
+              dests[0].append(u_str)
+              dests[1].append(peer)
+              added = True
+        else:
+          for idx in cur_g.dst_unit_to_indices[d]:
+            peer = cur_g.ref_targets[idx][1]
+            if peer and (u_str, peer) not in seen_pairs:
+              seen_pairs.add((u_str, peer))
+              dests[0].append(u_str)
+              dests[1].append(peer)
+              added = True
+        if not added and u_str not in dests[0]:
+          dests[0].append(u_str)
+
       while next_idx < n:
-        curr_level_hops: list[_HopTask] = []
-        max_level_targets = min(len(prev_level_hops) * fanout_k, n - next_idx)
-        for j in range(max_level_targets):
-          parent_hop = prev_level_hops[j % len(prev_level_hops)]
+        new_round_hops: list[_HopTask] = []
+
+        # 1. All previously populated samplers each send 1:1 to 1 new sampler
+        #    (ordered newest-first so partial final rounds use earliest-free TX NICs).
+        for parent_hop in reversed(populated_hops):
+          if next_idx >= n:
+            break
           d = dst_units[next_idx]
           child_hop = _HopTask(
-              g, parent_hop.receiver, d, g.dst_unit_to_indices[d]
+              group=g,
+              sender=parent_hop.receiver,
+              receiver=d,
+              dst_indices=g.dst_unit_to_indices[d],
+              round_idx=round_idx,
+              child_order=sender_child_count[parent_hop.receiver],
           )
+          sender_child_count[parent_hop.receiver] += 1
           parent_hop.children.append(child_hop)
-          curr_level_hops.append(child_hop)
+          new_round_hops.append(child_hop)
+          _record_hop_destinations(parent_hop.receiver, d, round_idx)
           next_idx += 1
-        prev_level_hops = curr_level_hops
+
+        # 2. Trainer sends to up to n_seed new samplers in this round.
+        k_train = min(n_seed, n - next_idx)
+        for _ in range(k_train):
+          d = dst_units[next_idx]
+          hop = _HopTask(
+              group=g,
+              sender=g.primary_src_unit,
+              receiver=d,
+              dst_indices=g.dst_unit_to_indices[d],
+              round_idx=round_idx,
+              child_order=sender_child_count[g.primary_src_unit],
+          )
+          sender_child_count[g.primary_src_unit] += 1
+          ready_queue[g.primary_src_unit].append(hop)
+          new_round_hops.append(hop)
+          _record_hop_destinations(g.primary_src_unit, d, round_idx)
+          next_idx += 1
+
+        populated_hops.extend(new_round_hops)
+        round_idx += 1
+
+    round_dests_by_sender: dict[RaidenId, list[Any]] = {}
+    for s, rounds_dict in worker_round_destinations.items():
+      sorted_rounds = sorted(rounds_dict.keys())
+      round_dests_by_sender[s] = [
+          controller_types.BroadcastRoundDestinations(
+              round_idx=r,
+              dst_units=rounds_dict[r][0],
+              dst_peers=rounds_dict[r][1],
+          )
+          for r in sorted_rounds
+      ]
 
     async def _run_single_transfer(
         s_node: RaidenId,
@@ -678,6 +751,10 @@ class BroadcastEngine:
               skip_d2h=final_plan.skip_d2h,
               skip_tiling=final_plan.skip_tiling,
               is_weight_sync=final_plan.is_weight_sync,
+              broadcast_round=hop.round_idx,
+              broadcast_round_destinations=round_dests_by_sender.get(
+                  group.primary_src_unit, []
+              ),
           )
 
           s_u_plans = {}
@@ -706,6 +783,8 @@ class BroadcastEngine:
                 skip_d2h=final_plan.skip_d2h,
                 skip_tiling=final_plan.skip_tiling,
                 is_weight_sync=final_plan.is_weight_sync,
+                broadcast_round=hop.round_idx,
+                broadcast_round_destinations=round_dests_by_sender.get(s_u, []),
             )
 
           task = asyncio.create_task(
@@ -726,25 +805,25 @@ class BroadcastEngine:
                 continue
               seen_var_plans.add((layer_idx, plan_id))
               relay_shards = stage_group.canonical_relay_plans.get(plan_id, {})
-            for local_dst_idx, blocks in relay_shards.items():
-              for min_offset, block_size, dst_block_id in blocks:
-                dst_peer = stage_group.data_addresses[dst_unit][local_dst_idx]
-                entry = (
-                    dst_peer,
-                    local_dst_idx,
-                    min_offset,
-                    min_offset,
-                    block_size,
-                    dst_block_id,
-                    dst_block_id,
-                    block_size,
-                    block_size,
-                    1,
-                    layer_idx,
-                    stage_group.pool_group,
-                )
-                sub_schedule[s].setdefault(local_dst_idx, []).append(entry)
-                expected_block_count += 1
+              for local_dst_idx, blocks in relay_shards.items():
+                for min_offset, block_size, dst_block_id in blocks:
+                  dst_peer = stage_group.data_addresses[dst_unit][local_dst_idx]
+                  entry = (
+                      dst_peer,
+                      local_dst_idx,
+                      min_offset,
+                      min_offset,
+                      block_size,
+                      dst_block_id,
+                      dst_block_id,
+                      block_size,
+                      block_size,
+                      1,
+                      layer_idx,
+                      stage_group.pool_group,
+                  )
+                  sub_schedule[s].setdefault(local_dst_idx, []).append(entry)
+                  expected_block_count += 1
 
           sub_plan = type(final_plan)(
               src_units=[s],
@@ -770,6 +849,8 @@ class BroadcastEngine:
               skip_d2h=True,
               skip_tiling=final_plan.skip_tiling,
               is_weight_sync=final_plan.is_weight_sync,
+              broadcast_round=hop.round_idx,
+              broadcast_round_destinations=round_dests_by_sender.get(s, []),
           )
           task = asyncio.create_task(
               _run_single_transfer(s, dst_unit, sub_plan)
@@ -893,16 +974,20 @@ class BroadcastEngine:
             skip_d2h=final_plan.skip_d2h or (s != group.src_unit),
             skip_tiling=final_plan.skip_tiling,
             is_weight_sync=final_plan.is_weight_sync,
+            broadcast_round=hop.round_idx,
+            broadcast_round_destinations=round_dests_by_sender.get(s, []),
         )
         task = asyncio.create_task(_run_single_transfer(s, dst_unit, sub_plan))
         transfers_in_progress[task] = hop
 
+    src_units = set(g.src_unit for g in groups)
     try:
       while any(ready_queue.values()) or transfers_in_progress:
         while True:
           scheduled_any = False
           for u in all_workers:
-            while active_pushes[u] < fanout_k and ready_queue[u]:
+            max_active = n_seed if u in src_units else 1
+            while active_pushes[u] < max_active and ready_queue[u]:
               hop = ready_queue[u].popleft()
               _dispatch_hop(hop)
               scheduled_any = True
@@ -937,7 +1022,7 @@ class BroadcastEngine:
       self,
       keys_and_targets: list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]],
       final_plan: Any,
-      fanout_k: int,
+      n_seed: int,
       req_id: str,
       dst_mem_type: int,
       registered_shards: dict[RaidenId, list[str]],
@@ -948,7 +1033,7 @@ class BroadcastEngine:
     await self.execute_slice_broadcast_pipeline(
         groups_list=[keys_and_targets],
         final_plan=final_plan,
-        fanout_k=fanout_k,
+        n_seed=n_seed,
         req_id=req_id,
         dst_mem_type=dst_mem_type,
         registered_shards=registered_shards,

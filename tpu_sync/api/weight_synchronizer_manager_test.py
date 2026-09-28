@@ -33,7 +33,7 @@ class WeightSynchronizerManagerTest(absltest.TestCase):
     manager = weight_synchronizer_manager.WeightSynchronizerManager(
         port=0,
         worker_rpc_client=dummy_client,
-        broadcast_k=32,
+        broadcast_host_ratio=1.0,
         enable_plan_cache=True,
     )
 

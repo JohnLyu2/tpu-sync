@@ -63,16 +63,16 @@ class BroadcastEngineTest(absltest.TestCase):
     groups = {key1: targets1, key2: targets2}
     direct, bcast = (
         broadcast_engine.BroadcastEngine.partition_direct_and_broadcast_groups(
-            groups, broadcast_k=1
+            groups, n_seed=1
         )
     )
     self.assertIn(src, direct)
     self.assertLen(bcast, 1)
 
   def test_execute_slice_broadcast_multihop(self) -> None:
-    """Verifies multi-hop fanout execution with fanout_k=1, 2, 4 and node promotion."""
-    for fanout_k in (1, 2, 4):
-      with self.subTest(fanout_k=fanout_k):
+    """Verifies multi-hop fanout execution with n_seed=1, 2, 4 and node promotion."""
+    for n_seed in (1, 2, 4):
+      with self.subTest(n_seed=n_seed):
         rpc_client = RecordingWorkerRpcClient()
         self.addCleanup(rpc_client.close)
         engine = broadcast_engine.BroadcastEngine(rpc_client)
@@ -102,7 +102,7 @@ class BroadcastEngineTest(absltest.TestCase):
             engine.execute_slice_broadcast(
                 keys_and_targets=[(key, targets)],
                 final_plan=final_plan,
-                fanout_k=fanout_k,
+                n_seed=n_seed,
                 req_id="req_test",
                 dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
                 registered_shards=registered_shards,
@@ -188,7 +188,7 @@ class BroadcastEngineTest(absltest.TestCase):
         engine.execute_slice_broadcast_pipeline(
             groups_list=[[(key0, targets0)], [(key1, targets1)]],
             final_plan=final_plan,
-            fanout_k=2,
+            n_seed=2,
             req_id="req_pipeline_test",
             dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
             registered_shards=registered_shards,
@@ -213,13 +213,13 @@ class BroadcastEngineTest(absltest.TestCase):
     self.assertLen(
         g0_src_pushes,
         2,
-        "Source must dispatch exactly fanout_k=2 copies for Group 0, got"
+        "Source must dispatch exactly n_seed=2 copies for Group 0, got"
         f" {len(g0_src_pushes)}",
     )
     self.assertLen(
         g1_src_pushes,
         2,
-        "Source must dispatch exactly fanout_k=2 copies for Group 1, got"
+        "Source must dispatch exactly n_seed=2 copies for Group 1, got"
         f" {len(g1_src_pushes)}",
     )
     self.assertLen(
@@ -495,7 +495,7 @@ class BroadcastEngineTest(absltest.TestCase):
           engine.execute_slice_broadcast_pipeline(
               groups_list=[[(key0, targets0)]],
               final_plan=final_plan,
-              fanout_k=2,
+              n_seed=2,
               req_id="req_failure_test",
               dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
               registered_shards=registered_shards,
@@ -507,8 +507,8 @@ class BroadcastEngineTest(absltest.TestCase):
         "Sibling transfer task must be cancelled when one hop fails.",
     )
 
-  def test_execute_slice_broadcast_pipeline_invalid_fanout(self) -> None:
-    """Verifies ValueError is raised when fanout_k <= 0."""
+  def test_execute_slice_broadcast_pipeline_invalid_seed(self) -> None:
+    """Verifies ValueError is raised when n_seed <= 0."""
     src = RaidenId(job_name="src", job_replica_id="0", data_name="w")
     dst0 = RaidenId(job_name="dst", job_replica_id="0", data_name="w")
     rpc_client = raiden_controller.WeightSyncWorkerRpcClient()
@@ -528,14 +528,14 @@ class BroadcastEngineTest(absltest.TestCase):
     )
     registered_shards = {src: ["s0"], dst0: ["s0"]}
 
-    for invalid_k in (0, -1):
-      with self.assertRaisesRegex(ValueError, "fanout_k must be >= 1"):
+    for invalid_seed in (0, -1):
+      with self.assertRaisesRegex(ValueError, "n_seed must be >= 1"):
         asyncio.run(
             engine.execute_slice_broadcast_pipeline(
                 groups_list=[[(key0, targets0)]],
                 final_plan=final_plan,
-                fanout_k=invalid_k,
-                req_id="req_invalid_k",
+                n_seed=invalid_seed,
+                req_id="req_invalid_seed",
                 dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
                 registered_shards=registered_shards,
             )
@@ -583,7 +583,7 @@ class BroadcastEngineTest(absltest.TestCase):
         engine.execute_slice_broadcast(
             keys_and_targets=[(key0, targets0), (key1, targets1)],
             final_plan=final_plan,
-            fanout_k=1,
+            n_seed=1,
             req_id="req_multishard_test",
             dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
             registered_shards=registered_shards,
@@ -690,7 +690,7 @@ class BroadcastEngineTest(absltest.TestCase):
                 (key1_b, targets1_b),
             ],
             final_plan=final_plan,
-            fanout_k=1,
+            n_seed=1,
             req_id="req_coalesce_test",
             dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
             registered_shards=registered_shards,
@@ -777,7 +777,7 @@ class BroadcastEngineTest(absltest.TestCase):
         engine.execute_slice_broadcast_pipeline(
             groups_list=[stage_group],
             final_plan=final_plan,
-            fanout_k=2,
+            n_seed=2,
             req_id="req_stage_relay_test",
             dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
             registered_shards={
@@ -798,8 +798,8 @@ class BroadcastEngineTest(absltest.TestCase):
       self.assertEqual(seed_receiver_calls[0].expected_block_count, 2)
 
     # 2. Verify Sampler -> Sampler Relay transfers
-    # With fanout_k=2 and 4 samplers:
-    # dst_units[0] relays to dst_units[2], dst_units[1] relays to dst_units[3].
+    # With n_seed=2 and 4 samplers:
+    # dst_units[0] and dst_units[1] relay to dst_units[2] and dst_units[3].
     relay_sender_calls = [
         plan
         for target_id, plan in rpc_client.invocations
@@ -842,6 +842,111 @@ class BroadcastEngineTest(absltest.TestCase):
         if target_id == plan.dst_units[0] and target_id in dst_units
     }
     self.assertEqual(receivers, set(dst_units))
+
+  def test_all_source_binomial_tree_population_and_destinations(self) -> None:
+    """Verifies population counts across rounds and round-grouped destination logging."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    # 7 samplers with n_seed=1 -> Round 0: 1, Round 1: 3, Round 2: 7
+    dsts = [
+        RaidenId(job_name="sampler", job_replica_id=str(i), data_name="w")
+        for i in range(7)
+    ]
+
+    key = (src, 0, 0, 0, 1024, 0, 1, 0, 0)
+    targets = [(dsts[i], f"127.0.0.1:800{i}", 0, 0, 0, 0) for i in range(7)]
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=dsts,
+        plan=None,
+        worker_data_addresses={
+            u: [f"127.0.0.1:800{i}"] for i, u in enumerate([src] + dsts)
+        },
+    )
+    registered_shards = {u: ["s0"] for u in [src] + dsts}
+
+    asyncio.run(
+        engine.execute_slice_broadcast(
+            keys_and_targets=[(key, targets)],
+            final_plan=final_plan,
+            n_seed=1,
+            req_id="req_tree_audit",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+        )
+    )
+
+    # Verify all 7 destinations received the transfer
+    dst_received = {
+        plan.dst_units[0]
+        for target_id, plan in rpc_client.invocations
+        if target_id == plan.dst_units[0]
+    }
+    self.assertEqual(dst_received, set(dsts))
+
+    # Verify every dispatched sub_plan has broadcast_round and broadcast_round_destinations
+    for target_id, plan in rpc_client.invocations:
+      self.assertIsNotNone(plan.broadcast_round)
+      self.assertIn(plan.broadcast_round, (0, 1, 2))
+      self.assertNotEmpty(plan.broadcast_round_destinations)
+      for rd in plan.broadcast_round_destinations:
+        self.assertGreaterEqual(rd.round_idx, 0)
+        self.assertNotEmpty(rd.dst_units)
+        self.assertNotEmpty(rd.dst_peers)
+
+  def test_all_source_binomial_tree_newest_first_partial_round(self) -> None:
+    """Verifies newest-first parent assignment on partial final rounds (N=5, n_seed=1)."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    dsts = [
+        RaidenId(job_name="sampler", job_replica_id=str(i), data_name="w")
+        for i in range(5)
+    ]
+
+    key = (src, 0, 0, 0, 1024, 0, 1, 0, 0)
+    targets = [(dsts[i], f"127.0.0.1:800{i}", 0, 0, 0, 0) for i in range(5)]
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=dsts,
+        plan=None,
+        worker_data_addresses={
+            u: [f"127.0.0.1:800{i}"] for i, u in enumerate([src] + dsts)
+        },
+    )
+    registered_shards = {u: ["s0"] for u in [src] + dsts}
+
+    asyncio.run(
+        engine.execute_slice_broadcast(
+            keys_and_targets=[(key, targets)],
+            final_plan=final_plan,
+            n_seed=1,
+            req_id="req_partial_audit",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+        )
+    )
+
+    receiver_to_sender = {}
+    for target_id, plan in rpc_client.invocations:
+      if plan.is_sender:
+        receiver_to_sender[plan.dst_units[0]] = plan.src_units[0]
+
+    # Round 0: Trainer -> dsts[0]
+    self.assertEqual(receiver_to_sender[dsts[0]], src)
+    # Round 1: dsts[0] -> dsts[1], Trainer -> dsts[2]
+    self.assertEqual(receiver_to_sender[dsts[1]], dsts[0])
+    self.assertEqual(receiver_to_sender[dsts[2]], src)
+    # Round 2: Newest first: dsts[2] -> dsts[3], dsts[1] -> dsts[4]
+    self.assertEqual(receiver_to_sender[dsts[3]], dsts[2])
+    self.assertEqual(receiver_to_sender[dsts[4]], dsts[1])
 
 
 if __name__ == "__main__":

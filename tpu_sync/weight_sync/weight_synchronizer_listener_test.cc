@@ -289,6 +289,60 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
   close(sock);
 }
 
+TEST(WeightSynchronizerListenerTest,
+     ExecuteControlRequestBroadcastRoundDestinationsLogging) {
+  WeightSynchronizerBase engine(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+
+  StartTransferRequest* start_req = req.mutable_start_transfer_request();
+  start_req->set_is_sender(false);
+  start_req->set_req_id("test_bcast_dest_req");
+  start_req->set_uuid(8888);
+  start_req->set_broadcast_round(0);
+  start_req->set_expected_block_count(1);
+
+  auto* src_unit = start_req->add_src_units();
+  src_unit->set_job_name("trainer");
+  src_unit->set_job_replica_id("0");
+  src_unit->set_data_name("weights_0");
+
+  // Round 0: single destination unit with 1 peer.
+  auto* rd0 = start_req->add_broadcast_round_destinations();
+  rd0->set_round_idx(0);
+  rd0->add_dst_units("sampler:0");
+  rd0->add_dst_peers("10.0.0.1:8000");
+
+  // Round 1: multi-host unit with 1 unit and 2 peers (verifying refined
+  // formatting).
+  auto* rd1 = start_req->add_broadcast_round_destinations();
+  rd1->set_round_idx(1);
+  rd1->add_dst_units("sampler:1");
+  rd1->add_dst_peers("10.0.0.2:8000");
+  rd1->add_dst_peers("10.0.0.3:8000");
+
+  // Round 2: 1-to-1 paired units and peers.
+  auto* rd2 = start_req->add_broadcast_round_destinations();
+  rd2->set_round_idx(2);
+  rd2->add_dst_units("sampler:2");
+  rd2->add_dst_units("sampler:3");
+  rd2->add_dst_peers("10.0.0.4:8000");
+  rd2->add_dst_peers("10.0.0.5:8000");
+
+  ControlResponse resp;
+  WeightSynchronizerListener::ExecuteControlRequest(&engine, req, &resp,
+                                                    []() {});
+
+  EXPECT_TRUE(resp.success());
+  EXPECT_EQ(resp.message(), "SUCCESS");
+  EXPECT_EQ(start_req->broadcast_round(), 0);
+  EXPECT_EQ(start_req->broadcast_round_destinations_size(), 3);
+}
+
 }  // namespace
 }  // namespace weight_sync
 }  // namespace tpu_raiden

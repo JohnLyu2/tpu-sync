@@ -14,6 +14,7 @@
 
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -27,6 +28,8 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
@@ -95,9 +98,58 @@ void WeightSynchronizerListener::ExecuteControlRequest(
     bool is_sender = true;
     bool is_resharded = false;
     if (req.has_start_transfer_request()) {
-      is_sender = req.start_transfer_request().is_sender();
-      is_resharded =
-          !req.start_transfer_request().shard_push_schedules().empty();
+      const auto& start_req = req.start_transfer_request();
+      is_sender = start_req.is_sender();
+      is_resharded = !start_req.shard_push_schedules().empty();
+
+      if (start_req.broadcast_round_destinations_size() > 0 ||
+          start_req.has_broadcast_round()) {
+        std::string src_unit_str =
+            start_req.src_units().empty()
+                ? "unknown"
+                : absl::StrCat(start_req.src_units(0).job_name(), ":",
+                               start_req.src_units(0).job_replica_id());
+        std::string round_str = start_req.has_broadcast_round()
+                                    ? absl::StrCat(start_req.broadcast_round())
+                                    : "none";
+        std::vector<std::string> round_summaries;
+        round_summaries.reserve(start_req.broadcast_round_destinations_size());
+        for (const auto& rd : start_req.broadcast_round_destinations()) {
+          std::vector<std::string> dest_entries;
+          if (rd.dst_units_size() == 1 && rd.dst_peers_size() > 1) {
+            dest_entries.reserve(rd.dst_peers_size());
+            std::string u = rd.dst_units(0);
+            for (const auto& p : rd.dst_peers()) {
+              dest_entries.push_back(absl::StrCat(u, " (", p, ")"));
+            }
+          } else {
+            int count = std::max(rd.dst_units_size(), rd.dst_peers_size());
+            dest_entries.reserve(count);
+            for (int i = 0; i < count; ++i) {
+              std::string u = (i < rd.dst_units_size()) ? rd.dst_units(i) : "";
+              std::string p = (i < rd.dst_peers_size()) ? rd.dst_peers(i) : "";
+              if (!u.empty() && !p.empty()) {
+                dest_entries.push_back(absl::StrCat(u, " (", p, ")"));
+              } else if (!u.empty()) {
+                dest_entries.push_back(u);
+              } else if (!p.empty()) {
+                dest_entries.push_back(p);
+              }
+            }
+          }
+          round_summaries.push_back(
+              absl::StrCat("Round ", rd.round_idx(), ": [",
+                           absl::StrJoin(dest_entries, ", "), "]"));
+        }
+        std::string schedule_summary =
+            round_summaries.empty() ? "none"
+                                    : absl::StrJoin(round_summaries, ", ");
+        LOG(INFO) << "WeightSynchronizerListener [src_unit=" << src_unit_str
+                  << ", req_id=" << start_req.req_id()
+                  << ", uuid=" << start_req.uuid()
+                  << ", active_round=" << round_str
+                  << "] broadcast round destinations: " << schedule_summary;
+      }
     }
 
     if (is_sender) {

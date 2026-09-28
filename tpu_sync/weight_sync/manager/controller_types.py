@@ -235,6 +235,16 @@ class _CachedTransferSchedule:
   canonical_relay_plans: dict[int, dict[int, list[tuple[int, int, int]]]] = (
       dataclasses.field(default_factory=dict)
   )
+  n_seed: int = 1
+
+
+@dataclasses.dataclass
+class BroadcastRoundDestinations:
+  """Destinations grouped by broadcast round for audit and native logging."""
+
+  round_idx: int
+  dst_units: list[str] = dataclasses.field(default_factory=list)
+  dst_peers: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -338,6 +348,10 @@ class TransferPlan:
   )
   variable_to_plan_id: dict[RaidenId, dict[int, int]] = dataclasses.field(
       default_factory=dict, repr=False, compare=False
+  )
+  broadcast_round: Optional[int] = None
+  broadcast_round_destinations: list[Any] = dataclasses.field(
+      default_factory=list
   )
 
 

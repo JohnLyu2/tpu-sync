@@ -113,7 +113,7 @@ class RaidenController:
       port: int,
       worker_rpc_client: Optional[WorkerRpcClient] = None,
       request_registry_ttl_s: float = 600.0,
-      broadcast_k: Optional[int] = None,
+      broadcast_host_ratio: Optional[float] = None,
       enable_plan_cache: bool = True,
   ):
     """Initializes the RaidenController.
@@ -123,16 +123,23 @@ class RaidenController:
       worker_rpc_client: Optional legacy worker RPC client override wrapped into
         managed JobEntity instances for backward compatibility.
       request_registry_ttl_s: TTL in seconds for request registry entries.
-      broadcast_k: Fan-out factor K for tree-based broadcast transfers.
+      broadcast_host_ratio: Ratio of trainer TX host bandwidth to sampler RX
+        host bandwidth (K0 = B_train_TX / B_sample_RX). A value of 0.0 disables
+        tree broadcast and forces Direct P2P.
       enable_plan_cache: Whether to cache transfer planning and resharding
         schedules across transfer invocations with identical topologies.
     """
     self.port = port
-    self.broadcast_k = (
-        broadcast_k
-        if broadcast_k is not None
-        else int(os.environ.get("RAIDEN_BROADCAST_K", "64"))
+    raw_ratio = (
+        broadcast_host_ratio
+        if broadcast_host_ratio is not None
+        else float(os.environ.get("RAIDEN_BROADCAST_HOST_RATIO", "1.0"))
     )
+    if raw_ratio < 0.0:
+      raise ValueError(
+          f"broadcast_host_ratio must be non-negative, got {raw_ratio}"
+      )
+    self.broadcast_host_ratio = float(raw_ratio)
     self.enable_plan_cache = enable_plan_cache
     self._plan_cache: dict[Any, _CachedTransferSchedule] = {}
     self._active_transfers: dict[str, TransferPlan] = {}
@@ -629,17 +636,22 @@ class RaidenController:
     with self._lock:
       return len(self._plan_cache)
 
-  @classmethod
   def _make_plan_cache_key(
-      cls,
+      self,
       src_units: list[RaidenId],
       dst_units: list[RaidenId],
       group_size: int = 1,
       skip_tiling: Optional[dict[int, bool]] = None,
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      broadcast_host_ratio: Optional[float] = None,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
+    ratio = (
+        broadcast_host_ratio
+        if broadcast_host_ratio is not None
+        else self.broadcast_host_ratio
+    )
     return ReshardPlanner.make_plan_cache_key(
         src_units=src_units,
         dst_units=dst_units,
@@ -647,6 +659,7 @@ class RaidenController:
         skip_tiling=skip_tiling,
         dst_controller_address=dst_controller_address,
         src_controller_address=src_controller_address,
+        broadcast_host_ratio=ratio,
     )
 
   async def warmup_transfer_plan(
@@ -738,7 +751,7 @@ class RaidenController:
         registered_shards=self._registered_shards,
         computed_phys_meshes=self._computed_phys_meshes,
         worker_endpoints=worker_endpoints,
-        broadcast_k=self.broadcast_k,
+        broadcast_host_ratio=self.broadcast_host_ratio,
         lock=self._lock,
         group_size=group_size,
         skip_tiling=skip_tiling,
@@ -857,7 +870,7 @@ class RaidenController:
       self,
       keys_and_targets: list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]],
       final_plan: TransferPlan,
-      fanout_k: int,
+      n_seed: int,
       req_id: str,
       dst_mem_type: int,
       dst_controller_address: Optional[str],
@@ -867,7 +880,7 @@ class RaidenController:
     await self._broadcast_engine.execute_slice_broadcast(
         keys_and_targets=keys_and_targets,
         final_plan=final_plan,
-        fanout_k=fanout_k,
+        n_seed=n_seed,
         req_id=req_id,
         dst_mem_type=dst_mem_type,
         registered_shards=self._registered_shards,
@@ -879,7 +892,7 @@ class RaidenController:
       self,
       groups_list: list[list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]]],
       final_plan: TransferPlan,
-      fanout_k: int,
+      n_seed: int,
       req_id: str,
       dst_mem_type: int,
       dst_controller_address: Optional[str],
@@ -891,7 +904,7 @@ class RaidenController:
       groups_list: List of transfer groups, where each group is a list of (key,
         targets) slice tuples.
       final_plan: TransferPlan containing metadata and worker addresses.
-      fanout_k: Maximum fan-out factor for the broadcast tree.
+      n_seed: Number of seed samplers for bandwidth-matched tree broadcast.
       req_id: Identifier for the transfer request.
       dst_mem_type: Destination memory type enum or integer.
       dst_controller_address: Optional address of remote destination controller.
@@ -900,7 +913,7 @@ class RaidenController:
     await self._broadcast_engine.execute_slice_broadcast_pipeline(
         groups_list=groups_list,
         final_plan=final_plan,
-        fanout_k=fanout_k,
+        n_seed=n_seed,
         req_id=req_id,
         dst_mem_type=dst_mem_type,
         registered_shards=self._registered_shards,
@@ -1243,6 +1256,22 @@ class RaidenController:
 
           direct_plan = None
           if direct_schedules:
+            direct_dst_peers = []
+            direct_dst_units = []
+            for sched in direct_schedules.values():
+              for entries in sched.values():
+                for entry in entries:
+                  if entry[0] and entry[0] not in direct_dst_peers:
+                    direct_dst_peers.append(entry[0])
+                    if entry[0] not in cached_schedule.data_address_to_unit:
+                      raise KeyError(
+                          f"Destination peer endpoint '{entry[0]}' not found in"
+                          " data_address_to_unit"
+                      )
+                    direct_dst_units.append(
+                        str(cached_schedule.data_address_to_unit[entry[0]])
+                    )
+
             direct_plan = TransferPlan(
                 src_units=list(direct_schedules.keys()),
                 dst_units=dst_units,
@@ -1277,6 +1306,18 @@ class RaidenController:
                 ),
                 variable_plans=cached_schedule.variable_plans,
                 variable_to_plan_id=cached_schedule.variable_to_plan_id,
+                broadcast_round=0,
+                broadcast_round_destinations=[
+                    controller_types.BroadcastRoundDestinations(
+                        round_idx=0,
+                        dst_units=(
+                            direct_dst_units
+                            if direct_dst_units
+                            else [str(u) for u in dst_units]
+                        ),
+                        dst_peers=direct_dst_peers,
+                    )
+                ],
             )
 
           # 1. Arm direct schedule receivers
@@ -1381,7 +1422,7 @@ class RaidenController:
                 self._execute_slice_broadcast_pipeline(
                     groups_list=groups_list,
                     final_plan=final_plan,
-                    fanout_k=self.broadcast_k,
+                    n_seed=cached_schedule.n_seed,
                     req_id=req_id,
                     dst_mem_type=dst_mem_type,
                     dst_controller_address=dst_controller_address,

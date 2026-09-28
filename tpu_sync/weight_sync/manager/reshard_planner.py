@@ -646,8 +646,68 @@ def generate_strided_copy_chunks_tile_aware(
   return [(src_offset, dst_offset, size_bytes, src_stride, dst_stride, count)]
 
 
+def compute_bandwidth_matched_seed(
+    broadcast_host_ratio: float,
+    num_src_hosts: int,
+    num_dst_hosts_per_unit: int,
+    num_dst_units: int,
+) -> int:
+  """Computes bandwidth-matched seed sampler count N_seed.
+
+  Args:
+    broadcast_host_ratio: Ratio of trainer TX host bandwidth to sampler RX host
+      bandwidth (K0 = B_train_TX / B_sample_RX). A value of 0.0 disables tree
+      broadcast and forces Direct P2P.
+    num_src_hosts: Number of trainer host endpoints (H_train).
+    num_dst_hosts_per_unit: Number of sampler host endpoints per unit
+      (H_sample).
+    num_dst_units: Number of destination sampler units (N_samplers).
+
+  Returns:
+    N_seed: Number of seed samplers to populate directly in Round 0.
+  """
+  if broadcast_host_ratio < 0.0:
+    raise ValueError(
+        f"broadcast_host_ratio must be non-negative, got {broadcast_host_ratio}"
+    )
+  if num_src_hosts <= 0:
+    raise ValueError(f"num_src_hosts must be positive, got {num_src_hosts}")
+  if num_dst_hosts_per_unit <= 0:
+    raise ValueError(
+        f"num_dst_hosts_per_unit must be positive, got {num_dst_hosts_per_unit}"
+    )
+  if num_dst_units < 0:
+    raise ValueError(f"num_dst_units must be non-negative, got {num_dst_units}")
+  if broadcast_host_ratio == 0.0:
+    return max(1, num_dst_units)
+  return max(
+      1,
+      int(
+          math.floor(
+              broadcast_host_ratio * (num_src_hosts / num_dst_hosts_per_unit)
+          )
+      ),
+  )
+
+
 class ReshardPlanner:
   """Computes resharding schedules across registered source and destination JobEntities."""
+
+  @classmethod
+  def compute_bandwidth_matched_seed(
+      cls,
+      broadcast_host_ratio: float,
+      num_src_hosts: int,
+      num_dst_hosts_per_unit: int,
+      num_dst_units: int,
+  ) -> int:
+    del cls
+    return compute_bandwidth_matched_seed(
+        broadcast_host_ratio=broadcast_host_ratio,
+        num_src_hosts=num_src_hosts,
+        num_dst_hosts_per_unit=num_dst_hosts_per_unit,
+        num_dst_units=num_dst_units,
+    )
 
   @classmethod
   def make_plan_cache_key(
@@ -658,6 +718,7 @@ class ReshardPlanner:
       skip_tiling: Optional[dict[int, bool]] = None,
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      broadcast_host_ratio: float = 1.0,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
     del cls
@@ -670,6 +731,7 @@ class ReshardPlanner:
         tuple(sorted(skip_tiling.items())) if skip_tiling is not None else None,
         dst_controller_address,
         src_controller_address,
+        float(broadcast_host_ratio),
     )
 
   @classmethod
@@ -717,7 +779,7 @@ class ReshardPlanner:
       registered_shards: Mapping[RaidenId, list[str]],
       computed_phys_meshes: dict[RaidenId, list[int]],
       worker_endpoints: dict[RaidenId, str],
-      broadcast_k: int,
+      broadcast_host_ratio: float,
       lock: threading.Lock,
       group_size: int = 1,
       skip_tiling: Optional[dict[int, bool]] = None,
@@ -748,7 +810,35 @@ class ReshardPlanner:
 
     variable_plans = {}
     variable_to_plan_id = {}
+    canonical_relay_plans = {}
     local_skip_tiling = dict(skip_tiling) if skip_tiling else {}
+
+    if not src_units:
+      raise ValueError("src_units must not be empty")
+    num_src_hosts = sum(len(resolve_shards_locked(u)) for u in src_units)
+
+    if dst_metadata:
+      if dst_metadata[0].shards:
+        dst_shards_0 = list(dst_metadata[0].shards)
+      else:
+        dst_shards_0 = resolve_shards_locked(
+            _raiden_id_from_proto(dst_metadata[0].unit)
+        )
+      num_dst_units = len(dst_metadata)
+    elif dst_units:
+      dst_shards_0 = resolve_shards_locked(dst_units[0])
+      num_dst_units = len(dst_units)
+    else:
+      raise ValueError("dst_metadata or dst_units must not be empty")
+    num_dst_hosts_per_unit = len(dst_shards_0)
+
+    n_seed = compute_bandwidth_matched_seed(
+        broadcast_host_ratio=broadcast_host_ratio,
+        num_src_hosts=num_src_hosts,
+        num_dst_hosts_per_unit=num_dst_hosts_per_unit,
+        num_dst_units=num_dst_units,
+    )
+
     if shard_push_schedules:
       logging.info("Using pre-computed shard_push_schedules")
       computed_schedules = shard_push_schedules
@@ -1089,8 +1179,8 @@ class ReshardPlanner:
       dst_units_index = {u: i for i, u in enumerate(dst_units)}
 
       # Track direct block counts during template expansion when tree broadcast
-      # cannot be triggered (len(dst_meta_info) <= max(1, broadcast_k)).
-      can_fast_path_direct = len(dst_meta_info) <= max(1, broadcast_k)
+      # cannot be triggered (len(dst_meta_info) <= n_seed).
+      can_fast_path_direct = len(dst_meta_info) <= n_seed
       fast_dst_unit_counts = {}
       fast_dst_unit_layer_counts = {}
       fast_dst_endpoint_counts = {}
@@ -1896,7 +1986,7 @@ class ReshardPlanner:
 
       direct_schedules, broadcast_groups = (
           BroadcastEngine.partition_direct_and_broadcast_groups(
-              groups, broadcast_k, group_size
+              groups, n_seed, group_size
           )
       )
 
@@ -1973,4 +2063,5 @@ class ReshardPlanner:
         variable_plans=variable_plans,
         variable_to_plan_id=variable_to_plan_id,
         canonical_relay_plans=canonical_relay_plans,
+        n_seed=n_seed,
     )

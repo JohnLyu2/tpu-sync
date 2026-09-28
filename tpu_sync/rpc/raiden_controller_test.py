@@ -15,6 +15,7 @@
 """Tests for Raiden Controller high-level transfer API under rpc/."""
 
 import asyncio
+import dataclasses
 import math
 import os
 import socket
@@ -551,7 +552,7 @@ class RaidenControllerTest(absltest.TestCase):
     controller = raiden_controller.RaidenController(
         port=10004, worker_rpc_client=mock_client
     )
-    controller.broadcast_k = 2
+    controller.broadcast_host_ratio = 2.0
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -626,7 +627,7 @@ class RaidenControllerTest(absltest.TestCase):
     controller = raiden_controller.RaidenController(
         port=10005, worker_rpc_client=mock_client
     )
-    controller.broadcast_k = 2
+    controller.broadcast_host_ratio = 2.0
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -888,7 +889,7 @@ class RaidenControllerTest(absltest.TestCase):
     controller = raiden_controller.RaidenController(
         port=10004, worker_rpc_client=client
     )
-    controller.broadcast_k = 2
+    controller.broadcast_host_ratio = 2.0
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -957,7 +958,7 @@ class RaidenControllerTest(absltest.TestCase):
     controller = raiden_controller.RaidenController(
         port=10004, worker_rpc_client=client
     )
-    controller.broadcast_k = 2
+    controller.broadcast_host_ratio = 2.0
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -2233,7 +2234,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
     controller = raiden_controller.RaidenController(
         port=10005, worker_rpc_client=client
     )
-    controller.broadcast_k = 1
+    controller.broadcast_host_ratio = 1.0
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -2328,7 +2329,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         if call[0] == target_1 and "_d2h_" not in call[1].req_id
     ]
 
-    # Under tree broadcast with broadcast_k=1 and StageBroadcastGroup,
+    # Under tree broadcast with broadcast_host_ratio=1.0 and StageBroadcastGroup,
     # stages are grouped across all trainer shards (2 stages for 4 variables with group_size=2).
     # src sends to target_0 (2 calls), target_0 relays to target_1 (2 receiver + 2 sender = 4 calls),
     # and target_1 receives from target_0 (2 calls).
@@ -4008,7 +4009,9 @@ class RaidenPlanWarmupTest(absltest.TestCase):
       self.assertEqual(list(proto.host_subgrid), [2, 2])
 
   def test_qwen_norm_scale_schedule(self):
-    controller = raiden_controller.RaidenController(port=10100)
+    controller = raiden_controller.RaidenController(
+        port=10100, broadcast_host_ratio=0.0
+    )
     src_units = [
         raiden_controller.RaidenId("pathways_trainer", str(i), "weights")
         for i in range(16)
@@ -5394,6 +5397,69 @@ class SenderScheduleSlicingAndPayloadCachingTest(absltest.TestCase):
       self.assertEqual(owned, {3, 7})
     finally:
       client.close()
+
+  def test_start_transfer_direct_plan_broadcast_round_destinations_and_missing_key(
+      self,
+  ):
+    client = RecordingWorkerRpcClient()
+    self.addCleanup(client.close)
+    controller = raiden_controller.RaidenController(
+        port=0,
+        worker_rpc_client=client,
+        broadcast_host_ratio=0.0,
+    )
+    src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    dst_unit = raiden_controller.RaidenId("sampler", "0", "weights", 0)
+    var = raiden_service_pb2.VariableMetadataProto(
+        name="weights_0",
+        shape=[128, 1024],
+        mesh_shape=[1, 1],
+        layout=[0, 1],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[0],
+    )
+    controller.register_work_unit(src_unit, ["10.0.0.1:8000"], variables=[var])
+    controller.register_work_unit(dst_unit, ["10.0.0.2:8000"], variables=[var])
+
+    future = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+    )
+    asyncio.run(future.wait())
+    self.assertTrue(future.done())
+
+    dispatched_plans = [plan for tid, plan in client.calls if tid == src_unit]
+    self.assertNotEmpty(dispatched_plans)
+    direct_plan = dispatched_plans[0]
+    self.assertEqual(direct_plan.broadcast_round, 0)
+    self.assertNotEmpty(direct_plan.broadcast_round_destinations)
+    rd = direct_plan.broadcast_round_destinations[0]
+    self.assertEqual(rd.round_idx, 0)
+    self.assertIn("10.0.0.2:8000", rd.dst_peers)
+    self.assertIn(str(dst_unit), rd.dst_units)
+
+    original_compute = controller._compute_transfer_schedule
+
+    async def mock_compute(*args, **kwargs):
+      sched = await original_compute(*args, **kwargs)
+      return dataclasses.replace(sched, data_address_to_unit={})
+
+    controller._compute_transfer_schedule = mock_compute
+    controller._plan_cache.clear()
+
+    future2 = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+    )
+    with self.assertRaisesRegex(
+        KeyError,
+        "Destination peer endpoint '10.0.0.2:8000' not found in"
+        " data_address_to_unit",
+    ):
+      asyncio.run(future2.wait())
 
 
 class JobEntityTest(absltest.TestCase):
