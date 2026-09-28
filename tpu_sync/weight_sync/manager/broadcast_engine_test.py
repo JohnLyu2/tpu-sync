@@ -1222,6 +1222,93 @@ class BroadcastEngineTest(absltest.TestCase):
           )
       )
 
+  def test_execute_slice_broadcast_multistage_tree_propagates_parallelism(
+      self,
+  ) -> None:
+    """Verifies that all sender hop plans in a multi-stage tree inherit parallelism."""
+    for expected_parallelism in (4, 0):
+      with self.subTest(parallelism=expected_parallelism):
+        rpc_client = RecordingWorkerRpcClient()
+        self.addCleanup(rpc_client.close)
+        engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+        src = RaidenId(job_name="src", job_replica_id="0", data_name="w")
+        relay = RaidenId(job_name="relay", job_replica_id="0", data_name="w")
+        dst = RaidenId(job_name="dst", job_replica_id="0", data_name="w")
+
+        key0 = (src, 0, 0, 0, 1024, 0, 1, 0, 0)
+        key1 = (src, 0, 1, 0, 1024, 0, 1, 0, 0)
+        targets0: list[tuple[Any, ...]] = [
+            (relay, "127.0.0.1:8001", 0, 0, 0, 0),
+            (dst, "127.0.0.1:8002", 0, 0, 0, 0),
+        ]
+        targets1: list[tuple[Any, ...]] = [
+            (relay, "127.0.0.1:8001", 1, 1, 0, 0),
+            (dst, "127.0.0.1:8002", 1, 1, 0, 0),
+        ]
+
+        final_plan = raiden_controller.TransferPlan(
+            src_units=[src],
+            dst_units=[relay, dst],
+            plan=None,
+            worker_data_addresses={
+                src: ["127.0.0.1:8000"],
+                relay: ["127.0.0.1:8001"],
+                dst: ["127.0.0.1:8002"],
+            },
+            is_weight_sync=True,
+            parallelism=expected_parallelism,
+            uuid=101,
+        )
+        registered_shards = {
+            src: ["s0"],
+            relay: ["s0", "s1"],
+            dst: ["s0", "s1"],
+        }
+
+        asyncio.run(
+            engine.execute_slice_broadcast(
+                keys_and_targets=[(key0, targets0), (key1, targets1)],
+                final_plan=final_plan,
+                n_seed=1,
+                req_id=f"req_parallelism_{expected_parallelism}",
+                dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+                registered_shards=registered_shards,
+            )
+        )
+
+        seed_sender_plans = [
+            plan
+            for target_id, plan in rpc_client.invocations
+            if target_id == src and plan.src_units[0] == src and plan.is_sender
+        ]
+        relay_sender_plans = [
+            plan
+            for target_id, plan in rpc_client.invocations
+            if target_id == relay
+            and plan.src_units[0] == relay
+            and plan.is_sender
+        ]
+
+        self.assertNotEmpty(seed_sender_plans)
+        self.assertNotEmpty(relay_sender_plans)
+
+        for plan in seed_sender_plans:
+          self.assertEqual(
+              plan.parallelism,
+              expected_parallelism,
+              "Seed sender hop plan must carry"
+              f" parallelism={expected_parallelism}",
+          )
+
+        for plan in relay_sender_plans:
+          self.assertEqual(
+              plan.parallelism,
+              expected_parallelism,
+              "Relay sender hop plan must carry"
+              f" parallelism={expected_parallelism}",
+          )
+
 
 if __name__ == "__main__":
   absltest.main()
