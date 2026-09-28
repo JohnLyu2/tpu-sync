@@ -42,9 +42,10 @@
 
 namespace tpu_raiden::telemetry {
 
-namespace {
-
 std::optional<std::string> ResolveEnvVar(const char* env_var) {
+  if (env_var == nullptr) {
+    return std::nullopt;
+  }
   const char* value = std::getenv(env_var);
   if (value != nullptr && *value != '\0') {
     absl::string_view trimmed = absl::StripAsciiWhitespace(value);
@@ -54,6 +55,8 @@ std::optional<std::string> ResolveEnvVar(const char* env_var) {
   }
   return std::nullopt;
 }
+
+namespace {
 
 int ResolveExporterPort() {
   if (std::optional<std::string> port_str =
@@ -74,9 +77,8 @@ int ResolveExporterPort() {
 
 std::string ResolveEnvVar(const char* env_var,
                           absl::string_view default_value) {
-  return ResolveEnvVar(env_var).value_or(std::string(default_value));
+  return telemetry::ResolveEnvVar(env_var).value_or(std::string(default_value));
 }
-
 
 }  // namespace
 

@@ -794,6 +794,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return buffer_holds_;
   }
 
+  // Returns the per-shard local_rank label values initialized at construction.
+  absl::Span<const std::string> shard_local_ranks() const {
+    return shard_local_ranks_;
+  }
+
   bool has_device_buffers() const { return !buffer_holds_.empty(); }
   void AttachPlaceholderDeviceHoldForTest() { buffer_holds_.emplace_back(); }
   int parallelism() const { return parallelism_; }
@@ -826,6 +831,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Per-layer device buffer holds bundled with the layer's on-device size.
   // See the LayerDeviceInfo definition in the public section above.
   std::vector<LayerDeviceInfo> buffer_holds_;
+  std::vector<std::string> shard_local_ranks_;
   // Pool table. Explicit after RegisterPools; otherwise lazily materialized
   // implicit pools (one per storage, tag "opaque"). pools_mu_ guards the lazy
   // build and replacement; hot transfer paths read the table without the lock
@@ -1053,6 +1059,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Initializes background worker thread if RAIDEN_ENABLE_ASYNC_DISPATCH is
   // enabled.
   void InitBackgroundWorker();
+
+  // Initializes per-shard local_rank label strings at construction time.
+  void InitShardLocalRanks();
 
   mutable absl::Mutex backends_mu_;
   absl::flat_hash_map<std::string, std::shared_ptr<backends::KVBackend>>

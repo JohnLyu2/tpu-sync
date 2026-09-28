@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,10 @@ inline constexpr char kTelemetryMultiprocDirEnvVar[] =
 inline constexpr absl::string_view kPrometheus = "prometheus";
 inline constexpr absl::string_view kBuffered = "buffered";
 // Backend names END.
+
+// Reads and trims an environment variable, returning std::nullopt if unset or
+// whitespace-only.
+std::optional<std::string> ResolveEnvVar(const char* env_var);
 
 // Central Telemetry Facade for managing metrics across registered backends.
 // This class is thread-safe for all concurrent operations.

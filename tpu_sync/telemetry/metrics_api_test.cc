@@ -22,6 +22,7 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>  // NOLINT(build/c++11)
 #include <thread>  // NOLINT(build/c++11)
@@ -160,6 +161,20 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.type, MetricType::kHistogram);
   EXPECT_THAT(metric_metadata::kP2pTransferTimeMs.label_names, IsEmpty());
 
+  // H2dBytesTotal
+  EXPECT_EQ(metric_labels::kHostIp, "host_ip");
+  EXPECT_EQ(metric_labels::kLocalRank, "local_rank");
+  EXPECT_EQ(metric_names::kH2dBytesTotal, "h2d_bytes_total");
+  EXPECT_EQ(metric_descriptions::kH2dBytesTotal,
+            "Cumulative bytes requested for Host DRAM to Device HBM transfers "
+            "that completed successfully.");
+  EXPECT_EQ(metric_metadata::kH2dBytesTotal.name, "h2d_bytes_total");
+  EXPECT_EQ(metric_metadata::kH2dBytesTotal.description,
+            "Cumulative bytes requested for Host DRAM to Device HBM transfers "
+            "that completed successfully.");
+  EXPECT_EQ(metric_metadata::kH2dBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kH2dBytesTotal.label_names, IsEmpty());
+
   // H2dTransferTimeMs
   EXPECT_EQ(metric_names::kH2dTransferTimeMs, "h2d_transfer_time_ms");
   EXPECT_EQ(metric_descriptions::kH2dTransferTimeMs,
@@ -169,6 +184,18 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "Host-to-Device transfer latency in milliseconds.");
   EXPECT_EQ(metric_metadata::kH2dTransferTimeMs.type, MetricType::kHistogram);
   EXPECT_THAT(metric_metadata::kH2dTransferTimeMs.label_names, IsEmpty());
+
+  // D2hBytesTotal
+  EXPECT_EQ(metric_names::kD2hBytesTotal, "d2h_bytes_total");
+  EXPECT_EQ(metric_descriptions::kD2hBytesTotal,
+            "Cumulative bytes requested for Device HBM to Host DRAM transfers "
+            "that completed successfully.");
+  EXPECT_EQ(metric_metadata::kD2hBytesTotal.name, "d2h_bytes_total");
+  EXPECT_EQ(metric_metadata::kD2hBytesTotal.description,
+            "Cumulative bytes requested for Device HBM to Host DRAM transfers "
+            "that completed successfully.");
+  EXPECT_EQ(metric_metadata::kD2hBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kD2hBytesTotal.label_names, IsEmpty());
 
   // D2hTransferTimeMs
   EXPECT_EQ(metric_names::kD2hTransferTimeMs, "d2h_transfer_time_ms");
@@ -280,28 +307,33 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_labels::kErrorCode, "error_code");
 
   // All Metrics
+  // clang-format off
   EXPECT_THAT(
       metric_metadata::kAllMetrics,
-      ElementsAre(metric_metadata::kSentBytesTotal,
-                  metric_metadata::kReceivedBytesTotal,
-                  metric_metadata::kTransferFailuresTotal,
-                  metric_metadata::kTransferDurationMs,
-                  metric_metadata::kP2pTransferTimeMs,
-                  metric_metadata::kH2dTransferTimeMs,
-                  metric_metadata::kD2hTransferTimeMs,
-                  metric_metadata::kBufferAllocatedBytes,
-                  metric_metadata::kWeightSyncSentBytesTotal,
-                  metric_metadata::kWeightSyncReceivedBytesTotal,
-                  metric_metadata::kWeightSyncTransferFailuresTotal,
-                  metric_metadata::kWeightSyncP2pTransferTimeMs,
-                  metric_metadata::kWeightSyncD2hTransferTimeMs,
-                  metric_metadata::kWeightSyncH2dTransferTimeMs,
-                  metric_metadata::kWeightSyncPushDurationMs,
-                  metric_metadata::kWeightSyncE2eBroadcastDurationMs,
-                  metric_metadata::kWeightSyncBufferAllocatedBytes,
-                  metric_metadata::kWeightSyncTilingTimeMs,
-                  metric_metadata::kWeightSyncDetilingTimeMs,
-                  metric_metadata::kWeightSyncScheduleGenerationTimeMs));
+      ElementsAre(
+          metric_metadata::kSentBytesTotal,
+          metric_metadata::kReceivedBytesTotal,
+          metric_metadata::kTransferFailuresTotal,
+          metric_metadata::kTransferDurationMs,
+          metric_metadata::kP2pTransferTimeMs,
+          metric_metadata::kH2dBytesTotal,
+          metric_metadata::kH2dTransferTimeMs,
+          metric_metadata::kD2hBytesTotal,
+          metric_metadata::kD2hTransferTimeMs,
+          metric_metadata::kBufferAllocatedBytes,
+          metric_metadata::kWeightSyncSentBytesTotal,
+          metric_metadata::kWeightSyncReceivedBytesTotal,
+          metric_metadata::kWeightSyncTransferFailuresTotal,
+          metric_metadata::kWeightSyncP2pTransferTimeMs,
+          metric_metadata::kWeightSyncD2hTransferTimeMs,
+          metric_metadata::kWeightSyncH2dTransferTimeMs,
+          metric_metadata::kWeightSyncPushDurationMs,
+          metric_metadata::kWeightSyncE2eBroadcastDurationMs,
+          metric_metadata::kWeightSyncBufferAllocatedBytes,
+          metric_metadata::kWeightSyncTilingTimeMs,
+          metric_metadata::kWeightSyncDetilingTimeMs,
+          metric_metadata::kWeightSyncScheduleGenerationTimeMs));
+  // clang-format on
 }
 
 TEST_F(MetricsApiTest, FastPathExitWhenNoBackends) {
@@ -887,6 +919,22 @@ TEST_F(MetricsApiTest, InitializeWithLocalRankEnvironmentVariable) {
   ScopedEnvironmentVariable env(kLocalRankEnvVar, "5");
   ASSERT_OK(store_.InitializeFromBackendNames({"prometheus"}));
   EXPECT_TRUE(store_.HasBackends());
+}
+
+TEST_F(MetricsApiTest, ResolveEnvVarTrimsAndHandlesUnset) {
+  EXPECT_EQ(ResolveEnvVar(nullptr), std::nullopt);
+  {
+    ScopedEnvironmentVariable unset_env(kLocalRankEnvVar, nullptr);
+    EXPECT_EQ(ResolveEnvVar(kLocalRankEnvVar), std::nullopt);
+  }
+  {
+    ScopedEnvironmentVariable empty_env(kLocalRankEnvVar, "   ");
+    EXPECT_EQ(ResolveEnvVar(kLocalRankEnvVar), std::nullopt);
+  }
+  {
+    ScopedEnvironmentVariable set_env(kLocalRankEnvVar, "  3 \t");
+    EXPECT_EQ(ResolveEnvVar(kLocalRankEnvVar), "3");
+  }
 }
 
 }  // namespace

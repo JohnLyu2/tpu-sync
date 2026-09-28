@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,6 +35,7 @@
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
+#include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 
@@ -128,6 +130,46 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
 
   ASSERT_THAT(buffer->GetReadyFuture().Await(), IsOk());
 
+  struct ScopedLocalRank {
+    std::optional<std::string> prev;
+    ScopedLocalRank() {
+      if (const char* p = std::getenv(telemetry::kLocalRankEnvVar)) {
+        prev = p;
+      }
+      unsetenv(telemetry::kLocalRankEnvVar);
+    }
+    ~ScopedLocalRank() {
+      if (prev.has_value()) {
+        setenv(telemetry::kLocalRankEnvVar, prev->c_str(), 1);
+      } else {
+        unsetenv(telemetry::kLocalRankEnvVar);
+      }
+    }
+  } scoped_rank;
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                          raiden::RaidenBufferHandle::Acquire(buffer.get()));
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
+      {std::move(handle)}};
+  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
+      layer_buffers,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/true,
+      /*parallelism=*/1,
+      /*host_allocator=*/nullptr,
+      /*node_id=*/0,
+      /*local_control_port=*/0,
+      /*max_blocks=*/2,
+      /*num_slots=*/2,
+      /*timeout_s=*/10.0);
+  const uint64_t expected_slice_bytes = engine->base()->slice_byte_size();
+
+  const auto pcie_labels_matcher = ElementsAre(
+      HasResolvedIpLabel(telemetry::metric_labels::kHostIp),
+      telemetry::MetricLabel{.key = telemetry::metric_labels::kLocalRank,
+                             .value = "0"});
+
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
   EXPECT_CALL(*raw_mock,
@@ -168,29 +210,20 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
                                IsEmpty(), Gt(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                               pcie_labels_matcher, expected_slice_bytes))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
               ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
                                IsEmpty(), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                               pcie_labels_matcher, expected_slice_bytes))
       .Times(1);
   // Register mock backend
   telemetry::ScopedMetricsBackendReset scoped_metrics_reset(
       std::move(mock_backend));
-
-  // Create KVCacheManagerWithTransfer
-  auto handle_or = raiden::RaidenBufferHandle::Acquire(buffer.get());
-  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
-      {handle_or.value()}};
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/nullptr,
-      /*node_id=*/0,
-      /*local_control_port=*/0,
-      /*max_blocks=*/2,
-      /*num_slots=*/2,
-      /*timeout_s=*/10.0);
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
   ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());

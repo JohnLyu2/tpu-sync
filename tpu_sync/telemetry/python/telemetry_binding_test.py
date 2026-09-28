@@ -216,12 +216,14 @@ class TelemetryBindingTest(absltest.TestCase):
     self.assertEqual(metrics_by_name["transfer_failures_total"].label_names, [])
     self.assertEqual(metrics_by_name["transfer_duration_ms"].label_names, [])
     self.assertEqual(metrics_by_name["p2p_transfer_time_ms"].label_names, [])
+    self.assertEqual(metrics_by_name["h2d_bytes_total"].label_names, [])
     self.assertEqual(metrics_by_name["h2d_transfer_time_ms"].label_names, [])
+    self.assertEqual(metrics_by_name["d2h_bytes_total"].label_names, [])
     self.assertEqual(metrics_by_name["d2h_transfer_time_ms"].label_names, [])
     self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
 
     # Verify weight sync metrics
-    self.assertEqual(len(metrics), 20)
+    self.assertEqual(len(metrics), 22)
     self.assertEqual(
         metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
     )
