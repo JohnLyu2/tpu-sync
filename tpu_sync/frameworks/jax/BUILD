@@ -776,7 +776,7 @@ py_test(
 )
 
 py_test(
-    name = "weight_synchronization_perf_gl",
+    name = "weight_synchronization_perf_vl",
     timeout = "long",
     srcs = ["weight_synchronization_perf_test.py"],
     main = "weight_synchronization_perf_test.py",
@@ -784,8 +784,8 @@ py_test(
         "cpu:8",
         "notap",
         "requires-accel-hbm",
-        "requires-ghostlite:8",
         "requires-net:external",
+        "requires-viperlite:8",
     ],
     deps = [
         ":resharding_planner",
