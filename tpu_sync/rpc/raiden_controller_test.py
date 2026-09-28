@@ -5966,6 +5966,48 @@ class JobEntityTest(absltest.TestCase):
     finally:
       controller.worker_rpc_client.close()
 
+  def test_broadcast_pipeline_stages_configuration_and_validation(self):
+    """Verifies broadcast_pipeline_stages initialization, env var, and validation."""
+    c_default = raiden_controller.RaidenController(port=0)
+    self.assertEqual(c_default.broadcast_pipeline_stages, 4)
+    c_default.worker_rpc_client.close()
+
+    c_custom = raiden_controller.RaidenController(
+        port=0, broadcast_pipeline_stages=8
+    )
+    self.assertEqual(c_custom.broadcast_pipeline_stages, 8)
+    c_custom.worker_rpc_client.close()
+
+    with mock.patch.dict(os.environ, {"RAIDEN_BROADCAST_PIPELINE_STAGES": "6"}):
+      c_env = raiden_controller.RaidenController(port=0)
+      self.assertEqual(c_env.broadcast_pipeline_stages, 6)
+      c_env.worker_rpc_client.close()
+
+    with self.assertRaisesRegex(
+        ValueError, "broadcast_pipeline_stages must be >= 1"
+    ):
+      raiden_controller.RaidenController(port=0, broadcast_pipeline_stages=0)
+
+    with self.assertRaisesRegex(
+        ValueError, "broadcast_pipeline_stages must be >= 1"
+    ):
+      raiden_controller.RaidenController(port=0, broadcast_pipeline_stages=-2)
+
+    # Cache key incorporates broadcast_pipeline_stages
+    c1 = raiden_controller.RaidenController(port=0, broadcast_pipeline_stages=4)
+    c2 = raiden_controller.RaidenController(port=0, broadcast_pipeline_stages=8)
+    try:
+      src = [raiden_controller.RaidenId("src", "0", "w")]
+      dst = [raiden_controller.RaidenId("dst", "0", "w")]
+      key1 = c1._make_plan_cache_key(src_units=src, dst_units=dst)
+      key2 = c2._make_plan_cache_key(src_units=src, dst_units=dst)
+      self.assertNotEqual(key1, key2)
+      self.assertEqual(key1[-1], 4)
+      self.assertEqual(key2[-1], 8)
+    finally:
+      c1.worker_rpc_client.close()
+      c2.worker_rpc_client.close()
+
 
 if __name__ == "__main__":
   absltest.main()

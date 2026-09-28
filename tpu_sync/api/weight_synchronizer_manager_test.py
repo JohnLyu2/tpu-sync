@@ -103,6 +103,24 @@ class WeightSynchronizerManagerTest(absltest.TestCase):
     # Ensure internal controller instance is not exposed to users
     self.assertNotIn("controller", manager_methods)
 
+  def test_broadcast_pipeline_stages_configuration_and_validation(self):
+    mgr_default = weight_synchronizer_manager.WeightSynchronizerManager(port=0)
+    self.assertEqual(mgr_default.broadcast_pipeline_stages, 4)
+    mgr_default.close()
+
+    mgr_custom = weight_synchronizer_manager.WeightSynchronizerManager(
+        port=0, broadcast_pipeline_stages=8
+    )
+    self.assertEqual(mgr_custom.broadcast_pipeline_stages, 8)
+    mgr_custom.close()
+
+    with self.assertRaisesRegex(
+        ValueError, "broadcast_pipeline_stages must be >= 1"
+    ):
+      weight_synchronizer_manager.WeightSynchronizerManager(
+          port=0, broadcast_pipeline_stages=0
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

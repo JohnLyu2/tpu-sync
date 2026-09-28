@@ -1674,7 +1674,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         for e in entries
     ]
     buggy_coalesced = broadcast_engine._coalesce_contiguous_relay_entries(
-        buggy_entries, is_weight_sync=False
+        buggy_entries
     )
     self.assertLen(buggy_coalesced, 1)
     self.assertEqual(buggy_coalesced[0][4], 8192)
@@ -1692,10 +1692,10 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
 
     # Verification 2 (Fixed output acceptance):
     # Under our fix,
-    # _coalesce_contiguous_relay_entries(entries, is_weight_sync=True)
+    # _coalesce_contiguous_relay_entries(entries)
     # returns 16 separate 512-byte entries with distinct dst_block_id = 0..15.
     fixed_coalesced = broadcast_engine._coalesce_contiguous_relay_entries(
-        entries, is_weight_sync=True
+        entries
     )
     self.assertLen(fixed_coalesced, 16)
     for i, e in enumerate(fixed_coalesced):

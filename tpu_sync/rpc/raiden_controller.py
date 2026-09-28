@@ -114,6 +114,7 @@ class RaidenController:
       worker_rpc_client: Optional[WorkerRpcClient] = None,
       request_registry_ttl_s: float = 600.0,
       broadcast_host_ratio: Optional[float] = None,
+      broadcast_pipeline_stages: Optional[int] = None,
       enable_plan_cache: bool = True,
   ):
     """Initializes the RaidenController.
@@ -126,6 +127,8 @@ class RaidenController:
       broadcast_host_ratio: Ratio of trainer TX host bandwidth to sampler RX
         host bandwidth (K0 = B_train_TX / B_sample_RX). A value of 0.0 disables
         tree broadcast and forces Direct P2P.
+      broadcast_pipeline_stages: Target number of pipelined broadcast stages
+        (default 4 or RAIDEN_BROADCAST_PIPELINE_STAGES).
       enable_plan_cache: Whether to cache transfer planning and resharding
         schedules across transfer invocations with identical topologies.
     """
@@ -140,6 +143,16 @@ class RaidenController:
           f"broadcast_host_ratio must be non-negative, got {raw_ratio}"
       )
     self.broadcast_host_ratio = float(raw_ratio)
+    raw_stages = (
+        broadcast_pipeline_stages
+        if broadcast_pipeline_stages is not None
+        else int(os.environ.get("RAIDEN_BROADCAST_PIPELINE_STAGES", "4"))
+    )
+    if raw_stages < 1:
+      raise ValueError(
+          f"broadcast_pipeline_stages must be >= 1, got {raw_stages}"
+      )
+    self.broadcast_pipeline_stages = int(raw_stages)
     self.enable_plan_cache = enable_plan_cache
     self._plan_cache: dict[Any, _CachedTransferSchedule] = {}
     self._active_transfers: dict[str, TransferPlan] = {}
@@ -645,12 +658,18 @@ class RaidenController:
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
       broadcast_host_ratio: Optional[float] = None,
+      broadcast_pipeline_stages: Optional[int] = None,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
     ratio = (
         broadcast_host_ratio
         if broadcast_host_ratio is not None
         else self.broadcast_host_ratio
+    )
+    stages = (
+        broadcast_pipeline_stages
+        if broadcast_pipeline_stages is not None
+        else self.broadcast_pipeline_stages
     )
     return ReshardPlanner.make_plan_cache_key(
         src_units=src_units,
@@ -660,6 +679,7 @@ class RaidenController:
         dst_controller_address=dst_controller_address,
         src_controller_address=src_controller_address,
         broadcast_host_ratio=ratio,
+        broadcast_pipeline_stages=stages,
     )
 
   async def warmup_transfer_plan(
@@ -758,6 +778,7 @@ class RaidenController:
         shard_push_schedules=shard_push_schedules,
         req_id=req_id,
         uuid=uuid,
+        pipeline_target_stages=self.broadcast_pipeline_stages,
     )
     common.record_histogram(
         "weight_sync_schedule_generation_time_ms",
@@ -886,6 +907,7 @@ class RaidenController:
         registered_shards=self._registered_shards,
         dst_controller_address=dst_controller_address,
         src_controller_address=src_controller_address,
+        pipeline_target_stages=self.broadcast_pipeline_stages,
     )
 
   async def _execute_slice_broadcast_pipeline(
@@ -919,6 +941,7 @@ class RaidenController:
         registered_shards=self._registered_shards,
         dst_controller_address=dst_controller_address,
         src_controller_address=src_controller_address,
+        pipeline_target_stages=self.broadcast_pipeline_stages,
     )
 
   def _start_pool_reshard_transfer(self, *args, **kwargs):

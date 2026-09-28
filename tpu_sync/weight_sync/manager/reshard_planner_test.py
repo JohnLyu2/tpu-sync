@@ -680,8 +680,52 @@ class ReshardPlannerTest(absltest.TestCase):
         src_units=src, dst_units=dst, broadcast_host_ratio=2.0
     )
     self.assertNotEqual(key1, key2)
-    self.assertEqual(key1[-1], 1.0)
-    self.assertEqual(key2[-1], 2.0)
+    self.assertEqual(key1[-2], 1.0)
+    self.assertEqual(key2[-2], 2.0)
+    self.assertEqual(key1[-1], 4)
+
+  def test_make_plan_cache_key_includes_broadcast_pipeline_stages(self):
+    src = [RaidenId("t", "0", "v", 0)]
+    dst = [RaidenId("s", "0", "v", 0)]
+    key1 = reshard_planner.ReshardPlanner.make_plan_cache_key(
+        src_units=src, dst_units=dst, broadcast_pipeline_stages=4
+    )
+    key2 = reshard_planner.ReshardPlanner.make_plan_cache_key(
+        src_units=src, dst_units=dst, broadcast_pipeline_stages=8
+    )
+    self.assertNotEqual(key1, key2)
+    self.assertEqual(key1[-1], 4)
+    self.assertEqual(key2[-1], 8)
+    with self.assertRaisesRegex(
+        ValueError, "broadcast_pipeline_stages must be >= 1"
+    ):
+      reshard_planner.ReshardPlanner.make_plan_cache_key(
+          src_units=src, dst_units=dst, broadcast_pipeline_stages=0
+      )
+
+  def test_compute_transfer_schedule_pipeline_target_stages_validation(self):
+    with self.assertRaisesRegex(
+        ValueError, "pipeline_target_stages must be >= 1"
+    ):
+      reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+          src_units=[],
+          dst_units=[],
+          dst_metadata=[],
+          entities={},
+          registered_variables={},
+          registered_global_shapes={},
+          registered_mesh_shapes={},
+          registered_mesh_axes={},
+          registered_host_subgrids={},
+          registered_layouts={},
+          registered_itemsizes={},
+          registered_shards={},
+          computed_phys_meshes={},
+          worker_endpoints={},
+          broadcast_host_ratio=0.0,
+          lock=threading.Lock(),
+          pipeline_target_stages=0,
+      )
 
   def test_compute_transfer_schedule_empty_src_units_raises(self):
     with self.assertRaisesRegex(ValueError, "src_units must not be empty"):

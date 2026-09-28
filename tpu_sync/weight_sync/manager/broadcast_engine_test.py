@@ -15,6 +15,7 @@
 """Unit tests for broadcast_engine."""
 
 import asyncio
+import collections
 from typing import Any, Optional
 
 from absl.testing import absltest
@@ -284,14 +285,14 @@ class BroadcastEngineTest(absltest.TestCase):
         for i in range(2)
     ]
     coalesced_same = broadcast_engine._coalesce_contiguous_relay_entries(
-        same_block_entries, is_weight_sync=False
+        same_block_entries
     )
     self.assertLen(coalesced_same, 1)
     self.assertEqual(coalesced_same[0][4], 2 * chunk_size)
     self.assertEqual(coalesced_same[0][5], 5)
     self.assertEqual(coalesced_same[0][6], 5)
 
-    # Entries with differing block IDs do NOT coalesce when is_weight_sync=False
+    # Entries with differing block IDs do NOT coalesce
     diff_block_entries = [
         (
             "127.0.0.1:8001",
@@ -310,7 +311,7 @@ class BroadcastEngineTest(absltest.TestCase):
         for i in range(2)
     ]
     coalesced_diff = broadcast_engine._coalesce_contiguous_relay_entries(
-        diff_block_entries, is_weight_sync=False
+        diff_block_entries
     )
     self.assertLen(coalesced_diff, 2)
 
@@ -336,7 +337,6 @@ class BroadcastEngineTest(absltest.TestCase):
     coalesced_ws = broadcast_engine._coalesce_contiguous_relay_entries(
         varying_block_entries,
         max_chunk_bytes=4 * 1024 * 1024,
-        is_weight_sync=True,
     )
     self.assertLen(coalesced_ws, 64)
     for i, entry in enumerate(coalesced_ws):
@@ -371,9 +371,7 @@ class BroadcastEngineTest(absltest.TestCase):
         )
         for i in range(16)
     ]
-    coalesced = broadcast_engine._coalesce_contiguous_relay_entries(
-        entries, is_weight_sync=True
-    )
+    coalesced = broadcast_engine._coalesce_contiguous_relay_entries(entries)
     self.assertLen(coalesced, 16)
     for i, entry in enumerate(coalesced):
       self.assertEqual(entry[4], 512)
@@ -411,7 +409,7 @@ class BroadcastEngineTest(absltest.TestCase):
         ),
     ]
     coalesced_within = broadcast_engine._coalesce_contiguous_relay_entries(
-        within_block_entries, is_weight_sync=True
+        within_block_entries
     )
     self.assertLen(coalesced_within, 1)
     self.assertEqual(coalesced_within[0][4], 512)
@@ -438,6 +436,33 @@ class BroadcastEngineTest(absltest.TestCase):
     self.assertLen(coalesced, 8)
     for stage in coalesced:
       self.assertLen(stage, 5)
+
+  def test_coalesce_pipeline_groups_multiple_shard_runs(self) -> None:
+    """Verifies each (src, shard) run coalesces into target_stages independently."""
+    dsts = [
+        RaidenId(job_name="dst", job_replica_id=str(i), data_name="w")
+        for i in range(4)
+    ]
+    targets = [(dsts[i], f"127.0.0.1:800{i}", 0, 0, 0, 0) for i in range(4)]
+
+    # 8 shards, each with 8 layer groups (total 64 groups)
+    groups_list = []
+    for shard_idx in range(8):
+      src = RaidenId(
+          job_name="src", job_replica_id=str(shard_idx), data_name="w"
+      )
+      for layer_idx in range(8):
+        groups_list.append(
+            [((src, shard_idx, 0, 0, 1024, 0, 1, layer_idx, 0), targets)]
+        )
+
+    coalesced = broadcast_engine._coalesce_pipeline_groups(
+        groups_list, target_stages=4
+    )
+    # Each of the 8 shards should produce 4 pipeline stages (total 32 stages)
+    self.assertLen(coalesced, 32)
+    for stage in coalesced:
+      self.assertLen(stage, 2)
 
   def test_execute_slice_broadcast_pipeline_cancels_siblings_on_failure(
       self,
@@ -947,6 +972,255 @@ class BroadcastEngineTest(absltest.TestCase):
     # Round 2: Newest first: dsts[2] -> dsts[3], dsts[1] -> dsts[4]
     self.assertEqual(receiver_to_sender[dsts[3]], dsts[2])
     self.assertEqual(receiver_to_sender[dsts[4]], dsts[1])
+
+  def test_stream_ordered_multi_chunk_dispatch(self) -> None:
+    """Verifies (child_order, g_idx) stream ordering across 3 binomial rounds with M=3 chunks."""
+    src = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    dsts = [
+        RaidenId(job_name="sampler", job_replica_id=str(i), data_name="w")
+        for i in range(7)
+    ]
+
+    dispatches_by_sender: dict[RaidenId, list[tuple[RaidenId, int]]] = (
+        collections.defaultdict(list)
+    )
+
+    class OrderingRpcClient(raiden_controller.WeightSyncWorkerRpcClient):
+
+      async def start_transfer(
+          self,
+          target_id: RaidenId,
+          transfer_plan: Any,
+          address: Optional[str] = None,
+      ) -> None:
+        del address
+        sender = transfer_plan.src_units[0]
+        receiver = transfer_plan.dst_units[0]
+        if target_id == sender:
+          g_idx = int(
+              transfer_plan.req_id.split("reqordered_")[1].split("_")[0]
+          )
+          dispatches_by_sender[sender].append((receiver, g_idx))
+
+    rpc_client = OrderingRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    groups_list = []
+    for g_idx in range(3):
+      key = (src, 0, 0, 0, 1024, 0, 1, g_idx, 0)
+      targets = [(dsts[i], f"127.0.0.1:800{i}", 0, 0, 0, 0) for i in range(7)]
+      groups_list.append([(key, targets)])
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=dsts,
+        plan=None,
+        worker_data_addresses={
+            u: [f"127.0.0.1:800{i}"] for i, u in enumerate([src] + dsts)
+        },
+    )
+    registered_shards = {u: ["s0"] for u in [src] + dsts}
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            n_seed=1,
+            req_id="reqordered",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+            pipeline_target_stages=10,
+        )
+    )
+
+    # Trainer dispatches (t0, g0), (t0, g1), (t0, g2) before (t2, g0), (t2, g1), (t2, g2)
+    # and before (t6, g0), (t6, g1), (t6, g2).
+    trainer_dispatches = dispatches_by_sender[src]
+    t0_pushes = [(dsts[0], 0), (dsts[0], 1), (dsts[0], 2)]
+    t2_pushes = [(dsts[2], 0), (dsts[2], 1), (dsts[2], 2)]
+    t6_pushes = [(dsts[6], 0), (dsts[6], 1), (dsts[6], 2)]
+
+    for p in t0_pushes + t2_pushes + t6_pushes:
+      self.assertIn(p, trainer_dispatches)
+
+    t0_indices = [trainer_dispatches.index(p) for p in t0_pushes]
+    t2_indices = [trainer_dispatches.index(p) for p in t2_pushes]
+    t6_indices = [trainer_dispatches.index(p) for p in t6_pushes]
+
+    self.assertLess(max(t0_indices), min(t2_indices))
+    self.assertLess(max(t2_indices), min(t6_indices))
+
+    # t0 dispatches (t1, g0), (t1, g1), (t1, g2) before (t5, g0), (t5, g1), (t5, g2)
+    t0_dispatches = dispatches_by_sender[dsts[0]]
+    t1_pushes = [(dsts[1], 0), (dsts[1], 1), (dsts[1], 2)]
+    t5_pushes = [(dsts[5], 0), (dsts[5], 1), (dsts[5], 2)]
+
+    for p in t1_pushes + t5_pushes:
+      self.assertIn(p, t0_dispatches)
+
+    t1_indices = [t0_dispatches.index(p) for p in t1_pushes]
+    t5_indices = [t0_dispatches.index(p) for p in t5_pushes]
+
+    self.assertLess(max(t1_indices), min(t5_indices))
+
+  def test_full_duplex_chunk_pipeline_overlap(self) -> None:
+    """Verifies t0 relays g0 to t1 while Trainer concurrently sends g1 to t0."""
+    src = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    dsts = [
+        RaidenId(job_name="sampler", job_replica_id=str(i), data_name="w")
+        for i in range(7)
+    ]
+
+    class OverlapRpcClient(raiden_controller.WeightSyncWorkerRpcClient):
+
+      def __init__(self) -> None:
+        super().__init__()
+        self.t0_relaying_g0_to_t1 = asyncio.Event()
+        self.trainer_sending_g1_to_t0 = asyncio.Event()
+        self.full_duplex_overlap_observed = False
+        self.allow_g1_to_complete = asyncio.Event()
+
+      async def start_transfer(
+          self,
+          target_id: RaidenId,
+          transfer_plan: Any,
+          address: Optional[str] = None,
+      ) -> None:
+        del address
+        sender = transfer_plan.src_units[0]
+        receiver = transfer_plan.dst_units[0]
+        is_sender_call = target_id == sender
+
+        # Detect Trainer -> t0 for Chunk 1
+        if (
+            is_sender_call
+            and sender == src
+            and receiver == dsts[0]
+            and "_1_" in transfer_plan.req_id
+        ):
+          self.trainer_sending_g1_to_t0.set()
+          try:
+            await asyncio.wait_for(
+                self.t0_relaying_g0_to_t1.wait(), timeout=5.0
+            )
+            self.full_duplex_overlap_observed = True
+          finally:
+            self.allow_g1_to_complete.set()
+
+        # Detect t0 -> t1 for Chunk 0
+        if (
+            is_sender_call
+            and sender == dsts[0]
+            and receiver == dsts[1]
+            and "_0_" in transfer_plan.req_id
+        ):
+          self.t0_relaying_g0_to_t1.set()
+
+    rpc_client = OverlapRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    groups_list = []
+    for g_idx in range(2):
+      key = (src, 0, 0, 0, 1024, 0, 1, g_idx, 0)
+      targets = [(dsts[i], f"127.0.0.1:800{i}", 0, 0, 0, 0) for i in range(7)]
+      groups_list.append([(key, targets)])
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=dsts,
+        plan=None,
+        worker_data_addresses={
+            u: [f"127.0.0.1:800{i}"] for i, u in enumerate([src] + dsts)
+        },
+    )
+    registered_shards = {u: ["s0"] for u in [src] + dsts}
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            n_seed=1,
+            req_id="reqoverlap",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+            pipeline_target_stages=10,
+        )
+    )
+
+    self.assertTrue(
+        rpc_client.full_duplex_overlap_observed,
+        "t0 must start relaying g0 to t2 concurrently while Trainer sends g1 to"
+        " t0 (full-duplex pipelining).",
+    )
+
+  def test_coalesce_granularity_and_pipeline_validation(self) -> None:
+    """Verifies configurable target_stages and max_chunk_bytes plus validations."""
+    src = RaidenId(job_name="src", job_replica_id="0", data_name="w")
+    dsts = [
+        RaidenId(job_name="dst", job_replica_id=str(i), data_name="w")
+        for i in range(4)
+    ]
+    targets = [(dsts[i], f"127.0.0.1:800{i}", 0, 0, 0, 0) for i in range(4)]
+    groups_list = [
+        [((src, 0, 0, 0, 1024, 0, 1, layer_idx, 0), targets)]
+        for layer_idx in range(40)
+    ]
+
+    # Valid coalescing to 4 stages
+    coalesced = broadcast_engine._coalesce_pipeline_groups(
+        groups_list, target_stages=4
+    )
+    self.assertLen(coalesced, 4)
+    for stage in coalesced:
+      self.assertLen(stage, 10)
+
+    # Validation on _coalesce_pipeline_groups
+    with self.assertRaisesRegex(ValueError, "target_stages must be >= 1"):
+      broadcast_engine._coalesce_pipeline_groups(groups_list, target_stages=0)
+    with self.assertRaisesRegex(ValueError, "target_stages must be >= 1"):
+      broadcast_engine._coalesce_pipeline_groups(groups_list, target_stages=-2)
+
+    # Validation on _coalesce_contiguous_relay_entries
+    with self.assertRaisesRegex(ValueError, "max_chunk_bytes must be > 0"):
+      broadcast_engine._coalesce_contiguous_relay_entries([], max_chunk_bytes=0)
+    with self.assertRaisesRegex(ValueError, "max_chunk_bytes must be > 0"):
+      broadcast_engine._coalesce_contiguous_relay_entries(
+          [], max_chunk_bytes=-1
+      )
+
+    # Validation on execute_slice_broadcast_pipeline
+    engine = broadcast_engine.BroadcastEngine(RecordingWorkerRpcClient())
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src], dst_units=dsts, plan=None
+    )
+    with self.assertRaisesRegex(
+        ValueError, "pipeline_target_stages must be >= 1"
+    ):
+      asyncio.run(
+          engine.execute_slice_broadcast_pipeline(
+              groups_list=groups_list,
+              final_plan=final_plan,
+              n_seed=1,
+              req_id="req_val",
+              dst_mem_type=0,
+              registered_shards={},
+              pipeline_target_stages=0,
+          )
+      )
+    with self.assertRaisesRegex(ValueError, "max_chunk_bytes must be > 0"):
+      asyncio.run(
+          engine.execute_slice_broadcast_pipeline(
+              groups_list=groups_list,
+              final_plan=final_plan,
+              n_seed=1,
+              req_id="req_val",
+              dst_mem_type=0,
+              registered_shards={},
+              max_chunk_bytes=0,
+          )
+      )
 
 
 if __name__ == "__main__":

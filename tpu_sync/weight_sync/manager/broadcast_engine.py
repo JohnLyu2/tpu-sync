@@ -17,6 +17,8 @@
 import asyncio
 import collections
 import functools
+import heapq
+import itertools
 import random
 from typing import Any, Callable, Optional
 
@@ -25,12 +27,13 @@ from absl import logging
 from tpu_sync.api.common import RaidenId
 from tpu_sync.weight_sync.manager import controller_types
 
+_PIPELINE_TARGET_STAGES: int = 4
+_RELAY_MAX_COALESCED_CHUNK_BYTES: int = 4 * 1024 * 1024
 
-# TODO(fhzhang): Make max_chunk_bytes and target_stages configurable via RaidenController options.
+
 def _coalesce_contiguous_relay_entries(
     entries: list[tuple[Any, ...]],
-    max_chunk_bytes: int = 4 * 1024 * 1024,
-    is_weight_sync: bool = False,
+    max_chunk_bytes: int = _RELAY_MAX_COALESCED_CHUNK_BYTES,
 ) -> list[tuple[Any, ...]]:
   """Coalesces adjacent contiguous relay entries into larger multi-MB blocks.
 
@@ -39,12 +42,15 @@ def _coalesce_contiguous_relay_entries(
       src_block_offset, size, src_block_id, dst_block_id, src_stride,
       dst_stride, count, layer_idx, pool_group).
     max_chunk_bytes: Maximum size in bytes of a coalesced chunk (default 4MB).
-    is_weight_sync: Whether this transfer is weight synchronization. Block IDs
-      are preserved to prevent block size mismatch in BlockTransport.
 
   Returns:
     Coalesced list of 12-tuples.
+
+  Raises:
+    ValueError: If max_chunk_bytes <= 0.
   """
+  if max_chunk_bytes <= 0:
+    raise ValueError(f"max_chunk_bytes must be > 0, got {max_chunk_bytes}")
   if not entries:
     return []
 
@@ -131,10 +137,9 @@ def _coalesce_contiguous_relay_entries(
   return coalesced
 
 
-# TODO(fhzhang): Make max_chunk_bytes and target_stages configurable via RaidenController options.
 def _coalesce_pipeline_groups(
     groups_list: list[Any],
-    target_stages: int = 8,
+    target_stages: int = _PIPELINE_TARGET_STAGES,
 ) -> list[Any]:
   """Coalesces fine-grained groups into fewer pipeline stages if len > target_stages.
 
@@ -225,34 +230,50 @@ def _coalesce_pipeline_groups(
       i = j
     return coalesced_stage_groups
 
-  max_groups_per_stage = (len(groups_list) + target_stages - 1) // target_stages
-  coalesced: list[list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]]] = []
-  current_stage: list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]] = []
-  current_key: Optional[tuple[Any, ...]] = None
-  current_count = 0
-
-  for g in groups_list:
-    if not g:
-      continue
+  def _routing_key(
+      g: list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]],
+  ) -> tuple[Any, ...]:
     ref_key, ref_targets = g[0]
     src_unit = ref_key[0]
     shard_idx = ref_key[1]
     sorted_targets = sorted(ref_targets, key=lambda t: (t[1], t[2]))
     targets_routing_key = tuple((t[0], t[1], t[2]) for t in sorted_targets)
-    routing_key = (src_unit, shard_idx, targets_routing_key)
+    return (src_unit, shard_idx, targets_routing_key)
 
-    if current_key == routing_key and current_count < max_groups_per_stage:
-      current_stage.extend(g)
-      current_count += 1
+  coalesced: list[list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]]] = []
+  i = 0
+  n = len(groups_list)
+  while i < n:
+    if not groups_list[i]:
+      i += 1
+      continue
+    cur_key = _routing_key(groups_list[i])
+    run: list[list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]]] = [
+        groups_list[i]
+    ]
+    j = i + 1
+    while j < n:
+      if not groups_list[j]:
+        j += 1
+        continue
+      if _routing_key(groups_list[j]) == cur_key:
+        run.append(groups_list[j])
+        j += 1
+      else:
+        break
+
+    run_len = len(run)
+    if run_len <= target_stages:
+      coalesced.extend(run)
     else:
-      if current_stage:
-        coalesced.append(current_stage)
-      current_stage = list(g)
-      current_key = routing_key
-      current_count = 1
+      max_per_stage = (run_len + target_stages - 1) // target_stages
+      for k in range(0, run_len, max_per_stage):
+        stage: list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]] = []
+        for g in run[k : k + max_per_stage]:
+          stage.extend(g)
+        coalesced.append(stage)
 
-  if current_stage:
-    coalesced.append(current_stage)
+    i = j
 
   return coalesced
 
@@ -437,13 +458,21 @@ class BroadcastEngine:
       registered_shards: dict[RaidenId, list[str]],
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      pipeline_target_stages: int = _PIPELINE_TARGET_STAGES,
+      max_chunk_bytes: int = _RELAY_MAX_COALESCED_CHUNK_BYTES,
   ) -> None:
     """Executes a pipelined multi-hop tree broadcast across multiple groups."""
     if n_seed <= 0:
       raise ValueError(f"n_seed must be >= 1, got {n_seed}")
+    if pipeline_target_stages <= 0:
+      raise ValueError(
+          f"pipeline_target_stages must be >= 1, got {pipeline_target_stages}"
+      )
+    if max_chunk_bytes <= 0:
+      raise ValueError(f"max_chunk_bytes must be > 0, got {max_chunk_bytes}")
 
     coalesced_groups_list = _coalesce_pipeline_groups(
-        groups_list, target_stages=8
+        groups_list, target_stages=pipeline_target_stages
     )
 
     groups: list[_GroupBroadcastState] = []
@@ -489,9 +518,10 @@ class BroadcastEngine:
       return
 
     active_pushes: dict[RaidenId, int] = {u: 0 for u in all_workers}
-    ready_queue: dict[RaidenId, collections.deque[_HopTask]] = {
-        u: collections.deque() for u in all_workers
+    ready_queue: dict[RaidenId, list[tuple[int, int, int, _HopTask]]] = {
+        u: [] for u in all_workers
     }
+    hop_counter = itertools.count()
     transfers_in_progress: dict[asyncio.Task[None], _HopTask] = {}
 
     # Build deterministic All-Source Binomial Tree for each group.
@@ -563,6 +593,7 @@ class BroadcastEngine:
 
         # 2. Trainer sends to up to n_seed new samplers in this round.
         k_train = min(n_seed, n - next_idx)
+        train_child_order = sender_child_count[g.primary_src_unit]
         for _ in range(k_train):
           d = dst_units[next_idx]
           hop = _HopTask(
@@ -571,13 +602,17 @@ class BroadcastEngine:
               receiver=d,
               dst_indices=g.dst_unit_to_indices[d],
               round_idx=round_idx,
-              child_order=sender_child_count[g.primary_src_unit],
+              child_order=train_child_order,
           )
-          sender_child_count[g.primary_src_unit] += 1
-          ready_queue[g.primary_src_unit].append(hop)
+          heapq.heappush(
+              ready_queue[g.primary_src_unit],
+              (hop.child_order, g.group_idx, next(hop_counter), hop),
+          )
           new_round_hops.append(hop)
           _record_hop_destinations(g.primary_src_unit, d, round_idx)
           next_idx += 1
+        if k_train > 0:
+          sender_child_count[g.primary_src_unit] += 1
 
         populated_hops.extend(new_round_hops)
         round_idx += 1
@@ -943,7 +978,7 @@ class BroadcastEngine:
           for shard_idx, entries in list(sub_schedule[s].items()):
             sub_schedule[s][shard_idx] = _coalesce_contiguous_relay_entries(
                 entries,
-                is_weight_sync=bool(final_plan.is_weight_sync),
+                max_chunk_bytes=max_chunk_bytes,
             )
             hop_expected_block_count += sum(
                 1 if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4])) else e[9]
@@ -988,7 +1023,7 @@ class BroadcastEngine:
           for u in all_workers:
             max_active = n_seed if u in src_units else 1
             while active_pushes[u] < max_active and ready_queue[u]:
-              hop = ready_queue[u].popleft()
+              _, _, _, hop = heapq.heappop(ready_queue[u])
               _dispatch_hop(hop)
               scheduled_any = True
           if not scheduled_any:
@@ -1009,8 +1044,15 @@ class BroadcastEngine:
             active_pushes[hop.sender] -= 1
 
             for child_hop in hop.children:
-              ready_queue[hop.receiver].append(child_hop)
-
+              heapq.heappush(
+                  ready_queue[hop.receiver],
+                  (
+                      child_hop.child_order,
+                      child_hop.group.group_idx,
+                      next(hop_counter),
+                      child_hop,
+                  ),
+              )
     finally:
       pending = [f for f in transfers_in_progress.keys() if not f.done()]
       for f in pending:
@@ -1028,6 +1070,8 @@ class BroadcastEngine:
       registered_shards: dict[RaidenId, list[str]],
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      pipeline_target_stages: int = _PIPELINE_TARGET_STAGES,
+      max_chunk_bytes: int = _RELAY_MAX_COALESCED_CHUNK_BYTES,
   ) -> None:
     """Executes a pipelined tree broadcast for a group of variables."""
     await self.execute_slice_broadcast_pipeline(
@@ -1039,4 +1083,6 @@ class BroadcastEngine:
         registered_shards=registered_shards,
         dst_controller_address=dst_controller_address,
         src_controller_address=src_controller_address,
+        pipeline_target_stages=pipeline_target_stages,
+        max_chunk_bytes=max_chunk_bytes,
     )

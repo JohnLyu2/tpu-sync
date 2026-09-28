@@ -102,6 +102,7 @@ class WeightSynchronizerManager:
       worker_rpc_client: Optional[raiden_controller.WorkerRpcClient] = None,
       request_registry_ttl_s: float = 600.0,
       broadcast_host_ratio: Optional[float] = None,
+      broadcast_pipeline_stages: Optional[int] = None,
       enable_plan_cache: bool = True,
       auto_start_server: bool = False,
   ):
@@ -115,6 +116,8 @@ class WeightSynchronizerManager:
       broadcast_host_ratio: Ratio of trainer TX host bandwidth to sampler RX
         host bandwidth (K0 = B_train_TX / B_sample_RX). A value of 0.0 disables
         tree broadcast and forces Direct P2P.
+      broadcast_pipeline_stages: Target number of pipelined broadcast stages
+        (default 4 or RAIDEN_BROADCAST_PIPELINE_STAGES).
       enable_plan_cache: Whether to cache transfer planning and resharding
         schedules across transfer invocations with identical topologies.
       auto_start_server: Whether to automatically spawn the background TCP
@@ -125,6 +128,7 @@ class WeightSynchronizerManager:
         worker_rpc_client=worker_rpc_client,
         request_registry_ttl_s=request_registry_ttl_s,
         broadcast_host_ratio=broadcast_host_ratio,
+        broadcast_pipeline_stages=broadcast_pipeline_stages,
         enable_plan_cache=enable_plan_cache,
     )
     self._server: Optional[raiden_controller.RaidenControllerServer] = None
@@ -139,6 +143,11 @@ class WeightSynchronizerManager:
   @port.setter
   def port(self, value: int) -> None:
     self._controller.port = value
+
+  @property
+  def broadcast_pipeline_stages(self) -> int:
+    """Returns the configured broadcast pipeline stages."""
+    return self._controller.broadcast_pipeline_stages
 
   def register_work_unit(
       self,

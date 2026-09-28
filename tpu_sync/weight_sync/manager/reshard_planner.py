@@ -39,6 +39,9 @@ _proto_to_nd_slice = controller_types.proto_to_nd_slice
 _raiden_id_from_proto = controller_types.raiden_id_from_proto
 _StageBroadcastGroup = controller_types.StageBroadcastGroup
 
+_PIPELINE_TARGET_STAGES: int = 4
+_RELAY_MAX_COALESCED_CHUNK_BYTES: int = 4 * 1024 * 1024
+
 
 def to_physical(logical_shape, logical_mesh_shape, minor_to_major):
   """Maps logical tensor and mesh shapes to physical memory layout."""
@@ -719,11 +722,17 @@ class ReshardPlanner:
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
       broadcast_host_ratio: float = 1.0,
+      broadcast_pipeline_stages: int = 4,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
     del cls
     if group_size <= 0:
       raise ValueError("group_size must be positive")
+    if broadcast_pipeline_stages <= 0:
+      raise ValueError(
+          "broadcast_pipeline_stages must be >= 1, got"
+          f" {broadcast_pipeline_stages}"
+      )
     return (
         tuple(src_units),
         tuple(dst_units),
@@ -732,6 +741,7 @@ class ReshardPlanner:
         dst_controller_address,
         src_controller_address,
         float(broadcast_host_ratio),
+        int(broadcast_pipeline_stages),
     )
 
   @classmethod
@@ -788,10 +798,15 @@ class ReshardPlanner:
       ] = None,
       req_id: str = "warmup",
       uuid: Any = "",
+      pipeline_target_stages: int = _PIPELINE_TARGET_STAGES,
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math and returns a _CachedTransferSchedule."""
     if group_size <= 0:
       raise ValueError("group_size must be positive")
+    if pipeline_target_stages <= 0:
+      raise ValueError(
+          f"pipeline_target_stages must be >= 1, got {pipeline_target_stages}"
+      )
 
     computed_schedules = {}
     computed_slices = {}
@@ -2049,7 +2064,9 @@ class ReshardPlanner:
         computed_schedules=computed_schedules,
         direct_schedules=direct_schedules,
         broadcast_groups=broadcast_groups,
-        local_skip_tiling=dict(local_skip_tiling) if local_skip_tiling else {},
+        local_skip_tiling=(
+            dict(local_skip_tiling) if local_skip_tiling else {}
+        ),
         expected_block_count=computed_expected_block_count,
         dst_unit_layer_counts=dst_unit_layer_counts,
         data_address_to_unit=dict(data_address_to_unit),
