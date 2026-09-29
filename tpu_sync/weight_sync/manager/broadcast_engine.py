@@ -374,6 +374,8 @@ class BroadcastEngine:
 
     tree-broadcast groups.
     """
+    if n_seed <= 0:
+      raise ValueError(f"n_seed must be positive, got {n_seed}")
     direct_schedules: dict[RaidenId, dict[int, list[Any]]] = {}
     broadcast_groups: dict[tuple[Any, ...], list[Any]] = {}
 
@@ -530,6 +532,23 @@ class BroadcastEngine:
     ] = collections.defaultdict(
         lambda: collections.defaultdict(lambda: ([], []))
     )
+    pipeline_uuid = (
+        final_plan.uuid
+        if (final_plan.uuid is not None and final_plan.uuid > 0)
+        else random.randint(1, 2**63 - 1)
+    )
+    receiver_block_counts: dict[RaidenId, int] = collections.defaultdict(int)
+    receiver_layer_counts: dict[RaidenId, dict[int, int]] = (
+        collections.defaultdict(lambda: collections.defaultdict(int))
+    )
+    receiver_endpoint_counts: dict[RaidenId, dict[str, int]] = (
+        collections.defaultdict(lambda: collections.defaultdict(int))
+    )
+    receiver_endpoint_layer_counts: dict[
+        RaidenId, dict[str, dict[int, int]]
+    ] = collections.defaultdict(
+        lambda: collections.defaultdict(lambda: collections.defaultdict(int))
+    )
 
     for g in groups:
       dst_units = g.pending_dst_units
@@ -617,6 +636,139 @@ class BroadcastEngine:
         populated_hops.extend(new_round_hops)
         round_idx += 1
 
+      # Accumulate full-transfer receiver chunk expectations across stages so
+      # OnLayerDataReceived fires once per layer and OnDataReceived fires only
+      # after the final pipeline stage completes for the shared transfer UUID.
+      if g.stage_group is not None:
+        stage_group = g.stage_group
+        seed_shard_layer_counts: dict[int, dict[int, int]] = (
+            collections.defaultdict(lambda: collections.defaultdict(int))
+        )
+        relay_shard_layer_counts: dict[int, dict[int, int]] = (
+            collections.defaultdict(lambda: collections.defaultdict(int))
+        )
+        seen_relay_plans: set[tuple[int, int]] = set()
+        for s_u in stage_group.src_units:
+          var_list = stage_group.stage_ordered_vars_by_unit.get(s_u, [])
+          var_plans = stage_group.canonical_variable_plans.get(s_u, {})
+          for layer_idx, plan_id in var_list:
+            p_dict = var_plans.get(plan_id, {})
+            for tuples_9 in p_dict.values():
+              for t9 in tuples_9:
+                seed_shard_layer_counts[t9[0]][layer_idx] += 1
+            if (layer_idx, plan_id) not in seen_relay_plans:
+              seen_relay_plans.add((layer_idx, plan_id))
+              relay_shards = stage_group.canonical_relay_plans.get(plan_id, {})
+              for local_dst_idx, blocks in relay_shards.items():
+                if blocks:
+                  relay_shard_layer_counts[local_dst_idx][layer_idx] += len(
+                      blocks
+                  )
+
+        for hop in populated_hops:
+          dst_unit = hop.receiver
+          shard_layer_counts = (
+              seed_shard_layer_counts
+              if hop.sender == g.primary_src_unit
+              else relay_shard_layer_counts
+          )
+          dst_addrs = stage_group.data_addresses.get(dst_unit, [])
+          for local_dst_idx, layer_dict in shard_layer_counts.items():
+            dst_peer = (
+                dst_addrs[local_dst_idx]
+                if local_dst_idx < len(dst_addrs)
+                else ""
+            )
+            host_ip = (
+                controller_types._extract_host_ip(dst_peer) if dst_peer else ""
+            )
+            for layer_idx, cnt in layer_dict.items():
+              receiver_block_counts[dst_unit] += cnt
+              receiver_layer_counts[dst_unit][layer_idx] += cnt
+              if host_ip:
+                receiver_endpoint_counts[dst_unit][host_ip] += cnt
+                receiver_endpoint_layer_counts[dst_unit][host_ip][
+                    layer_idx
+                ] += cnt
+      else:
+        for hop in populated_hops:
+          dst_unit = hop.receiver
+          s = hop.sender
+          if s == g.primary_src_unit:
+            for key, k_targets in g.keys_and_sorted_targets:
+              k_size = key[4]
+              k_s_stride = key[5]
+              k_count = key[6]
+              k_layer_idx = key[7]
+              is_contiguous = (k_count == 1) or (k_s_stride == k_size)
+              for idx in hop.dst_indices:
+                k_target = k_targets[idx]
+                k_dst_peer = k_target[1]
+                k_dst_stride = k_target[5]
+                entry_contiguous = is_contiguous and (
+                    k_count == 1 or k_dst_stride == k_size
+                )
+                push_count = 1 if entry_contiguous else k_count
+                receiver_block_counts[dst_unit] += push_count
+                receiver_layer_counts[dst_unit][k_layer_idx] += push_count
+                host_ip = (
+                    controller_types._extract_host_ip(k_dst_peer)
+                    if k_dst_peer
+                    else ""
+                )
+                if host_ip:
+                  receiver_endpoint_counts[dst_unit][host_ip] += push_count
+                  receiver_endpoint_layer_counts[dst_unit][host_ip][
+                      k_layer_idx
+                  ] += push_count
+          else:
+            ref_idx = g.dst_unit_to_indices[s][0]
+            tmp_sched: dict[int, list[Any]] = {}
+            for key, k_targets in g.keys_and_sorted_targets:
+              k_s_target = k_targets[ref_idx]
+              k_s_shard_idx = k_s_target[2]
+              k_s_block_id = k_s_target[3]
+              k_s_block_offset = k_s_target[4]
+              k_s_stride = k_s_target[5]
+              for idx in hop.dst_indices:
+                k_dst_target = k_targets[idx]
+                entry = (
+                    k_dst_target[1],
+                    k_dst_target[2],
+                    k_dst_target[4],
+                    k_s_block_offset,
+                    key[4],
+                    k_s_block_id,
+                    k_dst_target[3],
+                    k_s_stride,
+                    k_dst_target[5],
+                    key[6],
+                    key[7],
+                    key[8],
+                )
+                tmp_sched.setdefault(k_s_shard_idx, []).append(entry)
+            for entries in tmp_sched.values():
+              coalesced_entries = _coalesce_contiguous_relay_entries(
+                  entries, max_chunk_bytes=max_chunk_bytes
+              )
+              for e in coalesced_entries:
+                push_count = (
+                    1
+                    if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4]))
+                    else e[9]
+                )
+                layer_idx = e[10]
+                receiver_block_counts[dst_unit] += push_count
+                receiver_layer_counts[dst_unit][layer_idx] += push_count
+                host_ip = (
+                    controller_types._extract_host_ip(e[0]) if e[0] else ""
+                )
+                if host_ip:
+                  receiver_endpoint_counts[dst_unit][host_ip] += push_count
+                  receiver_endpoint_layer_counts[dst_unit][host_ip][
+                      layer_idx
+                  ] += push_count
+
     round_dests_by_sender: dict[RaidenId, list[Any]] = {}
     for s, rounds_dict in worker_round_destinations.items():
       sorted_rounds = sorted(rounds_dict.keys())
@@ -693,15 +845,9 @@ class BroadcastEngine:
               if s_u in registered_shards
           ])
         else:
-          if s_node in registered_shards and int(dst_mem_type) in (0, 1):
-            await asyncio.gather(
-                self._worker_rpc_client.start_transfer(d_node, plan),
-                self._worker_rpc_client.start_transfer(s_node, plan),
-            )
-          else:
-            await self._worker_rpc_client.start_transfer(d_node, plan)
-            if s_node in registered_shards:
-              await self._worker_rpc_client.start_transfer(s_node, plan)
+          # Arm destination receiver first, then dispatch sender
+          await self._worker_rpc_client.start_transfer(d_node, plan)
+          await self._worker_rpc_client.start_transfer(s_node, plan)
 
     def _dispatch_hop(hop: _HopTask) -> None:
       group = hop.group
@@ -710,12 +856,16 @@ class BroadcastEngine:
       dst_indices = hop.dst_indices
 
       active_pushes[s] += 1
-      hop_uuid = (
-          final_plan.uuid
-          if (final_plan.uuid is not None and final_plan.uuid > 0)
-          else random.randint(1, 2**63 - 1)
-      )
+      hop_uuid = pipeline_uuid
       hop_req_id = f"{req_id}_{group.group_idx}_{dst_unit}_{hop_uuid}"
+
+      dst_total_blocks = receiver_block_counts[dst_unit]
+      dst_layer_counts = dict(receiver_layer_counts[dst_unit])
+      dst_ep_counts = dict(receiver_endpoint_counts[dst_unit])
+      dst_ep_layer_counts = {
+          h: dict(lc)
+          for h, lc in receiver_endpoint_layer_counts[dst_unit].items()
+      }
 
       if group.stage_group is not None:
         stage_group = group.stage_group
@@ -723,7 +873,6 @@ class BroadcastEngine:
           # Trainer -> Seed Sampler: multi-source concurrent push
           s_u_schedules: dict[RaidenId, dict[int, list[Any]]] = {}
           s_u_expected_blocks: dict[RaidenId, int] = {}
-          total_expected_blocks = 0
           for s_u in stage_group.src_units:
             s_u_schedules[s_u] = {}
             s_u_cnt = 0
@@ -750,17 +899,8 @@ class BroadcastEngine:
                       stage_group.pool_group,
                   )
                   s_u_schedules[s_u].setdefault(local_src_idx, []).append(entry)
-                  count = t9[8]
-                  size = t9[3]
-                  src_stride = t9[6]
-                  dst_stride = t9[7]
-                  is_contiguous = (count == 1) or (
-                      src_stride == size and dst_stride == size
-                  )
-                  push_count = 1 if is_contiguous else count
-                  s_u_cnt += push_count
+                  s_u_cnt += 1
             s_u_expected_blocks[s_u] = s_u_cnt
-            total_expected_blocks += s_u_cnt
 
           receiver_plan = type(final_plan)(
               src_units=list(stage_group.src_units),
@@ -781,7 +921,12 @@ class BroadcastEngine:
               dst_mem_type=dst_mem_type,
               use_block_chunks=True,
               is_sender=False,
-              expected_block_count=total_expected_blocks,
+              expected_block_count=dst_total_blocks,
+              dst_expected_block_counts={dst_unit: dst_total_blocks},
+              expected_layer_chunk_counts=dst_layer_counts,
+              dst_expected_layer_chunk_counts={dst_unit: dst_layer_counts},
+              dst_endpoint_counts=dst_ep_counts,
+              dst_endpoint_layer_counts=dst_ep_layer_counts,
               req_id=hop_req_id,
               skip_d2h=final_plan.skip_d2h,
               skip_tiling=final_plan.skip_tiling,
@@ -833,7 +978,6 @@ class BroadcastEngine:
         else:
           # Sampler -> Sampler relay: 1-to-1 whole-block transfer
           sub_schedule: dict[RaidenId, dict[int, list[Any]]] = {s: {}}
-          expected_block_count = 0
           seen_var_plans = set()
           for s_u in stage_group.src_units:
             var_list = stage_group.stage_ordered_vars_by_unit.get(s_u, [])
@@ -860,7 +1004,6 @@ class BroadcastEngine:
                       stage_group.pool_group,
                   )
                   sub_schedule[s].setdefault(local_dst_idx, []).append(entry)
-                  expected_block_count += 1
 
           sub_plan = type(final_plan)(
               src_units=[s],
@@ -881,7 +1024,12 @@ class BroadcastEngine:
               dst_mem_type=dst_mem_type,
               use_block_chunks=True,
               is_sender=True,
-              expected_block_count=expected_block_count,
+              expected_block_count=dst_total_blocks,
+              dst_expected_block_counts={dst_unit: dst_total_blocks},
+              expected_layer_chunk_counts=dst_layer_counts,
+              dst_expected_layer_chunk_counts={dst_unit: dst_layer_counts},
+              dst_endpoint_counts=dst_ep_counts,
+              dst_endpoint_layer_counts=dst_ep_layer_counts,
               req_id=hop_req_id,
               skip_d2h=True,
               skip_tiling=final_plan.skip_tiling,
@@ -897,7 +1045,6 @@ class BroadcastEngine:
       else:
         # Legacy slice-list mode
         sub_schedule: dict[RaidenId, dict[int, list[Any]]] = {s: {}}
-        hop_expected_block_count = 0
         if s == group.primary_src_unit:
           for key, k_targets in group.keys_and_sorted_targets:
             k_s_shard_idx = key[1]
@@ -935,12 +1082,6 @@ class BroadcastEngine:
                   k_pool_group,
               )
               sub_schedule[s].setdefault(k_s_shard_idx, []).append(entry)
-
-              is_contiguous = (k_count == 1) or (
-                  k_s_stride == k_size and k_dst_stride == k_size
-              )
-              push_count = 1 if is_contiguous else k_count
-              hop_expected_block_count += push_count
         else:
           ref_idx = group.dst_unit_to_indices[s][0]
           for key, k_targets in group.keys_and_sorted_targets:
@@ -977,15 +1118,10 @@ class BroadcastEngine:
               )
               sub_schedule[s].setdefault(k_s_shard_idx, []).append(entry)
 
-          hop_expected_block_count = 0
           for shard_idx, entries in list(sub_schedule[s].items()):
             sub_schedule[s][shard_idx] = _coalesce_contiguous_relay_entries(
                 entries,
                 max_chunk_bytes=max_chunk_bytes,
-            )
-            hop_expected_block_count += sum(
-                1 if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4])) else e[9]
-                for e in sub_schedule[s][shard_idx]
             )
 
         sub_plan = type(final_plan)(
@@ -1007,7 +1143,12 @@ class BroadcastEngine:
             dst_mem_type=dst_mem_type,
             use_block_chunks=True,
             is_sender=True,
-            expected_block_count=hop_expected_block_count,
+            expected_block_count=dst_total_blocks,
+            dst_expected_block_counts={dst_unit: dst_total_blocks},
+            expected_layer_chunk_counts=dst_layer_counts,
+            dst_expected_layer_chunk_counts={dst_unit: dst_layer_counts},
+            dst_endpoint_counts=dst_ep_counts,
+            dst_endpoint_layer_counts=dst_ep_layer_counts,
             req_id=hop_req_id,
             skip_d2h=final_plan.skip_d2h or (s != group.src_unit),
             skip_tiling=final_plan.skip_tiling,

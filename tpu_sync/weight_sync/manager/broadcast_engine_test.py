@@ -70,6 +70,11 @@ class BroadcastEngineTest(absltest.TestCase):
     self.assertIn(src, direct)
     self.assertLen(bcast, 1)
 
+    with self.assertRaises(ValueError):
+      broadcast_engine.BroadcastEngine.partition_direct_and_broadcast_groups(
+          groups, n_seed=0
+      )
+
   def test_execute_slice_broadcast_multihop(self) -> None:
     """Verifies multi-hop fanout execution with n_seed=1, 2, 4 and node promotion."""
     for n_seed in (1, 2, 4):
@@ -1308,6 +1313,243 @@ class BroadcastEngineTest(absltest.TestCase):
               "Relay sender hop plan must carry"
               f" parallelism={expected_parallelism}",
           )
+
+
+  def test_stage_broadcast_group_multistage_cumulative_receiver_counts(
+      self,
+  ) -> None:
+    """Verifies multi-stage StageBroadcastGroup arms seed and relay receivers with full-transfer block and layer chunk counts."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(worker_rpc_client=rpc_client)
+
+    train_0 = RaidenId("trainer", "0", "weights", 0)
+    train_1 = RaidenId("trainer", "1", "weights", 0)
+    src_units = [train_0, train_1]
+    dst_units = [RaidenId("sampler", str(i), "weights", 0) for i in range(4)]
+
+    data_addresses = {
+        train_0: ["10.0.0.1:8000"],
+        train_1: ["10.0.0.2:8000"],
+        **{
+            u: [f"10.0.1.{i}:8000", f"10.0.1.{i}:8001"]
+            for i, u in enumerate(dst_units)
+        },
+    }
+    worker_rpc_addresses = {
+        train_0: "10.0.0.1:9000",
+        train_1: "10.0.0.2:9000",
+        **{u: f"10.0.1.{i}:9000" for i, u in enumerate(dst_units)},
+    }
+
+    # Each trainer pushes 1 slice to dst shard 0 and 1 slice to dst shard 1
+    # (4 slices per layer for seed samplers, 2 whole blocks per layer for relay samplers)
+    canonical_var_plans = {
+        train_0: {
+            100: {
+                0: [
+                    (0, 0, 0, 512, 0, 0, 512, 512, 1),
+                    (1, 0, 0, 512, 1, 1, 512, 512, 1),
+                ]
+            }
+        },
+        train_1: {
+            100: {
+                0: [
+                    (0, 512, 0, 512, 0, 0, 512, 512, 1),
+                    (1, 512, 0, 512, 1, 1, 512, 512, 1),
+                ]
+            }
+        },
+    }
+    canonical_relay = {
+        100: {
+            0: [(0, 1024, 0)],
+            1: [(0, 1024, 1)],
+        }
+    }
+
+    # 3 stages: Stage 0 (layers 0, 1), Stage 1 (layers 2, 3), Stage 2 (layers 4, 5)
+    groups_list = []
+    for stage_idx, layers in enumerate([(0, 1), (2, 3), (4, 5)]):
+      groups_list.append(
+          controller_types.StageBroadcastGroup(
+              pool_group=0,
+              layer_group_idx=stage_idx,
+              src_units=src_units,
+              dst_units=dst_units,
+              stage_ordered_vars_by_unit={
+                  train_0: [(l, 100) for l in layers],
+                  train_1: [(l, 100) for l in layers],
+              },
+              canonical_variable_plans=canonical_var_plans,
+              canonical_relay_plans=canonical_relay,
+              data_addresses=data_addresses,
+          )
+      )
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=src_units,
+        dst_units=dst_units,
+        plan=None,
+        worker_data_addresses=data_addresses,
+        worker_rpc_addresses=worker_rpc_addresses,
+        uuid=777,
+        is_weight_sync=True,
+    )
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            n_seed=2,
+            req_id="req_multistage_sbg",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards={
+                u: data_addresses[u] for u in src_units + dst_units
+            },
+            pipeline_target_stages=3,
+        )
+    )
+
+    # Seed samplers (dst_units[0], dst_units[1]):
+    # 6 layers total * 4 chunks/layer = 24 total chunks
+    expected_seed_layers = {l: 4 for l in range(6)}
+    for i in (0, 1):
+      seed = dst_units[i]
+      host_ip = f"10.0.1.{i}"
+      seed_recv_plans = [
+          plan
+          for target_id, plan in rpc_client.invocations
+          if target_id == seed and not plan.is_sender
+      ]
+      self.assertLen(seed_recv_plans, 3)
+      for plan in seed_recv_plans:
+        self.assertEqual(plan.uuid, 777)
+        self.assertEqual(plan.expected_block_count, 24)
+        self.assertEqual(plan.dst_expected_block_counts[seed], 24)
+        self.assertEqual(plan.expected_layer_chunk_counts, expected_seed_layers)
+        self.assertEqual(
+            plan.dst_expected_layer_chunk_counts[seed], expected_seed_layers
+        )
+        self.assertEqual(plan.dst_endpoint_counts, {host_ip: 24})
+        self.assertEqual(
+            plan.dst_endpoint_layer_counts, {host_ip: expected_seed_layers}
+        )
+
+    # Relay samplers (dst_units[2], dst_units[3]):
+    # 6 layers total * 2 whole blocks/layer (1 per shard) = 12 total chunks
+    expected_relay_layers = {l: 2 for l in range(6)}
+    for i in (2, 3):
+      relay_dst = dst_units[i]
+      host_ip = f"10.0.1.{i}"
+      relay_recv_plans = [
+          plan
+          for target_id, plan in rpc_client.invocations
+          if target_id == relay_dst and plan.dst_units == [relay_dst]
+      ]
+      self.assertLen(relay_recv_plans, 3)
+      for plan in relay_recv_plans:
+        self.assertEqual(plan.uuid, 777)
+        self.assertEqual(plan.expected_block_count, 12)
+        self.assertEqual(plan.dst_expected_block_counts[relay_dst], 12)
+        self.assertEqual(
+            plan.expected_layer_chunk_counts, expected_relay_layers
+        )
+        self.assertEqual(
+            plan.dst_expected_layer_chunk_counts[relay_dst],
+            expected_relay_layers,
+        )
+        self.assertEqual(plan.dst_endpoint_counts, {host_ip: 12})
+        self.assertEqual(
+            plan.dst_endpoint_layer_counts, {host_ip: expected_relay_layers}
+        )
+
+  def test_slice_broadcast_pipeline_multistage_cumulative_receiver_counts(
+      self,
+  ) -> None:
+    """Verifies legacy slice-list multi-stage pipeline arms seed and relay receivers with full-transfer block and layer counts."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(worker_rpc_client=rpc_client)
+
+    src = RaidenId(job_name="src", job_replica_id="0", data_name="w")
+    seed = RaidenId(job_name="sampler", job_replica_id="0", data_name="w")
+    relay = RaidenId(job_name="sampler", job_replica_id="1", data_name="w")
+
+    # 2 stages, each with 1 layer having 2 contiguous 512B slices on shard 0:
+    # Seed receives 2 slices per layer (4 total across 2 layers);
+    # Relay coalesces the 2 contiguous slices into 1 chunk per layer (2 total across 2 layers).
+    groups_list = []
+    for layer_idx in (0, 1):
+      key_a = (src, 0, layer_idx, 0, 512, 0, 1, layer_idx, 0)
+      key_b = (src, 0, layer_idx, 512, 512, 0, 1, layer_idx, 0)
+      targets_a = [
+          (seed, "10.0.2.0:8000", 0, layer_idx, 0, 0),
+          (relay, "10.0.2.1:8000", 0, layer_idx, 0, 0),
+      ]
+      targets_b = [
+          (seed, "10.0.2.0:8000", 0, layer_idx, 512, 0),
+          (relay, "10.0.2.1:8000", 0, layer_idx, 512, 0),
+      ]
+      groups_list.append([(key_a, targets_a), (key_b, targets_b)])
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=[seed, relay],
+        plan=None,
+        worker_data_addresses={
+            src: ["10.0.0.1:8000"],
+            seed: ["10.0.2.0:8000"],
+            relay: ["10.0.2.1:8000"],
+        },
+        uuid=888,
+        is_weight_sync=True,
+    )
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            n_seed=1,
+            req_id="req_multistage_slice",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards={src: ["s0"], seed: ["s0"], relay: ["s0"]},
+            pipeline_target_stages=2,
+        )
+    )
+
+    seed_recv_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == seed and plan.dst_units == [seed]
+    ]
+    self.assertLen(seed_recv_plans, 2)
+    for plan in seed_recv_plans:
+      self.assertEqual(plan.uuid, 888)
+      self.assertEqual(plan.expected_block_count, 4)
+      self.assertEqual(plan.dst_expected_block_counts[seed], 4)
+      self.assertEqual(plan.expected_layer_chunk_counts, {0: 2, 1: 2})
+      self.assertEqual(plan.dst_endpoint_counts, {"10.0.2.0": 4})
+      self.assertEqual(
+          plan.dst_endpoint_layer_counts, {"10.0.2.0": {0: 2, 1: 2}}
+      )
+
+    relay_recv_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == relay and plan.dst_units == [relay]
+    ]
+    self.assertLen(relay_recv_plans, 2)
+    for plan in relay_recv_plans:
+      self.assertEqual(plan.uuid, 888)
+      self.assertEqual(plan.expected_block_count, 2)
+      self.assertEqual(plan.dst_expected_block_counts[relay], 2)
+      self.assertEqual(plan.expected_layer_chunk_counts, {0: 1, 1: 1})
+      self.assertEqual(plan.dst_endpoint_counts, {"10.0.2.1": 2})
+      self.assertEqual(
+          plan.dst_endpoint_layer_counts, {"10.0.2.1": {0: 1, 1: 1}}
+      )
 
 
 if __name__ == "__main__":

@@ -1195,7 +1195,9 @@ class ReshardPlanner:
 
       # Track direct block counts during template expansion when tree broadcast
       # cannot be triggered (len(dst_meta_info) <= n_seed).
-      can_fast_path_direct = len(dst_meta_info) <= n_seed
+      can_fast_path_direct = (
+          broadcast_host_ratio <= 0.0 or len(dst_meta_info) <= n_seed
+      )
       fast_dst_unit_counts = {}
       fast_dst_unit_layer_counts = {}
       fast_dst_endpoint_counts = {}
@@ -1916,10 +1918,7 @@ class ReshardPlanner:
                 src_stride = t9[6]
                 dst_stride = t9[7]
                 count = t9[8]
-                is_contiguous = (count == 1) or (
-                    src_stride == size and dst_stride == size
-                )
-                push_count = 1 if is_contiguous else count
+                push_count = 1
                 layer_cnt += push_count
             stage_blocks += layer_cnt
             for d_u in dst_units:
