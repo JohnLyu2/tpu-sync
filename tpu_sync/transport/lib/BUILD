@@ -63,6 +63,15 @@ cc_library(
 )
 
 cc_library(
+    name = "transport_metrics_exporter",
+    srcs = ["transport_metrics_exporter.cc"],
+    hdrs = ["transport_metrics_exporter.h"],
+    deps = [
+        "@peregrine//peregrine/src/api:transport_metrics",
+    ],
+)
+
+cc_library(
     name = "socket_transport_adapter",
     srcs = ["socket_transport_adapter.cc"],
     hdrs = ["socket_transport_adapter.h"],
