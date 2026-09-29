@@ -187,6 +187,8 @@ class ReshardPlannerTest(absltest.TestCase):
           vp.item_size = v.item_size
           vp.layer_idx = v.layer_idx
           vp.sharding_spec.extend(v.sharding_spec)
+          if getattr(v, "global_shard_indices", None):
+            vp.global_shard_indices.extend(v.global_shard_indices)
         proto_vars = list(tmpl.variables)
         proto_vars_cache[id(u_vars)] = proto_vars
       meta.variables.extend(proto_vars)
@@ -822,6 +824,131 @@ class ReshardPlannerTest(absltest.TestCase):
         )
     )
     self.assertEqual(sched_r025.n_seed, 2)
+
+  def test_multi_host_destination_equivalence_class_broadcast(self):
+    """Verifies disjoint broadcast trees for multi-host (:0 and :1) rollout replicas."""
+    src_units = [RaidenId("train", str(i), "w", 0) for i in range(16)]
+    dst_units = []
+    for r in range(8):
+      dst_units.append(RaidenId(f"roll-{r}", "0", "w", 0))
+      dst_units.append(RaidenId(f"roll-{r}", "1", "w", 0))
+
+    src_vars_by_unit = {}
+    for i, u in enumerate(src_units):
+      src_vars_by_unit[u] = [
+          reshard_planner._VariableMetadata(
+              name="layer0.weight",
+              shape=[128, 256],
+              mesh_shape=[16, 8],
+              layout=[1, 0],
+              item_size=2,
+              layer_idx=0,
+              sharding_spec=["fsdp", "tp"],
+              global_shard_indices=list(range(i * 8, (i + 1) * 8)),
+          )
+      ]
+
+    dst_vars_by_unit = {}
+    for d_u in dst_units:
+      host_idx = int(d_u.job_replica_id)
+      dst_vars_by_unit[d_u] = [
+          reshard_planner._VariableMetadata(
+              name="layer0.weight",
+              shape=[128, 256],
+              mesh_shape=[1, 16],
+              layout=[1, 0],
+              item_size=2,
+              layer_idx=0,
+              sharding_spec=["", "tp"],
+              global_shard_indices=list(
+                  range(host_idx * 8, (host_idx + 1) * 8)
+              ),
+          )
+      ]
+
+    inputs = self._build_planner_inputs(
+        src_vars_by_unit=src_vars_by_unit,
+        dst_vars_by_unit=dst_vars_by_unit,
+        src_phys_mesh=[4, 4, 8],
+        src_mesh_axes=["x", "y", "z"],
+        src_host_subgrid=[2, 2, 2],
+        dst_phys_mesh=[2, 2, 4],
+        dst_mesh_axes=["x", "y", "z"],
+        dst_host_subgrid=[2, 2, 2],
+        broadcast_host_ratio=0.25,
+    )
+    sched = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **inputs
+        )
+    )
+    self.assertEqual(sched.n_seed, 2)
+    self.assertEmpty(sched.direct_schedules)
+    self.assertLen(sched.broadcast_groups, 2)
+    sg0 = sched.broadcast_groups[(0, 0)]
+    sg1 = sched.broadcast_groups[(1, 0)]
+    self.assertEqual([u.job_replica_id for u in sg0.dst_units], ["0"] * 8)
+    self.assertEqual([u.job_replica_id for u in sg1.dst_units], ["1"] * 8)
+    for sg in (sg0, sg1):
+      seed_block_ids_for_shard0 = set()
+      for u_plans in sg.canonical_variable_plans.values():
+        for shard_dict in u_plans.values():
+          for tuples_9 in shard_dict.values():
+            for t9 in tuples_9:
+              if t9[0] == 0:
+                seed_block_ids_for_shard0.add(t9[5])
+      # Multiple FSDP source shards produce distinct sub-row t9[5] block IDs,
+      # which coalesce into a single whole-buffer relay block with
+      # dst_block_id=0.
+      self.assertGreater(len(seed_block_ids_for_shard0), 1)
+      for pid_relays in sg.canonical_relay_plans.values():
+        self.assertLen(pid_relays, 8)
+        for blocks in pid_relays.values():
+          self.assertLen(blocks, 1)
+          self.assertEqual(blocks[0][1], 256)
+          self.assertEqual(blocks[0][2], 0)
+
+    # With broadcast_host_ratio=0.5, 16 source hosts / 2 dst hosts per replica
+    # * 0.5 = 4 seeds per equivalence class.
+    inputs_r05 = dict(inputs, broadcast_host_ratio=0.5)
+    sched_r05 = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **inputs_r05
+        )
+    )
+    self.assertEqual(sched_r05.n_seed, 4)
+
+  def test_destination_equivalence_class_missing_metadata_raises(self):
+    src_units = [RaidenId("train", "0", "w", 0)]
+    dst_units = [
+        RaidenId("roll-0", "0", "w", 0),
+        RaidenId("roll-0", "1", "w", 0),
+    ]
+    v_meta = [
+        reshard_planner._VariableMetadata(
+            name="layer0.weight",
+            shape=[16, 16],
+            mesh_shape=[1, 1],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=0,
+        )
+    ]
+    inputs = self._build_planner_inputs(
+        src_vars_by_unit={src_units[0]: v_meta},
+        dst_vars_by_unit={u: v_meta for u in dst_units},
+        src_phys_mesh=[1, 1],
+        src_mesh_axes=["x", "y"],
+        src_host_subgrid=[1, 1],
+        dst_phys_mesh=[1, 1],
+        dst_mesh_axes=["x", "y"],
+        dst_host_subgrid=[1, 1],
+    )
+    inputs["dst_metadata"] = inputs["dst_metadata"][:1]
+    with self.assertRaisesRegex(ValueError, "missing from dst_meta_info"):
+      reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+          **inputs
+      )
 
 
 if __name__ == "__main__":

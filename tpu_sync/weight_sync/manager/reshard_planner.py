@@ -823,6 +823,10 @@ class ReshardPlanner:
           raise ValueError(f"Work unit is not registered: {u}")
         return list(shards)
 
+    def _count_hosts_for_shards(shards: Sequence[str]) -> int:
+      hosts = {_extract_host_ip(s) for s in shards if _extract_host_ip(s)}
+      return max(1, len(hosts))
+
     variable_plans = {}
     variable_to_plan_id = {}
     canonical_relay_plans = {}
@@ -830,7 +834,10 @@ class ReshardPlanner:
 
     if not src_units:
       raise ValueError("src_units must not be empty")
-    num_src_hosts = sum(len(resolve_shards_locked(u)) for u in src_units)
+    total_src_hosts = sum(
+        _count_hosts_for_shards(resolve_shards_locked(u)) for u in src_units
+    )
+    num_src_hosts = total_src_hosts
 
     if dst_metadata:
       if dst_metadata[0].shards:
@@ -845,7 +852,7 @@ class ReshardPlanner:
       num_dst_units = len(dst_units)
     else:
       raise ValueError("dst_metadata or dst_units must not be empty")
-    num_dst_hosts_per_unit = len(dst_shards_0)
+    num_dst_hosts_per_unit = _count_hosts_for_shards(dst_shards_0)
 
     n_seed = compute_bandwidth_matched_seed(
         broadcast_host_ratio=broadcast_host_ratio,
@@ -1192,11 +1199,111 @@ class ReshardPlanner:
 
       dst_group_sig_by_name = {}
       dst_units_index = {u: i for i, u in enumerate(dst_units)}
+      dst_indices_cache = {}
+
+      # Partition dst_units into shard-slice equivalence classes so multi-host
+      # destination replicas (e.g. :0 holding shards 0..7 and :1 holding shards
+      # 8..15) form disjoint broadcast trees per replica-host role.
+      dst_eq_classes: list[list[RaidenId]] = []
+      dst_unit_to_eq_class: dict[RaidenId, int] = {}
+      eq_sig_to_class_idx: dict[tuple[Any, ...], int] = {}
+      expected_num_key_parts: Optional[int] = None
+      for d_u in dst_units:
+        if d_u not in dst_meta_info:
+          raise ValueError(
+              f"Destination unit {d_u} is missing from dst_meta_info"
+          )
+        d_vars = dst_vars_by_unit.get(d_u, [])
+        d_shards, d_phys_mesh, d_mesh_axes, d_host_subgrid = dst_meta_info[d_u]
+        num_d_phys_hosts = max(
+            1, len(dst_job_replicas_by_job.get(d_u.job_name, set()))
+        )
+        seen_d_sigs = set()
+        unit_eq_key_parts = []
+        for d_var in d_vars:
+          d_sig = dst_sig_by_unit_and_name.get(d_u, {}).get(d_var.name)
+          if d_sig is None:
+            raise ValueError(
+                f"Variable {d_var.name} on destination unit {d_u} is missing"
+                " signature"
+            )
+          if d_sig in seen_d_sigs:
+            continue
+          seen_d_sigs.add(d_sig)
+          d_nd_slices = computed_nd_slices.get(d_u, {}).get(d_var.name)
+          if not d_nd_slices:
+            raise ValueError(
+                f"Variable {d_var.name} on destination unit {d_u} is missing"
+                " computed nd_slices"
+            )
+          cache_key = (d_u, d_sig)
+          d_indices = dst_indices_cache.get(cache_key)
+          if d_indices is None:
+            d_global_shard_indices = (
+                list(d_var.global_shard_indices)
+                if getattr(d_var, "global_shard_indices", None)
+                else None
+            )
+            d_indices = _get_global_indices(
+                d_u,
+                d_shards,
+                list(d_var.mesh_shape),
+                list(d_var.layout),
+                num_d_phys_hosts,
+                sharding_spec=list(d_var.sharding_spec),
+                mesh_axes=d_mesh_axes,
+                physical_mesh_shape=d_phys_mesh,
+                host_subgrid=d_host_subgrid,
+                global_shard_indices=d_global_shard_indices,
+            )
+            dst_indices_cache[cache_key] = d_indices
+          slice_pairs = tuple(
+              (l_idx, d_nd_slices[g_idx])
+              for l_idx, g_idx in d_indices
+              if g_idx < len(d_nd_slices)
+          )
+          unit_eq_key_parts.append((d_sig[:4], slice_pairs))
+        if expected_num_key_parts is None:
+          expected_num_key_parts = len(unit_eq_key_parts)
+        elif len(unit_eq_key_parts) != expected_num_key_parts:
+          raise ValueError(
+              f"Destination unit {d_u} produced {len(unit_eq_key_parts)}"
+              f" equivalence key parts, expected {expected_num_key_parts}"
+          )
+        eq_sig = tuple(unit_eq_key_parts)
+        eq_idx = eq_sig_to_class_idx.get(eq_sig)
+        if eq_idx is None:
+          eq_idx = len(dst_eq_classes)
+          eq_sig_to_class_idx[eq_sig] = eq_idx
+          dst_eq_classes.append([])
+        dst_eq_classes[eq_idx].append(d_u)
+        dst_unit_to_eq_class[d_u] = eq_idx
+
+      if not dst_eq_classes:
+        raise ValueError(
+            "Destination equivalence class partitioning produced no classes"
+        )
+
+      max_eq_class_len = max((len(c) for c in dst_eq_classes), default=0)
+      if len(dst_eq_classes) > 1 and max_eq_class_len > 0:
+        num_dst_hosts_per_replica = sum(
+            _count_hosts_for_shards(dst_meta_info[c[0]][0])
+            for c in dst_eq_classes
+            if c
+        )
+        n_seed = compute_bandwidth_matched_seed(
+            broadcast_host_ratio=broadcast_host_ratio,
+            num_src_hosts=total_src_hosts,
+            num_dst_hosts_per_unit=max(1, num_dst_hosts_per_replica),
+            num_dst_units=max_eq_class_len,
+        )
 
       # Track direct block counts during template expansion when tree broadcast
-      # cannot be triggered (len(dst_meta_info) <= n_seed).
+      # cannot be triggered (max_eq_class_len <= n_seed) or broadcast is
+      # disabled.
       can_fast_path_direct = (
-          broadcast_host_ratio <= 0.0 or len(dst_meta_info) <= n_seed
+          broadcast_host_ratio <= 0.0
+          or (max_eq_class_len or len(dst_meta_info)) <= n_seed
       )
       fast_dst_unit_counts = {}
       fast_dst_unit_layer_counts = {}
@@ -1211,16 +1318,22 @@ class ReshardPlanner:
       # is stored once in `variable_plans[src_unit][plan_id]`, and every
       # variable (`layer_idx`) stores `variable_to_plan_id[src_unit][layer_idx]`
       # referring to `plan_id`.
-      dst_indices_cache = {}
       dst_targets_cache = {}
       chunk_descriptor_cache = {}
       active_slice_chunks_cache = {}
       slice_candidate_cache = {}
       global_sig_to_plan_id = {}
-      variable_plans = {}
+      num_eq_classes = len(dst_eq_classes)
+      variable_plans_by_eq_class: list[dict[RaidenId, dict[int, Any]]] = [
+          {} for _ in range(num_eq_classes)
+      ]
+      variable_plans = variable_plans_by_eq_class[0]
       variable_to_plan_id = {}
       unit_ordered_vars_by_unit = {}
-      canonical_relay_plans = {}
+      canonical_relay_plans_by_eq_class: list[dict[int, Any]] = [
+          {} for _ in range(num_eq_classes)
+      ]
+      canonical_relay_plans = canonical_relay_plans_by_eq_class[0]
       plan_classification_cache = {}
       plan_unit_counts_by_pid = {}
       plan_host_counts_by_pid = {}
@@ -1228,7 +1341,9 @@ class ReshardPlanner:
       for src_unit_idx, src_unit in enumerate(src_units):
         src_vars = src_vars_by_unit.get(src_unit, [])
         src_shards = resolve_shards_locked(src_unit)
-        unit_plans_by_id = {}
+        unit_plans_by_eq_and_id: list[dict[int, Any]] = [
+            {} for _ in range(num_eq_classes)
+        ]
         unit_shard_plans_by_id = {}
         unit_shard_pid_dst_units = {}
 
@@ -1370,6 +1485,7 @@ class ReshardPlanner:
           if dst_target_bundle is None:
             dst_targets = []
             dst_targets_by_slice = {}
+            rep_targets_by_eq = {}
             for dst_unit in dst_units:
               dst_var = dst_vars_by_unit_and_name.get(dst_unit, {}).get(
                   var_name
@@ -1452,19 +1568,29 @@ class ReshardPlanner:
                     data_address_to_host.get(dst_peer),
                 ))
 
-              dst_targets.append((
+              target_tuple = (
                   dst_unit,
                   dst_unit_idx,
                   is_dst_legacy,
                   num_dst_shards,
                   dst_shard_items,
-              ))
-            dst_target_bundle = (dst_targets, dst_targets_by_slice)
+              )
+              dst_targets.append(target_tuple)
+              eq_idx = dst_unit_to_eq_class.get(dst_unit, 0)
+              if eq_idx not in rep_targets_by_eq:
+                rep_targets_by_eq[eq_idx] = target_tuple
+            dst_target_bundle = (
+                dst_targets,
+                dst_targets_by_slice,
+                rep_targets_by_eq,
+            )
             dst_targets_cache[dst_group_sig] = dst_target_bundle
           else:
-            dst_targets, dst_targets_by_slice = dst_target_bundle
+            dst_targets, dst_targets_by_slice, rep_targets_by_eq = (
+                dst_target_bundle
+            )
 
-          canonical_template_for_var = {}
+          canonical_templates_by_eq = [{} for _ in range(num_eq_classes)]
           tmpl_unit_counts = {}
           tmpl_host_counts = {}
           is_src_legacy = is_legacy_by_unit.get(src_unit, True)
@@ -1596,14 +1722,15 @@ class ReshardPlanner:
             if not active_slice_chunks:
               continue
 
-            if dst_targets:
+            for eq_idx, rep_target in rep_targets_by_eq.items():
               (
                   _,
                   _,
                   is_canonical_legacy,
-                  _,
+                  rep_num_shards,
                   canonical_shard_items,
-              ) = dst_targets[0]
+              ) = rep_target
+              eq_tmpl = canonical_templates_by_eq[eq_idx]
               for local_dst_idx, dst_slice, _ in canonical_shard_items:
                 converted_chunks = active_slice_chunks.get(
                     (dst_slice, is_canonical_legacy)
@@ -1611,13 +1738,13 @@ class ReshardPlanner:
                 if not converted_chunks:
                   continue
                 if num_candidates > 1:
-                  dst_global_idx = local_dst_idx
+                  dst_global_idx = eq_idx * rep_num_shards + local_dst_idx
                   if dst_global_idx % num_candidates != candidate_rank:
                     continue
                 for chunk_desc in converted_chunks:
-                  canonical_template_for_var.setdefault(
-                      local_src_idx, []
-                  ).append((local_dst_idx, *chunk_desc))
+                  eq_tmpl.setdefault(local_src_idx, []).append(
+                      (local_dst_idx, *chunk_desc)
+                  )
 
             if can_fast_path_direct:
               template_entries = []
@@ -1735,7 +1862,10 @@ class ReshardPlanner:
                     shard_dst_units_order
                 )
 
-          unit_plans_by_id[plan_id] = canonical_template_for_var
+          for eq_idx in range(num_eq_classes):
+            unit_plans_by_eq_and_id[eq_idx][plan_id] = (
+                canonical_templates_by_eq[eq_idx]
+            )
           if can_fast_path_direct:
             layers_tuple = unit_layers_tuple_by_pid.get(plan_id, ())
             if layers_tuple:
@@ -1747,7 +1877,10 @@ class ReshardPlanner:
               for d_h, cnt in tmpl_host_counts.items():
                 pid_h_counts[d_h] = pid_h_counts.get(d_h, 0) + cnt
 
-        variable_plans[src_unit] = unit_plans_by_id
+        for eq_idx in range(num_eq_classes):
+          variable_plans_by_eq_class[eq_idx][src_unit] = (
+              unit_plans_by_eq_and_id[eq_idx]
+          )
         variable_to_plan_id[src_unit] = dict(unit_var_to_plan_id)
         unit_ordered_vars_by_unit[src_unit] = unit_ordered_vars
         if unit_shard_plans_by_id:
@@ -1797,42 +1930,66 @@ class ReshardPlanner:
             for l_idx in layers_tuple:
               h_layer_map[l_idx] = h_layer_map.get(l_idx, 0) + cnt
 
-      canonical_relay_plans = {}
-      all_plan_ids = set()
-      for u_plans in variable_plans.values():
-        all_plan_ids.update(u_plans.keys())
+      for eq_idx, eq_var_plans in enumerate(variable_plans_by_eq_class):
+        eq_dst_units = dst_eq_classes[eq_idx]
+        eq_is_legacy = (
+            is_legacy_by_unit.get(eq_dst_units[0], True)
+            if eq_dst_units
+            else True
+        )
+        all_plan_ids = set()
+        for u_plans in eq_var_plans.values():
+          all_plan_ids.update(u_plans.keys())
 
-      for pid in all_plan_ids:
-        blocks_by_dst: dict[tuple[int, int], list[int]] = {}
-        for u in src_units:
-          u_plans = variable_plans.get(u, {})
-          tuples_by_shard = u_plans.get(pid, {})
-          for local_src_idx, tuples_9 in tuples_by_shard.items():
-            for t9 in tuples_9:
-              local_dst_idx = t9[0]
-              dst_block_offset = t9[1]
-              size = t9[3]
-              dst_block_id = t9[5]
-              dst_stride = t9[7]
-              count = t9[8]
-              cur_end = dst_block_offset + (count - 1) * dst_stride + size
-              key = (local_dst_idx, dst_block_id)
-              if key not in blocks_by_dst:
-                blocks_by_dst[key] = [dst_block_offset, cur_end]
-              else:
-                cur = blocks_by_dst[key]
-                if dst_block_offset < cur[0]:
-                  cur[0] = dst_block_offset
-                if cur_end > cur[1]:
-                  cur[1] = cur_end
+        eq_relay_plans = canonical_relay_plans_by_eq_class[eq_idx]
+        for pid in all_plan_ids:
+          blocks_by_dst: dict[tuple[int, int], list[int]] = {}
+          for u in src_units:
+            u_plans = eq_var_plans.get(u, {})
+            tuples_by_shard = u_plans.get(pid, {})
+            for local_src_idx, tuples_9 in tuples_by_shard.items():
+              for t9 in tuples_9:
+                local_dst_idx = t9[0]
+                dst_block_offset = t9[1]
+                size = t9[3]
+                # For non-legacy variable weight sync, each variable occupies a
+                # single contiguous device buffer and dst_block_offset is an
+                # absolute byte offset into that buffer (rather than a
+                # block-relative offset). Normalizing dst_block_id to 0 allows
+                # row chunks arriving from distinct FSDP source shards (which
+                # carry different t9[5] = dst_offset // dst_block_bytes sub-row
+                # indices) to coalesce into a single whole-buffer relay range.
+                dst_block_id = (
+                    0 if (not eq_is_legacy and num_eq_classes > 1) else t9[5]
+                )
+                dst_stride = t9[7]
+                count = t9[8]
+                cur_end = dst_block_offset + (count - 1) * dst_stride + size
+                key = (local_dst_idx, dst_block_id)
+                if key not in blocks_by_dst:
+                  blocks_by_dst[key] = [dst_block_offset, cur_end]
+                else:
+                  cur = blocks_by_dst[key]
+                  if dst_block_offset < cur[0]:
+                    cur[0] = dst_block_offset
+                  if cur_end > cur[1]:
+                    cur[1] = cur_end
 
-        canonical_relay_plans[pid] = {}
-        for (local_dst_idx, dst_block_id), (min_off, max_end) in sorted(
-            blocks_by_dst.items(), key=lambda item: (item[0][0], item[0][1])
-        ):
-          canonical_relay_plans[pid].setdefault(local_dst_idx, []).append(
-              (min_off, max_end - min_off, dst_block_id)
-          )
+          eq_relay_plans[pid] = {}
+          for (local_dst_idx, dst_block_id), (min_off, max_end) in sorted(
+              blocks_by_dst.items(),
+              key=lambda item: (item[0][0], item[1][0], item[0][1]),
+          ):
+            shard_blocks = eq_relay_plans[pid].setdefault(local_dst_idx, [])
+            if not eq_is_legacy and shard_blocks:
+              prev_off, prev_size, prev_bid = shard_blocks[-1]
+              prev_end = prev_off + prev_size
+              if min_off < prev_end:
+                new_end = max(prev_end, max_end)
+                shard_blocks[-1] = (prev_off, new_end - prev_off, prev_bid)
+                continue
+            shard_blocks.append((min_off, max_end - min_off, dst_block_id))
+      canonical_relay_plans = canonical_relay_plans_by_eq_class[0]
 
     # Build rpc_addresses for local source workers
     rpc_addresses = dict(worker_endpoints)
@@ -1895,50 +2052,52 @@ class ReshardPlanner:
         lg_idx = l_idx // group_size if group_size > 1 else l_idx
         layer_group_map.setdefault(lg_idx, []).append(l_idx)
 
-      total_seed_blocks = 0
+      dst_unit_counts = {}
       dst_unit_layer_counts = {}
-      for lg_idx, l_indices in layer_group_map.items():
-        l_set = set(l_indices)
-        stage_ordered_vars_by_unit = {}
-        stage_blocks = 0
-        for u in src_units:
-          u_vars = [
-              (l_idx, pid)
-              for (l_idx, pid) in unit_ordered_vars_by_unit.get(u, [])
-              if l_idx in l_set
-          ]
-          stage_ordered_vars_by_unit[u] = u_vars
-          u_plans = variable_plans.get(u, {})
-          for l_idx, pid in u_vars:
-            tuples_by_shard = u_plans.get(pid, {})
-            layer_cnt = 0
-            for local_src_idx, tuples_9 in tuples_by_shard.items():
-              for t9 in tuples_9:
-                size = t9[3]
-                src_stride = t9[6]
-                dst_stride = t9[7]
-                count = t9[8]
-                push_count = 1
-                layer_cnt += push_count
-            stage_blocks += layer_cnt
-            for d_u in dst_units:
-              dst_unit_layer_counts.setdefault(d_u, {})[l_idx] = layer_cnt
+      for eq_idx, eq_dst_units in enumerate(dst_eq_classes):
+        eq_var_plans = variable_plans_by_eq_class[eq_idx]
+        eq_relay_plans = canonical_relay_plans_by_eq_class[eq_idx]
+        eq_total_seed_blocks = 0
+        for lg_idx, l_indices in layer_group_map.items():
+          l_set = set(l_indices)
+          stage_ordered_vars_by_unit = {}
+          stage_blocks = 0
+          for u in src_units:
+            u_vars = [
+                (l_idx, pid)
+                for (l_idx, pid) in unit_ordered_vars_by_unit.get(u, [])
+                if l_idx in l_set
+            ]
+            stage_ordered_vars_by_unit[u] = u_vars
+            u_plans = eq_var_plans.get(u, {})
+            for l_idx, pid in u_vars:
+              tuples_by_shard = u_plans.get(pid, {})
+              layer_cnt = 0
+              for local_src_idx, tuples_9 in tuples_by_shard.items():
+                layer_cnt += len(tuples_9)
+              stage_blocks += layer_cnt
+              for d_u in eq_dst_units:
+                dst_layer_map = dst_unit_layer_counts.setdefault(d_u, {})
+                dst_layer_map[l_idx] = dst_layer_map.get(l_idx, 0) + layer_cnt
 
-        total_seed_blocks += stage_blocks
-        stage_group = _StageBroadcastGroup(
-            pool_group=0,
-            layer_group_idx=lg_idx,
-            src_units=list(src_units),
-            dst_units=list(dst_units),
-            stage_ordered_vars_by_unit=stage_ordered_vars_by_unit,
-            canonical_variable_plans=variable_plans,
-            canonical_relay_plans=canonical_relay_plans,
-            data_addresses=dict(data_addresses),
-        )
-        broadcast_groups[(0, lg_idx)] = stage_group
+          eq_total_seed_blocks += stage_blocks
+          stage_group = _StageBroadcastGroup(
+              pool_group=eq_idx,
+              layer_group_idx=lg_idx,
+              src_units=list(src_units),
+              dst_units=list(eq_dst_units),
+              stage_ordered_vars_by_unit=stage_ordered_vars_by_unit,
+              canonical_variable_plans=eq_var_plans,
+              canonical_relay_plans=eq_relay_plans,
+              data_addresses=dict(data_addresses),
+          )
+          broadcast_groups[(eq_idx, lg_idx)] = stage_group
+        for d_u in eq_dst_units:
+          dst_unit_counts[d_u] = eq_total_seed_blocks
 
-      computed_expected_block_count = total_seed_blocks
-      dst_unit_counts = {u: total_seed_blocks for u in dst_units}
+      computed_expected_block_count = (
+          max(dst_unit_counts.values()) if dst_unit_counts else 0
+      )
       dst_endpoint_counts = {}
       dst_endpoint_layer_counts = {}
       direct_dsts = []
