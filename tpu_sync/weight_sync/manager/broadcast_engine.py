@@ -965,6 +965,9 @@ class BroadcastEngine:
                 is_weight_sync=final_plan.is_weight_sync,
                 broadcast_round=hop.round_idx,
                 broadcast_round_destinations=round_dests_by_sender.get(s_u, []),
+                cached_serialized_payloads=getattr(
+                    final_plan, "cached_serialized_payloads", {}
+                ),
             )
 
           task = asyncio.create_task(
@@ -1051,6 +1054,9 @@ class BroadcastEngine:
               is_weight_sync=final_plan.is_weight_sync,
               broadcast_round=hop.round_idx,
               broadcast_round_destinations=round_dests_by_sender.get(s, []),
+              cached_serialized_payloads=getattr(
+                  final_plan, "cached_serialized_payloads", {}
+              ),
           )
           task = asyncio.create_task(
               _run_single_transfer(s, dst_unit, sub_plan)
@@ -1170,6 +1176,9 @@ class BroadcastEngine:
             is_weight_sync=final_plan.is_weight_sync,
             broadcast_round=hop.round_idx,
             broadcast_round_destinations=round_dests_by_sender.get(s, []),
+            cached_serialized_payloads=getattr(
+                final_plan, "cached_serialized_payloads", {}
+            ),
         )
         task = asyncio.create_task(_run_single_transfer(s, dst_unit, sub_plan))
         transfers_in_progress[task] = hop

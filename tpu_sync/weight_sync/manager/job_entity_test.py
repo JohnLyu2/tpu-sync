@@ -362,6 +362,98 @@ class JobEntityTest(absltest.TestCase):
           " contract",
       )
 
+  def test_tree_hop_template_cache_differentiates_stages_and_reuses_on_warm_sync(
+      self,
+  ):
+    """Verifies shared cached_serialized_payloads differentiates stages/destinations and reuses templates on warm syncs."""
+    entity = job_entity.JobEntity(
+        unit=self.src_unit,
+        shards=["10.11.0.1:8000"],
+        control_endpoints=["10.11.0.1:9000"],
+        control_pipe=self.pipe_stub,
+        weight_sync_mode=True,
+    )
+    self.addCleanup(entity.worker_rpc_client.close)
+
+    dst_0 = RaidenId("sampler", "0", "weights")
+    dst_1 = RaidenId("sampler", "1", "weights")
+    shared_cache: dict[Any, Any] = {}
+
+    def _make_hop_plan(
+        dst_unit: RaidenId,
+        dst_peer: str,
+        layer_idx: int,
+        uuid_val: int,
+        req_id: str,
+    ) -> controller_types.TransferPlan:
+      ref_sched = controller_types.PlanReferencedShardSchedule(
+          {1: [(dst_peer, 0, 0, 0, 1024, 0, 0, 1024, 1024, 1)]},
+          {layer_idx: 1},
+          [(layer_idx, 1)],
+      )
+      return controller_types.TransferPlan(
+          src_units=[self.src_unit],
+          dst_units=[dst_unit],
+          plan=None,
+          shard_push_schedules={self.src_unit: {0: ref_sched}},
+          worker_data_addresses={
+              self.src_unit: ["10.11.0.1:8000"],
+              dst_0: ["10.11.0.3:8000"],
+              dst_1: ["10.11.0.4:8000"],
+          },
+          use_block_chunks=True,
+          is_sender=True,
+          is_weight_sync=True,
+          uuid=uuid_val,
+          req_id=req_id,
+          cached_serialized_payloads=shared_cache,
+      )
+
+    # Cold sync (uuid=100): Stage 0 -> dst_0, Stage 1 -> dst_0, Stage 0 -> dst_1
+    p_s0_d0 = entity.encode_start_transfer(
+        _make_hop_plan(dst_0, "10.11.0.3:8000", 0, 100, "sync0_s0_d0"),
+        address="10.11.0.1:9000",
+        unit=self.src_unit,
+    )
+    p_s1_d0 = entity.encode_start_transfer(
+        _make_hop_plan(dst_0, "10.11.0.3:8000", 5, 100, "sync0_s1_d0"),
+        address="10.11.0.1:9000",
+        unit=self.src_unit,
+    )
+    p_s0_d1 = entity.encode_start_transfer(
+        _make_hop_plan(dst_1, "10.11.0.4:8000", 0, 100, "sync0_s0_d1"),
+        address="10.11.0.1:9000",
+        unit=self.src_unit,
+    )
+
+    self.assertNotEqual(p_s0_d0, p_s1_d0)
+    self.assertNotEqual(p_s0_d0, p_s0_d1)
+
+    # Warm sync (uuid=200): verify template hit skips rebuilding schedule protos
+    build_calls = 0
+    orig_build = entity.build_sender_push_schedule_protos
+
+    def _counting_build(push_schedules):
+      nonlocal build_calls
+      build_calls += 1
+      return orig_build(push_schedules)
+
+    entity.build_sender_push_schedule_protos = _counting_build
+    warm_s1_d0 = entity.encode_start_transfer(
+        _make_hop_plan(dst_0, "10.11.0.3:8000", 5, 200, "sync1_s1_d0"),
+        address="10.11.0.1:9000",
+        unit=self.src_unit,
+    )
+    self.assertEqual(build_calls, 0)
+
+    req_warm = raiden_service_pb2.ControlRequest()
+    req_warm.ParseFromString(warm_s1_d0)
+    self.assertEqual(req_warm.start_transfer_request.uuid, 200)
+    self.assertEqual(req_warm.start_transfer_request.req_id, "sync1_s1_d0")
+    entry = req_warm.start_transfer_request.shard_push_schedules[0].entries[0]
+    self.assertEqual(entry.layer_idx, 5)
+    self.assertEqual(entry.dst_peer, "10.11.0.3:8000")
+
 
 if __name__ == "__main__":
   absltest.main()

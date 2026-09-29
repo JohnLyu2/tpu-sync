@@ -18,6 +18,7 @@ import asyncio
 from collections import abc
 import concurrent.futures
 import dataclasses
+import functools
 import os
 from typing import Any, Callable, Optional, Sequence
 
@@ -949,6 +950,53 @@ class JobEntity:
         data_replica_idx=unit.data_replica_idx,
     )
 
+  def _schedule_cache_signature(
+      self, transfer_plan: TransferPlan, target_id: RaidenId
+  ) -> tuple[Any, ...]:
+    """Computes a structural cache signature for `target_id`'s push schedules."""
+    scheds_by_unit = getattr(transfer_plan, "shard_push_schedules", None)
+    if not scheds_by_unit:
+      return ()
+    target_scheds = scheds_by_unit.get(target_id)
+    if not target_scheds:
+      return ()
+    for shard_idx in sorted(target_scheds.keys()):
+      entries = target_scheds[shard_idx]
+      if hasattr(entries, "plans_by_id") and hasattr(
+          entries, "variable_to_plan_id"
+      ):
+        ordered_vars = getattr(entries, "_ordered_vars", None) or tuple(
+            entries.variable_to_plan_id.items()
+        )
+        return (
+            "plan_ref",
+            len(target_scheds),
+            shard_idx,
+            getattr(entries, "pool_group", 0),
+            tuple(ordered_vars),
+        )
+      if entries:
+        first = entries[0]
+        last = entries[-1]
+        if isinstance(first, tuple):
+          return (
+              "tuples",
+              len(target_scheds),
+              shard_idx,
+              len(entries),
+              first[0],
+              first[5] if len(first) > 5 else 0,
+              first[6] if len(first) > 6 else 0,
+              first[10] if len(first) > 10 else 0,
+              first[11] if len(first) > 11 else 0,
+              last[0],
+              last[5] if len(last) > 5 else 0,
+              last[6] if len(last) > 6 else 0,
+              last[10] if len(last) > 10 else 0,
+          )
+        return ("protos", len(target_scheds), shard_idx, len(entries))
+    return ()
+
   def encode_start_transfer(
       self,
       transfer_plan: TransferPlan,
@@ -975,9 +1023,13 @@ class JobEntity:
     is_ws = getattr(transfer_plan, "is_weight_sync", False)
     ep_count = len(target_eps)
     include_recv_sched = self.include_receiver_push_schedules(transfer_plan)
+    dst_units_key = tuple(getattr(transfer_plan, "dst_units", ()))
+    sched_sig = self._schedule_cache_signature(transfer_plan, target_id)
     cache_key = (
         target_id,
         address,
+        dst_units_key,
+        sched_sig,
         uuid_val,
         req_id_val,
         skip_d2h_val,
@@ -989,6 +1041,8 @@ class JobEntity:
     steady_key = (
         target_id,
         address,
+        dst_units_key,
+        sched_sig,
         uuid_val,
         skip_d2h_val,
         is_sender,
@@ -1000,6 +1054,8 @@ class JobEntity:
         "__template__",
         target_id,
         address,
+        dst_units_key,
+        sched_sig,
         is_sender,
         is_ws,
         int(transfer_plan.dst_mem_type),
@@ -1396,20 +1452,58 @@ class JobEntity:
     else:
       addrs = await self.resolve_endpoints(rep_id)
 
+    loop = asyncio.get_running_loop()
+    offload_encode = (
+        self._executor is not None
+        and getattr(transfer_plan, "is_sender", False)
+        and bool(getattr(transfer_plan, "shard_push_schedules", None))
+    )
+
     coros = []
     if self.is_payload_invariant_across_hosts(
         transfer_plan, addrs, unit=target_id
     ):
       try:
         spec_addr = addrs[0] if addrs else None
-        payload = self._encode_for_host(
-            transfer_plan, address=spec_addr, unit=target_id
-        )
+        if offload_encode:
+          payload = await loop.run_in_executor(
+              self._executor,
+              functools.partial(
+                  self._encode_for_host,
+                  transfer_plan,
+                  address=spec_addr,
+                  unit=target_id,
+              ),
+          )
+        else:
+          payload = self._encode_for_host(
+              transfer_plan, address=spec_addr, unit=target_id
+          )
       except NotImplementedError:
         payload = None
       if payload:
         for addr in addrs:
           coros.append(self._send_and_verify(addr, payload))
+    elif offload_encode:
+
+      async def _encode_and_send(addr: str) -> None:
+        try:
+          payload = await loop.run_in_executor(
+              self._executor,
+              functools.partial(
+                  self._encode_for_host,
+                  transfer_plan,
+                  address=addr,
+                  unit=target_id,
+              ),
+          )
+        except NotImplementedError:
+          return
+        if payload:
+          await self._send_and_verify(addr, payload)
+
+      for addr in addrs:
+        coros.append(_encode_and_send(addr))
     else:
       for addr in addrs:
         try:
