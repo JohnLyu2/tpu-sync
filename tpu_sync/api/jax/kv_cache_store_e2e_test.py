@@ -714,13 +714,13 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         )
 
         print(
-            "[JAX E2E Storage][Step 10/11] Triggering cold recall (store2.load)"
-            " into device_block_ids=[0, 1]...",
+            "[JAX E2E Storage][Step 10/11] Triggering cold recall"
+            " (store2.read_remote) into device_block_ids=[0, 1]...",
             flush=True,
         )
         load_start = time.time()
         storage_slices = [s for _, s in storage_lookup]
-        self.assertTrue(store2.load(hashes, [0, 1], slices=storage_slices))
+        self.assertTrue(store2.read_remote(hashes, storage_slices, [0, 1]))
 
         done = False
         while not done:
@@ -804,6 +804,269 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         f"======================================================================\n",
         flush=True,
     )
+
+  # ---------------------------------------------------------------------------
+  # Helpers for the multi-source (load / read_remote) tests. Completion waits
+  # reuse _await_terminal, which accumulates drained poll results across polls:
+  # each source completes independently and may be reported by a different
+  # poll.
+  # ---------------------------------------------------------------------------
+
+  def _assert_block_statuses(self, lookup_result, hashes, expected_statuses):
+    """Asserts lookup_result covers hashes in order with expected statuses.
+
+    expected_statuses[i] is a BlockStatus or a tuple of acceptable statuses.
+    """
+    self.assertEqual([h for h, _ in lookup_result], list(hashes))
+    got = [s.status for _, s in lookup_result]
+    for i, want in enumerate(expected_statuses):
+      allowed = want if isinstance(want, tuple) else (want,)
+      self.assertIn(got[i], allowed,
+                    f"block {hashes[i]!r}: statuses={got}")
+
+  def _await_lookup_statuses(self, store, hashes, expected_statuses,
+                             timeout_s=120.0, **lookup_kwargs):
+    """Polls lookup() until it returns exactly expected_statuses.
+
+    Replaces fixed sleeps where visibility is eventually consistent (global
+    registry publication). lookup_kwargs must not pin, since lookups repeat.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+      result = store.lookup(hashes, **lookup_kwargs)
+      try:
+        self._assert_block_statuses(result, hashes, expected_statuses)
+        return result
+      except AssertionError:
+        if time.time() > deadline:
+          raise
+      time.sleep(0.1)
+
+  def _make_storage_dir(self, prefix):
+    if _SECONDARY_STORAGE_ROOT.value:
+      temp_dir = os.path.join(_SECONDARY_STORAGE_ROOT.value,
+                              f"{prefix}_{uuid.uuid4().hex[:8]}")
+      os.makedirs(temp_dir, exist_ok=True)
+      return temp_dir, True
+    return tempfile.mkdtemp(), False
+
+  def _posix_cfg(self, root, model_name):
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = 0
+    cfg.parallelism.tp_size = self.num_devices
+    cfg.set_property("root_dir", root)
+    cfg.set_property("model_name", model_name)
+    return cfg
+
+  def _hbm_slices(self, raiden_id, num_blocks):
+    return [
+        kv_cache_store.RaidenBlockId(
+            raiden_id,
+            host_block_id=-1,
+            device_block_id=i,
+            status=kv_cache_store.BlockStatus.HBM,
+        )
+        for i in range(num_blocks)
+    ]
+
+  def test_secondary_storage_e2e_connector_three_source_load(self):
+    """[HOST, REMOTE, SHARED_STORAGE] served by load() + one read_remote().
+
+    Mirrors the vLLM connector: one lookup() resolves three sources, and the
+    caller issues load() for the local block and ONE read_remote() for the peer
+    and storage blocks together. All three complete through poll_load_status().
+
+    Blocks: 3src_h0 -> HOST (consumer B host RAM, pinned by lookup),
+            3src_r0 -> REMOTE (peer A host RAM, via global registry),
+            3src_s0 -> SHARED_STORAGE.
+      1. Seed storage:  writer saves 3src_s0 to POSIX storage.
+      2. Stage remote:  peer A saves 3src_r0 to its host RAM (published).
+      3. Stage local:   consumer B saves 3src_h0 (host RAM + storage).
+      4. Lookup:        B sees exactly [HOST_AND_HBM, REMOTE(A), SHARED_STORAGE].
+      5. Load:          load([h0]) -> HBM 1, read_remote([r0, s0]) ->
+                        HBM [2, 3]; all done.
+      6. Verify:        HBM 1..3 bit-exact; s0 now HOST_AND_HBM in B's host
+                        cache (published by the recall), r0 still not local.
+    """
+    tag = "JAX 3-SOURCE LOAD"
+    status = kv_cache_store.BlockStatus
+    tpu_sharding = self.setup_shardings()
+    num_blocks = 4
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    shard_size_bytes = (128 * 8 * 8 * 128 * 4) // self.num_devices
+    h0, r0, s0 = b"3src_h0", b"3src_r0", b"3src_s0"
+    model_name = "llama_70b_jax_three_source"
+
+    temp_dir, is_custom_root = self._make_storage_dir("jax_three_source")
+    cfg = self._posix_cfg(temp_dir, model_name)
+    print(f"[{tag}] {self.num_devices} chips, shape={shape}, storage={temp_dir}",
+          flush=True)
+    try:
+      # ---- Phase 1/6: seed storage with 3src_s0. ----
+      port_s = _pick_unused_port()
+      rid_s = kv_cache_store.RaidenId(f"writer3s_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_s", 0)
+      store_s = kv_cache_store.KVCacheStore(
+          capacity=1,
+          raiden_id=rid_s,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_s,
+          secondary_backend_configs=[cfg],
+      )
+      tpu_cache_s = jax.device_put(jnp.array(host_data[2:3]), tpu_sharding)
+      jax.block_until_ready(tpu_cache_s)
+      manager_s = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache_s],
+          local_control_port=0,
+          max_blocks=1,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{port_s}",
+          worker_id="worker_s",
+          backend_configs=[cfg],
+      )
+      try:
+        print(f"[{tag}][Phase 1/6] Saving {s0!r} -> SHARED_STORAGE.",
+              flush=True)
+        self.assertTrue(store_s.insert([s0], self._hbm_slices(rid_s, 1),
+                                       on_host=False))
+        self.assertTrue(store_s.save([s0]))
+        self._await_terminal(store_s.poll_save_status, 1, "storage save")
+      finally:
+        del manager_s, store_s, tpu_cache_s
+
+      # ---- Phase 2/6: peer A stages 3src_r0 in its host RAM. ----
+      port_a = _pick_unused_port()
+      rid_a = kv_cache_store.RaidenId(f"job3s_a_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_a", 0)
+      store_a = kv_cache_store.KVCacheStore(
+          capacity=2,
+          global_registry_address=f"localhost:{_registry_port}",
+          raiden_id=rid_a,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_a,
+      )
+      tpu_cache_a = jax.device_put(jnp.array(host_data[1:2]), tpu_sharding)
+      jax.block_until_ready(tpu_cache_a)
+      manager_a = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache_a],
+          local_control_port=0,
+          max_blocks=1,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=_pick_unused_port(),
+          raiden_controller_address=f"localhost:{port_a}",
+          worker_id="worker_a",
+          node_id=0,
+      )
+      print(f"[{tag}][Phase 2/6] Peer A saving {r0!r} -> HOST (published to"
+            " global registry).", flush=True)
+      self.assertTrue(store_a.insert([r0], self._hbm_slices(rid_a, 1),
+                                     on_host=False))
+      self.assertTrue(store_a.save([r0]))
+      self._await_terminal(store_a.poll_save_status, 1, "peer A save")
+
+      # ---- Phase 3/6: consumer B saves 3src_h0. B has a secondary backend, so
+      # the save writes 3src_h0 to B's host RAM and to POSIX storage; lookup
+      # still reports HOST_AND_HBM because the host tier is checked first. ----
+      # B's HBM: block 0 holds h0's data; blocks 1-3 are zero and serve as the
+      # Load() targets, so any DMA that slipped through would show up there.
+      port_b = _pick_unused_port()
+      rid_b = kv_cache_store.RaidenId(f"job3s_b_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_b", 0)
+      store_b = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          global_registry_address=f"localhost:{_registry_port}",
+          raiden_id=rid_b,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_b,
+          secondary_backend_configs=[cfg],
+      )
+      init_b = np.zeros(shape, dtype=np.float32)
+      init_b[0] = host_data[0]
+      tpu_cache_b = jax.device_put(jnp.array(init_b), tpu_sharding)
+      jax.block_until_ready(tpu_cache_b)
+      manager_b = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache_b],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=_pick_unused_port(),
+          raiden_controller_address=f"localhost:{port_b}",
+          worker_id="worker_b",
+          node_id=0,
+          backend_configs=[cfg],
+      )
+      try:
+        print(f"[{tag}][Phase 3/6] Consumer B saving {h0!r} -> HOST (local) + "
+              "SHARED_STORAGE.", flush=True)
+        self.assertTrue(store_b.insert([h0], self._hbm_slices(rid_b, 1),
+                                       on_host=False))
+        self.assertTrue(store_b.save([h0]))
+        self._await_terminal(store_b.poll_save_status, 1, "consumer B save")
+
+        # ---- Phase 4/6: lookup sees exactly [HOST, REMOTE(A), STORAGE]. ----
+        hashes = [h0, r0, s0]
+        expected = [status.HOST_AND_HBM, status.REMOTE, status.SHARED_STORAGE]
+        # Wait (unpinned) for registry visibility, then take the pin once.
+        self._await_lookup_statuses(store_b, hashes, expected,
+                                    enable_global=True, pin_found=False)
+        lookup = store_b.lookup(hashes, enable_global=True, pin_found=True)
+        self._assert_block_statuses(lookup, hashes, expected)
+        self.assertEqual(lookup[1][1].raiden_id, rid_a)
+        for h, b in lookup:
+          print(f"  [B Lookup] hash={h!r} status={b.status.name}"
+                f" raiden_id={b.raiden_id}", flush=True)
+        slice_of = {h: s for h, s in lookup}
+        print(f"[{tag}][Phase 4/6] Lookup: [HOST, REMOTE(peer A),"
+              " SHARED_STORAGE] resolved in one call.", flush=True)
+
+        # ---- Phase 5/6: load() local, one read_remote() for the rest. ----
+        self.assertTrue(store_b.load([h0], [1], slices=[slice_of[h0]]))
+        print(f"[{tag}][Phase 5/6] load([{h0!r}]) -> HBM 1 launched"
+              " (local host DRAM, consumes lookup pin).", flush=True)
+        self.assertTrue(
+            store_b.read_remote([r0, s0], [slice_of[r0], slice_of[s0]], [2, 3]))
+        print(f"[{tag}][Phase 5/6] read_remote([{r0!r}, {s0!r}]) -> HBM [2, 3]"
+              " launched (peer A DRAM + secondary storage, no pin).",
+              flush=True)
+        self._await_terminal(store_b.poll_load_status, 3, "three-source load")
+        print(f"[{tag}][Phase 5/6] poll_load_status: all 3 blocks done.",
+              flush=True)
+
+        # ---- Phase 6/6: bytes and local records. ----
+        after = np.asarray(jax.jit(lambda x: x)(tpu_cache_b))
+        np.testing.assert_array_equal(after[1], host_data[0])
+        np.testing.assert_array_equal(after[2], host_data[1])
+        np.testing.assert_array_equal(after[3], host_data[2])
+        print(f"[{tag}][Phase 6/6] HBM blocks [1, 2, 3] bit-exact"
+              " (HOST, REMOTE, SHARED_STORAGE sources).", flush=True)
+
+        # The storage recall published s0 into B's host cache; the peer read
+        # recorded nothing locally.
+        local = store_b.lookup([s0], enable_global=False, pin_found=False)
+        self._assert_block_statuses(local, [s0], [status.HOST_AND_HBM])
+        self.assertEqual(local[0][1].raiden_id, rid_b)
+        r0_local = store_b.lookup([r0], enable_global=False, pin_found=False)
+        self.assertEmpty(r0_local, f"{r0!r} must not be recorded locally")
+        print(f"[{tag}][Phase 6/6] {s0!r} published HOST_AND_HBM under B;"
+              f" {r0!r} not recorded locally.", flush=True)
+      finally:
+        del manager_b, store_b, tpu_cache_b
+        del manager_a, store_a, tpu_cache_a
+    finally:
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
   def _run_remote_read_e2e_test(
       self,

@@ -260,6 +260,12 @@ class KVCacheStore {
   //
   // Registry-only hits are not pinned: they name a block on another node, and
   // there is nothing here to hold.
+  //
+  // One answer can mix sources: local host (HOST / HOST_AND_HBM), then peers
+  // (REMOTE -- only with enable_global, possibly several peers), then the
+  // secondary storage tier (SHARED_STORAGE, probed for the remaining tail
+  // whatever enable_global is). Only local hits are pinned. Local hits go to
+  // Load(); REMOTE and SHARED_STORAGE go to ReadRemote() (one call per peer).
   absl::StatusOr<BlockSliceList> Lookup(
       const std::vector<std::string>& block_hashes, bool enable_global = false,
       bool pin_found = true);
@@ -343,11 +349,14 @@ class KVCacheStore {
                     absl::Span<const int> device_block_ids);
 
   // Asynchronously loads KV cache blocks to device (HBM), either from local
-  // host DRAM or from a peer. This is the ONLY way to load from a peer -- the
-  // no-slices overload above is local-only.
+  // host DRAM or, by forwarding to ReadRemote(), from a peer and/or the
+  // secondary storage tier. The no-slices overload above is local-only.
   //
-  // ONE CALL IS ONE SOURCE. Every block in a batch must carry the same status,
-  // and remote blocks must all refer to the same peer.
+  // A single instance of the Load call should not mix local and non-local
+  // sources. All HOST / HOST_AND_HBM -> local host DRAM. All REMOTE (one peer)
+  // and/or SHARED_STORAGE -> forwarded to ReadRemote(); see there for staging
+  // and subsequent-lookup behavior. Mixing local and non-local slices is
+  // InvalidArgument.
   //
   // `device_block_ids` is the destination and must name one device block per
   // hash.
@@ -359,12 +368,14 @@ class KVCacheStore {
   //
   // PIN CONTRACT -- NOT the same as the overload above; the two sources
   // genuinely differ:
-  //   local source  -- every hash must be pinned on entry, and a successful
-  //                    load consumes one pin per hash.
-  //   remote source -- no pin is required and none is consumed. A hash
-  //                    resolved only through the registry never entered the
-  //                    local index, so there is nothing here to have pinned,
-  //                    and a load from a peer records nothing either.
+  //   local source     -- every hash must be pinned on entry, and a
+  //                       successful load consumes one pin per hash.
+  //   non-local source -- (REMOTE / SHARED_STORAGE) no pin is required and
+  //                       none is consumed, exactly as ReadRemote(). A hash
+  //                       resolved only through the registry or the storage
+  //                       tier was never pinned by Lookup(). A peer load
+  //                       records nothing; a storage recall is published as
+  //                       an unpinned HOST_AND_HBM entry.
   absl::Status Load(absl::Span<const std::string> block_hashes,
                     absl::Span<const RaidenBlockId> slices,
                     absl::Span<const int> device_block_ids);
@@ -429,8 +440,10 @@ class KVCacheStore {
 
   // Polls the status of all active/inflight Load operations.
   // Updates cache metadata upon successful H2D transfers:
-  //   - Loaded from local host DRAM -> HOST_AND_HBM
-  //   - Loaded from a peer          -> nothing is recorded at all.
+  //   - Loaded from local host DRAM   -> HOST_AND_HBM
+  //   - Loaded from a peer            -> nothing is recorded at all.
+  //   - Recalled from SHARED_STORAGE  -> published into the host LRU as an
+  //                                      unpinned HOST_AND_HBM entry.
   //
   // A peer load leaves no entry because there is nothing here to describe: no
   // local host copy is kept, so the entry could only say HBM with
@@ -460,26 +473,53 @@ class KVCacheStore {
       absl::AnyInvocable<void(absl::Span<const std::string>) const>;
   void SetEvictionCallback(EvictionCallback callback);
 
-  // Launches an async receiver-initiated read of REMOTE blocks from their
-  // owning peers straight into local HBM. Returns as soon as the reads are
-  // issued; poll with PollRemoteReadStatus().
+  // Launches async reads of non-local blocks into local HBM and returns once
+  // they are issued. Each slice is routed by status: REMOTE -> its owning peer
+  // (at most one peer per call), SHARED_STORAGE -> the secondary storage tier
+  // (backends_[1]). Any other status is InvalidArgument. `slices` is usually a
+  // Lookup() answer passed straight through; device_block_ids is mandatory and
+  // must match block_hashes in size, as must slices.
   //
-  // NOTE: This API delegates internally to Load(block_hashes, slices,
-  // device_block_ids).
+  // PIN CONTRACT: none. No pin is checked, taken, consumed or released, so the
+  // caller must not release() these hashes. Lookup() never pins peer or
+  // storage hits.
   //
-  // The caller supplies the source coordinates directly: `slices[i]` is the
-  // REMOTE RaidenBlockId for `block_hashes[i]`. If slices span multiple peers,
-  // they are grouped by peer and dispatched via Load().
+  // STAGING BEHAVIOR: host staging blocks are allocated internally; the caller
+  // never sees them. While in flight they are not in the LRU, so eviction and
+  // the sweep cannot reclaim them.
+  //   REMOTE peer    -- allocated from free blocks only (never evicts). Freed
+  //                     on success and on failure.
+  //   SHARED_STORAGE -- allocated via AllocateBlockIds, which may evict
+  //                     UNPINNED entries if short, never pinned ones. On
+  //                     success each block is published into the host LRU as
+  //                     an unpinned HOST_AND_HBM entry owned by this store (a
+  //                     refused publish frees its block); on failure all are
+  //                     freed.
   //
-  // This store's LRU is not modified. A later local lookup() of the same hash
-  // is still a miss.
+  // SUBSEQUENT LOOKUPS:
+  //   REMOTE peer    -- nothing is recorded: a local Lookup() still misses,
+  //                     and a global Lookup() may report REMOTE again.
+  //   SHARED_STORAGE -- a later Lookup() is a local HOST_AND_HBM hit (pinned
+  //                     if pin_found), so it is then loaded with Load() under
+  //                     the local pin contract. Being unpinned, the entry may
+  //                     be evicted at any time, after which Lookup() reports
+  //                     SHARED_STORAGE again.
+  //   Failure        -- nothing is recorded for either source.
   //
-  // device_block_ids is mandatory and must match block_hashes in size, as must
-  // slices; any other size is InvalidArgument.
+  // The whole batch is validated and reserved before anything launches; a
+  // validation error (bad status, two peers, a duplicate hash, a REMOTE slice
+  // naming this store, a hash already loading, or SHARED_STORAGE with no
+  // secondary backend) has no side effects. After launch (peer group, then
+  // storage group), every failure -- including no host staging blocks for
+  // either group -- is reported once, per hash, by PollLoadStatus(); the call
+  // still returns OK and the other group continues. On failure the
+  // destination device blocks are undefined.
   //
-  // Requires a global registry: it is what maps the owning peer to the store
-  // address this store loads from. A store built without one fails with
-  // FailedPrecondition.
+  // Load(slices) forwards any all-non-local batch here, so both entry points
+  // behave identically for REMOTE and SHARED_STORAGE blocks.
+  //
+  // A peer read needs a global registry to resolve the peer; without one the
+  // peer hashes are reported failed.
   absl::Status ReadRemote(const std::vector<std::string>& block_hashes,
                           const std::vector<RaidenBlockId>& slices,
                           const std::vector<int32_t>& device_block_ids);
@@ -710,6 +750,23 @@ class KVCacheStore {
 
   absl::StatusOr<std::vector<int>> AllocateBlockIds(int needed);
   void DeallocateBlockIds(absl::Span<const int> block_ids);
+
+  // Recalls `block_hashes` from the secondary storage tier (backends_[1]) into
+  // HBM at `device_block_ids`. Everything storage-specific happens here: the
+  // caller has validated the batch, checked that a secondary backend exists
+  // and marked `block_hashes` pending; this allocates the host staging blocks
+  // and issues an asynchronous RECALL transfer through the RaidenController.
+  // On completion, the callback admits the recalled blocks into the host-RAM
+  // tier's LRU (returning any staging block the tier refuses), frees the
+  // staging blocks on failure, and marks the blocks done or failed in
+  // load_tracker_.
+  //
+  // Every outcome, including failure to allocate staging blocks, is reported
+  // per hash through load_tracker_ only -- the same way the peer path reports
+  // its own staging failure -- so a failure is reported exactly once. Must be
+  // called without mutex_ held (AllocateBlockIds takes it).
+  void LoadFromSecondaryBackend(absl::Span<const std::string> block_hashes,
+                                absl::Span<const int> device_block_ids);
 
  public:
   // Lowers the outstanding-write-through bound so a test can reach it without

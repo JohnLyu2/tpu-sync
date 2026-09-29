@@ -11,6 +11,10 @@ class BlockStatus(enum.Enum):
   # peer leaves no local entry at all -- its landing blocks are freed and no
   # host copy is kept.
   HOST_AND_HBM = ...
+  # Found only in the secondary storage tier; read it with read_remote(). A
+  # successful recall publishes the block into the local host cache, so it
+  # then reports HOST_AND_HBM.
+  SHARED_STORAGE = ...
 
 class RaidenId:
   job_name: str
@@ -80,7 +84,9 @@ class KVCacheStore:
   ) -> list[tuple[bytes, RaidenBlockId]]:
     """Checks the LRU directory for cached block hashes. Returns a list of all
     matched replica pairs prior to the first miss. Pins every local hit unless
-    pin_found is False."""
+    pin_found is False. One answer can mix HOST, REMOTE (several peers) and
+    SHARED_STORAGE; only local hits are pinned. Route local hits to load() and
+    REMOTE / SHARED_STORAGE to read_remote()."""
     ...
   def insert(
       self,
@@ -139,10 +145,11 @@ class KVCacheStore:
       device_block_ids: list[int],
   ) -> bool:
     """Asynchronously loads KV cache blocks to device (HBM), either from local
-    host DRAM or from a peer.
+    host DRAM or, via read_remote()'s path, from a peer and/or storage.
 
-    ONE CALL IS ONE SOURCE. Every block in a batch must carry the same status,
-    and remote blocks must all refer to the same peer.
+    A single instance of the load call should not mix local and non-local sources.
+    All HOST slices load locally; all REMOTE (one peer) and/or SHARED_STORAGE
+    slices are handled exactly as read_remote(). Mixing the two returns False.
 
     `device_block_ids` is the destination and must name one device block per hash.
 
@@ -150,7 +157,9 @@ class KVCacheStore:
     used directly. A LOCAL source requires every hash to be pinned (lookup
     grants that pin) and a successful load consumes it; a REMOTE source needs
     no pin, consumes none, and records nothing locally -- it re-resolves
-    hashes at the peer, using `slices` only for the source's identity.
+    hashes at the peer, using `slices` only for the source's identity. A
+    SHARED_STORAGE source likewise needs no pin; its blocks are published
+    locally as unpinned HOST_AND_HBM.
     """
     ...
   def poll_save_status(
@@ -168,7 +177,10 @@ class KVCacheStore:
     """
     ...
   def poll_load_status(self) -> tuple[list[bytes], list[bytes], list[bytes]]:
-    """Polls status of asynchronous Load operations."""
+    """Polls status of asynchronous Load operations.
+
+    Reports completion for load() and read_remote().
+    """
     ...
   def set_eviction_callback(
       self, callback: Callable[[list[bytes]], None] | None
@@ -181,7 +193,7 @@ class KVCacheStore:
       slices: list[RaidenBlockId],
       device_block_ids: list[int],
   ) -> bool:
-    """Reads REMOTE blocks from their owning peers into local HBM."""
+    """Reads REMOTE and/or SHARED_STORAGE blocks into local HBM."""
     ...
   def poll_remote_read_status(self) -> tuple[list[bytes], list[bytes], list[bytes]]:
     """Polls status of active remote reads."""

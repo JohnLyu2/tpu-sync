@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import glob
 import os
 import pathlib
@@ -70,6 +71,7 @@ flags.DEFINE_integer("world_size", 0, "")
 flags.DEFINE_integer("master_port", 0, "")
 flags.DEFINE_integer("controller_port", 0, "")
 flags.DEFINE_integer("controller_port_b", 0, "")
+flags.DEFINE_integer("controller_port_s", 0, "")
 flags.DEFINE_integer("registry_port", 0, "")
 
 _GOOGLE_PCI_VENDOR_ID = "0x1ae0"
@@ -1169,13 +1171,13 @@ def _worker_secondary_storage_main(argv):
       if rank == 0:
         print(
             f"[MPMD Storage][Step 10/11][Read Phase][Rank 0] Triggering cold"
-            f" recall (store.load) into device_block_ids=[2, 3]...",
+            f" recall (store.read_remote) into device_block_ids=[2, 3]...",
             flush=True,
         )
         load_start = time.time()
-        assert store.load(
-            hashes, [2, 3], slices=storage_slices
-        ), "load failed on rank 0"
+        assert store.read_remote(
+            hashes, storage_slices, [2, 3]
+        ), "read_remote failed on rank 0"
         done = False
         while not done:
           load_done, load_failed, _ = store.poll_load_status()
@@ -1252,6 +1254,442 @@ def _worker_secondary_storage_main(argv):
         " and exiting.",
         flush=True,
     )
+    dist.destroy_process_group()
+
+
+# -----------------------------------------------------------------------------
+# Helpers for the three-source worker.
+#
+# poll_save_status() / poll_load_status() DRAIN their results: each block hash
+# is reported exactly once, in whichever poll observes it. load() and the
+# peer and storage groups of read_remote() complete independently through the
+# same tracker, so completions are accumulated across polls.
+# -----------------------------------------------------------------------------
+_THREE_SOURCE_WAIT_TIMEOUT_S = 120.0
+_THREE_SOURCE_BARRIER_TIMEOUT = datetime.timedelta(minutes=5)
+_THREE_SOURCE_WORKER_TIMEOUT_S = 600
+
+
+def _log(tag, phase, rank, msg):
+  print(f"[{tag}][Phase {phase}][Rank {rank}] {msg}", flush=True)
+
+
+def _tpu_sync():
+  try:
+    torch.tpu.synchronize()
+  except (AttributeError, RuntimeError):
+    pass
+
+
+def _wait_for_workers(procs, timeout_s=_THREE_SOURCE_WORKER_TIMEOUT_S):
+  """Waits for worker subprocesses; kills all of them on timeout.
+
+  Returns:
+    A list of (rank, returncode) for workers that did not exit cleanly.
+  """
+  deadline = time.time() + timeout_s
+  failures = []
+  for rank, p in enumerate(procs):
+    try:
+      p.wait(timeout=max(0.0, deadline - time.time()))
+    except subprocess.TimeoutExpired:
+      for q in procs:
+        if q.poll() is None:
+          q.kill()
+      for q in procs:
+        q.wait()
+      return [(r, "timeout") for r in range(len(procs))]
+    if p.returncode != 0:
+      failures.append((rank, p.returncode))
+  return failures
+
+
+def _wait_for_all(poll_fn, expected_hashes, what,
+                  timeout_s=_THREE_SOURCE_WAIT_TIMEOUT_S):
+  """Blocks until every hash in expected_hashes is reported done by poll_fn.
+
+  Args:
+    poll_fn: store.poll_save_status or store.poll_load_status. Returns a tuple
+      whose first two entries are (done, failed); results are drained.
+    expected_hashes: the exact set of block hashes that must complete.
+    what: label used in error messages.
+    timeout_s: fails with the missing hashes after this many seconds.
+
+  Returns:
+    Seconds elapsed until all hashes completed.
+  """
+  expected = set(expected_hashes)
+  completed = set()
+  start = time.time()
+  while True:
+    done, failed = poll_fn()[:2]
+    if failed:
+      raise RuntimeError(f"{what} failed for {failed}")
+    completed.update(done)
+    if completed == expected:
+      return time.time() - start
+    if time.time() - start > timeout_s:
+      raise TimeoutError(
+          f"{what} incomplete after {timeout_s}s:"
+          f" missing={sorted(expected - completed)}"
+      )
+    time.sleep(0.01)
+
+
+def _assert_statuses(lookup_result, hashes, expected_statuses):
+  """Asserts lookup_result is exactly hashes with expected_statuses."""
+  got_hashes = [h for h, _ in lookup_result]
+  got_statuses = [s.status for _, s in lookup_result]
+  assert got_hashes == list(hashes), f"lookup hashes {got_hashes} != {hashes}"
+  assert got_statuses == list(expected_statuses), (
+      f"lookup statuses {got_statuses} != {list(expected_statuses)}"
+  )
+
+
+def _wait_for_lookup(store, hashes, expected_statuses,
+                     timeout_s=_THREE_SOURCE_WAIT_TIMEOUT_S, **lookup_kwargs):
+  """Polls store.lookup() until it returns exactly expected_statuses.
+
+  Used where visibility is eventually consistent (global registry publication),
+  replacing fixed sleeps. lookup_kwargs must not pin (pin_found=False), since
+  the lookup may be repeated.
+  """
+  start = time.time()
+  while True:
+    result = store.lookup(hashes, **lookup_kwargs)
+    try:
+      _assert_statuses(result, hashes, expected_statuses)
+      return result
+    except AssertionError:
+      if time.time() - start > timeout_s:
+        raise
+    time.sleep(0.1)
+
+
+def _verify_and_print_shard_files(tag, phase, storage_root, model_name,
+                                  world_size, rank, expected_count):
+  bin_files = sorted(
+      glob.glob(
+          os.path.join(
+              storage_root,
+              model_name,
+              f"tp{world_size}_r{rank}",
+              "**",
+              "*.bin",
+          ),
+          recursive=True,
+      )
+  )
+  assert len(bin_files) == expected_count, (
+      f"Rank {rank}: expected {expected_count} shard files, got"
+      f" {len(bin_files)}: {bin_files}"
+  )
+  _log(tag, phase, rank,
+       f"{len(bin_files)} on-disk shard files (exact count verified):")
+  for f in bin_files:
+    print(f"  [Shard File][Rank {rank}] {f}"
+          f" ({os.path.getsize(f)} bytes)", flush=True)
+
+
+def _init_worker_process_group(tag, rank, world_size, master_port, phase):
+  os.environ["MASTER_ADDR"] = "localhost"
+  os.environ["MASTER_PORT"] = str(master_port)
+  os.environ["RANK"] = str(rank)
+  os.environ["WORLD_SIZE"] = str(world_size)
+  os.environ["LOCAL_RANK"] = str(rank)
+  os.environ["PJRT_LOCAL_PROCESS_RANK"] = str(rank)
+  os.environ["GROUP_RANK"] = "0"
+  os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+  os.environ["GLOG_alsologtostderr"] = "1"
+  # A bounded barrier timeout turns a stuck rank into a fast, attributable
+  # failure instead of a silent hang until the Forge test timeout.
+  dist.init_process_group(
+      backend="gloo",
+      init_method=f"tcp://127.0.0.1:{master_port}",
+      rank=rank,
+      world_size=world_size,
+      timeout=_THREE_SOURCE_BARRIER_TIMEOUT,
+  )
+  print(
+      f"[{tag}][Rank {rank}][storage_phase={phase}] Process group ready"
+      f" (PID={os.getpid()}, master_port={master_port}).",
+      flush=True,
+  )
+
+
+def _create_managers(rank, world_size, **manager_kwargs):
+  """Creates one KVCacheManager per rank, one rank at a time."""
+  manager = None
+  for r in range(world_size):
+    if rank == r:
+      manager = kv_cache_manager.KVCacheManager(
+          local_control_port=0,
+          num_slots=2,
+          unsafe_skip_buffer_lock=True,
+          raiden_worker_port=0,
+          host_blocks_to_allocate=4,
+          node_id=rank,
+          **manager_kwargs,
+      )
+    dist.barrier()
+  return manager
+
+
+def _hbm_slices(raiden_id, num_blocks):
+  return [
+      kv_cache_store.RaidenBlockId(
+          raiden_id,
+          host_block_id=-1,
+          device_block_id=i,
+          status=kv_cache_store.BlockStatus.HBM,
+      )
+      for i in range(num_blocks)
+  ]
+
+
+def _worker_three_source_main(argv):
+  """4-rank MPMD [HOST, REMOTE, SHARED_STORAGE] via load() + read_remote().
+
+  Mirrors the vLLM connector: one lookup() resolves three sources, and the
+  caller issues load() for the local block and ONE read_remote() for the peer
+  and storage blocks together. All three complete through poll_load_status().
+
+  Blocks: 3src_h0 -> HOST (consumer B host RAM, pinned by lookup),
+          3src_r0 -> REMOTE (peer A host RAM, via global registry),
+          3src_s0 -> SHARED_STORAGE.
+    1. Seed storage:  writer saves 3src_s0 to POSIX storage.
+    2. Stage remote:  peer A saves 3src_r0 to its host RAM (published).
+    3. Stage local:   consumer B saves 3src_h0 (host RAM + storage).
+    4. Lookup:        B sees exactly [HOST_AND_HBM, REMOTE(A), SHARED_STORAGE].
+    5. Load:          load([h0]) -> HBM 1, read_remote([r0, s0]) ->
+                      HBM [2, 3]; all done.
+    6. Verify:        HBM 1..3 bit-exact on every rank; s0 now HOST_AND_HBM in
+                      B's host cache (published by the recall), r0 not local.
+  Rank 0 drives each action; every phase ends with one dist.barrier().
+  """
+  del argv
+  tag = "MPMD 3-SOURCE LOAD"
+  rank = FLAGS.rank
+  world_size = FLAGS.world_size
+  controller_port_a = FLAGS.controller_port
+  controller_port_b = FLAGS.controller_port_b
+  controller_port_s = FLAGS.controller_port_s
+  registry_port = FLAGS.registry_port
+  storage_root = _STORAGE_ROOT.value
+  phase = _STORAGE_PHASE.value
+  model_name = "test_model_mpmd_3src"
+  status = kv_cache_store.BlockStatus
+
+  _init_worker_process_group(tag, rank, world_size, FLAGS.master_port, phase)
+  try:
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = rank
+    cfg.parallelism.tp_size = world_size
+    cfg.set_property("root_dir", storage_root)
+    cfg.set_property("model_name", model_name)
+    if _STORAGE_DIRECT_IO.value:
+      cfg.set_property("direct_io", "true")
+
+    device = torch.device("tpu")
+    num_blocks = 4
+    # Shape: (4 blocks, 128 tokens/block, 8 head shards, 8 heads/shard,
+    # head_dim 128).
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+        rank * 1000.0
+    )
+    shard_size_bytes = 128 * 8 * 8 * 128 * 4
+    h0, r0, s0 = b"hash_mpmd_3src_h0", b"hash_mpmd_3src_r0", b"hash_mpmd_3src_s0"
+
+    if phase in ("write", "both"):
+      # ---- Phase 1/6: seed storage with s0 (data = host_data[2]). ----
+      tpu_cache_s = torch.tensor(host_data[2:3], device=device)
+      _tpu_sync()
+      rid_s = kv_cache_store.RaidenId(
+          "mpmd_3src_job_writer", "0", "mpmd_cache_writer", 0
+      )
+      store_s = None
+      if rank == 0:
+        store_s = kv_cache_store.KVCacheStore(
+            capacity=1,
+            raiden_id=rid_s,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port_s,
+            secondary_backend_configs=[cfg],
+        )
+        assert store_s.insert(
+            [s0], _hbm_slices(rid_s, 1), on_host=False
+        ), "writer insert failed"
+      dist.barrier()
+      manager_s = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache_s]],
+          max_blocks=1,
+          raiden_controller_address=f"localhost:{controller_port_s}",
+          worker_id=f"worker_s_{rank}",
+          backend_configs=[cfg],
+      )
+      if rank == 0:
+        _log(tag, "1/6", rank, f"Saving {s0!r} -> SHARED_STORAGE (POSIX).")
+        assert store_s.save([s0]), "writer save failed"
+        secs = _wait_for_all(store_s.poll_save_status, [s0], "storage save")
+        _log(tag, "1/6", rank, f"{s0!r} saved in {secs:.3f}s.")
+      dist.barrier()
+      _verify_and_print_shard_files(tag, "1/6", storage_root, model_name,
+                                    world_size, rank, 1)
+      del manager_s, store_s, tpu_cache_s
+      dist.barrier()
+      if phase == "write":
+        return
+
+    if phase in ("read", "both"):
+      # Peer A's HBM block 0 holds r0's data (host_data[1]). Consumer B's HBM
+      # block 0 holds h0's data (host_data[0]); blocks 1-3 are zero and are the
+      # targets of the three per-source calls.
+      tpu_cache_a = torch.tensor(host_data[1:2], device=device)
+      init_b = np.zeros(shape, dtype=np.float32)
+      init_b[0] = host_data[0]
+      tpu_cache_b = torch.tensor(init_b, device=device)
+      _tpu_sync()
+      rid_a = kv_cache_store.RaidenId(
+          "mpmd_3src_job_peer_a", "0", "mpmd_cache_peer_a", 0
+      )
+      rid_b = kv_cache_store.RaidenId(
+          "mpmd_3src_job_consumer_b", "0", "mpmd_cache_consumer_b", 0
+      )
+      store_a = None
+      store_b = None
+      if rank == 0:
+        store_a = kv_cache_store.KVCacheStore(
+            capacity=1,
+            global_registry_address=f"localhost:{registry_port}",
+            raiden_id=rid_a,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port_a,
+        )
+        store_b = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            global_registry_address=f"localhost:{registry_port}",
+            raiden_id=rid_b,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port_b,
+            secondary_backend_configs=[cfg],
+        )
+        assert store_a.insert(
+            [r0], _hbm_slices(rid_a, 1), on_host=False
+        ), "peer A insert failed"
+        assert store_b.insert(
+            [h0], _hbm_slices(rid_b, 1), on_host=False
+        ), "consumer B insert failed"
+      dist.barrier()
+      manager_a = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache_a]],
+          max_blocks=1,
+          raiden_controller_address=f"localhost:{controller_port_a}",
+          worker_id=f"worker_a_{rank}",
+      )
+      manager_b = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache_b]],
+          max_blocks=num_blocks,
+          raiden_controller_address=f"localhost:{controller_port_b}",
+          worker_id=f"worker_b_{rank}",
+          backend_configs=[cfg],
+      )
+
+      # ---- Phase 2/6: peer A stages r0 in its host RAM. ----
+      if rank == 0:
+        _log(tag, "2/6", rank,
+             f"Peer A saving {r0!r} -> HOST (published to global registry).")
+        assert store_a.save([r0]), "peer A save failed"
+        _wait_for_all(store_a.poll_save_status, [r0], "peer A save")
+      dist.barrier()
+
+      # ---- Phase 3/6: consumer B saves h0. B has a secondary backend, so the
+      # save writes h0 to B's host RAM and to POSIX storage; lookup still
+      # reports HOST_AND_HBM because the host tier is checked first. ----
+      if rank == 0:
+        _log(tag, "3/6", rank,
+             f"Consumer B saving {h0!r} -> HOST (local) + SHARED_STORAGE.")
+        assert store_b.save([h0]), "consumer B save failed"
+        _wait_for_all(store_b.poll_save_status, [h0], "consumer B save")
+      dist.barrier()
+
+      if rank == 0:
+        # ---- Phase 4/6: lookup sees exactly [HOST_AND_HBM, REMOTE, STORAGE].
+        hashes = [h0, r0, s0]
+        expected = [status.HOST_AND_HBM, status.REMOTE, status.SHARED_STORAGE]
+        # Wait (unpinned) for registry visibility, then take the pin once.
+        _wait_for_lookup(store_b, hashes, expected,
+                         enable_global=True, pin_found=False)
+        lookup = store_b.lookup(hashes, enable_global=True, pin_found=True)
+        _assert_statuses(lookup, hashes, expected)
+        assert lookup[1][1].raiden_id == rid_a, (
+            f"r0 owner {lookup[1][1].raiden_id} != peer A"
+        )
+        for h, b in lookup:
+          print(f"  [B Lookup] hash={h!r} status={b.status.name}"
+                f" raiden_id={b.raiden_id}", flush=True)
+        slice_of = {h: b for h, b in lookup}
+        _log(tag, "4/6", rank,
+             "Lookup: [HOST_AND_HBM, REMOTE(peer A), SHARED_STORAGE] resolved"
+             " in one call.")
+
+        # ---- Phase 5/6: load() local, one read_remote() for the rest. ----
+        assert store_b.load([h0], [1], slices=[slice_of[h0]]), "load failed"
+        _log(tag, "5/6", rank,
+             f"load([{h0!r}]) -> HBM 1 launched (local host DRAM, consumes"
+             " lookup pin).")
+        assert store_b.read_remote(
+            [r0, s0], [slice_of[r0], slice_of[s0]], [2, 3]
+        ), "read_remote failed"
+        _log(tag, "5/6", rank,
+             f"read_remote([{r0!r}, {s0!r}]) -> HBM [2, 3] launched (peer A"
+             " DRAM + secondary storage, no pin).")
+        secs = _wait_for_all(store_b.poll_load_status, hashes,
+                             "three-source load")
+        _log(tag, "5/6", rank,
+             f"poll_load_status: all 3 blocks done in {secs:.3f}s.")
+      dist.barrier()
+
+      # ---- Phase 6/6: bytes on every rank, local records on rank 0. ----
+      _tpu_sync()
+      after = tpu_cache_b.cpu().numpy()
+      np.testing.assert_array_equal(after[1], host_data[0])
+      np.testing.assert_array_equal(after[2], host_data[1])
+      np.testing.assert_array_equal(after[3], host_data[2])
+      _log(tag, "6/6", rank,
+           "HBM blocks [1, 2, 3] bit-exact (HOST, REMOTE, SHARED_STORAGE"
+           " sources).")
+      dist.barrier()
+      if rank == 0:
+        # The storage recall published s0 into B's host cache; the peer read
+        # recorded nothing locally.
+        local = store_b.lookup([s0], enable_global=False, pin_found=False)
+        _assert_statuses(local, [s0], [status.HOST_AND_HBM])
+        assert local[0][1].raiden_id == rid_b, (
+            f"s0 owner {local[0][1].raiden_id} != consumer B"
+        )
+        r0_local = store_b.lookup([r0], enable_global=False, pin_found=False)
+        assert not r0_local, f"{r0!r} must not be recorded locally: {r0_local}"
+        _log(tag, "6/6", rank,
+             f"{s0!r} published HOST_AND_HBM under B; {r0!r} not recorded"
+             " locally.")
+      del manager_b, store_b, manager_a, store_a
+      dist.barrier()
+  finally:
+    dist.barrier()
     dist.destroy_process_group()
 
 
@@ -1626,6 +2064,79 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
         flush=True,
     )
 
+  def test_mpmd_4rank_e2e_three_source_load(self):
+    """4-rank MPMD: [HOST, REMOTE, SHARED_STORAGE] served by three calls."""
+    world_size = 4
+    prepare_tpu_environment(world_size)
+    master_port = pick_unused_ports(1)[0]
+    controller_port_a = pick_unused_ports(1)[0]
+    controller_port_b = pick_unused_ports(1)[0]
+    controller_port_s = pick_unused_ports(1)[0]
+
+    if _STORAGE_ROOT.value:
+      temp_dir = os.path.join(
+          _STORAGE_ROOT.value,
+          f"torch_mpmd_3src_{int(time.time())}",
+      )
+      os.makedirs(temp_dir, exist_ok=True)
+      is_custom_root = True
+    else:
+      temp_dir = tempfile.mkdtemp()
+      is_custom_root = False
+
+    print(
+        "\n======================================================================\n"
+        "[MPMD Driver] STARTING 4-RANK THREE-SOURCE LOAD E2E TEST\n"
+        f"  World Size: {world_size} ranks (processes)\n"
+        f"  Master Port: {master_port}\n"
+        f"  Writer Controller: {controller_port_s} | Peer A Controller:"
+        f" {controller_port_a} | Consumer B Controller: {controller_port_b}\n"
+        f"  Registry: {_registry_port}\n"
+        f"  Storage Root: {temp_dir}\n"
+        "======================================================================",
+        flush=True,
+    )
+
+    try:
+      procs = []
+      for rank in range(world_size):
+        env = os.environ.copy()
+        env["GLOG_alsologtostderr"] = "1"
+        cmd = worker_launch_cmd() + [
+            "--run_worker",
+            "--alsologtostderr",
+            "--worker_mode=three_source",
+            "--storage_phase=both",
+            f"--storage_root={temp_dir}",
+            f"--rank={rank}",
+            f"--world_size={world_size}",
+            f"--master_port={master_port}",
+            f"--controller_port={controller_port_a}",
+            f"--controller_port_b={controller_port_b}",
+            f"--controller_port_s={controller_port_s}",
+            f"--registry_port={_registry_port}",
+        ]
+        p = subprocess.Popen(cmd, env=env)
+        print(
+            f"[MPMD Driver] Spawning three_source worker rank"
+            f" {rank}/{world_size} (PID={p.pid})...",
+            flush=True,
+        )
+        procs.append(p)
+
+      failures = _wait_for_workers(procs)
+      if failures:
+        self.fail(f"three_source workers failed: {failures}")
+      print(
+          f"[MPMD Driver][SUCCESS] All {world_size} MPMD three-source workers"
+          " completed successfully!\n"
+          "======================================================================\n",
+          flush=True,
+      )
+    finally:
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
   # The expected_worker_count barrier tests live in kv_cache_store_test.py;
   # they spawn no MPMD workers, so duplicating them here added nothing.
 
@@ -1638,6 +2149,8 @@ def main(argv):
       _worker_write_remote_main(argv)
     elif FLAGS.worker_mode == "secondary_storage":
       _worker_secondary_storage_main(argv)
+    elif FLAGS.worker_mode == "three_source":
+      _worker_three_source_main(argv)
     else:
       _worker_save_load_main(argv)
   else:

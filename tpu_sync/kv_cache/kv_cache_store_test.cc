@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <csignal>
@@ -23,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
@@ -41,6 +43,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
@@ -72,6 +75,7 @@
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
@@ -1888,7 +1892,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesMixedStatusesFails) {
   absl::Status status = store.Load(hashes, slices, {2, 3});
   EXPECT_TRUE(absl::IsInvalidArgument(status));
   EXPECT_THAT(std::string(status.message()),
-              ::testing::HasSubstr("Mixed block statuses"));
+              ::testing::HasSubstr("cannot mix local"));
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesRemoteSuccess) {
@@ -7072,6 +7076,730 @@ TEST(KVCacheStoreTest, PeerLookupPriorityOverStorageFallback) {
   ASSERT_TRUE(storage_lookup.ok()) << storage_lookup.status();
   ASSERT_EQ(storage_lookup->size(), 1);
   EXPECT_EQ((*storage_lookup)[0].second.status, BlockStatus::SHARED_STORAGE);
+}
+
+
+// ===========================================================================
+// ReadRemote(): REMOTE (one peer) and SHARED_STORAGE in one call
+// ===========================================================================
+
+struct StorageRecallTransferManager
+    : public ::tpu_raiden::controller::ShardAwareMockTransferManager {
+  using Base = ::tpu_raiden::controller::ShardAwareMockTransferManager;
+  using Result = decltype(std::declval<Base&>().H2d({}, {}, {}));
+
+  absl::Mutex mu;
+  bool fail_recall = false;
+  std::vector<std::vector<int64_t>> h2d_dst_batches ABSL_GUARDED_BY(mu);
+
+  Result H2d(const std::vector<int64_t>& src_offsets,
+             const std::vector<int64_t>& dst_offsets,
+             const std::vector<int64_t>& copy_sizes) {
+    {
+      absl::MutexLock lock(mu);
+      h2d_dst_batches.push_back(dst_offsets);
+    }
+    return Base::H2d(src_offsets, dst_offsets, copy_sizes);
+  }
+
+  Result H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<backends::KVBackend>> kv_backends,
+      const std::vector<backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    if (fail_recall) {
+      ++h2d_read_from_backend_calls;
+      return Result(absl::InternalError("scripted recall failure"));
+    }
+    return Base::H2dReadFromBackend(kv_backends, block_keys, src_host_block_ids,
+                                    dst_device_block_ids);
+  }
+
+  Result H2dReadFromBackend(std::shared_ptr<backends::KVBackend> backend,
+                            const std::vector<backends::BlockKey>& block_keys,
+                            const std::vector<int64_t>& src_host_block_ids,
+                            const std::vector<int64_t>& dst_device_block_ids) {
+    const std::shared_ptr<backends::KVBackend> b[] = {std::move(backend)};
+    return H2dReadFromBackend(absl::MakeSpan(b), block_keys,
+                              src_host_block_ids, dst_device_block_ids);
+  }
+
+  std::vector<int64_t> H2dDestinations() {
+    absl::MutexLock lock(mu);
+    std::vector<int64_t> out;
+    for (const auto& batch : h2d_dst_batches) {
+      out.insert(out.end(), batch.begin(), batch.end());
+    }
+    return out;
+  }
+};
+
+class ReadRemoteTest : public KVCacheStoreEmbeddedControllerTest {
+ protected:
+  static constexpr int kPeerHostBlockBase = 40;
+  static constexpr int kLocalHostBlockBase = 100;
+
+  void SetUp() override {
+    KVCacheStoreEmbeddedControllerTest::SetUp();
+    test_server_->service->SetTransferManager(
+        ::tpu_raiden::KVManagerHolder(&mgr_));
+  }
+
+  void TearDown() override {
+    store_.reset();
+    peer_server_.reset();
+    test_server_->service->SetTransferManager(
+        ::tpu_raiden::KVManagerHolder(dst_transfer_mock_.get()));
+    KVCacheStoreEmbeddedControllerTest::TearDown();
+  }
+
+  struct StoreOptions {
+    int num_host_blocks = 10;
+    std::vector<std::string> peer_hashes;
+    bool register_peer_blocks = false;
+    bool with_empty_registry = false;
+    bool with_storage = true;
+  };
+
+  void MakeStore(const StoreOptions& opts) {
+    auto controller = MakeController(opts.num_host_blocks);
+    RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+    std::string registry_address;
+    if (!opts.peer_hashes.empty()) {
+      registry_ = global_registry::CreateTestGlobalRegistryServer();
+      registry_address = registry_->server_address;
+
+      BackendConfig peer_config;
+      peer_config.type = "HostOffloadBackend";
+      peer_config.capacity = 100;
+      peer_config.global_registry_address = registry_address;
+      peer_config.raiden_id = peer_a_;
+      auto peer_raw = HostOffloadBackend::Create(peer_config, controller.get());
+      ASSERT_TRUE(peer_raw.ok()) << peer_raw.status();
+      peer_backend_ = std::dynamic_pointer_cast<HostOffloadBackend>(*peer_raw);
+      ASSERT_NE(peer_backend_, nullptr);
+
+      std::vector<RaidenBlockId> peer_slices;
+      std::vector<global_registry::Registration> entries;
+      for (size_t i = 0; i < opts.peer_hashes.size(); ++i) {
+        peer_slices.emplace_back(peer_a_, kPeerHostBlockBase + i,
+                                 BlockStatus::HOST);
+        entries.push_back({opts.peer_hashes[i], peer_a_,
+                           static_cast<int>(kPeerHostBlockBase + i)});
+      }
+      peer_backend_->Insert(opts.peer_hashes, peer_slices, /*on_host=*/true);
+
+      peer_server_ = KVCacheStoreServer::Create();
+      ABSL_ASSERT_OK(peer_server_->StartServer(peer_backend_.get(),
+                                               controller.get(), "127.0.0.1"));
+      ABSL_ASSERT_OK(registry_->client->RegisterStore(
+          peer_a_, peer_server_->GetServerAddress(),
+          controller->controller_address()));
+      if (opts.register_peer_blocks) {
+        ABSL_ASSERT_OK(registry_->client->Register(entries));
+      }
+    } else if (opts.with_empty_registry) {
+      registry_address = registry_address_;
+    }
+
+    store_ = std::make_unique<KVCacheStore>(
+        10, std::move(controller), registry_address, local_id_, std::nullopt,
+        /*store_server_ip=*/"127.0.0.1");
+
+    if (opts.with_storage) {
+      const std::string scratch_dir =
+          absl::StrCat(testing::TempDir(), "/",
+                       ::testing::UnitTest::GetInstance()
+                           ->current_test_info()->name());
+      posix_ = std::make_shared<backends::storage::PosixKVBackend>(
+          "posix",
+          absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      mapper_ = std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test", 1, 0);
+      posix_->set_mapper(mapper_);
+      KVCacheStoreTest::AddBackend(
+          *store_, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+                       posix_, "posix"));
+      mgr_.backends["posix"] = posix_;
+    }
+    initial_free_ = FreeBlocks();
+  }
+
+  void AddPinnedLocal(const std::vector<std::string>& hashes) {
+    std::vector<RaidenBlockId> slices;
+    for (size_t i = 0; i < hashes.size(); ++i) {
+      slices.emplace_back(local_id_, kLocalHostBlockBase + i,
+                          /*device_block_id=*/-1, BlockStatus::HOST);
+    }
+    ASSERT_TRUE(InsertResident(*store_, hashes, slices, /*on_host=*/true));
+    ABSL_ASSERT_OK(store_->Lookup(hashes));
+    for (const auto& h : hashes) ASSERT_EQ(store_->GetPinCount(h), 1) << h;
+  }
+
+  void WriteStorageFile(const std::string& hash) {
+    auto key = mapper_->MapKey(hash, {.parallelism = {.tp_rank = 0}});
+    ASSERT_TRUE(key.ok()) << key.status();
+    std::filesystem::create_directories(
+        std::filesystem::path(key->resolved_key).parent_path());
+    std::ofstream(key->resolved_key) << "storage bytes";
+  }
+
+  RaidenBlockId LocalSlice(int i) const {
+    return RaidenBlockId(local_id_, kLocalHostBlockBase + i, -1,
+                         BlockStatus::HOST);
+  }
+  RaidenBlockId PeerSlice(const RaidenId& peer, int i) const {
+    return RaidenBlockId(peer, kPeerHostBlockBase + i, BlockStatus::REMOTE);
+  }
+  static RaidenBlockId StorageSlice() {
+    return RaidenBlockId(RaidenId{"local_job", "0", "posix", 0}, -1, -1,
+                         BlockStatus::SHARED_STORAGE);
+  }
+
+  std::optional<RaidenBlockId> EntryOf(const std::string& hash) {
+    auto res = PeekLookup(*store_, {hash});
+    if (!res.ok() || res->empty()) return std::nullopt;
+    if ((*res)[0].second.status == BlockStatus::SHARED_STORAGE) {
+      return std::nullopt;
+    }
+    return (*res)[0].second;
+  }
+
+  int FreeBlocks() const {
+    return KVCacheStoreTest::GetController(*store_)
+        ->block_manager()
+        ->num_free_blocks();
+  }
+
+  void ExpectNoSideEffects(const std::vector<std::string>& pinned_local) {
+    auto poll = store_->PollLoadStatus();
+    EXPECT_THAT(poll.pending, ::testing::IsEmpty());
+    EXPECT_THAT(poll.done, ::testing::IsEmpty());
+    EXPECT_THAT(poll.failed, ::testing::IsEmpty());
+    EXPECT_EQ(FreeBlocks(), initial_free_);
+    EXPECT_EQ(mgr_.h2d_calls, 0);
+    EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 0);
+    for (const auto& h : pinned_local) EXPECT_EQ(store_->GetPinCount(h), 1) << h;
+  }
+
+  StorageRecallTransferManager mgr_;
+  RaidenId local_id_{"local_job", "0", "local_cache", 0};
+  RaidenId peer_a_{"peer_a", "0", "peer_cache", 0};
+  RaidenId peer_b_{"peer_b", "0", "peer_cache", 0};
+  std::unique_ptr<global_registry::TestGlobalRegistryServer> registry_;
+  std::shared_ptr<HostOffloadBackend> peer_backend_;
+  std::unique_ptr<KVCacheStoreServer> peer_server_;
+  std::shared_ptr<backends::storage::PosixKVBackend> posix_;
+  std::shared_ptr<backends::storage::PosixPathMapper> mapper_;
+  std::unique_ptr<KVCacheStore> store_;
+  int initial_free_ = 0;
+};
+
+// Recalls a batch of SHARED_STORAGE blocks into HBM. The blocks are published
+// into the local host LRU as unpinned HOST_AND_HBM entries under this store's
+// own raiden_id, and exactly one staging block per published hash stays
+// allocated. No pin is taken or consumed.
+TEST_F(ReadRemoteTest, RecallsIntoHbmAndPublishesUnpinned) {
+  MakeStore({});
+
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"s0", "s1"}, {StorageSlice(), StorageSlice()}, {4, 5}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("s0", "s1"));
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 1);
+  EXPECT_THAT(mgr_.last_backend_dst_block_ids, ::testing::ElementsAre(4, 5));
+  for (auto [hash, dev] : {std::pair{"s0", 4}, std::pair{"s1", 5}}) {
+    auto e = EntryOf(hash);
+    ASSERT_TRUE(e.has_value()) << hash;
+    EXPECT_EQ(e->status, BlockStatus::HOST_AND_HBM);
+    EXPECT_EQ(e->device_block_id, dev);
+    EXPECT_EQ(e->raiden_id, local_id_);
+    EXPECT_EQ(store_->GetPinCount(hash), 0) << hash;
+  }
+  EXPECT_EQ(FreeBlocks(), initial_free_ - 2);
+}
+
+// The connector flow: one Lookup() returns [HOST, HOST, SHARED_STORAGE,
+// SHARED_STORAGE] (flat and interleaved), and the caller splits it: Load() for
+// the pinned local prefix, ReadRemote() for the storage suffix. Lookup() pins
+// only the local hits, and only those pins are consumed.
+TEST_F(ReadRemoteTest, LookupThenLoadAndReadRemote) {
+  for (bool interleaved : {true, false}) {
+    SCOPED_TRACE(absl::StrCat("interleaved=", interleaved));
+    TearDown();
+    SetUp();
+    MakeStore({});
+    ASSERT_TRUE(InsertResident(*store_, {"l0", "l1"},
+                               {LocalSlice(0), LocalSlice(1)},
+                               /*on_host=*/true));
+    WriteStorageFile("s0");
+    WriteStorageFile("s1");
+
+    LookupOptions opts;
+    opts.enable_global = false;
+    opts.enable_interleaved_lookup = interleaved;
+    opts.pin_found = true;
+    TF_ASSERT_OK_AND_ASSIGN(BlockSliceList answer,
+                            store_->Lookup({"l0", "l1", "s0", "s1"}, opts));
+    ASSERT_EQ(answer.size(), 4);
+    EXPECT_EQ(answer[0].second.status, BlockStatus::HOST);
+    EXPECT_EQ(answer[1].second.status, BlockStatus::HOST);
+    EXPECT_EQ(answer[2].second.status, BlockStatus::SHARED_STORAGE);
+    EXPECT_EQ(answer[3].second.status, BlockStatus::SHARED_STORAGE);
+    EXPECT_EQ(store_->GetPinCount("l0"), 1);
+    EXPECT_EQ(store_->GetPinCount("s0"), 0);
+
+    ABSL_ASSERT_OK(store_->Load({"l0", "l1"},
+                                {answer[0].second, answer[1].second}, {2, 3}));
+    ABSL_ASSERT_OK(store_->ReadRemote(
+        {"s0", "s1"}, {answer[2].second, answer[3].second}, {4, 5}));
+
+    LoadOutcome outcome = WaitForLoadSettled(*store_, 4);
+    EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+    EXPECT_THAT(outcome.done,
+                ::testing::UnorderedElementsAre("l0", "l1", "s0", "s1"));
+    for (const char* h : {"l0", "l1", "s0", "s1"}) {
+      EXPECT_EQ(store_->GetPinCount(h), 0) << h;
+    }
+  }
+}
+
+// The [HOST, REMOTE, SHARED_STORAGE] P/D case: Load() for the local block and
+// ONE ReadRemote() for the peer and storage blocks, in either slice order. The
+// peer staging block is freed and nothing is recorded for r0; s0 is published
+// unpinned and keeps its staging block. No pin is left behind.
+TEST_F(ReadRemoteTest, PeerAndStorageInOneCall) {
+  for (bool storage_first : {false, true}) {
+    SCOPED_TRACE(absl::StrCat("storage_first=", storage_first));
+    TearDown();
+    SetUp();
+    {
+      // mgr_ is a fixture member, so it outlives TearDown()/SetUp().
+      absl::MutexLock lock(mgr_.mu);
+      mgr_.h2d_dst_batches.clear();
+    }
+    MakeStore({.peer_hashes = {"r0"}});
+    AddPinnedLocal({"l0"});
+
+    std::vector<std::string> hashes = {"r0", "s0"};
+    std::vector<RaidenBlockId> slices = {PeerSlice(peer_a_, 0), StorageSlice()};
+    std::vector<int32_t> dev = {3, 4};
+    if (storage_first) {
+      std::reverse(hashes.begin(), hashes.end());
+      std::reverse(slices.begin(), slices.end());
+      std::reverse(dev.begin(), dev.end());
+    }
+
+    ABSL_ASSERT_OK(store_->Load({"l0"}, {LocalSlice(0)}, {2}));
+    ABSL_ASSERT_OK(store_->ReadRemote(hashes, slices, dev));
+
+    LoadOutcome outcome = WaitForLoadSettled(*store_, 3);
+    EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+    EXPECT_THAT(outcome.done,
+                ::testing::UnorderedElementsAre("l0", "r0", "s0"));
+    EXPECT_THAT(mgr_.H2dDestinations(), ::testing::UnorderedElementsAre(2, 3));
+    EXPECT_THAT(mgr_.last_backend_dst_block_ids, ::testing::ElementsAre(4));
+    EXPECT_EQ(EntryOf("l0")->status, BlockStatus::HOST_AND_HBM);
+    EXPECT_FALSE(EntryOf("r0").has_value());
+    EXPECT_EQ(EntryOf("s0")->status, BlockStatus::HOST_AND_HBM);
+    for (const char* h : {"l0", "r0", "s0"}) {
+      EXPECT_EQ(store_->GetPinCount(h), 0) << h;
+    }
+    EXPECT_EQ(FreeBlocks(), initial_free_ - 1);
+  }
+}
+
+// HOST slices belong to Load(); ReadRemote() rejects any batch containing one,
+// whatever the order, with no side effects -- the caller's pin on l0 is
+// untouched.
+TEST_F(ReadRemoteTest, RejectsHostSlices) {
+  MakeStore({.peer_hashes = {"r0"}});
+  AddPinnedLocal({"l0"});
+
+  struct Case {
+    std::vector<std::string> hashes;
+    std::vector<RaidenBlockId> slices;
+  };
+  const std::vector<Case> cases = {
+      {{"l0"}, {LocalSlice(0)}},
+      {{"r0", "l0"}, {PeerSlice(peer_a_, 0), LocalSlice(0)}},
+      {{"s0", "l0"}, {StorageSlice(), LocalSlice(0)}},
+      {{"l0", "s0"}, {LocalSlice(0), StorageSlice()}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(absl::StrJoin(c.hashes, ","));
+    std::vector<int32_t> dev(c.hashes.size());
+    std::iota(dev.begin(), dev.end(), 2);
+    absl::Status status = store_->ReadRemote(c.hashes, c.slices, dev);
+    EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+    EXPECT_THAT(std::string(status.message()),
+                ::testing::HasSubstr("ReadRemote requires every slice to be "
+                                     "REMOTE or SHARED_STORAGE"));
+    ExpectNoSideEffects({"l0"});
+  }
+  store_->Release({"l0"});
+}
+
+// At most one peer per call: two peers are rejected before the storage block
+// is reserved or staged.
+TEST_F(ReadRemoteTest, RejectsTwoPeers) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  absl::Status status = store_->ReadRemote(
+      {"r0", "rb", "s0"},
+      {PeerSlice(peer_a_, 0), PeerSlice(peer_b_, 0), StorageSlice()},
+      {2, 3, 4});
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr(
+                  "Mixed remote node IDs in one call"));
+  ExpectNoSideEffects({});
+}
+
+// A hash may appear once per call, and a REMOTE slice must name a peer (not
+// this store, not an empty id). All are rejected with no side effects.
+TEST_F(ReadRemoteTest, RejectsDuplicateHashAndSelfPeer) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  struct Case {
+    std::vector<std::string> hashes;
+    std::vector<RaidenBlockId> slices;
+    std::string message;
+  };
+  const std::vector<Case> cases = {
+      {{"s0", "s0"},
+       {StorageSlice(), StorageSlice()},
+       "Duplicate block hash in ReadRemote: s0"},
+      {{"r0", "r0"},
+       {PeerSlice(peer_a_, 0), StorageSlice()},
+       "Duplicate block hash in ReadRemote: r0"},
+      {{"x0"},
+       {RaidenBlockId(local_id_, 0, BlockStatus::REMOTE)},
+       "REMOTE slice must name a peer, not this store: x0"},
+      {{"x0"},
+       {RaidenBlockId(RaidenId{}, 0, BlockStatus::REMOTE)},
+       "REMOTE slice must name a peer, not this store: x0"},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.message);
+    std::vector<int32_t> dev(c.hashes.size());
+    std::iota(dev.begin(), dev.end(), 2);
+    absl::Status status = store_->ReadRemote(c.hashes, c.slices, dev);
+    EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+    EXPECT_THAT(std::string(status.message()), ::testing::HasSubstr(c.message));
+    ExpectNoSideEffects({});
+  }
+}
+
+// Without a secondary backend, any batch with a SHARED_STORAGE slice fails with
+// NotFound before anything is reserved: no failed hashes are reported, no
+// staging block is allocated, and the peer block in the same call is NOT
+// launched.
+TEST_F(ReadRemoteTest, NoSecondaryBackendHasNoSideEffects) {
+  MakeStore({.peer_hashes = {"r0"}, .with_storage = false});
+
+  for (const auto& [hashes, slices] :
+       std::vector<std::pair<std::vector<std::string>,
+                             std::vector<RaidenBlockId>>>{
+           {{"s0"}, {StorageSlice()}},
+           {{"r0", "s0"}, {PeerSlice(peer_a_, 0), StorageSlice()}},
+       }) {
+    SCOPED_TRACE(absl::StrJoin(hashes, ","));
+    std::vector<int32_t> dev(hashes.size());
+    std::iota(dev.begin(), dev.end(), 2);
+    absl::Status status = store_->ReadRemote(hashes, slices, dev);
+    EXPECT_TRUE(absl::IsNotFound(status)) << status;
+    EXPECT_THAT(std::string(status.message()),
+                ::testing::HasSubstr(
+                    "No registered secondary backend found for: posix"));
+    ExpectNoSideEffects({});
+  }
+}
+
+// A hash already in flight cannot be read again until it settles. The check
+// covers the whole call: a batch whose storage hash is busy is rejected before
+// its peer hash is reserved or launched.
+TEST_F(ReadRemoteTest, AlreadyLoadingRejected) {
+  struct BlockingManager : public StorageRecallTransferManager {
+    absl::Notification started, release;
+    Result H2dReadFromBackend(
+        absl::Span<const std::shared_ptr<backends::KVBackend>> kv_backends,
+        const std::vector<backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_host_block_ids,
+        const std::vector<int64_t>& dst_device_block_ids) {
+      started.Notify();
+      release.WaitForNotification();
+      return StorageRecallTransferManager::H2dReadFromBackend(
+          kv_backends, block_keys, src_host_block_ids, dst_device_block_ids);
+    }
+  };
+  BlockingManager blocking;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&blocking));
+  MakeStore({.peer_hashes = {"r0"}});
+  blocking.backends["posix"] = posix_;
+
+  ABSL_ASSERT_OK(store_->ReadRemote({"s0"}, {StorageSlice()}, {2}));
+  blocking.started.WaitForNotification();
+
+  absl::Status status = store_->ReadRemote({"s0"}, {StorageSlice()}, {3});
+  EXPECT_TRUE(absl::IsFailedPrecondition(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Block is already loading: s0"));
+
+  status = store_->ReadRemote({"r0", "s0"},
+                              {PeerSlice(peer_a_, 0), StorageSlice()}, {4, 5});
+  EXPECT_TRUE(absl::IsFailedPrecondition(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Block is already loading: s0"));
+  EXPECT_EQ(blocking.h2d_calls, 0) << "r0 must not have been launched";
+
+  blocking.release.Notify();
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("s0"));
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mgr_));
+}
+
+// Under host-memory pressure, allocating the recall's staging block evicts only
+// unpinned entries: a block the caller holds pinned (e.g. for its own local
+// load) survives with its pin intact.
+TEST_F(ReadRemoteTest, StagingEvictsOnlyUnpinned) {
+  constexpr int kHostBlocks = 3;
+  MakeStore({.num_host_blocks = kHostBlocks});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> alloc_ids,
+      KVCacheStoreTest::GetController(*store_)->AllocateBlockIds(2));
+  ASSERT_TRUE(InsertResident(
+      *store_, {"unpinned0"},
+      {RaidenBlockId(local_id_, alloc_ids[0], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  ASSERT_TRUE(InsertResident(
+      *store_, {"l0"},
+      {RaidenBlockId(local_id_, alloc_ids[1], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  ABSL_ASSERT_OK(store_->Lookup({"l0"}));
+  ASSERT_EQ(store_->GetPinCount("l0"), 1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  ABSL_ASSERT_OK(store_->ReadRemote({"s0"}, {StorageSlice()}, {3}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("s0"));
+  EXPECT_EQ(store_->GetPinCount("l0"), 1);
+  EXPECT_TRUE(EntryOf("l0").has_value());
+  EXPECT_FALSE(EntryOf("unpinned0").has_value());
+  store_->Release({"l0"});
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// If no staging block can be allocated after validation passed, the call still
+// returns OK (the launch contract): the storage hashes are reported failed by
+// the poll -- exactly once -- and no recall is issued.
+TEST_F(ReadRemoteTest, StagingExhaustionFailsStorageGroup) {
+  constexpr int kHostBlocks = 4;
+  MakeStore({.num_host_blocks = kHostBlocks});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, kHostBlocks));
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"s0", "s1"}, {StorageSlice(), StorageSlice()}, {4, 5}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.failed, ::testing::UnorderedElementsAre("s0", "s1"));
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 0);
+  EXPECT_FALSE(EntryOf("s0").has_value());
+  EXPECT_FALSE(EntryOf("s1").has_value());
+  // Reported once: nothing is left for a later poll.
+  auto again = store_->PollLoadStatus();
+  EXPECT_THAT(again.failed, ::testing::IsEmpty());
+  EXPECT_THAT(again.pending, ::testing::IsEmpty());
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// Peers launch first: with a single free host block, the peer group takes it
+// as staging and completes, and the storage group then finds none and is
+// reported failed by the poll. The call returns OK; the groups are independent.
+TEST_F(ReadRemoteTest, StagingExhaustionStillLaunchesPeerGroup) {
+  MakeStore({.peer_hashes = {"r0"}});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks() - 1));
+  ASSERT_EQ(FreeBlocks(), 1);
+
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"r0", "s0"}, {PeerSlice(peer_a_, 0), StorageSlice()}, {3, 4}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("r0"));
+  EXPECT_THAT(outcome.failed, ::testing::ElementsAre("s0"));
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::ElementsAre(3));
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 0);
+  EXPECT_FALSE(EntryOf("s0").has_value());
+  auto again = store_->PollLoadStatus();
+  EXPECT_THAT(again.failed, ::testing::IsEmpty());
+  EXPECT_EQ(FreeBlocks(), 1);
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// Load(slices) forwards a storage batch to ReadRemote(), so staging
+// exhaustion there is also reported once, by the poll, and Load() returns OK
+// rather than an error on top of it.
+TEST_F(ReadRemoteTest, LoadStorageStagingExhaustionReportedOnceViaPoll) {
+  constexpr int kHostBlocks = 4;
+  MakeStore({.num_host_blocks = kHostBlocks});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, kHostBlocks));
+
+  ABSL_ASSERT_OK(
+      store_->Load({"s0", "s1"}, {StorageSlice(), StorageSlice()}, {4, 5}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.failed, ::testing::UnorderedElementsAre("s0", "s1"));
+  auto again = store_->PollLoadStatus();
+  EXPECT_THAT(again.failed, ::testing::IsEmpty());
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 0);
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// If the hash became resident concurrently, the publish is refused and the
+// staging block is returned; the read itself still succeeds.
+TEST_F(ReadRemoteTest, PublishRefusedReturnsStaging) {
+  MakeStore({});
+  ASSERT_TRUE(
+      InsertResident(*store_, {"s0"}, {LocalSlice(0)}, /*on_host=*/true));
+  const int free_before = FreeBlocks();
+
+  ABSL_ASSERT_OK(store_->ReadRemote({"s0"}, {StorageSlice()}, {3}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("s0"));
+  EXPECT_EQ(FreeBlocks(), free_before);
+  EXPECT_EQ(store_->GetPinCount("s0"), 0);
+}
+
+// A recall failure fails every storage hash in the batch, returns all staging
+// blocks and publishes nothing.
+TEST_F(ReadRemoteTest, RecallFailureFailsBatchAndReturnsStaging) {
+  MakeStore({});
+  mgr_.fail_recall = true;
+
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"s0", "s1"}, {StorageSlice(), StorageSlice()}, {4, 5}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.failed, ::testing::UnorderedElementsAre("s0", "s1"));
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 1);
+  EXPECT_FALSE(EntryOf("s0").has_value());
+  EXPECT_FALSE(EntryOf("s1").has_value());
+  EXPECT_EQ(store_->GetPinCount("s0"), 0);
+  EXPECT_EQ(FreeBlocks(), initial_free_);
+}
+
+// Groups fail independently: a storage recall failure does not fail the peer
+// read launched by the same call. Every staging block is returned and no pin
+// is left on either hash.
+TEST_F(ReadRemoteTest, StorageFailureDoesNotFailPeerGroup) {
+  MakeStore({.peer_hashes = {"r0"}});
+  mgr_.fail_recall = true;
+
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"r0", "s0"}, {PeerSlice(peer_a_, 0), StorageSlice()}, {3, 4}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("r0"));
+  EXPECT_THAT(outcome.failed, ::testing::ElementsAre("s0"));
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::ElementsAre(3));
+  EXPECT_FALSE(EntryOf("r0").has_value());
+  EXPECT_FALSE(EntryOf("s0").has_value());
+  EXPECT_EQ(store_->GetPinCount("r0"), 0);
+  EXPECT_EQ(store_->GetPinCount("s0"), 0);
+  EXPECT_EQ(FreeBlocks(), initial_free_);
+}
+
+// Load(slices) forks: an all-non-local batch (REMOTE and/or SHARED_STORAGE)
+// is forwarded to ReadRemote() and succeeds with no pins involved.
+TEST_F(ReadRemoteTest, LoadForwardsNonLocalBatchToReadRemote) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  ABSL_ASSERT_OK(store_->Load({"r0", "s0"},
+                              {PeerSlice(peer_a_, 0), StorageSlice()}, {3, 4}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("r0", "s0"));
+  EXPECT_FALSE(EntryOf("r0").has_value());
+  EXPECT_EQ(EntryOf("s0")->status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ(store_->GetPinCount("r0"), 0);
+  EXPECT_EQ(store_->GetPinCount("s0"), 0);
+}
+
+// Mixing local and non-local slices in one Load(slices) is rejected upfront,
+// whatever the order, with no side effects -- local pins are untouched. The
+// forwarded path keeps ReadRemote()'s checks (duplicate hash, self peer).
+TEST_F(ReadRemoteTest, LoadRejectsLocalAndNonLocalMix) {
+  MakeStore({.peer_hashes = {"r0"}});
+  AddPinnedLocal({"l0", "l1"});
+
+  struct Case {
+    std::vector<std::string> hashes;
+    std::vector<RaidenBlockId> slices;
+    std::string message;
+  };
+  const std::vector<Case> cases = {
+      {{"l0", "s0"}, {LocalSlice(0), StorageSlice()}, "cannot mix local"},
+      {{"l0", "s0", "l1"},
+       {LocalSlice(0), StorageSlice(), LocalSlice(1)},
+       "cannot mix local"},
+      {{"s0", "l0"}, {StorageSlice(), LocalSlice(0)}, "cannot mix local"},
+      {{"r0", "l0"}, {PeerSlice(peer_a_, 0), LocalSlice(0)}, "cannot mix local"},
+      {{"l0", "r0"}, {LocalSlice(0), PeerSlice(peer_a_, 0)}, "cannot mix local"},
+      {{"r0", "r0"},
+       {PeerSlice(peer_a_, 0), PeerSlice(peer_a_, 0)},
+       "Duplicate block hash"},
+      {{"r0"}, {PeerSlice(local_id_, 0)}, "must name a peer"},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(absl::StrJoin(c.hashes, ","));
+    std::vector<int> dev(c.hashes.size());
+    std::iota(dev.begin(), dev.end(), 2);
+    absl::Status status = store_->Load(c.hashes, c.slices, dev);
+    EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+    EXPECT_THAT(std::string(status.message()), ::testing::HasSubstr(c.message));
+    ExpectNoSideEffects({"l0", "l1"});
+  }
+  store_->Release({"l0", "l1"});
+}
+
+// Two peers are still rejected through Load(slices), via ReadRemote().
+TEST_F(ReadRemoteTest, LoadStillRejectsTwoPeers) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  absl::Status status = store_->Load(
+      {"r0", "rb"}, {PeerSlice(peer_a_, 0), PeerSlice(peer_b_, 0)}, {2, 3});
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Mixed remote node IDs in one call"));
+  ExpectNoSideEffects({});
 }
 
 }  // namespace

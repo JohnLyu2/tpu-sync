@@ -242,6 +242,15 @@ class KVCacheStore:
     registry are not: they name a block on another node, and there is nothing
     here to hold.
 
+    ONE ANSWER CAN MIX SOURCES: local host (HOST / HOST_AND_HBM), then peers
+    (REMOTE -- only with enable_global, possibly several peers), then secondary
+    storage (SHARED_STORAGE, probed for the remaining tail whatever
+    enable_global is). Only local hits are pinned. Route by status:
+      HOST / HOST_AND_HBM     -> load()         consumes the lookup pin
+      REMOTE, SHARED_STORAGE  -> read_remote()  no pin; one call per peer, and
+                                                the storage hits may join any
+                                                of them (or go alone)
+
     Args:
       block_hashes: Incoming block hashes to check.
       enable_global: Whether to fallback to global registry on miss. Defaults
@@ -383,15 +392,17 @@ class KVCacheStore:
       slices: list[RaidenBlockId] | None = None,
   ) -> bool:
     """Asynchronously loads KV cache blocks to device (HBM), either from local
-    host DRAM or from a peer (if `slices` is provided).
+    host DRAM, a peer, or shared storage (if `slices` is provided).
 
     If `slices` is None, this is LOCAL-ONLY: a hash whose cached entry has
     status REMOTE is refused (the call returns False) -- passing `slices` is
-    the only way to load from a peer.
-    If `slices` is provided, it handles loading from local host DRAM or from a peer.
+    the only way to load from a peer or shared storage.
+    If `slices` is provided, it handles loading from local host DRAM, a peer, or shared storage.
 
-    ONE CALL IS ONE SOURCE. Every block in a batch must carry the same status,
-    and remote blocks must all refer to the same peer.
+    A single instance of the load call should not mix local and non-local sources.
+    All HOST / HOST_AND_HBM slices load from local host DRAM. All REMOTE (one peer)
+    and/or SHARED_STORAGE slices are handled exactly as read_remote(). Mixing local
+    and non-local slices is refused (returns False).
 
     `device_block_ids` is the destination and must name one device block per hash.
 
@@ -403,9 +414,11 @@ class KVCacheStore:
                        stays pinned so you can retry, or release it
                        deliberately. Giving up is your decision, not the
                        store's.
-      remote source -- no pin is required and none is consumed. A hash resolved
-                       only through the registry never entered the local cache,
-                       so there is nothing here to have pinned.
+      non-local     -- (REMOTE / SHARED_STORAGE) no pin is required and none is
+                       consumed, exactly as read_remote(). lookup() never pins
+                       peer or storage hits. A recalled storage block is kept
+                       in this store's host cache as an unpinned HOST_AND_HBM
+                       entry; a peer load records nothing.
 
     A load from a peer records NOTHING locally: no host copy is kept, so a
     later lookup() of that hash is still a miss. Your own block manager is what
@@ -476,7 +489,9 @@ class KVCacheStore:
 
     For completed LOCAL transfers, it advances the LRU block states to
     HOST_AND_HBM and updates their device block locations. A completed REMOTE
-    load is only reported here -- it records nothing locally.
+    load is only reported here -- it records nothing locally. A completed
+    SHARED_STORAGE recall is published into this store's host cache as an
+    unpinned HOST_AND_HBM entry.
 
     Returns:
       A tuple of (done, failed, pending), where:
@@ -492,40 +507,62 @@ class KVCacheStore:
       slices: list[RaidenBlockId],
       device_block_ids: list[int],
   ) -> bool:
-    """Reads REMOTE blocks from their owning peers straight into local HBM.
+    """Reads REMOTE and/or SHARED_STORAGE blocks into local HBM.
 
-    Returns as soon as the reads are issued; poll with
-    poll_remote_read_status().
+    Returns as soon as the reads are issued; poll with poll_load_status()
+    (poll_remote_read_status() is an alias). Each slice is routed by status:
+    REMOTE -> its owning peer (one peer per call), SHARED_STORAGE -> the
+    secondary storage tier. Both may be mixed in one call. Local HOST blocks
+    go through load(). This is load(slices=...) restricted to non-local
+    slices: both reach the same C++ path.
 
-    This store's cache is neither consulted nor modified. The hashes need not
-    be present locally and need not be pinned; nothing is inserted on success
-    and nothing is left behind on failure. The bytes land ONLY in the given
-    device blocks -- no local host copy is kept, so a later local load() of the
-    same hash is still a miss.
+    PIN CONTRACT: none. No pin is required, taken or consumed; do not release()
+    these hashes.
 
-    Compare with load(): both bring a peer's block into local HBM. Use load()
-    when the hash may be resident locally and you want the store to decide; use
-    read_remote() when you already hold the source coordinates and want no
-    local record of the transfer.
+    STAGING BEHAVIOR: the store allocates host staging blocks internally.
+      REMOTE peer    -- uses free host blocks only (never evicts); they are
+                        freed on success and on failure.
+      SHARED_STORAGE -- may evict UNPINNED cached blocks to make room, never
+                        pinned ones (your lookup() pins for load() are safe).
+                        On success each block is kept in this store's host
+                        cache as an unpinned HOST_AND_HBM entry; on failure
+                        the staging blocks are freed.
 
-    Requires a global registry: it is what maps the owning peer to the
-    controller address this store acquires its read lease from. A store built
-    without a global_registry_address fails every read.
+    SUBSEQUENT LOOKUPS:
+      REMOTE peer    -- nothing is recorded locally: lookup() without global
+                        still misses, and a global lookup() may report REMOTE
+                        again. Your own block manager must remember that it
+                        owns the device block.
+      SHARED_STORAGE -- a later lookup() is a local HOST_AND_HBM hit (pinned if
+                        pin_found), so load it with load() under the local pin
+                        contract. The entry is unpinned and may be evicted at
+                        any time, after which lookup() reports SHARED_STORAGE
+                        again.
+      Failure        -- nothing is recorded for either source.
+
+    A peer read needs a global registry to resolve the peer; without one the
+    peer hashes are reported failed.
 
     Args:
       block_hashes: Block hashes to read.
-      slices: One REMOTE RaidenBlockId per hash, naming where to read from.
-        Only two fields are used -- raiden_id (the owning peer) and
-        host_block_id (the block on that peer) -- so a lookup() answer can be
-        passed straight through.
-      device_block_ids: One local device block id per hash. Mandatory.
-        On FAILURE their contents are UNDEFINED: they are written before the
-        source's verdict is known. Treat them as scratch until the read
-        reports success.
+      slices: One REMOTE or SHARED_STORAGE RaidenBlockId per hash; a lookup()
+        answer can be passed straight through.
+      device_block_ids: One local device block id per hash. Mandatory. On
+        FAILURE their contents are UNDEFINED; treat them as scratch until the
+        read reports success.
 
     Returns:
-      True if successfully launched.
+      True if launched; False if validation failed (a slice that is not
+      REMOTE or SHARED_STORAGE, two peers, duplicate hash, a REMOTE slice
+      naming this store, a hash already loading, or SHARED_STORAGE with no
+      secondary backend). A launched read may still fail, including for lack
+      of host staging blocks; check the poll.
     """
+    # Local slices would take load()'s local path and consume the caller's
+    # pins, which this call promises never to do.
+    non_local = (BlockStatus.REMOTE, BlockStatus.SHARED_STORAGE)
+    if any(s.status not in non_local for s in slices):
+      return False
     return self.load(block_hashes, device_block_ids, slices=slices)
 
   def poll_remote_read_status(
