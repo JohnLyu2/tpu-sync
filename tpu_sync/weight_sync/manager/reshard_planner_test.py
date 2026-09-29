@@ -14,6 +14,7 @@
 
 """Tests and benchmarks for ReshardPlanner schedule computation and deduplication."""
 
+import collections
 import threading
 import timeit
 from typing import Any
@@ -949,6 +950,168 @@ class ReshardPlannerTest(absltest.TestCase):
       reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
           **inputs
       )
+
+  def test_pathways_single_unit_multi_host_flat_direct_push_latin_square_shift(
+      self,
+  ):
+    """Verifies deterministic Latin Square circular shift for single-unit multi-host flat direct push."""
+    src_unit = RaidenId("trainer", "", "weights", 0)
+    src_units = [src_unit]
+    dst_units = [RaidenId(f"rollout_{j}", "0", "weights", 0) for j in range(4)]
+
+    src_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=4, is_src=True
+    )
+    dst_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=4, is_src=False
+    )
+
+    cases = [
+        ("contiguous_host_shards", lambda s: s // 8),
+        ("torus_interleaved_host_shards", lambda s: (s // 2) % 4),
+    ]
+
+    for case_name, host_fn in cases:
+      with self.subTest(placement=case_name):
+        src_shards = [f"10.0.0.{host_fn(s) + 1}:8000" for s in range(32)]
+        registered_shards = {src_unit: src_shards}
+        entities = {
+            src_unit: job_entity.JobEntity(unit=src_unit, shards=src_shards)
+        }
+        dst_metadata = []
+        for j, u in enumerate(dst_units):
+          shards = [f"10.1.{j + 1}.1:8000"]
+          registered_shards[u] = shards
+          meta = raiden_service_pb2.RegisterWorkUnitRequest(
+              unit=raiden_service_pb2.RaidenIdProto(
+                  job_name=u.job_name,
+                  job_replica_id=str(u.job_replica_id),
+                  data_name=u.data_name,
+                  data_replica_idx=u.data_replica_idx,
+              ),
+              control_plane_rpc_address=f"10.1.{j + 1}.1:9000",
+          )
+          meta.shards.extend(shards)
+          meta.mesh_shape.extend([1, 1])
+          meta.mesh_axes.extend(["tp", "tp_wo"])
+          meta.host_subgrid.extend([1, 1])
+          for v in dst_vars:
+            vp = meta.variables.add()
+            vp.name = v.name
+            vp.shape.extend(v.shape)
+            vp.mesh_shape.extend(v.mesh_shape)
+            vp.layout.extend(v.layout)
+            vp.item_size = v.item_size
+            vp.layer_idx = v.layer_idx
+            vp.sharding_spec.extend(v.sharding_spec)
+          dst_metadata.append(meta)
+
+        sched = reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            src_units=src_units,
+            dst_units=dst_units,
+            dst_metadata=dst_metadata,
+            entities=entities,
+            registered_variables={src_unit: src_vars},
+            registered_global_shapes={},
+            registered_mesh_shapes={src_unit: [1, 1, 4, 4, 2]},
+            registered_mesh_axes={
+                src_unit: ["data", "stage", "fsdp", "context", "expert"]
+            },
+            registered_host_subgrids={src_unit: [1, 1, 1, 4, 2]},
+            registered_layouts={},
+            registered_itemsizes={},
+            registered_shards=registered_shards,
+            computed_phys_meshes={},
+            worker_endpoints={
+                src_unit: (
+                    "10.0.0.1:9000,10.0.0.2:9000,10.0.0.3:9000,10.0.0.4:9000"
+                )
+            },
+            broadcast_host_ratio=0.0,
+            lock=threading.Lock(),
+        )
+
+        schedule_protos = entities[src_unit].build_sender_push_schedule_protos(
+            sched.direct_schedules[src_unit]
+        )
+
+        shards_by_host = collections.defaultdict(list)
+        for s in range(32):
+          h = host_fn(s)
+          shards_by_host[h].append(s)
+
+        peers_by_host_sched = {}
+        peers_by_host_proto = {}
+        first_dest_units_by_host = {}
+
+        for h in range(4):
+          host_shards = shards_by_host[h]
+          for s_idx in host_shards:
+            shard_sched = sched.direct_schedules[src_unit][s_idx]
+            layer0_sched_peers = []
+            for entry in shard_sched:
+              if entry[10] == 0:  # layer_idx
+                p = entry[0]
+                if p not in layer0_sched_peers:
+                  layer0_sched_peers.append(p)
+            self.assertLen(layer0_sched_peers, 4)
+            if h not in peers_by_host_sched:
+              peers_by_host_sched[h] = layer0_sched_peers
+            else:
+              self.assertEqual(
+                  peers_by_host_sched[h],
+                  layer0_sched_peers,
+                  f"All shards on host {h} must share destination sequence in"
+                  " sched",
+              )
+
+            proto = schedule_protos[s_idx]
+            layer0_entries = [e for e in proto.entries if e.layer_idx == 0]
+            self.assertNotEmpty(layer0_entries)
+            layer0_proto_peers = list(layer0_entries[0].dst_peers)
+            self.assertLen(layer0_proto_peers, 4)
+            if h not in peers_by_host_proto:
+              peers_by_host_proto[h] = layer0_proto_peers
+            else:
+              self.assertEqual(
+                  peers_by_host_proto[h],
+                  layer0_proto_peers,
+                  f"All shards on host {h} must share destination sequence in"
+                  " proto",
+              )
+
+          first_peer = peers_by_host_proto[h][0]
+          first_unit = sched.data_address_to_unit[first_peer]
+          first_dest_units_by_host[h] = first_unit
+          self.assertEqual(
+              first_unit,
+              dst_units[h],
+              f"Host {h} must start with {dst_units[h]}",
+          )
+
+        for h in range(4):
+          expected_shift_sched = (
+              peers_by_host_sched[0][h:] + peers_by_host_sched[0][:h]
+          )
+          self.assertEqual(
+              peers_by_host_sched[h],
+              expected_shift_sched,
+              f"Host {h} sched peers must be circularly shifted by {h}",
+          )
+          expected_shift_proto = (
+              peers_by_host_proto[0][h:] + peers_by_host_proto[0][:h]
+          )
+          self.assertEqual(
+              peers_by_host_proto[h],
+              expected_shift_proto,
+              f"Host {h} proto peers must be circularly shifted by {h}",
+          )
+
+        self.assertLen(
+            set(first_dest_units_by_host.values()),
+            4,
+            "All 4 hosts must have distinct first destination units",
+        )
 
 
 if __name__ == "__main__":

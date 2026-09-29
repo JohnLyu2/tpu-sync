@@ -18,7 +18,7 @@ from collections import abc
 import dataclasses
 import enum
 import threading
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from tpu_sync.api.common import RaidenId
 from tpu_sync.rpc import raiden_service_pb2
@@ -439,6 +439,40 @@ def _extract_host_ip(addr: str) -> str:
   if ":" in addr:
     return addr.rsplit(":", 1)[0]
   return addr
+
+
+def compute_shard_host_ranks(
+    src_shards: Sequence[str], num_src_units: int, unit_idx: int
+) -> dict[int, int]:
+  """Computes deterministic host rank per source shard index.
+
+  Args:
+    src_shards: Sequence of shard network addresses (e.g. 'ip:port') for the
+      source unit.
+    num_src_units: Total number of source units in the stage broadcast group.
+    unit_idx: Index of the current source unit within the source units sequence.
+
+  Returns:
+    A dictionary mapping each local shard index in `src_shards` to its
+    deterministic host rank integer.
+  """
+  shard_ips = [_extract_host_ip(s) for s in src_shards]
+  unique_ips = list(dict.fromkeys(ip for ip in shard_ips if ip))
+  if len(unique_ips) > 1:
+    ip_to_rank = {ip: idx for idx, ip in enumerate(unique_ips)}
+    return {
+        idx: unit_idx * len(unique_ips) + ip_to_rank[shard_ips[idx]]
+        for idx in range(len(src_shards))
+    }
+  else:
+    unique_addrs = list(dict.fromkeys(src_shards))
+    if num_src_units == 1 and len(unique_addrs) > 1:
+      addr_to_rank = {addr: idx for idx, addr in enumerate(unique_addrs)}
+      return {
+          idx: addr_to_rank[src_shards[idx]] for idx in range(len(src_shards))
+      }
+    else:
+      return {idx: unit_idx for idx in range(len(src_shards))}
 
 
 def _raiden_id_from_proto(unit: Any) -> RaidenId:

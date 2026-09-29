@@ -1341,6 +1341,9 @@ class ReshardPlanner:
       for src_unit_idx, src_unit in enumerate(src_units):
         src_vars = src_vars_by_unit.get(src_unit, [])
         src_shards = resolve_shards_locked(src_unit)
+        shard_host_ranks = controller_types.compute_shard_host_ranks(
+            src_shards, len(src_units), src_unit_idx
+        )
         unit_plans_by_eq_and_id: list[dict[int, Any]] = [
             {} for _ in range(num_eq_classes)
         ]
@@ -1599,6 +1602,7 @@ class ReshardPlanner:
               global_src_idx,
               candidate_rank,
           ) in src_ranked_indices:
+            src_host_rank = shard_host_ranks[local_src_idx]
             src_slice = src_nd_slices[global_src_idx]
             s_key = (s_sig, src_slice)
             candidates = src_slice_holders.get(s_key)
@@ -1773,7 +1777,7 @@ class ReshardPlanner:
                   continue
 
                 if len(matched_items) > 1:
-                  shift = src_unit_idx % len(matched_items)
+                  shift = src_host_rank % len(matched_items)
                   shifted_matched_items = (
                       matched_items[shift:] + matched_items[:shift]
                   )
@@ -1810,7 +1814,7 @@ class ReshardPlanner:
                     )
               else:
                 if len(dst_targets) > 1:
-                  shift = src_unit_idx % len(dst_targets)
+                  shift = src_host_rank % len(dst_targets)
                   shifted_dst_targets = (
                       dst_targets[shift:] + dst_targets[:shift]
                   )
