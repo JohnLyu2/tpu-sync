@@ -38,60 +38,69 @@ namespace tpu_raiden::telemetry {
 namespace nb = nanobind;
 
 void BindTelemetryApi(nb::module_& m) {
-  nb::enum_<MetricType>(m, "MetricType")
-      .value("COUNTER", MetricType::kCounter)
-      .value("GAUGE", MetricType::kGauge)
-      .value("HISTOGRAM", MetricType::kHistogram);
+  (void)RaidenMetricStore::GetGlobalMetricStore();
+  if (nb::type<MetricType>().is_valid()) {
+    m.attr("MetricType") = nb::type<MetricType>();
+  } else {
+    nb::enum_<MetricType>(m, "MetricType")
+        .value("COUNTER", MetricType::kCounter)
+        .value("GAUGE", MetricType::kGauge)
+        .value("HISTOGRAM", MetricType::kHistogram);
+  }
 
-  nb::class_<MetricMetadata>(m, "MetricMetadata")
-      .def_prop_ro(
-          "name",
-          [](const MetricMetadata& self) { return std::string(self.name); })
-      .def_prop_ro("description",
-                   [](const MetricMetadata& self) {
-                     return std::string(self.description);
-                   })
-      .def_ro("type", &MetricMetadata::type)
-      .def_prop_ro("buckets",
-                   [](const MetricMetadata& self) {
-                     return std::vector<double>(self.buckets.begin(),
-                                                self.buckets.end());
-                   })
-      .def_prop_ro("label_names",
-                   [](const MetricMetadata& self) {
-                     return std::vector<std::string>(self.label_names.begin(),
-                                                     self.label_names.end());
-                   })
-      .def("__repr__",
-           [](const MetricMetadata& self) {
-             std::string type_str;
-             switch (self.type) {
-               case MetricType::kCounter:
-                 type_str = "MetricType.COUNTER";
-                 break;
-               case MetricType::kGauge:
-                 type_str = "MetricType.GAUGE";
-                 break;
-               case MetricType::kHistogram:
-                 type_str = "MetricType.HISTOGRAM";
-                 break;
-             }
-             std::string buckets_str =
-                 absl::StrCat("[", absl::StrJoin(self.buckets, ", "), "]");
-             std::string labels_str =
-                 self.label_names.empty()
-                     ? "[]"
-                     : absl::StrCat("['",
-                                    absl::StrJoin(self.label_names, "', '"),
-                                    "']");
-             return absl::StrCat("MetricMetadata(name='", self.name,
-                                 "', description='", self.description,
-                                 "', type=", type_str,
-                                 ", buckets=", buckets_str,
-                                 ", label_names=", labels_str, ")");
-           })
-      .def(nb::self == nb::self)
-      .def(nb::self != nb::self);
+  if (nb::type<MetricMetadata>().is_valid()) {
+    m.attr("MetricMetadata") = nb::type<MetricMetadata>();
+  } else {
+    nb::class_<MetricMetadata>(m, "MetricMetadata")
+        .def_prop_ro(
+            "name",
+            [](const MetricMetadata& self) { return std::string(self.name); })
+        .def_prop_ro("description",
+                     [](const MetricMetadata& self) {
+                       return std::string(self.description);
+                     })
+        .def_ro("type", &MetricMetadata::type)
+        .def_prop_ro("buckets",
+                     [](const MetricMetadata& self) {
+                       return std::vector<double>(self.buckets.begin(),
+                                                  self.buckets.end());
+                     })
+        .def_prop_ro("label_names",
+                     [](const MetricMetadata& self) {
+                       return std::vector<std::string>(self.label_names.begin(),
+                                                       self.label_names.end());
+                     })
+        .def("__repr__",
+             [](const MetricMetadata& self) {
+               std::string type_str;
+               switch (self.type) {
+                 case MetricType::kCounter:
+                   type_str = "MetricType.COUNTER";
+                   break;
+                 case MetricType::kGauge:
+                   type_str = "MetricType.GAUGE";
+                   break;
+                 case MetricType::kHistogram:
+                   type_str = "MetricType.HISTOGRAM";
+                   break;
+               }
+               std::string buckets_str =
+                   absl::StrCat("[", absl::StrJoin(self.buckets, ", "), "]");
+               std::string labels_str =
+                   self.label_names.empty()
+                       ? "[]"
+                       : absl::StrCat("['",
+                                      absl::StrJoin(self.label_names, "', '"),
+                                      "']");
+               return absl::StrCat("MetricMetadata(name='", self.name,
+                                   "', description='", self.description,
+                                   "', type=", type_str,
+                                   ", buckets=", buckets_str,
+                                   ", label_names=", labels_str, ")");
+             })
+        .def(nb::self == nb::self)
+        .def(nb::self != nb::self);
+  }
 
   m.attr("ALL_METRICS") =
       std::vector<MetricMetadata>(std::begin(metric_metadata::kAllMetrics),
@@ -204,6 +213,18 @@ void BindTelemetryApi(nb::module_& m) {
       nb::arg("name"), nb::arg("val"), nb::arg("labels") = nb::none(),
       nb::call_guard<nb::gil_scoped_release>(),
       "Records an observation for a telemetry histogram metric.");
+
+  m.def(
+      "flush_cloud_logging",
+      [](const std::string& phase, uint64_t uuid,
+         const std::string& req_id) -> std::string {
+        return RaidenMetricStore::GetGlobalMetricStore().FlushToCloudLogging(
+            phase, uuid, req_id);
+      },
+      nb::arg("phase"), nb::arg("uuid") = 0, nb::arg("req_id") = "",
+      nb::call_guard<nb::gil_scoped_release>(),
+      "Flushes buffered metric samples as a structured Cloud Logging JSON "
+      "entry to stdout when the 'cloud_logging' backend is enabled.");
 }
 
 }  // namespace tpu_raiden::telemetry

@@ -588,7 +588,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
       absl::MutexLock lock(metrics_mu_);
       tiling_time_ms = metrics_.last_tiling_time_ms;
     }
-    joined.OnReady([start_time, tiling_time_ms](const auto& result) {
+    joined.OnReady([start_time, tiling_time_ms, uuid](const auto& result) {
       if (result.ok()) {
         auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
         store.ObserveHistogram(
@@ -599,6 +599,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
               telemetry::metric_names::kWeightSyncTilingTimeMs, {},
               tiling_time_ms);
         }
+        store.FlushToCloudLogging("destination_h2d", uuid);
       }
     });
   }
@@ -1190,7 +1191,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   }
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
-    if (!request.skip_d2h() && !already_completed) {
+    if (!request.skip_d2h() && !already_completed && !buffer_holds_.empty()) {
       double total_d2h_time_ms =
           absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
       store.ObserveHistogram(
@@ -1204,6 +1205,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     }
     store.ObserveHistogram(telemetry::metric_names::kWeightSyncPushDurationMs,
                            {}, total_push_time_ms);
+    store.FlushToCloudLogging("source_push", request.uuid(), request.req_id());
   }
   VLOG(1) << "Done with PushWeightsResharded (uuid=" << request.uuid()
           << ", total_push_time=" << total_push_time_ms
@@ -1353,6 +1355,10 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
   };
 
   if (!auto_h2d_) {
+    auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+    if (store.IsCloudLoggingEnabled()) {
+      store.FlushToCloudLogging("destination_receive", uuid);
+    }
     record_completion();
     return absl::OkStatus();
   }
@@ -1406,6 +1412,7 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
       store.ObserveHistogram(telemetry::metric_names::kWeightSyncTilingTimeMs,
                              {}, last_tiling_time_ms);
     }
+    store.FlushToCloudLogging("destination_on_data_received", uuid);
   }
   record_completion();
   {

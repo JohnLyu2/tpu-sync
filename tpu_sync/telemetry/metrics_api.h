@@ -40,11 +40,13 @@ inline constexpr char kPrometheusHostEnvVar[] = "TPU_RAIDEN_PROMETHEUS_HOST";
 inline constexpr char kLocalRankEnvVar[] = "LOCAL_RANK";
 inline constexpr char kTelemetryMultiprocDirEnvVar[] =
     "TPU_RAIDEN_TELEMETRY_MULTIPROC_DIR";
+inline constexpr char kWorkloadNameEnvVar[] = "TPU_RAIDEN_WORKLOAD_NAME";
 // Environment Variables END.
 
 // Backend names START.
 inline constexpr absl::string_view kPrometheus = "prometheus";
 inline constexpr absl::string_view kBuffered = "buffered";
+inline constexpr absl::string_view kCloudLogging = "cloud_logging";
 // Backend names END.
 
 // Reads and trims an environment variable, returning std::nullopt if unset or
@@ -80,6 +82,7 @@ class RaidenMetricStore {
 
   void SetBackends(std::vector<std::unique_ptr<MetricsBackend>> backends);
   bool HasBackends() const;
+  bool IsCloudLoggingEnabled() const;
 
   void IncrementCounter(absl::string_view name, LabelSpan labels,
                         uint64_t val = 1) const;
@@ -95,11 +98,19 @@ class RaidenMetricStore {
 
   std::map<std::string, std::vector<double>> GetAndResetMetricSamples();
 
+  // Drains buffered metric samples and writes a structured Cloud Logging JSON
+  // entry to stdout if the "cloud_logging" backend is enabled. Returns the
+  // emitted JSON line (including trailing newline), or "" if disabled or no
+  // samples were buffered.
+  std::string FlushToCloudLogging(absl::string_view phase, uint64_t uuid = 0,
+                                  absl::string_view req_id = "");
+
  private:
   mutable absl::Mutex mutex_;
   std::vector<std::unique_ptr<MetricsBackend>> backends_
       ABSL_GUARDED_BY(mutex_);
   std::atomic<bool> has_backends_{false};
+  std::atomic<bool> cloud_logging_enabled_{false};
 };
 
 }  // namespace tpu_raiden::telemetry

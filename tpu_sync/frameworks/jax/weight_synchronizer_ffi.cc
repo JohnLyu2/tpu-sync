@@ -21,6 +21,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +38,8 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/device_address.h"
@@ -45,6 +49,8 @@
 #include "xla/stream_executor/stream_executor.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -54,6 +60,8 @@ WeightSynchronizerBase* g_weight_synchronizers[kMaxShards] = {nullptr};
 std::unique_ptr<stream_executor::Stream> g_streams[kMaxShards] = {nullptr};
 
 static absl::Mutex ws_mu;
+static std::atomic<size_t> g_initialized_shards{0};
+static std::atomic<size_t> g_multi_h2d_completed_shards{0};
 static auto* ws_map =
     new absl::flat_hash_map<int32_t, WeightSynchronizerBase*>();
 struct SlotAndGlobal {
@@ -70,6 +78,8 @@ void ClearSharedWsMap() {
   absl::MutexLock lock(ws_mu);
   ws_map->clear();
   ws_shard_to_slot_map->clear();
+  g_initialized_shards.store(0, std::memory_order_relaxed);
+  g_multi_h2d_completed_shards.store(0, std::memory_order_relaxed);
   for (size_t i = 0; i < kMaxShards; ++i) {
     g_weight_synchronizers[i] = nullptr;
     g_streams[i].reset();
@@ -143,6 +153,7 @@ static WeightSynchronizerBase* GetSharedWs(
       shard_idx,
       SlotAndGlobal{assigned_slot, effective_global, has_explicit_global});
   if (inserted) {
+    g_initialized_shards.fetch_add(1, std::memory_order_release);
     std::vector<int64_t> indices(ws->num_shards(), -1);
     std::vector<int> local_indices(ws->num_shards(), -1);
     int64_t host_base = static_cast<int64_t>(submanager_idx) *
@@ -431,6 +442,7 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
   }
 
   // --- D2H Part (Loop through all passed layers) ---
+  absl::Time d2h_start = absl::Now();
   size_t local_slot = GetLocalSlot(shard_idx);
 
   for (size_t i = 0; i < jax_arrays.size(); ++i) {
@@ -468,6 +480,12 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
                              "Stream sync failed at the end of D2H copies: " +
                                  std::string(sync_status.message()));
     }
+  }
+  auto& d2h_store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (d2h_store.HasBackends()) {
+    double d2h_time_ms = absl::ToDoubleMilliseconds(absl::Now() - d2h_start);
+    d2h_store.ObserveHistogram(
+        telemetry::metric_names::kWeightSyncD2hTransferTimeMs, {}, d2h_time_ms);
   }
 
   return xla::ffi::Error::Success();
@@ -515,6 +533,7 @@ xla::ffi::Error TriggerH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
                            "WS not initialized.");
   }
 
+  absl::Time h2d_start = absl::Now();
   size_t size = g_weight_synchronizers[shard_idx]->block_bytes(layer_idx);
   size_t local_slot = GetLocalSlot(shard_idx);
   const uint8_t* src_host_ptr =
@@ -542,6 +561,12 @@ xla::ffi::Error TriggerH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
           "Stream sync failed: " + std::string(sync_status.message()));
     }
   }
+  auto& h2d_store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (h2d_store.HasBackends()) {
+    double h2d_time_ms = absl::ToDoubleMilliseconds(absl::Now() - h2d_start);
+    h2d_store.ObserveHistogram(
+        telemetry::metric_names::kWeightSyncH2dTransferTimeMs, {}, h2d_time_ms);
+  }
   return xla::ffi::Error::Success();
 }
 
@@ -559,6 +584,7 @@ xla::ffi::Error TriggerMultiH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
                            "WS not initialized.");
   }
 
+  absl::Time h2d_start = absl::Now();
   size_t num_layers = rets.size();
   size_t local_slot = GetLocalSlot(shard_idx);
 
@@ -598,6 +624,21 @@ xla::ffi::Error TriggerMultiH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
                                  std::string(sync_status.message()));
     }
   }
+  auto& h2d_store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (h2d_store.HasBackends()) {
+    double h2d_time_ms = absl::ToDoubleMilliseconds(absl::Now() - h2d_start);
+    h2d_store.ObserveHistogram(
+        telemetry::metric_names::kWeightSyncH2dTransferTimeMs, {}, h2d_time_ms);
+    size_t expected_shards = std::max(
+        {size_t{1}, g_initialized_shards.load(std::memory_order_acquire),
+         g_weight_synchronizers[shard_idx]->num_shards()});
+    size_t completed =
+        g_multi_h2d_completed_shards.fetch_add(1, std::memory_order_acq_rel) +
+        1;
+    if (completed % expected_shards == 0) {
+      h2d_store.FlushToCloudLogging("destination_h2d", 0);
+    }
+  }
   return xla::ffi::Error::Success();
 }
 
@@ -621,6 +662,7 @@ xla::ffi::Error TriggerD2HImpl(xla::ffi::AnyBuffer anchor,
                            "WS not initialized.");
   }
 
+  absl::Time d2h_start = absl::Now();
   size_t size = g_weight_synchronizers[shard_idx]->block_bytes(layer_idx);
   size_t local_slot = GetLocalSlot(shard_idx);
   uint8_t* dst_host_ptr =
@@ -649,6 +691,12 @@ xla::ffi::Error TriggerD2HImpl(xla::ffi::AnyBuffer anchor,
           xla::ffi::ErrorCode::kInternal,
           "Stream sync failed: " + std::string(sync_status.message()));
     }
+  }
+  auto& d2h_store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (d2h_store.HasBackends()) {
+    double d2h_time_ms = absl::ToDoubleMilliseconds(absl::Now() - d2h_start);
+    d2h_store.ObserveHistogram(
+        telemetry::metric_names::kWeightSyncD2hTransferTimeMs, {}, d2h_time_ms);
   }
   return xla::ffi::Error::Success();
 }

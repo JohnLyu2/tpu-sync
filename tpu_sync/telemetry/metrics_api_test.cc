@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>  // NOLINT(build/c++17)
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -114,6 +115,7 @@ TEST_F(MetricsApiTest, GlobalMetricStoreSingleton) {
 TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(kPrometheus, "prometheus");
   EXPECT_EQ(kBuffered, "buffered");
+  EXPECT_EQ(kCloudLogging, "cloud_logging");
   EXPECT_STREQ(kTelemetryBackendsEnvVar, "TPU_RAIDEN_TELEMETRY_BACKENDS");
 
   // SentBytesTotal
@@ -935,6 +937,96 @@ TEST_F(MetricsApiTest, ResolveEnvVarTrimsAndHandlesUnset) {
     ScopedEnvironmentVariable set_env(kLocalRankEnvVar, "  3 \t");
     EXPECT_EQ(ResolveEnvVar(kLocalRankEnvVar), "3");
   }
+}
+
+TEST_F(MetricsApiTest, InitializeFromBackendNamesCloudLogging) {
+  ASSERT_OK(store_.InitializeFromBackendNames({"cloud_logging"}));
+  EXPECT_TRUE(store_.HasBackends());
+  EXPECT_TRUE(store_.IsCloudLoggingEnabled());
+
+  store_.IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {}, 1024);
+  store_.IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {}, 2048);
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {}, 10.5);
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {}, 20.5);
+
+  std::string line = store_.FlushToCloudLogging("source_push", 42, "req_123");
+  EXPECT_THAT(line, HasSubstr("\"severity\":\"INFO\""));
+  EXPECT_THAT(line,
+              HasSubstr("\"component\":\"tpu_raiden.weight_synchronizer\""));
+  EXPECT_THAT(line, HasSubstr("\"phase\":\"source_push\""));
+  EXPECT_THAT(line, HasSubstr("\"uuid\":42"));
+  EXPECT_THAT(line, HasSubstr("\"req_id\":\"req_123\""));
+  EXPECT_THAT(
+      line,
+      HasSubstr("\"tpu_raiden_weight_sync_sent_bytes_total\":{\"count\":1,"
+                "\"sum\":3072,\"min\":3072,\"max\":3072,\"latest\":3072}"));
+  EXPECT_THAT(
+      line,
+      HasSubstr("\"tpu_raiden_weight_sync_push_duration_ms\":{\"count\":2,"
+                "\"sum\":31,\"min\":10.5,\"max\":20.5,\"latest\":20.5}"));
+
+  // Samples should be drained after FlushToCloudLogging.
+  EXPECT_THAT(store_.GetAndResetMetricSamples(), IsEmpty());
+  EXPECT_EQ(store_.FlushToCloudLogging("source_push", 42, "req_123"), "");
+}
+
+TEST_F(MetricsApiTest,
+       InitializeFromBackendNamesBufferedAndCloudLoggingDeduplicatesExporter) {
+  ASSERT_OK(store_.InitializeFromBackendNames({"buffered", "cloud_logging"}));
+  EXPECT_TRUE(store_.HasBackends());
+  EXPECT_TRUE(store_.IsCloudLoggingEnabled());
+
+  store_.IncrementCounter(metric_names::kSentBytesTotal, {}, 100);
+  EXPECT_THAT(store_.GetAndResetMetricSamples(),
+              UnorderedElementsAre(
+                  Pair("tpu_raiden_sent_bytes_total", ElementsAre(100.0))));
+}
+
+TEST_F(MetricsApiTest, FlushToCloudLoggingNoOpWhenBufferedOnly) {
+  ASSERT_OK(store_.InitializeFromBackendNames({"buffered"}));
+  EXPECT_TRUE(store_.HasBackends());
+  EXPECT_FALSE(store_.IsCloudLoggingEnabled());
+
+  store_.IncrementCounter(metric_names::kSentBytesTotal, {}, 256);
+  EXPECT_EQ(store_.FlushToCloudLogging("source_push", 1, "req_1"), "");
+
+  // Samples must remain intact for buffered-only callers.
+  EXPECT_THAT(store_.GetAndResetMetricSamples(),
+              UnorderedElementsAre(
+                  Pair("tpu_raiden_sent_bytes_total", ElementsAre(256.0))));
+}
+
+TEST_F(MetricsApiTest, FlushToCloudLoggingIncludesWorkloadNameFromEnv) {
+  ScopedEnvironmentVariable workload_env(kWorkloadNameEnvVar,
+                                         "test-qwen35b-v5e");
+  ASSERT_OK(store_.InitializeFromBackendNames({"cloud_logging"}));
+  store_.IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {}, 512);
+
+  std::string line = store_.FlushToCloudLogging("source_push", 7, "step_1");
+  EXPECT_THAT(line, HasSubstr("\"workload\":\"test-qwen35b-v5e\""));
+}
+
+TEST_F(MetricsApiTest, FlushToCloudLoggingSkipsNonFiniteValues) {
+  ASSERT_OK(store_.InitializeFromBackendNames({"cloud_logging"}));
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {},
+                          std::numeric_limits<double>::quiet_NaN());
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {},
+                          std::numeric_limits<double>::infinity());
+  // Only non-finite samples: nothing should be emitted.
+  EXPECT_EQ(store_.FlushToCloudLogging("source_push", 1, "req_nan"), "");
+
+  // Mix of finite and non-finite samples: only finite values are aggregated.
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {},
+                          std::numeric_limits<double>::quiet_NaN());
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {}, 12.5);
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {},
+                          -std::numeric_limits<double>::infinity());
+  store_.ObserveHistogram(metric_names::kWeightSyncPushDurationMs, {}, 27.5);
+  std::string line = store_.FlushToCloudLogging("source_push", 2, "req_mixed");
+  EXPECT_THAT(
+      line,
+      HasSubstr("\"tpu_raiden_weight_sync_push_duration_ms\":{\"count\":2,"
+                "\"sum\":40,\"min\":12.5,\"max\":27.5,\"latest\":27.5}"));
 }
 
 }  // namespace

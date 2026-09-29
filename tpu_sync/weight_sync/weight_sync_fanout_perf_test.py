@@ -558,6 +558,43 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         f"weight_sync_push_duration_ms missing from {samples.keys()}",
     )
 
+  def test_end_to_end_cloud_logging_telemetry(self):
+    """Verifies cloud_logging backend automatically flushes structured JSON at transfer completion."""
+    weight_synchronizer.configure_telemetry(["cloud_logging"])
+    _ = weight_synchronizer.get_and_reset_metric_samples()
+
+    self._fill_position_unique_source_pattern(0x5B)
+    for ws_dst in self.ws_dsts:
+      for l in range(self.num_layers):
+        buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
+        buf[:] = 0x00
+
+    uuid = 9998
+    future = self.controller.start_transfer(
+        src_units=[self.src_unit],
+        dst_units=self.dst_units,
+        dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+        use_block_chunks=True,
+        is_sender=True,
+        uuid=uuid,
+        req_id="cloud_logging_test",
+        skip_d2h=True,
+        skip_tiling={l: False for l in range(self.num_layers)},
+    )
+    loop = asyncio.new_event_loop()
+    try:
+      loop.run_until_complete(future.wait())
+    finally:
+      loop.close()
+
+    for ws_dst in self.ws_dsts:
+      ws_dst.wait_for_transfer_completion(uuid=uuid)
+
+    # All buffered metrics should have been automatically drained and flushed
+    # to stdout by source_push, destination_receive, and controller_transfer.
+    remaining = weight_synchronizer.get_and_reset_metric_samples()
+    self.assertEqual(remaining, {})
+
   def _fill_position_unique_source_pattern(self, seed_byte: int) -> None:
     """Fills source buffers with a position-unique 32-bit word pattern encoding (seed, layer, offset)."""
     seed_u32 = np.uint32(seed_byte & 0xFF) << np.uint32(24)

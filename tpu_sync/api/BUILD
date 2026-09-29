@@ -20,6 +20,9 @@ py_library(
     name = "common",
     srcs = ["common.py"],
     visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/telemetry/python:_telemetry_binding_test_ext",
+    ],
 )
 
 py_test(

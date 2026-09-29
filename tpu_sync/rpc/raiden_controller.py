@@ -1483,6 +1483,12 @@ class RaidenController:
             {"error_code": "INTERNAL", "direction": "push"},
         )
         raise
+      finally:
+        common.flush_cloud_logging(
+            phase="controller_transfer",
+            uuid=uuid,
+            req_id=req_id or "",
+        )
 
     def _on_transfer_done():
       with self._lock:

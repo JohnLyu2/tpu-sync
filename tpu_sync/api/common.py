@@ -18,6 +18,8 @@ import dataclasses
 import enum
 from typing import Callable, Mapping, NamedTuple, Optional
 
+from tpu_sync.telemetry.python import _telemetry_binding_test_ext as _default_telemetry_ext
+
 
 @dataclasses.dataclass(unsafe_hash=True, slots=True)
 class RaidenId:
@@ -61,15 +63,22 @@ class TelemetryCallbacks(NamedTuple):
   increment_counter: Callable[..., None]
   set_gauge: Callable[..., None]
   observe_histogram: Callable[..., None]
+  flush_cloud_logging: Optional[Callable[..., str]] = None
 
 
-_telemetry_callbacks: Optional[TelemetryCallbacks] = None
+_telemetry_callbacks: Optional[TelemetryCallbacks] = TelemetryCallbacks(
+    increment_counter=_default_telemetry_ext.increment_counter,
+    set_gauge=_default_telemetry_ext.set_gauge,
+    observe_histogram=_default_telemetry_ext.observe_histogram,
+    flush_cloud_logging=_default_telemetry_ext.flush_cloud_logging,
+)
 
 
 def register_telemetry_callbacks(
     increment_counter: Callable[..., None],
     set_gauge: Callable[..., None],
     observe_histogram: Callable[..., None],
+    flush_cloud_logging: Optional[Callable[..., str]] = None,  # pylint: disable=redefined-outer-name
 ) -> None:
   """Registers global telemetry callbacks for Python instrumentation."""
   global _telemetry_callbacks
@@ -77,6 +86,7 @@ def register_telemetry_callbacks(
       increment_counter=increment_counter,
       set_gauge=set_gauge,
       observe_histogram=observe_histogram,
+      flush_cloud_logging=flush_cloud_logging,
   )
 
 
@@ -117,3 +127,17 @@ def record_histogram(
     _telemetry_callbacks.observe_histogram(
         name, val, dict(labels) if labels else {}
     )
+
+
+def flush_cloud_logging(
+    phase: str,
+    uuid: int = 0,
+    req_id: str = "",
+) -> str:
+  """Flushes buffered telemetry metrics to Cloud Logging (stdout JSON) if enabled."""
+  if (
+      _telemetry_callbacks is not None
+      and _telemetry_callbacks.flush_cloud_logging is not None
+  ):
+    return _telemetry_callbacks.flush_cloud_logging(phase, uuid, req_id)
+  return ""

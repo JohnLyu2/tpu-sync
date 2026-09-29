@@ -14,8 +14,11 @@
 
 #include "tpu_sync/telemetry/metrics_api.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -29,6 +32,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
@@ -80,6 +84,16 @@ std::string ResolveEnvVar(const char* env_var,
   return telemetry::ResolveEnvVar(env_var).value_or(std::string(default_value));
 }
 
+std::optional<std::string> ResolveWorkloadName() {
+  for (const char* env_var :
+       {kWorkloadNameEnvVar, "JOBSET_NAME", "WORKLOAD_NAME", "M_RUN_NAME"}) {
+    if (std::optional<std::string> val = telemetry::ResolveEnvVar(env_var)) {
+      return val;
+    }
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 RaidenMetricStore& RaidenMetricStore::GetGlobalMetricStore() {
@@ -105,10 +119,15 @@ void RaidenMetricStore::SetBackends(
   absl::MutexLock lock(mutex_);
   backends_ = std::move(backends);
   has_backends_.store(!backends_.empty(), std::memory_order_release);
+  cloud_logging_enabled_.store(false, std::memory_order_release);
 }
 
 bool RaidenMetricStore::HasBackends() const {
   return has_backends_.load(std::memory_order_acquire);
+}
+
+bool RaidenMetricStore::IsCloudLoggingEnabled() const {
+  return cloud_logging_enabled_.load(std::memory_order_acquire);
 }
 
 absl::Status RaidenMetricStore::InitializeFromBackendNames(
@@ -121,8 +140,8 @@ absl::Status RaidenMetricStore::InitializeFromBackendNames(
     if (name.empty()) {
       continue;
     }
-    if (name == kPrometheus ||
-        name == kBuffered
+    if (name == kPrometheus || name == kBuffered ||
+        name == kCloudLogging
     ) {
       continue;
     }
@@ -136,6 +155,8 @@ absl::Status RaidenMetricStore::InitializeFromBackendNames(
 
   std::vector<std::unique_ptr<MetricsBackend>> new_backends;
   absl::flat_hash_set<std::string> seen_backends;
+  bool enable_cloud_logging = false;
+  bool has_buffered_exporter = false;
 
   for (absl::string_view backend_key : backend_names) {
     std::string name =
@@ -165,12 +186,19 @@ absl::Status RaidenMetricStore::InitializeFromBackendNames(
         new_backends.push_back(
             std::make_unique<PrometheusExporter>(std::move(exporter_options)));
       }
-    } else if (name == kBuffered) {
-      new_backends.push_back(std::make_unique<BufferedMetricsExporter>());
+    } else if (name == kBuffered || name == kCloudLogging) {
+      if (!has_buffered_exporter) {
+        new_backends.push_back(std::make_unique<BufferedMetricsExporter>());
+        has_buffered_exporter = true;
+      }
+      if (name == kCloudLogging) {
+        enable_cloud_logging = true;
+      }
     }
   }
 
   SetBackends(std::move(new_backends));
+  cloud_logging_enabled_.store(enable_cloud_logging, std::memory_order_release);
   return absl::OkStatus();
 }
 
@@ -245,6 +273,68 @@ RaidenMetricStore::GetAndResetMetricSamples() {
     }
   }
   return result;
+}
+
+std::string RaidenMetricStore::FlushToCloudLogging(absl::string_view phase,
+                                                   uint64_t uuid,
+                                                   absl::string_view req_id) {
+  if (!IsCloudLoggingEnabled()) {
+    return "";
+  }
+  auto samples = GetAndResetMetricSamples();
+  std::string metrics_json;
+  for (const auto& [key, vals] : samples) {
+    size_t finite_count = 0;
+    double sum = 0.0;
+    double min_v = 0.0;
+    double max_v = 0.0;
+    double latest = 0.0;
+    for (double v : vals) {
+      if (!std::isfinite(v)) {
+        continue;
+      }
+      if (finite_count == 0) {
+        min_v = v;
+        max_v = v;
+      } else {
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+      }
+      sum += v;
+      latest = v;
+      ++finite_count;
+    }
+    if (finite_count == 0) {
+      continue;
+    }
+    if (!metrics_json.empty()) {
+      absl::StrAppend(&metrics_json, ",");
+    }
+    absl::StrAppend(&metrics_json, "\"", absl::CEscape(key),
+                    "\":{\"count\":", finite_count, ",\"sum\":", sum,
+                    ",\"min\":", min_v, ",\"max\":", max_v,
+                    ",\"latest\":", latest, "}");
+  }
+  if (metrics_json.empty()) {
+    return "";
+  }
+  std::string workload_field;
+  if (std::optional<std::string> workload = ResolveWorkloadName()) {
+    workload_field =
+        absl::StrCat(",\"workload\":\"", absl::CEscape(*workload), "\"");
+  }
+  std::string req_id_field;
+  if (!req_id.empty()) {
+    req_id_field = absl::StrCat(",\"req_id\":\"", absl::CEscape(req_id), "\"");
+  }
+  std::string line = absl::StrCat(
+      "{\"severity\":\"INFO\",\"component\":\"tpu_raiden.weight_synchronizer\"",
+      workload_field, ",\"phase\":\"", absl::CEscape(phase),
+      "\",\"uuid\":", uuid, req_id_field, ",\"raiden_telemetry\":{",
+      metrics_json, "}}\n");
+  std::fwrite(line.data(), 1, line.size(), stdout);
+  std::fflush(stdout);
+  return line;
 }
 
 }  // namespace tpu_raiden::telemetry

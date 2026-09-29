@@ -112,12 +112,32 @@ class CommonApiTest(absltest.TestCase):
     self.assertEqual(BlockStatus.HOST_AND_HBM.value, 4)
     self.assertEqual(BlockStatus.SHARED_STORAGE.value, 5)
 
+  def test_default_telemetry_callbacks_populated_on_import(self):
+    from tpu_sync.api import common  # pylint: disable=g-import-not-at-top
+    from tpu_sync.telemetry.python import _telemetry_binding_test_ext as telemetry_ext  # pylint: disable=g-import-not-at-top
+
+    self.assertIsNotNone(common.get_telemetry_callbacks())
+    telemetry_ext.configure_telemetry(["cloud_logging"])
+    try:
+      common.record_histogram("weight_sync_schedule_generation_time_ms", 4.5)
+      line = common.flush_cloud_logging("controller_transfer", 99, "req_orch")
+      self.assertIn('"phase":"controller_transfer"', line)
+      self.assertIn('"uuid":99', line)
+      self.assertIn('"req_id":"req_orch"', line)
+      self.assertIn(
+          '"tpu_raiden_weight_sync_schedule_generation_time_ms"', line
+      )
+    finally:
+      telemetry_ext.configure_telemetry([])
+
   def test_telemetry_callbacks_registration_and_recording(self):
     from tpu_sync.api import common  # pylint: disable=g-import-not-at-top
 
+    prev_callbacks = common.get_telemetry_callbacks()
     recorded_counters = []
     recorded_gauges = []
     recorded_histograms = []
+    flushed_calls = []
 
     def mock_inc(name, val, labels):
       recorded_counters.append((name, val, labels))
@@ -128,24 +148,37 @@ class CommonApiTest(absltest.TestCase):
     def mock_hist(name, val, labels):
       recorded_histograms.append((name, val, labels))
 
-    common.register_telemetry_callbacks(
-        increment_counter=mock_inc,
-        set_gauge=mock_gauge,
-        observe_histogram=mock_hist,
-    )
+    def mock_flush(phase, uuid, req_id):
+      flushed_calls.append((phase, uuid, req_id))
+      return f'{{"phase":"{phase}","uuid":{uuid},"req_id":"{req_id}"}}\n'
 
-    self.assertIsNotNone(common.get_telemetry_callbacks())
+    try:
+      common.register_telemetry_callbacks(
+          increment_counter=mock_inc,
+          set_gauge=mock_gauge,
+          observe_histogram=mock_hist,
+          flush_cloud_logging=mock_flush,
+      )
 
-    common.record_counter("test_counter", 5, {"tag": "foo"})
-    self.assertEqual(recorded_counters, [("test_counter", 5, {"tag": "foo"})])
+      self.assertIsNotNone(common.get_telemetry_callbacks())
 
-    common.record_gauge("test_gauge", 42.5)
-    self.assertEqual(recorded_gauges, [("test_gauge", 42.5, {})])
+      common.record_counter("test_counter", 5, {"tag": "foo"})
+      self.assertEqual(recorded_counters, [("test_counter", 5, {"tag": "foo"})])
 
-    common.record_histogram("test_hist", 123.4, {"layer": "0"})
-    self.assertEqual(
-        recorded_histograms, [("test_hist", 123.4, {"layer": "0"})]
-    )
+      common.record_gauge("test_gauge", 42.5)
+      self.assertEqual(recorded_gauges, [("test_gauge", 42.5, {})])
+
+      common.record_histogram("test_hist", 123.4, {"layer": "0"})
+      self.assertEqual(
+          recorded_histograms, [("test_hist", 123.4, {"layer": "0"})]
+      )
+
+      line = common.flush_cloud_logging("controller_transfer", 7, "req_7")
+      self.assertEqual(flushed_calls, [("controller_transfer", 7, "req_7")])
+      self.assertIn('"phase":"controller_transfer"', line)
+    finally:
+      if prev_callbacks is not None:
+        common.register_telemetry_callbacks(*prev_callbacks)
 
 
 if __name__ == "__main__":

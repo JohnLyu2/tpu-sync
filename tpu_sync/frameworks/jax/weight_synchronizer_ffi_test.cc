@@ -17,8 +17,10 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "xla/ffi/api/c_api.h"
@@ -26,6 +28,7 @@
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
+#include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -831,6 +834,91 @@ TEST_F(WeightSynchronizerFfiTest, TorusPermutedDeviceIdsInitAndD2hTest) {
       }
     }
   }
+}
+
+TEST_F(WeightSynchronizerFfiTest,
+       InitAndD2hAndMultiH2DRecordsTelemetryMetrics) {
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  ASSERT_TRUE(store.InitializeFromBackendNames({"cloud_logging"}).ok());
+  store.GetAndResetMetricSamples();
+
+  int32_t shard_idx_0 = 0;
+  int32_t shard_idx_1 = 1;
+  FfiBufferFixture shard_0_fixture(XLA_FFI_DataType_S32, &shard_idx_0, {1});
+  FfiBufferFixture shard_1_fixture(XLA_FFI_DataType_S32, &shard_idx_1, {1});
+  xla::ffi::AnyBuffer shard_0_buf = shard_0_fixture.AsAnyBuffer();
+  xla::ffi::AnyBuffer shard_1_buf = shard_1_fixture.AsAnyBuffer();
+
+  int32_t slice_byte_size = 1024;
+  FfiBufferFixture sizes_fixture(XLA_FFI_DataType_S32, &slice_byte_size, {1});
+  xla::ffi::AnyBuffer slice_byte_sizes_buf = sizes_fixture.AsAnyBuffer();
+
+  std::vector<int32_t> src_data(256, 42);
+  FfiBufferFixture src_fixture(XLA_FFI_DataType_S32, src_data.data(), {256});
+  std::vector<xla::ffi::AnyBuffer> jax_arrays = {src_fixture.AsAnyBuffer()};
+
+  std::vector<int32_t> out_data_0(6, 0);
+  std::vector<int32_t> out_data_1(6, 0);
+  FfiBufferFixture out_fixture_0(XLA_FFI_DataType_S32, out_data_0.data(), {6});
+  FfiBufferFixture out_fixture_1(XLA_FFI_DataType_S32, out_data_1.data(), {6});
+  xla::ffi::Result<xla::ffi::AnyBuffer> out_0 = out_fixture_0.AsAnyBuffer();
+  xla::ffi::Result<xla::ffi::AnyBuffer> out_1 = out_fixture_1.AsAnyBuffer();
+
+  xla::ffi::Error err0 = TriggerWeightSynchronizerInitAndD2hHelper(
+      shard_0_buf, slice_byte_sizes_buf, jax_arrays,
+      /*local_port=*/0, /*parallelism=*/1, /*num_layers=*/1,
+      /*listener_port=*/10031, /*num_shards=*/2, out_0);
+  ASSERT_TRUE(err0.success()) << err0.message();
+
+  xla::ffi::Error err1 = TriggerWeightSynchronizerInitAndD2hHelper(
+      shard_1_buf, slice_byte_sizes_buf, jax_arrays,
+      /*local_port=*/0, /*parallelism=*/1, /*num_layers=*/1,
+      /*listener_port=*/10031, /*num_shards=*/2, out_1);
+  ASSERT_TRUE(err1.success()) << err1.message();
+
+  auto d2h_samples = store.GetAndResetMetricSamples();
+  ASSERT_EQ(d2h_samples.count("tpu_raiden_weight_sync_d2h_transfer_time_ms"),
+            1u);
+  EXPECT_EQ(d2h_samples["tpu_raiden_weight_sync_d2h_transfer_time_ms"].size(),
+            2u);
+
+  std::vector<int32_t> dst_data(256, 0);
+  FfiBufferFixture dst_fixture(XLA_FFI_DataType_S32, dst_data.data(), {256});
+  XLA_FFI_Buffer ffi_buf = dst_fixture.ffi_buf;
+  XLA_FFI_RetType types[] = {XLA_FFI_RetType_BUFFER};
+  void* rets_ptrs[] = {&ffi_buf};
+  XLA_FFI_Rets rets;
+  rets.struct_size = sizeof(XLA_FFI_Rets);
+  rets.extension_start = nullptr;
+  rets.size = 1;
+  rets.types = types;
+  rets.rets = rets_ptrs;
+  xla::ffi::RemainingRets remaining_rets(&rets, 0);
+
+  // Shard 0 (slot 0) finishes first: should record sample and NOT flush yet.
+  testing::internal::CaptureStdout();
+  err0 = TriggerMultiH2DImpl(shard_0_buf, remaining_rets);
+  std::string stdout_after_shard0 = testing::internal::GetCapturedStdout();
+  ASSERT_TRUE(err0.success()) << err0.message();
+  EXPECT_EQ(stdout_after_shard0, "");
+
+  // Shard 1 (slot 1) finishes last: should record second sample and flush both.
+  testing::internal::CaptureStdout();
+  err1 = TriggerMultiH2DImpl(shard_1_buf, remaining_rets);
+  std::string stdout_after_shard1 = testing::internal::GetCapturedStdout();
+  ASSERT_TRUE(err1.success()) << err1.message();
+  EXPECT_NE(stdout_after_shard1.find("\"phase\":\"destination_h2d\""),
+            std::string::npos);
+  EXPECT_NE(stdout_after_shard1.find(
+                "\"tpu_raiden_weight_sync_h2d_transfer_time_ms\":{\"count\":2"),
+            std::string::npos);
+
+  // Because the last finishing shard flushed to Cloud Logging, the buffer is
+  // now drained.
+  auto h2d_samples = store.GetAndResetMetricSamples();
+  EXPECT_EQ(h2d_samples.count("tpu_raiden_weight_sync_h2d_transfer_time_ms"),
+            0u);
+  store.SetBackends({});
 }
 
 INSTANTIATE_TEST_SUITE_P(FfiTypeTests, WeightSynchronizerFfiParamTest,

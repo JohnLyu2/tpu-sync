@@ -33,6 +33,7 @@ common.register_telemetry_callbacks(
     increment_counter=_weight_synchronizer.increment_counter,
     set_gauge=_weight_synchronizer.set_gauge,
     observe_histogram=_weight_synchronizer.observe_histogram,
+    flush_cloud_logging=_weight_synchronizer.flush_cloud_logging,
 )
 
 
@@ -49,6 +50,15 @@ def get_and_reset_metric_samples() -> dict[str, Any]:
 def get_raiden_metrics_prometheus_text() -> str:
   """Returns current Prometheus metric exposition text from RaidenMetricStore."""
   return _weight_synchronizer.get_raiden_metrics_prometheus_text()
+
+
+def flush_cloud_logging(
+    phase: str,
+    uuid: int = 0,
+    req_id: str = "",
+) -> str:
+  """Flushes buffered telemetry metrics to Cloud Logging (stdout JSON) if enabled."""
+  return _weight_synchronizer.flush_cloud_logging(phase, uuid, req_id)
 
 
 class WeightSynchronizer:
@@ -231,3 +241,10 @@ class WeightSynchronizer:
   def get_raiden_metrics_prometheus_text(cls) -> str:
     """Returns current Prometheus metric exposition text from RaidenMetricStore."""
     return get_raiden_metrics_prometheus_text()
+
+  @classmethod
+  def flush_cloud_logging(
+      cls, phase: str, uuid: int = 0, req_id: str = ""
+  ) -> str:
+    """Flushes buffered telemetry metrics to Cloud Logging (stdout JSON) if enabled."""
+    return flush_cloud_logging(phase, uuid, req_id)

@@ -39,7 +39,6 @@ cc_library(
 
 nanobind_extension(
     name = "_telemetry_binding_test_ext",
-    testonly = True,
     srcs = ["telemetry_binding_test_ext.cc"],
     features = [
         "-use_header_modules",

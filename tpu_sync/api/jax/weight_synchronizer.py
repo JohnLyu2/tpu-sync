@@ -27,6 +27,7 @@ common.register_telemetry_callbacks(
     increment_counter=_weight_synchronizer.increment_counter,
     set_gauge=_weight_synchronizer.set_gauge,
     observe_histogram=_weight_synchronizer.observe_histogram,
+    flush_cloud_logging=_weight_synchronizer.flush_cloud_logging,
 )
 
 configure_telemetry = _weight_synchronizer.configure_telemetry
@@ -34,6 +35,7 @@ get_and_reset_metric_samples = _weight_synchronizer.get_and_reset_metric_samples
 get_raiden_metrics_prometheus_text = (
     _weight_synchronizer.get_raiden_metrics_prometheus_text
 )
+flush_cloud_logging = _weight_synchronizer.flush_cloud_logging
 
 
 class WeightSynchronizer:
@@ -331,6 +333,13 @@ class WeightSynchronizer:
   def get_raiden_metrics_prometheus_text(cls) -> str:
     """Exports Prometheus text snapshot of TPU Raiden metrics."""
     return _weight_synchronizer.get_raiden_metrics_prometheus_text()
+
+  @classmethod
+  def flush_cloud_logging(
+      cls, phase: str, uuid: int = 0, req_id: str = ""
+  ) -> str:
+    """Flushes buffered telemetry metrics to Cloud Logging (stdout JSON) if enabled."""
+    return _weight_synchronizer.flush_cloud_logging(phase, uuid, req_id)
 
   def shutdown(self) -> None:
     """Releases and shuts down the underlying C++ synchronizer instance."""

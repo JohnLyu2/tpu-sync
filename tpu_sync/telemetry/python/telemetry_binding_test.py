@@ -326,6 +326,41 @@ class TelemetryBindingTest(absltest.TestCase):
       with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics") as resp:
         self.assertEqual(resp.status, 200)
 
+  def test_configure_telemetry_cloud_logging_and_flush(self):
+    import json  # pylint: disable=g-import-not-at-top
+
+    telemetry_ext.configure_telemetry(["cloud_logging"])
+    self.assertEqual(
+        telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
+    )
+    telemetry_ext.increment_counter("weight_sync_sent_bytes_total", 4096)
+    telemetry_ext.observe_histogram("weight_sync_push_duration_ms", 25.0)
+
+    line = telemetry_ext.flush_cloud_logging(
+        phase="source_push", uuid=101, req_id="req_abc"
+    )
+    self.assertTrue(line.endswith("\n"))
+    payload = json.loads(line)
+    self.assertEqual(payload["severity"], "INFO")
+    self.assertEqual(payload["component"], "tpu_raiden.weight_synchronizer")
+    self.assertEqual(payload["phase"], "source_push")
+    self.assertEqual(payload["uuid"], 101)
+    self.assertEqual(payload["req_id"], "req_abc")
+    self.assertIn("raiden_telemetry", payload)
+    self.assertEqual(
+        payload["raiden_telemetry"]["tpu_raiden_weight_sync_sent_bytes_total"][
+            "sum"
+        ],
+        4096,
+    )
+    self.assertEqual(
+        payload["raiden_telemetry"]["tpu_raiden_weight_sync_push_duration_ms"][
+            "latest"
+        ],
+        25.0,
+    )
+    self.assertEqual(telemetry_ext.get_and_reset_metric_samples(), {})
+
 
 if __name__ == "__main__":
   absltest.main()
