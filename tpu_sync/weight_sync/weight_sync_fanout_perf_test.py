@@ -1750,6 +1750,266 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     dst_buf = ws_mb.get_host_buffer(layer_idx=0, shard_idx=0)
     self.assertEqual(bytes(dst_buf[:8192]), bytes([0x5A] * 8192))
 
+  def test_fsdp32_high_concurrency_cold_connect_no_backlog_stall(self) -> None:
+    """Verifies that 512 concurrent TCP connects from 32 FSDP senders to 4 seed samplers do not overflow the socket listen backlog."""
+    num_fsdp = 32
+    num_dst = 6
+    num_layers_local = 4
+    parallelism = 16
+
+    src_fsdp_specs = [
+        s
+        for s in _make_scaled_qwen_specs(
+            num_layers=num_layers_local,
+            num_routed_experts=32,
+            role="fsdp_source",
+        )
+        if s[0][0] % num_fsdp == 0
+    ]
+    dst_specs = [
+        s
+        for s in _make_scaled_qwen_specs(
+            num_layers=num_layers_local,
+            num_routed_experts=32,
+            role="destination",
+        )
+        if s[0][0] % num_fsdp == 0
+    ]
+    num_vars = len(src_fsdp_specs)
+
+    src_fsdp_mesh_dict = {"fsdp": num_fsdp}
+    dst_mesh_dict = self.dst_mesh_dict
+
+    src_fsdp_slice_byte_sizes = [
+        int(np.prod(p.shape) // num_fsdp) * p.item_size
+        for p in build_variable_protos(
+            src_fsdp_specs, src_fsdp_mesh_dict, global_shard_idx=0
+        )
+    ]
+    dst_slice_byte_sizes = [
+        int(np.prod(p.shape) // np.prod(p.mesh_shape)) * p.item_size
+        for p in build_variable_protos(
+            dst_specs, dst_mesh_dict, global_shard_idx=0
+        )
+    ]
+    total_model_bytes_local = sum(dst_slice_byte_sizes)
+
+    ws_srcs: List[weight_synchronizer.WeightSynchronizer] = []
+    for i in range(num_fsdp):
+      ws = weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+          num_layers=num_vars,
+          num_shards=1,
+          slice_byte_size=src_fsdp_slice_byte_sizes,
+          local_port=0,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+          global_shard_indices=[i],
+      )
+      self.addCleanup(ws.shutdown)
+      ws_srcs.append(ws)
+
+    ws_dsts: List[weight_synchronizer.WeightSynchronizer] = []
+    for _ in range(num_dst):
+      ws = weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+          num_layers=num_vars,
+          num_shards=1,
+          slice_byte_size=dst_slice_byte_sizes,
+          local_port=0,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+      )
+      self.addCleanup(ws.shutdown)
+      ws_dsts.append(ws)
+
+    src_units = [
+        RaidenId("fsdp32_trainer", str(i), "weights") for i in range(num_fsdp)
+    ]
+    dst_units = [
+        RaidenId("fsdp32_sampler", str(i), "weights") for i in range(num_dst)
+    ]
+
+    mesh_axes = ["tp", "tp_wo", "tp_out"]
+    mesh_shape = [1] * len(mesh_axes)
+
+    for i, ws_src in enumerate(ws_srcs):
+      protos = build_variable_protos(
+          src_fsdp_specs, src_fsdp_mesh_dict, global_shard_idx=i
+      )
+      self.ctrl_client.register_work_unit(
+          src_units[i],
+          [f"127.0.0.1:{ws_src.local_port}"],
+          f"127.0.0.1:{ws_src.listener_port}",
+          mesh_shape=mesh_shape,
+          variables=protos,
+          mesh_axes=mesh_axes,
+      )
+
+    for j, ws_dst in enumerate(ws_dsts):
+      protos = build_variable_protos(
+          dst_specs, dst_mesh_dict, global_shard_idx=0
+      )
+      self.ctrl_client.register_work_unit(
+          dst_units[j],
+          [f"127.0.0.1:{ws_dst.local_port}"],
+          f"127.0.0.1:{ws_dst.listener_port}",
+          mesh_shape=mesh_shape,
+          variables=protos,
+          mesh_axes=mesh_axes,
+      )
+
+    def _fill_fsdp_pattern(seed: int) -> None:
+      for i, ws in enumerate(ws_srcs):
+        for l in range(num_vars):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          words = buf.view(np.uint32)
+          words[:] = (
+              (np.uint32(seed & 0xFF) << np.uint32(24))
+              | (np.uint32(i & 0x1F) << np.uint32(19))
+              | (np.uint32((l + 1) & 0x3F) << np.uint32(13))
+              | (
+                  np.arange(1, len(words) + 1, dtype=np.uint32)
+                  & np.uint32(0x1FFF)
+              )
+          )
+
+    def _verify_fsdp_destinations(seed: int, label: str) -> None:
+      expected_seed = np.uint32(seed & 0xFF)
+      for l in range(num_vars):
+        valid_bytes = dst_slice_byte_sizes[l]
+        ref_buf = ws_dsts[0].get_host_buffer(layer_idx=l, shard_idx=0)[
+            :valid_bytes
+        ]
+        ref_words = ref_buf.view(np.uint32)
+        self.assertTrue(
+            np.all((ref_words >> np.uint32(24)) == expected_seed),
+            f"{label} seed tag mismatch in layer {l} on sampler 0",
+        )
+        for j in range(1, num_dst):
+          dst_buf = ws_dsts[j].get_host_buffer(layer_idx=l, shard_idx=0)[
+              :valid_bytes
+          ]
+          dst_words = dst_buf.view(np.uint32)
+          self.assertTrue(
+              np.all((dst_words >> np.uint32(24)) == expected_seed),
+              f"{label} seed tag mismatch in layer {l} on sampler {j}",
+          )
+          self.assertTrue(
+              np.array_equal(dst_buf, ref_buf),
+              f"{label} sampler {j} mismatch against sampler 0 in layer {l}",
+          )
+
+    old_ratio = self.controller.broadcast_host_ratio
+    old_pipeline_group_size = os.environ.get(
+        "RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"
+    )
+    loop = asyncio.new_event_loop()
+    try:
+      self.controller.broadcast_host_ratio = 0.125
+      os.environ["RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"] = "5"
+
+      # Cold transfer: uuid = 3100, parallelism = 16, req_id = "cold_512_conns"
+      for ws in ws_dsts:
+        for l in range(num_vars):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          buf[:] = 0x00
+      for ws in ws_srcs:
+        ws.reset_metrics()
+      for ws in ws_dsts:
+        ws.reset_metrics()
+      _fill_fsdp_pattern(0x5A)
+
+      self.controller._plan_cache.clear()
+      t0 = time.perf_counter()
+      future_cold = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=3100,
+          req_id="cold_512_conns",
+          parallelism=parallelism,
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(num_vars)},
+      )
+      loop.run_until_complete(future_cold.wait())
+      t_cold = time.perf_counter() - t0
+
+      _verify_fsdp_destinations(0x5A, "Cold transfer")
+      src_metrics_cold = [ws.get_metrics() for ws in ws_srcs]
+      dst_metrics_cold = [ws.get_metrics() for ws in ws_dsts]
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in src_metrics_cold),
+          total_model_bytes_local * 4,
+      )
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in dst_metrics_cold),
+          total_model_bytes_local * 2,
+      )
+
+      # Warm transfer: uuid = 3101, parallelism = 16, req_id = "warm_512_conns"
+      for ws in ws_dsts:
+        for l in range(num_vars):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          buf[:] = 0x00
+      for ws in ws_srcs:
+        ws.reset_metrics()
+      for ws in ws_dsts:
+        ws.reset_metrics()
+      _fill_fsdp_pattern(0xA5)
+
+      t0 = time.perf_counter()
+      future_warm = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=3101,
+          req_id="warm_512_conns",
+          parallelism=parallelism,
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(num_vars)},
+      )
+      loop.run_until_complete(future_warm.wait())
+      t_warm = time.perf_counter() - t0
+
+      _verify_fsdp_destinations(0xA5, "Warm transfer")
+      src_metrics_warm = [ws.get_metrics() for ws in ws_srcs]
+      dst_metrics_warm = [ws.get_metrics() for ws in ws_dsts]
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in src_metrics_warm),
+          total_model_bytes_local * 4,
+      )
+      self.assertEqual(
+          sum(m["total_h2h_bytes"] for m in dst_metrics_warm),
+          total_model_bytes_local * 2,
+      )
+
+      print(
+          "\n[BENCHMARK] fsdp32_high_concurrency_cold_connect:"
+          f" t_cold={t_cold:.3f}s, t_warm={t_warm:.3f}s,"
+          f" delta={t_cold - t_warm:.3f}s"
+      )
+
+      self.assertLess(
+          t_cold - t_warm,
+          1.0,
+          f"Cold transfer ({t_cold:.3f}s) exceeded warm transfer"
+          f" ({t_warm:.3f}s) by >= 1.0s (delta: {t_cold - t_warm:.3f}s),"
+          " indicating TCP SYN backlog overflow stall.",
+      )
+    finally:
+      loop.close()
+      self.controller.broadcast_host_ratio = old_ratio
+      if old_pipeline_group_size is None:
+        os.environ.pop("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE", None)
+      else:
+        os.environ["RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"] = (
+            old_pipeline_group_size
+        )
+      self.controller._plan_cache.clear()
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -17,12 +17,15 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>  // NOLINT
@@ -37,8 +40,10 @@
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
@@ -64,6 +69,36 @@
 
 namespace tpu_raiden::transport::lib {
 namespace {
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    if (old != nullptr) {
+      old_value_ = old;
+    }
+    if (value != nullptr) {
+      setenv(name, value, 1);
+    } else {
+      unsetenv(name);
+    }
+  }
+
+  ~ScopedEnvVar() {
+    if (old_value_.has_value()) {
+      setenv(name_.c_str(), old_value_->c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+ private:
+  std::string name_;
+  std::optional<std::string> old_value_;
+};
 
 bool AllZero(absl::Span<const uint8_t> data) {
   for (uint8_t b : data) {
@@ -1526,6 +1561,109 @@ TEST_P(RawBufferTransportTest, SendJitterInjection) {
               Pointwise(Eq(), absl::MakeConstSpan(payload)));
 }
 
+TEST_P(RawBufferTransportTest, HighConcurrencyColdConnectNoBacklogStall) {
+  ScopedEnvVar env_backlog("TPU_RAIDEN_TCP_LISTEN_BACKLOG", "2048");
+  ScopedEnvVar env_reserve("TPU_RAIDEN_TCP_ACCEPT_BATCH_RESERVE", "64");
+
+  constexpr size_t kChunkSize = 64;
+  constexpr int kNumSenders = 32;
+  constexpr int kParallelism = 16;
+  constexpr size_t kTotalChunks = kNumSenders * kParallelism;  // 512
+  constexpr size_t kTotalBytes = kTotalChunks * kChunkSize;
+
+  RawMockDelegate dst(kTotalBytes);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::shared_ptr<grpc::Channel> dst_control_channel;
+  if (GetParam()) {
+    dst_control_channel = StartControlServer(&dst_transport);
+  }
+
+  std::vector<std::unique_ptr<RawMockDelegate>> src_delegates;
+  src_delegates.reserve(kNumSenders);
+  std::vector<std::unique_ptr<RawBufferTransport>> src_transports;
+  src_transports.reserve(kNumSenders);
+  std::vector<std::vector<uint8_t>> sender_payloads(
+      kNumSenders, std::vector<uint8_t>(kParallelism * kChunkSize));
+
+  for (int s = 0; s < kNumSenders; ++s) {
+    for (size_t i = 0; i < kParallelism * kChunkSize; ++i) {
+      sender_payloads[s][i] =
+          static_cast<uint8_t>((s * kParallelism * kChunkSize + i) % 251 + 1);
+    }
+    src_delegates.push_back(
+        std::make_unique<RawMockDelegate>(kParallelism * kChunkSize));
+    src_transports.push_back(std::make_unique<RawBufferTransport>(
+        src_delegates.back().get(), kLocalPort));
+    if (GetParam()) {
+      src_delegates.back()->SetPeerChannel(dst_addr, dst_control_channel);
+    }
+  }
+
+  constexpr uint64_t kUuid = 77777;
+  ABSL_ASSERT_OK(dst_transport.RegisterExpectedChunks(kUuid, kTotalChunks));
+
+  std::vector<std::vector<BufferPushTask>> all_tasks(kNumSenders);
+  for (int s = 0; s < kNumSenders; ++s) {
+    all_tasks[s].reserve(kParallelism);
+    for (int t = 0; t < kParallelism; ++t) {
+      all_tasks[s].push_back({
+          .peer = dst_addr,
+          .buffer_id = kBufferId,
+          .dst_shard_idx = kDstShardIdx,
+          .dst_offset_bytes =
+              static_cast<size_t>((s * kParallelism + t) * kChunkSize),
+          .data_ptr = sender_payloads[s].data() + t * kChunkSize,
+          .size_bytes = kChunkSize,
+      });
+    }
+  }
+
+  absl::Notification start_notification;
+  std::vector<absl::Status> sender_statuses(kNumSenders);
+  std::vector<absl::Duration> sender_latencies(kNumSenders);
+  std::vector<std::thread> sender_threads;
+  sender_threads.reserve(kNumSenders);
+
+  for (int s = 0; s < kNumSenders; ++s) {
+    sender_threads.emplace_back([&, s] {
+      start_notification.WaitForNotification();
+      const absl::Time t0 = absl::Now();
+      sender_statuses[s] = src_transports[s]->PushBuffers(
+          all_tasks[s], /*parallelism=*/kParallelism, kUuid);
+      sender_latencies[s] = absl::Now() - t0;
+    });
+  }
+
+  start_notification.Notify();
+  for (auto& t : sender_threads) {
+    t.join();
+  }
+
+  for (int s = 0; s < kNumSenders; ++s) {
+    ABSL_EXPECT_OK(sender_statuses[s]);
+  }
+  EXPECT_TRUE(dst.WaitForDataReceived(kNotificationTimeout));
+
+  for (int s = 0; s < kNumSenders; ++s) {
+    for (int t = 0; t < kParallelism; ++t) {
+      const size_t offset = (s * kParallelism + t) * kChunkSize;
+      EXPECT_THAT(
+          dst.DataSpan(offset, kChunkSize),
+          Pointwise(Eq(), absl::MakeConstSpan(
+                              sender_payloads[s].data() + t * kChunkSize,
+                              kChunkSize)));
+    }
+  }
+
+  absl::Duration max_latency = absl::ZeroDuration();
+  for (int s = 0; s < kNumSenders; ++s) {
+    max_latency = std::max(max_latency, sender_latencies[s]);
+  }
+  EXPECT_LT(max_latency, absl::Milliseconds(500));
+}
+
 INSTANTIATE_TEST_SUITE_P(
     PspAndPlainTcp, RawBufferTransportTest, ::testing::Bool(),
     [](const ::testing::TestParamInfo<bool>& info) {
@@ -1537,6 +1675,27 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<bool>& info) {
       return info.param ? "PSP" : "PlainTcp";
     });
+
+TEST(RawBufferTransportEnvTest, ValidEnvOverrides) {
+  ScopedEnvVar env_backlog("TPU_RAIDEN_TCP_LISTEN_BACKLOG", "1024");
+  ScopedEnvVar env_reserve("TPU_RAIDEN_TCP_ACCEPT_BATCH_RESERVE", "32");
+
+  RawMockDelegate delegate(1024);
+  RawBufferTransport transport(&delegate, /*local_port=*/0);
+  EXPECT_GT(transport.local_port(), 0);
+}
+
+TEST(RawBufferTransportEnvTest, NonPositiveOrInvalidEnvUsesDefault) {
+  for (const char* invalid_val : {"0", "-5", "not_an_int"}) {
+    ScopedEnvVar env_backlog("TPU_RAIDEN_TCP_LISTEN_BACKLOG", invalid_val);
+    ScopedEnvVar env_reserve("TPU_RAIDEN_TCP_ACCEPT_BATCH_RESERVE",
+                             invalid_val);
+
+    RawMockDelegate delegate(1024);
+    RawBufferTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_GT(transport.local_port(), 0);
+  }
+}
 
 }  // namespace
 }  // namespace tpu_raiden::transport::lib

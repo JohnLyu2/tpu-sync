@@ -30,6 +30,7 @@
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -46,6 +47,7 @@
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -128,6 +130,25 @@ void RecordWeightSyncFailure(RaidenMetricStore* store,
 }
 
 constexpr int kMaxPushThreads = 16;
+// Effective listen queue depth is bounded by kernel sysctls
+// net.core.somaxconn and net.ipv4.tcp_max_syn_backlog.
+constexpr int kDefaultListenBacklog = 4096;
+constexpr int kDefaultAcceptBatchReserve = 128;
+
+int GetPositiveIntFromEnvOrDefault(const char* name, int default_val) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_val;
+  }
+  int parsed = 0;
+  if (!absl::SimpleAtoi(value, &parsed) || parsed <= 0) {
+    LOG(WARNING) << name << "=\"" << value
+                 << "\" must be a positive integer; using default "
+                 << default_val;
+    return default_val;
+  }
+  return parsed;
+}
 
 absl::Status InternalError(absl::string_view msg, int _errno) {
   return absl::InternalError(absl::StrCat(msg, ": ", std::strerror(_errno)));
@@ -251,13 +272,16 @@ RawBufferTransport::RawBufferTransport(
   DCHECK(1 <= local_port_ && local_port_ <= 65535);
   DCHECK(IsValidSocket(server_fd_));
 
-  if (listen(server_fd_, 128) < 0) {
+  const int listen_backlog = GetPositiveIntFromEnvOrDefault(
+      "TPU_RAIDEN_TCP_LISTEN_BACKLOG", kDefaultListenBacklog);
+  if (listen(server_fd_, listen_backlog) < 0) {
     LOG(FATAL) << "Failed to listen on server socket: " << std::strerror(errno);
   }
   LOG(INFO) << "bound_ip_: " << bound_ip_
             << ", local_ips_: " << absl::StrJoin(local_ips_, ",")
             << ", local_port_: " << local_port_ << ", listening tcp socket "
-            << server_fd_ << ": " << GetAddrPortPair(server_fd_);
+            << server_fd_ << ": " << GetAddrPortPair(server_fd_)
+            << ", listen_backlog: " << listen_backlog;
 
   // 2. Start listener
   listener_thread_ = std::thread(&RawBufferTransport::ListenerLoop, this);
@@ -563,6 +587,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
 void RawBufferTransport::ConnectionWorker(int client_fd) {
   DCHECK_GE(client_fd, 0);
+  LOG(INFO) << absl::StrCat("accepted tcp socket ", client_fd, ": ",
+                            GetAddrPortPair(client_fd));
   while (!stopping_) {
     struct pollfd pfd;
     pfd.fd = client_fd;
@@ -585,7 +611,7 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
 
   DCHECK_GE(client_fd, 0);
   {
-    absl::MutexLock _( mu_ );
+    absl::MutexLock lock(mu_);
     active_client_fds_.erase(client_fd);
   }
   close(client_fd);
@@ -610,6 +636,9 @@ RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
 void RawBufferTransport::ListenerLoop() {
   const int server_fd = server_fd_.load();
   DCHECK(IsValidSocket(server_fd));
+  const size_t accept_batch_reserve =
+      static_cast<size_t>(GetPositiveIntFromEnvOrDefault(
+          "TPU_RAIDEN_TCP_ACCEPT_BATCH_RESERVE", kDefaultAcceptBatchReserve));
   while (!stopping_) {
     struct pollfd pfd;
     pfd.fd = server_fd;
@@ -620,39 +649,63 @@ void RawBufferTransport::ListenerLoop() {
       continue;
     }
 
-    struct sockaddr_in6 client_addr;
-    socklen_t clilen = sizeof(client_addr);
-    int client_fd =
-        FaultInjectErrno(hooks::kRawBufferTransportAccept, EMFILE)
-            ? -1
-            : accept(server_fd,
-                     reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
-    if (client_fd < 0) {
+    std::vector<int> accepted_fds;
+    accepted_fds.reserve(accept_batch_reserve);
+    while (!stopping_) {
+      struct sockaddr_in6 client_addr;
+      socklen_t clilen = sizeof(client_addr);
+      int client_fd =
+          FaultInjectErrno(hooks::kRawBufferTransportAccept, EMFILE)
+              ? -1
+              : accept(server_fd,
+                       reinterpret_cast<struct sockaddr*>(&client_addr),
+                       &clilen);
+      if (client_fd < 0) {
+        break;
+      }
+      if (require_psp_tcp_ && !PspEnabled(client_fd)) {
+        close(client_fd);
+        LOG_EVERY_N_SEC(ERROR, 1)
+            << "Unencrypted TCP connection rejected on PSP listener";
+      } else {
+        int opt = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        int buf_opt = 16 * 1024 * 1024;  // 16MB
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_opt, sizeof(buf_opt));
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_opt, sizeof(buf_opt));
+        DCHECK_GE(client_fd, 0);
+        accepted_fds.push_back(client_fd);
+      }
+
+      struct pollfd next_pfd;
+      next_pfd.fd = server_fd;
+      next_pfd.events = POLLIN;
+      next_pfd.revents = 0;
+      if (poll(&next_pfd, 1, 0) <= 0 || (next_pfd.revents & POLLIN) == 0) {
+        break;
+      }
+    }
+
+    if (accepted_fds.empty()) {
       if (stopping_) break;
       continue;
     }
-    if (require_psp_tcp_ && !PspEnabled(client_fd)) {
-      close(client_fd);
-      LOG_EVERY_N_SEC(ERROR, 1)
-          << "Unencrypted TCP connection rejected on PSP listener";
-      continue;
-    }
 
-    int opt = 1;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-    int buf_opt = 16 * 1024 * 1024;  // 16MB
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_opt, sizeof(buf_opt));
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_opt, sizeof(buf_opt));
-
-    DCHECK_GE(client_fd, 0);
-    LOG(INFO) << absl::StrCat("accepted tcp socket ", client_fd, ": ",
-                              GetAddrPortPair(client_fd));
     {
-      absl::MutexLock _(mu_);
-      active_client_fds_.insert(client_fd);
+      absl::MutexLock lock(mu_);
+      if (stopping_) {
+        for (int fd : accepted_fds) {
+          close(fd);
+        }
+        accepted_fds.clear();
+      } else {
+        active_client_fds_.insert(accepted_fds.begin(), accepted_fds.end());
+      }
     }
-    connection_threads_.Spawn(
-        [this, client_fd] { ConnectionWorker(client_fd); });
+    for (int client_fd : accepted_fds) {
+      connection_threads_.Spawn(
+          [this, client_fd] { ConnectionWorker(client_fd); });
+    }
   }
 }
 
