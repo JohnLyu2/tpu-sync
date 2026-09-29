@@ -493,5 +493,250 @@ TEST(TpuUtilsTest, GetLocalHostNicAddresses_AuthoritativeAllowlistAndDocker) {
   fs::remove_all(sysfs);
 }
 
+TEST(TpuUtilsTest, ContainerNoSysfs_AllowlistPositionalNumaFallback) {
+  namespace fs = std::filesystem;
+  std::string missing_sysfs =
+      (fs::path(testing::TempDir()) / "nonexistent_sysfs").string();
+  fs::remove_all(missing_sysfs);
+
+  sockaddr_in addr_ens5 = CreateSockAddr("10.128.0.10");
+  sockaddr_in addr_ens6 = CreateSockAddr("10.10.0.10");
+  sockaddr_in addr_enp192s4 = CreateSockAddr("10.190.0.10");
+  sockaddr_in addr_lo = CreateSockAddr("127.0.0.1");
+
+  ifaddrs ifa_enp192s4 = {nullptr, const_cast<char*>("enp192s4"),
+                          0,       reinterpret_cast<sockaddr*>(&addr_enp192s4),
+                          nullptr, {nullptr},
+                          nullptr};
+  ifaddrs ifa_ens6 = {&ifa_enp192s4,
+                      const_cast<char*>("ens6"),
+                      0,
+                      reinterpret_cast<sockaddr*>(&addr_ens6),
+                      nullptr,
+                      {nullptr},
+                      nullptr};
+  ifaddrs ifa_ens5 = {&ifa_ens6, const_cast<char*>("ens5"),
+                      0,         reinterpret_cast<sockaddr*>(&addr_ens5),
+                      nullptr,   {nullptr},
+                      nullptr};
+  ifaddrs ifa_lo = {&ifa_ens5, const_cast<char*>("lo"),
+                    0,         reinterpret_cast<sockaddr*>(&addr_lo),
+                    nullptr,   {nullptr},
+                    nullptr};
+
+  // 1. With TPU_RAIDEN_DATA_NICS="ens6,enp192s4" and no sysfs, positional
+  // allowlist index assigns ens6 -> NUMA 0 and enp192s4 -> NUMA 1.
+  setenv("TPU_RAIDEN_DATA_NICS", "ens6,enp192s4", 1);
+  auto nics =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, missing_sysfs);
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  ASSERT_EQ(nics.size(), 3);
+
+  auto it_ens5 = std::find_if(
+      nics.begin(), nics.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "ens5"; });
+  ASSERT_NE(it_ens5, nics.end());
+  EXPECT_EQ(it_ens5->classification, NicClassification::kControlPlane);
+  EXPECT_EQ(it_ens5->numa_node, 0);
+
+  auto it_ens6 = std::find_if(
+      nics.begin(), nics.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "ens6"; });
+  ASSERT_NE(it_ens6, nics.end());
+  EXPECT_EQ(it_ens6->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it_ens6->numa_node, 0);
+
+  auto it_enp = std::find_if(
+      nics.begin(), nics.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "enp192s4"; });
+  ASSERT_NE(it_enp, nics.end());
+  EXPECT_EQ(it_enp->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it_enp->numa_node, 1);
+
+  // 2. When TPU_RAIDEN_DATA_NICS is unset, GetInterfaceNumaNode legacy
+  // fallback remains intact (ens5 -> 0, ens6 -> 1, enp192s4 -> -1).
+  auto nics_unset =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, missing_sysfs);
+  auto it_unset_ens5 = std::find_if(
+      nics_unset.begin(), nics_unset.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "ens5"; });
+  ASSERT_NE(it_unset_ens5, nics_unset.end());
+  EXPECT_EQ(it_unset_ens5->numa_node, 0);
+
+  auto it_unset_ens6 = std::find_if(
+      nics_unset.begin(), nics_unset.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "ens6"; });
+  ASSERT_NE(it_unset_ens6, nics_unset.end());
+  EXPECT_EQ(it_unset_ens6->numa_node, 1);
+
+  auto it_unset_enp = std::find_if(
+      nics_unset.begin(), nics_unset.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "enp192s4"; });
+  ASSERT_NE(it_unset_enp, nics_unset.end());
+  EXPECT_EQ(it_unset_enp->numa_node, -1);
+}
+
+TEST(TpuUtilsTest, ContainerNoSysfs_AllowlistExplicitNumaOverride) {
+  namespace fs = std::filesystem;
+  std::string missing_sysfs =
+      (fs::path(testing::TempDir()) / "nonexistent_sysfs_explicit").string();
+  fs::remove_all(missing_sysfs);
+
+  sockaddr_in addr_ens6 = CreateSockAddr("10.10.0.10");
+  sockaddr_in addr_enp192s4 = CreateSockAddr("10.190.0.10");
+
+  ifaddrs ifa_enp192s4 = {nullptr, const_cast<char*>("enp192s4"),
+                          0,       reinterpret_cast<sockaddr*>(&addr_enp192s4),
+                          nullptr, {nullptr},
+                          nullptr};
+  ifaddrs ifa_ens6 = {&ifa_enp192s4,
+                      const_cast<char*>("ens6"),
+                      0,
+                      reinterpret_cast<sockaddr*>(&addr_ens6),
+                      nullptr,
+                      {nullptr},
+                      nullptr};
+
+  setenv("TPU_RAIDEN_DATA_NICS", " ens6 : 1 , enp192s4 : 0 ", 1);
+  auto nics =
+      internal::GetLocalHostNicAddressesInternal(&ifa_ens6, missing_sysfs);
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  ASSERT_EQ(nics.size(), 2);
+
+  auto it_ens6 = std::find_if(
+      nics.begin(), nics.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "ens6"; });
+  ASSERT_NE(it_ens6, nics.end());
+  EXPECT_EQ(it_ens6->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it_ens6->numa_node, 1);
+
+  auto it_enp = std::find_if(
+      nics.begin(), nics.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "enp192s4"; });
+  ASSERT_NE(it_enp, nics.end());
+  EXPECT_EQ(it_enp->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it_enp->numa_node, 0);
+
+  // Verify TPU_RAIDEN_SYSFS_ROOT actually overrides the default "/sys" path
+  // in GetLocalHostNicAddresses().
+  auto base_nics = GetLocalHostNicAddresses();
+  ASSERT_FALSE(base_nics.empty());
+  if (base_nics[0].interface_name != "lo") {
+    fs::path custom_sysfs =
+        fs::path(testing::TempDir()) / "mock_sysfs_env_override";
+    fs::remove_all(custom_sysfs);
+    fs::path dev_dir =
+        custom_sysfs / "class/net" / base_nics[0].interface_name / "device";
+    fs::create_directories(dev_dir);
+    {
+      std::ofstream f(dev_dir / "numa_node");
+      f << "7\n";
+    }
+    setenv("TPU_RAIDEN_SYSFS_ROOT", custom_sysfs.c_str(), 1);
+    auto overridden_nics = GetLocalHostNicAddresses();
+    unsetenv("TPU_RAIDEN_SYSFS_ROOT");
+    auto it_first = std::find_if(overridden_nics.begin(), overridden_nics.end(),
+                                 [&](const HostNicAddress& n) {
+                                   return n.interface_name ==
+                                          base_nics[0].interface_name;
+                                 });
+    ASSERT_NE(it_first, overridden_nics.end());
+    EXPECT_EQ(it_first->numa_node, 7);
+    fs::remove_all(custom_sysfs);
+  }
+}
+
+TEST(TpuUtilsTest,
+     SysfsPresent_AllowlistPreservesSysfsNumaAndSupportsOverrides) {
+  namespace fs = std::filesystem;
+  fs::path sysfs =
+      fs::path(testing::TempDir()) / "mock_sysfs_precedence_and_bdf";
+  fs::remove_all(sysfs);
+
+  fs::create_directories(sysfs / "class/net/ens6");
+  fs::create_directories(sysfs / "class/net/enp192s4");
+  fs::create_directories(sysfs / "devices/pci0000:00/0000:00:06.0");
+  fs::create_directories(sysfs / "devices/pci0000:c0/0000:c0:04.0");
+
+  fs::create_directory_symlink("../../../devices/pci0000:00/0000:00:06.0",
+                               sysfs / "class/net/ens6/device");
+  fs::create_directory_symlink("../../../devices/pci0000:c0/0000:c0:04.0",
+                               sysfs / "class/net/enp192s4/device");
+
+  // Populate sysfs with ens6 -> NUMA 1 and enp192s4 -> NUMA 0 (opposite of
+  // their 0-based allowlist order).
+  {
+    std::ofstream f(sysfs / "devices/pci0000:00/0000:00:06.0/numa_node");
+    f << "1\n";
+  }
+  {
+    std::ofstream f(sysfs / "devices/pci0000:c0/0000:c0:04.0/numa_node");
+    f << "0\n";
+  }
+
+  sockaddr_in addr_ens6 = CreateSockAddr("10.10.0.10");
+  sockaddr_in addr_enp192s4 = CreateSockAddr("10.190.0.10");
+
+  ifaddrs ifa_enp192s4 = {nullptr, const_cast<char*>("enp192s4"),
+                          0,       reinterpret_cast<sockaddr*>(&addr_enp192s4),
+                          nullptr, {nullptr},
+                          nullptr};
+  ifaddrs ifa_ens6 = {&ifa_enp192s4,
+                      const_cast<char*>("ens6"),
+                      0,
+                      reinterpret_cast<sockaddr*>(&addr_ens6),
+                      nullptr,
+                      {nullptr},
+                      nullptr};
+
+  // 1. When sysfs device/numa_node >= 0 and no :N suffix is given, sysfs NUMA
+  // takes precedence over positional allowlist index.
+  setenv("TPU_RAIDEN_DATA_NICS", "ens6,enp192s4", 1);
+  auto nics_sysfs =
+      internal::GetLocalHostNicAddressesInternal(&ifa_ens6, sysfs.string());
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  ASSERT_EQ(nics_sysfs.size(), 2);
+  auto it1_ens6 = std::find_if(
+      nics_sysfs.begin(), nics_sysfs.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "ens6"; });
+  ASSERT_NE(it1_ens6, nics_sysfs.end());
+  EXPECT_EQ(it1_ens6->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it1_ens6->numa_node, 1);
+
+  auto it1_enp = std::find_if(
+      nics_sysfs.begin(), nics_sysfs.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "enp192s4"; });
+  ASSERT_NE(it1_enp, nics_sysfs.end());
+  EXPECT_EQ(it1_enp->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it1_enp->numa_node, 0);
+
+  // 2. Explicit :N suffix overrides valid sysfs device/numa_node, including
+  // when matched by PCI BDF.
+  setenv("TPU_RAIDEN_DATA_NICS", "0000:00:06.0:0,0000:c0:04.0:1", 1);
+  auto nics_bdf_override =
+      internal::GetLocalHostNicAddressesInternal(&ifa_ens6, sysfs.string());
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  ASSERT_EQ(nics_bdf_override.size(), 2);
+  auto it2_ens6 = std::find_if(
+      nics_bdf_override.begin(), nics_bdf_override.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "ens6"; });
+  ASSERT_NE(it2_ens6, nics_bdf_override.end());
+  EXPECT_EQ(it2_ens6->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it2_ens6->numa_node, 0);
+
+  auto it2_enp = std::find_if(
+      nics_bdf_override.begin(), nics_bdf_override.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "enp192s4"; });
+  ASSERT_NE(it2_enp, nics_bdf_override.end());
+  EXPECT_EQ(it2_enp->classification, NicClassification::kDataPlane);
+  EXPECT_EQ(it2_enp->numa_node, 1);
+
+  fs::remove_all(sysfs);
+}
+
 }  // namespace
 }  // namespace tpu_raiden

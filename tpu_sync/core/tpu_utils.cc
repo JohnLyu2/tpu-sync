@@ -43,6 +43,7 @@
 
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
@@ -398,6 +399,76 @@ int GetTotalNumaNodes(absl::string_view sysfs_root) {
   return count > 0 ? count : 1;
 }
 
+struct DataNicAllowlistEntry {
+  std::string name_or_bdf;
+  int allowlist_index = -1;
+  std::optional<int> explicit_numa_node;
+};
+
+std::vector<DataNicAllowlistEntry> ParseDataNicAllowlist() {
+  std::vector<DataNicAllowlistEntry> entries;
+  const char* env_data_nics = std::getenv("TPU_RAIDEN_DATA_NICS");
+  if (env_data_nics == nullptr ||
+      absl::StripAsciiWhitespace(env_data_nics).empty()) {
+    return entries;
+  }
+  int idx = 0;
+  for (absl::string_view raw_token :
+       absl::StrSplit(env_data_nics, ',', absl::SkipWhitespace())) {
+    absl::string_view token = absl::StripAsciiWhitespace(raw_token);
+    if (token.empty()) continue;
+    DataNicAllowlistEntry entry;
+    entry.allowlist_index = idx++;
+    size_t colon = token.rfind(':');
+    int parsed_numa = -1;
+    if (colon != absl::string_view::npos && colon > 0 &&
+        colon + 1 < token.size()) {
+      absl::string_view prefix =
+          absl::StripAsciiWhitespace(token.substr(0, colon));
+      absl::string_view suffix =
+          absl::StripAsciiWhitespace(token.substr(colon + 1));
+      bool all_digits =
+          !suffix.empty() &&
+          std::all_of(suffix.begin(), suffix.end(),
+                      [](unsigned char c) { return absl::ascii_isdigit(c); });
+      if (!prefix.empty() && all_digits &&
+          absl::SimpleAtoi(suffix, &parsed_numa) && parsed_numa >= 0) {
+        entry.name_or_bdf = std::string(prefix);
+        entry.explicit_numa_node = parsed_numa;
+      }
+    }
+    if (entry.name_or_bdf.empty()) {
+      entry.name_or_bdf = std::string(token);
+    }
+    entries.push_back(std::move(entry));
+  }
+  return entries;
+}
+
+std::optional<DataNicAllowlistEntry> FindDataNicAllowlistEntry(
+    absl::string_view ifname, absl::string_view bdf,
+    const std::vector<DataNicAllowlistEntry>& allowlist) {
+  for (const auto& entry : allowlist) {
+    if (ifname == entry.name_or_bdf ||
+        (!bdf.empty() && bdf == entry.name_or_bdf)) {
+      return entry;
+    }
+  }
+  return std::nullopt;
+}
+
+int ReadSysfsInterfaceNumaNode(absl::string_view ifname,
+                               absl::string_view sysfs_root) {
+  std::string path =
+      absl::StrCat(sysfs_root, "/class/net/", ifname, "/device/numa_node");
+  std::ifstream f(path);
+  int node = -1;
+  if (f.is_open()) {
+    f >> node;
+  }
+  return node;
+}
+
 // Dedicated classifier for GKE / Cloud TPU VMs
 NicClassification ClassifyNicGke(absl::string_view ifname,
                                  absl::string_view bdf, int mtu) {
@@ -407,15 +478,10 @@ NicClassification ClassifyNicGke(absl::string_view ifname,
 
   // 1. Authoritative Override: If TPU_RAIDEN_DATA_NICS is set, it is the sole
   // authority. Any interface not explicitly listed is strictly control plane.
-  const char* env_data_nics = std::getenv("TPU_RAIDEN_DATA_NICS");
-  if (env_data_nics != nullptr &&
-      !absl::StripAsciiWhitespace(env_data_nics).empty()) {
-    for (absl::string_view raw_nic :
-         absl::StrSplit(env_data_nics, ',', absl::SkipWhitespace())) {
-      absl::string_view nic = absl::StripAsciiWhitespace(raw_nic);
-      if (ifname == nic || (!bdf.empty() && bdf == nic)) {
-        return NicClassification::kDataPlane;
-      }
+  std::vector<DataNicAllowlistEntry> allowlist = ParseDataNicAllowlist();
+  if (!allowlist.empty()) {
+    if (FindDataNicAllowlistEntry(ifname, bdf, allowlist).has_value()) {
+      return NicClassification::kDataPlane;
     }
     return NicClassification::kControlPlane;
   }
@@ -439,6 +505,24 @@ NicClassification ClassifyNic(absl::string_view ifname, absl::string_view bdf,
   return ClassifyNicGke(ifname, bdf, mtu);
 }
 
+int ResolveInterfaceNumaNode(
+    const char* ifname, absl::string_view bdf, absl::string_view sysfs_root,
+    const std::vector<DataNicAllowlistEntry>& allowlist) {
+  int node = GetInterfaceNumaNode(ifname, sysfs_root);
+  if (!allowlist.empty()) {
+    auto entry = FindDataNicAllowlistEntry(ifname, bdf, allowlist);
+    if (entry.has_value()) {
+      if (entry->explicit_numa_node.has_value()) {
+        return *entry->explicit_numa_node;
+      }
+      if (ReadSysfsInterfaceNumaNode(ifname, sysfs_root) < 0) {
+        return entry->allowlist_index;
+      }
+    }
+  }
+  return node;
+}
+
 std::string ClassificationToString(NicClassification classification) {
   switch (classification) {
     case NicClassification::kDataPlane:
@@ -458,6 +542,7 @@ namespace internal {
 std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
     struct ifaddrs* ifaddr, absl::string_view sysfs_root) {
   std::vector<HostNicAddress> nics;
+  const std::vector<DataNicAllowlistEntry> allowlist = ParseDataNicAllowlist();
   struct ifaddrs* ifa;
   for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
     if (ifa->ifa_addr == nullptr) continue;
@@ -471,9 +556,10 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
             nics.begin(), nics.end(),
             [&](const HostNicAddress& n) { return n.ip_address == ip_str; });
         if (it == nics.end()) {
-          int node = GetInterfaceNumaNode(ifa->ifa_name, sysfs_root);
           int mtu = GetInterfaceMtu(ifa->ifa_name, sysfs_root);
           std::string bdf = GetInterfaceBdf(ifa->ifa_name, sysfs_root);
+          int node = ResolveInterfaceNumaNode(ifa->ifa_name, bdf, sysfs_root,
+                                              allowlist);
           NicClassification classification =
               ClassifyNic(ifa->ifa_name, bdf, mtu);
           nics.push_back({ifa->ifa_name, ip_str, node, classification});
@@ -492,9 +578,10 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
             nics.begin(), nics.end(),
             [&](const HostNicAddress& n) { return n.ip_address == ip_str; });
         if (it == nics.end()) {
-          int node = GetInterfaceNumaNode(ifa->ifa_name, sysfs_root);
           int mtu = GetInterfaceMtu(ifa->ifa_name, sysfs_root);
           std::string bdf = GetInterfaceBdf(ifa->ifa_name, sysfs_root);
+          int node = ResolveInterfaceNumaNode(ifa->ifa_name, bdf, sysfs_root,
+                                              allowlist);
           NicClassification classification =
               ClassifyNic(ifa->ifa_name, bdf, mtu);
           nics.push_back({ifa->ifa_name, ip_str, node, classification});
@@ -565,6 +652,15 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
 
 std::vector<HostNicAddress> GetLocalHostNicAddresses(
     absl::string_view sysfs_root) {
+  if (sysfs_root == "/sys") {
+    const char* env_sysfs = std::getenv("TPU_RAIDEN_SYSFS_ROOT");
+    if (env_sysfs != nullptr) {
+      absl::string_view stripped = absl::StripAsciiWhitespace(env_sysfs);
+      if (!stripped.empty()) {
+        sysfs_root = stripped;
+      }
+    }
+  }
   struct ifaddrs* ifaddr;
   if (getifaddrs(&ifaddr) == 0) {
     auto nics = internal::GetLocalHostNicAddressesInternal(ifaddr, sysfs_root);
