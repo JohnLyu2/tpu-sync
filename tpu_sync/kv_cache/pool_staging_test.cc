@@ -300,6 +300,119 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
   EXPECT_FALSE(mixed.PoolStorageStagingBounded(0));
 }
 
+// A sender given the receiver's pool addresses (receiver_addrs) resolves each
+// chunk's remote address (raddr) to exactly the pointer the receiver itself
+// resolves, even though the two sides' pool geometries differ.
+TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
+  constexpr int64_t kDstBase = 128;
+  constexpr int64_t kDstStride = 64;
+  constexpr int64_t kDstBlocks = 8;
+  StagingTestManager receiver(/*num_layers=*/1, /*num_shards=*/1,
+                              /*slice_byte_size=*/kDstStride,
+                              /*host_blocks=*/1);
+  receiver.SetDeviceBacked(0, kDstBase + kDstStride * kDstBlocks);
+  ABSL_ASSERT_OK(receiver.RegisterPools(
+      {DensePool("fa", 0, kDstBase, kDstStride, kDstBlocks, 0)},
+      /*staging_leases=*/0));
+  ASSERT_FALSE(receiver.PoolStorageStagingBounded(0));
+
+  constexpr int64_t kSrcStride = 32;
+  constexpr int64_t kSrcBlocks = 16;
+  StagingTestManager sender(/*num_layers=*/1, /*num_shards=*/1,
+                            /*slice_byte_size=*/kSrcStride, /*host_blocks=*/1);
+  sender.SetDeviceBacked(0, kSrcStride * kSrcBlocks);
+  ABSL_ASSERT_OK(
+      sender.RegisterPools({DensePool("fa", 0, 0, kSrcStride, kSrcBlocks, 0)},
+                           /*staging_leases=*/0));
+
+  constexpr char kPeer[] = "127.0.0.1:1";
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(11);
+  request.set_req_id("req");
+  request.add_transfer_pool_indices(0);
+  auto* group = request.add_pool_groups();
+  group->add_pool_indices(0);
+  group->set_expected_pushes(1);
+  auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(kPeer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_block_id(3);
+  entry->set_dst_block_id(5);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(8);
+  entry->set_size_bytes(16);
+  entry->set_count(2);
+  entry->set_src_stride_bytes(16);
+  entry->set_dst_stride_bytes(24);
+
+  tpu_sync::rpc::StartTransferRequest recv_request = request;
+  recv_request.set_is_sender(false);
+  ABSL_ASSERT_OK(receiver.RegisterActivePlan(11, recv_request,
+                                             /*is_sender=*/false));
+  std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{5},
+      /*total_bytes=*/32, /*uuid=*/11, /*sender_node_id=*/0, /*peer=*/"",
+      /*src_block_id=*/3);
+  ASSERT_EQ(recv_chunks.size(), 2u);
+
+  tpu_sync::rpc::StartTransferRequest send_request = request;
+  send_request.set_is_sender(true);
+  tpu_sync::rpc::PoolHostAddrsProto& dst_pool =
+      (*(*send_request.mutable_receiver_addrs())[kPeer].mutable_pools())[0];
+  dst_pool.set_block_stride_bytes(kDstStride);
+  dst_pool.set_num_blocks(kDstBlocks);
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<uint64_t> dst_bases,
+                          receiver.PoolHostBaseAddrs(0));
+  for (uint64_t addr : dst_bases) dst_pool.add_host_base_addrs(addr);
+  ABSL_ASSERT_OK(sender.RegisterActivePlan(11, send_request,
+                                           /*is_sender=*/true));
+  std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{3},
+      /*total_bytes=*/32, /*uuid=*/11, /*sender_node_id=*/-1, kPeer,
+      /*src_block_id=*/-1, /*dst_block_id=*/5);
+  ASSERT_EQ(send_chunks.size(), recv_chunks.size());
+  for (size_t i = 0; i < send_chunks.size(); ++i) {
+    EXPECT_EQ(send_chunks[i].size, recv_chunks[i].size);
+    EXPECT_EQ(send_chunks[i].raddr, recv_chunks[i].ptr);
+  }
+
+  // No peer: the sender cannot tell which receiver's addresses apply.
+  send_chunks = sender.GetBlockChunks(0, 0, std::vector<int64_t>{3}, 32,
+                                      /*uuid=*/11, -1, /*peer=*/"", -1, 5);
+  ASSERT_EQ(send_chunks.size(), 2u);
+  for (const auto& chunk : send_chunks) {
+    EXPECT_EQ(chunk.raddr, nullptr);
+  }
+
+  // No addresses for this peer.
+  tpu_sync::rpc::StartTransferRequest other_request = send_request;
+  other_request.set_uuid(12);
+  other_request.mutable_receiver_addrs()->clear();
+  (*other_request.mutable_receiver_addrs())["127.0.0.1:2"] =
+      send_request.receiver_addrs().at(kPeer);
+  ABSL_ASSERT_OK(sender.RegisterActivePlan(12, other_request,
+                                           /*is_sender=*/true));
+  send_chunks = sender.GetBlockChunks(0, 0, std::vector<int64_t>{3}, 32,
+                                      /*uuid=*/12, -1, kPeer, -1, 5);
+  ASSERT_EQ(send_chunks.size(), 2u);
+  for (const auto& chunk : send_chunks) {
+    EXPECT_EQ(chunk.raddr, nullptr);
+  }
+
+  // Without host bases the sender cannot address the receiver.
+  send_request.set_uuid(13);
+  (*(*send_request.mutable_receiver_addrs())[kPeer].mutable_pools())[0]
+      .clear_host_base_addrs();
+  ABSL_ASSERT_OK(sender.RegisterActivePlan(13, send_request,
+                                           /*is_sender=*/true));
+  send_chunks = sender.GetBlockChunks(0, 0, std::vector<int64_t>{3}, 32,
+                                      /*uuid=*/13, -1, kPeer, -1, 5);
+  ASSERT_EQ(send_chunks.size(), 2u);
+  for (const auto& chunk : send_chunks) {
+    EXPECT_EQ(chunk.raddr, nullptr);
+  }
+}
+
 // PoolHostBaseAddrs reports, per local shard, each pool's base address
 // (storage host pointer + base offset), is empty for bounded staging, and
 // rejects unknown pools.

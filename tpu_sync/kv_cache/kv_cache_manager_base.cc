@@ -111,6 +111,48 @@ absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
   return absl::OkStatus();
 }
 
+// Returns the receiver's host addresses for the sender's local pool
+// `pool_idx`, or nullptr if the sender cannot compute remote addresses.
+const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverPoolAddrs(
+    const ::tpu_sync::rpc::StartTransferRequest& request,
+    absl::string_view peer, size_t pool_idx) {
+  if (request.pool_groups_size() == 0 || peer.empty()) return nullptr;
+  auto receiver_it = request.receiver_addrs().find(std::string(peer));
+  if (receiver_it == request.receiver_addrs().end()) return nullptr;
+  // Receivers report addresses under their own (wire) pool index; a sender
+  // rewritten into its own index space maps local -> wire.
+  int32_t wire_pool_idx = static_cast<int32_t>(pool_idx);
+  if (auto wire_it = request.wire_pool_indices().find(wire_pool_idx);
+      wire_it != request.wire_pool_indices().end()) {
+    wire_pool_idx = wire_it->second;
+  }
+  const auto& pools = receiver_it->second.pools();
+  auto pool_it = pools.find(wire_pool_idx);
+  if (pool_it == pools.end() || pool_it->second.host_base_addrs().empty()) {
+    return nullptr;
+  }
+  return &pool_it->second;
+}
+
+// Returns the chunk's address in the receiver's host memory, or nullptr if
+// unknown or out of bounds.
+uint8_t* RemoteAddress(const ::tpu_sync::rpc::PoolHostAddrsProto* pool,
+                       const ::tpu_sync::rpc::ShardPushEntryProto& entry,
+                       int64_t dst_offset, int64_t size) {
+  if (pool == nullptr || entry.dst_shard_idx() < 0 ||
+      entry.dst_shard_idx() >= pool->host_base_addrs_size() ||
+      entry.dst_block_id() < 0 || entry.dst_block_id() >= pool->num_blocks() ||
+      pool->block_stride_bytes() <= 0 || dst_offset < 0 || size < 0 ||
+      dst_offset > pool->block_stride_bytes() - size) {
+    return nullptr;
+  }
+  const uint64_t addr = pool->host_base_addrs(entry.dst_shard_idx()) +
+                        static_cast<uint64_t>(entry.dst_block_id()) *
+                            static_cast<uint64_t>(pool->block_stride_bytes()) +
+                        static_cast<uint64_t>(dst_offset);
+  return reinterpret_cast<uint8_t*>(addr);
+}
+
 // Converts int64 host-block offsets to validated int block ids.
 absl::StatusOr<std::vector<int>> ToHostBlockIds(
     const std::vector<int64_t>& offsets) {
@@ -3147,6 +3189,10 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     return std::find(indices.begin(), indices.end(),
                      static_cast<int32_t>(layer_idx)) != indices.end();
   };
+  const ::tpu_sync::rpc::PoolHostAddrsProto* dst_pool =
+      is_sender && explicit_pools_
+          ? GetReceiverPoolAddrs(request, peer, layer_idx)
+          : nullptr;
 
   std::vector<tpu_raiden::transport::BlockChunk> chunks;
   size_t accumulated_bytes = 0;
@@ -3194,8 +3240,13 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
 
             for (int c = 0; c < count; ++c) {
               size_t src_offset = src_base_offset + c * src_stride;
+              const int64_t dst_offset =
+                  entry.dst_offset_bytes() + c * entry.dst_stride_bytes();
               block_resolved_chunks.push_back(
-                  {.ptr = block_base + src_offset, .size = size});
+                  {.ptr = block_base + src_offset,
+                   .size = size,
+                   .raddr = RemoteAddress(dst_pool, entry, dst_offset,
+                                          entry.size_bytes())});
             }
           }
         }
@@ -3261,7 +3312,8 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       size_t size_to_add =
           std::min(chunk.size, total_bytes - accumulated_bytes);
       if (size_to_add > 0) {
-        chunks.push_back({.ptr = chunk.ptr, .size = size_to_add});
+        chunks.push_back(
+            {.ptr = chunk.ptr, .size = size_to_add, .raddr = chunk.raddr});
         accumulated_bytes += size_to_add;
       }
     }
