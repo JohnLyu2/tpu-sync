@@ -36,6 +36,10 @@ git_override(
         # local_wheels attribute that rules_python (1.8.5) doesn't support, so
         # wheels resolve from the index.
         "//:third_party/py/jax_remove_local_wheels.patch",
+        # Backport of jax-ml/jax@53bb8f2a5d (`jaxlib/mosaic/gpu/serde.cc`) so
+        # jax-v0.11.2 compiles against the newer LLVM pulled in by the `xla`
+        # pin below. Remove once `jax` is bumped past 53bb8f2a5d.
+        "//:third_party/py/jax_mosaic_gpu_mbarrier_layout.patch",
     ],
     remote = "https://github.com/jax-ml/jax.git",
 )
@@ -43,7 +47,7 @@ git_override(
 bazel_dep(name = "xla")
 git_override(
     module_name = "xla",
-    commit = "91888df6ce85102c30220e41d952065925e10886",
+    commit = "f60be94c9c5d1e1340a6259433ead57824c37293",
     patch_strip = 1,
     patches = [
         "//:third_party/xla/future_sfinae.patch",

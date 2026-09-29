@@ -1,0 +1,11 @@
+--- a/jaxlib/mosaic/gpu/serde.cc
++++ b/jaxlib/mosaic/gpu/serde.cc
+@@ -355,7 +355,7 @@
+     b.setInsertionPointAfter(op);
+     mlir::NVVM::MBarrierInitOp::create(
+         b, op->getLoc(), op->getOperand(0), op->getOperand(1),
+-        op->getNumOperands() < 3 ? Value{} : op->getOperand(2));
++        /*layout=*/0, op->getNumOperands() < 3 ? Value{} : op->getOperand(2));
+     op->erase();
+     erased = true;
+   }
