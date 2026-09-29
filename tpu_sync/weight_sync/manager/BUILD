@@ -33,8 +33,11 @@ py_test(
     deps = [
         ":broadcast_engine",
         ":controller_types",
+        ":job_entity",
+        ":reshard_planner",
         "//tpu_sync/api:common",
         "//tpu_sync/rpc:raiden_controller",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
         "@com_google_absl_py//absl/testing:absltest",
     ],
 )

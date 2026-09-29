@@ -16,14 +16,18 @@
 
 import asyncio
 import collections
+import threading
 from typing import Any, Optional
 
 from absl.testing import absltest
 
 from tpu_sync.api.common import RaidenId
 from tpu_sync.rpc import raiden_controller
+from tpu_sync.rpc import raiden_service_pb2
 from tpu_sync.weight_sync.manager import broadcast_engine
 from tpu_sync.weight_sync.manager import controller_types
+from tpu_sync.weight_sync.manager import job_entity
+from tpu_sync.weight_sync.manager import reshard_planner
 
 
 class RecordingWorkerRpcClient(raiden_controller.WeightSyncWorkerRpcClient):
@@ -1314,6 +1318,259 @@ class BroadcastEngineTest(absltest.TestCase):
               f" parallelism={expected_parallelism}",
           )
 
+  def test_stage_broadcast_group_trainer_seed_latin_square_circular_shift(
+      self,
+  ) -> None:
+    """Verifies Round 0 trainer seeds push to samplers in Latin Square circular shift."""
+    dst_units = [RaidenId("sampler", str(j), "weights", 0) for j in range(8)]
+    dst_shards = {u: [f"10.1.0.{j + 1}:8000"] for j, u in enumerate(dst_units)}
+
+    src_var = controller_types.VariableMetadata(
+        name="weight",
+        shape=[4096, 4096],
+        mesh_shape=[4, 1],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=0,
+        sharding_spec=["fsdp", ""],
+    )
+    dst_var = controller_types.VariableMetadata(
+        name="weight",
+        shape=[4096, 4096],
+        mesh_shape=[1, 1],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=0,
+        sharding_spec=["", ""],
+    )
+
+    for mode in ("multi_unit_trainer", "pathways_single_unit_trainer"):
+      with self.subTest(mode=mode):
+        if mode == "multi_unit_trainer":
+          src_units = [
+              RaidenId("trainer", str(h), "weights", 0) for h in range(4)
+          ]
+          registered_shards = {
+              u: [f"10.0.0.{h + 1}:8000"] for h, u in enumerate(src_units)
+          }
+          worker_endpoints = {
+              u: f"10.0.0.{h + 1}:9000" for h, u in enumerate(src_units)
+          }
+          entities = {
+              u: job_entity.JobEntity(unit=u, shards=registered_shards[u])
+              for u in src_units
+          }
+          registered_variables = {u: [src_var] for u in src_units}
+          registered_mesh_shapes = {u: [4, 1] for u in src_units}
+          registered_mesh_axes = {u: ["fsdp", "context"] for u in src_units}
+          registered_host_subgrids = {u: [1, 1] for u in src_units}
+        else:
+          src_unit = RaidenId("trainer", "", "weights", 0)
+          src_units = [src_unit]
+          src_shards = [f"10.0.0.{h + 1}:8000" for h in range(4)]
+          registered_shards = {src_unit: src_shards}
+          worker_endpoints = {
+              src_unit: (
+                  "10.0.0.1:9000,10.0.0.2:9000,10.0.0.3:9000,10.0.0.4:9000"
+              )
+          }
+          entities = {
+              src_unit: job_entity.JobEntity(unit=src_unit, shards=src_shards)
+          }
+          registered_variables = {src_unit: [src_var]}
+          registered_mesh_shapes = {src_unit: [4, 1]}
+          registered_mesh_axes = {src_unit: ["fsdp", "context"]}
+          registered_host_subgrids = {src_unit: [1, 1]}
+
+        registered_shards.update(dst_shards)
+        dst_metadata = []
+        for j, u in enumerate(dst_units):
+          worker_endpoints[u] = f"10.1.0.{j + 1}:9000"
+          meta = raiden_service_pb2.RegisterWorkUnitRequest(
+              unit=raiden_service_pb2.RaidenIdProto(
+                  job_name=u.job_name,
+                  job_replica_id=str(u.job_replica_id),
+                  data_name=u.data_name,
+                  data_replica_idx=u.data_replica_idx,
+              ),
+              control_plane_rpc_address=f"10.1.0.{j + 1}:9000",
+          )
+          meta.shards.extend(dst_shards[u])
+          meta.mesh_shape.extend([1, 1])
+          meta.mesh_axes.extend(["tp", "tp_wo"])
+          meta.host_subgrid.extend([1, 1])
+          vp = meta.variables.add()
+          vp.name = dst_var.name
+          vp.shape.extend(dst_var.shape)
+          vp.mesh_shape.extend(dst_var.mesh_shape)
+          vp.layout.extend(dst_var.layout)
+          vp.item_size = dst_var.item_size
+          vp.layer_idx = dst_var.layer_idx
+          vp.sharding_spec.extend(dst_var.sharding_spec)
+          dst_metadata.append(meta)
+
+        sched = reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            src_units=src_units,
+            dst_units=dst_units,
+            dst_metadata=dst_metadata,
+            entities=entities,
+            registered_variables=registered_variables,
+            registered_global_shapes={},
+            registered_mesh_shapes=registered_mesh_shapes,
+            registered_mesh_axes=registered_mesh_axes,
+            registered_host_subgrids=registered_host_subgrids,
+            registered_layouts={},
+            registered_itemsizes={},
+            registered_shards=registered_shards,
+            computed_phys_meshes={},
+            worker_endpoints=worker_endpoints,
+            broadcast_host_ratio=1.0,
+            lock=threading.Lock(),
+        )
+        self.assertEqual(sched.n_seed, 4)
+        self.assertNotEmpty(sched.broadcast_groups)
+
+        rpc_client = RecordingWorkerRpcClient()
+        self.addCleanup(rpc_client.close)
+        engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+        final_plan = raiden_controller.TransferPlan(
+            src_units=src_units,
+            dst_units=dst_units,
+            plan=None,
+            worker_data_addresses=sched.data_addresses,
+            worker_rpc_addresses=sched.rpc_addresses,
+            is_weight_sync=True,
+        )
+
+        asyncio.run(
+            engine.execute_slice_broadcast_pipeline(
+                groups_list=list(sched.broadcast_groups.values()),
+                final_plan=final_plan,
+                n_seed=sched.n_seed,
+                req_id="req_stage_latin_square",
+                dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+                registered_shards=dict(sched.data_addresses),
+            )
+        )
+
+        # 1. Verify all 4 Round-0 seed samplers (sampler:0..3) receive
+        # receiver plans.
+        for seed_idx in range(4):
+          seed = dst_units[seed_idx]
+          recv_plans = [
+              plan
+              for target_id, plan in rpc_client.invocations
+              if target_id == seed and not plan.is_sender
+          ]
+          self.assertNotEmpty(
+              recv_plans,
+              f"Seed sampler {seed} must receive receiver plan",
+          )
+
+        # Verify all 4 Round-1 relay samplers (sampler:4..7) receive whole-block
+        # relay transfers from sampler:0..3.
+        for relay_idx in range(4, 8):
+          relay_dst = dst_units[relay_idx]
+          recv_plans = [
+              plan
+              for target_id, plan in rpc_client.invocations
+              if target_id == relay_dst
+              and plan.dst_units[0] == relay_dst
+              and plan.src_units[0] in dst_units[:4]
+          ]
+          self.assertNotEmpty(
+              recv_plans,
+              f"Relay sampler {relay_dst} must receive relay transfer from seed"
+              " samplers",
+          )
+
+        relay_sender_plans = [
+            plan
+            for target_id, plan in rpc_client.invocations
+            if target_id in dst_units[:4] and plan.is_sender
+        ]
+        self.assertNotEmpty(relay_sender_plans)
+        for r_plan in relay_sender_plans:
+          s_u = r_plan.src_units[0]
+          s_sched = r_plan.shard_push_schedules[s_u]
+          for entries in s_sched.values():
+            for entry in entries:
+              self.assertEqual(
+                  entry[9], 1, "Relay transfers must have count = 1"
+              )
+
+        # 2. In Round 0, for each of the 4 trainer hosts h in {0, 1, 2, 3},
+        # the trainer sender schedule pushes to all 4 Round-0 seed samplers
+        # in the circularly shifted Latin Square order
+        # [sampler:h, sampler:(h+1)%4, sampler:(h+2)%4, sampler:(h+3)%4].
+        first_seed_by_host = {}
+        for h in range(4):
+          expected_seeds = [dst_units[(h + i) % 4] for i in range(4)]
+          if mode == "multi_unit_trainer":
+            u = src_units[h]
+            u_sender_plans = [
+                plan
+                for target_id, plan in rpc_client.invocations
+                if target_id == u and plan.is_sender
+            ]
+            self.assertNotEmpty(u_sender_plans)
+            sender_plan = u_sender_plans[0]
+            self.assertNotEmpty(
+                sender_plan.broadcast_round_destinations,
+                f"Trainer unit {u} must have non-empty"
+                " broadcast_round_destinations",
+            )
+            sched_map = sender_plan.shard_push_schedules[u]
+            entries = sched_map[0]
+            dst_peers = [e[0] for e in entries]
+            dst_units_order = [sched.data_address_to_unit[p] for p in dst_peers]
+            self.assertEqual(
+                dst_units_order,
+                expected_seeds,
+                f"Trainer unit {u} (host {h}) must push seeds in Latin Square"
+                " order",
+            )
+            protos = entities[u].build_sender_push_schedule_protos(sched_map)
+            proto_dst_peers = list(protos[0].entries[0].dst_peers)
+            proto_dst_units = [
+                sched.data_address_to_unit[p] for p in proto_dst_peers
+            ]
+            self.assertEqual(proto_dst_units, expected_seeds)
+            first_seed_by_host[h] = proto_dst_units[0]
+          else:
+            u = src_units[0]
+            u_sender_plans = [
+                plan
+                for target_id, plan in rpc_client.invocations
+                if target_id == u and plan.is_sender
+            ]
+            self.assertNotEmpty(u_sender_plans)
+            sender_plan = u_sender_plans[0]
+            sched_map = sender_plan.shard_push_schedules[u]
+            entries = sched_map[h]
+            dst_peers = [e[0] for e in entries]
+            dst_units_order = [sched.data_address_to_unit[p] for p in dst_peers]
+            self.assertEqual(
+                dst_units_order,
+                expected_seeds,
+                f"Trainer shard {h} (host {h}) must push seeds in Latin Square"
+                " order",
+            )
+            protos = entities[u].build_sender_push_schedule_protos(sched_map)
+            proto_dst_peers = list(protos[h].entries[0].dst_peers)
+            proto_dst_units = [
+                sched.data_address_to_unit[p] for p in proto_dst_peers
+            ]
+            self.assertEqual(proto_dst_units, expected_seeds)
+            first_seed_by_host[h] = proto_dst_units[0]
+
+        self.assertLen(
+            set(first_seed_by_host.values()),
+            4,
+            "All 4 trainer hosts must start with distinct seed samplers",
+        )
+
   def test_stage_broadcast_group_multistage_cumulative_receiver_counts(
       self,
   ) -> None:
@@ -1633,7 +1890,7 @@ class BroadcastEngineTest(absltest.TestCase):
     trainer_seeded_by_round = {0: set(), 1: set()}
     for target_id, plan in rpc_client.invocations:
       if target_id == src_0 and plan.is_sender:
-        trainer_seeded_by_round[plan.broadcast_round].add(plan.dst_units[0])
+        trainer_seeded_by_round[plan.broadcast_round].update(plan.dst_units)
 
     self.assertLen(trainer_seeded_by_round[0], 4)
     self.assertLen(trainer_seeded_by_round[1], 4)

@@ -302,6 +302,8 @@ class _HopTask:
       dst_indices: list[int],
       round_idx: int = 0,
       child_order: int = 0,
+      receivers: Optional[list[RaidenId]] = None,
+      seed_hops: Optional[list["_HopTask"]] = None,
   ) -> None:
     self.group = group
     self.sender = sender
@@ -309,6 +311,12 @@ class _HopTask:
     self.dst_indices = dst_indices
     self.round_idx = round_idx
     self.child_order = child_order
+    self.receivers: list[RaidenId] = (
+        list(receivers) if receivers is not None else [receiver]
+    )
+    self.seed_hops: list[_HopTask] = (
+        list(seed_hops) if seed_hops is not None else []
+    )
     self.children: list[_HopTask] = []
 
 
@@ -629,31 +637,69 @@ class BroadcastEngine:
         # 2. Trainer sends to up to n_seed new samplers in this round.
         k_train = min(n_seed, n - next_idx)
         train_child_order = sender_child_count[g.primary_src_unit]
-        for _ in range(k_train):
-          d = dst_units[next_idx]
-          hop = _HopTask(
+        if g.stage_group is not None and k_train > 0:
+          round_train_dsts = [dst_units[next_idx + i] for i in range(k_train)]
+          seed_hops = []
+          for d in round_train_dsts:
+            s_hop = _HopTask(
+                group=g,
+                sender=g.primary_src_unit,
+                receiver=d,
+                dst_indices=g.dst_unit_to_indices[d],
+                round_idx=round_idx,
+                child_order=train_child_order,
+            )
+            seed_hops.append(s_hop)
+            new_round_hops.append(s_hop)
+            _record_hop_destinations(g.primary_src_unit, d, round_idx)
+          trainer_hop = _HopTask(
               group=g,
               sender=g.primary_src_unit,
-              receiver=d,
-              dst_indices=g.dst_unit_to_indices[d],
+              receiver=round_train_dsts[0],
+              dst_indices=g.dst_unit_to_indices[round_train_dsts[0]],
               round_idx=round_idx,
               child_order=train_child_order,
+              receivers=round_train_dsts,
+              seed_hops=seed_hops,
           )
           heapq.heappush(
               ready_queue[g.primary_src_unit],
               (
-                  hop.child_order,
+                  trainer_hop.child_order,
                   g.stage_idx,
                   g.group_idx,
                   next(hop_counter),
-                  hop,
+                  trainer_hop,
               ),
           )
-          new_round_hops.append(hop)
-          _record_hop_destinations(g.primary_src_unit, d, round_idx)
-          next_idx += 1
-        if k_train > 0:
+          next_idx += k_train
           sender_child_count[g.primary_src_unit] += 1
+        elif g.stage_group is None:
+          for _ in range(k_train):
+            d = dst_units[next_idx]
+            hop = _HopTask(
+                group=g,
+                sender=g.primary_src_unit,
+                receiver=d,
+                dst_indices=g.dst_unit_to_indices[d],
+                round_idx=round_idx,
+                child_order=train_child_order,
+            )
+            heapq.heappush(
+                ready_queue[g.primary_src_unit],
+                (
+                    hop.child_order,
+                    g.stage_idx,
+                    g.group_idx,
+                    next(hop_counter),
+                    hop,
+                ),
+            )
+            new_round_hops.append(hop)
+            _record_hop_destinations(g.primary_src_unit, d, round_idx)
+            next_idx += 1
+          if k_train > 0:
+            sender_child_count[g.primary_src_unit] += 1
 
         populated_hops.extend(new_round_hops)
         round_idx += 1
@@ -808,6 +854,8 @@ class BroadcastEngine:
         d_node: RaidenId,
         plan: Any,
         s_u_plans: Optional[dict[RaidenId, Any]] = None,
+        hop: Optional[_HopTask] = None,
+        receiver_plans: Optional[dict[RaidenId, Any]] = None,
     ) -> None:
       if dst_controller_address:
         if self._remote_client_factory is None:
@@ -822,37 +870,72 @@ class BroadcastEngine:
         loop = asyncio.get_running_loop()
         rpc_executor = getattr(self._worker_rpc_client, "executor", None)
         remote_is_sender = s_node not in registered_shards
-        if (
-            remote_is_sender
-            or self._worker_rpc_client.include_receiver_push_schedules(plan)
-        ):
-          remote_schedules = plan.shard_push_schedules
+        if receiver_plans and hop is not None:
+          for d_unit in hop.receivers:
+            r_plan = receiver_plans[d_unit]
+            if (
+                remote_is_sender
+                or self._worker_rpc_client.include_receiver_push_schedules(
+                    r_plan
+                )
+            ):
+              remote_schedules = r_plan.shard_push_schedules
+            else:
+              remote_schedules = None
+            success = await loop.run_in_executor(
+                rpc_executor,
+                functools.partial(
+                    dst_facade.register_transfer_schedule,
+                    r_plan.src_units,
+                    [d_unit],
+                    r_plan.req_id,
+                    True,
+                    remote_is_sender,
+                    r_plan.expected_block_count,
+                    r_plan.uuid,
+                    dst_controller_address,
+                    src_controller_address,
+                    remote_schedules,
+                    dst_mem_type,
+                    skip_d2h=r_plan.skip_d2h,
+                ),
+            )
+            if not success:
+              raise RuntimeError(
+                  "Failed remote prepare in slice tree broadcast"
+              )
         else:
-          remote_schedules = None
-        success = await loop.run_in_executor(
-            rpc_executor,
-            functools.partial(
-                dst_facade.register_transfer_schedule,
-                plan.src_units,
-                [d_node],
-                plan.req_id,
-                True,
-                remote_is_sender,
-                plan.expected_block_count,
-                plan.uuid,
-                dst_controller_address,
-                src_controller_address,
-                remote_schedules,
-                dst_mem_type,
-                skip_d2h=plan.skip_d2h,
-            ),
-        )
-        if not success:
-          raise RuntimeError("Failed remote prepare in slice tree broadcast")
+          if (
+              remote_is_sender
+              or self._worker_rpc_client.include_receiver_push_schedules(plan)
+          ):
+            remote_schedules = plan.shard_push_schedules
+          else:
+            remote_schedules = None
+          success = await loop.run_in_executor(
+              rpc_executor,
+              functools.partial(
+                  dst_facade.register_transfer_schedule,
+                  plan.src_units,
+                  [d_node],
+                  plan.req_id,
+                  True,
+                  remote_is_sender,
+                  plan.expected_block_count,
+                  plan.uuid,
+                  dst_controller_address,
+                  src_controller_address,
+                  remote_schedules,
+                  dst_mem_type,
+                  skip_d2h=plan.skip_d2h,
+              ),
+          )
+          if not success:
+            raise RuntimeError("Failed remote prepare in slice tree broadcast")
         if s_u_plans:
           await asyncio.gather(*[
               self._worker_rpc_client.start_transfer(s_u, s_u_plans[s_u])
-              for s_u in plan.src_units
+              for s_u in (s_u_plans.keys() if s_u_plans else plan.src_units)
               if s_u in registered_shards
           ])
         elif s_node in registered_shards:
@@ -860,10 +943,18 @@ class BroadcastEngine:
       else:
         if s_u_plans:
           # Arm destination receiver first, then concurrently dispatch all trainer sources
-          await self._worker_rpc_client.start_transfer(d_node, plan)
+          if receiver_plans and hop is not None:
+            await asyncio.gather(*[
+                self._worker_rpc_client.start_transfer(
+                    d_unit, receiver_plans[d_unit]
+                )
+                for d_unit in hop.receivers
+            ])
+          else:
+            await self._worker_rpc_client.start_transfer(d_node, plan)
           await asyncio.gather(*[
               self._worker_rpc_client.start_transfer(s_u, s_u_plans[s_u])
-              for s_u in plan.src_units
+              for s_u in s_u_plans
               if s_u in registered_shards
           ])
         else:
@@ -877,7 +968,7 @@ class BroadcastEngine:
       dst_unit = hop.receiver
       dst_indices = hop.dst_indices
 
-      active_pushes[s] += 1
+      active_pushes[s] += len(hop.receivers)
       hop_uuid = pipeline_uuid
       hop_req_id = f"{req_id}_{group.group_idx}_{dst_unit}_{hop_uuid}"
 
@@ -893,10 +984,19 @@ class BroadcastEngine:
         stage_group = group.stage_group
         dst_addrs = stage_group.data_addresses[dst_unit]
         if s == group.primary_src_unit:
-          # Trainer -> Seed Sampler: multi-source concurrent push
+          # Trainer -> Seed Samplers: multi-source concurrent push
+          hop_receivers = hop.receivers
           s_u_schedules: dict[RaidenId, dict[int, Any]] = {}
           s_u_expected_blocks: dict[RaidenId, int] = {}
-          for s_u in stage_group.src_units:
+          for s_u_idx, s_u in enumerate(stage_group.src_units):
+            s_u_shards = (
+                stage_group.data_addresses[s_u]
+                if s_u in stage_group.data_addresses
+                else registered_shards[s_u]
+            )
+            shard_host_ranks = controller_types.compute_shard_host_ranks(
+                s_u_shards, len(stage_group.src_units), s_u_idx
+            )
             var_list = stage_group.stage_ordered_vars_by_unit.get(s_u, [])
             var_plans = stage_group.canonical_variable_plans.get(s_u, {})
             stage_var_to_pid = dict(var_list)
@@ -906,8 +1006,15 @@ class BroadcastEngine:
               p_dict = var_plans.get(pid, {})
               for local_src_idx, tuples_9 in p_dict.items():
                 if tuples_9:
+                  src_host_rank = shard_host_ranks[local_src_idx]
+                  shift = src_host_rank % len(hop_receivers)
+                  shifted_receivers = (
+                      hop_receivers[shift:] + hop_receivers[:shift]
+                  )
                   shard_plans_by_id.setdefault(local_src_idx, {})[pid] = [
-                      (dst_addrs[t9[0]], *t9) for t9 in tuples_9
+                      (stage_group.data_addresses[d_unit][t9[0]], *t9)
+                      for t9 in tuples_9
+                      for d_unit in shifted_receivers
                   ]
             s_u_sched = {}
             s_u_cnt = 0
@@ -923,47 +1030,72 @@ class BroadcastEngine:
             s_u_schedules[s_u] = s_u_sched
             s_u_expected_blocks[s_u] = s_u_cnt
 
-          receiver_plan = type(final_plan)(
-              src_units=list(stage_group.src_units),
-              dst_units=[dst_unit],
-              plan=None,
-              shard_push_schedules={},
-              worker_rpc_addresses=(
-                  dict(final_plan.worker_rpc_addresses)
-                  if final_plan.worker_rpc_addresses is not None
-                  else {}
-              ),
-              worker_data_addresses=(
-                  dict(final_plan.worker_data_addresses)
-                  if final_plan.worker_data_addresses is not None
-                  else {}
-              ),
-              uuid=hop_uuid,
-              dst_mem_type=dst_mem_type,
-              use_block_chunks=True,
-              is_sender=False,
-              expected_block_count=dst_total_blocks,
-              dst_expected_block_counts={dst_unit: dst_total_blocks},
-              expected_layer_chunk_counts=dst_layer_counts,
-              dst_expected_layer_chunk_counts={dst_unit: dst_layer_counts},
-              dst_endpoint_counts=dst_ep_counts,
-              dst_endpoint_layer_counts=dst_ep_layer_counts,
-              req_id=hop_req_id,
-              skip_d2h=final_plan.skip_d2h,
-              skip_tiling=final_plan.skip_tiling,
-              parallelism=final_plan.parallelism,
-              is_weight_sync=final_plan.is_weight_sync,
-              broadcast_round=hop.round_idx,
-              broadcast_round_destinations=round_dests_by_sender.get(
-                  group.primary_src_unit, []
-              ),
-          )
+          receiver_plans = {}
+          for d_unit in hop_receivers:
+            d_total_blocks = receiver_block_counts[d_unit]
+            d_layer_counts = dict(receiver_layer_counts[d_unit])
+            d_ep_counts = dict(receiver_endpoint_counts[d_unit])
+            d_ep_layer_counts = {
+                h: dict(lc)
+                for h, lc in receiver_endpoint_layer_counts[d_unit].items()
+            }
+            receiver_plans[d_unit] = type(final_plan)(
+                src_units=list(stage_group.src_units),
+                dst_units=[d_unit],
+                plan=None,
+                shard_push_schedules={},
+                worker_rpc_addresses=(
+                    dict(final_plan.worker_rpc_addresses)
+                    if final_plan.worker_rpc_addresses is not None
+                    else {}
+                ),
+                worker_data_addresses=(
+                    dict(final_plan.worker_data_addresses)
+                    if final_plan.worker_data_addresses is not None
+                    else {}
+                ),
+                uuid=hop_uuid,
+                dst_mem_type=dst_mem_type,
+                use_block_chunks=True,
+                is_sender=False,
+                expected_block_count=d_total_blocks,
+                dst_expected_block_counts={d_unit: d_total_blocks},
+                expected_layer_chunk_counts=d_layer_counts,
+                dst_expected_layer_chunk_counts={d_unit: d_layer_counts},
+                dst_endpoint_counts=d_ep_counts,
+                dst_endpoint_layer_counts=d_ep_layer_counts,
+                req_id=f"{req_id}_{group.group_idx}_{d_unit}_{hop_uuid}",
+                skip_d2h=final_plan.skip_d2h,
+                skip_tiling=final_plan.skip_tiling,
+                parallelism=final_plan.parallelism,
+                is_weight_sync=final_plan.is_weight_sync,
+                broadcast_round=hop.round_idx,
+                broadcast_round_destinations=round_dests_by_sender.get(
+                    group.primary_src_unit, []
+                ),
+            )
 
           s_u_plans = {}
-          for s_u in stage_group.src_units:
+          for s_u_idx, s_u in enumerate(stage_group.src_units):
+            s_u_shards = (
+                stage_group.data_addresses[s_u]
+                if s_u in stage_group.data_addresses
+                else registered_shards[s_u]
+            )
+            shard_host_ranks = controller_types.compute_shard_host_ranks(
+                s_u_shards, len(stage_group.src_units), s_u_idx
+            )
+            if len(set(shard_host_ranks.values())) == 1:
+              s_u_dsts = (
+                  hop_receivers[(s_u_idx % len(hop_receivers)) :]
+                  + hop_receivers[: (s_u_idx % len(hop_receivers))]
+              )
+            else:
+              s_u_dsts = list(hop_receivers)
+
             s_u_plans[s_u] = type(final_plan)(
                 src_units=[s_u],
-                dst_units=[dst_unit],
+                dst_units=s_u_dsts,
                 plan=None,
                 shard_push_schedules={s_u: s_u_schedules[s_u]},
                 worker_rpc_addresses=(
@@ -987,7 +1119,9 @@ class BroadcastEngine:
                 parallelism=final_plan.parallelism,
                 is_weight_sync=final_plan.is_weight_sync,
                 broadcast_round=hop.round_idx,
-                broadcast_round_destinations=round_dests_by_sender.get(s_u, []),
+                broadcast_round_destinations=round_dests_by_sender.get(
+                    group.primary_src_unit, []
+                ),
                 cached_serialized_payloads=getattr(
                     final_plan, "cached_serialized_payloads", {}
                 ),
@@ -995,7 +1129,12 @@ class BroadcastEngine:
 
           task = asyncio.create_task(
               _run_single_transfer(
-                  group.primary_src_unit, dst_unit, receiver_plan, s_u_plans
+                  group.primary_src_unit,
+                  hop_receivers[0],
+                  receiver_plans[hop_receivers[0]],
+                  s_u_plans=s_u_plans,
+                  hop=hop,
+                  receiver_plans=receiver_plans,
               )
           )
           transfers_in_progress[task] = hop
@@ -1222,7 +1361,11 @@ class BroadcastEngine:
           scheduled_any = False
           for u in all_workers:
             max_active = n_seed * num_dst_eq_classes if u in src_units else 1
-            while active_pushes[u] < max_active and ready_queue[u]:
+            while (
+                ready_queue[u]
+                and active_pushes[u] + len(ready_queue[u][0][4].receivers)
+                <= max_active
+            ):
               _, _, _, _, hop = heapq.heappop(ready_queue[u])
               _dispatch_hop(hop)
               scheduled_any = True
@@ -1241,19 +1384,21 @@ class BroadcastEngine:
               logging.error("Slice transfer failed in broadcast tree: %s", exc)
               raise exc
             hop = transfers_in_progress.pop(fut)
-            active_pushes[hop.sender] -= 1
+            active_pushes[hop.sender] -= len(hop.receivers)
 
-            for child_hop in hop.children:
-              heapq.heappush(
-                  ready_queue[hop.receiver],
-                  (
-                      child_hop.child_order,
-                      child_hop.group.stage_idx,
-                      child_hop.group.group_idx,
-                      next(hop_counter),
-                      child_hop,
-                  ),
-              )
+            hops_to_propagate = hop.seed_hops if hop.seed_hops else [hop]
+            for completed_hop in hops_to_propagate:
+              for child_hop in completed_hop.children:
+                heapq.heappush(
+                    ready_queue[completed_hop.receiver],
+                    (
+                        child_hop.child_order,
+                        child_hop.group.stage_idx,
+                        child_hop.group.group_idx,
+                        next(hop_counter),
+                        child_hop,
+                    ),
+                )
     finally:
       pending = [f for f in transfers_in_progress.keys() if not f.done()]
       for f in pending:
