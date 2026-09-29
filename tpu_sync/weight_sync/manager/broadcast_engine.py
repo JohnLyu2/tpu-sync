@@ -159,9 +159,6 @@ def _coalesce_pipeline_groups(
     return []
 
   if isinstance(groups_list[0], controller_types.StageBroadcastGroup):
-    if len(groups_list) <= target_stages:
-      return groups_list
-
     def _stage_routing_key(
         g: controller_types.StageBroadcastGroup,
     ) -> tuple[Any, ...]:
@@ -189,7 +186,22 @@ def _coalesce_pipeline_groups(
 
       run_len = len(run)
       if run_len <= target_stages:
-        coalesced_stage_groups.extend(run)
+        if run_len == 1:
+          coalesced_stage_groups.extend(run)
+        else:
+          for stage_slot, g in enumerate(run):
+            coalesced_stage_groups.append(
+                controller_types.StageBroadcastGroup(
+                    pool_group=g.pool_group * target_stages + stage_slot,
+                    layer_group_idx=stage_slot,
+                    src_units=list(g.src_units),
+                    dst_units=list(g.dst_units),
+                    stage_ordered_vars_by_unit=g.stage_ordered_vars_by_unit,
+                    canonical_variable_plans=g.canonical_variable_plans,
+                    canonical_relay_plans=g.canonical_relay_plans,
+                    data_addresses=dict(g.data_addresses),
+                )
+            )
       else:
         max_per_stage = (run_len + target_stages - 1) // target_stages
         for k in range(0, run_len, max_per_stage):
@@ -215,10 +227,11 @@ def _coalesce_pipeline_groups(
               )
             merged_canonical_relays.update(g.canonical_relay_plans)
 
+          stage_slot = k // max_per_stage
           coalesced_stage_groups.append(
               controller_types.StageBroadcastGroup(
-                  pool_group=first.pool_group,
-                  layer_group_idx=len(coalesced_stage_groups),
+                  pool_group=first.pool_group * target_stages + stage_slot,
+                  layer_group_idx=stage_slot,
                   src_units=list(first.src_units),
                   dst_units=list(first.dst_units),
                   stage_ordered_vars_by_unit=merged_stage_ordered_vars,
@@ -314,6 +327,9 @@ class _GroupBroadcastState:
   ) -> None:
     self.group_idx = group_idx
     self.stage_group = stage_group
+    self.stage_idx = (
+        stage_group.layer_group_idx if stage_group is not None else group_idx
+    )
     self.keys_and_sorted_targets = keys_and_sorted_targets or []
 
     if stage_group is not None:
@@ -520,7 +536,7 @@ class BroadcastEngine:
       return
 
     active_pushes: dict[RaidenId, int] = {u: 0 for u in all_workers}
-    ready_queue: dict[RaidenId, list[tuple[int, int, int, _HopTask]]] = {
+    ready_queue: dict[RaidenId, list[tuple[int, int, int, int, _HopTask]]] = {
         u: [] for u in all_workers
     }
     hop_counter = itertools.count()
@@ -625,7 +641,13 @@ class BroadcastEngine:
           )
           heapq.heappush(
               ready_queue[g.primary_src_unit],
-              (hop.child_order, g.group_idx, next(hop_counter), hop),
+              (
+                  hop.child_order,
+                  g.stage_idx,
+                  g.group_idx,
+                  next(hop_counter),
+                  hop,
+              ),
           )
           new_round_hops.append(hop)
           _record_hop_destinations(g.primary_src_unit, d, round_idx)
@@ -894,6 +916,7 @@ class BroadcastEngine:
                   shard_plans_by_id[local_src_idx],
                   stage_var_to_pid,
                   var_list,
+                  pool_group=stage_group.pool_group,
               )
               s_u_sched[local_src_idx] = ref_sched
               s_u_cnt += len(ref_sched)
@@ -1017,6 +1040,7 @@ class BroadcastEngine:
                       relay_shard_plans_by_id[local_dst_idx],
                       relay_var_to_pid,
                       ordered_relay_vars,
+                      pool_group=stage_group.pool_group,
                   )
                   for local_dst_idx in sorted(relay_shard_plans_by_id.keys())
               }
@@ -1199,7 +1223,7 @@ class BroadcastEngine:
           for u in all_workers:
             max_active = n_seed * num_dst_eq_classes if u in src_units else 1
             while active_pushes[u] < max_active and ready_queue[u]:
-              _, _, _, hop = heapq.heappop(ready_queue[u])
+              _, _, _, _, hop = heapq.heappop(ready_queue[u])
               _dispatch_hop(hop)
               scheduled_any = True
           if not scheduled_any:
@@ -1224,6 +1248,7 @@ class BroadcastEngine:
                   ready_queue[hop.receiver],
                   (
                       child_hop.child_order,
+                      child_hop.group.stage_idx,
                       child_hop.group.group_idx,
                       next(hop_counter),
                       child_hop,

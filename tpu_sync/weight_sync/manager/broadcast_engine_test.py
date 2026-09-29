@@ -1638,6 +1638,95 @@ class BroadcastEngineTest(absltest.TestCase):
     self.assertLen(trainer_seeded_by_round[0], 4)
     self.assertLen(trainer_seeded_by_round[1], 4)
 
+  def test_coalesced_stage_pool_group_isolation_and_stage_ordering(
+      self,
+  ) -> None:
+    """Verifies coalesced stages get distinct pool_group values and interleave by stage_idx across eq classes."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src_0 = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    eq0_units = [
+        RaidenId(job_name="sampler", job_replica_id=f"0_{i}", data_name="w")
+        for i in range(2)
+    ]
+    eq1_units = [
+        RaidenId(job_name="sampler", job_replica_id=f"1_{i}", data_name="w")
+        for i in range(2)
+    ]
+    all_dst_units = eq0_units + eq1_units
+
+    data_addresses = {src_0: ["10.0.0.1:8000"]}
+    for i, u in enumerate(eq0_units):
+      data_addresses[u] = [f"10.0.1.{i}:8000"]
+    for i, u in enumerate(eq1_units):
+      data_addresses[u] = [f"10.0.2.{i}:8000"]
+
+    canonical_vars = {
+        src_0: {1: {0: [(0, 0, 0, 1024, 0, 0, 1024, 1024, 1)]}},
+    }
+    canonical_relays = {1: {0: [(0, 1024, 0)]}}
+
+    # 4 layer groups per eq class, coalesced into target_stages=2 stages.
+    groups_list = []
+    for eq_idx, dsts in [(0, eq0_units), (1, eq1_units)]:
+      for lg_idx in range(4):
+        groups_list.append(
+            controller_types.StageBroadcastGroup(
+                pool_group=eq_idx,
+                layer_group_idx=lg_idx,
+                src_units=[src_0],
+                dst_units=dsts,
+                stage_ordered_vars_by_unit={src_0: [(lg_idx, 1)]},
+                canonical_variable_plans=canonical_vars,
+                canonical_relay_plans=canonical_relays,
+                data_addresses=data_addresses,
+            )
+        )
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src_0],
+        dst_units=all_dst_units,
+        plan=None,
+        worker_data_addresses=data_addresses,
+        uuid=1001,
+        is_weight_sync=True,
+    )
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            n_seed=1,
+            req_id="req_stage_pg",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards={u: ["s0"] for u in [src_0] + all_dst_units},
+            pipeline_target_stages=2,
+        )
+    )
+
+    sender_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == src_0 and plan.is_sender and plan.broadcast_round == 0
+    ]
+    self.assertLen(sender_plans, 4)
+
+    # Extract (pool_group, first_layer_idx) in dispatch order for Round 0:
+    # Stage 0 of eq0 (pg=0, layer=0) and Stage 0 of eq1 (pg=2, layer=0) must
+    # dispatch before Stage 1 of eq0 (pg=1, l=2) and Stage 1 of eq1 (pg=3, l=2).
+    dispatched_pg_and_layer = []
+    for plan in sender_plans:
+      sched = plan.shard_push_schedules[src_0][0]
+      first_entry = sched[0]
+      dispatched_pg_and_layer.append((first_entry[11], first_entry[10]))
+
+    self.assertEqual(
+        dispatched_pg_and_layer,
+        [(0, 0), (2, 0), (1, 2), (3, 2)],
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

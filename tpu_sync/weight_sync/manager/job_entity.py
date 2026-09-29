@@ -928,6 +928,7 @@ class JobEntity:
               plan_proto = self._proto_module.ShardPushScheduleProto()
               self._populate_schedule_proto_entries(plan_proto, plan_entries)
               folded_plans_by_id[plan_id] = plan_proto.entries
+          entry_pool_group = getattr(entries, "pool_group", 0)
           for layer_idx, plan_id in ordered_vars:
             tmpl_entries = folded_plans_by_id.get(plan_id)
             if tmpl_entries:
@@ -935,6 +936,7 @@ class JobEntity:
                 entry_copy = schedule_proto.entries.add()
                 entry_copy.CopyFrom(tmpl_entry)
                 entry_copy.layer_idx = layer_idx
+                entry_copy.pool_group = entry_pool_group
         else:
           self._populate_schedule_proto_entries(schedule_proto, entries)
       else:

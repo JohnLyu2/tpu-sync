@@ -107,6 +107,7 @@ class _PlanReferencedShardSchedule(abc.Sequence):
       plans_by_id: dict[int, list[tuple[Any, ...]]],
       variable_to_plan_id: dict[int, int],
       ordered_vars_and_plans: Optional[list[tuple[int, int]]] = None,
+      pool_group: int = 0,
   ) -> None:
     self.plans_by_id = plans_by_id
     self.variable_to_plan_id = variable_to_plan_id
@@ -115,6 +116,7 @@ class _PlanReferencedShardSchedule(abc.Sequence):
         if ordered_vars_and_plans is not None
         else list(variable_to_plan_id.items())
     )
+    self.pool_group = pool_group
     self._total_len: Optional[int] = None
     self._materialized: Optional[list[tuple[Any, ...]]] = None
 
@@ -147,11 +149,12 @@ class _PlanReferencedShardSchedule(abc.Sequence):
 
   def __iter__(self):
     plans = self.plans_by_id
+    pg = self.pool_group
     for layer_idx, pid in self._ordered_vars:
       entries = plans.get(pid)
       if entries:
         for p0, p1, p2, p3, p4, p5, p6, p7, p8, p9 in entries:
-          yield (p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, layer_idx, 0)
+          yield (p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, layer_idx, pg)
 
   def _ensure_materialized(self) -> list[tuple[Any, ...]]:
     if self._materialized is None:
@@ -175,7 +178,20 @@ class _PlanReferencedShardSchedule(abc.Sequence):
       elen = len(entries)
       if index < offset + elen:
         p0, p1, p2, p3, p4, p5, p6, p7, p8, p9 = entries[index - offset]
-        return (p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, layer_idx, 0)
+        return (
+            p0,
+            p1,
+            p2,
+            p3,
+            p4,
+            p5,
+            p6,
+            p7,
+            p8,
+            p9,
+            layer_idx,
+            self.pool_group,
+        )
       offset += elen
     raise IndexError("schedule index out of range")
 
@@ -184,6 +200,7 @@ class _PlanReferencedShardSchedule(abc.Sequence):
       if (
           self.plans_by_id == other.plans_by_id
           and self._ordered_vars == other._ordered_vars
+          and self.pool_group == other.pool_group
       ):
         return True
     if isinstance(other, abc.Sequence):
