@@ -14,24 +14,21 @@
 
 #include "tpu_sync/kv_cache/kv_cache_listener.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-#include <atomic>
-#include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
-#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "tpu_sync/common/control_pipe/control_dispatcher.h"
+#include "tpu_sync/common/control_pipe/control_pipe_server.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -54,137 +51,65 @@ bool HasPoolReshardFields(const tpu_sync::rpc::StartTransferRequest& request) {
 
 }  // namespace
 
-KVCacheListener::KVCacheListener(EngineCallbacks callbacks, int listener_port)
-    : callbacks_(std::move(callbacks)), listener_port_(listener_port) {
-  server_fd_ = socket(AF_INET6, SOCK_STREAM, 0);
-  if (server_fd_ < 0) {
-    LOG(FATAL) << "Failed to create C++ KVCacheListener socket: "
-               << std::strerror(errno);
-  }
+KVCacheListener::KVCacheListener(
+    EngineCallbacks callbacks, int listener_port,
+    std::optional<ControlPipeBackendType> backend_type)
+    : callbacks_(std::move(callbacks)),
+      backend_type_(ResolveControlPipeBackendType(backend_type)) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = backend_type_;
+  cfg.requested_port = listener_port;
+  cfg.allow_legacy_framing = true;
 
-  int opt = 1;
-  if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-    LOG(WARNING) << "setsockopt SO_REUSEADDR failed";
-  }
+  pipe_server_ = CreateControlPipeServer(cfg);
+  pipe_server_->dispatcher()
+      .RegisterHandler<ControlRequest, ControlResponse>(
+          [this](const ControlContext& /*ctx*/, const ControlRequest& req)
+              -> absl::StatusOr<ControlResponse> {
+            ControlResponse resp;
+            HandleControlRequest(req, &resp);
+            return resp;
+          },
+          HandlerOptions<ControlRequest>().WithMaxPayloadBytes(
+              cfg.max_frame_bytes));
 
-  sockaddr_in6 address{
-      .sin6_family = AF_INET6,
-      .sin6_port = htons(listener_port_),
-      .sin6_addr = in6addr_any,
-  };
-
-  if (bind(server_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) <
-      0) {
-    LOG(FATAL) << "C++ KVCacheListener bind failed on port "
-               << listener_port_ << ": " << std::strerror(errno);
-  }
-
-  if (listen(server_fd_, 128) < 0) {
-    LOG(FATAL) << "C++ KVCacheListener listen failed: "
-               << std::strerror(errno);
-  }
-
-  socklen_t addr_len = sizeof(address);
-  if (getsockname(server_fd_, reinterpret_cast<sockaddr*>(&address),
-                  &addr_len) == 0) {
-    listener_port_ = ntohs(address.sin6_port);
-  }
+  absl::StatusOr<int> bound_port = pipe_server_->Start(listener_port);
+  CHECK_OK(bound_port.status())
+      << "Failed to start KVCacheListener ControlPipeServer on port "
+      << listener_port;
+  listener_port_ = *bound_port;
 
   LOG(INFO) << "Native C++ KVCacheListener actively listening on port: "
-            << listener_port_;
-
-  listener_thread_ = std::thread(&KVCacheListener::ListenerLoop, this);
+            << listener_port_ << " (backend="
+            << ControlPipeBackendTypeName(pipe_server_->backend_type()) << ")";
 }
 
-KVCacheListener::~KVCacheListener() {
-  stopping_ = true;
-  if (server_fd_ >= 0) {
-    int sock = socket(AF_INET6, SOCK_STREAM, 0);
-    if (sock >= 0) {
-      sockaddr_in6 serv_addr{};
-      serv_addr.sin6_family = AF_INET6;
-      serv_addr.sin6_port = htons(listener_port_);
-      inet_pton(AF_INET6, "::1", &serv_addr.sin6_addr);
-      if (connect(sock, reinterpret_cast<sockaddr*>(&serv_addr),
-                  sizeof(serv_addr)) == 0) {
-        ControlRequest req;
-        req.set_command(ControlRequest::COMMAND_SHUTDOWN);
-        std::string payload;
-        if (req.SerializeToString(&payload)) {
-          uint32_t net_len = htonl(payload.size());
-          send(sock, &net_len, sizeof(net_len), MSG_NOSIGNAL);
-          send(sock, payload.data(), payload.size(), MSG_NOSIGNAL);
-        }
-      }
-      close(sock);
+KVCacheListener::~KVCacheListener() { Shutdown(); }
+
+void KVCacheListener::Shutdown() {
+  stopping_.store(true);
+  if (pipe_server_ != nullptr) {
+    pipe_server_->Stop();
+  }
+  if (!work_drained_.exchange(true)) {
+    absl::Status status = callbacks_.wait_for_pending_work();
+    if (!status.ok()) {
+      LOG(ERROR) << "WaitForPendingWork failed during shutdown: " << status;
     }
-    // shutdown() is what breaks the blocking accept(); the descriptor must
-    // stay valid until the listener thread is joined, or accept() could be
-    // handed a recycled descriptor. It is issued after the loopback SHUTDOWN
-    // request above so that request can still be delivered.
-    shutdown(server_fd_, SHUT_RDWR);
-  }
-
-  if (listener_thread_.joinable()) {
-    listener_thread_.join();
-  }
-
-  if (server_fd_ >= 0) {
-    close(server_fd_);
-    server_fd_ = -1;
-  }
-
-  connection_threads_.AwaitAllDone();
-}
-
-void KVCacheListener::ListenerLoop() {
-  while (!stopping_) {
-    sockaddr_in6 client_addr{};
-    socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(
-        server_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
-    if (client_fd < 0) {
-      if (stopping_) break;
-      continue;
-    }
-
-    connection_threads_.Spawn(
-        [this, client_fd] { ConnectionWorker(client_fd); });
   }
 }
 
-void KVCacheListener::ConnectionWorker(int client_fd) {
-  uint32_t net_len = 0;
-  if (read(client_fd, &net_len, sizeof(net_len)) != sizeof(net_len)) {
-    close(client_fd);
-    return;
-  }
-  uint32_t payload_len = ntohl(net_len);
-
-  std::vector<char> buffer(payload_len);
-  size_t total_read = 0;
-  while (total_read < payload_len) {
-    ssize_t n =
-        read(client_fd, buffer.data() + total_read, payload_len - total_read);
-    if (n <= 0) {
-      close(client_fd);
-      return;
-    }
-    total_read += n;
-  }
-
-  ControlRequest req;
-  if (!req.ParseFromString(absl::string_view(buffer.data(), buffer.size()))) {
-    LOG(ERROR) << "Failed to parse ControlRequest Protobuf";
-    close(client_fd);
-    return;
-  }
-
-  ControlResponse resp;
-  resp.set_success(true);
-  resp.set_message("SUCCESS");
+void KVCacheListener::HandleControlRequest(const ControlRequest& req,
+                                           ControlResponse* resp) {
+  resp->set_success(true);
+  resp->set_message("SUCCESS");
 
   if (req.command() == ControlRequest::COMMAND_START_TRANSFER) {
+    if (stopping_.load()) {
+      resp->set_success(false);
+      resp->set_message("KVCacheListener is stopping");
+      return;
+    }
     if (req.has_start_transfer_request()) {
       const auto& start_req = req.start_transfer_request();
       const bool is_pool_reshard = HasPoolReshardFields(start_req);
@@ -205,8 +130,8 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
         absl::Status status = callbacks_.pool_reshard_push(
             start_req, src_block_ids, start_req.parallelism());
         if (!status.ok()) {
-          resp.set_success(false);
-          resp.set_message(std::string(status.message()));
+          resp->set_success(false);
+          resp->set_message(std::string(status.message()));
           LOG(ERROR) << "PoolReshardPush native execution failed: " << status;
         }
       } else if (is_pool_reshard) {
@@ -223,8 +148,8 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
         absl::Status status =
             callbacks_.pool_reshard_register_recv(start_req, chip_block_ids);
         if (!status.ok()) {
-          resp.set_success(false);
-          resp.set_message(std::string(status.message()));
+          resp->set_success(false);
+          resp->set_message(std::string(status.message()));
           LOG(ERROR) << "PoolReshardRegisterRecv native execution failed: "
                      << status;
         } else {
@@ -239,7 +164,8 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
               continue;
             }
             if (addrs->host_base_addrs().empty()) continue;
-            (*resp.mutable_receiver_pool_addrs())[pool_idx] = *std::move(addrs);
+            (*resp->mutable_receiver_pool_addrs())[pool_idx] =
+                *std::move(addrs);
           }
         }
       } else if (start_req.is_sender()) {
@@ -248,8 +174,8 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
                      "(Sender)";
         absl::Status status = callbacks_.push_kv_cache_resharded(start_req);
         if (!status.ok()) {
-          resp.set_success(false);
-          resp.set_message(std::string(status.message()));
+          resp->set_success(false);
+          resp->set_message(std::string(status.message()));
           LOG(ERROR) << "PushKVCacheResharded native execution failed: "
                      << status;
         }
@@ -261,40 +187,34 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
         absl::Status status = callbacks_.register_active_plan(
             start_req.uuid(), start_req, /*is_sender=*/false);
         if (!status.ok()) {
-          resp.set_success(false);
-          resp.set_message(std::string(status.message()));
+          resp->set_success(false);
+          resp->set_message(std::string(status.message()));
           LOG(ERROR) << "RegisterActivePlan native execution failed: "
                      << status;
         }
       }
     } else {
-      resp.set_success(false);
-      resp.set_message("Missing start_transfer_request");
+      resp->set_success(false);
+      resp->set_message("Missing start_transfer_request");
       LOG(ERROR) << "Missing start_transfer_request in START_TRANSFER command";
     }
   } else if (req.command() == ControlRequest::COMMAND_SHUTDOWN) {
-    LOG(INFO) << "C++ KVCacheListener received SHUTDOWN command. Initiating clean exit.";
-    absl::Status status = callbacks_.wait_for_pending_work();
-    if (!status.ok()) {
-      LOG(ERROR) << "WaitForPendingWork failed during shutdown: " << status;
+    LOG(INFO) << "C++ KVCacheListener received SHUTDOWN command. Initiating "
+                 "clean exit.";
+    stopping_.store(true);
+    if (!work_drained_.exchange(true)) {
+      absl::Status status = callbacks_.wait_for_pending_work();
+      if (!status.ok()) {
+        LOG(ERROR) << "WaitForPendingWork failed during shutdown: " << status;
+      }
     }
-    stopping_ = true;
   } else {
-    resp.set_success(false);
-    resp.set_message("COMMAND_UNSPECIFIED");
-    LOG(WARNING) << "C++ KVCacheListener received unknown or unspecified Protobuf command";
+    resp->set_success(false);
+    resp->set_message("COMMAND_UNSPECIFIED");
+    LOG(WARNING)
+        << "C++ KVCacheListener received unknown or unspecified Protobuf "
+           "command";
   }
-
-  std::string resp_str;
-  if (resp.SerializeToString(&resp_str)) {
-    uint32_t resp_net_len = htonl(resp_str.size());
-    // The peer may intentionally close after sending a one-way shutdown
-    // request. Suppress SIGPIPE so listener teardown cannot terminate the
-    // hosting process while this worker races to send its acknowledgement.
-    send(client_fd, &resp_net_len, sizeof(resp_net_len), MSG_NOSIGNAL);
-    send(client_fd, resp_str.data(), resp_str.size(), MSG_NOSIGNAL);
-  }
-  close(client_fd);
 }
 
 }  // namespace kv_cache

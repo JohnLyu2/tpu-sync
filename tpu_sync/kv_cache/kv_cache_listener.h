@@ -19,14 +19,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
-#include <thread>  // NOLINT
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "tpu_sync/common/detached_thread_group.h"
+#include "tpu_sync/common/control_pipe/control_pipe_server.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_sync {
@@ -38,12 +40,15 @@ class StartTransferRequest;
 namespace tpu_raiden {
 namespace kv_cache {
 
-// Connection threads are detached; the destructor blocks until every in-flight
-// connection has returned instead of joining retained thread objects.
+// Control-plane server daemon for KV cache transfers backed by
+// ControlPipeServer (supporting TCP, gRPC, and ZMQ via
+// `TPU_RAIDEN_CONTROL_PLANE_BACKEND`).
 class KVCacheListener final {
  public:
   template <typename Engine>
-  KVCacheListener(Engine* engine, int listener_port)
+  KVCacheListener(
+      Engine* engine, int listener_port,
+      std::optional<ControlPipeBackendType> backend_type = std::nullopt)
       : KVCacheListener(
             EngineCallbacks{
                 .pool_reshard_push =
@@ -103,14 +108,15 @@ class KVCacheListener final {
                   }
                 },
             },
-            listener_port) {}
+            listener_port, backend_type) {}
   ~KVCacheListener();
 
   KVCacheListener(const KVCacheListener&) = delete;
   KVCacheListener& operator=(const KVCacheListener&) = delete;
 
   int listener_port() const { return listener_port_; }
-  bool is_active() const { return !stopping_; }
+  bool is_active() const { return !stopping_.load(); }
+  ControlPipeBackendType backend_type() const { return backend_type_; }
 
  private:
   struct EngineCallbacks {
@@ -133,20 +139,23 @@ class KVCacheListener final {
         pool_host_addrs;
   };
 
-  KVCacheListener(EngineCallbacks callbacks, int listener_port);
-  void ListenerLoop();
-  void ConnectionWorker(int client_fd);
+  KVCacheListener(EngineCallbacks callbacks, int listener_port,
+                  std::optional<ControlPipeBackendType> backend_type);
+  // Stops the server (waiting for in-flight handlers to return), then drains
+  // pending engine work unless a COMMAND_SHUTDOWN already did.
+  void Shutdown();
+  void HandleControlRequest(const tpu_sync::rpc::ControlRequest& req,
+                            tpu_sync::rpc::ControlResponse* resp);
 
   EngineCallbacks callbacks_;
-  int listener_port_;
-  int server_fd_ = -1;
+  // Port actually bound by |pipe_server_| (0 until Start() returns), which
+  // differs from the requested port when the caller asks for port 0.
+  int listener_port_ = 0;
+  ControlPipeBackendType backend_type_;
   std::atomic<bool> stopping_{false};
+  std::atomic<bool> work_drained_{false};
 
-  std::thread listener_thread_;
-
-  // The destructor drains this so |callbacks_| and `this` outlive every
-  // in-flight connection.
-  DetachedThreadGroup connection_threads_{"KVCacheListener connection"};
+  std::unique_ptr<ControlPipeServer> pipe_server_;
 };
 
 }  // namespace kv_cache

@@ -21,15 +21,22 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -280,6 +287,105 @@ TEST(KVCacheListenerTest, PoollessReceiverPreservesRegisterActivePlan) {
   EXPECT_EQ(manager.route(), Route::kRegisterActivePlan);
   EXPECT_EQ(manager.registered_uuid(), 5678);
   EXPECT_FALSE(manager.registered_is_sender());
+}
+
+TEST(KVCacheListenerTest, GrpcBackendRoutesPoolSenderAndShutdown) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto env_cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND"); });
+  RoutingKVCacheManager manager;
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+  EXPECT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
+
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  std::unique_ptr<ControlPipeClient> client = CreateControlPipeClient(cfg);
+  const std::string endpoint =
+      absl::StrCat("127.0.0.1:", listener.listener_port());
+
+  ControlRequest request;
+  StartTransferRequest* plan = AddPoolPlan(&request, /*is_sender=*/true);
+  plan->set_parallelism(2);
+  auto* schedule = &(*plan->mutable_shard_push_schedules())[0];
+  schedule->add_entries()->set_src_block_id(11);
+  schedule->add_entries()->set_src_block_id(4);
+
+  absl::StatusOr<ControlResponse> response =
+      client->Call<ControlRequest, ControlResponse>(endpoint, request,
+                                                    absl::Seconds(10));
+  ASSERT_TRUE(response.ok()) << response.status();
+  EXPECT_TRUE(response->success()) << response->message();
+  EXPECT_EQ(manager.route(), Route::kPoolReshardPush);
+  EXPECT_EQ(manager.local_block_ids(), (std::vector<int64_t>{4, 11}));
+  EXPECT_EQ(manager.parallelism(), 2);
+
+  ControlRequest shutdown_req;
+  shutdown_req.set_command(ControlRequest::COMMAND_SHUTDOWN);
+  absl::StatusOr<ControlResponse> shutdown_resp =
+      client->Call<ControlRequest, ControlResponse>(endpoint, shutdown_req,
+                                                    absl::Seconds(10));
+  ASSERT_TRUE(shutdown_resp.ok()) << shutdown_resp.status();
+  EXPECT_TRUE(shutdown_resp->success());
+  EXPECT_FALSE(listener.is_active());
+}
+
+TEST(KVCacheListenerTest, StartTransferRejectedAfterShutdown) {
+  RoutingKVCacheManager manager;
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+
+  ControlRequest shutdown_req;
+  shutdown_req.set_command(ControlRequest::COMMAND_SHUTDOWN);
+  ControlResponse shutdown_resp =
+      SendRequest(listener.listener_port(), shutdown_req);
+  EXPECT_TRUE(shutdown_resp.success()) << shutdown_resp.message();
+  EXPECT_FALSE(listener.is_active());
+
+  // The server keeps accepting until destruction, but no new engine work may
+  // start once shutdown has begun draining.
+  ControlRequest request;
+  StartTransferRequest* plan = AddPoolPlan(&request, /*is_sender=*/true);
+  (*plan->mutable_shard_push_schedules())[0].add_entries()->set_src_block_id(1);
+  ControlResponse response = SendRequest(listener.listener_port(), request);
+
+  EXPECT_FALSE(response.success());
+  EXPECT_EQ(response.message(), "KVCacheListener is stopping");
+  EXPECT_EQ(manager.route(), Route::kNone);
+}
+
+TEST(KVCacheListenerTest, GrpcBackendReceiverArmReplyCarriesHostBaseAddrs) {
+  RoutingKVCacheManager manager(/*host_blocks_to_allocate=*/1);
+  KVCacheListener listener(&manager, /*listener_port=*/0,
+                           ControlPipeBackendType::kGrpc);
+  ASSERT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
+  absl::StatusOr<std::vector<uint64_t>> expected = manager.PoolHostBaseAddrs(0);
+  ASSERT_TRUE(expected.ok()) << expected.status();
+  ASSERT_EQ(expected->size(), 1u);
+
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  std::unique_ptr<ControlPipeClient> client = CreateControlPipeClient(cfg);
+  const std::string endpoint =
+      absl::StrCat("127.0.0.1:", listener.listener_port());
+
+  ControlRequest request;
+  StartTransferRequest* plan = AddPoolPlan(&request, /*is_sender=*/false);
+  plan->mutable_pool_groups(0)->add_dst_device_block_ids(5);
+
+  absl::StatusOr<ControlResponse> response =
+      client->Call<ControlRequest, ControlResponse>(endpoint, request,
+                                                    absl::Seconds(10));
+  ASSERT_TRUE(response.ok()) << response.status();
+  EXPECT_TRUE(response->success()) << response->message();
+  EXPECT_EQ(manager.route(), Route::kPoolReshardRegisterRecv);
+  ASSERT_TRUE(response->receiver_pool_addrs().contains(0));
+  const auto& addrs = response->receiver_pool_addrs().at(0).host_base_addrs();
+  EXPECT_EQ(std::vector<uint64_t>(addrs.begin(), addrs.end()), *expected);
+  const PoolSpec* pool = manager.pool(0);
+  ASSERT_NE(pool, nullptr);
+  EXPECT_EQ(response->receiver_pool_addrs().at(0).block_stride_bytes(),
+            pool->block_stride_bytes);
+  EXPECT_EQ(response->receiver_pool_addrs().at(0).num_blocks(),
+            pool->num_blocks);
 }
 
 }  // namespace
