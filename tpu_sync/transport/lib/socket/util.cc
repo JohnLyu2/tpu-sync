@@ -27,8 +27,10 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -52,6 +54,42 @@ constexpr absl::Duration kConnectTimeout = absl::Seconds(3);
 void SetSendTimeout(int fd, absl::Duration timeout) {
   const timeval tv = absl::ToTimeval(timeout);
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+// Returns the socket's SO_SNDTIMEO (zero if unset or unreadable).
+absl::Duration GetSendTimeout(int fd) {
+  timeval tv = {};
+  socklen_t len = sizeof(tv);
+  getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, &len);
+  return absl::DurationFromTimeval(tv);
+}
+
+// Connects the blocking socket `fd` to `addr`, giving up after `timeout`. A
+// short timeout keeps a dead peer from hogging the calling thread, which could
+// starve the shared socket worker pool. Transfers on the connected socket keep
+// blocking I/O.
+absl::Status ConnectWithTimeout(int fd, const addrinfo& addr,
+                                absl::Duration timeout, bool require_psp,
+                                std::shared_ptr<grpc::Channel> channel) {
+  const absl::Duration saved_timeout = GetSendTimeout(fd);
+  SetSendTimeout(fd, timeout);
+  // Restore on every return so the timeout never leaks into transfers.
+  absl::Cleanup restore_timeout = [fd, saved_timeout] {
+    SetSendTimeout(fd, saved_timeout);
+  };
+  if (require_psp) {
+    return TcpPspConnect(fd, addr.ai_addr, addr.ai_addrlen, std::move(channel));
+  }
+  if (connect(fd, addr.ai_addr, addr.ai_addrlen) == 0) {
+    return absl::OkStatus();
+  }
+  // On a blocking socket, connect() fails with EINPROGRESS when SO_SNDTIMEO
+  // expires (see socket(7)).
+  if (errno == EINPROGRESS) {
+    return absl::DeadlineExceededError(absl::StrCat(
+        "connect timed out after ", absl::FormatDuration(timeout)));
+  }
+  return absl::ErrnoToStatus(errno, "connect failed");
 }
 
 }  // namespace
@@ -150,32 +188,8 @@ absl::StatusOr<int> ConnectToPeer(
       }
     }
 
-    // A short timeout keeps a dead peer from hogging the calling thread, which
-    // could starve the shared socket worker pool.
-    SetSendTimeout(sock_fd, kConnectTimeout);
-    absl::Status connect_status;
-    if (require_psp) {
-      connect_status =
-          TcpPspConnect(sock_fd, rp->ai_addr, rp->ai_addrlen, channel);
-    } else {
-      if (connect(sock_fd, rp->ai_addr, rp->ai_addrlen) >= 0) {
-        connect_status = absl::OkStatus();
-      } else {
-        last_errno = errno;
-        // On a blocking socket, connect() fails with EINPROGRESS when
-        // SO_SNDTIMEO expires (see socket(7)).
-        connect_status =
-            last_errno == EINPROGRESS
-                ? absl::DeadlineExceededError(
-                      absl::StrCat("connect timed out after ",
-                                   absl::FormatDuration(kConnectTimeout)))
-                : absl::ErrnoToStatus(last_errno, "connect failed");
-      }
-    }
-    // Only connect() is bounded; transfers keep blocking I/O. Reset right
-    // after connect, unconditionally, so no path leaks the timeout.
-    SetSendTimeout(sock_fd, absl::ZeroDuration());
-
+    const absl::Status connect_status = ConnectWithTimeout(
+        sock_fd, *rp, kConnectTimeout, require_psp, channel);
     if (connect_status.ok()) {
       break; /* Success */
     }
