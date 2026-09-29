@@ -291,6 +291,9 @@ struct RaidenBufferHandle {
 
 using BufferHoldAndAlias = RaidenBufferHandle;
 
+std::vector<int> DetectNumaNodes(
+    const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers);
+
 struct BufferHolder {
   std::shared_ptr<RawBufferHolder> c_api_hold;
   ScopedHold hold;

@@ -50,52 +50,32 @@ xla::Future<> ReturnFuture(const absl::Status& status) {
   return xla::Future<>(status);
 }
 
-void RaidenManagerBase::DetectAndAssignNumaNode(
-    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers) {
-  std::vector<int> unique_numa_nodes;
-  for (const auto& layer : layer_buffers) {
-    for (const auto& buf : layer) {
-      if (buf.device) {
-        int node = GetPjRtDeviceNumaNode(buf.device);
-        if (node >= 0) {
-          bool found = false;
-          for (int n : unique_numa_nodes) {
-            if (n == node) {
-              found = true;
-              break;
-            }
-          }
-          if (!found) unique_numa_nodes.push_back(node);
-        }
-      }
-    }
-  }
-  if (!unique_numa_nodes.empty()) {
-    assigned_numa_node_ = unique_numa_nodes[0];
-    if (unique_numa_nodes.size() > 1) {
-      LOG(WARNING) << "Incoming PJRT buffers are associated with more than one "
-                      "NUMA node ("
-                   << unique_numa_nodes[0] << " vs " << unique_numa_nodes[1]
-                   << "). Picking the first detected NUMA node: "
-                   << unique_numa_nodes[0];
-    }
-  }
-  InitTransportServer();
-}
-
 RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
                                      size_t slice_byte_size,
                                      std::optional<int> local_port,
                                      int parallelism,
-                                     std::optional<std::string> bind_ip)
+                                     std::optional<std::string> bind_ip,
+                                     std::vector<int> numa_nodes,
+                                     std::vector<HostNicAddress> host_nics)
     : num_layers_(num_layers),
       num_shards_(num_shards),
       slice_byte_size_(slice_byte_size),
       parallelism_(parallelism),
       local_port_cfg_(local_port.value_or(0)),
-      bind_ip_cfg_(bind_ip) {
+      bind_ip_cfg_(std::move(bind_ip)) {
   shard_factor_ = 1;
   (void)telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!numa_nodes.empty()) {
+    assigned_numa_node_ = numa_nodes[0];
+    if (numa_nodes.size() > 1) {
+      LOG(WARNING) << "Incoming PJRT buffers are associated with more than one "
+                      "NUMA node ("
+                   << numa_nodes[0] << " vs " << numa_nodes[1]
+                   << "). Picking the first detected NUMA node: "
+                   << numa_nodes[0];
+    }
+  }
+  InitTransportServer(std::move(host_nics));
 }
 
 RaidenManagerBase::~RaidenManagerBase() {
@@ -112,21 +92,11 @@ void RaidenManagerBase::StopTransportServer() {
 void RaidenManagerBase::SetTestOnlyRateLimiters(
     std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
     std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress) {
-  absl::MutexLock lock(server_init_mu_);
-  test_only_egress_rate_limiter_ = std::move(egress);
-  test_only_ingress_rate_limiter_ = std::move(ingress);
-  if (server_ != nullptr) {
-    server_->SetTestOnlyRateLimiters(test_only_egress_rate_limiter_,
-                                     test_only_ingress_rate_limiter_);
-  }
+  server_->SetTestOnlyRateLimiters(std::move(egress), std::move(ingress));
 }
 
-std::vector<HostNicAddress> RaidenManagerBase::GetHostNics() const {
-  return GetLocalHostNicAddresses();
-}
-
-tpu_raiden::transport::BlockTransport*
-RaidenManagerBase::InitTransportServer() {
+tpu_raiden::transport::BlockTransport* RaidenManagerBase::InitTransportServer(
+    std::vector<HostNicAddress> host_nics) {
   absl::MutexLock lock(server_init_mu_);
   if (server_) return server_.get();
 
@@ -134,7 +104,6 @@ RaidenManagerBase::InitTransportServer() {
   if (bind_ip_cfg_.has_value() && !bind_ip_cfg_->empty()) {
     collected_ips = {*bind_ip_cfg_};
   } else {
-    std::vector<HostNicAddress> host_nics = GetHostNics();
     std::vector<HostNicAddress> data_nics;
     std::vector<HostNicAddress> ctrl_nics;
     for (const auto& nic : host_nics) {
@@ -193,30 +162,18 @@ RaidenManagerBase::InitTransportServer() {
 
   server_ = std::make_unique<tpu_raiden::transport::BlockTransport>(
       this, local_port_cfg_, local_ips_, parallelism_);
-  if (test_only_egress_rate_limiter_ != nullptr ||
-      test_only_ingress_rate_limiter_ != nullptr) {
-    server_->SetTestOnlyRateLimiters(test_only_egress_rate_limiter_,
-                                     test_only_ingress_rate_limiter_);
-  }
   return server_.get();
 }
 
 std::optional<int> RaidenManagerBase::local_port() const {
-  auto* transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
-  if (transport) return transport->local_port();
-  return std::nullopt;
+  return server_->local_port();
 }
 
-std::string RaidenManagerBase::local_ip() const {
-  auto* transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
-  if (transport) return transport->bound_ip();
-  return "127.0.0.1";
-}
+std::string RaidenManagerBase::local_ip() const { return server_->bound_ip(); }
 
 std::vector<std::string> RaidenManagerBase::local_ips() const {
-  auto* transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
   if (local_ips_.empty()) {
-    return {transport ? transport->bound_ip() : "127.0.0.1"};
+    return {server_->bound_ip()};
   }
   return local_ips_;
 }
@@ -289,13 +246,9 @@ absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hWriteDirect(
     return absl::StrCat("blocks=", src_block_ids.size(),
                         " peers=", peers.size(), " uuid=", uuid);
   });
-  auto* transport = InitTransportServer();
-  if (!transport) {
-    return absl::FailedPreconditionError("Transport server is not running");
-  }
-  return transport->SyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
-                             tpu_raiden::transport::MajorOrder::kLayerMajor,
-                             uuid, layer_idx);
+  return server_->SyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
+                           tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
+                           layer_idx);
 }
 
 void RaidenManagerBase::H2hWriteDirectAsync(
@@ -307,20 +260,14 @@ void RaidenManagerBase::H2hWriteDirectAsync(
     return absl::StrCat("blocks=", src_block_ids.size(),
                         " peers=", peers.size(), " uuid=", uuid);
   });
-  auto* transport = InitTransportServer();
-  if (!transport) {
-    on_complete(
-        absl::FailedPreconditionError("Transport server is not running"));
-    return;
-  }
   absl::Status status = FaultInjectStatus(hooks::kRaidenManagerBaseH2hWrite);
   if (!status.ok()) {
     on_complete(status);
     return;
   }
-  transport->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
-                       tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
-                       layer_idx, std::move(on_complete));
+  server_->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
+                     tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
+                     layer_idx, std::move(on_complete));
 }
 
 absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hReadDirect(
@@ -330,11 +277,7 @@ absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hReadDirect(
     return absl::StrCat("blocks=", src_block_ids.size(),
                         " peers=", peers.size());
   });
-  auto* transport = InitTransportServer();
-  if (!transport) {
-    return absl::FailedPreconditionError("Transport server is not running");
-  }
-  return transport->SyncPull(peers, src_block_ids, {}, {}, parallelism_);
+  return server_->SyncPull(peers, src_block_ids, {}, {}, parallelism_);
 }
 
 absl::Status RaidenManagerBase::PushWeightsChunk(
@@ -345,12 +288,8 @@ absl::Status RaidenManagerBase::PushWeightsChunk(
     return absl::StrCat("peer=", peer, " layer=", layer_idx,
                         " shard=", dst_shard_idx, " bytes=", size_bytes);
   });
-  auto* transport = InitTransportServer();
-  if (!transport) {
-    return absl::FailedPreconditionError("Transport server is not running");
-  }
-  return transport->PushBuffer(peer, /*buffer_id=*/layer_idx, dst_shard_idx,
-                               dst_offset_bytes, data_ptr, size_bytes, uuid);
+  return server_->PushBuffer(peer, /*buffer_id=*/layer_idx, dst_shard_idx,
+                             dst_offset_bytes, data_ptr, size_bytes, uuid);
 }
 
 absl::Status RaidenManagerBase::PushWeightsChunks(
@@ -359,37 +298,22 @@ absl::Status RaidenManagerBase::PushWeightsChunks(
   RAIDEN_TRACE_FN("RaidenBase::PushWeightsChunks", [&]() {
     return absl::StrCat("tasks=", tasks.size(), " uuid=", uuid);
   });
-  auto* transport = InitTransportServer();
-  if (!transport) {
-    return absl::FailedPreconditionError("Transport server is not running");
-  }
-  return transport->PushBuffers(tasks, parallelism, uuid);
+  return server_->PushBuffers(tasks, parallelism, uuid);
 }
 
 absl::Status RaidenManagerBase::RegisterExpectedChunks(
     uint64_t uuid, uint32_t expected_chunks) {
-  auto* transport = InitTransportServer();
-  if (!transport) {
-    return absl::FailedPreconditionError("Transport server is not running");
-  }
-  return transport->RegisterExpectedChunks(uuid, expected_chunks);
+  return server_->RegisterExpectedChunks(uuid, expected_chunks);
 }
 
 absl::Status RaidenManagerBase::RegisterExpectedLayerChunks(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
-  auto* transport = InitTransportServer();
-  if (!transport) {
-    return absl::FailedPreconditionError("Transport server is not running");
-  }
-  return transport->RegisterExpectedLayerChunks(uuid, expected_layer_chunks);
+  return server_->RegisterExpectedLayerChunks(uuid, expected_layer_chunks);
 }
 
 void RaidenManagerBase::ForgetPushProgress(uint64_t uuid) {
-  auto* transport = InitTransportServer();
-  if (transport) {
-    transport->ForgetPushProgress(uuid);
-  }
+  server_->ForgetPushProgress(uuid);
 }
 
 size_t RaidenManagerBase::block_bytes(size_t layer_idx) const {

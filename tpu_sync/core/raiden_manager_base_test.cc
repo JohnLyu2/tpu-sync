@@ -44,12 +44,14 @@ namespace {
 // Test subclass to populate protected layers_ and implement AllocateBlocks
 class TestRaidenManager : public RaidenManagerBase {
  public:
-  TestRaidenManager(size_t num_layers, size_t num_shards,
-                    size_t slice_byte_size,
-                    std::optional<int> local_port = std::nullopt,
-                    int parallelism = 1)
-      : RaidenManagerBase(num_layers, num_shards, slice_byte_size,
-                          local_port, parallelism) {
+  TestRaidenManager(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::vector<int> numa_nodes = {},
+      std::vector<HostNicAddress> mock_nics = GetLocalHostNicAddresses())
+      : RaidenManagerBase(num_layers, num_shards, slice_byte_size, local_port,
+                          parallelism, /*bind_ip=*/std::nullopt,
+                          std::move(numa_nodes), std::move(mock_nics)) {
     layers_.resize(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       layers_[l].shards.resize(num_shards);
@@ -64,22 +66,6 @@ class TestRaidenManager : public RaidenManagerBase {
     }
     return ids;
   }
-
-  void SetMockNics(const std::vector<HostNicAddress>& nics) {
-    mock_nics_ = nics;
-  }
-
-  std::vector<HostNicAddress> GetHostNics() const override {
-    if (mock_nics_.has_value()) {
-      return *mock_nics_;
-    }
-    return RaidenManagerBase::GetHostNics();
-  }
-
-  void SetAssignedNumaNode(int node) { assigned_numa_node_ = node; }
-
- private:
-  std::optional<std::vector<HostNicAddress>> mock_nics_;
 };
 
 TEST(RaidenManagerBaseTest, LifecycleAndConfig) {
@@ -211,10 +197,6 @@ TEST(RaidenManagerBaseTest, E2eLoopbackTransferH2h) {
 }
 
 TEST(RaidenManagerBaseTest, IpCollectionNumaLocalData) {
-  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/1024);
-  manager.SetAssignedNumaNode(1);
-
   std::vector<HostNicAddress> mock_nics = {
       {"eth0", "10.0.0.1", 0, NicClassification::kControlPlane},
       {"eth1", "10.0.0.2", 0, NicClassification::kDataPlane},
@@ -222,7 +204,10 @@ TEST(RaidenManagerBaseTest, IpCollectionNumaLocalData) {
       {"eth3", "10.0.0.4", 1, NicClassification::kDataPlane},
       {"eth4", "10.0.0.5", 1, NicClassification::kDataPlane},
   };
-  manager.SetMockNics(mock_nics);
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{1}, mock_nics);
 
   auto ips = manager.local_ips();
 
@@ -232,15 +217,14 @@ TEST(RaidenManagerBaseTest, IpCollectionNumaLocalData) {
 }
 
 TEST(RaidenManagerBaseTest, IpCollectionFallbackToNumaLocalAny) {
-  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/1024);
-  manager.SetAssignedNumaNode(1);
-
   std::vector<HostNicAddress> mock_nics = {
       {"eth0", "10.0.0.1", 0, NicClassification::kControlPlane},
       {"eth2", "10.0.0.3", 1, NicClassification::kControlPlane},
   };
-  manager.SetMockNics(mock_nics);
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{1}, mock_nics);
 
   auto ips = manager.local_ips();
 
@@ -249,15 +233,14 @@ TEST(RaidenManagerBaseTest, IpCollectionFallbackToNumaLocalAny) {
 }
 
 TEST(RaidenManagerBaseTest, IpCollectionFallbackToFirstNic) {
-  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/1024);
-  manager.SetAssignedNumaNode(1);
-
   std::vector<HostNicAddress> mock_nics = {
       {"eth0", "10.0.0.1", 0, NicClassification::kControlPlane},
       {"eth1", "10.0.0.2", 0, NicClassification::kControlPlane},
   };
-  manager.SetMockNics(mock_nics);
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{1}, mock_nics);
 
   auto ips = manager.local_ips();
 
@@ -267,8 +250,9 @@ TEST(RaidenManagerBaseTest, IpCollectionFallbackToFirstNic) {
 
 TEST(RaidenManagerBaseTest, IpCollectionFallbackToLoopback) {
   TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/1024);
-  manager.SetMockNics({});
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{}, /*mock_nics=*/{});
 
   auto ips = manager.local_ips();
 
@@ -277,15 +261,14 @@ TEST(RaidenManagerBaseTest, IpCollectionFallbackToLoopback) {
 }
 
 TEST(RaidenManagerBaseTest, IpCollectionPrioritizeControlOverLoopback) {
-  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/1024);
-  manager.SetAssignedNumaNode(1);
-
   std::vector<HostNicAddress> mock_nics = {
       {"lo", "127.0.0.1", -1, NicClassification::kUnknown},
       {"eth0", "10.0.0.1", 0, NicClassification::kControlPlane},
   };
-  manager.SetMockNics(mock_nics);
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{1}, mock_nics);
 
   auto ips = manager.local_ips();
 

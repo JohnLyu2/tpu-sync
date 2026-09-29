@@ -39,11 +39,12 @@ namespace tpu_raiden {
 
 class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
  public:
-  RaidenManagerBase(size_t num_layers, size_t num_shards,
-                    size_t slice_byte_size,
-                    std::optional<int> local_port = std::nullopt,
-                    int parallelism = 1,
-                    std::optional<std::string> bind_ip = std::nullopt);
+  RaidenManagerBase(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::optional<std::string> bind_ip = std::nullopt,
+      std::vector<int> numa_nodes = {},
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses());
 
   ~RaidenManagerBase() override;
 
@@ -158,20 +159,11 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   std::optional<std::string> bind_ip_cfg_ = std::nullopt;
   std::vector<std::string> local_ips_;
 
-  tpu_raiden::transport::BlockTransport* InitTransportServer();
-  virtual std::vector<HostNicAddress> GetHostNics() const;
-
-  void DetectAndAssignNumaNode(
-      const std::vector<std::vector<raiden::RaidenBufferHandle>>&
-          layer_buffers);
+  tpu_raiden::transport::BlockTransport* InitTransportServer(
+      std::vector<HostNicAddress> host_nics = {});
 
   mutable absl::Mutex server_init_mu_;
-  std::unique_ptr<tpu_raiden::transport::BlockTransport> server_
-      ABSL_GUARDED_BY(server_init_mu_);
-  std::shared_ptr<transport::lib::TestOnlyRateLimiter>
-      test_only_egress_rate_limiter_ ABSL_GUARDED_BY(server_init_mu_);
-  std::shared_ptr<transport::lib::TestOnlyRateLimiter>
-      test_only_ingress_rate_limiter_ ABSL_GUARDED_BY(server_init_mu_);
+  std::unique_ptr<tpu_raiden::transport::BlockTransport> server_;
 
   std::vector<LayerInfoBase> layers_;
 

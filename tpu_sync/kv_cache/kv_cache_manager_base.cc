@@ -321,16 +321,13 @@ KVCacheManagerBase::KVCacheManagerBase(
               : (layer_buffers.empty() ? 0
                                        : raiden::GetMajorSliceByteSize(
                                              layer_buffers[0][0].shape)),
-          local_port, parallelism, bind_ip),
+          local_port, parallelism, bind_ip,
+          assigned_numa_node_override.has_value()
+              ? std::vector<int>{*assigned_numa_node_override}
+              : raiden::DetectNumaNodes(layer_buffers)),
       host_allocator_(host_allocator) {
   if (num_layers_ == 0 || num_shards_ == 0) {
     return;
-  }
-
-  if (assigned_numa_node_override.has_value()) {
-    assigned_numa_node_ = *assigned_numa_node_override;
-  } else {
-    DetectAndAssignNumaNode(layer_buffers);
   }
 
   const auto& first_handle = layer_buffers[0][0];
@@ -575,7 +572,6 @@ KVCacheManagerBase::KVCacheManagerBase(
   dma_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
   push_pool_ = std::make_shared<NumaThreadPool>(kPoolSize);
   pull_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
-  InitTransportServer();
   InitShardLocalRanks();
   InitBackgroundWorker();
   UpdateAllocatedOccupancyMetric();

@@ -88,7 +88,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           layer_buffers.empty() ? 0 : layer_buffers[0].size(),
           layer_buffers.empty() ? 0
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
-          local_port, parallelism, bind_ip),
+          local_port, parallelism, bind_ip,
+          raiden::DetectNumaNodes(layer_buffers)),
       auto_h2d_(auto_h2d) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
@@ -98,7 +99,6 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   } else {
     layer_names_ = std::move(layer_names);
   }
-  DetectAndAssignNumaNode(layer_buffers);
 
   if (num_layers_ == 0 || num_shards_ == 0) {
     return;
