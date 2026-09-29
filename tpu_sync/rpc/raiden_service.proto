@@ -217,6 +217,11 @@ message StartTransferRequest {
   map<int32, int64> expected_layer_chunk_counts = 21;
   optional int32 broadcast_round = 22;
   repeated BroadcastRoundDestinationsProto broadcast_round_destinations = 23;
+  // A sender addresses its pools by local index; this maps each local index
+  // to the destination index that names the pool on the wire. The coordinator
+  // fills it for every sender from the plan's pool pairing, identity entries
+  // included; a pool absent from the map is named by its local index.
+  map<int32, int32> wire_pool_indices = 24;
 }
 
 // Round-grouped destination targets for tree-based broadcast logging and audit.
