@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -35,10 +36,25 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "grpcpp/channel.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 
 namespace tpu_raiden::transport::lib {
+
+namespace {
+
+// Without a bound, connect() to a dead peer blocks for the kernel's SYN
+// retries (~127 s by default).
+constexpr absl::Duration kConnectTimeout = absl::Seconds(3);
+
+// Sets SO_SNDTIMEO, which on Linux also bounds connect(). Zero means none.
+void SetSendTimeout(int fd, absl::Duration timeout) {
+  const timeval tv = absl::ToTimeval(timeout);
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+}  // namespace
 
 absl::StatusOr<int> ConnectToPeer(
     absl::string_view peer, absl::string_view local_ip, bool require_psp,
@@ -134,6 +150,9 @@ absl::StatusOr<int> ConnectToPeer(
       }
     }
 
+    // A short timeout keeps a dead peer from hogging the calling thread, which
+    // could starve the shared socket worker pool.
+    SetSendTimeout(sock_fd, kConnectTimeout);
     absl::Status connect_status;
     if (require_psp) {
       connect_status =
@@ -143,9 +162,19 @@ absl::StatusOr<int> ConnectToPeer(
         connect_status = absl::OkStatus();
       } else {
         last_errno = errno;
-        connect_status = absl::ErrnoToStatus(errno, "connect failed");
+        // On a blocking socket, connect() fails with EINPROGRESS when
+        // SO_SNDTIMEO expires (see socket(7)).
+        connect_status =
+            last_errno == EINPROGRESS
+                ? absl::DeadlineExceededError(
+                      absl::StrCat("connect timed out after ",
+                                   absl::FormatDuration(kConnectTimeout)))
+                : absl::ErrnoToStatus(last_errno, "connect failed");
       }
     }
+    // Only connect() is bounded; transfers keep blocking I/O. Reset right
+    // after connect, unconditionally, so no path leaks the timeout.
+    SetSendTimeout(sock_fd, absl::ZeroDuration());
 
     if (connect_status.ok()) {
       break; /* Success */

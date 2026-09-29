@@ -25,7 +25,8 @@
 namespace tpu_raiden::transport::lib {
 
 // Connects to remote TCP peer with optional local IP binding and optional
-// gRPC channel for TCP-over-PSP out-of-band key exchange.
+// gRPC channel for TCP-over-PSP out-of-band key exchange. The connect times
+// out after a fixed bound.
 absl::StatusOr<int> ConnectToPeer(
     absl::string_view peer, absl::string_view local_ip = "",
     bool require_psp = false,
