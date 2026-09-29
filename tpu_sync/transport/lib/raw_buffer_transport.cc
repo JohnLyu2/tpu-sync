@@ -63,6 +63,7 @@
 #define IOV_MAX 1024
 #endif
 #include "absl/status/status_macros.h"
+#include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -74,7 +75,6 @@
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
-#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden::transport::lib {
 

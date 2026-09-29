@@ -63,7 +63,6 @@ cc_library(
         "//tpu_sync/transport/lib:socket_transport_adapter",
         "//tpu_sync/transport/lib:transport_adapter",
         "//tpu_sync/transport/lib/socket:util",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -75,6 +74,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -124,12 +124,12 @@ cc_binary(
     deps = [
         "//tpu_sync/transport/lib:chunk",
         "//tpu_sync/transport/lib:chunk_serializer",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )

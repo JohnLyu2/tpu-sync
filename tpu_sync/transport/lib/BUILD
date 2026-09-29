@@ -54,11 +54,11 @@ cc_library(
     name = "transport_adapter",
     hdrs = ["transport_adapter.h"],
     deps = [
-        "//tpu_sync/transport/peregrine/src/api:transport_metrics",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:transport_metrics",
     ],
 )
 
@@ -80,7 +80,6 @@ cc_library(
         "//tpu_sync/telemetry:label_util",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -93,6 +92,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -112,7 +112,6 @@ cc_test(
         ":transport_adapter",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/status",
@@ -123,6 +122,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -239,7 +239,6 @@ cc_library(
         "//tpu_sync/transport/lib/conn:pool",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
         "//tpu_sync/transport/lib/socket:util",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -257,6 +256,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -283,7 +283,6 @@ cc_test(
         "//tpu_sync/transport/lib/socket:psp_syscall_mock",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
         "//tpu_sync/transport/lib/socket:util",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -297,6 +296,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 

@@ -46,6 +46,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -60,7 +61,6 @@
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
-#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
