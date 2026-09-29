@@ -115,9 +115,9 @@ class ReshardCoordinator {
   QueryRemoteMetadata(const std::string& address);
 
   // Sends one worker RPC via client_ and applies
-  // WorkerRpcClient._verify_response.
-  absl::Status SendWorkerRpc(const std::string& address,
-                             const tpu_sync::rpc::ControlRequest& request);
+  // WorkerRpcClient._verify_response. Returns the reply on success.
+  absl::StatusOr<tpu_sync::rpc::ControlResponse> SendWorkerRpc(
+      const std::string& address, const tpu_sync::rpc::ControlRequest& request);
 
   WorkUnitDirectory* directory_;
   RequestBlockRegistry* registry_;

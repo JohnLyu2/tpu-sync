@@ -222,6 +222,10 @@ message StartTransferRequest {
   // fills it for every sender from the plan's pool pairing, identity entries
   // included; a pool absent from the map is named by its local index.
   map<int32, int32> wire_pool_indices = 24;
+  // Sender-only: each receiver's pool addresses, keyed by the receiver's data
+  // endpoint (ControlRequest.peers), used by the sender to compute
+  // remote addresses (raddr).
+  map<string, ReceiverAddrsProto> receiver_addrs = 25;
 }
 
 // Round-grouped destination targets for tree-based broadcast logging and audit.
@@ -274,6 +278,12 @@ message ControlRequest {
 // Pool base address per local shard of the receiving worker.
 message PoolHostAddrsProto {
   repeated uint64 host_base_addrs = 1;
+  int64 block_stride_bytes = 2;
+  int64 num_blocks = 3;
+}
+
+message ReceiverAddrsProto {
+  map<int32, PoolHostAddrsProto> pools = 1;
 }
 
 message ControlResponse {

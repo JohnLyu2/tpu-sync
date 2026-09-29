@@ -27,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "tpu_sync/common/detached_thread_group.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -76,14 +77,29 @@ class KVCacheListener final {
                     },
                 .wait_for_pending_work =
                     [engine]() { return engine->WaitForPendingWork(); },
-                .pool_host_base_addrs = [engine](size_t pool_idx)
-                    -> absl::StatusOr<std::vector<uint64_t>> {
+                .pool_host_addrs = [engine](size_t pool_idx)
+                    -> absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> {
+                  auto build = [pool_idx](const auto* manager)
+                      -> absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> {
+                    absl::StatusOr<std::vector<uint64_t>> addrs =
+                        manager->PoolHostBaseAddrs(pool_idx);
+                    if (!addrs.ok()) return addrs.status();
+                    tpu_sync::rpc::PoolHostAddrsProto proto;
+                    proto.mutable_host_base_addrs()->Add(addrs->begin(),
+                                                         addrs->end());
+                    if (const auto* pool = manager->pool(pool_idx);
+                        pool != nullptr) {
+                      proto.set_block_stride_bytes(pool->block_stride_bytes);
+                      proto.set_num_blocks(pool->num_blocks);
+                    }
+                    return proto;
+                  };
                   if constexpr (requires {
                                   engine->PoolHostBaseAddrs(pool_idx);
                                 }) {
-                    return engine->PoolHostBaseAddrs(pool_idx);
+                    return build(engine);
                   } else {
-                    return engine->base()->PoolHostBaseAddrs(pool_idx);
+                    return build(engine->base());
                   }
                 },
             },
@@ -111,9 +127,10 @@ class KVCacheListener final {
         register_active_plan;
     std::function<absl::Status()> wait_for_pending_work;
     // Pool base address per local shard (KVCacheManagerBase::
-    // PoolHostBaseAddrs), reported in the pool-reshard receiver arm reply.
-    std::function<absl::StatusOr<std::vector<uint64_t>>(size_t)>
-        pool_host_base_addrs;
+    // PoolHostBaseAddrs) and the pool layout, reported in the pool-reshard
+    // receiver arm reply.
+    std::function<absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto>(size_t)>
+        pool_host_addrs;
   };
 
   KVCacheListener(EngineCallbacks callbacks, int listener_port);

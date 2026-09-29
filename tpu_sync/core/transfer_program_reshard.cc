@@ -171,6 +171,7 @@ absl::StatusOr<::tpu_sync::proto::TransferProgramRequest> CompileStartTransfer(
   for (const auto& [local, wire] : request.wire_pool_indices()) {
     (*binding->mutable_wire_pool_indices())[local] = wire;
   }
+  *binding->mutable_receiver_addrs() = request.receiver_addrs();
 
   ::tpu_sync::proto::FanIn* fan_in =
       program->mutable_completion()->mutable_fan_in();
@@ -247,6 +248,7 @@ absl::StatusOr<::tpu_sync::rpc::StartTransferRequest> LowerToStartTransfer(
   for (const auto& [local, wire] : binding.wire_pool_indices()) {
     (*out.mutable_wire_pool_indices())[local] = wire;
   }
+  *out.mutable_receiver_addrs() = binding.receiver_addrs();
 
   const ::tpu_sync::proto::ExecutionPolicy& policy = program.policy();
   out.set_parallelism(policy.parallelism());

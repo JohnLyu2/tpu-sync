@@ -46,6 +46,7 @@ cc_test(
     deps = [
         ":kv_cache_listener",
         ":kv_cache_manager_base",
+        ":pool_layout",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

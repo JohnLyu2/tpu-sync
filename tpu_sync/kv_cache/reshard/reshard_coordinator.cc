@@ -237,6 +237,11 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
       (*start_req.mutable_shard_push_schedules())[0] = schedule_proto;
     }
   }
+  if (is_sender) {
+    for (const auto& [unit, addrs] : plan.receiver_addrs) {
+      (*start_req.mutable_receiver_addrs())[plan.dst_peers.at(unit)] = addrs;
+    }
+  }
 
   return start_req;
 }
@@ -281,7 +286,8 @@ ReshardCoordinator::QueryRemoteMetadata(const std::string& address) {
   return metadata;
 }
 
-absl::Status ReshardCoordinator::SendWorkerRpc(
+absl::StatusOr<tpu_sync::rpc::ControlResponse>
+ReshardCoordinator::SendWorkerRpc(
     const std::string& address, const tpu_sync::rpc::ControlRequest& request) {
   auto resp = CallReshardControlPipe<tpu_sync::rpc::ControlRequest,
                                      tpu_sync::rpc::ControlResponse>(
@@ -291,7 +297,7 @@ absl::Status ReshardCoordinator::SendWorkerRpc(
     return absl::InternalError(absl::StrCat(
         "Raiden remote native execution failed: ", resp->message()));
   }
-  return absl::OkStatus();
+  return resp;
 }
 
 absl::Status ReshardCoordinator::StartPoolReshard(const PoolReshardArgs& args) {
@@ -411,19 +417,26 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   const int64_t receiver_arm_start_ns = MonotonicNs();
   {
     std::vector<absl::Status> arm_status(plan.dst_units.size());
+    std::vector<tpu_sync::rpc::ControlResponse> arm_replies(
+        plan.dst_units.size());
     std::vector<std::thread> armers;
     armers.reserve(plan.dst_units.size());
     for (size_t i = 0; i < plan.dst_units.size(); ++i) {
       const RaidenId& unit = plan.dst_units[i];
-      armers.emplace_back([this, &plan, &arm_status, i, unit]() {
+      armers.emplace_back([this, &plan, &arm_status, &arm_replies, i, unit]() {
         auto addr_it = plan.worker_rpc_addresses.find(unit);
         if (addr_it == plan.worker_rpc_addresses.end()) {
           arm_status[i] = absl::InternalError(absl::StrCat(
               "No control endpoint recorded for ", PythonRepr(unit)));
           return;
         }
-        arm_status[i] = SendWorkerRpc(
+        absl::StatusOr<tpu_sync::rpc::ControlResponse> reply = SendWorkerRpc(
             addr_it->second, BuildStartTransferControlRequest(plan, unit));
+        if (!reply.ok()) {
+          arm_status[i] = reply.status();
+          return;
+        }
+        arm_replies[i] = *std::move(reply);
       });
     }
     for (std::thread& t : armers) t.join();
@@ -432,6 +445,13 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
         registry_->AbandonClaim(args.req_id, uuid, claim_owner);
         return status;
       }
+    }
+    // Each receiver reports its pool addresses in its arm reply; senders
+    // look them up by the receiver's data endpoint.
+    for (size_t i = 0; i < plan.dst_units.size(); ++i) {
+      if (arm_replies[i].receiver_pool_addrs().empty()) continue;
+      *plan.receiver_addrs[plan.dst_units[i]].mutable_pools() =
+          arm_replies[i].receiver_pool_addrs();
     }
   }
   const int64_t receiver_arm_ack_ns = MonotonicNs();
@@ -491,8 +511,10 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
               "No control endpoint recorded for ", PythonRepr(unit)));
           return;
         }
-        sender_status[i] = SendWorkerRpc(
-            addr_it->second, BuildStartTransferControlRequest(plan, unit));
+        sender_status[i] =
+            SendWorkerRpc(addr_it->second,
+                          BuildStartTransferControlRequest(plan, unit))
+                .status();
       });
     }
     for (std::thread& t : senders) t.join();

@@ -117,6 +117,14 @@ std::string Canonical(const ::tpu_sync::rpc::StartTransferRequest& msg) {
     ::tpu_sync::rpc::ShardPushEntryProto entry = MakeEntry(9, 3, 64, 32, 49152);
     entry.set_pool_group(1);
     *schedule3.add_entries() = entry;
+  } else {
+    // Senders carry the receivers' pool addresses for raddr computation.
+    ::tpu_sync::rpc::PoolHostAddrsProto& pool =
+        (*(*req.mutable_receiver_addrs())["10.0.0.2:14579"].mutable_pools())[0];
+    pool.set_block_stride_bytes(65536);
+    pool.set_num_blocks(64);
+    pool.add_host_base_addrs(uint64_t{0x7f00'0000'0000});
+    pool.add_host_base_addrs(uint64_t{0x7f10'0000'0000});
   }
   return req;
 }

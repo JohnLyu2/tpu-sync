@@ -228,20 +228,18 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
           LOG(ERROR) << "PoolReshardRegisterRecv native execution failed: "
                      << status;
         } else {
-          // Report this receiver's pool base addresses so the sender can
+          // Report this receiver's pool addresses so the sender can
           // compute raddr.
           for (int32_t pool_idx : start_req.transfer_pool_indices()) {
-            absl::StatusOr<std::vector<uint64_t>> addrs =
-                callbacks_.pool_host_base_addrs(static_cast<size_t>(pool_idx));
+            absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> addrs =
+                callbacks_.pool_host_addrs(static_cast<size_t>(pool_idx));
             if (!addrs.ok()) {
               LOG(WARNING) << "No host base address for pool " << pool_idx
                            << ": " << addrs.status();
               continue;
             }
-            if (addrs->empty()) continue;
-            (*resp.mutable_receiver_pool_addrs())[pool_idx]
-                .mutable_host_base_addrs()
-                ->Add(addrs->begin(), addrs->end());
+            if (addrs->host_base_addrs().empty()) continue;
+            (*resp.mutable_receiver_pool_addrs())[pool_idx] = *std::move(addrs);
           }
         }
       } else if (start_req.is_sender()) {

@@ -106,6 +106,11 @@ struct PoolReshardPlan {
   std::vector<int64_t> dst_expected_extent_bytes;
   std::vector<PlanPoolGroup> pool_groups;
   bool skip_d2h = false;
+  // Receiver pool addresses per destination unit, filled by the coordinator
+  // from the receivers' arm replies and forwarded to senders.
+  absl::btree_map<RaidenId, tpu_sync::rpc::ReceiverAddrsProto,
+                  RequestBlockRegistry::RaidenIdLess>
+      receiver_addrs;
 };
 
 // Inputs to the plan build, mirroring _build_pool_reshard_plan's keyword

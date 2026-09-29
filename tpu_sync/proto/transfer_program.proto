@@ -163,6 +163,7 @@ message ReshardBinding {
   // Local pool index -> the destination index that names the pool on the
   // wire; a pool absent from the map is named by its local index.
   map<int32, int32> wire_pool_indices = 5;
+  map<string, tpu_sync.rpc.ReceiverAddrsProto> receiver_addrs = 6;
 }
 
 message TransferProgram {

@@ -31,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -231,6 +232,12 @@ TEST(KVCacheListenerTest, PoolReceiverArmReplyCarriesHostBaseAddrs) {
   ASSERT_TRUE(response.receiver_pool_addrs().contains(0));
   const auto& addrs = response.receiver_pool_addrs().at(0).host_base_addrs();
   EXPECT_EQ(std::vector<uint64_t>(addrs.begin(), addrs.end()), *expected);
+  const PoolSpec* pool = manager.pool(0);
+  ASSERT_NE(pool, nullptr);
+  EXPECT_EQ(response.receiver_pool_addrs().at(0).block_stride_bytes(),
+            pool->block_stride_bytes);
+  EXPECT_EQ(response.receiver_pool_addrs().at(0).num_blocks(),
+            pool->num_blocks);
   EXPECT_FALSE(response.receiver_pool_addrs().contains(7));
 }
 

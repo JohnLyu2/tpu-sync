@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -108,6 +109,11 @@ class FakeTransport final : public ControlPipeClient {
       resp_env.set_payload(failed.SerializeAsString());
       return resp_env;
     }
+    auto reply_it = replies_.find(std::string(endpoint));
+    if (reply_it != replies_.end()) {
+      resp_env.set_payload(reply_it->second.SerializeAsString());
+      return resp_env;
+    }
     tpu_sync::rpc::ControlResponse ok;
     ok.set_success(true);
     resp_env.set_payload(ok.SerializeAsString());
@@ -123,6 +129,8 @@ class FakeTransport final : public ControlPipeClient {
   absl::Mutex mu_;
   std::vector<std::pair<std::string, std::string>> calls_;
   std::string fail_addr_;
+  // Reply returned for an endpoint instead of a bare success.
+  std::map<std::string, tpu_sync::rpc::ControlResponse> replies_;
 };
 
 class ReshardStackTest : public ::testing::Test {
@@ -570,6 +578,15 @@ TEST_F(ReshardStackTest, FullPoolReshardFlowEmitsArmThenDispatch) {
                 /*dst_offset=*/0, /*size=*/1024);
   RegisterSpans(1, "req-1", 42, 1024, /*src_block=*/5, /*dst_index=*/1,
                 /*dst_offset=*/0, /*size=*/512);
+  // The receiver reports its pool 0 addresses in the arm reply.
+  tpu_sync::rpc::ControlResponse arm_reply;
+  arm_reply.set_success(true);
+  tpu_sync::rpc::PoolHostAddrsProto& reply_pool =
+      (*arm_reply.mutable_receiver_pool_addrs())[0];
+  reply_pool.add_host_base_addrs(uint64_t{0x7f00'0000'0000});
+  reply_pool.set_block_stride_bytes(1024);
+  reply_pool.set_num_blocks(16);
+  transport_.replies_["10.0.0.2:9600"] = arm_reply;
   tpu_sync::rpc::ControllerResponse resp = Coordinate("req-1", 42, 2, {7, 9});
   ASSERT_TRUE(resp.success()) << resp.message();
 
@@ -588,6 +605,7 @@ TEST_F(ReshardStackTest, FullPoolReshardFlowEmitsArmThenDispatch) {
   EXPECT_EQ(group.dst_expected_extent_bytes(1), 512);
   // Receiver plan carries both source schedules keyed by ordinal.
   EXPECT_EQ(arm.start_transfer_request().shard_push_schedules_size(), 2);
+  EXPECT_TRUE(arm.start_transfer_request().receiver_addrs().empty());
 
   for (int i = 1; i <= 2; ++i) {
     tpu_sync::rpc::ControlRequest dispatch;
@@ -599,6 +617,17 @@ TEST_F(ReshardStackTest, FullPoolReshardFlowEmitsArmThenDispatch) {
     ASSERT_EQ(schedule.entries_size(), 1);
     EXPECT_EQ(schedule.entries(0).dst_peer(), "10.0.0.2:9400");
     EXPECT_EQ(schedule.entries(0).count(), 1);
+    // Senders get the receiver's pool addresses keyed by its data endpoint.
+    const auto& receiver_addrs =
+        dispatch.start_transfer_request().receiver_addrs();
+    ASSERT_EQ(receiver_addrs.size(), 1);
+    ASSERT_TRUE(receiver_addrs.contains("10.0.0.2:9400"));
+    const auto& pools = receiver_addrs.at("10.0.0.2:9400").pools();
+    ASSERT_TRUE(pools.contains(0));
+    ASSERT_EQ(pools.at(0).host_base_addrs_size(), 1);
+    EXPECT_EQ(pools.at(0).host_base_addrs(0), uint64_t{0x7f00'0000'0000});
+    EXPECT_EQ(pools.at(0).block_stride_bytes(), 1024);
+    EXPECT_EQ(pools.at(0).num_blocks(), 16);
   }
 
   // Status is COMPLETED once the synchronous coordination returns.
