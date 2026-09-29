@@ -1314,7 +1314,6 @@ class BroadcastEngineTest(absltest.TestCase):
               f" parallelism={expected_parallelism}",
           )
 
-
   def test_stage_broadcast_group_multistage_cumulative_receiver_counts(
       self,
   ) -> None:
@@ -1550,6 +1549,94 @@ class BroadcastEngineTest(absltest.TestCase):
       self.assertEqual(
           plan.dst_endpoint_layer_counts, {"10.0.2.1": {0: 1, 1: 1}}
       )
+
+  def test_multi_equivalence_class_trainer_seeding_across_rounds(self) -> None:
+    """Verifies Trainer seeds n_seed replicas per equivalence class in Rounds 0 and 1+."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src_0 = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    src_1 = RaidenId(job_name="trainer", job_replica_id="1", data_name="w")
+    src_units = [src_0, src_1]
+    eq0_units = [
+        RaidenId(job_name=f"roll-{i}", job_replica_id="0", data_name="w")
+        for i in range(6)
+    ]
+    eq1_units = [
+        RaidenId(job_name=f"roll-{i}", job_replica_id="1", data_name="w")
+        for i in range(6)
+    ]
+    all_dst_units = eq0_units + eq1_units
+
+    data_addresses = {
+        src_0: ["10.0.0.1:8000"],
+        src_1: ["10.0.0.2:8000"],
+    }
+    for i, u in enumerate(eq0_units):
+      data_addresses[u] = [f"10.0.1.{i}:8000"]
+    for i, u in enumerate(eq1_units):
+      data_addresses[u] = [f"10.0.2.{i}:8000"]
+
+    canonical_vars = {
+        src_0: {1: {0: [(0, 0, 0, 512, 0, 0, 512, 512, 1)]}},
+        src_1: {1: {0: [(0, 512, 0, 512, 0, 0, 512, 512, 1)]}},
+    }
+    canonical_relays = {1: {0: [(0, 1024, 0)]}}
+
+    sg_eq0 = controller_types.StageBroadcastGroup(
+        pool_group=0,
+        layer_group_idx=0,
+        src_units=src_units,
+        dst_units=eq0_units,
+        stage_ordered_vars_by_unit={src_0: [(0, 1)], src_1: [(0, 1)]},
+        canonical_variable_plans=canonical_vars,
+        canonical_relay_plans=canonical_relays,
+        data_addresses=data_addresses,
+    )
+    sg_eq1 = controller_types.StageBroadcastGroup(
+        pool_group=1,
+        layer_group_idx=0,
+        src_units=src_units,
+        dst_units=eq1_units,
+        stage_ordered_vars_by_unit={src_0: [(0, 1)], src_1: [(0, 1)]},
+        canonical_variable_plans=canonical_vars,
+        canonical_relay_plans=canonical_relays,
+        data_addresses=data_addresses,
+    )
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=src_units,
+        dst_units=all_dst_units,
+        plan=None,
+        worker_data_addresses=data_addresses,
+        uuid=999,
+        is_weight_sync=True,
+    )
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=[sg_eq0, sg_eq1],
+            final_plan=final_plan,
+            n_seed=2,
+            req_id="req_multi_eq_seed",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards={u: ["s0"] for u in src_units + all_dst_units},
+            pipeline_target_stages=1,
+        )
+    )
+
+    # With n_seed=2 and 6 units per equivalence class:
+    # Round 0: Trainer seeds 2 units per eq class (4 total).
+    # Round 1: 2 Round-0 seeds relay to 2 units, and Trainer seeds the remaining
+    #          2 units per eq class (4 total).
+    trainer_seeded_by_round = {0: set(), 1: set()}
+    for target_id, plan in rpc_client.invocations:
+      if target_id == src_0 and plan.is_sender:
+        trainer_seeded_by_round[plan.broadcast_round].add(plan.dst_units[0])
+
+    self.assertLen(trainer_seeded_by_round[0], 4)
+    self.assertLen(trainer_seeded_by_round[1], 4)
 
 
 if __name__ == "__main__":
