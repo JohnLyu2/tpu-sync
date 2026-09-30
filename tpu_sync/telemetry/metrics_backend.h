@@ -90,8 +90,10 @@ inline constexpr absl::string_view kP2pTransferTimeMs = "p2p_transfer_time_ms";
 
 inline constexpr absl::string_view kH2dBytesTotal = "h2d_bytes_total";
 inline constexpr absl::string_view kH2dTransferTimeMs = "h2d_transfer_time_ms";
+inline constexpr absl::string_view kH2dDmaTimeMs = "h2d_dma_time_ms";
 inline constexpr absl::string_view kD2hBytesTotal = "d2h_bytes_total";
 inline constexpr absl::string_view kD2hTransferTimeMs = "d2h_transfer_time_ms";
+inline constexpr absl::string_view kD2hDmaTimeMs = "d2h_dma_time_ms";
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "buffer_allocated_bytes";
 
@@ -144,11 +146,17 @@ inline constexpr absl::string_view kH2dBytesTotal =
     "completed successfully.";
 inline constexpr absl::string_view kH2dTransferTimeMs =
     "Host-to-Device transfer latency in milliseconds.";
+inline constexpr absl::string_view kH2dDmaTimeMs =
+    "Non-overlapping Host-to-Device PCIe DMA wire transfer duration in "
+    "milliseconds.";
 inline constexpr absl::string_view kD2hBytesTotal =
     "Cumulative bytes requested for Device HBM to Host DRAM transfers that "
     "completed successfully.";
 inline constexpr absl::string_view kD2hTransferTimeMs =
     "Device-to-Host transfer latency in milliseconds.";
+inline constexpr absl::string_view kD2hDmaTimeMs =
+    "Non-overlapping Device-to-Host PCIe DMA wire transfer duration in "
+    "milliseconds.";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "Total count of bytes sent over TPU Raiden weight sync interfaces.";
@@ -231,6 +239,11 @@ inline constexpr MetricMetadata kH2dTransferTimeMs{
     .description = metric_descriptions::kH2dTransferTimeMs,
     .type = MetricType::kHistogram};
 
+inline constexpr MetricMetadata kH2dDmaTimeMs{
+    .name = metric_names::kH2dDmaTimeMs,
+    .description = metric_descriptions::kH2dDmaTimeMs,
+    .type = MetricType::kHistogram};
+
 inline constexpr MetricMetadata kD2hBytesTotal{
     .name = metric_names::kD2hBytesTotal,
     .description = metric_descriptions::kD2hBytesTotal,
@@ -239,6 +252,11 @@ inline constexpr MetricMetadata kD2hBytesTotal{
 inline constexpr MetricMetadata kD2hTransferTimeMs{
     .name = metric_names::kD2hTransferTimeMs,
     .description = metric_descriptions::kD2hTransferTimeMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kD2hDmaTimeMs{
+    .name = metric_names::kD2hDmaTimeMs,
+    .description = metric_descriptions::kD2hDmaTimeMs,
     .type = MetricType::kHistogram};
 
 inline constexpr MetricMetadata kBufferAllocatedBytes{
@@ -314,8 +332,10 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kP2pTransferTimeMs,
     kH2dBytesTotal,
     kH2dTransferTimeMs,
+    kH2dDmaTimeMs,
     kD2hBytesTotal,
     kD2hTransferTimeMs,
+    kD2hDmaTimeMs,
     kBufferAllocatedBytes,
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

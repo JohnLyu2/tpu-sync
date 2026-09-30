@@ -210,12 +210,20 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
                                IsEmpty(), Gt(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kD2hDmaTimeMs,
+                               pcie_labels_matcher, testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
               IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
                                pcie_labels_matcher, expected_slice_bytes))
       .Times(1);
   EXPECT_CALL(*raw_mock,
               ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
                                IsEmpty(), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                               pcie_labels_matcher, testing::Ge(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_mock,
               IncrementCounter(telemetry::metric_names::kH2dBytesTotal,

@@ -187,6 +187,12 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kH2dTransferTimeMs.type, MetricType::kHistogram);
   EXPECT_THAT(metric_metadata::kH2dTransferTimeMs.label_names, IsEmpty());
 
+  // H2dDmaTimeMs
+  EXPECT_EQ(metric_names::kH2dDmaTimeMs, "h2d_dma_time_ms");
+  EXPECT_EQ(metric_metadata::kH2dDmaTimeMs.name, "h2d_dma_time_ms");
+  EXPECT_EQ(metric_metadata::kH2dDmaTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kH2dDmaTimeMs.label_names, IsEmpty());
+
   // D2hBytesTotal
   EXPECT_EQ(metric_names::kD2hBytesTotal, "d2h_bytes_total");
   EXPECT_EQ(metric_descriptions::kD2hBytesTotal,
@@ -208,6 +214,12 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "Device-to-Host transfer latency in milliseconds.");
   EXPECT_EQ(metric_metadata::kD2hTransferTimeMs.type, MetricType::kHistogram);
   EXPECT_THAT(metric_metadata::kD2hTransferTimeMs.label_names, IsEmpty());
+
+  // D2hDmaTimeMs
+  EXPECT_EQ(metric_names::kD2hDmaTimeMs, "d2h_dma_time_ms");
+  EXPECT_EQ(metric_metadata::kD2hDmaTimeMs.name, "d2h_dma_time_ms");
+  EXPECT_EQ(metric_metadata::kD2hDmaTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kD2hDmaTimeMs.label_names, IsEmpty());
 
   // TransferDurationMs
   EXPECT_EQ(metric_names::kTransferDurationMs, "transfer_duration_ms");
@@ -320,8 +332,10 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kP2pTransferTimeMs,
           metric_metadata::kH2dBytesTotal,
           metric_metadata::kH2dTransferTimeMs,
+          metric_metadata::kH2dDmaTimeMs,
           metric_metadata::kD2hBytesTotal,
           metric_metadata::kD2hTransferTimeMs,
+          metric_metadata::kD2hDmaTimeMs,
           metric_metadata::kBufferAllocatedBytes,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,

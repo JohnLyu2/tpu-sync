@@ -295,6 +295,28 @@ uint64_t ComputeBytesPerShard(
   return bytes_per_shard;
 }
 
+// PJRT events only expose completion callbacks (OnReady), not hardware DMA
+// start timestamps. Since a chip's PCIe DMA stream executes descriptors in
+// FIFO order, clamping the CPU enqueue timestamp (start_time) against the
+// previous completion watermark (busy_until) recovers the active hardware
+// transfer duration on the PCIe bus without lock contention.
+double ComputeDmaTransferTimeMs(absl::string_view dma_metric,
+                                absl::Time start_time, absl::Time end_time) {
+  static std::atomic<absl::Time> h2d_busy_until{absl::InfinitePast()};
+  static std::atomic<absl::Time> d2h_busy_until{absl::InfinitePast()};
+  std::atomic<absl::Time>& busy_until =
+      (dma_metric == telemetry::metric_names::kH2dDmaTimeMs)
+          ? h2d_busy_until
+          : d2h_busy_until;
+  absl::Time prev_busy = busy_until.load(std::memory_order_relaxed);
+  while (end_time > prev_busy &&
+         !busy_until.compare_exchange_weak(prev_busy, end_time,
+                                           std::memory_order_relaxed)) {
+  }
+  const absl::Time effective_start = std::max(start_time, prev_busy);
+  return std::max(0.0, absl::ToDoubleMilliseconds(end_time - effective_start));
+}
+
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
 // bytes transferred if telemetry is enabled.
 raiden::PjRtCopyFuture JoinAndRecordTelemetry(
@@ -323,20 +345,31 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
     active_local_ranks =
         shard_ranks.subspan(clamped_start, clamped_end - clamped_start);
   }
+  const absl::string_view dma_time_metric =
+      (time_metric_name == telemetry::metric_names::kH2dTransferTimeMs)
+          ? telemetry::metric_names::kH2dDmaTimeMs
+          : telemetry::metric_names::kD2hDmaTimeMs;
   joined_future.OnReady(
-      [start_time, time_metric = time_metric_name,
+      [start_time, time_metric = time_metric_name, dma_metric = dma_time_metric,
        bytes_metric = bytes_metric_name, bytes = bytes_per_shard,
        host_ip = manager.local_ip(), local_ranks = active_local_ranks](
           const absl::StatusOr<raiden::BufferHolders>& result) {
         if (result.ok()) {
           auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+          if (!store.HasBackends()) {
+            return;
+          }
+          const absl::Time end_time = absl::Now();
           store.ObserveHistogram(
               time_metric, {},
-              absl::ToDoubleMilliseconds(absl::Now() - start_time));
+              absl::ToDoubleMilliseconds(end_time - start_time));
+          const double dma_ms =
+              ComputeDmaTransferTimeMs(dma_metric, start_time, end_time);
           for (absl::string_view local_rank : local_ranks) {
             const telemetry::MetricLabel labels[] = {
                 {telemetry::metric_labels::kHostIp, host_ip},
                 {telemetry::metric_labels::kLocalRank, local_rank}};
+            store.ObserveHistogram(dma_metric, labels, dma_ms);
             store.IncrementCounter(bytes_metric, labels, bytes);
           }
         }

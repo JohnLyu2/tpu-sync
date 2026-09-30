@@ -1307,6 +1307,16 @@ TEST(KVCacheManagerTest, TelemetryMetricsObservedWhenEnabled) {
                                testing::IsEmpty(), testing::Ge(0.0)))
       .Times(2);
   EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                               testing::ElementsAreArray(shard0_labels),
+                               testing::Ge(0.0)))
+      .Times(2);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                               testing::ElementsAreArray(shard1_labels),
+                               testing::Ge(0.0)))
+      .Times(2);
+  EXPECT_CALL(*raw_backend,
               IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
                                testing::ElementsAreArray(shard0_labels), 256))
       .Times(1);
@@ -1328,6 +1338,16 @@ TEST(KVCacheManagerTest, TelemetryMetricsObservedWhenEnabled) {
   EXPECT_CALL(*raw_backend,
               ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
                                testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hDmaTimeMs,
+                               testing::ElementsAreArray(shard0_labels),
+                               testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hDmaTimeMs,
+                               testing::ElementsAreArray(shard1_labels),
+                               testing::Ge(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_backend,
               IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
@@ -1379,6 +1399,11 @@ TEST(KVCacheManagerTest, SingleShardTransferEmitsTelemetryOnlyForActiveShard) {
                                testing::IsEmpty(), testing::Ge(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                               testing::ElementsAreArray(shard1_labels),
+                               testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
               IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
                                testing::ElementsAreArray(shard1_labels), 256))
       .Times(1);
@@ -1387,13 +1412,28 @@ TEST(KVCacheManagerTest, SingleShardTransferEmitsTelemetryOnlyForActiveShard) {
                                testing::IsEmpty(), testing::Ge(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hDmaTimeMs,
+                               testing::ElementsAreArray(shard1_labels),
+                               testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
               IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
                                testing::ElementsAreArray(shard1_labels), 128))
       .Times(1);
 
   EXPECT_CALL(
       *raw_backend,
+      ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                       testing::ElementsAreArray(shard0_labels), testing::_))
+      .Times(0);
+  EXPECT_CALL(
+      *raw_backend,
       IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                       testing::ElementsAreArray(shard0_labels), testing::_))
+      .Times(0);
+  EXPECT_CALL(
+      *raw_backend,
+      ObserveHistogram(telemetry::metric_names::kD2hDmaTimeMs,
                        testing::ElementsAreArray(shard0_labels), testing::_))
       .Times(0);
   EXPECT_CALL(
@@ -1446,6 +1486,21 @@ TEST(KVCacheManagerTest, SingleShardUsesLocalRankEnvWhileMultiShardIgnoresIt) {
               ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
                                testing::IsEmpty(), testing::Ge(0.0)))
       .Times(2);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                               testing::ElementsAreArray(single_shard_labels),
+                               testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                               testing::ElementsAreArray(multi_shard0_labels),
+                               testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dDmaTimeMs,
+                               testing::ElementsAreArray(multi_shard1_labels),
+                               testing::Ge(0.0)))
+      .Times(1);
   EXPECT_CALL(
       *raw_backend,
       IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
@@ -1513,16 +1568,23 @@ TEST(KVCacheManagerTest, D2hWritePipelinedTelemetryBatchObservation) {
       IncrementCounter(testing::Ne(telemetry::metric_names::kD2hBytesTotal),
                        testing::_, testing::_))
       .Times(testing::AnyNumber());
-  EXPECT_CALL(
-      *raw_backend,
-      ObserveHistogram(testing::Ne(telemetry::metric_names::kD2hTransferTimeMs),
-                       testing::_, testing::_))
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(
+                  testing::AllOf(
+                      testing::Ne(telemetry::metric_names::kD2hTransferTimeMs),
+                      testing::Ne(telemetry::metric_names::kD2hDmaTimeMs)),
+                  testing::_, testing::_))
       .Times(2);
 
   // Exactly 1 observation for the entire batch of chunks, not 1 per chunk.
   EXPECT_CALL(*raw_backend,
               ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
                                testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hDmaTimeMs,
+                               testing::ElementsAreArray(sender_labels),
+                               testing::Ge(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_backend,
               IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
