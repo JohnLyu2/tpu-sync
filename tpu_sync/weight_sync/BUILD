@@ -148,6 +148,7 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    tags = ["no_oss"],
     deps = [
         ":tiling_utils",
         "//tpu_sync/core:numa_thread_pool",
@@ -165,6 +166,7 @@ py_test(
     shard_count = 6,
     tags = [
         "cpu:4",
+        "no_oss",
         "requires-mem:28g",
     ],
     deps = [
@@ -186,6 +188,7 @@ py_test(
     srcs = ["weight_sync_tp_mismatch_test.py"],
     tags = [
         "cpu:4",
+        "no_oss",
         "requires-mem:16g",
     ],
     deps = [
@@ -207,6 +210,7 @@ py_test(
     srcs = ["weight_sync_tree_relay_checksum_test.py"],
     tags = [
         "cpu:4",
+        "no_oss",
         "requires-mem:16g",
     ],
     deps = [

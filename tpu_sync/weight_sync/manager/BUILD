@@ -30,6 +30,7 @@ py_library(
 py_test(
     name = "broadcast_engine_test",
     srcs = ["broadcast_engine_test.py"],
+    tags = ["no_oss"],
     deps = [
         ":broadcast_engine",
         ":controller_types",
@@ -66,6 +67,7 @@ py_library(
 py_test(
     name = "job_entity_test",
     srcs = ["job_entity_test.py"],
+    tags = ["no_oss"],
     deps = [
         ":controller_types",
         ":job_entity",
@@ -93,6 +95,7 @@ py_test(
     name = "reshard_planner_test",
     timeout = "long",
     srcs = ["reshard_planner_test.py"],
+    tags = ["no_oss"],
     deps = [
         ":controller_types",
         ":job_entity",

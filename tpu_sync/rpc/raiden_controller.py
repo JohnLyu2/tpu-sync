@@ -1097,10 +1097,10 @@ class RaidenController:
       with self._lock:
         self._active_transfers[req_id] = plan
 
-    t_transfer_start = time.perf_counter()
+    t_transfer_start = time.monotonic()
 
     async def _execute_transfer_inner() -> None:
-      nonlocal skip_d2h, expected_block_count
+      nonlocal skip_d2h, expected_block_count, t_transfer_start
       if use_block_chunks:
         if not is_sender:
           local_dst_units = [
@@ -1169,6 +1169,7 @@ class RaidenController:
           )
 
         else:
+          t_transfer_start = time.monotonic()
           logging.info(
               "RaidenController acting as SENDER COORDINATOR (is_sender=True)"
               " for req_id %s (uuid=%s): %s -> %s",
@@ -1196,7 +1197,19 @@ class RaidenController:
             with self._lock:
               cached_schedule = self._plan_cache.get(cache_key)
 
+          logging.vlog(
+              1,
+              "RAIDEN_DIAG plan_compute_start req_id=%s uuid=%s"
+              " use_cached_plan=%s cache_hit=%s",
+              req_id,
+              uuid,
+              use_cached_plan,
+              cached_schedule is not None,
+          )
+
+          newly_computed = False
           if cached_schedule is None:
+            newly_computed = True
             cached_schedule = await self._compute_transfer_schedule(
                 src_units=src_units,
                 dst_units=dst_units,
@@ -1207,11 +1220,21 @@ class RaidenController:
                 req_id=req_id,
                 uuid=uuid,
             )
-            if (
-                self.enable_plan_cache
-                and use_cached_plan
-                and not shard_push_schedules
-            ):
+            raw_schedules = (
+                cached_schedule.direct_schedules
+                or cached_schedule.computed_schedules
+            )
+            if raw_schedules:
+              for src_u, push_schedules in raw_schedules.items():
+                if (
+                    src_u not in cached_schedule.sender_push_schedule_protos
+                    and push_schedules
+                ):
+                  src_ent = self.get_or_create_entity(src_u)
+                  cached_schedule.sender_push_schedule_protos[src_u] = (
+                      src_ent.build_sender_push_schedule_protos(push_schedules)
+                  )
+            if self.enable_plan_cache and not shard_push_schedules:
               with self._lock:
                 self._plan_cache[cache_key] = cached_schedule
           else:
@@ -1228,6 +1251,17 @@ class RaidenController:
           computed_schedules = cached_schedule.computed_schedules
           direct_schedules = cached_schedule.direct_schedules
           broadcast_groups = cached_schedule.broadcast_groups
+          logging.vlog(
+              1,
+              "RAIDEN_DIAG plan_ready req_id=%s uuid=%s compute_ms=%.2f"
+              " is_cached=%s direct_schedules=%d broadcast_groups=%d",
+              req_id,
+              uuid,
+              (time.monotonic() - t_transfer_start) * 1000.0,
+              cached_schedule is not None and not newly_computed,
+              len(direct_schedules),
+              len(broadcast_groups),
+          )
           local_skip_tiling = cached_schedule.local_skip_tiling
           if expected_block_count == 0:
             expected_block_count = cached_schedule.expected_block_count
@@ -1237,6 +1271,142 @@ class RaidenController:
           rpc_addresses.update(self.get_entity_rpc_addresses())
           data_addresses = cached_schedule.data_addresses
           dst_unit_counts = cached_schedule.dst_unit_counts
+
+          endpoint_to_shards: dict[tuple[RaidenId, str] | str, set[int]] = {}
+          if cached_schedule.is_weight_sync and direct_schedules:
+            for src_u in direct_schedules.keys():
+              src_ent = self.get_or_create_entity(src_u)
+              all_shards = self._registered_shards.get(src_u, []) or list(
+                  src_ent.shards
+              )
+              if not all_shards:
+                continue
+
+              has_host_shards = bool(
+                  src_ent.hosts
+                  and any(h.control_address and h.shards for h in src_ent.hosts)
+                  and (
+                      not hasattr(src_ent, "_hosts_by_replica")
+                      or (
+                          bool(src_ent._hosts_by_replica)
+                          and not (
+                              len(src_ent.hosts) == 1
+                              and len(
+                                  str(src_ent.hosts[0].control_address).split(
+                                      ","
+                                  )
+                              )
+                              > 1
+                          )
+                      )
+                  )
+              )
+              if has_host_shards:
+                for host_desc in src_ent.hosts:
+                  if host_desc.control_address:
+                    host_shards_set = set(host_desc.shards)
+                    owned_indices = {
+                        idx
+                        for idx, s in enumerate(all_shards)
+                        if s in host_shards_set
+                    }
+                    if owned_indices:
+                      for c_addr in str(host_desc.control_address).split(","):
+                        c_addr = c_addr.strip()
+                        if c_addr:
+                          endpoint_to_shards[(src_u, c_addr)] = owned_indices
+                          endpoint_to_shards[c_addr] = owned_indices
+              else:
+                control_addrs: list[str] = []
+                for host_desc in src_ent.hosts:
+                  if host_desc.control_address:
+                    for a in str(host_desc.control_address).split(","):
+                      c_addr = a.strip()
+                      if c_addr and c_addr not in control_addrs:
+                        control_addrs.append(c_addr)
+
+                if not control_addrs:
+                  for a in self._registered_control_plane_endpoints.get(
+                      src_u, []
+                  ):
+                    c_addr = str(a).strip()
+                    if c_addr and c_addr not in control_addrs:
+                      control_addrs.append(c_addr)
+
+                if not control_addrs:
+                  continue
+
+                if len(control_addrs) == 1:
+                  c_addr = control_addrs[0]
+                  owned = set(range(len(all_shards)))
+                  if owned:
+                    endpoint_to_shards[(src_u, c_addr)] = owned
+                    endpoint_to_shards[c_addr] = owned
+                elif len(control_addrs) > 1:
+                  distinct_data_addrs: list[str] = []
+                  for s in all_shards:
+                    if s not in distinct_data_addrs:
+                      distinct_data_addrs.append(s)
+
+                  if len(distinct_data_addrs) == len(control_addrs):
+                    for i, c_addr in enumerate(control_addrs):
+                      target_data_addr = distinct_data_addrs[i]
+                      owned = {
+                          idx
+                          for idx, s in enumerate(all_shards)
+                          if s == target_data_addr
+                      }
+                      if owned:
+                        endpoint_to_shards[(src_u, c_addr)] = owned
+                        endpoint_to_shards[c_addr] = owned
+                  else:
+                    control_ips: list[str] = []
+                    c_by_ip: dict[str, list[str]] = {}
+                    for c in control_addrs:
+                      ip = c.rsplit(":", 1)[0]
+                      if ip not in control_ips:
+                        control_ips.append(ip)
+                      c_by_ip.setdefault(ip, []).append(c)
+
+                    d_by_ip: dict[str, list[str]] = {}
+                    for d in distinct_data_addrs:
+                      ip = d.rsplit(":", 1)[0]
+                      d_by_ip.setdefault(ip, []).append(d)
+
+                    can_match_by_ip = set(control_ips) == set(
+                        d_by_ip.keys()
+                    ) and all(
+                        len(c_by_ip[ip]) == len(d_by_ip.get(ip, []))
+                        or len(c_by_ip[ip]) == 1
+                        for ip in control_ips
+                    )
+
+                    if can_match_by_ip:
+                      for ip in control_ips:
+                        c_addrs_on_ip = c_by_ip[ip]
+                        data_addrs_on_ip = d_by_ip.get(ip, [])
+                        if len(c_addrs_on_ip) == len(data_addrs_on_ip):
+                          for j, c_addr in enumerate(c_addrs_on_ip):
+                            target_data_addr = data_addrs_on_ip[j]
+                            owned = {
+                                idx
+                                for idx, s in enumerate(all_shards)
+                                if s == target_data_addr
+                            }
+                            if owned:
+                              endpoint_to_shards[(src_u, c_addr)] = owned
+                              endpoint_to_shards[c_addr] = owned
+                        elif len(c_addrs_on_ip) == 1:
+                          owned = {
+                              idx
+                              for idx, s in enumerate(all_shards)
+                              if s.rsplit(":", 1)[0] == ip
+                          }
+                          if owned:
+                            endpoint_to_shards[(src_u, c_addrs_on_ip[0])] = (
+                                owned
+                            )
+                            endpoint_to_shards[c_addrs_on_ip[0]] = owned
 
           final_plan = TransferPlan(
               src_units=list(computed_schedules.keys())
@@ -1273,6 +1443,7 @@ class RaidenController:
               ),
               variable_plans=cached_schedule.variable_plans,
               variable_to_plan_id=cached_schedule.variable_to_plan_id,
+              endpoint_to_shards=endpoint_to_shards,
           )
           with self._lock:
             self._active_transfers[req_id] = final_plan
@@ -1341,11 +1512,21 @@ class RaidenController:
                         dst_peers=direct_dst_peers,
                     )
                 ],
+                endpoint_to_shards=endpoint_to_shards,
             )
 
           # 1. Arm direct schedule receivers
           if direct_schedules:
+            arm_start = time.monotonic()
             if dst_controller_address:
+              logging.vlog(
+                  1,
+                  "RAIDEN_DIAG recv_arm_start remote dst_controller=%s"
+                  " direct_dsts=%d req_id=%s",
+                  dst_controller_address,
+                  len(direct_dsts),
+                  req_id,
+              )
               dst_facade = RaidenControllerClientFacade(
                   dst_controller_address,
                   name_resolver=self.name_resolver,
@@ -1384,6 +1565,14 @@ class RaidenController:
                     self._dispatch_entity_transfer(unit, direct_plan)
                     for unit in local_direct_dsts
                 ])
+            logging.vlog(
+                1,
+                "RAIDEN_DIAG recv_arm_complete req_id=%s uuid=%s"
+                " arm_elapsed_ms=%.2f",
+                req_id,
+                uuid,
+                (time.monotonic() - arm_start) * 1000.0,
+            )
 
           # 2. Arm destination controller for tree broadcast top-level req_id
           if broadcast_groups:
@@ -1425,12 +1614,27 @@ class RaidenController:
 
           push_tasks = []
 
+          senders_start = time.monotonic()
+          local_direct_srcs = (
+              [
+                  u
+                  for u in direct_schedules.keys()
+                  if u in self._registered_shards
+              ]
+              if direct_schedules
+              else []
+          )
+          logging.vlog(
+              1,
+              "RAIDEN_DIAG senders_dispatch_start req_id=%s uuid=%s"
+              " local_direct_srcs=%d elapsed_since_transfer_start_ms=%.2f",
+              req_id,
+              uuid,
+              len(local_direct_srcs),
+              (senders_start - t_transfer_start) * 1000.0,
+          )
+
           if direct_schedules:
-            local_direct_srcs = [
-                u
-                for u in direct_schedules.keys()
-                if u in self._registered_shards
-            ]
             if local_direct_srcs:
               push_tasks.append(
                   asyncio.gather(*[
@@ -1456,6 +1660,16 @@ class RaidenController:
           if push_tasks:
             await asyncio.gather(*push_tasks)
 
+          logging.vlog(
+              1,
+              "RAIDEN_DIAG senders_dispatch_complete req_id=%s uuid=%s"
+              " push_tasks_ms=%.2f total_transfer_ms=%.2f",
+              req_id,
+              uuid,
+              (time.monotonic() - senders_start) * 1000.0,
+              (time.monotonic() - t_transfer_start) * 1000.0,
+          )
+
       else:
         with self._lock:
           old_plan = self._active_transfers[req_id]
@@ -1474,7 +1688,7 @@ class RaidenController:
         if is_sender:
           common.record_histogram(
               "weight_sync_e2e_broadcast_duration_ms",
-              (time.perf_counter() - t_transfer_start) * 1000.0,
+              (time.monotonic() - t_transfer_start) * 1000.0,
           )
       except Exception:
         common.record_counter(

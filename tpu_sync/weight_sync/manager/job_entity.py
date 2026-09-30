@@ -695,6 +695,8 @@ class JobEntity:
         transfer_plan, "src_units", []
     ) and getattr(transfer_plan, "is_sender", False)
     if is_sender:
+      if bool(getattr(transfer_plan, "endpoint_to_shards", None)):
+        return False
       cached_protos = getattr(
           transfer_plan, "sender_push_schedule_protos", None
       )
@@ -1260,21 +1262,37 @@ class JobEntity:
             transfer_plan, "sender_push_schedule_protos", None
         )
         if cached_protos is not None and target_id in cached_protos:
-          for shard_idx, schedule_proto in cached_protos[target_id].items():
-            if owned_shards is None or shard_idx in owned_shards:
+          target_cache = cached_protos[target_id]
+          if owned_shards is not None:
+            for shard_idx in owned_shards:
+              if shard_idx not in target_cache:
+                raise KeyError(
+                    f"Missing cached push schedule proto for shard {shard_idx}"
+                    f" on unit {target_id}"
+                )
+              start_req.shard_push_schedules[shard_idx].CopyFrom(
+                  target_cache[shard_idx]
+              )
+          else:
+            for shard_idx, schedule_proto in target_cache.items():
               start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
         else:
           push_schedules = transfer_plan.shard_push_schedules.get(target_id)
           if push_schedules:
+            if owned_shards is not None:
+              schedules_to_build = {
+                  s_idx: push_schedules[s_idx]
+                  for s_idx in owned_shards
+                  if s_idx in push_schedules
+              }
+            else:
+              schedules_to_build = push_schedules
             target_protos = self.build_sender_push_schedule_protos(
-                push_schedules
+                schedules_to_build
             )
             for shard_idx, schedule_proto in target_protos.items():
-              if owned_shards is None or shard_idx in owned_shards:
-                start_req.shard_push_schedules[shard_idx].CopyFrom(
-                    schedule_proto
-                )
-            if cached_protos is not None:
+              start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
+            if cached_protos is not None and owned_shards is None:
               cached_protos[target_id] = target_protos
 
     # If this host is a sender in a block-chunk plan but owns no shards with

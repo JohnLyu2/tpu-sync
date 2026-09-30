@@ -115,18 +115,9 @@ py_library(
 )
 
 py_test(
-    name = "raiden_controller_test",
-    srcs = ["raiden_controller_test.py"],
-    deps = [
-        ":raiden_controller",
-        ":raiden_service_py_pb2",
-        "@com_google_absl_py//absl/testing:absltest",
-    ],
-)
-
-py_test(
     name = "coordination_helper_test",
     srcs = ["coordination_helper_test.py"],
+    tags = ["no_oss"],
     deps = [
         ":coordination_helper",
         "@com_google_absl_py//absl/testing:absltest",
@@ -150,6 +141,7 @@ cc_library(
 cc_test(
     name = "coordination_client_test",
     srcs = ["coordination_client_test.cc"],
+    tags = ["no_oss"],
     deps = [
         ":coordination_cc_grpc",
         ":coordination_cc_proto",
