@@ -63,6 +63,7 @@
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
@@ -427,7 +428,8 @@ KVCacheManagerBase::KVCacheManagerBase(
   }
   semaphore_ = std::make_unique<xla::Semaphore>(std::max<int>(4, parallelism));
 
-  layers_.reserve(num_layers_);
+  std::vector<LayerInfoBase> layers;
+  layers.reserve(num_layers_);
   buffer_holds_.reserve(num_layers_);
   layer_row_bytes_.reserve(num_layers_);
   size_t total_host_dram_bytes = 0;
@@ -480,6 +482,7 @@ KVCacheManagerBase::KVCacheManagerBase(
     for (size_t i = 0; i < num_shards_; ++i) {
       const auto& dst_buffer = dst_buffers[i];
       ShardBufferInfoBase shard_info;
+      shard_info.device = dst_buffer.device;
 
       shard_info.device_size = dst_buffer.GetOnDeviceSizeInBytes();
       if (shard_info.device_size < device_info.physical_size) {
@@ -534,9 +537,12 @@ KVCacheManagerBase::KVCacheManagerBase(
       device_info.holds.push_back(dst_buffer);
       layer_info.shards.push_back(std::move(shard_info));
     }
-    layers_.push_back(std::move(layer_info));
+    layers.push_back(std::move(layer_info));
     buffer_holds_.push_back(std::move(device_info));
   }
+  layers_ = StagingArena(
+      std::move(layers),
+      host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
   {
     absl::MutexLock lock(allocated_host_dram_bytes_mu_);
     allocated_host_dram_bytes_ = total_host_dram_bytes;
@@ -587,7 +593,8 @@ KVCacheManagerBase::KVCacheManagerBase(
     layer_row_bytes_.push_back(slice_byte_sizes[layer_idx]);
   }
 
-  layers_.reserve(num_layers_);
+  std::vector<LayerInfoBase> layers;
+  layers.reserve(num_layers_);
   size_t total_host_dram_bytes = 0;
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     LayerInfoBase layer_info;
@@ -637,8 +644,11 @@ KVCacheManagerBase::KVCacheManagerBase(
       total_host_dram_bytes += shard_info.host_size;
       layer_info.shards.push_back(std::move(shard_info));
     }
-    layers_.push_back(std::move(layer_info));
+    layers.push_back(std::move(layer_info));
   }
+  layers_ = StagingArena(
+      std::move(layers),
+      host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
   {
     absl::MutexLock lock(allocated_host_dram_bytes_mu_);
     allocated_host_dram_bytes_ = total_host_dram_bytes;
@@ -706,7 +716,7 @@ KVCacheManagerBase::~KVCacheManagerBase() {
   dma_pool_.reset();
   pull_pool_.reset();
   buffer_holds_.clear();
-  layers_.clear();
+  layers_ = StagingArena();
   host_block_manager_.reset();
 }
 

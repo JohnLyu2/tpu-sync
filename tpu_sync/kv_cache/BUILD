@@ -278,6 +278,7 @@ cc_library(
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_manager_base",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:staging_arena",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
         "//tpu_sync/kv_cache/backends:backend",

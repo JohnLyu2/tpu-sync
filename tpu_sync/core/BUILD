@@ -109,6 +109,46 @@ cc_test(
 )
 
 cc_library(
+    name = "staging_arena",
+    srcs = ["staging_arena.cc"],
+    hdrs = ["staging_arena.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":host_memory_allocator",
+        ":xla_pjrt_headers",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_test(
+    name = "staging_arena_test",
+    size = "small",
+    srcs = ["staging_arena_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":host_memory_allocator",
+        ":staging_arena",
+        ":xla_pjrt_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "raiden_manager_base",
     srcs = [
         "raiden_manager_base.cc",
@@ -124,6 +164,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":raw_transfer_core",
+        ":staging_arena",
         ":tpu_utils",
         ":xla_raw_transfer_headers",
         "//tpu_sync/common:trace",
@@ -825,16 +866,11 @@ cc_test(
     deps = [
         ":host_memory_allocator",
         ":raiden_manager_base",
-        ":raw_transfer_core",
         ":tpu_pjrt_manager",
         ":tpu_utils",
-        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
-        "@xla//xla:future",
-        "@xla//xla:literal",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",  # build_cleaner: keep
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",

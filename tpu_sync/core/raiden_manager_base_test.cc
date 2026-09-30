@@ -14,8 +14,8 @@
 
 #include "tpu_sync/core/raiden_manager_base.h"
 
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -23,18 +23,13 @@
 #include <utility>
 #include <vector>
 
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "xla/future.h"
-#include "xla/literal.h"
-#include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/host_memory_allocator.h"
-#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
 #include "tpu_sync/core/tpu_utils.h"
 
@@ -52,10 +47,11 @@ class TestRaidenManager : public RaidenManagerBase {
       : RaidenManagerBase(num_layers, num_shards, slice_byte_size, local_port,
                           parallelism, /*bind_ip=*/std::nullopt,
                           std::move(numa_nodes), std::move(mock_nics)) {
-    layers_.resize(num_layers);
+    std::vector<LayerInfoBase> layers(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
-      layers_[l].shards.resize(num_shards);
+      layers[l].shards.resize(num_shards);
     }
+    layers_ = StagingArena(std::move(layers));
   }
 
   absl::StatusOr<std::vector<int>> AllocateBlocks(

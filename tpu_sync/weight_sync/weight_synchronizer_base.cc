@@ -59,6 +59,7 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -133,7 +134,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   HostMemoryAllocator* host_allocator = host_allocator_.get();
 
   size_t shard_idx = 0;
-  layers_.reserve(num_layers_);
+  std::vector<LayerInfoBase> layers;
+  layers.reserve(num_layers_);
   buffer_holds_.reserve(num_layers_);
 
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
@@ -151,6 +153,7 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     for (size_t i = 0; i < num_shards_; ++i) {
       const auto& dst_buffer = dst_buffers[i];
       ShardBufferInfoBase shard_info;
+      shard_info.device = dst_buffer.device;
 
       shard_info.device_size = dst_buffer.GetOnDeviceSizeInBytes();
 
@@ -210,9 +213,13 @@ WeightSynchronizerBase::WeightSynchronizerBase(
       hold_info.push_back(dst_buffer);
       layer_info.shards.push_back(std::move(shard_info));
     }
-    layers_.push_back(std::move(layer_info));
+    layers.push_back(std::move(layer_info));
     buffer_holds_.push_back(std::move(hold_info));
   }
+  layers_ =
+      StagingArena(std::move(layers),
+                   host_allocator ? MakeHostBufferAllocator(host_allocator)
+                                  : MakeDefaultHostBufferAllocator());
 
   if (listener_port) {
     listener_ =
@@ -231,8 +238,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
 
   size_t init_host_bytes = 0;
-  for (const auto& layer : layers_) {
-    for (const auto& shard : layer.shards) {
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    for (const auto& shard : layers_[i].shards) {
       init_host_bytes += shard.host_size;
     }
   }
@@ -276,7 +283,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   shard_factor_ = 1;
   major_dim_size_ = 1;
 
-  layers_.reserve(num_layers_);
+  std::vector<LayerInfoBase> layers;
+  layers.reserve(num_layers_);
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     size_t current_slice_byte_size = (layer_idx < slice_byte_sizes.size())
                                          ? slice_byte_sizes[layer_idx]
@@ -306,8 +314,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
 
       layer_info.shards.push_back(std::move(shard_info));
     }
-    layers_.push_back(std::move(layer_info));
+    layers.push_back(std::move(layer_info));
   }
+  layers_ = StagingArena(std::move(layers), MakeDefaultHostBufferAllocator());
 
   if (listener_port) {
     listener_ =
@@ -326,8 +335,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
 
   size_t init_host_bytes = 0;
-  for (const auto& layer : layers_) {
-    for (const auto& shard : layer.shards) {
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    for (const auto& shard : layers_[i].shards) {
       init_host_bytes += shard.host_size;
     }
   }
@@ -1120,6 +1129,11 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
                          : nullptr;
 
   size_t pipeline_group_size = GetPipelineGroupSize();
+  if ((request.skip_d2h() || already_completed) &&
+      !pipeline_group_size_override_.has_value() &&
+      std::getenv("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE") == nullptr) {
+    pipeline_group_size = 0;
+  }
   size_t group_size =
       (pipeline_group_size == 0) ? num_layers_ : pipeline_group_size;
   if (group_size == 0) {

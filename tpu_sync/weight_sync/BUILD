@@ -63,6 +63,7 @@ cc_library(
         "//tpu_sync/core:raiden_manager_base",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:staging_arena",
         "//tpu_sync/core:xla_raw_transfer_headers",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry:metrics_api",

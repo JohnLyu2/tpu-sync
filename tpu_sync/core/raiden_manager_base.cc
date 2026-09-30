@@ -35,7 +35,6 @@
 #include "absl/synchronization/mutex.h"
 #include "xla/future.h"
 #include "tpu_sync/common/trace.h"
-#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
@@ -317,8 +316,7 @@ void RaidenManagerBase::ForgetPushProgress(uint64_t uuid) {
 }
 
 size_t RaidenManagerBase::block_bytes(size_t layer_idx) const {
-  if (layers_.empty() || layer_idx >= layers_.size() ||
-      layers_[layer_idx].shards.empty()) {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
     return slice_byte_size_;
   }
   size_t dev_size = layers_[layer_idx].shards[0].device_size;

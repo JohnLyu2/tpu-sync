@@ -24,11 +24,13 @@
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -39,6 +41,10 @@ namespace tpu_raiden {
 
 class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
  public:
+  using ShardBufferInfoBase = ::tpu_raiden::ShardBufferInfoBase;
+  using LayerInfoBase = ::tpu_raiden::LayerInfoBase;
+  using StagingArena = ::tpu_raiden::StagingArena;
+
   RaidenManagerBase(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
@@ -120,6 +126,9 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   void SetExternalHostPointers(const std::vector<const uint8_t*>& host_ptrs,
                                const std::vector<size_t>& host_sizes);
 
+  StagingArena& staging_arena() { return layers_; }
+  const StagingArena& staging_arena() const { return layers_; }
+
   // Delegate overrides E2E
   size_t num_layers() const override { return num_layers_; }
   size_t num_shards() const override { return num_shards_; }
@@ -130,24 +139,6 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   size_t shard_factor() const override { return shard_factor_; }
 
  protected:
-  struct ShardBufferInfoBase {
-    const uint8_t* host_ptr = nullptr;
-    size_t host_size = 0;
-    size_t device_size = 0;
-    std::unique_ptr<uint8_t[], void (*)(void*)> owned_host_buffer = {
-        nullptr, [](void*) {}};
-    std::shared_ptr<void> host_owner;
-    std::unique_ptr<uint8_t[], void (*)(void*)> owned_tiled_buffer = {
-        nullptr, [](void*) {}};
-    std::shared_ptr<void> tiled_owner;
-    uint8_t* tiled_ptr = nullptr;
-    size_t tiled_size = 0;
-  };
-
-  struct LayerInfoBase {
-    std::vector<ShardBufferInfoBase> shards;
-  };
-
   size_t num_layers_ = 0;
   size_t num_shards_ = 0;
   size_t slice_byte_size_ = 0;
@@ -165,7 +156,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   mutable absl::Mutex server_init_mu_;
   std::unique_ptr<tpu_raiden::transport::BlockTransport> server_;
 
-  std::vector<LayerInfoBase> layers_;
+  StagingArena layers_;
 
   // Delegate allocator overrides
   absl::StatusOr<std::vector<int>> AllocateBlocks(size_t num_blocks,
