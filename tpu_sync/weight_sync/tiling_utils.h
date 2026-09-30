@@ -32,6 +32,11 @@ namespace tpu_raiden::weight_sync {
 bool IsStandardRowMajorTiled(const xla::Shape& shape,
                              const xla::Layout& layout);
 
+// Returns true if the shape and layout qualify for the optimized column-major
+// tiling fast-path.
+bool IsStandardColMajorTiled(const xla::Shape& shape,
+                             const xla::Layout& layout);
+
 // Calculates the total number of physical elements required for a tiled buffer.
 int64_t GetTiledBufferElements(const xla::Shape& shape);
 

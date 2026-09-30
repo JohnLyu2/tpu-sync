@@ -1452,5 +1452,444 @@ TEST(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
   }
 }
 
+TEST(TilingUtilsTest, IsStandardColMajorTiledAnd1DPacked) {
+  // 2D column-major unpacked {0,1:T(8,128)}
+  xla::Shape col_unpacked = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {2560, 1216}, {0, 1}, {xla::Tile({8, 128})});
+  EXPECT_TRUE(IsStandardColMajorTiled(col_unpacked, col_unpacked.layout()));
+  EXPECT_FALSE(IsStandardRowMajorTiled(col_unpacked, col_unpacked.layout()));
+
+  // 2D column-major packed {0,1:T(8,128)(2,1)}
+  xla::Shape col_packed_p2 = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {2560, 1216}, {0, 1},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})});
+  EXPECT_TRUE(IsStandardColMajorTiled(col_packed_p2, col_packed_p2.layout()));
+  EXPECT_FALSE(IsStandardRowMajorTiled(col_packed_p2, col_packed_p2.layout()));
+
+  // 2D column-major packed {0,1:T(8,128)(4,1)}
+  xla::Shape col_packed_p4 = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::S8, {2560, 1216}, {0, 1},
+      {xla::Tile({8, 128}), xla::Tile({4, 1})});
+  EXPECT_TRUE(IsStandardColMajorTiled(col_packed_p4, col_packed_p4.layout()));
+
+  // 3D batched column-major {1,2,0:T(8,128)(2,1)}
+  xla::Shape col_3d = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {4, 256, 128}, {1, 2, 0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})});
+  EXPECT_TRUE(IsStandardColMajorTiled(col_3d, col_3d.layout()));
+  EXPECT_FALSE(IsStandardRowMajorTiled(col_3d, col_3d.layout()));
+
+  // 3D with permuted batch dimension {0,1,2} is NOT standard batched col-major
+  xla::Shape col_3d_permuted = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {4, 256, 128}, {0, 1, 2},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})});
+  EXPECT_FALSE(
+      IsStandardColMajorTiled(col_3d_permuted, col_3d_permuted.layout()));
+
+  // 1D tensor is NOT column-major tiled
+  xla::Shape shape_1d = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {2560}, {0}, {xla::Tile({128})});
+  EXPECT_FALSE(IsStandardColMajorTiled(shape_1d, shape_1d.layout()));
+
+  // 1D 3-level packed {0:T(1024)(128)(2,1)}
+  xla::Shape shape_1d_3level = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {2560}, {0},
+      {xla::Tile({1024}), xla::Tile({128}), xla::Tile({2, 1})});
+  EXPECT_TRUE(
+      IsStandardRowMajorTiled(shape_1d_3level, shape_1d_3level.layout()));
+
+  // 1D 2-level packed {0:T(128)(2,1)}
+  xla::Shape shape_1d_2level = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {2560}, {0},
+      {xla::Tile({128}), xla::Tile({2, 1})});
+  EXPECT_TRUE(
+      IsStandardRowMajorTiled(shape_1d_2level, shape_1d_2level.layout()));
+
+  // 1D 2-level unpacked {0:T(1024)(128)}
+  xla::Shape shape_1d_2level_unpacked =
+      xla::ShapeUtil::MakeShapeWithDenseLayout(
+          xla::PrimitiveType::BF16, {2560}, {0},
+          {xla::Tile({1024}), xla::Tile({128})});
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape_1d_2level_unpacked,
+                                      shape_1d_2level_unpacked.layout()));
+}
+
+TEST(TilingUtilsTest, ColMajor_Packed_BF16_ExactAndQwen3DownProj) {
+  // Test Qwen3-4B (TP=8 on TPU v6e) mlp.down_proj.weight shape:
+  // BF16[2560, 1216] with {0, 1: T(8, 128)(2, 1)}
+  const int64_t D0 = 2560;
+  const int64_t D1 = 1216;
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {D0, D1}, {0, 1},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})});
+
+  ASSERT_TRUE(IsStandardColMajorTiled(shape, shape.layout()));
+  const int64_t num_elements = D0 * D1;
+  const int64_t total_physical_elements = GetTiledBufferElements(shape);
+  EXPECT_EQ(total_physical_elements, num_elements);
+
+  std::vector<uint16_t> src_linear(num_elements);
+  for (int64_t i = 0; i < num_elements; ++i) {
+    src_linear[i] = static_cast<uint16_t>((i * 7 + 13) % 65521);
+  }
+
+  std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t), 0);
+  ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                         dst_tiled.data(), shape, shape.layout())
+                  .ok());
+
+  // Verify against XLA canonical LinearIndexForNestedTiling on a smaller exact
+  // shape [128, 64] so full element-by-element verification runs quickly.
+  {
+    xla::Shape small_shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::BF16, {128, 64}, {0, 1},
+        {xla::Tile({8, 128}), xla::Tile({2, 1})});
+    const int64_t small_elems = 128 * 64;
+    std::vector<uint16_t> small_src(small_elems);
+    for (int64_t i = 0; i < small_elems; ++i) {
+      small_src[i] = static_cast<uint16_t>(i * 5 + 1);
+    }
+    std::vector<uint8_t> small_tiled(small_elems * sizeof(uint16_t), 0);
+    ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(small_src.data()),
+                           small_tiled.data(), small_shape,
+                           small_shape.layout())
+                    .ok());
+
+    xla::Shape standard_shape = xla::ShapeUtil::MakeShape(
+        small_shape.element_type(), small_shape.dimensions());
+    const uint16_t* tiled_u16 =
+        reinterpret_cast<const uint16_t*>(small_tiled.data());
+    xla::ShapeUtil::ForEachIndexNoStatus(
+        small_shape, [&](absl::Span<const int64_t> indices) -> bool {
+          int64_t linear_idx =
+              xla::IndexUtil::MultidimensionalIndexToLinearIndex(standard_shape,
+                                                                 indices);
+          int64_t physical_idx =
+              xla::LayoutUtil::LinearIndexForNestedTiling(small_shape, indices);
+          EXPECT_EQ(tiled_u16[physical_idx], small_src[linear_idx])
+              << "Mismatch at (" << indices[0] << ", " << indices[1] << ")";
+          return true;
+        });
+  }
+
+  std::vector<uint16_t> dst_linear(num_elements, 0);
+  ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
+                           reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+                           shape.layout())
+                  .ok());
+  EXPECT_EQ(dst_linear, src_linear);
+}
+
+TEST(TilingUtilsTest, ColMajor_Packed_And_Unpacked_WithPadding2D) {
+  // Shape [175, 53] with {0, 1: T(8, 128)(2, 1)} (padding in both D0 and D1)
+  const int64_t D0 = 175;
+  const int64_t D1 = 53;
+  for (bool packed : {false, true}) {
+    xla::Shape shape = packed ? xla::ShapeUtil::MakeShapeWithDenseLayout(
+                                    xla::PrimitiveType::BF16, {D0, D1}, {0, 1},
+                                    {xla::Tile({8, 128}), xla::Tile({2, 1})})
+                              : xla::ShapeUtil::MakeShapeWithDenseLayout(
+                                    xla::PrimitiveType::BF16, {D0, D1}, {0, 1},
+                                    {xla::Tile({8, 128})});
+    ASSERT_TRUE(IsStandardColMajorTiled(shape, shape.layout()));
+
+    const int64_t num_elements = D0 * D1;
+    std::vector<uint16_t> src_linear(num_elements);
+    for (int64_t i = 0; i < num_elements; ++i) {
+      src_linear[i] = static_cast<uint16_t>(i * 3 + 7);
+    }
+
+    int64_t total_physical_elements = GetTiledBufferElements(shape);
+    // H = D1 = 53 (Ceil(53/8)=7), W = D0 = 175 (Ceil(175/128)=2) -> 14 * 1024
+    EXPECT_EQ(total_physical_elements, 7 * 2 * 1024);
+
+    // Pre-fill dst_tiled with non-zero garbage to verify padding is zeroed.
+    std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t),
+                                   0xFF);
+    ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
+
+    std::vector<bool> is_valid_phys(total_physical_elements, false);
+    xla::Shape standard_shape =
+        xla::ShapeUtil::MakeShape(shape.element_type(), shape.dimensions());
+    const uint16_t* tiled_u16 =
+        reinterpret_cast<const uint16_t*>(dst_tiled.data());
+    xla::ShapeUtil::ForEachIndexNoStatus(
+        shape, [&](absl::Span<const int64_t> indices) -> bool {
+          int64_t linear_idx =
+              xla::IndexUtil::MultidimensionalIndexToLinearIndex(standard_shape,
+                                                                 indices);
+          int64_t physical_idx =
+              xla::LayoutUtil::LinearIndexForNestedTiling(shape, indices);
+          is_valid_phys[physical_idx] = true;
+          EXPECT_EQ(tiled_u16[physical_idx], src_linear[linear_idx])
+              << "Mismatch at (" << indices[0] << ", " << indices[1] << ")";
+          return true;
+        });
+
+    for (int64_t p_idx = 0; p_idx < total_physical_elements; ++p_idx) {
+      if (!is_valid_phys[p_idx]) {
+        EXPECT_EQ(tiled_u16[p_idx], 0)
+            << "Padding not zeroed at physical index " << p_idx;
+      }
+    }
+
+    std::vector<uint16_t> dst_linear(num_elements, 0);
+    ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
+                             reinterpret_cast<uint8_t*>(dst_linear.data()),
+                             shape, shape.layout())
+                    .ok());
+    EXPECT_EQ(dst_linear, src_linear);
+  }
+}
+
+TEST(TilingUtilsTest, ColMajor_Packed_S8_And_MultiBatch3D_And_Parallel) {
+  // 1. S8 with {0, 1: T(8, 128)(4, 1)} and padding
+  {
+    const int64_t D0 = 175;
+    const int64_t D1 = 29;
+    xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::S8, {D0, D1}, {0, 1},
+        {xla::Tile({8, 128}), xla::Tile({4, 1})});
+    ASSERT_TRUE(IsStandardColMajorTiled(shape, shape.layout()));
+
+    const int64_t num_elements = D0 * D1;
+    std::vector<int8_t> src_linear(num_elements);
+    for (int64_t i = 0; i < num_elements; ++i) {
+      src_linear[i] = static_cast<int8_t>((i % 125) + 1);
+    }
+
+    int64_t total_physical_elements = GetTiledBufferElements(shape);
+    std::vector<uint8_t> dst_tiled(total_physical_elements, 0xFF);
+    ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
+
+    xla::Shape standard_shape =
+        xla::ShapeUtil::MakeShape(shape.element_type(), shape.dimensions());
+    const int8_t* tiled_s8 = reinterpret_cast<const int8_t*>(dst_tiled.data());
+    xla::ShapeUtil::ForEachIndexNoStatus(
+        shape, [&](absl::Span<const int64_t> indices) -> bool {
+          int64_t linear_idx =
+              xla::IndexUtil::MultidimensionalIndexToLinearIndex(standard_shape,
+                                                                 indices);
+          int64_t physical_idx =
+              xla::LayoutUtil::LinearIndexForNestedTiling(shape, indices);
+          EXPECT_EQ(tiled_s8[physical_idx], src_linear[linear_idx]);
+          return true;
+        });
+
+    std::vector<int8_t> dst_linear(num_elements, 0);
+    ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
+                             reinterpret_cast<uint8_t*>(dst_linear.data()),
+                             shape, shape.layout())
+                    .ok());
+    EXPECT_EQ(dst_linear, src_linear);
+  }
+
+  // 2. 3D batched column-major [3, 300, 40] with {1, 2, 0: T(8, 128)(2, 1)}
+  {
+    const int64_t B = 3;
+    const int64_t D0 = 300;
+    const int64_t D1 = 40;
+    xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::BF16, {B, D0, D1}, {1, 2, 0},
+        {xla::Tile({8, 128}), xla::Tile({2, 1})});
+    ASSERT_TRUE(IsStandardColMajorTiled(shape, shape.layout()));
+
+    const int64_t num_elements = B * D0 * D1;
+    std::vector<uint16_t> src_linear(num_elements);
+    for (int64_t i = 0; i < num_elements; ++i) {
+      src_linear[i] = static_cast<uint16_t>((i * 11 + 3) % 65535);
+    }
+
+    int64_t total_physical_elements = GetTiledBufferElements(shape);
+    std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t),
+                                   0);
+    ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
+
+    xla::Shape standard_shape =
+        xla::ShapeUtil::MakeShape(shape.element_type(), shape.dimensions());
+    const uint16_t* tiled_u16 =
+        reinterpret_cast<const uint16_t*>(dst_tiled.data());
+    xla::ShapeUtil::ForEachIndexNoStatus(
+        shape, [&](absl::Span<const int64_t> indices) -> bool {
+          int64_t linear_idx =
+              xla::IndexUtil::MultidimensionalIndexToLinearIndex(standard_shape,
+                                                                 indices);
+          int64_t physical_idx =
+              xla::LayoutUtil::LinearIndexForNestedTiling(shape, indices);
+          EXPECT_EQ(tiled_u16[physical_idx], src_linear[linear_idx]);
+          return true;
+        });
+
+    std::vector<uint16_t> dst_linear(num_elements, 0);
+    ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
+                             reinterpret_cast<uint8_t*>(dst_linear.data()),
+                             shape, shape.layout())
+                    .ok());
+    EXPECT_EQ(dst_linear, src_linear);
+  }
+
+  // 3. Large 8.4 MB tensor with padding [2050, 2050] on 4-thread pool
+  {
+    const int64_t D0 = 2050;
+    const int64_t D1 = 2050;
+    xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::BF16, {D0, D1}, {0, 1},
+        {xla::Tile({8, 128}), xla::Tile({2, 1})});
+    const int64_t num_elements = D0 * D1;
+    std::vector<uint16_t> src_linear(num_elements);
+    for (int64_t i = 0; i < num_elements; ++i) {
+      src_linear[i] = static_cast<uint16_t>(i % 32749);
+    }
+    int64_t total_physical_elements = GetTiledBufferElements(shape);
+    std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t),
+                                   0);
+    tpu_raiden::NumaThreadPool pool(4);
+    ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                           dst_tiled.data(), shape, shape.layout(), &pool)
+                    .ok());
+    std::vector<uint16_t> dst_linear(num_elements, 0);
+    ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
+                             reinterpret_cast<uint8_t*>(dst_linear.data()),
+                             shape, shape.layout(), &pool)
+                    .ok());
+    EXPECT_EQ(dst_linear, src_linear);
+  }
+}
+
+TEST(TilingUtilsTest, Packed1D_2Level_And_3Level_AllCases) {
+  // Test {0:T(1024)(128)(2,1)} (Qwen3-4B 1D norm layout) and {0:T(128)(2,1)}
+  // across exact (2048), outer-tile padded (2560), and arbitrary (300, 17)
+  // lengths.
+  for (int64_t W : {17, 300, 2048, 2500, 2560}) {
+    for (bool three_level : {false, true}) {
+      xla::Shape shape =
+          three_level
+              ? xla::ShapeUtil::MakeShapeWithDenseLayout(
+                    xla::PrimitiveType::BF16, {W}, {0},
+                    {xla::Tile({1024}), xla::Tile({128}), xla::Tile({2, 1})})
+              : xla::ShapeUtil::MakeShapeWithDenseLayout(
+                    xla::PrimitiveType::BF16, {W}, {0},
+                    {xla::Tile({128}), xla::Tile({2, 1})});
+      ASSERT_TRUE(IsStandardRowMajorTiled(shape, shape.layout()));
+
+      std::vector<uint16_t> src_linear(W);
+      for (int64_t i = 0; i < W; ++i) {
+        src_linear[i] = static_cast<uint16_t>(i * 7 + 19);
+      }
+
+      int64_t total_physical_elements = GetTiledBufferElements(shape);
+      std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t),
+                                     0xFF);
+      ASSERT_TRUE(
+          TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                     dst_tiled.data(), shape, shape.layout())
+              .ok());
+
+      std::vector<bool> is_valid_phys(total_physical_elements, false);
+      const uint16_t* tiled_u16 =
+          reinterpret_cast<const uint16_t*>(dst_tiled.data());
+      for (int64_t i = 0; i < W; ++i) {
+        int64_t physical_idx =
+            xla::LayoutUtil::LinearIndexForNestedTiling(shape, {i});
+        ASSERT_GE(physical_idx, 0);
+        ASSERT_LT(physical_idx, total_physical_elements);
+        is_valid_phys[physical_idx] = true;
+        EXPECT_EQ(tiled_u16[physical_idx], src_linear[i])
+            << "Mismatch at W=" << W << ", three_level=" << three_level
+            << ", i=" << i;
+      }
+      for (int64_t p_idx = 0; p_idx < total_physical_elements; ++p_idx) {
+        if (!is_valid_phys[p_idx]) {
+          EXPECT_EQ(tiled_u16[p_idx], 0)
+              << "Padding not zeroed at W=" << W
+              << ", three_level=" << three_level << ", p_idx=" << p_idx;
+        }
+      }
+
+      std::vector<uint16_t> dst_linear(W, 0);
+      ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
+                               reinterpret_cast<uint8_t*>(dst_linear.data()),
+                               shape, shape.layout())
+                      .ok());
+      EXPECT_EQ(dst_linear, src_linear);
+    }
+  }
+
+  // Also test S8 with P=4 ({0:T(1024)(128)(4,1)} and {0:T(128)(4,1)}) and
+  // 2-level unpacked {0:T(1024)(128)}.
+  for (int64_t W : {300, 2560}) {
+    for (bool three_level_s8 : {false, true}) {
+      xla::Shape shape_s8 =
+          three_level_s8
+              ? xla::ShapeUtil::MakeShapeWithDenseLayout(
+                    xla::PrimitiveType::S8, {W}, {0},
+                    {xla::Tile({1024}), xla::Tile({128}), xla::Tile({4, 1})})
+              : xla::ShapeUtil::MakeShapeWithDenseLayout(
+                    xla::PrimitiveType::S8, {W}, {0},
+                    {xla::Tile({128}), xla::Tile({4, 1})});
+      ASSERT_TRUE(IsStandardRowMajorTiled(shape_s8, shape_s8.layout()));
+      std::vector<int8_t> src_s8(W);
+      for (int64_t i = 0; i < W; ++i) {
+        src_s8[i] = static_cast<int8_t>((i % 120) + 1);
+      }
+      int64_t phys_s8 = GetTiledBufferElements(shape_s8);
+      std::vector<uint8_t> tiled_s8(phys_s8, 0xFF);
+      ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_s8.data()),
+                             tiled_s8.data(), shape_s8, shape_s8.layout())
+                      .ok());
+      for (int64_t i = 0; i < W; ++i) {
+        int64_t p_idx =
+            xla::LayoutUtil::LinearIndexForNestedTiling(shape_s8, {i});
+        EXPECT_EQ(reinterpret_cast<const int8_t*>(tiled_s8.data())[p_idx],
+                  src_s8[i]);
+      }
+      std::vector<int8_t> dst_s8(W, 0);
+      ASSERT_TRUE(DetileBuffer(tiled_s8.data(),
+                               reinterpret_cast<uint8_t*>(dst_s8.data()),
+                               shape_s8, shape_s8.layout())
+                      .ok());
+      EXPECT_EQ(dst_s8, src_s8);
+    }
+
+    xla::Shape shape_unpacked = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::BF16, {W}, {0},
+        {xla::Tile({1024}), xla::Tile({128})});
+    ASSERT_TRUE(
+        IsStandardRowMajorTiled(shape_unpacked, shape_unpacked.layout()));
+    std::vector<uint16_t> src_u16(W);
+    for (int64_t i = 0; i < W; ++i) {
+      src_u16[i] = static_cast<uint16_t>(i * 5 + 3);
+    }
+    int64_t phys_u16 = GetTiledBufferElements(shape_unpacked);
+    std::vector<uint8_t> tiled_u16(phys_u16 * sizeof(uint16_t), 0xFF);
+    ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_u16.data()),
+                           tiled_u16.data(), shape_unpacked,
+                           shape_unpacked.layout())
+                    .ok());
+    const uint16_t* tiled_u16_ptr =
+        reinterpret_cast<const uint16_t*>(tiled_u16.data());
+    for (int64_t i = 0; i < W; ++i) {
+      int64_t p_idx =
+          xla::LayoutUtil::LinearIndexForNestedTiling(shape_unpacked, {i});
+      EXPECT_EQ(tiled_u16_ptr[p_idx], src_u16[i]);
+    }
+    for (int64_t p_idx = W; p_idx < phys_u16; ++p_idx) {
+      EXPECT_EQ(tiled_u16_ptr[p_idx], 0);
+    }
+    std::vector<uint16_t> dst_u16(W, 0);
+    ASSERT_TRUE(DetileBuffer(tiled_u16.data(),
+                             reinterpret_cast<uint8_t*>(dst_u16.data()),
+                             shape_unpacked, shape_unpacked.layout())
+                    .ok());
+    EXPECT_EQ(dst_u16, src_u16);
+  }
+}
+
 }  // namespace
 }  // namespace tpu_raiden::weight_sync

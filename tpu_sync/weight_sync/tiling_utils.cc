@@ -51,11 +51,19 @@ bool IsStandardRowMajorTiled(const xla::Shape& shape,
     }
   }
 
-  if (layout.tiles().size() == 1) {
-    const auto& t0 = layout.tiles(0);
-    for (int64_t d : t0.dimensions()) {
+  if (layout.tiles().empty()) return false;
+  for (const auto& t : layout.tiles()) {
+    if (t.dimensions().empty()) return false;
+    for (int64_t d : t.dimensions()) {
       if (d <= 0) return false;
     }
+  }
+
+  const int64_t itemsize =
+      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+
+  if (layout.tiles().size() == 1) {
+    const auto& t0 = layout.tiles(0);
     if (t0.dimensions().size() == 2) return true;
     if (R == 1 && t0.dimensions().size() == 1) return true;
     return false;
@@ -64,12 +72,76 @@ bool IsStandardRowMajorTiled(const xla::Shape& shape,
   if (layout.tiles().size() == 2) {
     const auto& t0 = layout.tiles(0);
     const auto& t1 = layout.tiles(1);
-    for (int64_t d : t0.dimensions()) {
+    if (t0.dimensions().size() == 2 && t1.dimensions().size() == 2) {
+      int64_t tile_H = t0.dimension(0);
+      int64_t P = t1.dimension(0);
+      int64_t sub_W = t1.dimension(1);
+      return (sub_W == 1 &&
+              ((P == 2 && itemsize == 2) || (P == 4 && itemsize == 1)) &&
+              tile_H % P == 0);
+    }
+    if (R == 1 && t0.dimensions().size() == 1 && t1.dimensions().size() == 2) {
+      int64_t P = t1.dimension(0);
+      int64_t sub_W = t1.dimension(1);
+      return (sub_W == 1 &&
+              ((P == 2 && itemsize == 2) || (P == 4 && itemsize == 1)));
+    }
+    if (R == 1 && t0.dimensions().size() == 1 && t1.dimensions().size() == 1) {
+      return (t0.dimension(0) % t1.dimension(0) == 0);
+    }
+    return false;
+  }
+
+  if (layout.tiles().size() == 3) {
+    const auto& t0 = layout.tiles(0);
+    const auto& t1 = layout.tiles(1);
+    const auto& t2 = layout.tiles(2);
+    if (R == 1 && t0.dimensions().size() == 1 && t1.dimensions().size() == 1 &&
+        t2.dimensions().size() == 2) {
+      int64_t outer_W = t0.dimension(0);
+      int64_t inner_W = t1.dimension(0);
+      int64_t P = t2.dimension(0);
+      int64_t sub_W = t2.dimension(1);
+      return (sub_W == 1 &&
+              ((P == 2 && itemsize == 2) || (P == 4 && itemsize == 1)) &&
+              outer_W % inner_W == 0 && (outer_W / inner_W) % P == 0);
+    }
+    return false;
+  }
+
+  return false;
+}
+
+bool IsStandardColMajorTiled(const xla::Shape& shape,
+                             const xla::Layout& layout) {
+  const int R = shape.dimensions().size();
+  if (R < 2) return false;
+  if (layout.minor_to_major().size() != R) return false;
+
+  if (layout.minor_to_major(0) != R - 2 || layout.minor_to_major(1) != R - 1) {
+    return false;
+  }
+  for (int i = 2; i < R; ++i) {
+    if (layout.minor_to_major(i) != R - 1 - i) {
+      return false;
+    }
+  }
+
+  if (layout.tiles().empty()) return false;
+  for (const auto& t : layout.tiles()) {
+    if (t.dimensions().empty()) return false;
+    for (int64_t d : t.dimensions()) {
       if (d <= 0) return false;
     }
-    for (int64_t d : t1.dimensions()) {
-      if (d <= 0) return false;
-    }
+  }
+
+  if (layout.tiles().size() == 1) {
+    return layout.tiles(0).dimensions().size() == 2;
+  }
+
+  if (layout.tiles().size() == 2) {
+    const auto& t0 = layout.tiles(0);
+    const auto& t1 = layout.tiles(1);
     if (t0.dimensions().size() != 2 || t1.dimensions().size() != 2) {
       return false;
     }
@@ -630,6 +702,145 @@ void DetileSingleTilePackedWithPadding(const uint8_t* src_tile_ptr,
   }
 }
 
+// Tiles a 1D buffer when the outer tile is 1D (e.g. {0:T(128)},
+// {0:T(1024)(128)}, {0:T(128)(P,1)}, or {0:T(1024)(128)(P,1)}).
+absl::Status TileBuffer1DOptimized(const uint8_t* src_linear,
+                                   uint8_t* dst_tiled, const xla::Shape& shape,
+                                   const xla::Layout& layout) {
+  const int64_t W = shape.dimensions(0);
+  const int64_t itemsize =
+      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+
+  const int num_tiles = layout.tiles().size();
+  const auto& last_tile = layout.tiles(num_tiles - 1);
+
+  // Unpacked 1D tiling: {0:T(T0)} or {0:T(T0)(T1)}.
+  if (last_tile.dimensions().size() == 1) {
+    const int64_t outer_W = layout.tiles(0).dimension(0);
+    const int64_t total_physical_elements =
+        xla::CeilOfRatio(W, outer_W) * outer_W;
+    if (W > 0) {
+      std::memcpy(dst_tiled, src_linear, W * itemsize);
+    }
+    if (total_physical_elements > W) {
+      ZeroRowHighway(
+          dst_tiled + W * itemsize,
+          static_cast<size_t>((total_physical_elements - W) * itemsize));
+    }
+    return absl::OkStatus();
+  }
+
+  // Packed 1D tiling: {0:T(tile_W)(P,1)} or {0:T(outer_W)(tile_W)(P,1)}.
+  const int64_t P = last_tile.dimension(0);
+  int64_t tile_W = 1;
+  int64_t total_groups = 0;
+  if (num_tiles == 2) {
+    tile_W = layout.tiles(0).dimension(0);
+    total_groups = xla::CeilOfRatio(xla::CeilOfRatio(W, tile_W), P);
+  } else {
+    const int64_t outer_W = layout.tiles(0).dimension(0);
+    tile_W = layout.tiles(1).dimension(0);
+    total_groups = xla::CeilOfRatio(W, outer_W) * ((outer_W / tile_W) / P);
+  }
+
+  const int64_t group_elems = P * tile_W;
+  const int64_t group_bytes = group_elems * itemsize;
+
+  DispatchByPackingFactor(P, [&](auto kPackingFactorTag) {
+    constexpr int64_t kPackingFactor = decltype(kPackingFactorTag)::value;
+    for (int64_t g = 0; g < total_groups; ++g) {
+      uint8_t* dst_group_ptr = dst_tiled + g * group_bytes;
+      const int64_t group_start = g * group_elems;
+      if (group_start + group_elems <= W) {
+        CopyTilePackedNoPadding<kPackingFactor, 0>(
+            src_linear, dst_group_ptr, /*tile_row=*/g, /*tile_col=*/0,
+            /*tile_H=*/kPackingFactor, tile_W, /*W=*/tile_W, itemsize);
+      } else if (group_start >= W) {
+        ZeroRowHighway(dst_group_ptr, static_cast<size_t>(group_bytes));
+      } else {
+        ZeroRowHighway(dst_group_ptr, static_cast<size_t>(group_bytes));
+        for (int64_t p = 0; p < kPackingFactor; ++p) {
+          const int64_t row_start = (g * kPackingFactor + p) * tile_W;
+          for (int64_t c = 0; c < tile_W; ++c) {
+            const int64_t idx = row_start + c;
+            if (idx < W) {
+              std::memcpy(dst_group_ptr + (c * kPackingFactor + p) * itemsize,
+                          src_linear + idx * itemsize, itemsize);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  return absl::OkStatus();
+}
+
+absl::Status DetileBuffer1DOptimized(const uint8_t* src_tiled,
+                                     uint8_t* dst_linear,
+                                     const xla::Shape& shape,
+                                     const xla::Layout& layout) {
+  const int64_t W = shape.dimensions(0);
+  const int64_t itemsize =
+      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+
+  const int num_tiles = layout.tiles().size();
+  const auto& last_tile = layout.tiles(num_tiles - 1);
+
+  // Unpacked 1D tiling: {0:T(T0)} or {0:T(T0)(T1)}.
+  if (last_tile.dimensions().size() == 1) {
+    if (W > 0) {
+      std::memcpy(dst_linear, src_tiled, W * itemsize);
+    }
+    return absl::OkStatus();
+  }
+
+  // Packed 1D tiling: {0:T(tile_W)(P,1)} or {0:T(outer_W)(tile_W)(P,1)}.
+  const int64_t P = last_tile.dimension(0);
+  int64_t tile_W = 1;
+  int64_t total_groups = 0;
+  if (num_tiles == 2) {
+    tile_W = layout.tiles(0).dimension(0);
+    total_groups = xla::CeilOfRatio(xla::CeilOfRatio(W, tile_W), P);
+  } else {
+    const int64_t outer_W = layout.tiles(0).dimension(0);
+    tile_W = layout.tiles(1).dimension(0);
+    total_groups = xla::CeilOfRatio(W, outer_W) * ((outer_W / tile_W) / P);
+  }
+
+  const int64_t group_elems = P * tile_W;
+  const int64_t group_bytes = group_elems * itemsize;
+
+  DispatchByPackingFactor(P, [&](auto kPackingFactorTag) {
+    constexpr int64_t kPackingFactor = decltype(kPackingFactorTag)::value;
+    for (int64_t g = 0; g < total_groups; ++g) {
+      const uint8_t* src_group_ptr = src_tiled + g * group_bytes;
+      const int64_t group_start = g * group_elems;
+      if (group_start + group_elems <= W) {
+        DetileSingleTilePackedNoPadding<kPackingFactor, 0>(
+            src_group_ptr, dst_linear, /*tile_row=*/g, /*tile_col=*/0,
+            /*tile_H=*/kPackingFactor, tile_W, /*W=*/tile_W, itemsize);
+      } else if (group_start >= W) {
+        break;
+      } else {
+        for (int64_t p = 0; p < kPackingFactor; ++p) {
+          const int64_t row_start = (g * kPackingFactor + p) * tile_W;
+          for (int64_t c = 0; c < tile_W; ++c) {
+            const int64_t idx = row_start + c;
+            if (idx < W) {
+              std::memcpy(dst_linear + idx * itemsize,
+                          src_group_ptr + (c * kPackingFactor + p) * itemsize,
+                          itemsize);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  return absl::OkStatus();
+}
+
 // Tiles a buffer using an optimized path for standard row-major layouts.
 // It avoids global zero-initialization of the destination buffer to prevent
 // CPU cache pollution, instead zeroing padding elements locally per tile.
@@ -638,6 +849,10 @@ absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
                                    const xla::Layout& layout,
                                    tpu_raiden::NumaThreadPool* pool = nullptr) {
   const int R = shape.dimensions().size();
+  if (R == 1 && layout.tiles(0).dimensions().size() == 1) {
+    return TileBuffer1DOptimized(src_linear, dst_tiled, shape, layout);
+  }
+
   int64_t H = (R == 1) ? 1 : shape.dimensions(layout.minor_to_major(1));
   int64_t W = shape.dimensions(layout.minor_to_major(0));
   int64_t itemsize =
@@ -806,6 +1021,10 @@ absl::Status DetileBufferNDOptimized(
     const uint8_t* src_tiled, uint8_t* dst_linear, const xla::Shape& shape,
     const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
   const int R = shape.dimensions().size();
+  if (R == 1 && layout.tiles(0).dimensions().size() == 1) {
+    return DetileBuffer1DOptimized(src_tiled, dst_linear, shape, layout);
+  }
+
   int64_t H = (R == 1) ? 1 : shape.dimensions(layout.minor_to_major(1));
   int64_t W = shape.dimensions(layout.minor_to_major(0));
   int64_t itemsize =
@@ -963,6 +1182,641 @@ absl::Status DetileBufferNDOptimized(
   return absl::OkStatus();
 }
 
+// Column-major tile copy helpers:
+// In column-major layouts (minor_to_major = {R-2, R-1, ...}), H = D1 (the
+// stride-1 dimension in src_linear/dst_linear) and W = D0 (the major dimension
+// with stride H in src_linear/dst_linear). Because sub-tile packing (P, 1)
+// groups P consecutive elements along H, each packed unit of (P * itemsize)
+// bytes is already contiguous in both src_linear and dst_tiled.
+template <typename Word>
+inline Word LoadUnaligned(const uint8_t* ptr) {
+  Word w;
+  std::memcpy(&w, ptr, sizeof(Word));
+  return w;
+}
+
+template <typename Word>
+inline void StoreUnaligned(uint8_t* ptr, Word w) {
+  std::memcpy(ptr, &w, sizeof(Word));
+}
+
+#if HWY_TARGET != HWY_SCALAR
+// Transposes a 4x4 matrix of uint32_t (4 rows of 16 bytes -> 4 cols of 16
+// bytes) using unaligned uint8_t* loads and stores.
+inline void Transpose4x4U32(const uint8_t* r0_ptr, const uint8_t* r1_ptr,
+                            const uint8_t* r2_ptr, const uint8_t* r3_ptr,
+                            uint8_t* c0_ptr, uint8_t* c1_ptr, uint8_t* c2_ptr,
+                            uint8_t* c3_ptr) {
+  const hn::FixedTag<uint8_t, 16> du8;
+  const hn::FixedTag<uint32_t, 4> du32;
+  const hn::FixedTag<uint64_t, 2> du64;
+
+  const auto r0 = hn::BitCast(du32, hn::LoadU(du8, r0_ptr));
+  const auto r1 = hn::BitCast(du32, hn::LoadU(du8, r1_ptr));
+  const auto r2 = hn::BitCast(du32, hn::LoadU(du8, r2_ptr));
+  const auto r3 = hn::BitCast(du32, hn::LoadU(du8, r3_ptr));
+
+  const auto t0 = hn::BitCast(du64, hn::InterleaveLower(du32, r0, r1));
+  const auto t1 = hn::BitCast(du64, hn::InterleaveUpper(du32, r0, r1));
+  const auto t2 = hn::BitCast(du64, hn::InterleaveLower(du32, r2, r3));
+  const auto t3 = hn::BitCast(du64, hn::InterleaveUpper(du32, r2, r3));
+
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveLower(du64, t0, t2)), du8, c0_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveUpper(du64, t0, t2)), du8, c1_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveLower(du64, t1, t3)), du8, c2_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveUpper(du64, t1, t3)), du8, c3_ptr);
+}
+
+// Transposes an 8x8 matrix of uint16_t (8 rows of 16 bytes -> 8 cols of 16
+// bytes) using unaligned uint8_t* loads and stores.
+inline void Transpose8x8U16(const uint8_t* r0_ptr, const uint8_t* r1_ptr,
+                            const uint8_t* r2_ptr, const uint8_t* r3_ptr,
+                            const uint8_t* r4_ptr, const uint8_t* r5_ptr,
+                            const uint8_t* r6_ptr, const uint8_t* r7_ptr,
+                            uint8_t* c0_ptr, uint8_t* c1_ptr, uint8_t* c2_ptr,
+                            uint8_t* c3_ptr, uint8_t* c4_ptr, uint8_t* c5_ptr,
+                            uint8_t* c6_ptr, uint8_t* c7_ptr) {
+  const hn::FixedTag<uint8_t, 16> du8;
+  const hn::FixedTag<uint16_t, 8> du16;
+  const hn::FixedTag<uint32_t, 4> du32;
+  const hn::FixedTag<uint64_t, 2> du64;
+
+  const auto r0 = hn::BitCast(du16, hn::LoadU(du8, r0_ptr));
+  const auto r1 = hn::BitCast(du16, hn::LoadU(du8, r1_ptr));
+  const auto r2 = hn::BitCast(du16, hn::LoadU(du8, r2_ptr));
+  const auto r3 = hn::BitCast(du16, hn::LoadU(du8, r3_ptr));
+  const auto r4 = hn::BitCast(du16, hn::LoadU(du8, r4_ptr));
+  const auto r5 = hn::BitCast(du16, hn::LoadU(du8, r5_ptr));
+  const auto r6 = hn::BitCast(du16, hn::LoadU(du8, r6_ptr));
+  const auto r7 = hn::BitCast(du16, hn::LoadU(du8, r7_ptr));
+
+  const auto s0 = hn::BitCast(du32, hn::InterleaveLower(du16, r0, r1));
+  const auto s1 = hn::BitCast(du32, hn::InterleaveUpper(du16, r0, r1));
+  const auto s2 = hn::BitCast(du32, hn::InterleaveLower(du16, r2, r3));
+  const auto s3 = hn::BitCast(du32, hn::InterleaveUpper(du16, r2, r3));
+  const auto s4 = hn::BitCast(du32, hn::InterleaveLower(du16, r4, r5));
+  const auto s5 = hn::BitCast(du32, hn::InterleaveUpper(du16, r4, r5));
+  const auto s6 = hn::BitCast(du32, hn::InterleaveLower(du16, r6, r7));
+  const auto s7 = hn::BitCast(du32, hn::InterleaveUpper(du16, r6, r7));
+
+  const auto t0 = hn::BitCast(du64, hn::InterleaveLower(du32, s0, s2));
+  const auto t1 = hn::BitCast(du64, hn::InterleaveUpper(du32, s0, s2));
+  const auto t2 = hn::BitCast(du64, hn::InterleaveLower(du32, s1, s3));
+  const auto t3 = hn::BitCast(du64, hn::InterleaveUpper(du32, s1, s3));
+  const auto t4 = hn::BitCast(du64, hn::InterleaveLower(du32, s4, s6));
+  const auto t5 = hn::BitCast(du64, hn::InterleaveUpper(du32, s4, s6));
+  const auto t6 = hn::BitCast(du64, hn::InterleaveLower(du32, s5, s7));
+  const auto t7 = hn::BitCast(du64, hn::InterleaveUpper(du32, s5, s7));
+
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveLower(du64, t0, t4)), du8, c0_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveUpper(du64, t0, t4)), du8, c1_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveLower(du64, t1, t5)), du8, c2_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveUpper(du64, t1, t5)), du8, c3_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveLower(du64, t2, t6)), du8, c4_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveUpper(du64, t2, t6)), du8, c5_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveLower(du64, t3, t7)), du8, c6_ptr);
+  hn::StoreU(hn::BitCast(du8, hn::InterleaveUpper(du64, t3, t7)), du8, c7_ptr);
+}
+#endif  // HWY_TARGET != HWY_SCALAR
+
+template <typename Word>
+void CopyTileColMajorUnitsNoPadding(const uint8_t* src_batch_ptr,
+                                    uint8_t* dst_tile_ptr, int64_t tile_row,
+                                    int64_t tile_col, int64_t tile_H,
+                                    int64_t tile_W, int64_t H, int64_t itemsize,
+                                    int64_t num_groups) {
+  constexpr size_t kWordBytes = sizeof(Word);
+  const int64_t logical_row_start = tile_row * tile_H;
+  const int64_t logical_col_start = tile_col * tile_W;
+  const int64_t src_stride_bytes = H * itemsize;
+  const uint8_t* src_base =
+      src_batch_ptr + (logical_col_start * H + logical_row_start) * itemsize;
+  const int64_t dst_group_stride = tile_W * kWordBytes;
+
+  if (num_groups == 4) {
+    uint8_t* dst0 = dst_tile_ptr + 0 * dst_group_stride;
+    uint8_t* dst1 = dst_tile_ptr + 1 * dst_group_stride;
+    uint8_t* dst2 = dst_tile_ptr + 2 * dst_group_stride;
+    uint8_t* dst3 = dst_tile_ptr + 3 * dst_group_stride;
+    int64_t c = 0;
+#if HWY_TARGET != HWY_SCALAR
+    if constexpr (kWordBytes == 4) {
+      for (; c + 4 <= tile_W; c += 4) {
+        const uint8_t* s = src_base + c * src_stride_bytes;
+        const int64_t d_off = c * 4;
+        Transpose4x4U32(s + 0 * src_stride_bytes, s + 1 * src_stride_bytes,
+                        s + 2 * src_stride_bytes, s + 3 * src_stride_bytes,
+                        dst0 + d_off, dst1 + d_off, dst2 + d_off, dst3 + d_off);
+      }
+    }
+#endif
+    for (; c < tile_W; ++c) {
+      const uint8_t* src_col = src_base + c * src_stride_bytes;
+      const int64_t d_off = c * kWordBytes;
+      StoreUnaligned<Word>(dst0 + d_off,
+                           LoadUnaligned<Word>(src_col + 0 * kWordBytes));
+      StoreUnaligned<Word>(dst1 + d_off,
+                           LoadUnaligned<Word>(src_col + 1 * kWordBytes));
+      StoreUnaligned<Word>(dst2 + d_off,
+                           LoadUnaligned<Word>(src_col + 2 * kWordBytes));
+      StoreUnaligned<Word>(dst3 + d_off,
+                           LoadUnaligned<Word>(src_col + 3 * kWordBytes));
+    }
+  } else if (num_groups == 8) {
+    uint8_t* dst0 = dst_tile_ptr + 0 * dst_group_stride;
+    uint8_t* dst1 = dst_tile_ptr + 1 * dst_group_stride;
+    uint8_t* dst2 = dst_tile_ptr + 2 * dst_group_stride;
+    uint8_t* dst3 = dst_tile_ptr + 3 * dst_group_stride;
+    uint8_t* dst4 = dst_tile_ptr + 4 * dst_group_stride;
+    uint8_t* dst5 = dst_tile_ptr + 5 * dst_group_stride;
+    uint8_t* dst6 = dst_tile_ptr + 6 * dst_group_stride;
+    uint8_t* dst7 = dst_tile_ptr + 7 * dst_group_stride;
+    int64_t c = 0;
+#if HWY_TARGET != HWY_SCALAR
+    if constexpr (kWordBytes == 2) {
+      for (; c + 8 <= tile_W; c += 8) {
+        const uint8_t* s = src_base + c * src_stride_bytes;
+        const int64_t d_off = c * 2;
+        Transpose8x8U16(s + 0 * src_stride_bytes, s + 1 * src_stride_bytes,
+                        s + 2 * src_stride_bytes, s + 3 * src_stride_bytes,
+                        s + 4 * src_stride_bytes, s + 5 * src_stride_bytes,
+                        s + 6 * src_stride_bytes, s + 7 * src_stride_bytes,
+                        dst0 + d_off, dst1 + d_off, dst2 + d_off, dst3 + d_off,
+                        dst4 + d_off, dst5 + d_off, dst6 + d_off, dst7 + d_off);
+      }
+    }
+#endif
+    for (; c < tile_W; ++c) {
+      const uint8_t* src_col = src_base + c * src_stride_bytes;
+      const int64_t d_off = c * kWordBytes;
+      StoreUnaligned<Word>(dst0 + d_off,
+                           LoadUnaligned<Word>(src_col + 0 * kWordBytes));
+      StoreUnaligned<Word>(dst1 + d_off,
+                           LoadUnaligned<Word>(src_col + 1 * kWordBytes));
+      StoreUnaligned<Word>(dst2 + d_off,
+                           LoadUnaligned<Word>(src_col + 2 * kWordBytes));
+      StoreUnaligned<Word>(dst3 + d_off,
+                           LoadUnaligned<Word>(src_col + 3 * kWordBytes));
+      StoreUnaligned<Word>(dst4 + d_off,
+                           LoadUnaligned<Word>(src_col + 4 * kWordBytes));
+      StoreUnaligned<Word>(dst5 + d_off,
+                           LoadUnaligned<Word>(src_col + 5 * kWordBytes));
+      StoreUnaligned<Word>(dst6 + d_off,
+                           LoadUnaligned<Word>(src_col + 6 * kWordBytes));
+      StoreUnaligned<Word>(dst7 + d_off,
+                           LoadUnaligned<Word>(src_col + 7 * kWordBytes));
+    }
+  } else if (num_groups == 2) {
+    uint8_t* dst0 = dst_tile_ptr + 0 * dst_group_stride;
+    uint8_t* dst1 = dst_tile_ptr + 1 * dst_group_stride;
+    for (int64_t c = 0; c < tile_W; ++c) {
+      const uint8_t* src_col = src_base + c * src_stride_bytes;
+      const int64_t d_off = c * kWordBytes;
+      StoreUnaligned<Word>(dst0 + d_off,
+                           LoadUnaligned<Word>(src_col + 0 * kWordBytes));
+      StoreUnaligned<Word>(dst1 + d_off,
+                           LoadUnaligned<Word>(src_col + 1 * kWordBytes));
+    }
+  } else {
+    for (int64_t c = 0; c < tile_W; ++c) {
+      const uint8_t* src_col = src_base + c * src_stride_bytes;
+      for (int64_t g = 0; g < num_groups; ++g) {
+        StoreUnaligned<Word>(dst_tile_ptr + (g * tile_W + c) * kWordBytes,
+                             LoadUnaligned<Word>(src_col + g * kWordBytes));
+      }
+    }
+  }
+}
+
+void CopyTileColMajorNoPadding(const uint8_t* src_batch_ptr,
+                               uint8_t* dst_tile_ptr, int64_t tile_row,
+                               int64_t tile_col, int64_t tile_H, int64_t tile_W,
+                               int64_t H, int64_t itemsize,
+                               int64_t packing_factor) {
+  const int64_t num_groups = tile_H / packing_factor;
+  const int64_t unit_bytes = packing_factor * itemsize;
+  switch (unit_bytes) {
+    case 4:
+      CopyTileColMajorUnitsNoPadding<uint32_t>(src_batch_ptr, dst_tile_ptr,
+                                               tile_row, tile_col, tile_H,
+                                               tile_W, H, itemsize, num_groups);
+      break;
+    case 2:
+      CopyTileColMajorUnitsNoPadding<uint16_t>(src_batch_ptr, dst_tile_ptr,
+                                               tile_row, tile_col, tile_H,
+                                               tile_W, H, itemsize, num_groups);
+      break;
+    case 1:
+      CopyTileColMajorUnitsNoPadding<uint8_t>(src_batch_ptr, dst_tile_ptr,
+                                              tile_row, tile_col, tile_H,
+                                              tile_W, H, itemsize, num_groups);
+      break;
+    case 8:
+      CopyTileColMajorUnitsNoPadding<uint64_t>(src_batch_ptr, dst_tile_ptr,
+                                               tile_row, tile_col, tile_H,
+                                               tile_W, H, itemsize, num_groups);
+      break;
+    default: {
+      const int64_t logical_row_start = tile_row * tile_H;
+      const int64_t logical_col_start = tile_col * tile_W;
+      const int64_t src_stride_bytes = H * itemsize;
+      const uint8_t* src_base =
+          src_batch_ptr +
+          (logical_col_start * H + logical_row_start) * itemsize;
+      for (int64_t c = 0; c < tile_W; ++c) {
+        const uint8_t* src_col = src_base + c * src_stride_bytes;
+        for (int64_t g = 0; g < num_groups; ++g) {
+          std::memcpy(dst_tile_ptr + (g * tile_W + c) * unit_bytes,
+                      src_col + g * unit_bytes, unit_bytes);
+        }
+      }
+      break;
+    }
+  }
+}
+
+void CopyTileColMajorWithPadding(const uint8_t* src_batch_ptr,
+                                 uint8_t* dst_tile_ptr, int64_t tile_row,
+                                 int64_t tile_col, int64_t tile_H,
+                                 int64_t tile_W, int64_t H, int64_t W,
+                                 int64_t itemsize, int64_t packing_factor,
+                                 int64_t tile_size_bytes) {
+  ZeroRowHighway(dst_tile_ptr, static_cast<size_t>(tile_size_bytes));
+  const int64_t logical_row_start = tile_row * tile_H;
+  const int64_t logical_col_start = tile_col * tile_W;
+  const int64_t valid_H = std::clamp<int64_t>(H - logical_row_start, 0, tile_H);
+  const int64_t valid_W = std::clamp<int64_t>(W - logical_col_start, 0, tile_W);
+  if (valid_H <= 0 || valid_W <= 0) {
+    return;
+  }
+
+  for (int64_t c = 0; c < valid_W; ++c) {
+    const uint8_t* src_col =
+        src_batch_ptr +
+        ((logical_col_start + c) * H + logical_row_start) * itemsize;
+    for (int64_t r = 0; r < valid_H; ++r) {
+      int64_t g = r / packing_factor;
+      int64_t p = r % packing_factor;
+      int64_t dst_elem_idx = (g * tile_W + c) * packing_factor + p;
+      std::memcpy(dst_tile_ptr + dst_elem_idx * itemsize,
+                  src_col + r * itemsize, itemsize);
+    }
+  }
+}
+
+template <typename Word>
+void DetileSingleTileColMajorUnitsNoPadding(const uint8_t* src_tile_ptr,
+                                            uint8_t* dst_batch_ptr,
+                                            int64_t tile_row, int64_t tile_col,
+                                            int64_t tile_H, int64_t tile_W,
+                                            int64_t H, int64_t itemsize,
+                                            int64_t num_groups) {
+  constexpr size_t kWordBytes = sizeof(Word);
+  const int64_t logical_row_start = tile_row * tile_H;
+  const int64_t logical_col_start = tile_col * tile_W;
+  const int64_t dst_stride_bytes = H * itemsize;
+  uint8_t* dst_base =
+      dst_batch_ptr + (logical_col_start * H + logical_row_start) * itemsize;
+  const int64_t src_group_stride = tile_W * kWordBytes;
+
+  if (num_groups == 4) {
+    const uint8_t* src0 = src_tile_ptr + 0 * src_group_stride;
+    const uint8_t* src1 = src_tile_ptr + 1 * src_group_stride;
+    const uint8_t* src2 = src_tile_ptr + 2 * src_group_stride;
+    const uint8_t* src3 = src_tile_ptr + 3 * src_group_stride;
+    int64_t c = 0;
+#if HWY_TARGET != HWY_SCALAR
+    if constexpr (kWordBytes == 4) {
+      for (; c + 4 <= tile_W; c += 4) {
+        const int64_t s_off = c * 4;
+        uint8_t* d = dst_base + c * dst_stride_bytes;
+        Transpose4x4U32(src0 + s_off, src1 + s_off, src2 + s_off, src3 + s_off,
+                        d + 0 * dst_stride_bytes, d + 1 * dst_stride_bytes,
+                        d + 2 * dst_stride_bytes, d + 3 * dst_stride_bytes);
+      }
+    }
+#endif
+    for (; c < tile_W; ++c) {
+      uint8_t* dst_col = dst_base + c * dst_stride_bytes;
+      const int64_t s_off = c * kWordBytes;
+      StoreUnaligned<Word>(dst_col + 0 * kWordBytes,
+                           LoadUnaligned<Word>(src0 + s_off));
+      StoreUnaligned<Word>(dst_col + 1 * kWordBytes,
+                           LoadUnaligned<Word>(src1 + s_off));
+      StoreUnaligned<Word>(dst_col + 2 * kWordBytes,
+                           LoadUnaligned<Word>(src2 + s_off));
+      StoreUnaligned<Word>(dst_col + 3 * kWordBytes,
+                           LoadUnaligned<Word>(src3 + s_off));
+    }
+  } else if (num_groups == 8) {
+    const uint8_t* src0 = src_tile_ptr + 0 * src_group_stride;
+    const uint8_t* src1 = src_tile_ptr + 1 * src_group_stride;
+    const uint8_t* src2 = src_tile_ptr + 2 * src_group_stride;
+    const uint8_t* src3 = src_tile_ptr + 3 * src_group_stride;
+    const uint8_t* src4 = src_tile_ptr + 4 * src_group_stride;
+    const uint8_t* src5 = src_tile_ptr + 5 * src_group_stride;
+    const uint8_t* src6 = src_tile_ptr + 6 * src_group_stride;
+    const uint8_t* src7 = src_tile_ptr + 7 * src_group_stride;
+    int64_t c = 0;
+#if HWY_TARGET != HWY_SCALAR
+    if constexpr (kWordBytes == 2) {
+      for (; c + 8 <= tile_W; c += 8) {
+        const int64_t s_off = c * 2;
+        uint8_t* d = dst_base + c * dst_stride_bytes;
+        Transpose8x8U16(src0 + s_off, src1 + s_off, src2 + s_off, src3 + s_off,
+                        src4 + s_off, src5 + s_off, src6 + s_off, src7 + s_off,
+                        d + 0 * dst_stride_bytes, d + 1 * dst_stride_bytes,
+                        d + 2 * dst_stride_bytes, d + 3 * dst_stride_bytes,
+                        d + 4 * dst_stride_bytes, d + 5 * dst_stride_bytes,
+                        d + 6 * dst_stride_bytes, d + 7 * dst_stride_bytes);
+      }
+    }
+#endif
+    for (; c < tile_W; ++c) {
+      uint8_t* dst_col = dst_base + c * dst_stride_bytes;
+      const int64_t s_off = c * kWordBytes;
+      StoreUnaligned<Word>(dst_col + 0 * kWordBytes,
+                           LoadUnaligned<Word>(src0 + s_off));
+      StoreUnaligned<Word>(dst_col + 1 * kWordBytes,
+                           LoadUnaligned<Word>(src1 + s_off));
+      StoreUnaligned<Word>(dst_col + 2 * kWordBytes,
+                           LoadUnaligned<Word>(src2 + s_off));
+      StoreUnaligned<Word>(dst_col + 3 * kWordBytes,
+                           LoadUnaligned<Word>(src3 + s_off));
+      StoreUnaligned<Word>(dst_col + 4 * kWordBytes,
+                           LoadUnaligned<Word>(src4 + s_off));
+      StoreUnaligned<Word>(dst_col + 5 * kWordBytes,
+                           LoadUnaligned<Word>(src5 + s_off));
+      StoreUnaligned<Word>(dst_col + 6 * kWordBytes,
+                           LoadUnaligned<Word>(src6 + s_off));
+      StoreUnaligned<Word>(dst_col + 7 * kWordBytes,
+                           LoadUnaligned<Word>(src7 + s_off));
+    }
+  } else if (num_groups == 2) {
+    const uint8_t* src0 = src_tile_ptr + 0 * src_group_stride;
+    const uint8_t* src1 = src_tile_ptr + 1 * src_group_stride;
+    for (int64_t c = 0; c < tile_W; ++c) {
+      uint8_t* dst_col = dst_base + c * dst_stride_bytes;
+      const int64_t s_off = c * kWordBytes;
+      StoreUnaligned<Word>(dst_col + 0 * kWordBytes,
+                           LoadUnaligned<Word>(src0 + s_off));
+      StoreUnaligned<Word>(dst_col + 1 * kWordBytes,
+                           LoadUnaligned<Word>(src1 + s_off));
+    }
+  } else {
+    for (int64_t c = 0; c < tile_W; ++c) {
+      uint8_t* dst_col = dst_base + c * dst_stride_bytes;
+      for (int64_t g = 0; g < num_groups; ++g) {
+        StoreUnaligned<Word>(
+            dst_col + g * kWordBytes,
+            LoadUnaligned<Word>(src_tile_ptr + (g * tile_W + c) * kWordBytes));
+      }
+    }
+  }
+}
+
+void DetileSingleTileColMajorNoPadding(const uint8_t* src_tile_ptr,
+                                       uint8_t* dst_batch_ptr, int64_t tile_row,
+                                       int64_t tile_col, int64_t tile_H,
+                                       int64_t tile_W, int64_t H,
+                                       int64_t itemsize,
+                                       int64_t packing_factor) {
+  const int64_t num_groups = tile_H / packing_factor;
+  const int64_t unit_bytes = packing_factor * itemsize;
+  switch (unit_bytes) {
+    case 4:
+      DetileSingleTileColMajorUnitsNoPadding<uint32_t>(
+          src_tile_ptr, dst_batch_ptr, tile_row, tile_col, tile_H, tile_W, H,
+          itemsize, num_groups);
+      break;
+    case 2:
+      DetileSingleTileColMajorUnitsNoPadding<uint16_t>(
+          src_tile_ptr, dst_batch_ptr, tile_row, tile_col, tile_H, tile_W, H,
+          itemsize, num_groups);
+      break;
+    case 1:
+      DetileSingleTileColMajorUnitsNoPadding<uint8_t>(
+          src_tile_ptr, dst_batch_ptr, tile_row, tile_col, tile_H, tile_W, H,
+          itemsize, num_groups);
+      break;
+    case 8:
+      DetileSingleTileColMajorUnitsNoPadding<uint64_t>(
+          src_tile_ptr, dst_batch_ptr, tile_row, tile_col, tile_H, tile_W, H,
+          itemsize, num_groups);
+      break;
+    default: {
+      const int64_t logical_row_start = tile_row * tile_H;
+      const int64_t logical_col_start = tile_col * tile_W;
+      const int64_t dst_stride_bytes = H * itemsize;
+      uint8_t* dst_base =
+          dst_batch_ptr +
+          (logical_col_start * H + logical_row_start) * itemsize;
+      for (int64_t c = 0; c < tile_W; ++c) {
+        uint8_t* dst_col = dst_base + c * dst_stride_bytes;
+        for (int64_t g = 0; g < num_groups; ++g) {
+          std::memcpy(dst_col + g * unit_bytes,
+                      src_tile_ptr + (g * tile_W + c) * unit_bytes, unit_bytes);
+        }
+      }
+      break;
+    }
+  }
+}
+
+void DetileSingleTileColMajorWithPadding(const uint8_t* src_tile_ptr,
+                                         uint8_t* dst_batch_ptr,
+                                         int64_t tile_row, int64_t tile_col,
+                                         int64_t tile_H, int64_t tile_W,
+                                         int64_t H, int64_t W, int64_t itemsize,
+                                         int64_t packing_factor) {
+  const int64_t logical_row_start = tile_row * tile_H;
+  const int64_t logical_col_start = tile_col * tile_W;
+  const int64_t valid_H = std::clamp<int64_t>(H - logical_row_start, 0, tile_H);
+  const int64_t valid_W = std::clamp<int64_t>(W - logical_col_start, 0, tile_W);
+  if (valid_H <= 0 || valid_W <= 0) {
+    return;
+  }
+
+  for (int64_t c = 0; c < valid_W; ++c) {
+    uint8_t* dst_col =
+        dst_batch_ptr +
+        ((logical_col_start + c) * H + logical_row_start) * itemsize;
+    for (int64_t r = 0; r < valid_H; ++r) {
+      int64_t g = r / packing_factor;
+      int64_t p = r % packing_factor;
+      int64_t src_elem_idx = (g * tile_W + c) * packing_factor + p;
+      std::memcpy(dst_col + r * itemsize,
+                  src_tile_ptr + src_elem_idx * itemsize, itemsize);
+    }
+  }
+}
+
+// Tiles a buffer using an optimized path for standard column-major layouts.
+// Iterates tile_col in the outer loop and tile_row in the inner loop so that
+// the tile_W rows of src_linear stay hot in L1d cache (128 * 64B = 8 KB) as
+// tile_row advances sequentially along the stride-1 dimension H = D1.
+absl::Status TileBufferColMajorOptimized(
+    const uint8_t* src_linear, uint8_t* dst_tiled, const xla::Shape& shape,
+    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
+  const int R = shape.dimensions().size();
+  int64_t H = shape.dimensions(layout.minor_to_major(1));
+  int64_t W = shape.dimensions(layout.minor_to_major(0));
+  int64_t itemsize =
+      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+
+  const xla::Tile& tile = layout.tiles(0);
+  int64_t tile_H = tile.dimension(0);
+  int64_t tile_W = tile.dimension(1);
+  int64_t packing_factor = 1;
+  if (layout.tiles().size() >= 2) {
+    packing_factor = layout.tiles(1).dimension(0);
+  }
+
+  int64_t num_tiles_0 = xla::CeilOfRatio(H, tile_H);
+  int64_t num_tiles_1 = xla::CeilOfRatio(W, tile_W);
+  int64_t tile_size_bytes = tile_H * tile_W * itemsize;
+
+  int64_t batch_size = 1;
+  for (int i = 2; i < R; ++i) {
+    batch_size *= shape.dimensions(layout.minor_to_major(i));
+  }
+
+  int64_t matrix_size_bytes = H * W * itemsize;
+  int64_t tiled_matrix_size_bytes = num_tiles_0 * num_tiles_1 * tile_size_bytes;
+  bool has_padding = (H % tile_H != 0) || (W % tile_W != 0);
+
+  int64_t total_tasks = batch_size * num_tiles_1;
+  int64_t total_bytes = batch_size * H * W * itemsize;
+  int64_t desired_chunks =
+      std::max<int64_t>(1, total_bytes / kParallelizationThresholdBytes);
+
+  auto process_tile_col = [&](int64_t b, int64_t tile_col) {
+    const uint8_t* src_batch_ptr = src_linear + b * matrix_size_bytes;
+    uint8_t* dst_batch_ptr = dst_tiled + b * tiled_matrix_size_bytes;
+    bool is_col_interior = (tile_col * tile_W + tile_W <= W);
+
+    if (!has_padding) {
+      for (int64_t tile_row = 0; tile_row < num_tiles_0; ++tile_row) {
+        int64_t tile_index = tile_row * num_tiles_1 + tile_col;
+        uint8_t* dst_tile_ptr = dst_batch_ptr + tile_index * tile_size_bytes;
+        CopyTileColMajorNoPadding(src_batch_ptr, dst_tile_ptr, tile_row,
+                                  tile_col, tile_H, tile_W, H, itemsize,
+                                  packing_factor);
+      }
+    } else {
+      for (int64_t tile_row = 0; tile_row < num_tiles_0; ++tile_row) {
+        int64_t tile_index = tile_row * num_tiles_1 + tile_col;
+        uint8_t* dst_tile_ptr = dst_batch_ptr + tile_index * tile_size_bytes;
+        bool is_row_interior = (tile_row * tile_H + tile_H <= H);
+        if (is_row_interior && is_col_interior) {
+          CopyTileColMajorNoPadding(src_batch_ptr, dst_tile_ptr, tile_row,
+                                    tile_col, tile_H, tile_W, H, itemsize,
+                                    packing_factor);
+        } else {
+          CopyTileColMajorWithPadding(src_batch_ptr, dst_tile_ptr, tile_row,
+                                      tile_col, tile_H, tile_W, H, W, itemsize,
+                                      packing_factor, tile_size_bytes);
+        }
+      }
+    }
+  };
+
+  if (desired_chunks <= 1 || total_tasks <= 1) {
+    for (int64_t b = 0; b < batch_size; ++b) {
+      for (int64_t tile_col = 0; tile_col < num_tiles_1; ++tile_col) {
+        process_tile_col(b, tile_col);
+      }
+    }
+  } else {
+    ExecuteParallelTasks(total_tasks, num_tiles_1, desired_chunks, pool,
+                         process_tile_col);
+  }
+
+  return absl::OkStatus();
+}
+
+absl::Status DetileBufferColMajorOptimized(
+    const uint8_t* src_tiled, uint8_t* dst_linear, const xla::Shape& shape,
+    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
+  const int R = shape.dimensions().size();
+  int64_t H = shape.dimensions(layout.minor_to_major(1));
+  int64_t W = shape.dimensions(layout.minor_to_major(0));
+  int64_t itemsize =
+      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+
+  const xla::Tile& tile = layout.tiles(0);
+  int64_t tile_H = tile.dimension(0);
+  int64_t tile_W = tile.dimension(1);
+  int64_t packing_factor = 1;
+  if (layout.tiles().size() >= 2) {
+    packing_factor = layout.tiles(1).dimension(0);
+  }
+
+  int64_t num_tiles_0 = xla::CeilOfRatio(H, tile_H);
+  int64_t num_tiles_1 = xla::CeilOfRatio(W, tile_W);
+  int64_t tile_size_bytes = tile_H * tile_W * itemsize;
+
+  int64_t batch_size = 1;
+  for (int i = 2; i < R; ++i) {
+    batch_size *= shape.dimensions(layout.minor_to_major(i));
+  }
+
+  int64_t matrix_size_bytes = H * W * itemsize;
+  int64_t tiled_matrix_size_bytes = num_tiles_0 * num_tiles_1 * tile_size_bytes;
+  bool has_padding = (H % tile_H != 0) || (W % tile_W != 0);
+
+  int64_t total_tasks = batch_size * num_tiles_1;
+  int64_t total_bytes = batch_size * H * W * itemsize;
+  int64_t desired_chunks =
+      std::max<int64_t>(1, total_bytes / kParallelizationThresholdBytes);
+
+  auto process_tile_col = [&](int64_t b, int64_t tile_col) {
+    const uint8_t* src_batch_ptr = src_tiled + b * tiled_matrix_size_bytes;
+    uint8_t* dst_batch_ptr = dst_linear + b * matrix_size_bytes;
+    bool is_col_interior = (tile_col * tile_W + tile_W <= W);
+
+    if (!has_padding) {
+      for (int64_t tile_row = 0; tile_row < num_tiles_0; ++tile_row) {
+        int64_t tile_index = tile_row * num_tiles_1 + tile_col;
+        const uint8_t* src_tile_ptr =
+            src_batch_ptr + tile_index * tile_size_bytes;
+        DetileSingleTileColMajorNoPadding(src_tile_ptr, dst_batch_ptr, tile_row,
+                                          tile_col, tile_H, tile_W, H, itemsize,
+                                          packing_factor);
+      }
+    } else {
+      for (int64_t tile_row = 0; tile_row < num_tiles_0; ++tile_row) {
+        int64_t tile_index = tile_row * num_tiles_1 + tile_col;
+        const uint8_t* src_tile_ptr =
+            src_batch_ptr + tile_index * tile_size_bytes;
+        bool is_row_interior = (tile_row * tile_H + tile_H <= H);
+        if (is_row_interior && is_col_interior) {
+          DetileSingleTileColMajorNoPadding(src_tile_ptr, dst_batch_ptr,
+                                            tile_row, tile_col, tile_H, tile_W,
+                                            H, itemsize, packing_factor);
+        } else {
+          DetileSingleTileColMajorWithPadding(
+              src_tile_ptr, dst_batch_ptr, tile_row, tile_col, tile_H, tile_W,
+              H, W, itemsize, packing_factor);
+        }
+      }
+    }
+  };
+
+  if (desired_chunks <= 1 || total_tasks <= 1) {
+    for (int64_t b = 0; b < batch_size; ++b) {
+      for (int64_t tile_col = 0; tile_col < num_tiles_1; ++tile_col) {
+        process_tile_col(b, tile_col);
+      }
+    }
+  } else {
+    ExecuteParallelTasks(total_tasks, num_tiles_1, desired_chunks, pool,
+                         process_tile_col);
+  }
+
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 int64_t GetTiledBufferElements(const xla::Shape& shape) {
@@ -970,17 +1824,16 @@ int64_t GetTiledBufferElements(const xla::Shape& shape) {
   if (num_dims == 0) {
     return 1;
   }
+  if (!shape.has_layout() ||
+      shape.layout().minor_to_major().size() != num_dims) {
+    return xla::ShapeUtil::ElementsIn(shape);
+  }
 
   std::vector<int64_t> current_shape;
   current_shape.reserve(std::max(num_dims, 2));
-  if (num_dims == 1) {
-    current_shape.push_back(1);
-    current_shape.push_back(shape.dimensions(0));
-  } else {
-    for (int64_t i = num_dims - 1; i >= 0; --i) {
-      int64_t logical_dim = shape.layout().minor_to_major(i);
-      current_shape.push_back(shape.dimensions(logical_dim));
-    }
+  for (int64_t i = num_dims - 1; i >= 0; --i) {
+    int64_t logical_dim = shape.layout().minor_to_major(i);
+    current_shape.push_back(shape.dimensions(logical_dim));
   }
 
   for (const xla::Tile& tile : shape.layout().tiles()) {
@@ -1027,7 +1880,10 @@ absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
                           const xla::Shape& shape, const xla::Layout& layout,
                           tpu_raiden::NumaThreadPool* pool) {
   if (layout.tiles().empty()) {
-    std::memcpy(dst_linear, src_tiled, xla::ShapeUtil::ByteSizeOf(shape));
+    const int64_t bytes = xla::ShapeUtil::ByteSizeOf(shape);
+    if (bytes > 0) {
+      std::memcpy(dst_linear, src_tiled, bytes);
+    }
     return absl::OkStatus();
   }
 
@@ -1035,20 +1891,27 @@ absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
     return DetileBufferNDOptimized(src_tiled, dst_linear, shape, layout, pool);
   }
 
+  if (IsStandardColMajorTiled(shape, layout)) {
+    return DetileBufferColMajorOptimized(src_tiled, dst_linear, shape, layout,
+                                         pool);
+  }
+
   int64_t itemsize =
       xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
 
+  xla::Shape tiled_shape = shape;
+  *tiled_shape.mutable_layout() = layout;
   xla::Shape standard_shape =
       xla::ShapeUtil::MakeShape(shape.element_type(), shape.dimensions());
 
   xla::ShapeUtil::ForEachIndexNoStatus(
-      shape, [&](absl::Span<const int64_t> indices) -> bool {
+      tiled_shape, [&](absl::Span<const int64_t> indices) -> bool {
         int64_t linear_offset =
             xla::IndexUtil::MultidimensionalIndexToLinearIndex(standard_shape,
                                                                indices) *
             itemsize;
         int64_t physical_offset =
-            xla::LayoutUtil::LinearIndexForNestedTiling(shape, indices) *
+            xla::LayoutUtil::LinearIndexForNestedTiling(tiled_shape, indices) *
             itemsize;
         std::memcpy(dst_linear + linear_offset, src_tiled + physical_offset,
                     itemsize);
@@ -1062,7 +1925,10 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
                         const xla::Shape& shape, const xla::Layout& layout,
                         tpu_raiden::NumaThreadPool* pool) {
   if (layout.tiles().empty()) {
-    std::memcpy(dst_tiled, src_linear, xla::ShapeUtil::ByteSizeOf(shape));
+    const int64_t bytes = xla::ShapeUtil::ByteSizeOf(shape);
+    if (bytes > 0) {
+      std::memcpy(dst_tiled, src_linear, bytes);
+    }
     return absl::OkStatus();
   }
 
@@ -1070,10 +1936,17 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
     return TileBufferNDOptimized(src_linear, dst_tiled, shape, layout, pool);
   }
 
+  if (IsStandardColMajorTiled(shape, layout)) {
+    return TileBufferColMajorOptimized(src_linear, dst_tiled, shape, layout,
+                                       pool);
+  }
+
   int64_t itemsize =
       xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
 
-  int64_t total_physical_elements = GetTiledBufferElements(shape);
+  xla::Shape tiled_shape = shape;
+  *tiled_shape.mutable_layout() = layout;
+  int64_t total_physical_elements = GetTiledBufferElements(tiled_shape);
   int64_t logical_elements = 1;
   for (int64_t dim : shape.dimensions()) {
     logical_elements *= dim;
@@ -1086,13 +1959,13 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
       xla::ShapeUtil::MakeShape(shape.element_type(), shape.dimensions());
 
   xla::ShapeUtil::ForEachIndexNoStatus(
-      shape, [&](absl::Span<const int64_t> indices) -> bool {
+      tiled_shape, [&](absl::Span<const int64_t> indices) -> bool {
         int64_t linear_offset =
             xla::IndexUtil::MultidimensionalIndexToLinearIndex(standard_shape,
                                                                indices) *
             itemsize;
         int64_t physical_offset =
-            xla::LayoutUtil::LinearIndexForNestedTiling(shape, indices) *
+            xla::LayoutUtil::LinearIndexForNestedTiling(tiled_shape, indices) *
             itemsize;
         std::memcpy(dst_tiled + physical_offset, src_linear + linear_offset,
                     itemsize);
