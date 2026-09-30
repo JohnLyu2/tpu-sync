@@ -224,9 +224,10 @@ TEST(KVCacheListenerTest, PoolReceiverRoutesToPoolReshardRegisterRecv) {
 TEST(KVCacheListenerTest, PoolReceiverArmReplyCarriesHostBaseAddrs) {
   RoutingKVCacheManager manager(/*host_blocks_to_allocate=*/1);
   KVCacheListener listener(&manager, /*listener_port=*/0);
-  absl::StatusOr<std::vector<uint64_t>> expected = manager.PoolHostBaseAddrs(0);
+  absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> expected =
+      manager.PoolHostBaseAddrs(/*uuid=*/1234, 0);
   ASSERT_TRUE(expected.ok()) << expected.status();
-  ASSERT_EQ(expected->size(), 1u);
+  ASSERT_EQ(expected->host_base_addrs_size(), 1);
 
   ControlRequest request;
   StartTransferRequest* plan = AddPoolPlan(&request, /*is_sender=*/false);
@@ -238,7 +239,9 @@ TEST(KVCacheListenerTest, PoolReceiverArmReplyCarriesHostBaseAddrs) {
   EXPECT_TRUE(response.success()) << response.message();
   ASSERT_TRUE(response.receiver_pool_addrs().contains(0));
   const auto& addrs = response.receiver_pool_addrs().at(0).host_base_addrs();
-  EXPECT_EQ(std::vector<uint64_t>(addrs.begin(), addrs.end()), *expected);
+  EXPECT_EQ(std::vector<uint64_t>(addrs.begin(), addrs.end()),
+            std::vector<uint64_t>(expected->host_base_addrs().begin(),
+                                  expected->host_base_addrs().end()));
   const PoolSpec* pool = manager.pool(0);
   ASSERT_NE(pool, nullptr);
   EXPECT_EQ(response.receiver_pool_addrs().at(0).block_stride_bytes(),
@@ -357,9 +360,10 @@ TEST(KVCacheListenerTest, GrpcBackendReceiverArmReplyCarriesHostBaseAddrs) {
   KVCacheListener listener(&manager, /*listener_port=*/0,
                            ControlPipeBackendType::kGrpc);
   ASSERT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
-  absl::StatusOr<std::vector<uint64_t>> expected = manager.PoolHostBaseAddrs(0);
+  absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> expected =
+      manager.PoolHostBaseAddrs(/*uuid=*/1234, 0);
   ASSERT_TRUE(expected.ok()) << expected.status();
-  ASSERT_EQ(expected->size(), 1u);
+  ASSERT_EQ(expected->host_base_addrs_size(), 1);
 
   ControlPipeConfig cfg;
   cfg.backend_type = ControlPipeBackendType::kGrpc;
@@ -379,7 +383,9 @@ TEST(KVCacheListenerTest, GrpcBackendReceiverArmReplyCarriesHostBaseAddrs) {
   EXPECT_EQ(manager.route(), Route::kPoolReshardRegisterRecv);
   ASSERT_TRUE(response->receiver_pool_addrs().contains(0));
   const auto& addrs = response->receiver_pool_addrs().at(0).host_base_addrs();
-  EXPECT_EQ(std::vector<uint64_t>(addrs.begin(), addrs.end()), *expected);
+  EXPECT_EQ(std::vector<uint64_t>(addrs.begin(), addrs.end()),
+            std::vector<uint64_t>(expected->host_base_addrs().begin(),
+                                  expected->host_base_addrs().end()));
   const PoolSpec* pool = manager.pool(0);
   ASSERT_NE(pool, nullptr);
   EXPECT_EQ(response->receiver_pool_addrs().at(0).block_stride_bytes(),

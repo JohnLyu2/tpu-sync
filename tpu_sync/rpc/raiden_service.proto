@@ -280,6 +280,9 @@ message PoolHostAddrsProto {
   repeated uint64 host_base_addrs = 1;
   int64 block_stride_bytes = 2;
   int64 num_blocks = 3;
+  // Bounded staging: device block id -> host slot leased to this transfer.
+  // Empty means each block lands at its own id.
+  map<int64, int64> host_slot_by_block = 4;
 }
 
 message ReceiverAddrsProto {

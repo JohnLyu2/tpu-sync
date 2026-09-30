@@ -82,29 +82,14 @@ class KVCacheListener final {
                     },
                 .wait_for_pending_work =
                     [engine]() { return engine->WaitForPendingWork(); },
-                .pool_host_addrs = [engine](size_t pool_idx)
+                .pool_host_addrs = [engine](uint64_t uuid, size_t pool_idx)
                     -> absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> {
-                  auto build = [pool_idx](const auto* manager)
-                      -> absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> {
-                    absl::StatusOr<std::vector<uint64_t>> addrs =
-                        manager->PoolHostBaseAddrs(pool_idx);
-                    if (!addrs.ok()) return addrs.status();
-                    tpu_sync::rpc::PoolHostAddrsProto proto;
-                    proto.mutable_host_base_addrs()->Add(addrs->begin(),
-                                                         addrs->end());
-                    if (const auto* pool = manager->pool(pool_idx);
-                        pool != nullptr) {
-                      proto.set_block_stride_bytes(pool->block_stride_bytes);
-                      proto.set_num_blocks(pool->num_blocks);
-                    }
-                    return proto;
-                  };
                   if constexpr (requires {
-                                  engine->PoolHostBaseAddrs(pool_idx);
+                                  engine->PoolHostBaseAddrs(uuid, pool_idx);
                                 }) {
-                    return build(engine);
+                    return engine->PoolHostBaseAddrs(uuid, pool_idx);
                   } else {
-                    return build(engine->base());
+                    return engine->base()->PoolHostBaseAddrs(uuid, pool_idx);
                   }
                 },
             },
@@ -135,7 +120,8 @@ class KVCacheListener final {
     // Pool base address per local shard (KVCacheManagerBase::
     // PoolHostBaseAddrs) and the pool layout, reported in the pool-reshard
     // receiver arm reply.
-    std::function<absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto>(size_t)>
+    std::function<absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto>(uint64_t,
+                                                                    size_t)>
         pool_host_addrs;
   };
 

@@ -140,15 +140,22 @@ const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverPoolAddrs(
 uint8_t* RemoteAddress(const ::tpu_sync::rpc::PoolHostAddrsProto* pool,
                        const ::tpu_sync::rpc::ShardPushEntryProto& entry,
                        int64_t dst_offset, int64_t size) {
-  if (pool == nullptr || entry.dst_shard_idx() < 0 ||
-      entry.dst_shard_idx() >= pool->host_base_addrs_size() ||
-      entry.dst_block_id() < 0 || entry.dst_block_id() >= pool->num_blocks() ||
-      pool->block_stride_bytes() <= 0 || dst_offset < 0 || size < 0 ||
+  if (pool == nullptr) return nullptr;
+  int64_t host_block = entry.dst_block_id();
+  if (!pool->host_slot_by_block().empty()) {
+    auto it = pool->host_slot_by_block().find(host_block);
+    if (it == pool->host_slot_by_block().end()) return nullptr;
+    host_block = it->second;
+  }
+  if (entry.dst_shard_idx() < 0 ||
+      entry.dst_shard_idx() >= pool->host_base_addrs_size() || host_block < 0 ||
+      host_block >= pool->num_blocks() || pool->block_stride_bytes() <= 0 ||
+      dst_offset < 0 || size < 0 ||
       dst_offset > pool->block_stride_bytes() - size) {
     return nullptr;
   }
   const uint64_t addr = pool->host_base_addrs(entry.dst_shard_idx()) +
-                        static_cast<uint64_t>(entry.dst_block_id()) *
+                        static_cast<uint64_t>(host_block) *
                             static_cast<uint64_t>(pool->block_stride_bytes()) +
                         static_cast<uint64_t>(dst_offset);
   return reinterpret_cast<uint8_t*>(addr);
@@ -2328,24 +2335,53 @@ absl::StatusOr<PoolBlockRef> KVCacheManagerBase::GetPoolBlockRef(
   };
 }
 
-absl::StatusOr<std::vector<uint64_t>> KVCacheManagerBase::PoolHostBaseAddrs(
-    size_t pool_idx) const {
+absl::StatusOr<::tpu_sync::rpc::PoolHostAddrsProto>
+KVCacheManagerBase::PoolHostBaseAddrs(uint64_t uuid, size_t pool_idx) const {
   EnsureImplicitPools();
   if (pool_idx >= pools_.size()) {
     return absl::OutOfRangeError(absl::StrCat(
         "pool index ", pool_idx, " out of range: ", pools_.size(), " pools"));
   }
-  std::vector<uint64_t> addrs;
-  if (PoolStorageStagingBounded(pools_[pool_idx].storage_index)) {
-    return addrs;
+  const PoolSpec& pool = pools_[pool_idx];
+  ::tpu_sync::rpc::PoolHostAddrsProto proto;
+  proto.set_block_stride_bytes(pool.block_stride_bytes);
+  proto.set_num_blocks(pool.num_blocks);
+  if (PoolStorageStagingBounded(pool.storage_index)) {
+    // Bounded arena: blocks live in the slots leased to this transfer.
+    // TODO(swasthi): Senders cache these slot addresses as raddr, but the
+    // receiver may release the lease (e.g. on deadline) and re-lease the slots
+    // while a sender can still write to them. Prevent senders from writing to
+    // raddr after the receiver releases its lease.
+    std::shared_ptr<const PoolStagingLease> lease =
+        PoolStagingLeaseSnapshot(pool.storage_index, uuid);
+    if (lease == nullptr) return proto;
+    if (pool.storage_index >= layers_.size() ||
+        layers_[pool.storage_index].shards.size() < num_shards_) {
+      return absl::OutOfRangeError("storage or shard index out of range");
+    }
+    {
+      absl::MutexLock lock(staging_mu_);
+      proto.set_num_blocks(pool_staging_[pool.storage_index].num_slots);
+    }
+    for (const auto& [block_id, slot] : lease->slot_by_block) {
+      (*proto.mutable_host_slot_by_block())[block_id] = slot;
+    }
+    for (size_t sh = 0; sh < num_shards_; ++sh) {
+      const uint8_t* base = layers_[pool.storage_index].shards[sh].host_ptr;
+      if (base == nullptr) {
+        return absl::FailedPreconditionError("host pointer is null");
+      }
+      proto.add_host_base_addrs(reinterpret_cast<uintptr_t>(base) +
+                                pool.base_offset_bytes);
+    }
+    return proto;
   }
-  addrs.reserve(num_shards_);
   for (size_t sh = 0; sh < num_shards_; ++sh) {
     ABSL_ASSIGN_OR_RETURN(PoolBlockRef ref,
                           GetPoolBlockRef(pool_idx, sh, /*block_id=*/0));
-    addrs.push_back(reinterpret_cast<uintptr_t>(ref.ptr));
+    proto.add_host_base_addrs(reinterpret_cast<uintptr_t>(ref.ptr));
   }
-  return addrs;
+  return proto;
 }
 
 const PoolSpec* KVCacheManagerBase::pool(size_t pool_idx) const {

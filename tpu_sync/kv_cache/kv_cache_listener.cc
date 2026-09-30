@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/kv_cache_listener.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -157,7 +158,8 @@ void KVCacheListener::HandleControlRequest(const ControlRequest& req,
           // compute raddr.
           for (int32_t pool_idx : start_req.transfer_pool_indices()) {
             absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> addrs =
-                callbacks_.pool_host_addrs(static_cast<size_t>(pool_idx));
+                callbacks_.pool_host_addrs(start_req.uuid(),
+                                           static_cast<size_t>(pool_idx));
             if (!addrs.ok()) {
               LOG(WARNING) << "No host base address for pool " << pool_idx
                            << ": " << addrs.status();

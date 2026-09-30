@@ -361,9 +361,11 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
       (*(*send_request.mutable_receiver_addrs())[kPeer].mutable_pools())[0];
   dst_pool.set_block_stride_bytes(kDstStride);
   dst_pool.set_num_blocks(kDstBlocks);
-  TF_ASSERT_OK_AND_ASSIGN(std::vector<uint64_t> dst_bases,
-                          receiver.PoolHostBaseAddrs(0));
-  for (uint64_t addr : dst_bases) dst_pool.add_host_base_addrs(addr);
+  TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto dst_bases,
+                          receiver.PoolHostBaseAddrs(/*uuid=*/11, 0));
+  for (uint64_t addr : dst_bases.host_base_addrs()) {
+    dst_pool.add_host_base_addrs(addr);
+  }
   ABSL_ASSERT_OK(sender.RegisterActivePlan(11, send_request,
                                            /*is_sender=*/true));
   std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
@@ -413,6 +415,74 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
   }
 }
 
+// On a bounded receiver the sender addresses the block's leased slot.
+TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot) {
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kBlocks = 16;
+  StagingTestManager receiver(/*num_layers=*/1, /*num_shards=*/1,
+                              /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  receiver.SetDeviceBacked(0, kStride * kBlocks);
+  ABSL_ASSERT_OK(
+      receiver.RegisterPools({DensePool("fa", 0, 0, kStride, kBlocks,
+                                        /*staging_blocks_per_request=*/2)},
+                             /*staging_leases=*/2));
+  ASSERT_TRUE(receiver.PoolStorageStagingBounded(0));
+  ABSL_ASSERT_OK(receiver.AcquirePoolStagingLease(
+      /*uuid=*/11, /*storage_idx=*/0, std::vector<int64_t>{5, 9},
+      absl::Milliseconds(50)));
+
+  StagingTestManager sender(/*num_layers=*/1, /*num_shards=*/1,
+                            /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  sender.SetDeviceBacked(0, kStride * kBlocks);
+  ABSL_ASSERT_OK(sender.RegisterPools(
+      {DensePool("fa", 0, 0, kStride, kBlocks, 0)}, /*staging_leases=*/0));
+
+  constexpr char kPeer[] = "127.0.0.1:1";
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(11);
+  request.set_req_id("req");
+  request.add_transfer_pool_indices(0);
+  auto* group = request.add_pool_groups();
+  group->add_pool_indices(0);
+  group->set_expected_pushes(1);
+  auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(kPeer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_block_id(3);
+  entry->set_dst_block_id(9);
+  entry->set_dst_offset_bytes(8);
+  entry->set_size_bytes(16);
+
+  tpu_sync::rpc::StartTransferRequest recv_request = request;
+  recv_request.set_is_sender(false);
+  ABSL_ASSERT_OK(receiver.RegisterActivePlan(11, recv_request,
+                                             /*is_sender=*/false));
+  std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{9},
+      /*total_bytes=*/16, /*uuid=*/11, /*sender_node_id=*/0, /*peer=*/"",
+      /*src_block_id=*/3);
+  ASSERT_EQ(recv_chunks.size(), 1u);
+
+  tpu_sync::rpc::StartTransferRequest send_request = request;
+  send_request.set_is_sender(true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      (*(*send_request.mutable_receiver_addrs())[kPeer].mutable_pools())[0],
+      receiver.PoolHostBaseAddrs(/*uuid=*/11, /*pool_idx=*/0));
+  ABSL_ASSERT_OK(sender.RegisterActivePlan(11, send_request,
+                                           /*is_sender=*/true));
+  std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{3},
+      /*total_bytes=*/16, /*uuid=*/11, /*sender_node_id=*/-1, kPeer,
+      /*src_block_id=*/-1, /*dst_block_id=*/9);
+  ASSERT_EQ(send_chunks.size(), 1u);
+  EXPECT_EQ(send_chunks[0].raddr, recv_chunks[0].ptr);
+
+  // A transfer without a lease has no host addresses.
+  TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto unleased,
+                          receiver.PoolHostBaseAddrs(12, 0));
+  EXPECT_TRUE(unleased.host_base_addrs().empty());
+}
+
 // PoolHostBaseAddrs reports, per local shard, each pool's base address
 // (storage host pointer + base offset), is empty for bounded staging, and
 // rejects unknown pools.
@@ -426,16 +496,16 @@ TEST(PoolStagingTest, PoolHostBaseAddrs) {
        StridedPool("b", 0, /*base_offset=*/32, kStride, 8, 0)},
       /*staging_leases=*/0));
   for (size_t pool_idx = 0; pool_idx < 2; ++pool_idx) {
-    TF_ASSERT_OK_AND_ASSIGN(std::vector<uint64_t> addrs,
-                            full.PoolHostBaseAddrs(pool_idx));
-    ASSERT_EQ(addrs.size(), 2u);
+    TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto addrs,
+                            full.PoolHostBaseAddrs(/*uuid=*/1, pool_idx));
+    ASSERT_EQ(addrs.host_base_addrs_size(), 2);
     for (size_t sh = 0; sh < 2; ++sh) {
-      EXPECT_EQ(addrs[sh],
+      EXPECT_EQ(addrs.host_base_addrs(sh),
                 reinterpret_cast<uint64_t>(full.GetHostPointer(0, sh)) +
                     full.pool(pool_idx)->base_offset_bytes);
     }
   }
-  EXPECT_THAT(full.PoolHostBaseAddrs(2),
+  EXPECT_THAT(full.PoolHostBaseAddrs(/*uuid=*/1, 2),
               StatusIs(absl::StatusCode::kOutOfRange));
 
   StagingTestManager bounded(/*num_layers=*/1, /*num_shards=*/1,
@@ -445,9 +515,9 @@ TEST(PoolStagingTest, PoolHostBaseAddrs) {
       {DensePool("fa", 0, 0, kStride, 32, /*staging_blocks_per_request=*/2)},
       /*staging_leases=*/2));
   ASSERT_TRUE(bounded.PoolStorageStagingBounded(0));
-  TF_ASSERT_OK_AND_ASSIGN(std::vector<uint64_t> addrs,
-                          bounded.PoolHostBaseAddrs(0));
-  EXPECT_TRUE(addrs.empty());
+  TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto addrs,
+                          bounded.PoolHostBaseAddrs(/*uuid=*/1, 0));
+  EXPECT_TRUE(addrs.host_base_addrs().empty());
 }
 
 }  // namespace
