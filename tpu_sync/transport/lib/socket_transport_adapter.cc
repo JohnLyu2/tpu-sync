@@ -87,18 +87,34 @@ void RecordPushSentBytes(absl::Span<const std::string> local_ips,
                          bytes_sent);
 }
 
+// Clamps `start_ts` against the previous completion watermark (`busy_until`)
+// so concurrent overlapping transfers record non-overlapping active wire
+// duration, and attaches `local_rank` to prevent cross-worker sum inflation.
 void RecordP2pTransferTime(std::chrono::steady_clock::time_point start_ts,
                            std::chrono::steady_clock::time_point end_ts,
                            absl::string_view src_ip, absl::string_view dst_ip) {
-  const absl::Duration duration = absl::FromChrono(end_ts - start_ts);
+  RaidenMetricStore& store = RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) return;
+  using TimePoint = std::chrono::steady_clock::time_point;
+  static std::atomic<TimePoint> busy_until{TimePoint::min()};
+  TimePoint prev_busy = busy_until.load(std::memory_order_relaxed);
+  while (end_ts > prev_busy &&
+         !busy_until.compare_exchange_weak(prev_busy, end_ts,
+                                           std::memory_order_relaxed)) {
+  }
+  const TimePoint effective_start = std::max(start_ts, prev_busy);
+  const absl::Duration duration = absl::FromChrono(end_ts - effective_start);
   const double duration_ms =
       std::max(0.0, absl::ToDoubleMilliseconds(duration));
+  const std::string rank =
+      telemetry::ResolveEnvVar(telemetry::kLocalRankEnvVar).value_or("0");
   const MetricLabel p2p_labels[] = {
       {.key = metric_labels::kSrcIp, .value = src_ip},
       {.key = metric_labels::kDstIp, .value = dst_ip},
+      {.key = metric_labels::kLocalRank, .value = rank},
   };
-  RaidenMetricStore::GetGlobalMetricStore().ObserveHistogram(
-      metric_names::kP2pTransferTimeMs, p2p_labels, duration_ms);
+  store.ObserveHistogram(metric_names::kP2pTransferTimeMs, p2p_labels,
+                         duration_ms);
 }
 
 absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {

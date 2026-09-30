@@ -19,11 +19,13 @@
 #include <sys/socket.h>
 
 #include <array>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
@@ -36,6 +38,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -50,6 +53,7 @@ namespace {
 
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
+using ::testing::_;
 using ::testing::ElementsAre;
 using ::testing::Gt;
 
@@ -69,12 +73,15 @@ auto MatchBytesLabels(absl::string_view direction, absl::string_view src_ip,
                              .value = dst_ip});
 }
 
-auto MatchP2pTimeLabels(absl::string_view src_ip, absl::string_view dst_ip) {
+auto MatchP2pTimeLabels(absl::string_view src_ip, absl::string_view dst_ip,
+                        absl::string_view local_rank = "0") {
   return ElementsAre(
       telemetry::MetricLabel{.key = telemetry::metric_labels::kSrcIp,
                              .value = src_ip},
       telemetry::MetricLabel{.key = telemetry::metric_labels::kDstIp,
-                             .value = dst_ip});
+                             .value = dst_ip},
+      telemetry::MetricLabel{.key = telemetry::metric_labels::kLocalRank,
+                             .value = local_rank});
 }
 
 std::string GetIpPort(const RawBufferTransport& transport) {
@@ -509,6 +516,159 @@ TEST(SocketTransportAdapterTest,
       /*requests=*/requests));
   EXPECT_THAT(recv_buf0, ElementsAre(1, 2, 3, 4));
   EXPECT_THAT(recv_buf1, ElementsAre(1, 2, 3, 4));
+}
+
+TEST(SocketTransportAdapterTest,
+     PostSocketPushOverlappingConcurrentTransfersClampDuration) {
+  setenv("LOCAL_RANK", "2", 1);
+  absl::Cleanup unset_local_rank = [] { unsetenv("LOCAL_RANK"); };
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  std::vector<double> observed_durations_ms;
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kP2pTransferTimeMs,
+                               MatchP2pTimeLabels("127.0.0.9", "127.0.0.1",
+                                                  /*local_rank=*/"2"),
+                               _))
+      .Times(2)
+      .WillRepeatedly(
+          [&](absl::string_view, absl::Span<const telemetry::MetricLabel>,
+              double value) { observed_durations_ms.push_back(value); });
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(
+                  telemetry::metric_names::kSentBytesTotal,
+                  MatchBytesLabels(telemetry::metric_labels::kDirectionPush,
+                                   "127.0.0.9", "127.0.0.1"),
+                  8))
+      .Times(2);
+
+  absl::Notification push1_in_flight;
+  absl::Notification push2_in_flight;
+  absl::Notification release_push1;
+  absl::Notification release_push2;
+
+  auto server_handler = [&](int client_fd,
+                            const ChunkHeader& header) -> absl::Status {
+    if (header.op != 1) {
+      return absl::InvalidArgumentError("Expected op 1");
+    }
+    std::vector<int> allocated_ids(header.count_or_size, 200);
+    const std::vector<uint8_t> serialized_ids =
+        SerializeBlockIds(allocated_ids);
+    if (absl::Status status = peregrine::WriteExact(
+            client_fd, serialized_ids.data(), serialized_ids.size());
+        !status.ok()) {
+      return status;
+    }
+
+    for (size_t i = 0; i < header.count_or_size; ++i) {
+      uint8_t size_buf[kChunkSizeFieldSize];
+      if (absl::Status status =
+              peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf));
+          !status.ok()) {
+        return status;
+      }
+      const uint32_t chunk_size = DeserializeChunkSize(size_buf);
+      std::vector<uint8_t> payload(chunk_size);
+      if (chunk_size > 0) {
+        if (absl::Status status =
+                peregrine::ReadExact(client_fd, payload.data(), payload.size());
+            !status.ok()) {
+          return status;
+        }
+      }
+    }
+
+    if (header.uuid == 601) {
+      push1_in_flight.Notify();
+      release_push1.WaitForNotification();
+    } else if (header.uuid == 602) {
+      push2_in_flight.Notify();
+      release_push2.WaitForNotification();
+    }
+
+    uint8_t ack = 1;
+    return peregrine::WriteExact(client_fd, &ack, 1);
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{"127.0.0.9"});
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/2);
+
+  std::vector<uint8_t> test_data(8, 1);
+  auto make_push_request = [&](uint64_t uuid) {
+    Request request = {};
+    request.socket_opcode = 1;
+    request.laddr = test_data.data();
+    request.len = test_data.size();
+    request.count_or_size = 1;
+    request.uuid = uuid;
+    request.parallelism = 1;
+    request.request_id = 0;
+    request.stream_idx = 0;
+    return request;
+  };
+
+  const Request push1_request = make_push_request(601);
+  const Request push2_request = make_push_request(602);
+  const int src_block_id = 10;
+
+  absl::Notification push1_done;
+  absl::Notification push2_done;
+  absl::StatusOr<std::vector<int>> push1_result;
+  absl::StatusOr<std::vector<int>> push2_result;
+
+  const std::chrono::steady_clock::time_point wall_start =
+      std::chrono::steady_clock::now();
+  ABSL_ASSERT_OK(client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&push1_request, 1),
+      /*src_block_ids=*/absl::MakeConstSpan(&src_block_id, 1),
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> result) {
+        push1_result = std::move(result);
+        push1_done.Notify();
+      }));
+  push1_in_flight.WaitForNotification();
+
+  ABSL_ASSERT_OK(client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&push2_request, 1),
+      /*src_block_ids=*/absl::MakeConstSpan(&src_block_id, 1),
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> result) {
+        push2_result = std::move(result);
+        push2_done.Notify();
+      }));
+  push2_in_flight.WaitForNotification();
+
+  // Keep both transfers concurrently in flight for 50ms so their intervals
+  // overlap by at least 50ms.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Complete Push 1 first (setting busy_until = end_ts_1), then complete
+  // Push 2 immediately afterward.
+  release_push1.Notify();
+  push1_done.WaitForNotification();
+
+  release_push2.Notify();
+  push2_done.WaitForNotification();
+  const std::chrono::steady_clock::time_point wall_end =
+      std::chrono::steady_clock::now();
+  const double total_wall_ms =
+      absl::ToDoubleMilliseconds(absl::FromChrono(wall_end - wall_start));
+
+  EXPECT_THAT(push1_result, IsOkAndHolds(ElementsAre(200)));
+  EXPECT_THAT(push2_result, IsOkAndHolds(ElementsAre(200)));
+  ASSERT_EQ(observed_durations_ms.size(), 2);
+  EXPECT_GE(observed_durations_ms[0], 45.0);
+  // Because Push 2's effective start is clamped to Push 1's end timestamp,
+  // the sum of both recorded durations cannot exceed total elapsed wall time.
+  EXPECT_LE(observed_durations_ms[0] + observed_durations_ms[1], total_wall_ms);
+  EXPECT_LT(observed_durations_ms[1], observed_durations_ms[0]);
 }
 
 std::string GetPeerIp(int client_fd) {

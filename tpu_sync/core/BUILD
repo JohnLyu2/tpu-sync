@@ -946,11 +946,13 @@ cc_test(
         "requires-jellyfish",
     ],
     deps = [
+        ":host_memory_allocator",
         ":kv_cache_manager_with_transfer",
         ":raw_transfer_core",
         ":tpu_pjrt_manager",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/telemetry:metrics_api",
+        "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",

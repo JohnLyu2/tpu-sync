@@ -33,8 +33,10 @@
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
+#include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
@@ -202,7 +204,9 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
           ElementsAre(
               telemetry::MetricLabel{.key = telemetry::metric_labels::kSrcIp,
                                      .value = "127.0.0.1"},
-              HasResolvedIpLabel(telemetry::metric_labels::kDstIp)),
+              HasResolvedIpLabel(telemetry::metric_labels::kDstIp),
+              telemetry::MetricLabel{
+                  .key = telemetry::metric_labels::kLocalRank, .value = "0"}),
           Gt(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_mock,
