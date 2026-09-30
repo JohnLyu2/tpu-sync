@@ -95,6 +95,12 @@ apt-get update -qq
 apt-get install -y -qq clang-18 libstdc++-12-dev >/dev/null
 ln -sf /usr/bin/clang-18 /usr/bin/clang
 ln -sf /usr/bin/clang++-18 /usr/bin/clang++
+# Bazel's auto-configured C++ toolchain takes the compiler from CC and falls
+# back to the system gcc without it. build.sh sets CC only for the torch leg, so
+# export it here for every leg: upstream XLA is only built with clang, and its
+# headers do not all compile under gcc.
+export CC=clang-18
+export CXX=clang++-18
 clang --version | head -1
 
 if [[ "${BUILD_MODE}" == "torch" ]]; then
