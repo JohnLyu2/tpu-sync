@@ -379,6 +379,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   absl::flat_hash_map<uint64_t, std::vector<bool>> uuid_to_skip_tiling_
       ABSL_GUARDED_BY(skip_tiling_mu_);
   std::vector<bool> latest_skip_tiling_ ABSL_GUARDED_BY(skip_tiling_mu_);
+  absl::flat_hash_map<uint64_t, std::string> uuid_to_req_id_
+      ABSL_GUARDED_BY(skip_tiling_mu_);
 
   mutable absl::Mutex d2h_mu_;
   absl::flat_hash_set<uint64_t> completed_d2h_uuids_ ABSL_GUARDED_BY(d2h_mu_);

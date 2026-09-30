@@ -29,12 +29,14 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/optimization.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -1072,9 +1074,9 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         d2h_layer_futures.push_back(std::move(f));
       }
     } else {
-      VLOG(1) << "PushWeightsResharded: Coalescing D2H copy (already completed "
-                 "for uuid "
-              << uuid << ")";
+      VLOG(1) << "RAIDEN_DIAG push PushWeightsResharded: Coalescing D2H copy"
+                 " (already completed for uuid "
+              << uuid << " req_id=" << request.req_id() << ")";
     }
   } else {
     VLOG(1) << "PushWeightsResharded: Skipping D2H copy.";
@@ -1106,6 +1108,16 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   size_t total_d2h_bytes = 0;
   double first_d2h_time_ms = 0.0;
   absl::Time last_d2h_done_time = d2h_start;
+  absl::Duration d2h_wait_duration = absl::ZeroDuration();
+
+  const bool diag_vlog = VLOG_IS_ON(1);
+  struct PushTaskTiming {
+    absl::Mutex mu;
+    std::vector<double> queue_waits ABSL_GUARDED_BY(mu);
+  };
+  auto task_timing = ABSL_PREDICT_FALSE(diag_vlog)
+                         ? std::make_shared<PushTaskTiming>()
+                         : nullptr;
 
   size_t pipeline_group_size = GetPipelineGroupSize();
   size_t group_size =
@@ -1127,7 +1139,12 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         total_d2h_bytes += GetHostSize(l, s);
       }
       if (!request.skip_d2h() && !already_completed) {
+        absl::Time d2h_wait_start =
+            ABSL_PREDICT_FALSE(diag_vlog) ? absl::Now() : absl::InfinitePast();
         TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
+        if (ABSL_PREDICT_FALSE(diag_vlog)) {
+          d2h_wait_duration += (absl::Now() - d2h_wait_start);
+        }
         last_d2h_done_time = absl::Now();
         if (l == 0) {
           first_d2h_time_ms =
@@ -1147,9 +1164,18 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     if (!group_tasks.empty()) {
       int push_parallelism =
           request.parallelism() > 0 ? request.parallelism() : parallelism_;
+      absl::Time schedule_time =
+          (task_timing != nullptr) ? absl::Now() : absl::InfinitePast();
       push_futures.push_back(push_pool_->Schedule(
-          assigned_numa_node_, [this, group_tasks = std::move(group_tasks),
-                                push_parallelism, uuid = request.uuid()]() {
+          assigned_numa_node_,
+          [this, group_tasks = std::move(group_tasks), push_parallelism,
+           uuid = request.uuid(), schedule_time, task_timing]() {
+            if (task_timing != nullptr) {
+              double wait_ms =
+                  absl::ToDoubleMilliseconds(absl::Now() - schedule_time);
+              absl::MutexLock lock(task_timing->mu);
+              task_timing->queue_waits.push_back(wait_ms);
+            }
             return PushWeightsChunks(group_tasks, push_parallelism, uuid);
           }));
     }
@@ -1206,6 +1232,34 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     store.ObserveHistogram(telemetry::metric_names::kWeightSyncPushDurationMs,
                            {}, total_push_time_ms);
     store.FlushToCloudLogging("source_push", request.uuid(), request.req_id());
+  }
+  if (ABSL_PREDICT_FALSE(diag_vlog)) {
+    double d2h_wait_ms = absl::ToDoubleMilliseconds(d2h_wait_duration);
+    size_t num_push_tasks = 0;
+    double max_queue_wait_ms = 0.0;
+    double sum_queue_wait_ms = 0.0;
+    if (task_timing != nullptr) {
+      absl::MutexLock lock(task_timing->mu);
+      num_push_tasks = task_timing->queue_waits.size();
+      for (double w : task_timing->queue_waits) {
+        max_queue_wait_ms = std::max(max_queue_wait_ms, w);
+        sum_queue_wait_ms += w;
+      }
+    }
+    double avg_queue_wait_ms =
+        num_push_tasks > 0 ? (sum_queue_wait_ms / num_push_tasks) : 0.0;
+    std::string d2h_status =
+        request.skip_d2h() ? "skipped"
+                           : (already_completed ? "coalesced" : "executed");
+    VLOG(1) << "RAIDEN_DIAG push PushWeightsResharded complete"
+            << " uuid=" << request.uuid() << " req_id=" << request.req_id()
+            << " staging_time_ms=" << staging_time_ms
+            << " d2h_wait_ms=" << d2h_wait_ms << " h2h_time_ms=" << h2h_time_ms
+            << " total_push_time_ms=" << total_push_time_ms
+            << " total_h2h_bytes=" << total_h2h_bytes
+            << " push_tasks=" << num_push_tasks << " d2h_status=" << d2h_status
+            << " queue_wait_avg_ms=" << avg_queue_wait_ms
+            << " queue_wait_max_ms=" << max_queue_wait_ms;
   }
   VLOG(1) << "Done with PushWeightsResharded (uuid=" << request.uuid()
           << ", total_push_time=" << total_push_time_ms
@@ -1360,6 +1414,20 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
       store.FlushToCloudLogging("destination_receive", uuid);
     }
     record_completion();
+    if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+      std::string req_id;
+      {
+        absl::MutexLock lock(skip_tiling_mu_);
+        auto it = uuid_to_req_id_.find(uuid);
+        if (it != uuid_to_req_id_.end()) {
+          req_id = std::move(it->second);
+          uuid_to_req_id_.erase(it);
+        }
+      }
+      VLOG(1) << "RAIDEN_DIAG recv OnDataReceived complete uuid=" << uuid
+              << (req_id.empty() ? "" : absl::StrCat(" req_id=", req_id))
+              << " h2d_time_ms=0 auto_h2d=false";
+    }
     return absl::OkStatus();
   }
   VLOG(1) << "Starting OnDataReceived (auto_h2d for uuid=" << uuid << ")...";
@@ -1418,6 +1486,20 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
   {
     absl::MutexLock lock(pending_h2d_mu_);
     active_h2d_uuids_.erase(uuid);
+  }
+  if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+    std::string req_id;
+    {
+      absl::MutexLock lock(skip_tiling_mu_);
+      auto it = uuid_to_req_id_.find(uuid);
+      if (it != uuid_to_req_id_.end()) {
+        req_id = std::move(it->second);
+        uuid_to_req_id_.erase(it);
+      }
+    }
+    VLOG(1) << "RAIDEN_DIAG recv OnDataReceived complete uuid=" << uuid
+            << (req_id.empty() ? "" : absl::StrCat(" req_id=", req_id))
+            << " h2d_time_ms=" << h2d_time_ms;
   }
   VLOG(1) << "Done with OnDataReceived (auto_h2d for uuid=" << uuid
           << ", h2d_time=" << h2d_time_ms << " ms).";
@@ -1518,6 +1600,11 @@ void WeightSynchronizerBase::StoreSkipTilingLocal(
   absl::MutexLock lock(skip_tiling_mu_);
   latest_skip_tiling_ = skip;
   uuid_to_skip_tiling_[uuid] = std::move(skip);
+  if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+    if (!request.req_id().empty()) {
+      uuid_to_req_id_[uuid] = request.req_id();
+    }
+  }
 }
 
 absl::Status WeightSynchronizerBase::OnBlocksReceived(
@@ -1538,6 +1625,7 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   {
     absl::MutexLock lock(skip_tiling_mu_);
     uuid_to_skip_tiling_.erase(uuid);
+    uuid_to_req_id_.erase(uuid);
   }
   {
     absl::MutexLock lock(d2h_mu_);

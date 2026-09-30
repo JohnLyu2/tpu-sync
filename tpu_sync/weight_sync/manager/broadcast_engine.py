@@ -20,6 +20,7 @@ import functools
 import heapq
 import itertools
 import random
+import time
 from typing import Any, Callable, Optional
 
 from absl import logging
@@ -318,6 +319,14 @@ class _HopTask:
         list(seed_hops) if seed_hops is not None else []
     )
     self.children: list[_HopTask] = []
+    self.enqueued_time: float = 0.0
+    self.dispatch_time: float = 0.0
+    self.queue_wait_ms: float = 0.0
+    self.plan_build_ms: float = 0.0
+    self.recv_arm_ms: float = 0.0
+    self.sender_rpc_ms: float = 0.0
+    self.active_pushes_at_dispatch: int = 0
+    self.hop_req_id: str = ""
 
 
 class _GroupBroadcastState:
@@ -488,6 +497,7 @@ class BroadcastEngine:
       max_chunk_bytes: int = _RELAY_MAX_COALESCED_CHUNK_BYTES,
   ) -> None:
     """Executes a pipelined multi-hop tree broadcast across multiple groups."""
+    diag_vlog = logging.vlog_is_on(1)
     if n_seed <= 0:
       raise ValueError(f"n_seed must be >= 1, got {n_seed}")
     if pipeline_target_stages <= 0:
@@ -662,6 +672,8 @@ class BroadcastEngine:
               receivers=round_train_dsts,
               seed_hops=seed_hops,
           )
+          if diag_vlog:
+            trainer_hop.enqueued_time = time.monotonic()
           heapq.heappush(
               ready_queue[g.primary_src_unit],
               (
@@ -685,6 +697,8 @@ class BroadcastEngine:
                 round_idx=round_idx,
                 child_order=train_child_order,
             )
+            if diag_vlog:
+              hop.enqueued_time = time.monotonic()
             heapq.heappush(
                 ready_queue[g.primary_src_unit],
                 (
@@ -837,6 +851,35 @@ class BroadcastEngine:
                       layer_idx
                   ] += push_count
 
+      hops_by_round: dict[int, list[str]] = collections.defaultdict(list)
+      for tree_hop in populated_hops:
+        hops_by_round[tree_hop.round_idx].append(
+            f"{controller_types.format_unit(tree_hop.sender)}->"
+            f"{controller_types.format_unit(tree_hop.receiver)}"
+        )
+      for r in sorted(hops_by_round):
+        logging.info(
+            "Broadcast tree %s: stage %d round %d (%d hop(s)): %s",
+            req_id,
+            g.group_idx,
+            r,
+            len(hops_by_round[r]),
+            ", ".join(hops_by_round[r]),
+        )
+
+    all_pending_dst_units = set()
+    for grp in groups:
+      all_pending_dst_units.update(grp.pending_dst_units)
+    logging.info(
+        "Broadcast tree %s: n_seed=%d, %d planner stage group(s) coalesced"
+        " into %d pipeline stage(s) (target %d), %d destination unit(s)",
+        req_id,
+        n_seed,
+        len(groups_list),
+        len(groups),
+        pipeline_target_stages,
+        len(all_pending_dst_units),
+    )
     round_dests_by_sender: dict[RaidenId, list[Any]] = {}
     for s, rounds_dict in worker_round_destinations.items():
       sorted_rounds = sorted(rounds_dict.keys())
@@ -870,6 +913,7 @@ class BroadcastEngine:
         loop = asyncio.get_running_loop()
         rpc_executor = getattr(self._worker_rpc_client, "executor", None)
         remote_is_sender = s_node not in registered_shards
+        recv_arm_start = time.monotonic() if diag_vlog else 0.0
         if receiver_plans and hop is not None:
           for d_unit in hop.receivers:
             r_plan = receiver_plans[d_unit]
@@ -932,6 +976,9 @@ class BroadcastEngine:
           )
           if not success:
             raise RuntimeError("Failed remote prepare in slice tree broadcast")
+        if diag_vlog and hop is not None:
+          hop.recv_arm_ms = (time.monotonic() - recv_arm_start) * 1000.0
+        sender_rpc_start = time.monotonic() if diag_vlog else 0.0
         if s_u_plans:
           await asyncio.gather(*[
               self._worker_rpc_client.start_transfer(s_u, s_u_plans[s_u])
@@ -940,9 +987,12 @@ class BroadcastEngine:
           ])
         elif s_node in registered_shards:
           await self._worker_rpc_client.start_transfer(s_node, plan)
+        if diag_vlog and hop is not None:
+          hop.sender_rpc_ms = (time.monotonic() - sender_rpc_start) * 1000.0
       else:
         if s_u_plans:
           # Arm destination receiver first, then concurrently dispatch all trainer sources
+          recv_arm_start = time.monotonic() if diag_vlog else 0.0
           if receiver_plans and hop is not None:
             await asyncio.gather(*[
                 self._worker_rpc_client.start_transfer(
@@ -952,15 +1002,27 @@ class BroadcastEngine:
             ])
           else:
             await self._worker_rpc_client.start_transfer(d_node, plan)
+          if diag_vlog and hop is not None:
+            hop.recv_arm_ms = (time.monotonic() - recv_arm_start) * 1000.0
+          sender_rpc_start = time.monotonic() if diag_vlog else 0.0
           await asyncio.gather(*[
               self._worker_rpc_client.start_transfer(s_u, s_u_plans[s_u])
               for s_u in s_u_plans
               if s_u in registered_shards
           ])
+          if diag_vlog and hop is not None:
+            hop.sender_rpc_ms = (time.monotonic() - sender_rpc_start) * 1000.0
         else:
           # Arm destination receiver first, then dispatch sender
+          recv_arm_start = time.monotonic() if diag_vlog else 0.0
           await self._worker_rpc_client.start_transfer(d_node, plan)
-          await self._worker_rpc_client.start_transfer(s_node, plan)
+          if diag_vlog and hop is not None:
+            hop.recv_arm_ms = (time.monotonic() - recv_arm_start) * 1000.0
+          if s_node in registered_shards:
+            sender_rpc_start = time.monotonic() if diag_vlog else 0.0
+            await self._worker_rpc_client.start_transfer(s_node, plan)
+            if diag_vlog and hop is not None:
+              hop.sender_rpc_ms = (time.monotonic() - sender_rpc_start) * 1000.0
 
     def _dispatch_hop(hop: _HopTask) -> None:
       group = hop.group
@@ -968,9 +1030,21 @@ class BroadcastEngine:
       dst_unit = hop.receiver
       dst_indices = hop.dst_indices
 
+      if diag_vlog:
+        dispatch_time = time.monotonic()
+        hop.dispatch_time = dispatch_time
+        hop.queue_wait_ms = (
+            (dispatch_time - hop.enqueued_time) * 1000.0
+            if hop.enqueued_time > 0
+            else 0.0
+        )
+        hop.active_pushes_at_dispatch = active_pushes[s]
       active_pushes[s] += len(hop.receivers)
       hop_uuid = pipeline_uuid
       hop_req_id = f"{req_id}_{group.group_idx}_{dst_unit}_{hop_uuid}"
+      hop.hop_req_id = hop_req_id
+
+      plan_build_start = time.monotonic() if diag_vlog else 0.0
 
       dst_total_blocks = receiver_block_counts[dst_unit]
       dst_layer_counts = dict(receiver_layer_counts[dst_unit])
@@ -1127,6 +1201,8 @@ class BroadcastEngine:
                 ),
             )
 
+          if diag_vlog:
+            hop.plan_build_ms = (time.monotonic() - plan_build_start) * 1000.0
           task = asyncio.create_task(
               _run_single_transfer(
                   group.primary_src_unit,
@@ -1221,8 +1297,10 @@ class BroadcastEngine:
                   final_plan, "cached_serialized_payloads", {}
               ),
           )
+          if diag_vlog:
+            hop.plan_build_ms = (time.monotonic() - plan_build_start) * 1000.0
           task = asyncio.create_task(
-              _run_single_transfer(s, dst_unit, sub_plan)
+              _run_single_transfer(s, dst_unit, sub_plan, hop=hop)
           )
           transfers_in_progress[task] = hop
       else:
@@ -1343,8 +1421,40 @@ class BroadcastEngine:
                 final_plan, "cached_serialized_payloads", {}
             ),
         )
-        task = asyncio.create_task(_run_single_transfer(s, dst_unit, sub_plan))
+        if diag_vlog:
+          hop.plan_build_ms = (time.monotonic() - plan_build_start) * 1000.0
+        task = asyncio.create_task(
+            _run_single_transfer(s, dst_unit, sub_plan, hop=hop)
+        )
         transfers_in_progress[task] = hop
+
+    async def _monitor_event_loop_lag() -> None:
+      step = 0.1
+      threshold = 0.25
+      try:
+        while True:
+          t0 = time.monotonic()
+          await asyncio.sleep(step)
+          elapsed = time.monotonic() - t0
+          lag = elapsed - step
+          if lag > threshold:
+            logging.vlog(
+                1,
+                "RAIDEN_DIAG loop_lag req_id=%s lag_ms=%.2f elapsed_ms=%.2f"
+                " expected_ms=%.2f",
+                req_id,
+                lag * 1000.0,
+                elapsed * 1000.0,
+                step * 1000.0,
+            )
+      except asyncio.CancelledError:
+        pass
+
+    lag_monitor_task = (
+        asyncio.create_task(_monitor_event_loop_lag())
+        if logging.vlog_is_on(1)
+        else None
+    )
 
     src_units = set(g.src_unit for g in groups)
     num_dst_eq_classes = max(
@@ -1379,16 +1489,67 @@ class BroadcastEngine:
           for fut in done:
             if fut.cancelled():
               raise asyncio.CancelledError()
-            exc = fut.exception()
-            if exc is not None:
-              logging.error("Slice transfer failed in broadcast tree: %s", exc)
-              raise exc
             hop = transfers_in_progress.pop(fut)
             active_pushes[hop.sender] -= len(hop.receivers)
+            if diag_vlog:
+              total_ms = (time.monotonic() - hop.dispatch_time) * 1000.0
+              sender_str = controller_types.format_unit(hop.sender)
+              receiver_str = (
+                  controller_types.format_unit(hop.receiver)
+                  if len(hop.receivers) == 1
+                  else controller_types.format_units(hop.receivers)
+              )
+
+            exc = fut.exception()
+            if exc is not None:
+              if diag_vlog:
+                logging.vlog(
+                    1,
+                    "RAIDEN_DIAG hop status=FAILED hop_req_id=%s %s->%s"
+                    " round=%d stage_group=%d queue_wait_ms=%.2f"
+                    " plan_build_ms=%.2f recv_arm_ms=%.2f sender_rpc_ms=%.2f"
+                    " total_ms=%.2f active_pushes=%d error=%s",
+                    hop.hop_req_id,
+                    sender_str,
+                    receiver_str,
+                    hop.round_idx,
+                    hop.group.group_idx,
+                    hop.queue_wait_ms,
+                    hop.plan_build_ms,
+                    hop.recv_arm_ms,
+                    hop.sender_rpc_ms,
+                    total_ms,
+                    hop.active_pushes_at_dispatch,
+                    exc,
+                )
+              logging.error("Slice transfer failed in broadcast tree: %s", exc)
+              raise exc
+
+            if diag_vlog:
+              logging.vlog(
+                  1,
+                  "RAIDEN_DIAG hop status=COMPLETE hop_req_id=%s %s->%s"
+                  " round=%d stage_group=%d queue_wait_ms=%.2f"
+                  " plan_build_ms=%.2f recv_arm_ms=%.2f sender_rpc_ms=%.2f"
+                  " total_ms=%.2f active_pushes=%d",
+                  hop.hop_req_id,
+                  sender_str,
+                  receiver_str,
+                  hop.round_idx,
+                  hop.group.group_idx,
+                  hop.queue_wait_ms,
+                  hop.plan_build_ms,
+                  hop.recv_arm_ms,
+                  hop.sender_rpc_ms,
+                  total_ms,
+                  hop.active_pushes_at_dispatch,
+              )
 
             hops_to_propagate = hop.seed_hops if hop.seed_hops else [hop]
             for completed_hop in hops_to_propagate:
               for child_hop in completed_hop.children:
+                if diag_vlog:
+                  child_hop.enqueued_time = time.monotonic()
                 heapq.heappush(
                     ready_queue[completed_hop.receiver],
                     (
@@ -1400,6 +1561,12 @@ class BroadcastEngine:
                     ),
                 )
     finally:
+      if lag_monitor_task is not None:
+        lag_monitor_task.cancel()
+        try:
+          await lag_monitor_task
+        except asyncio.CancelledError:
+          pass
       pending = [f for f in transfers_in_progress.keys() if not f.done()]
       for f in pending:
         f.cancel()

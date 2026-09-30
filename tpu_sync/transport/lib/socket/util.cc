@@ -38,6 +38,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
@@ -70,7 +71,8 @@ absl::Duration GetSendTimeout(int fd) {
 // blocking I/O.
 absl::Status ConnectWithTimeout(int fd, const addrinfo& addr,
                                 absl::Duration timeout, bool require_psp,
-                                std::shared_ptr<grpc::Channel> channel) {
+                                std::shared_ptr<grpc::Channel> channel,
+                                ConnectTiming* timing) {
   const absl::Duration saved_timeout = GetSendTimeout(fd);
   SetSendTimeout(fd, timeout);
   // Restore on every return so the timeout never leaks into transfers.
@@ -78,9 +80,26 @@ absl::Status ConnectWithTimeout(int fd, const addrinfo& addr,
     SetSendTimeout(fd, saved_timeout);
   };
   if (require_psp) {
-    return TcpPspConnect(fd, addr.ai_addr, addr.ai_addrlen, std::move(channel));
+    double psp_kex_ms = 0.0;
+    double tcp_connect_ms = 0.0;
+    absl::Status status =
+        TcpPspConnect(fd, addr.ai_addr, addr.ai_addrlen, std::move(channel),
+                      timing != nullptr ? &psp_kex_ms : nullptr,
+                      timing != nullptr ? &tcp_connect_ms : nullptr);
+    if (status.ok() && timing != nullptr) {
+      timing->psp_key_exchange_ms = psp_kex_ms;
+      timing->connect_ms = tcp_connect_ms;
+    }
+    return status;
   }
+  absl::Time connect_start =
+      (timing != nullptr) ? absl::Now() : absl::InfinitePast();
   if (connect(fd, addr.ai_addr, addr.ai_addrlen) == 0) {
+    if (timing != nullptr) {
+      timing->connect_ms =
+          absl::ToDoubleMilliseconds(absl::Now() - connect_start);
+      timing->psp_key_exchange_ms = 0.0;
+    }
     return absl::OkStatus();
   }
   // On a blocking socket, connect() fails with EINPROGRESS when SO_SNDTIMEO
@@ -94,9 +113,10 @@ absl::Status ConnectWithTimeout(int fd, const addrinfo& addr,
 
 }  // namespace
 
-absl::StatusOr<int> ConnectToPeer(
-    absl::string_view peer, absl::string_view local_ip, bool require_psp,
-    std::shared_ptr<grpc::Channel> channel) {
+absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
+                                  absl::string_view local_ip, bool require_psp,
+                                  std::shared_ptr<grpc::Channel> channel,
+                                  ConnectTiming* timing) {
   if (require_psp && channel == nullptr) {
     return absl::InvalidArgumentError(
         "gRPC channel is required for PSP connection");
@@ -189,7 +209,7 @@ absl::StatusOr<int> ConnectToPeer(
     }
 
     const absl::Status connect_status = ConnectWithTimeout(
-        sock_fd, *rp, kConnectTimeout, require_psp, channel);
+        sock_fd, *rp, kConnectTimeout, require_psp, channel, timing);
     if (connect_status.ok()) {
       break; /* Success */
     }
@@ -233,6 +253,10 @@ std::string SockAddrToEndpoint(int fd, int (*get_fn)(int, struct sockaddr*,
                                   : absl::StrCat(host, ":", serv);
 }
 }  // namespace
+
+std::string GetLocalEndpoint(int fd) {
+  return SockAddrToEndpoint(fd, ::getsockname);
+}
 
 std::string GetAddrPortPair(int fd) {
   return absl::StrCat(SockAddrToEndpoint(fd, ::getsockname), " <> ",

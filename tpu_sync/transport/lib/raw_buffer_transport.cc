@@ -46,6 +46,7 @@
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
@@ -383,6 +384,20 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       absl::MutexLock lock(raw_progress_mu_);
       auto& prog = raw_progress_[header.uuid];
       prog.completed_chunks++;
+      if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+        prog.total_bytes += size_bytes;
+        if (prog.first_chunk_time == absl::InfinitePast()) {
+          prog.first_chunk_time = absl::Now();
+          double elapsed_since_arm_ms =
+              (prog.arm_time != absl::InfinitePast())
+                  ? absl::ToDoubleMilliseconds(prog.first_chunk_time -
+                                               prog.arm_time)
+                  : -1.0;
+          VLOG(1) << "RAIDEN_DIAG recv first_chunk uuid=" << header.uuid
+                  << " batch_size=1"
+                  << " elapsed_since_arm_ms=" << elapsed_since_arm_ms;
+        }
+      }
       prog.completed_chunks_per_layer[buf_id]++;
       auto it = prog.expected_chunks_per_layer.find(buf_id);
       if (it != prog.expected_chunks_per_layer.end() && it->second > 0 &&
@@ -405,6 +420,24 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       // its partitioned quota. Using '>=' ensures completion triggers reliably.
       if (prog.expected_chunks.has_value() &&
           prog.completed_chunks >= *prog.expected_chunks) {
+        if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+          auto now = absl::Now();
+          double elapsed_since_arm_ms =
+              (prog.arm_time != absl::InfinitePast())
+                  ? absl::ToDoubleMilliseconds(now - prog.arm_time)
+                  : -1.0;
+          double elapsed_since_first_chunk_ms =
+              (prog.first_chunk_time != absl::InfinitePast())
+                  ? absl::ToDoubleMilliseconds(now - prog.first_chunk_time)
+                  : -1.0;
+          VLOG(1) << "RAIDEN_DIAG recv complete uuid=" << header.uuid
+                  << " received_count=" << prog.completed_chunks
+                  << " expected_count=" << *prog.expected_chunks
+                  << " elapsed_since_arm_ms=" << elapsed_since_arm_ms
+                  << " elapsed_since_first_chunk_ms="
+                  << elapsed_since_first_chunk_ms
+                  << " bytes=" << prog.total_bytes;
+        }
         raw_progress_.erase(header.uuid);
         trigger_h2d = true;
         VLOG(1) << "Triggering H2D for uuid=" << header.uuid;
@@ -540,6 +573,20 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       absl::MutexLock lock(raw_progress_mu_);
       auto& prog = raw_progress_[header.uuid];
       prog.completed_chunks += batch_size;
+      if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+        prog.total_bytes += total_bytes;
+        if (prog.first_chunk_time == absl::InfinitePast()) {
+          prog.first_chunk_time = absl::Now();
+          double elapsed_since_arm_ms =
+              (prog.arm_time != absl::InfinitePast())
+                  ? absl::ToDoubleMilliseconds(prog.first_chunk_time -
+                                               prog.arm_time)
+                  : -1.0;
+          VLOG(1) << "RAIDEN_DIAG recv first_chunk uuid=" << header.uuid
+                  << " batch_size=" << batch_size
+                  << " elapsed_since_arm_ms=" << elapsed_since_arm_ms;
+        }
+      }
       for (const auto& [l, count] : layer_histogram) {
         // Adding the whole run at once crosses the per-layer threshold exactly
         // when the equivalent sequence of single increments would, because the
@@ -562,6 +609,24 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
                       : "unknown");
       if (prog.expected_chunks.has_value() &&
           prog.completed_chunks >= *prog.expected_chunks) {
+        if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+          auto now = absl::Now();
+          double elapsed_since_arm_ms =
+              (prog.arm_time != absl::InfinitePast())
+                  ? absl::ToDoubleMilliseconds(now - prog.arm_time)
+                  : -1.0;
+          double elapsed_since_first_chunk_ms =
+              (prog.first_chunk_time != absl::InfinitePast())
+                  ? absl::ToDoubleMilliseconds(now - prog.first_chunk_time)
+                  : -1.0;
+          VLOG(1) << "RAIDEN_DIAG recv complete uuid=" << header.uuid
+                  << " received_count=" << prog.completed_chunks
+                  << " expected_count=" << *prog.expected_chunks
+                  << " elapsed_since_arm_ms=" << elapsed_since_arm_ms
+                  << " elapsed_since_first_chunk_ms="
+                  << elapsed_since_first_chunk_ms
+                  << " bytes=" << prog.total_bytes;
+        }
         raw_progress_.erase(header.uuid);
         trigger_h2d = true;
         VLOG(1) << "Triggering H2D for uuid=" << header.uuid;
@@ -826,10 +891,33 @@ absl::Status RawBufferTransport::RegisterExpectedChunks(
     absl::MutexLock lock(raw_progress_mu_);
     auto& prog = raw_progress_[uuid];
     prog.expected_chunks = expected_chunks;
+    if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+      if (prog.arm_time == absl::InfinitePast()) {
+        prog.arm_time = absl::Now();
+      }
+    }
     VLOG(1) << "RegisterExpectedChunks: uuid=" << uuid
             << " expected_chunks=" << expected_chunks
             << " completed_chunks=" << prog.completed_chunks;
     if (prog.completed_chunks >= expected_chunks) {
+      if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+        auto now = absl::Now();
+        double elapsed_since_arm_ms =
+            (prog.arm_time != absl::InfinitePast())
+                ? absl::ToDoubleMilliseconds(now - prog.arm_time)
+                : -1.0;
+        double elapsed_since_first_chunk_ms =
+            (prog.first_chunk_time != absl::InfinitePast())
+                ? absl::ToDoubleMilliseconds(now - prog.first_chunk_time)
+                : -1.0;
+        VLOG(1) << "RAIDEN_DIAG recv complete uuid=" << uuid
+                << " received_count=" << prog.completed_chunks
+                << " expected_count=" << expected_chunks
+                << " elapsed_since_arm_ms=" << elapsed_since_arm_ms
+                << " elapsed_since_first_chunk_ms="
+                << elapsed_since_first_chunk_ms
+                << " bytes=" << prog.total_bytes;
+      }
       raw_progress_.erase(uuid);
       trigger_h2d = true;
       VLOG(1) << "RegisterExpectedChunks triggering H2D for uuid=" << uuid;
@@ -1102,43 +1190,115 @@ absl::Status RawBufferTransport::PushBuffers(
     return absl::OkStatus();
   }
 
-  auto push_batch = [&](const BatchInfo& batch) -> absl::Status {
+  const bool diag_vlog = VLOG_IS_ON(1);
+  struct BatchTiming {
+    absl::Time start_time = absl::InfiniteFuture();
+    absl::Time end_time = absl::InfinitePast();
+  };
+  std::vector<BatchTiming> batch_timings;
+  std::vector<uint8_t> batch_executed;
+  if (ABSL_PREDICT_FALSE(diag_vlog)) {
+    batch_timings.resize(batches.size());
+    batch_executed.assign(batches.size(), 0);
+  }
+
+  auto push_batch = [&](size_t batch_idx) -> absl::Status {
+    const auto& batch = batches[batch_idx];
+    if (ABSL_PREDICT_FALSE(diag_vlog)) {
+      batch_timings[batch_idx].start_time = absl::Now();
+    }
     ABSL_ASSIGN_OR_RETURN(
         std::vector<Request> requests,
         BuildBufferRequests(absl::MakeConstSpan(grouped_tasks)
                                 .subspan(batch.start_idx, batch.count),
                             uuid, kOpBufferPushBatched));
-    return ProcessSocketBufferBatchPush(batch.peer, requests);
+    absl::Status s = ProcessSocketBufferBatchPush(batch.peer, requests);
+    if (ABSL_PREDICT_FALSE(diag_vlog)) {
+      batch_timings[batch_idx].end_time = absl::Now();
+    }
+    return s;
   };
 
-  if (parallelism <= 1 || batches.size() == 1) {
-    for (const auto& batch : batches) {
-      ABSL_RETURN_IF_ERROR(push_batch(batch));
-    }
-    return absl::OkStatus();
-  }
-
-  tpu_raiden::NumaThreadPool* pool = nullptr;
-  {
-    absl::MutexLock lock(push_pool_mu_);
-    if (!push_pool_) {
-      push_pool_ =
-          std::make_unique<tpu_raiden::NumaThreadPool>(kMaxPushThreads);
-    }
-    pool = push_pool_.get();
-  }
-
-  absl::BlockingCounter counter(batches.size());
   std::vector<absl::Status> statuses(batches.size(), absl::OkStatus());
-  for (size_t i = 0; i < batches.size(); ++i) {
-    pool->Schedule(
-        [&push_batch, &batch = batches[i], &counter, &status = statuses[i]]() {
-          status = push_batch(batch);
-          counter.DecrementCount();
-        });
+  if (parallelism <= 1 || batches.size() == 1) {
+    for (size_t i = 0; i < batches.size(); ++i) {
+      if (ABSL_PREDICT_FALSE(diag_vlog)) {
+        batch_executed[i] = 1;
+      }
+      statuses[i] = push_batch(i);
+      if (!statuses[i].ok()) {
+        break;
+      }
+    }
+  } else {
+    tpu_raiden::NumaThreadPool* pool = nullptr;
+    {
+      absl::MutexLock lock(push_pool_mu_);
+      if (!push_pool_) {
+        push_pool_ =
+            std::make_unique<tpu_raiden::NumaThreadPool>(kMaxPushThreads);
+      }
+      pool = push_pool_.get();
+    }
+
+    absl::BlockingCounter counter(batches.size());
+    for (size_t i = 0; i < batches.size(); ++i) {
+      pool->Schedule([&push_batch, i, &counter, &status = statuses[i],
+                      &batch_executed, diag_vlog]() {
+        if (ABSL_PREDICT_FALSE(diag_vlog)) {
+          batch_executed[i] = 1;
+        }
+        status = push_batch(i);
+        counter.DecrementCount();
+      });
+    }
+    counter.Wait();
   }
 
-  counter.Wait();
+  if (ABSL_PREDICT_FALSE(diag_vlog)) {
+    struct PeerSummary {
+      size_t bytes = 0;
+      size_t batches = 0;
+      absl::Time first_send = absl::InfiniteFuture();
+      absl::Time last_ack = absl::InfinitePast();
+    };
+    absl::flat_hash_map<std::string, PeerSummary> peer_summaries;
+    for (size_t i = 0; i < batches.size(); ++i) {
+      if (!batch_executed[i] || !statuses[i].ok()) {
+        continue;
+      }
+      const auto& batch = batches[i];
+      auto& summary = peer_summaries[batch.peer];
+      summary.batches++;
+      if (batch_timings[i].start_time < summary.first_send) {
+        summary.first_send = batch_timings[i].start_time;
+      }
+      if (batch_timings[i].end_time > summary.last_ack) {
+        summary.last_ack = batch_timings[i].end_time;
+      }
+      for (size_t j = 0; j < batch.count; ++j) {
+        const auto& t = grouped_tasks[batch.start_idx + j];
+        summary.bytes += (t.count > 0 ? t.count : 1) * t.size_bytes;
+      }
+    }
+
+    for (const auto& [peer, summary] : peer_summaries) {
+      double elapsed_ms = (summary.last_ack > summary.first_send)
+                              ? absl::ToDoubleMilliseconds(summary.last_ack -
+                                                           summary.first_send)
+                              : 0.0;
+      double gbps =
+          (elapsed_ms > 0.0) ? (summary.bytes * 8.0 / (elapsed_ms * 1e6)) : 0.0;
+      size_t threads_used =
+          (parallelism <= 1 || batches.size() == 1)
+              ? 1
+              : std::min(summary.batches, static_cast<size_t>(parallelism));
+      VLOG(1) << "RAIDEN_DIAG peer_xfer uuid=" << uuid << " peer=" << peer
+              << " bytes=" << summary.bytes << " batches=" << summary.batches
+              << " threads=" << threads_used << " elapsed_ms=" << elapsed_ms
+              << " gbps=" << gbps;
+    }
+  }
 
   for (const auto& s : statuses) {
     ABSL_RETURN_IF_ERROR(s);

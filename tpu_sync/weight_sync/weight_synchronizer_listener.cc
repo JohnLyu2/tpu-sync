@@ -14,6 +14,8 @@
 
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -23,9 +25,11 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/optimization.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -155,8 +159,26 @@ void WeightSynchronizerListener::ExecuteControlRequest(
     if (is_sender) {
       if (is_resharded) {
         LOG(INFO) << "C++ Listener executing PushWeightsResharded";
-        absl::Status status =
-            engine->PushWeightsResharded(req.start_transfer_request());
+        const auto& start_req = req.start_transfer_request();
+        if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+          int64_t total_entries = 0;
+          for (const auto& [shard_idx, schedule] :
+               start_req.shard_push_schedules()) {
+            total_entries += schedule.entries_size();
+          }
+          std::string round_str =
+              start_req.has_broadcast_round()
+                  ? absl::StrCat(start_req.broadcast_round())
+                  : "none";
+          VLOG(1)
+              << "RAIDEN_DIAG push C++ Listener executing PushWeightsResharded"
+              << " req_id=" << start_req.req_id()
+              << " uuid=" << start_req.uuid() << " is_sender=" << is_sender
+              << " broadcast_round=" << round_str << " pid=" << getpid()
+              << " shards=" << start_req.shard_push_schedules_size()
+              << " schedule_entries=" << total_entries;
+        }
+        absl::Status status = engine->PushWeightsResharded(start_req);
         if (!status.ok()) {
           resp->set_success(false);
           resp->set_message(std::string(status.message()));
@@ -181,6 +203,12 @@ void WeightSynchronizerListener::ExecuteControlRequest(
                    "registering expected block count";
       int64_t expected_block_count =
           req.start_transfer_request().expected_block_count();
+      uint64_t uuid = req.start_transfer_request().uuid();
+      if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+        std::string req_id = req.start_transfer_request().req_id();
+        VLOG(1) << "RAIDEN_DIAG recv arm uuid=" << uuid << " req_id=" << req_id
+                << " expected_block_count=" << expected_block_count;
+      }
       if (expected_block_count <= 0 ||
           expected_block_count > std::numeric_limits<uint32_t>::max()) {
         resp->set_success(false);
@@ -189,7 +217,6 @@ void WeightSynchronizerListener::ExecuteControlRequest(
         LOG(ERROR) << "Invalid expected_block_count: " << expected_block_count;
         return;
       }
-      uint64_t uuid = req.start_transfer_request().uuid();
       engine->StoreSkipTiling(uuid, req.start_transfer_request());
 
       const auto& layer_counts_proto =

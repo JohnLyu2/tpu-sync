@@ -24,13 +24,21 @@
 
 namespace tpu_raiden::transport::lib {
 
+struct ConnectTiming {
+  double connect_ms = 0.0;
+  double psp_key_exchange_ms = 0.0;
+};
+
 // Connects to remote TCP peer with optional local IP binding and optional
 // gRPC channel for TCP-over-PSP out-of-band key exchange. The connect times
 // out after a fixed bound.
 absl::StatusOr<int> ConnectToPeer(
     absl::string_view peer, absl::string_view local_ip = "",
-    bool require_psp = false,
-    std::shared_ptr<grpc::Channel> channel = nullptr);
+    bool require_psp = false, std::shared_ptr<grpc::Channel> channel = nullptr,
+    ConnectTiming* timing = nullptr);
+
+// Returns the local endpoint ("ip:port") for the socket `fd`.
+std::string GetLocalEndpoint(int fd);
 
 // Returns a string of self/peer ip:port pair ("self_ip:port <> peer_ip:port")
 // for the socket `fd`.

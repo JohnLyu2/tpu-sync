@@ -56,9 +56,11 @@ bool PspEnabled(int client_fd);
 
 // Performs out-of-band PSP key exchange on sock_fd using the provided gRPC
 // channel and connects to addr.
-absl::Status TcpPspConnect(
-    int sock_fd, const struct sockaddr* addr, socklen_t addrlen,
-    std::shared_ptr<grpc::Channel> channel);
+absl::Status TcpPspConnect(int sock_fd, const struct sockaddr* addr,
+                           socklen_t addrlen,
+                           std::shared_ptr<grpc::Channel> channel,
+                           double* psp_kex_ms = nullptr,
+                           double* tcp_connect_ms = nullptr);
 
 }  // namespace tpu_raiden::transport::lib
 

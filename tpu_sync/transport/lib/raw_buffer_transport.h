@@ -34,6 +34,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
 #include "tpu_sync/common/detached_thread_group.h"
@@ -55,6 +56,9 @@ struct RawProgress {
   absl::flat_hash_map<size_t, uint32_t> completed_chunks_per_layer;
   absl::flat_hash_map<size_t, uint32_t> expected_chunks_per_layer;
   absl::flat_hash_set<size_t> triggered_layers;
+  absl::Time arm_time = absl::InfinitePast();
+  absl::Time first_chunk_time = absl::InfinitePast();
+  uint64_t total_bytes = 0;
 };
 
 // Builds a single Request struct for buffer push/ pull operations.

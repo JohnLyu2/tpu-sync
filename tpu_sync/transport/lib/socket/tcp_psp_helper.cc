@@ -45,7 +45,8 @@ bool PspEnabled(int client_fd) { return false; }
 
 absl::Status TcpPspConnect(
     int sock_fd, const struct sockaddr* addr, socklen_t addrlen,
-    std::shared_ptr<grpc::Channel> channel) {
+    std::shared_ptr<grpc::Channel> channel, double* psp_kex_ms,
+    double* tcp_connect_ms) {
   return absl::UnimplementedError("PSP-TCP is unimplemented.");
 }
 

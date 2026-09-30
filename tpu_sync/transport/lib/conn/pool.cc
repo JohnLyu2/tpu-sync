@@ -18,16 +18,23 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cstddef>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "absl/base/optimization.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "grpcpp/channel.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/transport/lib/socket/util.h"
@@ -50,8 +57,12 @@ void CloseSocket(const int fd) {
 absl::StatusOr<int> ConnPool::Borrow(
     absl::string_view peer, absl::string_view local_ip, bool require_psp,
     std::shared_ptr<grpc::Channel> channel) {
+  const bool diag_vlog = VLOG_IS_ON(1);
+  absl::Time borrow_start =
+      ABSL_PREDICT_FALSE(diag_vlog) ? absl::Now() : absl::InfinitePast();
   const Key key = GenPoolKey(peer, local_ip);
   int reused_fd = -1;
+  size_t current_pool_size = 0;
   {
     absl::MutexLock lock(mu_);
     if (stop_) {
@@ -71,15 +82,38 @@ absl::StatusOr<int> ConnPool::Borrow(
         reused_fd = fd;
         break;
       }
+      current_pool_size = fds.size();
     }
   }
   if (reused_fd >= 0) {
     FaultInjectSocket(hooks::kConnPoolBorrowReuse, reused_fd);
+    if (ABSL_PREDICT_FALSE(diag_vlog)) {
+      double wait_ms = absl::ToDoubleMilliseconds(absl::Now() - borrow_start);
+      if (wait_ms > 10.0) {
+        VLOG(1) << "RAIDEN_DIAG conn borrow_wait wait_ms=" << wait_ms
+                << " peer=" << peer << " local_ip=" << local_ip;
+      }
+    }
     return reused_fd;
   }
   ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kConnPoolBorrowConnect,
                                          absl::StatusCode::kUnavailable));
-  return ConnectToPeer(peer, local_ip, require_psp, channel);
+  ConnectTiming timing;
+  ABSL_ASSIGN_OR_RETURN(int sock_fd,
+                        ConnectToPeer(peer, local_ip, require_psp, channel,
+                                      diag_vlog ? &timing : nullptr));
+  if (ABSL_PREDICT_FALSE(diag_vlog)) {
+    std::string local_endpoint = GetLocalEndpoint(sock_fd);
+    std::string psp_str =
+        require_psp ? absl::StrCat(" psp_kex_ms=", timing.psp_key_exchange_ms)
+                    : "";
+    VLOG(1) << "RAIDEN_DIAG conn new_socket fd=" << sock_fd << " peer=" << peer
+            << " local_ip=" << (local_ip.empty() ? local_endpoint : local_ip)
+            << " bound_local=" << local_endpoint
+            << " connect_ms=" << timing.connect_ms << psp_str
+            << " pool_size=" << current_pool_size;
+  }
+  return sock_fd;
 }
 
 void ConnPool::Return(bool ok, int fd, absl::string_view peer,

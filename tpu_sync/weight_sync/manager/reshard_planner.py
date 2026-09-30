@@ -2117,6 +2117,20 @@ class ReshardPlanner:
           computed_expected_block_count,
           len(broadcast_groups),
       )
+      if logging.vlog_is_on(1):
+        logging.vlog(
+            1,
+            "RAIDEN_DIAG tree_schedule req_id=%s uuid=%s n_seed=%d"
+            " broadcast_host_ratio=%s num_src_hosts=%d"
+            " num_dst_hosts_per_unit=%d num_dst_units=%d",
+            req_id,
+            uuid,
+            n_seed,
+            broadcast_host_ratio,
+            num_src_hosts,
+            num_dst_hosts_per_unit,
+            num_dst_units,
+        )
     else:
       # Group flat entries into slices for broadcast
       groups = {}

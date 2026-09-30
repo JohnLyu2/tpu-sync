@@ -20,6 +20,7 @@ import concurrent.futures
 import dataclasses
 import functools
 import os
+import time
 from typing import Any, Callable, Optional, Sequence
 
 from absl import logging
@@ -1460,8 +1461,10 @@ class JobEntity:
         and getattr(transfer_plan, "is_sender", False)
         and bool(getattr(transfer_plan, "shard_push_schedules", None))
     )
-
+    const_vlog = logging.vlog_is_on(1)
+    encode_start = time.monotonic() if const_vlog else 0.0
     coros = []
+    total_payload_bytes = 0
     if self.is_payload_invariant_across_hosts(
         transfer_plan, addrs, unit=target_id
     ):
@@ -1484,11 +1487,13 @@ class JobEntity:
       except NotImplementedError:
         payload = None
       if payload:
+        total_payload_bytes = len(payload)
         for addr in addrs:
           coros.append(self._send_and_verify(addr, payload))
     elif offload_encode:
 
       async def _encode_and_send(addr: str) -> None:
+        nonlocal total_payload_bytes
         try:
           payload = await loop.run_in_executor(
               self._executor,
@@ -1502,6 +1507,7 @@ class JobEntity:
         except NotImplementedError:
           return
         if payload:
+          total_payload_bytes += len(payload)
           await self._send_and_verify(addr, payload)
 
       for addr in addrs:
@@ -1516,10 +1522,30 @@ class JobEntity:
             continue
         except NotImplementedError:
           continue
+        total_payload_bytes += len(payload)
         coros.append(self._send_and_verify(addr, payload))
+
+    if const_vlog:
+      encode_ms = (time.monotonic() - encode_start) * 1000.0
+      rpc_start = time.monotonic()
 
     if coros:
       await asyncio.gather(*coros)
+
+    if const_vlog:
+      rpc_ms = (time.monotonic() - rpc_start) * 1000.0
+      logging.vlog(
+          1,
+          "RAIDEN_DIAG rpc target=%s req_id=%s uuid=%s addrs=%d"
+          " payload_bytes=%d encode_ms=%.2f rpc_ms=%.2f",
+          controller_types.format_unit(target_id),
+          transfer_plan.req_id,
+          transfer_plan.uuid,
+          len(addrs),
+          total_payload_bytes,
+          encode_ms,
+          rpc_ms,
+      )
 
   def _encode_shutdown(self) -> bytes:
     req = self._proto_module.ControlRequest(
