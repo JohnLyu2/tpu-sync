@@ -1199,6 +1199,9 @@ class BroadcastEngine:
                 cached_serialized_payloads=getattr(
                     final_plan, "cached_serialized_payloads", {}
                 ),
+                endpoint_to_shards=dict(
+                    getattr(final_plan, "endpoint_to_shards", None) or {}
+                ),
             )
 
           if diag_vlog:
@@ -1295,6 +1298,9 @@ class BroadcastEngine:
               broadcast_round_destinations=round_dests_by_sender.get(s, []),
               cached_serialized_payloads=getattr(
                   final_plan, "cached_serialized_payloads", {}
+              ),
+              endpoint_to_shards=dict(
+                  getattr(final_plan, "endpoint_to_shards", None) or {}
               ),
           )
           if diag_vlog:
@@ -1419,6 +1425,9 @@ class BroadcastEngine:
             broadcast_round_destinations=round_dests_by_sender.get(s, []),
             cached_serialized_payloads=getattr(
                 final_plan, "cached_serialized_payloads", {}
+            ),
+            endpoint_to_shards=dict(
+                getattr(final_plan, "endpoint_to_shards", None) or {}
             ),
         )
         if diag_vlog:

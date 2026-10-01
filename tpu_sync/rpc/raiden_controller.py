@@ -1271,8 +1271,19 @@ class RaidenController:
           rpc_addresses.update(self.get_entity_rpc_addresses())
           data_addresses = cached_schedule.data_addresses
           dst_unit_counts = cached_schedule.dst_unit_counts
+          endpoint_to_shards: dict[Any, set[int]] = {}
+          for u in (*src_units, *dst_units):
+            u_rpc = rpc_addresses.get(u, "")
+            u_shards = data_addresses.get(u) or self._registered_shards.get(
+                u, ()
+            )
+            if u_rpc and u_shards:
+              endpoint_to_shards.update(
+                  controller_types.compute_endpoint_to_shards(
+                      u, [u_rpc], u_shards
+                  )
+              )
 
-          endpoint_to_shards: dict[tuple[RaidenId, str] | str, set[int]] = {}
           if cached_schedule.is_weight_sync and direct_schedules:
             for src_u in direct_schedules.keys():
               src_ent = self.get_or_create_entity(src_u)
@@ -1441,9 +1452,9 @@ class RaidenController:
                   if not broadcast_groups
                   else {}
               ),
+              endpoint_to_shards=endpoint_to_shards,
               variable_plans=cached_schedule.variable_plans,
               variable_to_plan_id=cached_schedule.variable_to_plan_id,
-              endpoint_to_shards=endpoint_to_shards,
           )
           with self._lock:
             self._active_transfers[req_id] = final_plan
@@ -1452,19 +1463,35 @@ class RaidenController:
           if direct_schedules:
             direct_dst_peers = []
             direct_dst_units = []
+            seen_direct_dst_peers: set[str] = set()
             for sched in direct_schedules.values():
               for entries in sched.values():
-                for entry in entries:
-                  if entry[0] and entry[0] not in direct_dst_peers:
-                    direct_dst_peers.append(entry[0])
-                    if entry[0] not in cached_schedule.data_address_to_unit:
-                      raise KeyError(
-                          f"Destination peer endpoint '{entry[0]}' not found in"
-                          " data_address_to_unit"
+                if hasattr(entries, "plans_by_id") and hasattr(
+                    entries, "variable_to_plan_id"
+                ):
+                  ordered_vars = getattr(
+                      entries, "_ordered_vars", None
+                  ) or tuple(entries.variable_to_plan_id.items())
+                  used_pids = dict.fromkeys(pid for _, pid in ordered_vars)
+                  entry_groups = (
+                      entries.plans_by_id.get(pid, ()) for pid in used_pids
+                  )
+                else:
+                  entry_groups = (entries,)
+                for group_entries in entry_groups:
+                  for entry in group_entries:
+                    peer = entry[0]
+                    if peer and peer not in seen_direct_dst_peers:
+                      seen_direct_dst_peers.add(peer)
+                      direct_dst_peers.append(peer)
+                      if peer not in cached_schedule.data_address_to_unit:
+                        raise KeyError(
+                            f"Destination peer endpoint '{peer}' not found in"
+                            " data_address_to_unit"
+                        )
+                      direct_dst_units.append(
+                          str(cached_schedule.data_address_to_unit[peer])
                       )
-                    direct_dst_units.append(
-                        str(cached_schedule.data_address_to_unit[entry[0]])
-                    )
 
             direct_plan = TransferPlan(
                 src_units=list(direct_schedules.keys()),
@@ -1498,6 +1525,7 @@ class RaidenController:
                 cached_serialized_payloads=(
                     cached_schedule.cached_serialized_payloads
                 ),
+                endpoint_to_shards=endpoint_to_shards,
                 variable_plans=cached_schedule.variable_plans,
                 variable_to_plan_id=cached_schedule.variable_to_plan_id,
                 broadcast_round=0,
@@ -1512,7 +1540,6 @@ class RaidenController:
                         dst_peers=direct_dst_peers,
                     )
                 ],
-                endpoint_to_shards=endpoint_to_shards,
             )
 
           # 1. Arm direct schedule receivers

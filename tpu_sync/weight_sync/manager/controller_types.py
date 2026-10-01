@@ -492,6 +492,84 @@ def compute_shard_host_ranks(
       return {idx: unit_idx for idx in range(len(src_shards))}
 
 
+def compute_endpoint_to_shards(
+    unit: RaidenId,
+    control_endpoints: Sequence[str],
+    data_shards: Sequence[str],
+) -> dict[Any, set[int]]:
+  """Maps control-plane RPC endpoints of `unit` to their owned global shard indices.
+
+  Args:
+    unit: The work unit `RaidenId`.
+    control_endpoints: Sequence of control-plane RPC endpoints (or
+      comma-separated endpoint strings) registered for `unit`.
+    data_shards: Sequence of data-plane `ip:port` strings for each global shard
+      index `0..N-1` of `unit`.
+
+  Returns:
+    A dictionary mapping `(unit, ep)` and `(_entity_key_from_unit(unit), ep)` to
+    the `set[int]` of global shard indices owned by `ep`, or `{}` when there is
+    at most one control endpoint or no host mapping can be inferred.
+  """
+  ctrl_eps: list[str] = []
+  for raw_ep in control_endpoints:
+    if not raw_ep:
+      continue
+    for part in str(raw_ep).split(","):
+      clean = part.strip()
+      if clean and clean not in ctrl_eps:
+        ctrl_eps.append(clean)
+  if len(ctrl_eps) <= 1 or not data_shards:
+    return {}
+
+  ctrl_by_host: dict[str, list[str]] = {}
+  for ep in ctrl_eps:
+    h_ip = _extract_host_ip(ep)
+    ctrl_by_host.setdefault(h_ip, []).append(ep)
+
+  data_eps_by_host: dict[str, dict[str, set[int]]] = {}
+  all_shards_by_host: dict[str, set[int]] = {}
+  for shard_idx, shard_addr in enumerate(data_shards):
+    clean_shard = shard_addr.strip() if shard_addr else ""
+    if not clean_shard:
+      continue
+    h_ip = _extract_host_ip(clean_shard)
+    data_eps_by_host.setdefault(h_ip, {}).setdefault(clean_shard, set()).add(
+        shard_idx
+    )
+    all_shards_by_host.setdefault(h_ip, set()).add(shard_idx)
+
+  if any(h_ip not in data_eps_by_host for h_ip in ctrl_by_host):
+    return {}
+
+  entity_key = _entity_key_from_unit(unit)
+  result: dict[Any, set[int]] = {}
+  num_hosts = len(ctrl_by_host)
+  for h_ip, h_ctrl_eps in ctrl_by_host.items():
+    unique_data_sets = list(data_eps_by_host[h_ip].values())
+    n_ctrl = len(h_ctrl_eps)
+    n_data = len(unique_data_sets)
+    if n_ctrl == n_data:
+      for ep, shard_set in zip(h_ctrl_eps, unique_data_sets):
+        owned = set(shard_set)
+        result[(unit, ep)] = owned
+        result[(entity_key, ep)] = owned
+    elif n_ctrl == 1:
+      owned = set(all_shards_by_host[h_ip])
+      ep = h_ctrl_eps[0]
+      result[(unit, ep)] = owned
+      result[(entity_key, ep)] = owned
+    elif num_hosts > 1:
+      owned = set(all_shards_by_host[h_ip])
+      for ep in h_ctrl_eps:
+        result[(unit, ep)] = owned
+        result[(entity_key, ep)] = owned
+    else:
+      return {}
+
+  return result
+
+
 def _raiden_id_from_proto(unit: Any) -> RaidenId:
   return RaidenId(
       job_name=unit.job_name,

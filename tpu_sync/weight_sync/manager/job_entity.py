@@ -1030,11 +1030,20 @@ class JobEntity:
     include_recv_sched = self.include_receiver_push_schedules(transfer_plan)
     dst_units_key = tuple(getattr(transfer_plan, "dst_units", ()))
     sched_sig = self._schedule_cache_signature(transfer_plan, target_id)
+    owned_shards = (
+        self.get_host_owned_shards(transfer_plan, address, unit=target_id)
+        if (is_sender and address)
+        else None
+    )
+    owned_shards_key = (
+        tuple(sorted(owned_shards)) if owned_shards is not None else None
+    )
     cache_key = (
         target_id,
         address,
         dst_units_key,
         sched_sig,
+        owned_shards_key,
         uuid_val,
         req_id_val,
         skip_d2h_val,
@@ -1048,6 +1057,7 @@ class JobEntity:
         address,
         dst_units_key,
         sched_sig,
+        owned_shards_key,
         uuid_val,
         skip_d2h_val,
         is_sender,
@@ -1061,6 +1071,7 @@ class JobEntity:
         address,
         dst_units_key,
         sched_sig,
+        owned_shards_key,
         is_sender,
         is_ws,
         int(transfer_plan.dst_mem_type),
@@ -1252,48 +1263,50 @@ class JobEntity:
               if len(schedule_proto.entries) > 0:
                 start_req.shard_push_schedules[key_idx].CopyFrom(schedule_proto)
       else:
-        owned_shards = None
-        if address:
-          owned_shards = self.get_host_owned_shards(
-              transfer_plan, address, unit=target_id
+        push_schedules = transfer_plan.shard_push_schedules.get(target_id)
+        if owned_shards is not None:
+          unit_cached = (
+              cached_protos.setdefault(target_id, {})
+              if cached_protos is not None
+              else None
           )
-
-        cached_protos = getattr(
-            transfer_plan, "sender_push_schedule_protos", None
-        )
-        if cached_protos is not None and target_id in cached_protos:
-          target_cache = cached_protos[target_id]
-          if owned_shards is not None:
-            for shard_idx in owned_shards:
-              if shard_idx not in target_cache:
-                raise KeyError(
-                    f"Missing cached push schedule proto for shard {shard_idx}"
-                    f" on unit {target_id}"
-                )
+          missing_schedules = {}
+          for shard_idx in sorted(owned_shards):
+            if unit_cached is not None and shard_idx in unit_cached:
               start_req.shard_push_schedules[shard_idx].CopyFrom(
-                  target_cache[shard_idx]
+                  unit_cached[shard_idx]
               )
-          else:
-            for shard_idx, schedule_proto in target_cache.items():
-              start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
-        else:
-          push_schedules = transfer_plan.shard_push_schedules.get(target_id)
-          if push_schedules:
-            if owned_shards is not None:
-              schedules_to_build = {
-                  s_idx: push_schedules[s_idx]
-                  for s_idx in owned_shards
-                  if s_idx in push_schedules
-              }
-            else:
-              schedules_to_build = push_schedules
-            target_protos = self.build_sender_push_schedule_protos(
-                schedules_to_build
+            elif push_schedules and shard_idx in push_schedules:
+              missing_schedules[shard_idx] = push_schedules[shard_idx]
+            elif unit_cached is not None and not push_schedules:
+              raise KeyError(
+                  f"Missing cached push schedule proto for shard {shard_idx}"
+                  f" on unit {target_id}"
+              )
+          if missing_schedules:
+            built_protos = self.build_sender_push_schedule_protos(
+                missing_schedules
             )
-            for shard_idx, schedule_proto in target_protos.items():
+            for shard_idx, schedule_proto in built_protos.items():
               start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
-            if cached_protos is not None and owned_shards is None:
-              cached_protos[target_id] = target_protos
+              if unit_cached is not None:
+                unit_cached[shard_idx] = schedule_proto
+        elif (
+            cached_protos is not None
+            and target_id in cached_protos
+            and (
+                not push_schedules
+                or len(cached_protos[target_id]) >= len(push_schedules)
+            )
+        ):
+          for shard_idx, schedule_proto in cached_protos[target_id].items():
+            start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
+        elif push_schedules:
+          target_protos = self.build_sender_push_schedule_protos(push_schedules)
+          for shard_idx, schedule_proto in target_protos.items():
+            start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
+          if cached_protos is not None:
+            cached_protos[target_id] = target_protos
 
     # If this host is a sender in a block-chunk plan but owns no shards with
     # push schedules, there is nothing for it to push; do not send an empty

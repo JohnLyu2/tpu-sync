@@ -454,6 +454,141 @@ class JobEntityTest(absltest.TestCase):
     self.assertEqual(entry.layer_idx, 5)
     self.assertEqual(entry.dst_peer, "10.11.0.3:8000")
 
+  def test_compute_endpoint_to_shards_topologies(self):
+    """Verifies compute_endpoint_to_shards across multi-host, NUMA, and torus-interleaved topologies."""
+    unit = RaidenId("trainer", "0", "weights")
+    ent_key = controller_types.entity_key_from_unit(unit)
+
+    # 1. Multi-host multi-NUMA: 2 hosts, 2 control endpoints/host, 2 unique
+    # data endpoints/host, 8 shards total.
+    ctrl_numa = [
+        "10.0.0.1:9000,10.0.0.1:9001,10.0.0.2:9000,10.0.0.2:9001",
+    ]
+    data_numa = [
+        "10.0.0.1:8000",
+        "10.0.0.1:8000",
+        "10.0.0.1:8001",
+        "10.0.0.1:8001",
+        "10.0.0.2:8000",
+        "10.0.0.2:8000",
+        "10.0.0.2:8001",
+        "10.0.0.2:8001",
+    ]
+    res_numa = controller_types.compute_endpoint_to_shards(
+        unit, ctrl_numa, data_numa
+    )
+    self.assertEqual(res_numa[(unit, "10.0.0.1:9000")], {0, 1})
+    self.assertEqual(res_numa[(ent_key, "10.0.0.1:9000")], {0, 1})
+    self.assertEqual(res_numa[(unit, "10.0.0.1:9001")], {2, 3})
+    self.assertEqual(res_numa[(unit, "10.0.0.2:9000")], {4, 5})
+    self.assertEqual(res_numa[(unit, "10.0.0.2:9001")], {6, 7})
+
+    # 2. Torus-interleaved TP=2 on loopback
+    ctrl_torus = ["127.0.0.1:9000,127.0.0.1:9001"]
+    data_torus = [
+        "127.0.0.1:8000",
+        "127.0.0.1:8000",
+        "127.0.0.1:8001",
+        "127.0.0.1:8001",
+        "127.0.0.1:8000",
+        "127.0.0.1:8000",
+        "127.0.0.1:8001",
+        "127.0.0.1:8001",
+    ]
+    res_torus = controller_types.compute_endpoint_to_shards(
+        unit, ctrl_torus, data_torus
+    )
+    self.assertEqual(res_torus[(unit, "127.0.0.1:9000")], {0, 1, 4, 5})
+    self.assertEqual(res_torus[(unit, "127.0.0.1:9001")], {2, 3, 6, 7})
+
+    # 3. Multi-host single control endpoint per host with per-chip data ports
+    ctrl_single = ["10.0.0.1:9000,10.0.0.2:9000"]
+    data_single = [f"10.0.0.1:{8000 + i}" for i in range(4)] + [
+        f"10.0.0.2:{8000 + i}" for i in range(4)
+    ]
+    res_single = controller_types.compute_endpoint_to_shards(
+        unit, ctrl_single, data_single
+    )
+    self.assertEqual(res_single[(unit, "10.0.0.1:9000")], {0, 1, 2, 3})
+    self.assertEqual(res_single[(unit, "10.0.0.2:9000")], {4, 5, 6, 7})
+
+  def test_encode_start_transfer_builds_only_host_owned_shards(self):
+    """Verifies encode_start_transfer with endpoint_to_shards only builds protos for owned_shards."""
+    entity = job_entity.JobEntity(
+        unit=self.src_unit,
+        shards=[
+            "10.11.0.1:8000",
+            "10.11.0.1:8000",
+            "10.11.0.2:8000",
+            "10.11.0.2:8000",
+        ],
+        control_endpoints=["10.11.0.1:9000", "10.11.0.2:9000"],
+        control_pipe=self.pipe_stub,
+    )
+    self.addCleanup(entity.worker_rpc_client.close)
+
+    ep_to_shards = controller_types.compute_endpoint_to_shards(
+        self.src_unit,
+        ["10.11.0.1:9000,10.11.0.2:9000"],
+        [
+            "10.11.0.1:8000",
+            "10.11.0.1:8000",
+            "10.11.0.2:8000",
+            "10.11.0.2:8000",
+        ],
+    )
+    plan = controller_types.TransferPlan(
+        src_units=[self.src_unit],
+        dst_units=[self.dst_unit],
+        plan=None,
+        shard_push_schedules={
+            self.src_unit: {i: [self._make_dummy_entry(i)] for i in range(4)}
+        },
+        worker_data_addresses={
+            self.src_unit: [
+                "10.11.0.1:8000",
+                "10.11.0.1:8000",
+                "10.11.0.2:8000",
+                "10.11.0.2:8000",
+            ],
+            self.dst_unit: ["10.11.0.3:8000"],
+        },
+        endpoint_to_shards=ep_to_shards,
+        use_block_chunks=True,
+        is_sender=True,
+    )
+
+    built_shard_sets: list[set[int]] = []
+    orig_build = entity.build_sender_push_schedule_protos
+
+    def _recording_build(push_schedules):
+      built_shard_sets.append(set(push_schedules.keys()))
+      return orig_build(push_schedules)
+
+    entity.build_sender_push_schedule_protos = _recording_build
+
+    payload_h0 = entity.encode_start_transfer(
+        plan, address="10.11.0.1:9000", unit=self.src_unit
+    )
+    self.assertEqual(built_shard_sets, [{0, 1}])
+    req_h0 = raiden_service_pb2.ControlRequest()
+    req_h0.ParseFromString(payload_h0)
+    self.assertEqual(
+        set(req_h0.start_transfer_request.shard_push_schedules.keys()),
+        {0, 1},
+    )
+
+    payload_h1 = entity.encode_start_transfer(
+        plan, address="10.11.0.2:9000", unit=self.src_unit
+    )
+    self.assertEqual(built_shard_sets, [{0, 1}, {2, 3}])
+    req_h1 = raiden_service_pb2.ControlRequest()
+    req_h1.ParseFromString(payload_h1)
+    self.assertEqual(
+        set(req_h1.start_transfer_request.shard_push_schedules.keys()),
+        {2, 3},
+    )
+
 
 if __name__ == "__main__":
   absltest.main()
