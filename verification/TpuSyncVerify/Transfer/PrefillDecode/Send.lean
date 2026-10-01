@@ -764,6 +764,24 @@ theorem d2hDone_spec {s s' : Send} (hs : step s .d2hDone = some s') :
   · cases hs; exact ⟨‹_›, rfl⟩
   · cases hs
 
+/-- Only `wake` consumes a layer's future. -/
+theorem step_woken {s s' : Send} {e : Ev} (hs : step s e = some s') (he : ∀ ok, e ≠ .wake ok) :
+    s'.woken = s.woken := by
+  cases e <;> (try exact absurd rfl (he _)) <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> rfl)
+
+/-- `wake` consumes exactly the next one. -/
+theorem wake_woken {s s' : Send} {ok : Bool} (hs : step s (.wake ok) = some s') :
+    s'.woken = s.woken + 1 := by
+  simp only [step, wake] at hs
+  split at hs
+  · (repeat' split at hs) <;> cases hs <;>
+      simp only [endOp, finish, Lifecycle.finishOnceLocked_inFlight] <;> (repeat' split) <;> rfl
+  · cases hs
+
 theorem h2hDone_guard {s s' : Send} {ok : Bool} (hs : step s (.h2hDone ok) = some s') :
     s.h2hRetired < s.h2hIssued := by
   simp only [step, h2hDone] at hs

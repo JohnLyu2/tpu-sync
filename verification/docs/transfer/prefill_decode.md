@@ -12,11 +12,13 @@ was read at that commit when the stage was written.
 | `Transfer/Session.lean` | 1 | the settle protocol shared by the session classes: `in_flight_`, `draining_`, `done_`, staging ownership | `Consistent` is preserved by `beginOp`/`finish*`/`endOp` |
 | `PrefillDecode/Receive.lean` | 1–2 | one `TransferReceiveSession` plus the manager's poll and publication; transport block accounting; `IsReadyToComplete` | `Recv.reachable_safe` |
 | `PrefillDecode/Send.lean` | 3 | one `TransferSendSession`: the D2H loop and the H2H push chain against one `in_flight_` | `Send.reachable_safe` |
-| `PrefillDecode/Pipeline.lean` | 4 | `Send` + `Recv` + five layer-indexed memories (prefill HBM → staging → wire → decode staging → decode HBM), engine reclaim, staging reuse | `Pipeline.reachable_safe`, `Pipeline.attention_safe` |
+| `PrefillDecode/Pipeline.lean` | 4 | `Send` + `Recv` + five layer-indexed memories (prefill HBM → staging → wire → decode staging → decode HBM), engine reclaim, staging reuse; every memory-touching event names its layer, so layers complete in any order at every stage | `Pipeline.reachable_safe`, `Pipeline.attention_safe` |
 
 Stage boundaries are the commits on `experimental` (see the README status
 table). Each later stage uses the earlier models as-is: `Pipeline` composes
-`Send.step` and `Recv.step` and only adds the memory effect of each event.
+`Send.step` and `Recv.step`, adds the memory effect of each event and the
+per-layer guards the counters cannot express (a push waits for *its* layer's
+D2H copy; an H2D dispatch waits for *its* layer to land).
 
 ## Proposal properties → theorems
 
@@ -44,7 +46,7 @@ was checked when:
 | 1 | `transfer_receive_session.{h,cc}` | `ExecuteLayerH2d` re-checks `done_ || draining_` under its second lock (`.cc:601-612`); fault injection adds dispatch/completion failure paths; `in_flight_` starts at 1 for a load plan (`.cc:342`). All encoded. |
 | 2 | `block_transport.cc`, `kv_cache_manager_with_transfer.cc` (`CompleteReadRaw`, `begin/end_incoming_push`, `OnBlocksReceived` path) | `OnLayerReceived` fires once per layer (`bt.cc:528-530`) and before `OnBlocksReceived` on the same thread (`bt.cc:570-584`): assumption A4 of `Receive.lean`. |
 | 3 | `transfer_send_session.{h,cc}`, `mgr.cc` pull worker and deadline | two op chains on one counter; `SendNextLayer` carries an op across the pool task; `FinishLocked` is first-call-wins. |
-| 4 | the above plus `bt.cc:436-470` (landing), `mgr.cc:918-925` (send publication) | layer granularity (A1), delivery modelled after the callback (A2), one sender (A3). |
+| 4 | the above plus `bt.cc:436-470` (landing), `mgr.cc:918-925` (send publication), `send.cc:324` / `:449` (D2H copies and pushes are *issued* in layer order), `send.cc:380-384` (`SendNextLayer(l)` waits on layer `l`'s own future) | layer granularity (A1), delivery modelled after the callback (A2), one sender per layer (A3). Completion order is **not** assumed: every memory-touching event is layer-indexed. |
 
 Assumptions are numbered per module (`Receive` A1–A4, `Send` A1–A6,
 `Pipeline` A1–A4) and each names the guard that encodes it. The ones a reader
@@ -53,8 +55,18 @@ should know about:
 * **Receive A4 / Pipeline A3** — transport ordering and a single sender per
   layer. Readiness soundness depends on A4; the mutant
   `Recv.netAccountUnordered` shows what breaks without it.
+* **Send A3** — the send model counts copies and pushes without naming
+  layers; sound for `Send` alone because it has no per-layer state. The
+  pipeline, which does, does not inherit this: its events carry the layer
+  and its ghost sets (`d2hDoneL`, `readyL`, …) record which layers have
+  passed each stage, with `cnt_d2hDone` / `cnt_ready` tying two of them to
+  the session counters.
 * **Send A5** — no consumer `Ack`: `HandleAck → AckSend → Finish()` has no
   non-test caller at `01ffa3d`, so it is not an event.
+* **Pipeline A2** — the push callback is modelled *before* the landing it
+  reports; the real order is the reverse. The docstring gives the simulation
+  argument (the pushed cell cannot change between issue and callback) and
+  the one real trace shape this leaves out (layer landed, callback fails).
 * **Pipeline A4** — the engine contract: decode reads only after
   `done_recving`, prefill frees only after `done_sending`.
 
@@ -65,6 +77,8 @@ Traces (all `decide`):
 | Theorem | Shows |
 |---|---|
 | `Recv.trace_normal`, `Send.trace_normal`, `Pipeline.trace_normal` | the happy path reaches publication with the data in decode HBM |
+| `Pipeline.trace_layers_out_of_order` | two layers: D2H finishes 1 then 0, pushes complete 1 then 0, layer 1 lands and is dispatched first, H2D finishes 1 then 0 — publication finds `[kv 0, kv 1]`. The proposal's out-of-order question, answered inside the model |
+| `Pipeline.trace_wake_needs_own_layer` | `SendNextLayer(0)` does not proceed on layer 1's finished copy |
 | `Recv.trace_poll_before_callbacks` | `IsReadyToComplete` can be true before the callbacks ran; publication waits |
 | `Recv.trace_deadline_during_copy`, `Send.trace_deadline_during_copy` | a deadline under an in-flight copy drains but does not settle until the op ends |
 | `Recv.trace_finish_between_locks` | the race the `.cc:601-612` re-check closes |
@@ -73,11 +87,12 @@ Traces (all `decide`):
 | `Send.trace_push_fails` | a failed push drains the chain |
 | `Send.trace_cancel_after_ok_finish` | first-finish-wins on the send side |
 | `Pipeline.trace_slow_consumer` | producer published, reclaimed and reseated before the consumer lands anything; data still right |
-| `Pipeline.trace_no_dispatch_before_land` | `h2dBegin` needs the layer to have landed |
+| `Pipeline.trace_no_dispatch_before_land` | `h2dBegin l` needs layer `l` to have landed |
 
 Bounded searches (`#guard … = .outOfFuel`): `Recv` from both initial states
 (fuel 10, n = 2), `Send` (fuel 12, n = 2), `Pipeline` from `init 1` and from
-`afterProducer` (fuel 10).
+`afterProducer` (fuel 10), and from `afterProducer2` — the two-layer producer
+that finished out of order — over every consumer interleaving (fuel 7, n = 2).
 
 Mutants (each yields a `.counterexample`):
 
@@ -86,7 +101,8 @@ Mutants (each yields a `.counterexample`):
 | `Recv.cancelEager`, `Send.cancelEager` | settle waits for `in_flight_ = 0` | settle safety |
 | `Recv.netAccountUnordered` | layer accounted only after its copy is issued (A4) | readiness soundness |
 | `Send.sendNextUncounted` / `d2hIssueUncounted` | the op `SendNextLayer` takes at `.cc:381` | no underflow / drained |
-| `Pipeline.dispatchEarly` | `h2dBegin` after the layer landed | publication correctness (junk in HBM) |
+| `Pipeline.dispatchEarly` | `h2dBegin l` after layer `l` landed | publication correctness (junk in HBM) |
+| `Pipeline.h2dReadyByRank` | the H2D copy for layer `l` reads slot `l` (it reads the slot the *counter* points at instead — the shape of a counter-indexed model) | publication correctness: with layer 1 landing first, HBM ends `[kv 1, junk]` |
 | `Pipeline.reseatAtFinish` | staging released at settle, not at `Finish` | publication correctness via the send's staging |
 
 ## Outcome at `01ffa3d`
@@ -111,10 +127,10 @@ what remains is where it deliberately stops.
 | # | Work | Why | Cost |
 |---|---|---|---|
 | F1 | **Progress / no-leak property.** In every reachable state with `inFlight > 0`, some op-retiring event is enabled (every accounted unit of `in_flight_` has an owner that can end it). Both sessions. | `Accounted` says `in_flight_` is explained, not that each unit can retire. A leaked op is a session that never settles and staging never released — the production failure mode the safety proofs do not catch. Cheap given `Accounted`. This is the proposal's "termination" half of staging integrity. | low |
-| F2 | **Model validation: Lean traces → C++ scenario tests.** `trace_finish_between_locks`, `trace_poll_before_callbacks`, `trace_cancel_after_ok_finish`, `trace_slow_consumer`; `trace_reseat_at_finish` as a fault-injected negative test, using the fault-injection hooks already in `transfer_*_session.cc`. | The correspondence tables are trusted, not checked. Executable scenarios make them checkable and the work legible to tpu-sync owners. Proposal §3.3. | medium |
+| F2 | **Model validation: Lean traces → C++ scenario tests.** `trace_finish_between_locks`, `trace_poll_before_callbacks`, `trace_cancel_after_ok_finish`, `trace_slow_consumer`, `trace_layers_out_of_order`; `trace_reseat_at_finish` as a fault-injected negative test, using the fault-injection hooks already in `transfer_*_session.cc`. In the other direction, recorded executions replay without relabelling layers, since every pipeline event names its layer. | The correspondence tables are trusted, not checked. Executable scenarios make them checkable and the work legible to tpu-sync owners. Proposal §3.3. | medium |
 | F3 | **Maintenance.** `lake build` in CI on the fork; a citation-check script that stores the cited snippet next to each `file:line` and fails when it drifts. | Citations rot with every upstream commit. | low |
 | F4 | **Discharge Receive A1/A3/A4 by modelling the transport.** Add `block_transport.cc`: per-block accounting, `on_layer_received_called`, several senders per layer. Then `OnLayerReceived`-before-`OnBlocksReceived` and readiness soundness are proved rather than assumed. | A4 is the one assumption whose failure would be a real bug. Multi-sender is where the threshold arithmetic `num_completed_blocks_ / total_blocks_` is subtle and currently unexercised. | medium–high; worth it if multi-sender transfers are used in production |
-| F5 | Completeness: `Pipeline` on the push-plan path (`Recv.initPush` + `StartPush` via `HandlePullStream`); n = 2 search from a mid-state; the mutant table above kept in sync automatically. | rounds things out; low discovery potential | low |
+| F5 | Completeness: `Pipeline` on the push-plan path (`Recv.initPush` + `StartPush` via `HandlePullStream`); a mixed-outcome push (layer landed, callback failed — see Pipeline A2); the mutant table above kept in sync automatically. | rounds things out; low discovery potential | low |
 
 Explicitly not planned: block-granularity memories for their own sake;
 staging-pool contention (`AcquireStagingWithRetry`) — a liveness/resource

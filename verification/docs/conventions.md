@@ -45,7 +45,11 @@ Each ghost is listed in the module's state table and marked `ghost`.
 Prefer counters to indexed maps when identity does not matter. `Nat` keeps
 `DecidableEq`, avoids `funext`, and lets the same model be proved and
 model-checked. Use indexed structure only where the property needs it
-(`Pipeline` memories are `List Cell` indexed by layer).
+(`Pipeline` memories are `List Cell` indexed by layer). When identity does
+matter but the session keeps only a counter, add a per-item `List Bool`
+ghost set next to the counter and tie them with an invariant
+(`countTrue set = counter`); the counter stays the thing the C++ checks,
+the set is what the proof reasons about.
 
 ## Module layout
 
