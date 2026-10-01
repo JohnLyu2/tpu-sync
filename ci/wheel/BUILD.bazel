@@ -71,6 +71,7 @@ TORCH_REQUIRES = COMMON_REQUIRES + TORCH_REQ + ["libtpu>=0.0.47"]
 #
 COMMON_DEPS = [
     "//tpu_sync/api:common",
+    "//tpu_sync/api:weight_synchronizer_manager",
     "//tpu_sync/rpc:coordination_helper",
     "//tpu_sync/rpc:raiden_controller",
 ]
