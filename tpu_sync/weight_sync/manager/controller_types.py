@@ -284,6 +284,9 @@ class StageBroadcastGroup:
   canonical_variable_plans: dict[RaidenId, dict[int, dict[int, list[Any]]]]
   canonical_relay_plans: dict[int, dict[int, list[tuple[int, int, int]]]]
   data_addresses: dict[RaidenId, list[str]]
+  cached_hop_schedules: dict[Any, Any] = dataclasses.field(
+      default_factory=dict, repr=False, compare=False
+  )
 
 
 @dataclasses.dataclass

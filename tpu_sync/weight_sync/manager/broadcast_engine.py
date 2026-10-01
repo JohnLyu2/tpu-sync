@@ -201,6 +201,7 @@ def _coalesce_pipeline_groups(
                     canonical_variable_plans=g.canonical_variable_plans,
                     canonical_relay_plans=g.canonical_relay_plans,
                     data_addresses=dict(g.data_addresses),
+                    cached_hop_schedules=g.cached_hop_schedules,
                 )
             )
       else:
@@ -239,6 +240,7 @@ def _coalesce_pipeline_groups(
                   canonical_variable_plans=merged_canonical_vars,
                   canonical_relay_plans=merged_canonical_relays,
                   data_addresses=dict(first.data_addresses),
+                  cached_hop_schedules=first.cached_hop_schedules,
               )
           )
       i = j
@@ -743,55 +745,123 @@ class BroadcastEngine:
       # after the final pipeline stage completes for the shared transfer UUID.
       if g.stage_group is not None:
         stage_group = g.stage_group
-        seed_shard_layer_counts: dict[int, dict[int, int]] = (
-            collections.defaultdict(lambda: collections.defaultdict(int))
+        hop_cache = getattr(stage_group, "cached_hop_schedules", None)
+        layer_counts_key = (
+            "__layer_counts__",
+            stage_group.pool_group,
+            stage_group.layer_group_idx,
         )
-        relay_shard_layer_counts: dict[int, dict[int, int]] = (
-            collections.defaultdict(lambda: collections.defaultdict(int))
-        )
-        seen_relay_layers: set[int] = set()
-        for s_u in stage_group.src_units:
-          var_list = stage_group.stage_ordered_vars_by_unit.get(s_u, [])
-          var_plans = stage_group.canonical_variable_plans.get(s_u, {})
-          for layer_idx, plan_id in var_list:
-            p_dict = var_plans.get(plan_id, {})
-            for tuples_9 in p_dict.values():
-              for t9 in tuples_9:
-                seed_shard_layer_counts[t9[0]][layer_idx] += 1
-            if layer_idx not in seen_relay_layers:
-              seen_relay_layers.add(layer_idx)
-              relay_shards = stage_group.canonical_relay_plans.get(plan_id, {})
-              for local_dst_idx, blocks in relay_shards.items():
-                if blocks:
-                  relay_shard_layer_counts[local_dst_idx][layer_idx] += len(
-                      blocks
-                  )
+        if hop_cache is not None and layer_counts_key in hop_cache:
+          (
+              seed_shard_layer_counts,
+              seed_total_blocks,
+              seed_layer_totals,
+              relay_shard_layer_counts,
+              relay_total_blocks,
+              relay_layer_totals,
+          ) = hop_cache[layer_counts_key]
+        else:
+          seed_shard_layer_counts: dict[int, dict[int, int]] = (
+              collections.defaultdict(lambda: collections.defaultdict(int))
+          )
+          relay_shard_layer_counts: dict[int, dict[int, int]] = (
+              collections.defaultdict(lambda: collections.defaultdict(int))
+          )
+          seen_relay_layers: set[int] = set()
+          for s_u in stage_group.src_units:
+            var_list = stage_group.stage_ordered_vars_by_unit.get(s_u, [])
+            var_plans = stage_group.canonical_variable_plans.get(s_u, {})
+            pid_seed_dst_counts: dict[int, dict[int, int]] = {}
+            for layer_idx, plan_id in var_list:
+              dst_counts = pid_seed_dst_counts.get(plan_id)
+              if dst_counts is None:
+                dst_counts = collections.defaultdict(int)
+                for tuples_9 in var_plans.get(plan_id, {}).values():
+                  for t9 in tuples_9:
+                    dst_counts[t9[0]] += 1
+                pid_seed_dst_counts[plan_id] = dst_counts
+              for local_dst_idx, cnt in dst_counts.items():
+                seed_shard_layer_counts[local_dst_idx][layer_idx] += cnt
+              if layer_idx not in seen_relay_layers:
+                seen_relay_layers.add(layer_idx)
+                relay_shards = stage_group.canonical_relay_plans.get(
+                    plan_id, {}
+                )
+                for local_dst_idx, blocks in relay_shards.items():
+                  if blocks:
+                    relay_shard_layer_counts[local_dst_idx][layer_idx] += len(
+                        blocks
+                    )
+          seed_layer_totals: dict[int, int] = collections.defaultdict(int)
+          seed_total_blocks = 0
+          for layer_dict in seed_shard_layer_counts.values():
+            for layer_idx, cnt in layer_dict.items():
+              seed_layer_totals[layer_idx] += cnt
+              seed_total_blocks += cnt
+          relay_layer_totals: dict[int, int] = collections.defaultdict(int)
+          relay_total_blocks = 0
+          for layer_dict in relay_shard_layer_counts.values():
+            for layer_idx, cnt in layer_dict.items():
+              relay_layer_totals[layer_idx] += cnt
+              relay_total_blocks += cnt
+          if hop_cache is not None:
+            hop_cache[layer_counts_key] = (
+                seed_shard_layer_counts,
+                seed_total_blocks,
+                seed_layer_totals,
+                relay_shard_layer_counts,
+                relay_total_blocks,
+                relay_layer_totals,
+            )
 
         for hop in populated_hops:
           dst_unit = hop.receiver
+          is_seed_hop = hop.sender == g.primary_src_unit
           shard_layer_counts = (
               seed_shard_layer_counts
-              if hop.sender == g.primary_src_unit
+              if is_seed_hop
               else relay_shard_layer_counts
           )
+          hop_total_blocks = (
+              seed_total_blocks if is_seed_hop else relay_total_blocks
+          )
+          hop_layer_totals = (
+              seed_layer_totals if is_seed_hop else relay_layer_totals
+          )
+          receiver_block_counts[dst_unit] += hop_total_blocks
+          dst_lc = receiver_layer_counts[dst_unit]
+          for layer_idx, cnt in hop_layer_totals.items():
+            dst_lc[layer_idx] += cnt
+
           dst_addrs = stage_group.data_addresses.get(dst_unit, [])
-          for local_dst_idx, layer_dict in shard_layer_counts.items():
-            dst_peer = (
-                dst_addrs[local_dst_idx]
-                if local_dst_idx < len(dst_addrs)
-                else ""
-            )
-            host_ip = (
-                controller_types._extract_host_ip(dst_peer) if dst_peer else ""
-            )
-            for layer_idx, cnt in layer_dict.items():
-              receiver_block_counts[dst_unit] += cnt
-              receiver_layer_counts[dst_unit][layer_idx] += cnt
+          unique_host_ips = {
+              controller_types.extract_host_ip(dst_addrs[local_dst_idx])
+              if local_dst_idx < len(dst_addrs) and dst_addrs[local_dst_idx]
+              else ""
+              for local_dst_idx in shard_layer_counts
+          }
+          if len(unique_host_ips) == 1:
+            only_ip = next(iter(unique_host_ips))
+            if only_ip:
+              receiver_endpoint_counts[dst_unit][only_ip] += hop_total_blocks
+              ep_lc = receiver_endpoint_layer_counts[dst_unit][only_ip]
+              for layer_idx, cnt in hop_layer_totals.items():
+                ep_lc[layer_idx] += cnt
+          else:
+            for local_dst_idx, layer_dict in shard_layer_counts.items():
+              dst_peer = (
+                  dst_addrs[local_dst_idx]
+                  if local_dst_idx < len(dst_addrs)
+                  else ""
+              )
+              host_ip = (
+                  controller_types.extract_host_ip(dst_peer) if dst_peer else ""
+              )
               if host_ip:
-                receiver_endpoint_counts[dst_unit][host_ip] += cnt
-                receiver_endpoint_layer_counts[dst_unit][host_ip][
-                    layer_idx
-                ] += cnt
+                ep_lc = receiver_endpoint_layer_counts[dst_unit][host_ip]
+                for layer_idx, cnt in layer_dict.items():
+                  receiver_endpoint_counts[dst_unit][host_ip] += cnt
+                  ep_lc[layer_idx] += cnt
       else:
         for hop in populated_hops:
           dst_unit = hop.receiver
@@ -1076,6 +1146,7 @@ class BroadcastEngine:
 
       if group.stage_group is not None:
         stage_group = group.stage_group
+        hop_cache = getattr(stage_group, "cached_hop_schedules", None)
         dst_addrs = stage_group.data_addresses[dst_unit]
         if s == group.primary_src_unit:
           hop_receivers = hop.receivers
@@ -1084,22 +1155,39 @@ class BroadcastEngine:
               and hop.round_idx == 0
               and len(hop_receivers) == len(group.pending_dst_units)
           )
-          if (
-              getattr(final_plan, "has_explicit_shard_push_schedules", False)
-              or is_single_stage_1hop
-          ) and final_plan.shard_push_schedules:
-            s_u_schedules = {
-                s_u: final_plan.shard_push_schedules.get(s_u, {})
-                for s_u in stage_group.src_units
-            }
+          seed_cache_key = (
+              "seed",
+              stage_group.pool_group,
+              stage_group.layer_group_idx,
+              tuple(hop_receivers),
+              tuple(
+                  tuple(stage_group.data_addresses.get(d_u, ()))
+                  for d_u in hop_receivers
+              ),
+          )
+          if hop_cache is not None and seed_cache_key in hop_cache:
+            s_u_schedules, s_u_expected_blocks = hop_cache[seed_cache_key]
           else:
-            s_u_schedules = self.build_stage_trainer_push_schedules(
-                stage_group, hop_receivers, registered_shards=registered_shards
-            )
-          s_u_expected_blocks: dict[RaidenId, int] = {
-              s_u: sum(len(sched) for sched in sched_dict.values())
-              for s_u, sched_dict in s_u_schedules.items()
-          }
+            if (
+                getattr(final_plan, "has_explicit_shard_push_schedules", False)
+                or is_single_stage_1hop
+            ) and final_plan.shard_push_schedules:
+              s_u_schedules = {
+                  s_u: final_plan.shard_push_schedules.get(s_u, {})
+                  for s_u in stage_group.src_units
+              }
+            else:
+              s_u_schedules = self.build_stage_trainer_push_schedules(
+                  stage_group,
+                  hop_receivers,
+                  registered_shards=registered_shards,
+              )
+            s_u_expected_blocks = {
+                s_u: sum(len(sched) for sched in sched_dict.values())
+                for s_u, sched_dict in s_u_schedules.items()
+            }
+            if hop_cache is not None:
+              hop_cache[seed_cache_key] = (s_u_schedules, s_u_expected_blocks)
 
           use_explicit_plan_counts = bool(
               getattr(final_plan, "has_explicit_shard_push_schedules", False)
@@ -1247,50 +1335,61 @@ class BroadcastEngine:
           transfers_in_progress[task] = hop
         else:
           # Sampler -> Sampler relay: 1-to-1 whole-block transfer
-          seen_relay_layers = set()
-          ordered_relay_vars = []
-          for s_u in stage_group.src_units:
-            for (
-                layer_idx,
-                plan_id,
-            ) in stage_group.stage_ordered_vars_by_unit.get(s_u, []):
-              if layer_idx not in seen_relay_layers:
-                seen_relay_layers.add(layer_idx)
-                ordered_relay_vars.append((layer_idx, plan_id))
-          relay_var_to_pid = dict(ordered_relay_vars)
-          unique_relay_pids = set(relay_var_to_pid.values())
-          relay_shard_plans_by_id: dict[int, dict[int, list[Any]]] = {}
-          for pid in unique_relay_pids:
-            relay_shards = stage_group.canonical_relay_plans.get(pid, {})
-            for local_dst_idx, blocks in relay_shards.items():
-              if blocks:
-                dst_peer = dst_addrs[local_dst_idx]
-                relay_shard_plans_by_id.setdefault(local_dst_idx, {})[pid] = [
-                    (
-                        dst_peer,
-                        local_dst_idx,
-                        min_offset,
-                        min_offset,
-                        block_size,
-                        dst_block_id,
-                        dst_block_id,
-                        block_size,
-                        block_size,
-                        1,
-                    )
-                    for min_offset, block_size, dst_block_id in blocks
-                ]
-          sub_schedule: dict[RaidenId, dict[int, Any]] = {
-              s: {
-                  local_dst_idx: controller_types.PlanReferencedShardSchedule(
-                      relay_shard_plans_by_id[local_dst_idx],
-                      relay_var_to_pid,
-                      ordered_relay_vars,
-                      pool_group=stage_group.pool_group,
-                  )
-                  for local_dst_idx in sorted(relay_shard_plans_by_id.keys())
-              }
-          }
+          relay_cache_key = (
+              "relay",
+              stage_group.pool_group,
+              stage_group.layer_group_idx,
+              dst_unit,
+              tuple(dst_addrs),
+          )
+          if hop_cache is not None and relay_cache_key in hop_cache:
+            relay_shard_sched = hop_cache[relay_cache_key]
+          else:
+            seen_relay_layers = set()
+            ordered_relay_vars = []
+            for s_u in stage_group.src_units:
+              for (
+                  layer_idx,
+                  plan_id,
+              ) in stage_group.stage_ordered_vars_by_unit.get(s_u, []):
+                if layer_idx not in seen_relay_layers:
+                  seen_relay_layers.add(layer_idx)
+                  ordered_relay_vars.append((layer_idx, plan_id))
+            relay_var_to_pid = dict(ordered_relay_vars)
+            unique_relay_pids = set(relay_var_to_pid.values())
+            relay_shard_plans_by_id: dict[int, dict[int, list[Any]]] = {}
+            for pid in unique_relay_pids:
+              relay_shards = stage_group.canonical_relay_plans.get(pid, {})
+              for local_dst_idx, blocks in relay_shards.items():
+                if blocks:
+                  dst_peer = dst_addrs[local_dst_idx]
+                  relay_shard_plans_by_id.setdefault(local_dst_idx, {})[pid] = [
+                      (
+                          dst_peer,
+                          local_dst_idx,
+                          min_offset,
+                          min_offset,
+                          block_size,
+                          dst_block_id,
+                          dst_block_id,
+                          block_size,
+                          block_size,
+                          1,
+                      )
+                      for min_offset, block_size, dst_block_id in blocks
+                  ]
+            relay_shard_sched = {
+                local_dst_idx: controller_types.PlanReferencedShardSchedule(
+                    relay_shard_plans_by_id[local_dst_idx],
+                    relay_var_to_pid,
+                    ordered_relay_vars,
+                    pool_group=stage_group.pool_group,
+                )
+                for local_dst_idx in sorted(relay_shard_plans_by_id.keys())
+            }
+            if hop_cache is not None:
+              hop_cache[relay_cache_key] = relay_shard_sched
+          sub_schedule: dict[RaidenId, dict[int, Any]] = {s: relay_shard_sched}
 
           sub_plan = type(final_plan)(
               src_units=[s],

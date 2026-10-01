@@ -1984,6 +1984,95 @@ class BroadcastEngineTest(absltest.TestCase):
         [(0, 0), (2, 0), (1, 2), (3, 2)],
     )
 
+  def test_stage_broadcast_group_reuses_cached_hop_schedules_across_rounds(
+      self,
+  ):
+    """Verifies StageBroadcastGroup caches hop schedules across rounds."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src_0 = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    dst_units = [
+        RaidenId(job_name="sampler", job_replica_id=str(i), data_name="w")
+        for i in range(4)
+    ]
+    data_addresses = {src_0: ["10.0.0.1:8000", "10.0.0.2:8000"]}
+    for i, u in enumerate(dst_units):
+      data_addresses[u] = [f"10.0.1.{i}:8000", f"10.0.1.{i}:8001"]
+
+    canonical_vars = {
+        src_0: {
+            1: {
+                0: [(0, 0, 0, 1024, 0, 0, 1024, 1024, 1)],
+                1: [(1, 0, 0, 1024, 0, 0, 1024, 1024, 1)],
+            }
+        }
+    }
+    canonical_relays = {
+        1: {
+            0: [(0, 1024, 0)],
+            1: [(0, 1024, 0)],
+        }
+    }
+    stage_group = controller_types.StageBroadcastGroup(
+        pool_group=0,
+        layer_group_idx=0,
+        src_units=[src_0],
+        dst_units=dst_units,
+        stage_ordered_vars_by_unit={src_0: [(0, 1), (1, 1), (2, 1)]},
+        canonical_variable_plans=canonical_vars,
+        canonical_relay_plans=canonical_relays,
+        data_addresses=data_addresses,
+    )
+    shared_payload_cache: dict[Any, Any] = {}
+    registered_shards = {u: list(addrs) for u, addrs in data_addresses.items()}
+
+    for round_idx, uuid in enumerate([1001, 1002]):
+      final_plan = raiden_controller.TransferPlan(
+          src_units=[src_0],
+          dst_units=dst_units,
+          plan=None,
+          worker_data_addresses=data_addresses,
+          uuid=uuid,
+          is_weight_sync=True,
+          cached_serialized_payloads=shared_payload_cache,
+      )
+      asyncio.run(
+          engine.execute_slice_broadcast_pipeline(
+              groups_list=[stage_group],
+              final_plan=final_plan,
+              n_seed=1,
+              req_id=f"req_warm_{round_idx}",
+              dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+              registered_shards=registered_shards,
+              pipeline_target_stages=2,
+          )
+      )
+
+    self.assertIn(("__layer_counts__", 0, 0), stage_group.cached_hop_schedules)
+    r0_sender_plans = [
+        plan
+        for _, plan in rpc_client.invocations
+        if plan.is_sender and plan.uuid == 1001
+    ]
+    r1_sender_plans = [
+        plan
+        for _, plan in rpc_client.invocations
+        if plan.is_sender and plan.uuid == 1002
+    ]
+    self.assertLen(r0_sender_plans, len(r1_sender_plans))
+    for p0, p1 in zip(r0_sender_plans, r1_sender_plans):
+      self.assertIs(
+          p0.cached_serialized_payloads, p1.cached_serialized_payloads
+      )
+      for s_u in p0.shard_push_schedules:
+        for shard_idx in p0.shard_push_schedules[s_u]:
+          self.assertIs(
+              p0.shard_push_schedules[s_u][shard_idx],
+              p1.shard_push_schedules[s_u][shard_idx],
+          )
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -973,12 +973,23 @@ class JobEntity:
         ordered_vars = getattr(entries, "_ordered_vars", None) or tuple(
             entries.variable_to_plan_id.items()
         )
+        plans_by_id = entries.plans_by_id
+        plan_samples = tuple(
+            (
+                pid,
+                len(p_entries),
+                p_entries[0] if p_entries else (),
+                p_entries[-1] if p_entries else (),
+            )
+            for pid, p_entries in sorted(plans_by_id.items())
+        )
         return (
             "plan_ref",
             len(target_scheds),
             shard_idx,
             getattr(entries, "pool_group", 0),
             tuple(ordered_vars),
+            plan_samples,
         )
       if entries:
         first = entries[0]
@@ -1024,10 +1035,12 @@ class JobEntity:
     uuid_val = getattr(transfer_plan, "uuid", None)
     req_id_val = getattr(transfer_plan, "req_id", None)
     skip_d2h_val = bool(getattr(transfer_plan, "skip_d2h", False))
+    broadcast_round_val = getattr(transfer_plan, "broadcast_round", None)
     is_sender = target_id in transfer_plan.src_units and transfer_plan.is_sender
     is_ws = getattr(transfer_plan, "is_weight_sync", False)
     ep_count = len(target_eps)
     include_recv_sched = self.include_receiver_push_schedules(transfer_plan)
+    src_units_key = tuple(getattr(transfer_plan, "src_units", ()))
     dst_units_key = tuple(getattr(transfer_plan, "dst_units", ()))
     sched_sig = self._schedule_cache_signature(transfer_plan, target_id)
     owned_shards = (
@@ -1041,9 +1054,11 @@ class JobEntity:
     cache_key = (
         target_id,
         address,
+        src_units_key,
         dst_units_key,
         sched_sig,
         owned_shards_key,
+        broadcast_round_val,
         uuid_val,
         req_id_val,
         skip_d2h_val,
@@ -1055,9 +1070,11 @@ class JobEntity:
     steady_key = (
         target_id,
         address,
+        src_units_key,
         dst_units_key,
         sched_sig,
         owned_shards_key,
+        broadcast_round_val,
         uuid_val,
         skip_d2h_val,
         is_sender,
@@ -1069,9 +1086,11 @@ class JobEntity:
         "__template__",
         target_id,
         address,
+        src_units_key,
         dst_units_key,
         sched_sig,
         owned_shards_key,
+        broadcast_round_val,
         is_sender,
         is_ws,
         int(transfer_plan.dst_mem_type),
@@ -1094,6 +1113,16 @@ class JobEntity:
         serialized_bytes = cached_req.SerializeToString()
         payload_cache[cache_key] = serialized_bytes
         payload_cache[steady_key] = serialized_bytes
+        prev_list = payload_cache.setdefault(
+            ("__prev_keys__", template_key), []
+        )
+        prev_list.append((cache_key, steady_key))
+        while len(prev_list) > 4:
+          old_cache_k, old_steady_k = prev_list.pop(0)
+          if all(old_cache_k != ck for ck, _ in prev_list):
+            payload_cache.pop(old_cache_k, None)
+          if all(old_steady_k != sk for _, sk in prev_list):
+            payload_cache.pop(old_steady_k, None)
         return serialized_bytes
 
     peers = []
@@ -1346,6 +1375,25 @@ class JobEntity:
       if is_sender and is_ws:
         payload_cache[steady_key] = serialized_bytes
         payload_cache[template_key] = req
+        prev_list = payload_cache.setdefault(
+            ("__prev_keys__", template_key), []
+        )
+        prev_list.append((cache_key, steady_key))
+        while len(prev_list) > 4:
+          old_cache_k, old_steady_k = prev_list.pop(0)
+          if all(old_cache_k != ck for ck, _ in prev_list):
+            payload_cache.pop(old_cache_k, None)
+          if all(old_steady_k != sk for _, sk in prev_list):
+            payload_cache.pop(old_steady_k, None)
+      else:
+        prev_recv = payload_cache.setdefault(
+            ("__prev_recv_keys__", template_key), []
+        )
+        prev_recv.append(cache_key)
+        while len(prev_recv) > 4:
+          old_ck = prev_recv.pop(0)
+          if old_ck not in prev_recv:
+            payload_cache.pop(old_ck, None)
     return serialized_bytes
 
   # pylint: disable=protected-access
