@@ -1478,7 +1478,7 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // The store can be destroyed while this transfer is in flight, so every
   // touch of it goes through the lifetime fence below.
   future.OnReady(
-      [lifetime = lifetime_, host_ram_backend = backend(),
+      [lifetime = lifetime_, host_ram_backend = backend(), secondary_backend,
        raiden_id = raiden_id_,
        block_hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
@@ -1488,6 +1488,11 @@ void KVCacheStore::LoadFromSecondaryBackend(
            std::vector<int>(device_block_ids.begin(), device_block_ids.end())](
           absl::Status status) {
         if (!status.ok()) {
+          // The tier's Lookup may have answered from a stale existence cache
+          // (e.g. the files were evicted out of band). Drop those entries so
+          // the next Lookup re-probes storage. The worker's error code does
+          // not survive the RPC, so this is done for every recall failure.
+          secondary_backend->Delete(block_hashes, /*slices=*/{});
           // TODO: revisit returning every staging block and failing the whole
           // batch on a recall error. The transfer reports a single status, so
           // a partial storage failure (some blocks landed in HBM) is treated

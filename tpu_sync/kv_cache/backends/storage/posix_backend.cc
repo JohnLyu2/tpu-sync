@@ -29,6 +29,8 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <functional>
 #include <future>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -36,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -47,6 +50,9 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -596,6 +602,38 @@ absl::StatusOr<PosixBackendOptions> PosixBackendOptions::FromProperties(
     }
   }
 
+  // metadata_cache_max_entries: 0 (off), > 0 (cap) or -1 (unbounded).
+  ABSL_RETURN_IF_ERROR(
+      num("metadata_cache_max_entries", &options.metadata_cache_max_entries));
+  if (options.metadata_cache_max_entries < 0 &&
+      options.metadata_cache_max_entries != kUnboundedMetadataCache) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "metadata_cache_max_entries must be >= 0 or ", kUnboundedMetadataCache,
+        ", got ", options.metadata_cache_max_entries));
+  }
+  // metadata_cache_ttl_secs: > 0 or -1 (never expire).
+  ABSL_RETURN_IF_ERROR(
+      num("metadata_cache_ttl_secs", &options.metadata_cache_ttl_secs));
+  if (options.metadata_cache_ttl_secs <= 0 &&
+      options.metadata_cache_ttl_secs != kUnboundedMetadataCache) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "metadata_cache_ttl_secs must be > 0 or ", kUnboundedMetadataCache,
+        ", got ", options.metadata_cache_ttl_secs));
+  }
+  if (options.metadata_cache_max_entries != 0) {
+    if (options.metadata_cache_max_entries == kUnboundedMetadataCache) {
+      LOG(WARNING) << "POSIX metadata cache is unbounded "
+                      "(metadata_cache_max_entries=-1); memory grows with the "
+                      "number of distinct shard files looked up.";
+    }
+    if (options.metadata_cache_ttl_secs == kUnboundedMetadataCache) {
+      LOG(WARNING) << "POSIX metadata cache entries never expire "
+                      "(metadata_cache_ttl_secs=-1); files removed from "
+                      "storage out of band are only forgotten after a failed "
+                      "recall.";
+    }
+  }
+
   return options;
 }
 
@@ -635,83 +673,281 @@ absl::StatusOr<BlockKey> PosixPathMapper::MapKey(
 
 // --- PosixKVCacheStoreBackend Implementation ---
 
+MetadataCacheOptions MetadataCacheOptions::FromPosixOptions(
+    const PosixBackendOptions& options) {
+  MetadataCacheOptions cache_options;
+  cache_options.max_entries =
+      options.metadata_cache_max_entries == kUnboundedMetadataCache
+          ? std::numeric_limits<size_t>::max()
+          : static_cast<size_t>(options.metadata_cache_max_entries);
+  cache_options.ttl = options.metadata_cache_ttl_secs == kUnboundedMetadataCache
+                          ? absl::InfiniteDuration()
+                          : absl::Seconds(options.metadata_cache_ttl_secs);
+  return cache_options;
+}
+
+PosixKVCacheStoreBackend::PosixKVCacheStoreBackend(
+    std::shared_ptr<KVBackend> storage_backend, std::string name,
+    size_t capacity_bytes, size_t lookup_batch_size,
+    MetadataCacheOptions cache_options)
+    : storage_backend_(std::move(storage_backend)),
+      name_(std::move(name)),
+      capacity_bytes_(capacity_bytes),
+      lookup_batch_size_(lookup_batch_size > 0 ? lookup_batch_size
+                                               : kDefaultLookupBatchSize),
+      cache_options_(cache_options),
+      cache_(cache_options.max_entries) {
+  if (cache_options_.enabled()) {
+    LOG(INFO) << "PosixKVCacheStoreBackend '" << name_
+              << "': metadata cache enabled (max_entries="
+              << (cache_options_.max_entries ==
+                          std::numeric_limits<size_t>::max()
+                      ? std::string("unbounded")
+                      : absl::StrCat(cache_options_.max_entries))
+              << ", ttl=" << cache_options_.ttl << ")";
+  }
+}
+
+size_t PosixKVCacheStoreBackend::metadata_cache_size() const {
+  absl::MutexLock lock(cache_mu_);
+  return cache_.size();
+}
+
+RaidenBlockId PosixKVCacheStoreBackend::MakeSharedStorageBlock() const {
+  RaidenBlockId block;
+  block.status = BlockStatus::SHARED_STORAGE;
+  block.raiden_id.job_replica_id = "shared";
+  block.raiden_id.data_name = name_;
+  return block;
+}
+
+absl::StatusOr<std::vector<BlockKey>> PosixKVCacheStoreBackend::MapShardKeys(
+    const std::string& block_hash) const {
+  const std::shared_ptr<BlockKeyMapper> mapper = storage_backend_->mapper();
+  // In secondary storage each block is partitioned across all TP workers
+  // (r0..rN-1), one file per shard. Only the rank-0 shard is required today:
+  // its presence is taken as a witness for the whole block.
+  // TODO: require every rank in [0, tp_size) for a consistent lookup based on
+  // all shards' availability in the storage layer.
+  constexpr int kRequiredRanks[] = {0};
+  std::vector<BlockKey> keys;
+  keys.reserve(std::size(kRequiredRanks));
+  for (const int rank : kRequiredRanks) {
+    const backends::KeyMappingOptions lookup_opts{
+        .parallelism = {.tp_size = mapper->tp_size(), .tp_rank = rank},
+    };
+    ABSL_ASSIGN_OR_RETURN(BlockKey key,
+                          mapper->MapKey(block_hash, lookup_opts));
+    keys.push_back(std::move(key));
+  }
+  return keys;
+}
+
+std::vector<std::vector<bool>> PosixKVCacheStoreBackend::CachedFresh(
+    absl::Span<const std::vector<BlockKey>> shard_keys) {
+  std::vector<std::vector<bool>> fresh;
+  fresh.reserve(shard_keys.size());
+  for (const std::vector<BlockKey>& keys : shard_keys) {
+    fresh.emplace_back(keys.size(), false);
+  }
+  if (!cache_options_.enabled()) return fresh;
+  const absl::Time now = absl::Now();
+  absl::MutexLock lock(cache_mu_);
+  for (size_t i = 0; i < shard_keys.size(); ++i) {
+    for (size_t j = 0; j < shard_keys[i].size(); ++j) {
+      const std::string& resolved_key = shard_keys[i][j].resolved_key;
+      ExistenceEntry* entry = cache_.Get(resolved_key);  // Promotes to MRU.
+      if (entry == nullptr) continue;
+      if (now - entry->last_used >= cache_options_.ttl) {
+        cache_.Erase(resolved_key);
+        continue;
+      }
+      entry->last_used = now;  // Every hit refreshes the TTL.
+      fresh[i][j] = true;
+    }
+  }
+  return fresh;
+}
+
+void PosixKVCacheStoreBackend::CacheInsert(
+    absl::Span<const BlockKey* const> keys) {
+  if (!cache_options_.enabled() || keys.empty()) return;
+  const absl::Time now = absl::Now();
+  absl::MutexLock lock(cache_mu_);
+  for (const BlockKey* key : keys) {
+    // Confirmed on storage: insert, or refresh the TTL if already cached.
+    std::optional<std::pair<std::string, ExistenceEntry>> evicted =
+        cache_.Put(key->resolved_key, ExistenceEntry{now});
+    // LRUCache parks the evicted entry on its candidate list; reclaim it now
+    // so the cache never holds more than max_entries.
+    if (evicted.has_value()) cache_.Erase(evicted->first);
+  }
+}
+
+std::vector<bool> PosixKVCacheStoreBackend::ProbeExists(
+    absl::Span<const BlockKey> keys) {
+  std::vector<bool> exists(keys.size(), false);
+  std::promise<std::vector<absl::StatusOr<bool>>> promise;
+  auto future = promise.get_future();
+  storage_backend_->BatchExistsAsync(
+      keys, [&promise](std::vector<absl::StatusOr<bool>> res) {
+        promise.set_value(std::move(res));
+      });
+  const std::vector<absl::StatusOr<bool>> answers = future.get();
+  // A short answer cannot be attributed to keys reliably; treat it as absent.
+  if (answers.size() != keys.size()) return exists;
+  for (size_t i = 0; i < answers.size(); ++i) {
+    exists[i] = answers[i].ok() && *answers[i];
+  }
+  return exists;
+}
+
+// Returns the longest prefix of `block_hashes` that is available on storage.
+//
+// Block hash -> shard keys.
+//   A KV block is written by every tensor-parallel worker, each storing its own
+//   shard as a separate file. MapKey(hash, {tp_size, tp_rank = r}) resolves the
+//   file for shard r, e.g.
+//     <root>/<model>/tp<tp_size>_r<r>/<l1>/<l2>/<hex(hash)>.bin
+//   so one block hash maps to up to tp_size storage keys ("shard keys").
+//   MapShardKeys(hash) returns the shard keys that must ALL exist for the block
+//   to count as available. Today that is only the rank-0 shard (a witness for
+//   the whole block).
+//   TODO: change MapShardKeys to report all ranks' keys.
+//
+// Metadata cache contents.
+//   When enabled (metadata_cache_max_entries != 0), the cache maps one shard
+//   key (its resolved file path) to the last time it was used: a cache hit or
+//   a storage probe that found the file. It holds only positive answers: a
+//   shard key is either cached as "exists" or not cached at all. An entry is
+//   fresh while now - last_used < ttl (a sliding, idle TTL), so a hot entry
+//   is not re-checked on storage. A stale entry for a deleted file is dropped
+//   when a recall from this tier fails (Delete()), when it goes unused for
+//   ttl, or when it is evicted least-recently-used past max_entries.
+//   A block is answered from the cache only if every one of its shard keys is
+//   fresh.
+//
+// Algorithm. i = block index (block_hashes[i], request order); j = shard
+// index within MapShardKeys(block_hashes[i]) (today always 0: rank 0).
+//   Phase 0 (map):   shard_keys[i] = MapShardKeys(block_hashes[i]), in order.
+//                    The first hash that cannot be mapped ends the prefix.
+//   Phase 1 (cache): mark each shard key present if it has a fresh cache
+//                    entry; each fresh hit refreshes its last_used. Expired
+//                    entries are erased and treated as misses.
+//   Phase 2 (storage): gather the cache-missed shard keys of ALL blocks into
+//                    one list, in block order, and check it with
+//                    BatchExistsAsync in chunks of lookup_batch_size. Misses
+//                    from different blocks therefore share a storage call.
+//                    Early exit: if a chunk reports shard key k absent, the
+//                    block owning k is unavailable, so the result can only
+//                    contain blocks before it. Because keys are probed in
+//                    block order, every key of those earlier blocks was in
+//                    this chunk or an earlier one and is already resolved.
+//                    Remaining chunks hold keys of the unavailable block or
+//                    later blocks only, which cannot change the result, so
+//                    they are not probed.
+//   Phase 3 (merge): block i is available iff all of shard_keys[i] are present
+//                    (fresh in cache or found on storage). Return blocks up to
+//                    the first unavailable one, and cache every shard key that
+//                    storage confirmed (insert only if absent).
+//
+// With the cache disabled every shard key is a miss, so Lookup reduces to the
+// chunked storage probe with early exit.
 absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
     absl::Span<const std::string> block_hashes, const LookupOptions& options) {
   BlockSliceList results;
   if (!storage_backend_ || !storage_backend_->mapper() || block_hashes.empty())
     return results;
 
-  const size_t total_blocks = block_hashes.size();
-  const size_t batch_size =
-      lookup_batch_size_ > 0 ? lookup_batch_size_ : kDefaultLookupBatchSize;
+  // Phase 0 (map).
+  std::vector<std::vector<BlockKey>> shard_keys;
+  shard_keys.reserve(block_hashes.size());
+  for (const std::string& hash : block_hashes) {
+    absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
+    if (!keys.ok()) break;
+    shard_keys.push_back(*std::move(keys));
+  }
+  if (shard_keys.empty()) return results;
 
-  // -------------------------------------------------------------------------
-  // Canonical Rank-0 Witness Resolution:
-  // In secondary storage, each block is partitioned across all TP workers
-  // (r0..rN-1). The existence of the shard at rank 0 confirms the availability
-  // of the entire logical block. We explicitly query rank = 0 with the
-  // mapper's configured tp_size.
-  //
-  // TODO: Revisit this logic to ensure a consistent lookup based on all
-  // shards availability in the storage layer.
-  // -------------------------------------------------------------------------
-  backends::KeyMappingOptions lookup_opts{
-      .parallelism = {.tp_size = storage_backend_->mapper()->tp_size(),
-                      .tp_rank = 0},
+  // Phase 1 (cache).
+  std::vector<std::vector<bool>> present = CachedFresh(shard_keys);
+
+  // Phase 2 (storage).
+  struct ShardRef {
+    size_t block;
+    size_t shard;
   };
-
-  for (size_t offset = 0; offset < total_blocks; offset += batch_size) {
-    size_t current_chunk_len = std::min(batch_size, total_blocks - offset);
-    auto chunk_hashes = block_hashes.subspan(offset, current_chunk_len);
-
-    std::vector<BlockKey> chunk_keys;
-    chunk_keys.reserve(current_chunk_len);
-    // batch_exists[i] is indexed against chunk_hashes[i] below, so skipping an
-    // unmappable key would misattribute existence results to the wrong block.
-    // Truncate the probe instead: under-reporting hits is always safe.
-    bool mapping_failed = false;
-    for (const auto& hash : chunk_hashes) {
-      absl::StatusOr<BlockKey> key =
-          storage_backend_->mapper()->MapKey(hash, lookup_opts);
-      if (!key.ok()) {
-        mapping_failed = true;
-        break;
-      }
-      chunk_keys.push_back(*std::move(key));
-    }
-    if (mapping_failed) break;
-
-    std::promise<std::vector<absl::StatusOr<bool>>> promise;
-    auto future = promise.get_future();
-    storage_backend_->BatchExistsAsync(
-        chunk_keys, [&promise](std::vector<absl::StatusOr<bool>> res) {
-          promise.set_value(std::move(res));
-        });
-    auto batch_exists = future.get();
-    const size_t check_count =
-        std::min(batch_exists.size(), chunk_hashes.size());
-    bool hit_streak = (batch_exists.size() == chunk_hashes.size());
-
-    for (size_t i = 0; i < check_count; ++i) {
-      if (hit_streak && batch_exists[i].ok() && *batch_exists[i]) {
-        RaidenBlockId block;
-        block.status = BlockStatus::SHARED_STORAGE;
-        block.raiden_id.job_replica_id = "shared";
-        block.raiden_id.data_name = name_;
-        results.push_back(std::make_pair(chunk_hashes[i], block));
-      } else {
-        hit_streak = false;
-        break;
-      }
-    }
-
-    // Prefix-cache semantics: stop probing subsequent chunks upon first miss.
-    if (!hit_streak) {
-      break;
+  // One entry per cache-missed shard key: shard_keys[block][shard]. This is a
+  // single flat list across ALL blocks, ordered by block i, then shard j
+  // within the block. Chunks below cut this list every lookup_batch_size
+  // entries without regard to block boundaries, so one BatchExistsAsync call
+  // can carry shards of several blocks, and one block's shards can be split
+  // across two consecutive calls.
+  std::vector<ShardRef> misses;
+  for (size_t i = 0; i < shard_keys.size(); ++i) {
+    for (size_t j = 0; j < shard_keys[i].size(); ++j) {
+      if (!present[i][j]) misses.push_back({i, j});
     }
   }
+  std::vector<const BlockKey*> confirmed;
+  for (size_t offset = 0; offset < misses.size();
+       offset += lookup_batch_size_) {
+    const size_t chunk_len =
+        std::min(lookup_batch_size_, misses.size() - offset);
+    std::vector<BlockKey> chunk_keys;
+    chunk_keys.reserve(chunk_len);
+    for (size_t k = 0; k < chunk_len; ++k) {
+      const ShardRef& miss = misses[offset + k];
+      chunk_keys.push_back(shard_keys[miss.block][miss.shard]);
+    }
+    const std::vector<bool> exists = ProbeExists(chunk_keys);
+    bool chunk_has_absent = false;
+    for (size_t k = 0; k < chunk_len; ++k) {
+      const ShardRef& miss = misses[offset + k];
+      if (exists[k]) {
+        present[miss.block][miss.shard] = true;
+        confirmed.push_back(&shard_keys[miss.block][miss.shard]);
+      } else {
+        chunk_has_absent = true;
+      }
+    }
+    if (chunk_has_absent) break;  // Early exit; see Phase 2 above.
+  }
+  CacheInsert(confirmed);
 
+  // Phase 3 (merge).
+  auto all_present = [](const std::vector<bool>& shards) {
+    return absl::c_all_of(shards, [](bool shard_present) {
+      return shard_present;
+    });
+  };
+  for (size_t i = 0; i < shard_keys.size() && all_present(present[i]); ++i) {
+    results.push_back(
+        std::make_pair(block_hashes[i], MakeSharedStorageBlock()));
+  }
   return results;
+}
+
+void PosixKVCacheStoreBackend::Delete(
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const RaidenBlockId> slices) {
+  if (!cache_options_.enabled() || !storage_backend_ ||
+      !storage_backend_->mapper()) {
+    return;
+  }
+  std::vector<std::string> resolved_keys;
+  resolved_keys.reserve(block_hashes.size());
+  for (const std::string& hash : block_hashes) {
+    absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
+    if (!keys.ok()) continue;  // Never cached; keep invalidating the rest.
+    for (BlockKey& key : *keys) {
+      resolved_keys.push_back(std::move(key.resolved_key));
+    }
+  }
+  absl::MutexLock lock(cache_mu_);
+  for (const std::string& resolved_key : resolved_keys) {
+    cache_.Erase(resolved_key);
+  }
 }
 
 }  // namespace storage
@@ -758,5 +994,7 @@ REGISTER_KV_CACHE_STORE_BACKEND(
       const PosixBackendOptions& options = backend->options();
       return std::make_shared<PosixKVCacheStoreBackend>(
           std::move(backend), backend_name, options.capacity_bytes,
-          options.lookup_batch_size);
+          options.lookup_batch_size,
+          ::tpu_raiden::kv_cache::backends::storage::MetadataCacheOptions::
+              FromPosixOptions(options));
     });

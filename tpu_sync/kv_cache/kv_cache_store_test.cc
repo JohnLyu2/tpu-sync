@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -68,6 +69,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
@@ -75,7 +77,6 @@
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
@@ -6700,6 +6701,59 @@ LoadOutcome WaitForLoadSettled(KVCacheStore& store, size_t expected) {
     }
   }
   return outcome;
+}
+
+// A recall failure is the store's signal that the storage tier may have
+// answered Lookup from a stale metadata cache entry; the entry must be dropped
+// so the next Lookup re-probes storage instead of re-offering the block.
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       StorageRecallFailureInvalidatesStorageMetadataCache) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  mock_mgr.fail_transfers = true;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::string scratch_dir =
+      std::string(testing::TempDir()) + "/" +
+      ::testing::UnitTest::GetInstance()->current_test_info()->name();
+  auto mapper = std::make_shared<backends::storage::PosixPathMapper>(
+      scratch_dir, "model_test", 1, 0);
+  auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
+      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+  worker_backend->set_mapper(mapper);
+  auto storage_tier =
+      std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+          worker_backend, "posix", /*capacity_bytes=*/0,
+          backends::storage::kDefaultLookupBatchSize,
+          backends::storage::MetadataCacheOptions{.max_entries = 1000});
+  KVCacheStoreTest::AddBackend(store, storage_tier);
+  mock_mgr.backends["posix"] = worker_backend;
+
+  // Warm the tier's metadata cache with a block that exists on storage.
+  TF_ASSERT_OK_AND_ASSIGN(
+      backends::BlockKey key,
+      mapper->MapKey("storage_hash", {.parallelism = {.tp_rank = 0}}));
+  std::filesystem::create_directories(
+      std::filesystem::path(key.resolved_key).parent_path());
+  { std::ofstream(key.resolved_key, std::ios::binary) << "data"; }
+  TF_ASSERT_OK_AND_ASSIGN(auto warm, storage_tier->Lookup({"storage_hash"}));
+  ASSERT_EQ(warm.size(), 1);
+  ASSERT_EQ(storage_tier->metadata_cache_size(), 1);
+
+  RaidenBlockId slice(RaidenId{"test_job", "0", "posix", 0}, -1, -1,
+                      BlockStatus::SHARED_STORAGE);
+  ASSERT_TRUE(store.Load({"storage_hash"}, {slice}, {4}).ok());
+  LoadOutcome outcome = WaitForLoadSettled(store, /*expected=*/1);
+  EXPECT_THAT(outcome.failed, ::testing::ElementsAre("storage_hash"));
+
+  EXPECT_EQ(storage_tier->metadata_cache_size(), 0);
 }
 
 // The storage tier's Lookup stamps a synthetic identity on the slice it

@@ -22,7 +22,9 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <ios>
+#include <limits>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -34,6 +36,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
@@ -42,7 +45,10 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
@@ -1332,6 +1338,374 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnalignedBufferRejected) {
   const std::vector<HostBufferDescriptor> aligned = {
       HostBufferDescriptor{.ptr = base, .size = align}};
   EXPECT_THAT(RunRead(*backend, offset_key, aligned, align), kNotAligned);
+}
+
+// ===========================================================================
+// Theme 8: Metadata Cache
+// ===========================================================================
+
+// Counts existence probes so tests can observe which lookups reach storage.
+class CountingPosixKVBackend : public PosixKVBackend {
+ public:
+  using PosixKVBackend::PosixKVBackend;
+
+  void BatchExistsAsync(absl::Span<const BlockKey> keys,
+                        std::function<void(std::vector<absl::StatusOr<bool>>)>
+                            callback) override {
+    {
+      absl::MutexLock lock(mu_);
+      ++batch_calls_;
+      probed_keys_ += keys.size();
+    }
+    PosixKVBackend::BatchExistsAsync(keys, std::move(callback));
+  }
+
+  int batch_calls() const {
+    absl::MutexLock lock(mu_);
+    return batch_calls_;
+  }
+  size_t probed_keys() const {
+    absl::MutexLock lock(mu_);
+    return probed_keys_;
+  }
+  void ResetCounts() {
+    absl::MutexLock lock(mu_);
+    batch_calls_ = 0;
+    probed_keys_ = 0;
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  int batch_calls_ ABSL_GUARDED_BY(mu_) = 0;
+  size_t probed_keys_ ABSL_GUARDED_BY(mu_) = 0;
+};
+
+class MetadataCacheTest : public StorageDriverTest {
+ protected:
+  // Short enough to wait out in a test, long enough that a hit checked right
+  // after insertion is still fresh on a loaded machine.
+  static constexpr absl::Duration kShortTtl = absl::Milliseconds(200);
+
+  struct Env {
+    std::shared_ptr<CountingPosixKVBackend> backend;
+    std::shared_ptr<PosixPathMapper> mapper;
+    std::unique_ptr<PosixKVCacheStoreBackend> store;
+
+    std::string PathOf(const std::string& hash, int tp_rank = 0) {
+      absl::StatusOr<BlockKey> key =
+          mapper->MapKey(hash, {.parallelism = {.tp_rank = tp_rank}});
+      EXPECT_TRUE(key.ok()) << key.status();
+      return key.ok() ? key->resolved_key : "";
+    }
+    void CreateBlock(const std::string& hash, int tp_rank = 0) {
+      const std::string path = PathOf(hash, tp_rank);
+      fs::create_directories(fs::path(path).parent_path());
+      std::ofstream file(path, std::ios::binary);
+      file << "data";
+    }
+    void RemoveBlock(const std::string& hash) {
+      ASSERT_TRUE(fs::remove(PathOf(hash))) << hash;
+    }
+    size_t LookupCount(const std::vector<std::string>& hashes) {
+      absl::StatusOr<BlockSliceList> result = store->Lookup(hashes);
+      EXPECT_TRUE(result.ok()) << result.status();
+      return result.ok() ? result->size() : 0;
+    }
+  };
+
+  static MetadataCacheOptions Enabled(size_t max_entries = 1000,
+                                      absl::Duration ttl = absl::Seconds(60)) {
+    return MetadataCacheOptions{.max_entries = max_entries, .ttl = ttl};
+  }
+
+  Env CreateEnv(MetadataCacheOptions cache_options, size_t batch_size = 4,
+                int tp_size = 1) {
+    auto backend = std::make_shared<CountingPosixKVBackend>(
+        "posix",
+        absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+    auto mapper = std::make_shared<PosixPathMapper>(scratch_dir_, "model_test",
+                                                    tp_size, 0);
+    backend->set_mapper(mapper);
+    auto store = std::make_unique<PosixKVCacheStoreBackend>(
+        backend, "posix", 0, batch_size, cache_options);
+    return Env{std::move(backend), std::move(mapper), std::move(store)};
+  }
+};
+
+TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        PosixBackendOptions opts,
+        PosixBackendOptions::FromProperties({{"tp_rank", "0"}}));
+    EXPECT_EQ(opts.metadata_cache_max_entries, 0);
+    EXPECT_EQ(opts.metadata_cache_ttl_secs, 60);
+    const MetadataCacheOptions cache =
+        MetadataCacheOptions::FromPosixOptions(opts);
+    EXPECT_FALSE(cache.enabled());
+    EXPECT_EQ(cache.max_entries, 0);
+    EXPECT_EQ(cache.ttl, absl::Seconds(60));
+  }
+  {
+    TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                            PosixBackendOptions::FromProperties(
+                                {{"tp_rank", "0"},
+                                 {"metadata_cache_max_entries", "-1"},
+                                 {"metadata_cache_ttl_secs", "-1"}}));
+    const MetadataCacheOptions cache =
+        MetadataCacheOptions::FromPosixOptions(opts);
+    EXPECT_TRUE(cache.enabled());
+    EXPECT_EQ(cache.max_entries, std::numeric_limits<size_t>::max());
+    EXPECT_EQ(cache.ttl, absl::InfiniteDuration());
+  }
+  {
+    TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                            PosixBackendOptions::FromProperties(
+                                {{"tp_rank", "0"},
+                                 {"metadata_cache_max_entries", "7"},
+                                 {"metadata_cache_ttl_secs", "5"}}));
+    const MetadataCacheOptions cache =
+        MetadataCacheOptions::FromPosixOptions(opts);
+    EXPECT_TRUE(cache.enabled());
+    EXPECT_EQ(cache.max_entries, 7);
+    EXPECT_EQ(cache.ttl, absl::Seconds(5));
+  }
+  for (const char* invalid_val : {"-2", "abc"}) {
+    EXPECT_THAT(
+        PosixBackendOptions::FromProperties(
+            {{"tp_rank", "0"}, {"metadata_cache_max_entries", invalid_val}}),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 HasSubstr("metadata_cache_max_entries")))
+        << invalid_val;
+  }
+  for (const char* invalid_val : {"0", "-2", "abc"}) {
+    EXPECT_THAT(
+        PosixBackendOptions::FromProperties(
+            {{"tp_rank", "0"}, {"metadata_cache_ttl_secs", invalid_val}}),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 HasSubstr("metadata_cache_ttl_secs")))
+        << invalid_val;
+  }
+}
+
+TEST_F(StorageDriverTest, FactoryWiresMetadataCacheOptions) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("metadata_cache_max_entries", "10");
+  config.SetProperty("metadata_cache_ttl_secs", "5");
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend> created,
+      ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+          .CreateBackend(config, /*controller=*/nullptr));
+  auto store = std::dynamic_pointer_cast<PosixKVCacheStoreBackend>(created);
+  ASSERT_NE(store, nullptr);
+  EXPECT_TRUE(store->metadata_cache_options().enabled());
+  EXPECT_EQ(store->metadata_cache_options().max_entries, 10);
+  EXPECT_EQ(store->metadata_cache_options().ttl, absl::Seconds(5));
+}
+
+TEST_F(MetadataCacheTest, DisabledProbesStorageEveryTime) {
+  Env env = CreateEnv(MetadataCacheOptions{});
+  env.CreateBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->batch_calls(), 2);
+  EXPECT_EQ(env.store->metadata_cache_size(), 0);
+
+  env.RemoveBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  env.store->Delete({"a"}, {});  // No-op when disabled.
+}
+
+TEST_F(MetadataCacheTest, CachedHitSkipsStorageProbe) {
+  Env env = CreateEnv(Enabled());
+  for (const char* hash : {"a", "b", "c"}) env.CreateBlock(hash);
+
+  EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 3);
+  EXPECT_EQ(env.backend->batch_calls(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 3);
+
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 3);
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+}
+
+TEST_F(MetadataCacheTest, OnlyTheRankZeroShardIsRequiredAndCached) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/4, /*tp_size=*/2);
+  // The rank-1 shard alone does not make the block available.
+  env.CreateBlock("a", /*tp_rank=*/1);
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.store->metadata_cache_size(), 0);
+
+  // The rank-0 shard does, and it is the one shard entry cached per block.
+  env.CreateBlock("a", /*tp_rank=*/0);
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 1);
+}
+
+TEST_F(MetadataCacheTest, StaleEntryServedWithinTtlThenExpires) {
+  Env env = CreateEnv(Enabled(/*max_entries=*/1000, kShortTtl));
+  env.CreateBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+
+  // Removed out of band: the cache still vouches for it until the TTL passes.
+  env.RemoveBlock("a");
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+
+  // No hits for a full TTL after the last one: the entry expires.
+  absl::SleepFor(kShortTtl + absl::Milliseconds(50));
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.backend->batch_calls(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 0);
+}
+
+TEST_F(MetadataCacheTest, CacheHitsExtendTheTtl) {
+  Env env = CreateEnv(Enabled(/*max_entries=*/1000, kShortTtl));
+  env.CreateBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  const absl::Time inserted = absl::Now();
+  // Removed out of band, so any storage probe would report "a" absent: every
+  // positive answer below must come from the cache.
+  env.RemoveBlock("a");
+  env.backend->ResetCounts();
+
+  // Keep hitting the entry for twice its TTL. Each hit refreshes last_used,
+  // so it stays fresh well past `inserted + kShortTtl`.
+  while (absl::Now() - inserted < 2 * kShortTtl) {
+    EXPECT_EQ(env.LookupCount({"a"}), 1);
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+
+  // Once idle for a full TTL it expires and storage is probed again.
+  absl::SleepFor(kShortTtl + absl::Milliseconds(50));
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.backend->batch_calls(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 0);
+}
+
+TEST_F(MetadataCacheTest, InfiniteTtlNeverExpires) {
+  Env env = CreateEnv(Enabled(/*max_entries=*/1000, absl::InfiniteDuration()));
+  env.CreateBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  env.RemoveBlock("a");
+  absl::SleepFor(kShortTtl);
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+}
+
+TEST_F(MetadataCacheTest, DeleteInvalidatesSoNextLookupReprobes) {
+  Env env = CreateEnv(Enabled());
+  env.CreateBlock("a");
+  env.CreateBlock("b");
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
+
+  env.RemoveBlock("a");
+  env.store->Delete({"a", std::string(kMaxBlockHashBytes + 1, 'x')}, {});
+  EXPECT_EQ(env.store->metadata_cache_size(), 1);
+
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 0);
+  EXPECT_EQ(env.backend->probed_keys(), 1);  // Only "a"; "b" still cached.
+}
+
+TEST_F(MetadataCacheTest, MaxEntriesEvictsLeastRecentlyUsed) {
+  Env env = CreateEnv(Enabled(/*max_entries=*/2));
+  for (const char* hash : {"a", "b", "c"}) env.CreateBlock(hash);
+
+  EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 3);
+  EXPECT_EQ(env.store->metadata_cache_size(), 2);
+
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"b", "c"}), 2);
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+  EXPECT_EQ(env.LookupCount({"a"}), 1);  // Evicted: probed again.
+  EXPECT_EQ(env.backend->probed_keys(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 2);
+}
+
+TEST_F(MetadataCacheTest, UnboundedCacheHoldsEverything) {
+  Env env = CreateEnv(Enabled(std::numeric_limits<size_t>::max()),
+                      /*batch_size=*/16);
+  std::vector<std::string> hashes;
+  for (int i = 0; i < 100; ++i) {
+    hashes.push_back(absl::StrCat("block_", i));
+    env.CreateBlock(hashes.back());
+  }
+  EXPECT_EQ(env.LookupCount(hashes), 100);
+  EXPECT_EQ(env.store->metadata_cache_size(), 100);
+}
+
+TEST_F(MetadataCacheTest, PrefixMergesCacheAndStorage) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/4);
+  env.CreateBlock("a");
+  env.CreateBlock("c");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.LookupCount({"c"}), 1);
+  // Only the cache still knows "a" and "c" (within TTL); "b" is only on disk.
+  env.RemoveBlock("a");
+  env.RemoveBlock("c");
+  env.CreateBlock("b");
+
+  env.backend->ResetCounts();
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result,
+                          env.store->Lookup({"a", "b", "c", "d"}));
+  ASSERT_EQ(result.size(), 3);
+  EXPECT_EQ(result[0].first, "a");
+  EXPECT_EQ(result[1].first, "b");
+  EXPECT_EQ(result[2].first, "c");
+  for (const auto& [hash, block] : result) {
+    EXPECT_EQ(block.status, BlockStatus::SHARED_STORAGE);
+    EXPECT_EQ(block.raiden_id.job_replica_id, "shared");
+    EXPECT_EQ(block.raiden_id.data_name, "posix");
+  }
+  // Only the cache misses ("b", "d") were probed, in one batch.
+  EXPECT_EQ(env.backend->batch_calls(), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 2);
+}
+
+TEST_F(MetadataCacheTest, StopsAtFirstBlockAbsentEverywhere) {
+  Env env = CreateEnv(Enabled());
+  env.CreateBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  env.CreateBlock("c");
+  EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 1);
+}
+
+TEST_F(MetadataCacheTest, ColdLookupProbesOnlyUntilFirstMissingChunk) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/4);
+  std::vector<std::string> hashes;
+  for (int i = 0; i < 12; ++i) hashes.push_back(absl::StrCat("block_", i));
+  env.CreateBlock(hashes[0]);
+  env.CreateBlock(hashes[1]);
+
+  EXPECT_EQ(env.LookupCount(hashes), 2);
+  EXPECT_EQ(env.backend->batch_calls(), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 4);
+}
+
+TEST_F(MetadataCacheTest, ConfirmedBlocksPastThePrefixAreCached) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/4);
+  env.CreateBlock("b");
+  env.CreateBlock("c");
+  EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 0);
+  EXPECT_EQ(env.store->metadata_cache_size(), 2);
+
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"b", "c"}), 2);
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+}
+
+TEST_F(MetadataCacheTest, UnmappableHashTruncatesPrefix) {
+  Env env = CreateEnv(Enabled());
+  env.CreateBlock("a");
+  env.CreateBlock("c");
+  EXPECT_EQ(env.LookupCount({"a", std::string(kMaxBlockHashBytes + 1, 'x'),
+                             "c"}),
+            1);
 }
 
 }  // namespace
