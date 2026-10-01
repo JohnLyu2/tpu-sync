@@ -14,6 +14,7 @@
 
 import datetime
 import glob
+import hashlib
 import os
 import pathlib
 import shutil
@@ -65,6 +66,11 @@ _STORAGE_PHASE = flags.DEFINE_string(
     "storage_phase",
     "both",
     "Phase of secondary storage test: 'write', 'read', or 'both'",
+)
+_REPLICA_CONTROLLER_PORTS = flags.DEFINE_list(
+    "replica_controller_ports",
+    [],
+    "gdn_hybrid_mock mode: one Raiden controller port per replica.",
 )
 flags.DEFINE_integer("rank", 0, "")
 flags.DEFINE_integer("world_size", 0, "")
@@ -1693,6 +1699,490 @@ def _worker_three_source_main(argv):
     dist.destroy_process_group()
 
 
+# -----------------------------------------------------------------------------
+# Storage offload helpers for the GDN hybrid cache mock below.
+# -----------------------------------------------------------------------------
+_SENTINEL = 0xA5  # every byte of a reader buffer starts as this
+
+
+def _buffer_blocks(seed, num_buffers, block_bytes, num_blocks):
+  """Host image: num_buffers x np.uint8[num_blocks, block_bytes].
+
+  Byte i of block b of buffer k is (seed * 31 + k * 7 + b * 3 + i) % 251, so
+  every (seed, buffer, block) holds different bytes: a block that lands in the
+  wrong buffer or block slot, or comes from the wrong replica, is caught.
+  251 is prime, so the pattern does not repeat at power-of-two offsets.
+  """
+  idx = np.arange(block_bytes, dtype=np.int64)
+  return [
+      np.stack([
+          ((seed * 31 + k * 7 + b * 3 + idx) % 251).astype(np.uint8)
+          for b in range(num_blocks)
+      ])
+      for k in range(num_buffers)
+  ]
+
+
+def _blocks_to_device_buffer(img, device):
+  """Uploads np.uint8[num_blocks, block_bytes] as one kv_caches buffer.
+
+  With the GDN sizes below, one buffer k (model layers 4k..4k+3) becomes
+  int32[16, 8, 8, 128] = 512 KiB:
+    [b]           block b (32 KiB) = half of page b // 2. Raiden only reads
+                  this dimension: LayerBlockByteSize = nbytes / 16.
+    [b, t]        4 KiB piece t = 0..7 of block b.
+    [b, t, :, :]  those 4 KiB as 8 x 128 int32 words (one TPU tile).
+  What a block holds depends on the group that owns its page:
+    FA page p   blocks 2p, 2p+1: the first and second half of FA layer
+                4k+3's KV for that page of tokens. Pieces t are just
+                consecutive bytes of it; token and head layout is not modeled.
+    GDN page p  one state slot of GDN layer 4k+g (64 KiB, scaled 1/128):
+                block 2p   = ssm, bytes 0..32767 of the slot (all 8 pieces);
+                block 2p+1 = conv (bytes 0..575 of piece 0), conv pad
+                (576..1023), then tail pad to the end of the block
+                (test-only rounding to the 64K page; not real padding).
+  The test fills every block with a seeded pattern rather than real KV or
+  state; only the block boundaries matter to Raiden.
+  Why int32 and (8, 128): the device stores whole int32 tiles as plain bytes,
+  so block b is raw bytes [b * 32K, (b + 1) * 32K) exactly as on the host. A
+  uint8 or 2-D tensor would be packed 4 rows per 32-bit word on device, and
+  its raw bytes would no longer be the blocks.
+  """
+  num_blocks, block_bytes = img.shape
+  words = img.view(np.int32).reshape(num_blocks, block_bytes // 4096, 8, 128)
+  return torch.tensor(words, device=device)
+
+
+def _device_buffer_to_blocks(buffer, block_bytes):
+  """Inverse of _blocks_to_device_buffer: buffer -> np.uint8[num_blocks, B]."""
+  words = buffer.cpu().numpy()
+  return words.view(np.uint8).reshape(words.shape[0], block_bytes)
+
+
+def _check_file(path, blocks, block, who, *, block_bytes):
+  """File bytes == ResolveBlockSlices(block).
+
+  That is block `block` of buffer 0, then of buffer 1, ..., of the last
+  buffer: len(blocks) * block_bytes bytes.
+  """
+  data = np.fromfile(path, dtype=np.uint8)
+  want = np.concatenate([b[block] for b in blocks])
+  assert data.size == want.size, (
+      f"{who} block {block}: file {data.size} B != {want.size} B"
+  )
+  bad = np.flatnonzero(data != want)
+  assert bad.size == 0, (
+      f"{who} block {block}: {bad.size} bad bytes, first at buffer"
+      f" {bad[0] // block_bytes} offset {bad[0] % block_bytes}"
+  )
+
+
+def _check_recalled(
+    buffers, src_blocks, moved, who, *, block_bytes, num_blocks
+):
+  """In every buffer, block dst == source block moved[dst]; others sentinel."""
+  for k, buffer in enumerate(buffers):
+    got = _device_buffer_to_blocks(buffer, block_bytes)
+    for b in range(num_blocks):
+      want = src_blocks[k][moved[b]] if b in moved else _SENTINEL
+      bad = np.flatnonzero(got[b] != want)
+      assert bad.size == 0, (
+          f"{who} buffer {k} block {b}: {bad.size} bad bytes, first at"
+          f" offset {bad[0]}"
+      )
+
+
+# -----------------------------------------------------------------------------
+# GDN hybrid cache mock: Raiden storage offload and recall of the KV cache of
+# a hybrid full-attention (FA) + GDN (gated delta net) model.
+#
+# Shared buffers, and how GDN layers alias FA layers:
+#   * The model mixes two kinds of layers. An FA layer keeps KV for every
+#     token. A GDN layer keeps one fixed-size recurrent state per request
+#     (ssm + conv), however long the request is.
+#   * vLLM splits the layers into KV-cache groups; each group tracks which
+#     pages its requests own. With model layers 4k..4k+3 for k = 0..14:
+#       fa : FA layers 4k+3 (15 layers)
+#       g0 : GDN layers 4k   (15 layers)
+#       g1 : GDN layers 4k+1 (15 layers)
+#       g2 : GDN layers 4k+2 (15 layers)
+#   * vLLM allocates one device buffer per 4 consecutive model layers:
+#     60 layers -> 15 buffers. Buffer k holds model layers 4k..4k+3, which
+#     are one layer from each group:
+#       4k   : GDN (g0)      4k+2 : GDN (g2)
+#       4k+1 : GDN (g1)      4k+3 : FA  (fa)
+#   * All four groups share one set of page indices: page p belongs to one
+#     group at a time, the same group in every buffer. So page p of buffer
+#     k holds EITHER the KV of FA layer 4k+3 for one page of tokens, OR the
+#     state of GDN layer 4k+g for one request, where g is the group that
+#     owns page p. Only the groups know which; the bytes do not say. The
+#     writer in this test uses this layout (page p of buffer k is one cell):
+#
+#       address within each buffer increases left to right ->
+#       page      : | 0 |   1   |   2   |   3   |   4   |   5   | 6,7 |
+#       blocks    : |0,1| 2, 3  | 4, 5  | 6, 7  | 8, 9  | 10,11 |12-15|
+#       owner     : | - |  fa   |  fa   |  g0   |  g1   |  g2   |  -  |
+#       buffer 0  : [ - : FA 3  : FA 3  : GDN 0 : GDN 1 : GDN 2 :  -  ]  @ A_0
+#       buffer 1  : [ - : FA 7  : FA 7  : GDN 4 : GDN 5 : GDN 6 :  -  ]  @ A_1
+#         ...
+#       buffer 14 : [ - : FA 59 : FA 59 :GDN 56 :GDN 57 :GDN 58 :  -  ]  @ A_14
+#
+#   Row k is buffer k = model layers 4k..4k+3. Each cell names the one layer
+#   of that buffer whose data it holds: the layer of the column's owner group
+#   (fa -> 4k+3, g0 -> 4k, g1 -> 4k+1, g2 -> 4k+2). "-" marks pages 0, 6, 7,
+#   which the writer does not save. Every page is 64K, every block 32K.
+#
+# Contiguous bytes. Each buffer is its own allocation at base A_k; addresses
+# run left to right within a buffer, never down a column:
+#   buffer k             [A_k, A_k + 512K)                  contiguous
+#   page p of buffer k   [A_k + p*64K, A_k + (p+1)*64K)     contiguous
+#   block b of buffer k  [A_k + b*32K, A_k + (b+1)*32K)     contiguous
+#   page p (column)      15 cells at A_0 + p*64K, ...       NOT contiguous
+#   block b (column)     15 pieces of 32K, one per buffer   NOT contiguous
+#
+# Only the page size is chosen; the rest follow.
+# "/ 128" below is a scaling factor that only shrinks the test: every real
+# model byte size is divided by 128 so buffers stay small.
+#   page   64K   CHOSEN by this test (_GDN_PAGE_BYTES): the smallest power of
+#                two that holds one scaled GDN state slot of 33,792 B:
+#                  ssm  = 64 x 128 x 128 x fp32 = 4,194,304 B real
+#                         / 128 (scale) = 32,768 B
+#                  conv = 3 x 12,288 x bf16 = 73,728 B real. For this test
+#                         the state is laid out in 1,024 B rows, so conv
+#                         needs 73,728 / 1,024 = 72 rows, rounded up to a
+#                         power of two: 128 rows = 131,072 B real
+#                         / 128 (scale) = 1,024 B (576 B live conv, then
+#                         448 B conv pad)
+#                  slot = 32,768 + 1,024 = 33,792 B  (<= 64K)
+#   block  32K   = page / f = 64K / 2 (_GDN_BLOCK_BYTES).
+#   buffer 512K  = 8 pages x 64K = 16 blocks x 32K. The 8 pages
+#                (_GDN_NUM_PAGES) are also a test choice: the test uses
+#                pages 0..7.
+# FOR TEST PURPOSES ONLY, not an accurate model of a real serving stack:
+#   * the 1/128 byte scale;
+#   * the 1,024 B row and the power-of-two rounding of the conv rows;
+#   * the 64K page, i.e. the 31,744 B "tail pad" after each GDN state slot;
+#   * 8 pages per buffer.
+# Raiden never looks inside a block, so none of these change what it does.
+#
+# What storage offloads: one file per block column (one key). It takes the
+# 15 separate 32K pieces (block b of buffer 0, then buffer 1, ... buffer 14,
+# i.e. ResolveBlockSlices(b)) and concatenates them into one contiguous 480K
+# file. Recall splits the file back into the 15 places. Storage never looks
+# inside a block, so a GDN page uses the same keys and blocks as an FA page.
+#
+# Tied to layers: block b lies in page p = b // f (integer division; page p
+# is blocks p*f .. p*f+f-1, e.g. blocks 2, 3 -> page 1). One group owns page
+# p, so piece k of the file is that group's layer in buffer k. One file
+# therefore holds a 1/f slice of the same group's 15 layers, in layer order:
+#   page 1 (fa): blocks 2, 3 -> FA layers 3, 7, ..., 59 (each half the page)
+#   page 3 (g0): block 6 -> ssm of GDN layers 0, 4, ..., 56;
+#                block 7 -> conv + conv pad + tail pad of the same layers.
+# (With f = 2 and ssm exactly one block, a GDN state slot spans two files.)
+#
+# Terms (names follow KVCacheManager):
+#   * replica : one TP=1 engine (one DP rank) with its own KVCacheStore,
+#               KVCacheManager and Raiden controller
+#               (--replica_controller_ports), POSIX tp_rank 0 of tp_size 1.
+#               The world_size workers are world_size replicas sharing one
+#               storage directory (tp1_r0).
+#   * key     : one per block, so a page has f keys. Raiden keys are opaque
+#               bytes; this test builds each as namespace (16 B) || page key
+#               || sub_idx (4 B, big endian), where sub_idx in [0, f) picks
+#               the block within the page.
+#
+# Shapes follow the public Qwen3.5-397B-A17B text config at TP=1:
+#   * 60 model layers, full_attention_interval 4 -> 15 buffers (15 FA +
+#     3 x 15 GDN), groups fa, g0, g1, g2.
+#   * ssm  = linear_num_value_heads 64 x linear_key_head_dim 128 x
+#            linear_value_head_dim 128 x fp32 (4 B)
+#          = 64 x 128 x 128 x 4 = 4,194,304 B (32,768 B scaled).
+#   * conv = (linear_conv_kernel_dim 4 - 1) x conv_dim 12,288
+#            (2 x 16 x 128 + 64 x 128) x bf16 = 73,728 B.
+#   * conv starts right after ssm. For this test its region is rounded up
+#     to a power-of-two count of 1,024 B rows: 73,728 B = 72 rows, rounded
+#     up to 128 rows = 131,072 B, so 57,344 B of conv pad follow the live
+#     conv (region: 1,024 B scaled).
+#   * state slot = ssm + conv region = 4,325,376 B (33,792 B scaled).
+# Byte sizes are divided by 128, a scaling factor that only shrinks the
+# test (buffer and GDN group counts are not scaled).
+# -----------------------------------------------------------------------------
+_GDN_NUM_BUFFERS = 15  # kv_caches entries k = 0..14 (4 model layers each)
+_GDN_PAGE_BYTES = 64 << 10  # chosen: >= one 33,792 B GDN state slot
+_GDN_F = 2  # blocks per page
+_GDN_BLOCK_BYTES = _GDN_PAGE_BYTES // _GDN_F  # LayerBlockByteSize: 32 KiB
+_GDN_NUM_PAGES = 8  # chosen: pages 0..7 per buffer (8 x 64K = 512K)
+_GDN_NUM_BLOCKS = _GDN_NUM_PAGES * _GDN_F  # blocks 0..15 per buffer
+#
+# Page -> block mapping. Page p is blocks 2p and 2p + 1 (f = 2), the same in
+# every buffer. The *_PAGES constants below are PAGE indices, not block ids.
+#   page  : 0     1     2     3     4     5       6       7
+#   blocks: 0, 1  2, 3  4, 5  6, 7  8, 9  10, 11  12, 13  14, 15
+#
+# Writer: saves 5 pages = 10 blocks = 10 keys = 10 files.
+#   page 0 (blocks  0,  1) : not saved
+#   page 1 (blocks  2,  3) : FA KV                     _GDN_ATTN_PAGES
+#   page 2 (blocks  4,  5) : FA KV                     _GDN_ATTN_PAGES
+#   page 3 (blocks  6,  7) : GDN state slot, group g0  _GDN_STATE_PAGES
+#   page 4 (blocks  8,  9) : GDN state slot, group g1  _GDN_STATE_PAGES
+#   page 5 (blocks 10, 11) : GDN state slot, group g2  _GDN_STATE_PAGES
+#   page 6 (blocks 12, 13) : not saved
+#   page 7 (blocks 14, 15) : not saved
+#
+# Reader: recalls the writer's 5 pages into different pages (_GDN_DST_PAGES).
+#   source page 1 (blocks  2,  3) -> reader page 7 (blocks 14, 15)
+#   source page 2 (blocks  4,  5) -> reader page 0 (blocks  0,  1)
+#   source page 3 (blocks  6,  7) -> reader page 5 (blocks 10, 11)
+#   source page 4 (blocks  8,  9) -> reader page 3 (blocks  6,  7)
+#   source page 5 (blocks 10, 11) -> reader page 4 (blocks  8,  9)
+#   reader page 1 (blocks  2,  3) : not a recall target, must stay 0xA5
+#   reader page 2 (blocks  4,  5) : not a recall target, must stay 0xA5
+#   reader page 6 (blocks 12, 13) : not a recall target, must stay 0xA5
+_GDN_ATTN_PAGES = (1, 2)
+_GDN_STATE_PAGES = (3, 4, 5)
+_GDN_SRC_PAGES = _GDN_ATTN_PAGES + _GDN_STATE_PAGES  # pages 1..5
+_GDN_DST_PAGES = (7, 0, 5, 3, 4)  # reader page for source pages 1..5
+# Key namespace prefix (16 B).
+_GDN_NAMESPACE = hashlib.sha256(b"gdn-hybrid-mock-layout").digest()[:16]
+
+
+def _gdn_expand(pages):
+  """Page indices -> block ids: page p -> blocks 2p, 2p + 1 (f = 2).
+
+  E.g. _GDN_SRC_PAGES (1, 2, 3, 4, 5) -> blocks [2, 3, 4, ..., 11].
+  """
+  return [p * _GDN_F + i for p in pages for i in range(_GDN_F)]
+
+
+def _gdn_keys(replica, pages):
+  """Block keys for `pages`: 2 per page, in _gdn_expand(pages) order.
+
+  The page key is only an ingredient: it is derived from the page, and is
+  shared by both blocks of that page. What this returns, and what Raiden
+  stores, are BLOCK keys, one per block. Each block key is a separate
+  storage file, named after it: <root>/test_model_mpmd/tp1_r0/.../
+  <block_key.hex()>.bin. So one page is 2 files, never 1.
+
+  Each block key is 52 bytes, the concatenation of:
+    namespace  16 B  _GDN_NAMESPACE, the same for every key
+    page key   32 B  sha256("gdn-hybrid-replica{r}-page{p}"), same for both
+                     blocks of page p
+    sub_idx     4 B  0 or 1 as a 4-byte big-endian integer (hex bytes
+                     00 00 00 00 or 00 00 00 01); picks block 2p or 2p + 1.
+  E.g. replica 0, page 3 -> page key K = sha256("gdn-hybrid-replica0-page3")
+  -> block keys namespace||K||00000000 (block 6, file 1) and
+     namespace||K||00000001 (block 7, file 2).
+  """
+  keys = []
+  for p in pages:
+    # Page key: one per page, not stored on its own.
+    page_key = hashlib.sha256(f"gdn-hybrid-replica{replica}-page{p}".encode())
+    # Block keys: page key + sub_idx; block 2p + i -> its own file.
+    keys += [
+        _GDN_NAMESPACE + page_key.digest() + i.to_bytes(4, "big")
+        for i in range(_GDN_F)
+    ]
+  return keys
+
+
+def _gdn_blocks(replica):
+  """Writer host image of one replica: 15 x np.uint8[16, 32768].
+
+  All 16 blocks of every buffer are seeded with replica + 1, so each
+  replica's bytes differ and the reader can tell whose blocks it recalled.
+  """
+  return _buffer_blocks(
+      replica + 1, _GDN_NUM_BUFFERS, _GDN_BLOCK_BYTES, _GDN_NUM_BLOCKS
+  )
+
+
+def _worker_gdn_hybrid_mock_main(argv):
+  """One replica of the GDN hybrid cache mock (see the section comment).
+
+  The driver runs 4 writer replicas (--storage_phase=write), then 4 cold
+  reader replicas (--storage_phase=read). All share one storage directory,
+  <root>/test_model_mpmd/tp1_r0. Every key names its writer, so writers
+  never share a file. Reader r recalls writer (r + 1) % 4:
+
+    writer 0 ...10 files...+                     +...> reader 3
+    writer 1 ...10 files...+                     +...> reader 0
+    writer 2 ...10 files...+..> tp1_r0/ 40 files +...> reader 1
+    writer 3 ...10 files...+                     +...> reader 2
+
+  Each replica has its OWN 15 buffers (its own kv_caches), so source and
+  destination blocks are independent per replica: every writer saves its
+  own blocks 2..11 and every reader fills its own blocks below. Only the
+  files in tp1_r0 are shared.
+
+  Write (writer w). Each saved block b (b = 2..11, pages 1..5) becomes one
+  file holding block b of every buffer, in buffer order
+  (ResolveBlockSlices(b)): 15 x 32K = 480K. 10 blocks -> 10 files.
+
+    buffer 0  [ .. | block b | .. ] ....32K....+
+    buffer 1  [ .. | block b | .. ] ....32K....+
+      ...                                      +....> file _gdn_keys(w, b)
+    buffer 14 [ .. | block b | .. ] ....32K....+      (480K)
+
+  Read (reader r, source writer w = (r + 1) % 4). Each file is split back
+  into 15 pieces of 32K, written to the same block d of every buffer:
+
+                            +....32K....> buffer 0  [ .. | block d | .. ]
+    file _gdn_keys(w, b) ...+....32K....> buffer 1  [ .. | block d | .. ]
+      (480K)                ...
+                            +....32K....> buffer 14 [ .. | block d | .. ]
+
+    source block b : 2   3   4  5  6   7   8  9  10  11
+    reader block d : 14  15  0  1  10  11  6  7  8   9
+  Reader blocks 2..5, 12, 13 get no file and must still be 0xA5.
+  _gdn_keys(w, b) is short for the key of writer w's block b, i.e.
+  _gdn_keys(w, [b // 2])[b % 2] (_gdn_keys takes pages, 2 keys each).
+  """
+  del argv
+  tag, rank, world_size = "GDN_HYBRID_MOCK", FLAGS.rank, FLAGS.world_size
+  phase, root = _STORAGE_PHASE.value, _STORAGE_ROOT.value
+  assert phase in ("write", "read"), phase
+  # --replica_controller_ports: 4 writer ports, then 4 reader ports.
+  ports = [int(p) for p in _REPLICA_CONTROLLER_PORTS.value]
+  assert len(ports) == 2 * world_size, ports
+  port = ports[rank + (world_size if phase == "read" else 0)]
+  _init_worker_process_group(tag, rank, world_size, FLAGS.master_port, phase)
+
+  def make_replica(buffers, role):
+    """KVCacheStore + KVCacheManager of one TP=1 replica over `buffers`."""
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = 0  # every replica is TP rank 0 of 1, so all
+    cfg.parallelism.tp_size = 1  # share <root>/test_model_mpmd/tp1_r0
+    cfg.set_property("root_dir", root)
+    cfg.set_property("model_name", "test_model_mpmd")
+    if _STORAGE_DIRECT_IO.value:
+      cfg.set_property("direct_io", "true")
+    rid = kv_cache_store.RaidenId(f"{role}_m{rank}", "0", f"{role}_c{rank}", 0)
+    store = kv_cache_store.KVCacheStore(
+        capacity=_GDN_NUM_BLOCKS,
+        raiden_id=rid,
+        num_shards=1,
+        shard_size_bytes=_GDN_NUM_BUFFERS * _GDN_BLOCK_BYTES,
+        store_server_ip="127.0.0.1",
+        raiden_controller_port=port,
+        secondary_backend_configs=[cfg],
+    )
+    manager = kv_cache_manager.KVCacheManager(
+        kv_caches=[[t] for t in buffers],  # 15 buffers, one tensor each
+        local_control_port=0,
+        max_blocks=_GDN_NUM_BLOCKS,
+        num_slots=2,
+        unsafe_skip_buffer_lock=True,
+        raiden_worker_port=0,
+        raiden_controller_address=f"localhost:{port}",
+        worker_id=f"worker_m{rank}",
+        host_blocks_to_allocate=_GDN_NUM_BLOCKS,
+        node_id=0,
+        backend_configs=[cfg],
+    )
+    return rid, store, manager
+
+  try:
+    device = torch.device("tpu")
+    src_ids = _gdn_expand(_GDN_SRC_PAGES)  # [2, 3, ..., 11]
+    if phase == "write":
+      # W1. Seed this replica's 15 buffers (int32[16, 8, 8, 128] each, 16
+      #     blocks of 32 KiB) and upload them as kv_caches.
+      blocks = _gdn_blocks(rank)
+      buffers = [_blocks_to_device_buffer(img, device) for img in blocks]
+      _tpu_sync()
+      rid, store, manager = make_replica(buffers, "w")
+      # W2. Insert 10 keys, one per device block, status HBM:
+      #     page 1 -> blocks 2, 3    page 3 -> blocks 6, 7    page 5 -> 10, 11
+      #     page 2 -> blocks 4, 5    page 4 -> blocks 8, 9
+      #     keys[i] names block src_ids[i] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11].
+      keys = _gdn_keys(rank, _GDN_SRC_PAGES)
+      hbm_ids = [
+          kv_cache_store.RaidenBlockId(
+              rid,
+              host_block_id=-1,
+              device_block_id=b,
+              status=kv_cache_store.BlockStatus.HBM,
+          )
+          for b in src_ids
+      ]
+      assert store.insert(keys, hbm_ids, on_host=False), "insert failed"
+      # W3. Offload: one file per key under <root>/test_model_mpmd/tp1_r0.
+      assert store.save(keys), "store.save failed"
+      _wait_for_all(store.poll_save_status, keys, "save")
+      dist.barrier()
+      # W4. After the barrier every replica has saved, so tp1_r0 holds
+      #     exactly world_size x 10 files, one per key of every replica, and
+      #     nothing else.
+      shard_dir = os.path.join(root, "test_model_mpmd", "tp1_r0")
+      paths = glob.glob(os.path.join(shard_dir, "**", "*.bin"), recursive=True)
+      files = {os.path.basename(p): p for p in paths}
+      want_names = {
+          f"{k.hex()}.bin"
+          for r in range(world_size)
+          for k in _gdn_keys(r, _GDN_SRC_PAGES)
+      }
+      assert len(paths) == len(files) and set(files) == want_names, (
+          f"replica {rank}: {len(paths)} files,"
+          f" missing {sorted(want_names - set(files))},"
+          f" unexpected {sorted(set(files) - want_names)}"
+      )
+      # W5. Each of this replica's 10 files is 15 x 32 KiB = 480 KiB: block
+      #     b of buffer 0, then buffer 1, ..., buffer 14
+      #     (ResolveBlockSlices(b)).
+      for key, b in zip(keys, src_ids):
+        _check_file(files[f"{key.hex()}.bin"], blocks, b, f"replica {rank}",
+                    block_bytes=_GDN_BLOCK_BYTES)
+      _log(tag, phase, rank,
+           f"PASS: {len(files)} files in tp1_r0; own {len(keys)} byte-exact.")
+    else:
+      # R1. Cold replica: 15 buffers with every byte 0xA5; nothing of the
+      #     source is on this replica's host or device.
+      src = (rank + 1) % world_size  # recall another replica's blocks
+      img = np.full((_GDN_NUM_BLOCKS, _GDN_BLOCK_BYTES), _SENTINEL, np.uint8)
+      buffers = [
+          _blocks_to_device_buffer(img, device)
+          for _ in range(_GDN_NUM_BUFFERS)
+      ]
+      _tpu_sync()
+      _, store, manager = make_replica(buffers, "r")
+      # R2. All 10 of replica src's keys must be found in SHARED_STORAGE.
+      keys = _gdn_keys(src, _GDN_SRC_PAGES)
+      found = _wait_for_lookup(
+          store, keys,
+          [kv_cache_store.BlockStatus.SHARED_STORAGE] * len(keys),
+          pin_found=False,
+      )
+      # R3. Recall keys[i] into reader block dst_ids[i]:
+      #     source page 1 (blocks  2,  3) -> reader page 7 (blocks 14, 15)
+      #     source page 2 (blocks  4,  5) -> reader page 0 (blocks  0,  1)
+      #     source page 3 (blocks  6,  7) -> reader page 5 (blocks 10, 11)
+      #     source page 4 (blocks  8,  9) -> reader page 3 (blocks  6,  7)
+      #     source page 5 (blocks 10, 11) -> reader page 4 (blocks  8,  9)
+      #     dst_ids = [14, 15, 0, 1, 10, 11, 6, 7, 8, 9].
+      dst_ids = _gdn_expand(_GDN_DST_PAGES)
+      assert store.read_remote(
+          keys, [s for _, s in found], dst_ids
+      ), "read_remote failed"
+      _wait_for_all(store.poll_load_status, keys, "load")
+      _tpu_sync()
+      # R4. In every one of the 15 buffers:
+      #     reader blocks 14, 15, 0, 1, 10, 11, 6, 7, 8, 9 equal source blocks
+      #     2, 3, 4, 5, 6, 7, 8, 9, 10, 11 byte for byte (the R3 pairs), and
+      #     reader page 1 (blocks 2, 3), page 2 (blocks 4, 5) and page 6
+      #     (blocks 12, 13), which were not recall targets, are still 0xA5.
+      _check_recalled(buffers, _gdn_blocks(src), dict(zip(dst_ids, src_ids)),
+                      f"replica {rank}", block_bytes=_GDN_BLOCK_BYTES,
+                      num_blocks=_GDN_NUM_BLOCKS)
+      _log(tag, phase, rank, f"PASS: replica {src}'s blocks bit-exact.")
+    dist.barrier()
+    del manager, store
+    dist.barrier()
+  finally:
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
 
   @classmethod
@@ -1904,6 +2394,19 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
   def test_mpmd_4rank_e2e_secondary_storage_offload_recall(
       self, direct_io: bool = False
   ):
+    self._drive_secondary_storage("secondary_storage", direct_io, [])
+
+  @parameterized.named_parameters(("buffered", False), ("direct_io", True))
+  def test_mpmd_4rank_e2e_gdn_hybrid_mock_offload_recall(self, direct_io: bool):
+    """4 TP=1 replicas with a hybrid attention + GDN layout share storage."""
+    # 4 writer controller ports, then 4 reader controller ports.
+    ports = ",".join(str(p) for p in pick_unused_ports(8))
+    self._drive_secondary_storage(
+        "gdn_hybrid_mock", direct_io, [f"--replica_controller_ports={ports}"]
+    )
+
+  def _drive_secondary_storage(self, worker_mode, direct_io, extra_flags):
+    """Runs a writer group, then a cold reader group, of 4 ranks each."""
     world_size = 4
     prepare_tpu_environment(world_size)
     master_port_w = pick_unused_ports(1)[0]
@@ -1915,7 +2418,7 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
     if _STORAGE_ROOT.value:
       temp_dir = os.path.join(
           _STORAGE_ROOT.value,
-          f"torch_mpmd_{mode_str}_{int(time.time())}",
+          f"torch_mpmd_{worker_mode}_{mode_str}_{int(time.time())}",
       )
       os.makedirs(temp_dir, exist_ok=True)
       is_custom_root = True
@@ -1952,7 +2455,7 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
         cmd = worker_launch_cmd() + [
             "--run_worker",
             "--alsologtostderr",
-            "--worker_mode=secondary_storage",
+            f"--worker_mode={worker_mode}",
             "--storage_phase=write",
             f"--storage_root={temp_dir}",
             f"--storage_direct_io={direct_io}",
@@ -1961,7 +2464,7 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
             f"--master_port={master_port_w}",
             f"--controller_port={controller_port_w}",
             f"--registry_port={_registry_port}",
-        ]
+        ] + list(extra_flags)
         p = subprocess.Popen(cmd, env=env)
         print(
             f"[MPMD Driver] Spawning Writer worker rank {rank}/{world_size}"
@@ -2004,7 +2507,7 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
         cmd = worker_launch_cmd() + [
             "--run_worker",
             "--alsologtostderr",
-            "--worker_mode=secondary_storage",
+            f"--worker_mode={worker_mode}",
             "--storage_phase=read",
             f"--storage_root={temp_dir}",
             f"--storage_direct_io={direct_io}",
@@ -2013,7 +2516,7 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
             f"--master_port={master_port_r}",
             f"--controller_port={controller_port_r}",
             f"--registry_port={_registry_port}",
-        ]
+        ] + list(extra_flags)
         p = subprocess.Popen(cmd, env=env)
         print(
             f"[MPMD Driver] Spawning Reader worker rank {rank}/{world_size}"
@@ -2149,6 +2652,8 @@ def main(argv):
       _worker_write_remote_main(argv)
     elif FLAGS.worker_mode == "secondary_storage":
       _worker_secondary_storage_main(argv)
+    elif FLAGS.worker_mode == "gdn_hybrid_mock":
+      _worker_gdn_hybrid_mock_main(argv)
     elif FLAGS.worker_mode == "three_source":
       _worker_three_source_main(argv)
     else:

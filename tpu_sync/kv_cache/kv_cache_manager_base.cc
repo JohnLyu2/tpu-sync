@@ -48,7 +48,6 @@
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
-#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
@@ -3607,6 +3606,12 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
   if (num_chunks == 0) {
     return raiden::PjRtCopyFuture(raiden::BufferHolders{});
   }
+  for (int64_t id : dst_host_block_ids) {
+    if (ResolveBlockSlices(static_cast<int>(id)).empty()) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("No host staging block ", id));
+    }
+  }
 
   auto [promise, aggregate_future] = xla::MakePromise();
 
@@ -3687,6 +3692,12 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
   if (num_chunks == 0) {
     return raiden::PjRtCopyFuture(raiden::BufferHolders{});
   }
+  for (int64_t id : src_host_block_ids) {
+    if (ResolveBlockSlices(static_cast<int>(id)).empty()) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("No host staging block ", id));
+    }
+  }
 
   auto [promise, aggregate_future] = xla::MakePromise();
   auto state = std::make_shared<TransferPipelinedState>(
@@ -3729,48 +3740,6 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
   return raiden::PjRtCopyFuture(std::move(aggregate_future), /*holds=*/{});
 }
 
-absl::Status KVCacheManagerBase::WriteSingleBlockToBackendSync(
-    std::shared_ptr<backends::KVBackend> backend, const backends::BlockKey& key,
-    int staging_block_id) {
-  if (backend == nullptr) {
-    return absl::InvalidArgumentError("Backend is null");
-  }
-  auto slices = ResolveBlockSlices(staging_block_id);
-  size_t total_bytes = 0;
-  for (const auto& s : slices) {
-    total_bytes += s.size;
-  }
-  absl::Notification done;
-  absl::Status status;
-  backend->WriteAsync(key, slices, total_bytes, [&](absl::Status s) {
-    status = std::move(s);
-    done.Notify();
-  });
-  done.WaitForNotification();
-  return status;
-}
-
-absl::Status KVCacheManagerBase::ReadSingleBlockFromBackendSync(
-    std::shared_ptr<backends::KVBackend> backend, const backends::BlockKey& key,
-    int staging_block_id) {
-  if (backend == nullptr) {
-    return absl::InvalidArgumentError("Backend is null");
-  }
-  auto slices = ResolveBlockSlices(staging_block_id);
-  size_t total_bytes = 0;
-  for (const auto& s : slices) {
-    total_bytes += s.size;
-  }
-  absl::Notification done;
-  absl::Status status;
-  backend->ReadAsync(key, slices, total_bytes, [&](absl::Status s) {
-    status = std::move(s);
-    done.Notify();
-  });
-  done.WaitForNotification();
-  return status;
-}
-
 std::vector<backends::HostBufferDescriptor>
 KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
   std::vector<backends::HostBufferDescriptor> slices;
@@ -3782,9 +3751,15 @@ KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
     for (size_t s = 0; s < num_shards_; ++s) {
       uint8_t* ptr = const_cast<KVCacheManagerBase*>(this)->GetBlockHostPointer(
           l, s, staging_block_id);
-      if (ptr == nullptr) {
-        LOG(ERROR) << "Null host pointer resolved for layer " << l << ", shard "
-                   << s << ", staging_block_id " << staging_block_id;
+      // Explicit pools are bounded by GetBlockHostPointer; check buffer bounds
+      // for implicit pool.
+      if (ptr == nullptr ||
+          (!explicit_pools_ &&
+           (static_cast<size_t>(staging_block_id) + 1) * slice_bytes >
+               const_cast<KVCacheManagerBase*>(this)->GetHostSize(l, s))) {
+        LOG(ERROR) << "No host bytes for staging_block_id " << staging_block_id
+                   << " in layer " << l << ", shard " << s;
+        return {};
       }
       backends::HostBufferDescriptor desc;
       desc.ptr = ptr;

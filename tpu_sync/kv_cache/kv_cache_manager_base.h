@@ -378,15 +378,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   //   storage.
   //   2. Recall: destination slices to scatter-read from secondary storage ->
   //   host DRAM.
+  // Returns empty if the block has no host bytes.
   virtual std::vector<backends::HostBufferDescriptor> ResolveBlockSlices(
       int staging_block_id) const;
 
-  absl::Status WriteSingleBlockToBackendSync(
-      std::shared_ptr<backends::KVBackend> backend,
-      const backends::BlockKey& key, int staging_block_id);
-  absl::Status ReadSingleBlockFromBackendSync(
-      std::shared_ptr<backends::KVBackend> backend,
-      const backends::BlockKey& key, int staging_block_id);
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
       std::string peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& local_block_ids,
