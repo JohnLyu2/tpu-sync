@@ -1,9 +1,19 @@
+import TpuSyncVerify.Common.System
+import TpuSyncVerify.Common.ModelCheck
+import TpuSyncVerify.Transfer.Session
+import TpuSyncVerify.Transfer.PrefillDecode.Receive
+
 /-!
-# TPU Sync publication safety
+# TpuSyncVerify
 
-Formal model of the TPU Sync remote-read protocol and proofs about when
-transferred KV-cache data may be published to a consumer.
+Formal models of TPU Sync protocols and proofs about them, organised by the
+subsystem of `tpu_sync/` they describe:
 
-The modules below are added incrementally; see `proposal.md` for the overall
-plan.
+* `Common` — the transition-system core and a bounded model checker shared by
+  every model.
+* `Transfer` — the session-based KV transfer path (`tpu_sync/core/transfer_*`,
+  `tpu_sync/transport`). `Transfer.PrefillDecode` is the prefill-to-decode
+  model of `proposal.md`, built up in stages.
+
+Every module states which tpu-sync commit its citations were checked against.
 -/
