@@ -101,17 +101,6 @@ and by induction on the chain HBM → staging → wire → staging → HBM each
 layer that arrives is the right one. The guards that make this true are
 exactly the sessions' refusal to begin an op once draining and their refusal
 to settle while an op is in flight — the settle protocol of stage 1.
-
-## Relation to the v1 model
-
-The archived model (`archive/prefill-decode-v1`) proved the same four
-properties over `LayerId → BlockId → Option BlockContent` memories with a
-hand-written producer and consumer. Here the sessions are the audited stage
-1-3 models; blocks are collapsed into layers (A1); the network memory is a
-per-layer `wire`; reclaim and staging reuse are explicit events rather than
-ghost flags; attention safety is a theorem about runs instead of a
-`consumed` flag; and source-buffer and staging safety are derived from the
-sessions' `Drained` / `Accounted` invariants instead of being proved anew.
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode

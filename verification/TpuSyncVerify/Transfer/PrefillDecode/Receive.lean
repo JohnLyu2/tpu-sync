@@ -99,8 +99,8 @@ All proved on every reachable state (`reachable_safe`):
 * **Readiness is sound.** `IsReadyToComplete → ready = numLayers`: when the
   poll decides the receive is complete, every layer's copy has been issued
   *and* has finished on the device. The `network_completed_` disjunct is
-  sound only because of A4 (see `HypotheticalReordering` in the v1 archive for
-  what breaks without it).
+  sound only because of A4 (the mutant `netAccountUnordered` below shows what
+  breaks without it).
 * **Publication.** `published = some true → completed = numLayers`: when the
   engine is told `done_recving`, every layer's H2D callback has run with an
   OK status. Counter-level form of the proposal's *publication correctness*;
@@ -108,12 +108,13 @@ All proved on every reachable state (`reachable_safe`):
 * **Counters.** `completed ≤ retired ≤ ready ≤ issued ≤ numLayers` and
   `layersAccounted ≤ issued`.
 
-Note on the readiness predicate. The v1 model proved its two readiness
-variants equal; here they are not: `IsReadyToComplete` tests futures
-(`ready`), callbacks (`retired`, `completed`) can lag behind, so the shipping
-predicate can be true before `num_completed_layers_` reaches `numLayers`. That
-is harmless — `done` still waits for every callback through `in_flight_` — and
-the publication property above is the one that matters.
+Note on the readiness predicate. One might expect `IsReadyToComplete` to
+coincide with "every layer's callback has run OK"; it does not.
+`IsReadyToComplete` tests futures (`ready`), and callbacks (`retired`,
+`completed`) can lag behind, so the shipping predicate can be true before
+`num_completed_layers_` reaches `numLayers` (`trace_poll_before_callbacks`).
+That is harmless — `done` still waits for every callback through `in_flight_`
+— and the publication property above is the one that matters.
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode
