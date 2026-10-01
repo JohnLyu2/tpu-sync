@@ -4,6 +4,7 @@ import TpuSyncVerify.Transfer.Session
 import TpuSyncVerify.Transfer.PrefillDecode.Receive
 import TpuSyncVerify.Transfer.PrefillDecode.Send
 import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
+import TpuSyncVerify.Controller.ReadRemote
 
 /-!
 # TpuSyncVerify
@@ -16,6 +17,9 @@ subsystem of `tpu_sync/` they describe:
 * `Transfer` — the session-based KV transfer path (`tpu_sync/core/transfer_*`,
   `tpu_sync/transport`). `Transfer.PrefillDecode` is the prefill-to-decode
   model of `proposal.md`, built up in stages.
+* `Controller` — `RaidenController` (`tpu_sync/core/controller`).
+  `Controller.ReadRemote` is the exhaustive check behind finding F2 in
+  `findings/`.
 
 Every module states which tpu-sync commit its citations were checked against.
 -/

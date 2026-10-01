@@ -1,0 +1,137 @@
+diff --git a/tpu_sync/core/controller/raiden_controller.cc b/tpu_sync/core/controller/raiden_controller.cc
+index d0be9bd..9b0577f 100644
+--- a/tpu_sync/core/controller/raiden_controller.cc
++++ b/tpu_sync/core/controller/raiden_controller.cc
+@@ -668,9 +668,28 @@ tsl::Future<> RaidenController::TransferBuffers(
+     }
+   }
+ 
++  std::vector<tsl::Future<>> worker_futures;
++  // Every error return below must give back auto-allocated staging blocks, but
++  // only after any worker already dispatched with them has finished.
++  auto fail = [&](absl::Status error) -> tsl::Future<> {
++    if (!auto_allocated_staging_ids.has_value()) return tsl::Future<>(error);
++    if (worker_futures.empty()) {
++      (void)this->DeallocateBlockIds(*auto_allocated_staging_ids);
++      return tsl::Future<>(error);
++    }
++    auto [promise, future] = tsl::MakePromise<>();
++    tsl::JoinFutures(absl::MakeSpan(worker_futures))
++        .OnReady([this, promise = std::move(promise), error,
++                  ids = *auto_allocated_staging_ids](absl::Status) mutable {
++          (void)this->DeallocateBlockIds(ids);
++          promise.Set(error);
++        });
++    return future;
++  };
++
+   auto workers = worker_registry_->GetRegisteredWorkers();
+   if (workers.empty()) {
+-    return tsl::Future<>(absl::FailedPreconditionError(
++    return fail(absl::FailedPreconditionError(
+         "No registered workers available for TransferBuffers"));
+   }
+ 
+@@ -697,7 +716,6 @@ tsl::Future<> RaidenController::TransferBuffers(
+     }
+   }
+ 
+-  std::vector<tsl::Future<>> worker_futures;
+   worker_futures.reserve(workers.size());
+ 
+   for (size_t w = 0; w < workers.size(); ++w) {
+@@ -719,7 +737,7 @@ tsl::Future<> RaidenController::TransferBuffers(
+         // corrupt the shards.
+         auto it = peer_node_id_to_endpoints.find(workers[w].node_id);
+         if (it == peer_node_id_to_endpoints.end()) {
+-          return tsl::Future<>(absl::FailedPreconditionError(absl::StrCat(
++          return fail(absl::FailedPreconditionError(absl::StrCat(
+               "TransferBuffers: no source worker group with node_id ",
+               workers[w].node_id, " to match local worker '",
+               workers[w].worker_id, "' (source provided ",
+@@ -734,7 +752,7 @@ tsl::Future<> RaidenController::TransferBuffers(
+       if (!dst_buf.remote_worker_endpoints().empty()) {
+         auto it = peer_node_id_to_endpoints.find(workers[w].node_id);
+         if (it == peer_node_id_to_endpoints.end()) {
+-          return tsl::Future<>(absl::FailedPreconditionError(absl::StrCat(
++          return fail(absl::FailedPreconditionError(absl::StrCat(
+               "TransferBuffers: no destination worker group with node_id ",
+               workers[w].node_id, " to match source worker '",
+               workers[w].worker_id, "' (destination provided ",
+@@ -765,7 +783,7 @@ tsl::Future<> RaidenController::TransferBuffers(
+     auto req_or = BuildTransferBuffersRequest(
+         worker_src, worker_dst, request_staging, worker_copy_sizes);
+     if (!req_or.ok()) {
+-      return tsl::Future<>(req_or.status());
++      return fail(req_or.status());
+     }
+ 
+     worker_futures.push_back(
+@@ -773,7 +791,7 @@ tsl::Future<> RaidenController::TransferBuffers(
+   }
+ 
+   if (worker_futures.empty()) {
+-    return tsl::Future<>(absl::FailedPreconditionError(
++    return fail(absl::FailedPreconditionError(
+         "No active WorkerServiceClient available for TransferBuffers"));
+   }
+ 
+@@ -1158,8 +1176,16 @@ void RaidenController::PullAndRelease(
+   RAIDEN_LEASE_TRACE("pull issue lease=", state->lease_id,
+                      " blocks=", src_buffers.size(),
+                      " to_hbm=", to_hbm ? 1 : 0);
++  bool already_settled = false;
++  {
++    absl::MutexLock lock(&state->mu);
++    already_settled = state->settled;
++  }
+   tsl::Future<> transfer =
+-      TransferBuffers(src_buffers, dst_buffers, staging_buffers);
++      already_settled
++          ? tsl::Future<>(absl::CancelledError(
++                "ReadRemote already settled; pull not issued"))
++          : TransferBuffers(src_buffers, dst_buffers, staging_buffers);
+   RAIDEN_LEASE_TRACE("pull issued lease=", state->lease_id);
+ 
+   // ---- Phase 3: Commit -- release and read the verdict. -------------------
+diff --git a/tpu_sync/kv_cache/kv_cache_store.cc b/tpu_sync/kv_cache/kv_cache_store.cc
+index b51759c..89a0950 100644
+--- a/tpu_sync/kv_cache/kv_cache_store.cc
++++ b/tpu_sync/kv_cache/kv_cache_store.cc
+@@ -1655,8 +1655,16 @@ void KVCacheStore::RegisterReadRemoteHooks() {
+ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
+     absl::Span<const std::string> block_hashes) {
+   absl::MutexLock lock(mutex_);
+-  ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
++  LookupOptions options;
++  options.enable_global = false;
++  options.pin_found = true;
++  ABSL_ASSIGN_OR_RETURN(const auto& slices,
++                        backend()->Lookup(block_hashes, options));
++  std::vector<std::string> pinned;
++  pinned.reserve(slices.size());
++  for (const auto& entry : slices) pinned.push_back(entry.first);
+   if (slices.size() < block_hashes.size()) {
++    backend()->Release(pinned);
+     return absl::NotFoundError(
+         absl::StrCat("BLOCK_HASH_NOT_FOUND: ", block_hashes[slices.size()]));
+   }
+@@ -1667,6 +1675,7 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
+     const auto& existing = slices[i].second;
+     if (existing.status != BlockStatus::HOST &&
+         existing.status != BlockStatus::HOST_AND_HBM) {
++      backend()->Release(pinned);
+       return absl::FailedPreconditionError(absl::StrCat(
+           "Block not resident in host DRAM (status=",
+           static_cast<int>(existing.status), "): ", block_hashes[i]));
+@@ -1674,10 +1683,6 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
+     src_host_block_ids.push_back(existing.host_block_id);
+   }
+ 
+-  if (!backend()->Pin(block_hashes)) {
+-    return absl::InternalError("Failed to pin host blocks");
+-  }
+-
+   return src_host_block_ids;
+ }
+ 
