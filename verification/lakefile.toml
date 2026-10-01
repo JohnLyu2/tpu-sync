@@ -1,0 +1,9 @@
+name = "tpu-sync-verify"
+defaultTargets = ["TpuSyncVerify"]
+
+# No dependencies on purpose: the model uses a hand-rolled finite state
+# representation, so the build stays fast and the toolchain pin stays light.
+# Add Mathlib only when a proof genuinely needs its order/cardinality lemmas.
+
+[[lean_lib]]
+name = "TpuSyncVerify"
