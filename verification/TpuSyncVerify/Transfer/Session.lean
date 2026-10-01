@@ -175,6 +175,86 @@ theorem beginOp_active {l l' : Lifecycle} (hb : beginOp l = some l') :
       · rfl
       · exact absurd (Or.inr hdrain) hn
 
+/-! ## What each operation does to `statusOk` and `draining` -/
+
+@[simp] theorem settleLocked_statusOk (l : Lifecycle) :
+    (settleLocked l).statusOk = l.statusOk := by
+  unfold settleLocked; split <;> rfl
+
+@[simp] theorem settleLocked_draining (l : Lifecycle) :
+    (settleLocked l).draining = l.draining := by
+  unfold settleLocked; split <;> rfl
+
+/-- `FinishLocked` records the first error: the status stays OK only if it was
+OK and this finish is OK. -/
+@[simp] theorem finishLocked_statusOk (ok : Bool) (l : Lifecycle) :
+    (finishLocked ok l).statusOk = (ok && l.statusOk) := by
+  have key : ∀ l' : Lifecycle,
+      (if l'.draining = true then l' else settleLocked { l' with draining := true }).statusOk
+        = l'.statusOk := by
+    intro l'; split <;> simp
+  simp only [finishLocked]
+  split
+  · rename_i h
+    rw [key]
+    simp [h.1]
+  · rename_i h
+    rw [key]
+    cases ok <;> cases hst : l.statusOk <;> simp_all
+
+@[simp] theorem finishLocked_draining (ok : Bool) (l : Lifecycle) :
+    (finishLocked ok l).draining = true := by
+  simp only [finishLocked]
+  split <;> split <;> simp_all
+
+@[simp] theorem endOpLocked_statusOk (l : Lifecycle) :
+    (endOpLocked l).statusOk = l.statusOk := by
+  unfold endOpLocked; split <;> simp
+
+@[simp] theorem endOpLocked_draining (l : Lifecycle) :
+    (endOpLocked l).draining = l.draining := by
+  unfold endOpLocked; split <;> simp
+
+theorem beginOp_statusOk {l l' : Lifecycle} (hb : beginOp l = some l') :
+    l'.statusOk = l.statusOk := by
+  unfold beginOp at hb
+  split at hb
+  · cases hb
+  · cases hb; rfl
+
+theorem beginOp_draining {l l' : Lifecycle} (hb : beginOp l = some l') :
+    l'.draining = false := by
+  unfold beginOp at hb
+  split at hb
+  · cases hb
+  · rename_i hn
+    cases hb
+    cases hdrain : l.draining
+    · rfl
+    · exact absurd (Or.inr hdrain) hn
+
+/-! ## `done` is never cleared -/
+
+theorem settleLocked_done_mono {l : Lifecycle} (h : l.done = true) :
+    (settleLocked l).done = true := by
+  unfold settleLocked; split <;> simp_all
+
+theorem finishLocked_done_mono {l : Lifecycle} (ok : Bool) (h : l.done = true) :
+    (finishLocked ok l).done = true := by
+  simp only [finishLocked]
+  split <;> split
+  · simpa using h
+  · exact settleLocked_done_mono (by simpa using h)
+  · exact h
+  · exact settleLocked_done_mono (by simpa using h)
+
+theorem endOpLocked_done_mono {l : Lifecycle} (h : l.done = true) :
+    (endOpLocked l).done = true := by
+  unfold endOpLocked
+  split
+  · exact h
+  · exact settleLocked_done_mono (by simpa using h)
+
 end Lifecycle
 
 end TpuSyncVerify.Transfer
