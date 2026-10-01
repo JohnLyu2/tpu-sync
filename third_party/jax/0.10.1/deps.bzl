@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dependency revisions for JAX 0.10.1."""
+"""Dependency revisions for JAX 0.10.1.
+
+Every value except libtpu, raiden_jax, and abseil patches is read from JAX
+619764c1's MODULE.bazel. See README.md for patch details.
+"""
 
 DEPS = {
     "jax_version": "0.10.1",

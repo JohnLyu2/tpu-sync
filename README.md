@@ -45,13 +45,13 @@ TPU Sync is actively validated and optimized for the following accelerator gener
 
 ### Supported JAX versions
 
-tpu-raiden builds against one JAX version at a time, chosen at build time. All
+tpu-raiden builds against one JAX version at a time, chosen at build time (defaults to 0.11.2). All
 four are validated the same way: the extension builds, `raw_transfer_test`
 passes, and the full `run_tests.sh jax` suite passes on TPU.
 
 | JAX / jaxlib | libtpu | XLA | abseil | Status |
 | --- | --- | --- | --- | --- |
-| 0.11.0 | 0.0.47 | `131bf41a` | 20260526.0 | **Default** |
+| 0.11.2 | 0.0.48 | `f60be94c` | 20260526.0 | **Default** |
 | 0.10.2 | 0.0.42.1 | `5a9e73cb` | 20260107.1 | Supported |
 | 0.10.1 | 0.0.41 | `9b635916` | 20260107.1 | Supported |
 | 0.10.0 | 0.0.40 | `b6f37ab7` | 20260107.1 | Supported |
@@ -63,14 +63,16 @@ RAIDEN_JAX_VERSION=0.10.2 ./build.sh jax
 ./run_tests.sh jax
 ```
 
-`build.sh` installs that version's requirements when it finishes -- the
+When `build.sh` finishes it installs that version's requirements -- the
 top-level `requirements.txt` with `jax`, `jaxlib` and `libtpu` swapped for the
-version's -- so the
-environment matches what the extension was compiled against, and the tests
-then run against whatever the build left behind. That matching is
-not cosmetic: raiden's extension and jaxlib load into the same process, and an
-XLA or abseil that disagrees with the installed jaxlib does not fail to
-compile — it crashes at runtime, usually far from the cause.
+version's -- so the environment matches what the extension was compiled
+against, and the tests then run against whatever the build left behind.
+
+That matching is not cosmetic. raiden's extension and jaxlib load into the same
+process, and an XLA or abseil that disagrees with the installed jaxlib does not
+fail to compile -- it crashes at run time, usually far from the cause. `pip`
+installs into whatever `python3` resolves to, so activate the environment you
+intend to test in before you build.
 
 Anything outside the table is rejected; the accepted list is
 `SUPPORTED_VERSIONS` in `third_party/jax/versions.bzl`. See
@@ -174,7 +176,7 @@ What this script does:
 1. Navigates to the workspace directory.
 2. Compiles the selected extension modules (`_tpu_raiden_jax.so` and/or `_tpu_raiden_torch.so`) using Bazel.
 3. For PyTorch builds, executes `patchelf --add-needed` on the generated shared library.
-4. Installs the Python dependencies for the JAX version it built against — `requirements.txt` with `jax`, `jaxlib` and `libtpu` set to that version's.
+4. Installs the Python dependencies for the JAX version it built against -- `requirements.txt` with `jax`, `jaxlib` and `libtpu` set to that version's.
 5. Copies compiled `.so` extension binaries directly into their respective framework source packages.
 
 ##### Building against a specific JAX version
@@ -193,13 +195,13 @@ That one variable moves everything that has to move together. The build takes
 its `jax`, `xla`, `rules_ml_toolchain` and `abseil` revisions from
 `third_party/jax/0.10.2/deps.bzl`, and the install step at the end puts the
 matching `jax`, `jaxlib` and `libtpu` into the active Python environment. Run
-the tests with no variable — they use whatever the build installed.
+the tests with no variable -- they use whatever the build installed.
 
 Three things worth knowing:
 
 - **Rebuild when you switch.** The extension is compiled against one jaxlib's
   headers and loaded into a process with whatever jaxlib is installed. If those
-  disagree it does not fail to import — it corrupts, and the crash comes later
+  disagree it does not fail to import -- it corrupts, and the crash comes later
   and somewhere else. Changing `RAIDEN_JAX_VERSION` means running `build.sh`
   again, in the environment you intend to use.
 - **Only listed versions are accepted.** `SUPPORTED_VERSIONS` in
