@@ -37,6 +37,8 @@ Pinned revisions must match upstream JAX's `MODULE.bazel` exactly:
 - **abseil**: Must match `jaxlib`'s Abseil version to prevent runtime ABI mismatches.
 - **libtpu**: Runtime PJRT plugin wheel.
 
+When code requires functionality not present in an older revision, the entry patches the revision rather than bumping it. The 0.10.x entries use `third_party/abseil/status_macros.patch` to backport `ABSL_RETURN_IF_ERROR` and `ABSL_ASSIGN_OR_RETURN` into Abseil `20260107.1`.
+
 ## Adding a Version
 
 1. Read `xla`, `rules_ml_toolchain`, and `abseil-cpp` revisions from upstream JAX `MODULE.bazel`.

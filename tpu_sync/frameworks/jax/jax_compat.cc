@@ -33,6 +33,7 @@
 namespace raiden {
 namespace {
 
+#if RAIDEN_JAX >= 1100
 // Returns the runtime jaxlib version as (major * 10000 + minor * 100 + patch),
 // e.g., 0.11.0 -> 1100, 0.11.1 -> 1101, 0.11.2 -> 1102.
 int GetRuntimeJaxVersion() {
@@ -66,6 +67,7 @@ int GetRuntimeJaxVersion() {
   }();
   return version;
 }
+#endif  // RAIDEN_JAX >= 1100
 
 // Mirrors jaxlib's private PyArrayObject from py_array.cc.
 struct PyArrayObject {
@@ -79,6 +81,9 @@ struct PyArrayObject {
       jax::PyArray::Storage) char array_storage[sizeof(jax::PyArray::Storage)];
 };
 
+// Runtime dispatch across 0.11.x jaxlibs. 0.10.x builds use their own headers'
+// layout directly.
+#if RAIDEN_JAX >= 1100
 // In JAX 0.11.0 and 0.11.1, PyArray_Storage placed ifrt_array at byte offset 80
 // (aval [8B], weak_type + pad [8B], dtype [8B], shape [24B], sharding [8B],
 // npy_value [8B], committed + pad [8B], py_client [8B]). In JAX 0.11.2+,
@@ -124,17 +129,20 @@ class PjRtCompatibleArray_0_11_0 {
   // xla::ifrt::PjRtCompatibleArray::pjrt_buffers() (slot 21)
   virtual absl::Span<const std::shared_ptr<xla::PjRtBuffer>> pjrt_buffers() = 0;
 };
+#endif  // RAIDEN_JAX >= 1100
 
 xla::ifrt::Array* GetIfrtArray(PyObject* obj) ABSL_NO_THREAD_SAFETY_ANALYSIS {
   auto* py_array_object = reinterpret_cast<PyArrayObject*>(obj);
   if (!py_array_object->initialized) {
     throw std::runtime_error("PyArrayObject not initialized");
   }
+#if RAIDEN_JAX >= 1100
   if (GetRuntimeJaxVersion() < 1102) {
     return std::launder(reinterpret_cast<PyArrayStorage_0_11_0*>(
                             py_array_object->array_storage))
         ->ifrt_array.get();
   }
+#endif
   return std::launder(reinterpret_cast<jax::PyArray::Storage*>(
                           py_array_object->array_storage))
       ->ifrt_array.get();
@@ -147,10 +155,14 @@ xla::ifrt::PjRtCompatibleArray* CastToPjRtCompatibleArray(
   // CopyArraysToHostBufferShards; skip the runtime_type() check there and
   // static_cast directly (cross-DSO dynamic_cast is unavailable in OSS builds
   // because _jax.so hides RTTI symbols).
+#if RAIDEN_JAX >= 1100
   if (GetRuntimeJaxVersion() >= 1102 &&
       ifrt_array->client()->runtime_type() != "pjrt_ifrt") {
     return nullptr;
   }
+#else
+  if (ifrt_array->client()->runtime_type() != "pjrt_ifrt") return nullptr;
+#endif
   return static_cast<xla::ifrt::PjRtCompatibleArray*>(ifrt_array);
 }
 
@@ -162,12 +174,14 @@ xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj)
   if (arr == nullptr) {
     throw std::runtime_error("Not a PjRt compatible array");
   }
+#if RAIDEN_JAX >= 1100
   if (GetRuntimeJaxVersion() < 1101) {
     return reinterpret_cast<PjRtCompatibleArray_0_11_0*>(arr)
         ->pjrt_buffers()
         .front()
         .get();
   }
+#endif
   return arr->pjrt_buffers().front().get();
 }
 

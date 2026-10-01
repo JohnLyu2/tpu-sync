@@ -18,4 +18,7 @@ DEFAULT_VERSION = "0.11.2"
 
 SUPPORTED_VERSIONS = [
     "0.11.2",
+    "0.10.2",
+    "0.10.1",
+    "0.10.0",
 ]

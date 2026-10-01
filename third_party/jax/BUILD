@@ -21,9 +21,27 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "raiden_jax_version",
     defines = select({
+        ":jax_1000": ["RAIDEN_JAX=1000"],
+        ":jax_1001": ["RAIDEN_JAX=1001"],
+        ":jax_1002": ["RAIDEN_JAX=1002"],
         ":jax_1102": ["RAIDEN_JAX=1102"],
         "//conditions:default": ["RAIDEN_JAX=1102"],
     }),
+)
+
+config_setting(
+    name = "jax_1000",
+    define_values = {"raiden_jax": "1000"},
+)
+
+config_setting(
+    name = "jax_1001",
+    define_values = {"raiden_jax": "1001"},
+)
+
+config_setting(
+    name = "jax_1002",
+    define_values = {"raiden_jax": "1002"},
 )
 
 config_setting(
