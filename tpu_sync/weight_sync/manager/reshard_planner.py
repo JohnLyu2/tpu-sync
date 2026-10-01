@@ -14,6 +14,7 @@
 
 """Resharding plan and N-D slice math for RaidenController."""
 
+import collections
 import math
 import sys
 import threading
@@ -650,17 +651,17 @@ def generate_strided_copy_chunks_tile_aware(
 
 
 def compute_bandwidth_matched_seed(
-    broadcast_host_ratio: float,
-    num_src_hosts: int,
-    num_dst_hosts_per_unit: int,
-    num_dst_units: int,
+    broadcast_host_ratio: Optional[float] = 1.0,
+    num_src_hosts: int = 1,
+    num_dst_hosts_per_unit: int = 1,
+    num_dst_units: int = 1,
 ) -> int:
   """Computes bandwidth-matched seed sampler count N_seed.
 
   Args:
     broadcast_host_ratio: Ratio of trainer TX host bandwidth to sampler RX host
-      bandwidth (K0 = B_train_TX / B_sample_RX). A value of 0.0 disables tree
-      broadcast and forces Direct P2P.
+      bandwidth (K0 = B_train_TX / B_sample_RX). Values <= 0.0 or None default
+      to 1.0.
     num_src_hosts: Number of trainer host endpoints (H_train).
     num_dst_hosts_per_unit: Number of sampler host endpoints per unit
       (H_sample).
@@ -669,10 +670,6 @@ def compute_bandwidth_matched_seed(
   Returns:
     N_seed: Number of seed samplers to populate directly in Round 0.
   """
-  if broadcast_host_ratio < 0.0:
-    raise ValueError(
-        f"broadcast_host_ratio must be non-negative, got {broadcast_host_ratio}"
-    )
   if num_src_hosts <= 0:
     raise ValueError(f"num_src_hosts must be positive, got {num_src_hosts}")
   if num_dst_hosts_per_unit <= 0:
@@ -681,14 +678,15 @@ def compute_bandwidth_matched_seed(
     )
   if num_dst_units < 0:
     raise ValueError(f"num_dst_units must be non-negative, got {num_dst_units}")
-  if broadcast_host_ratio == 0.0:
-    return max(1, num_dst_units)
+  effective_ratio = (
+      1.0
+      if broadcast_host_ratio is None or broadcast_host_ratio <= 0.0
+      else float(broadcast_host_ratio)
+  )
   return max(
       1,
       int(
-          math.floor(
-              broadcast_host_ratio * (num_src_hosts / num_dst_hosts_per_unit)
-          )
+          math.floor(effective_ratio * (num_src_hosts / num_dst_hosts_per_unit))
       ),
   )
 
@@ -699,10 +697,10 @@ class ReshardPlanner:
   @classmethod
   def compute_bandwidth_matched_seed(
       cls,
-      broadcast_host_ratio: float,
-      num_src_hosts: int,
-      num_dst_hosts_per_unit: int,
-      num_dst_units: int,
+      broadcast_host_ratio: Optional[float] = 1.0,
+      num_src_hosts: int = 1,
+      num_dst_hosts_per_unit: int = 1,
+      num_dst_units: int = 1,
   ) -> int:
     del cls
     return compute_bandwidth_matched_seed(
@@ -721,7 +719,7 @@ class ReshardPlanner:
       skip_tiling: Optional[dict[int, bool]] = None,
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
-      broadcast_host_ratio: float = 1.0,
+      broadcast_host_ratio: Optional[float] = 1.0,
       broadcast_pipeline_stages: int = 4,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
@@ -733,6 +731,11 @@ class ReshardPlanner:
           "broadcast_pipeline_stages must be >= 1, got"
           f" {broadcast_pipeline_stages}"
       )
+    effective_ratio = (
+        1.0
+        if broadcast_host_ratio is None or broadcast_host_ratio <= 0.0
+        else float(broadcast_host_ratio)
+    )
     return (
         tuple(src_units),
         tuple(dst_units),
@@ -740,7 +743,7 @@ class ReshardPlanner:
         tuple(sorted(skip_tiling.items())) if skip_tiling is not None else None,
         dst_controller_address,
         src_controller_address,
-        float(broadcast_host_ratio),
+        effective_ratio,
         int(broadcast_pipeline_stages),
     )
 
@@ -789,8 +792,8 @@ class ReshardPlanner:
       registered_shards: Mapping[RaidenId, list[str]],
       computed_phys_meshes: dict[RaidenId, list[int]],
       worker_endpoints: dict[RaidenId, str],
-      broadcast_host_ratio: float,
-      lock: threading.Lock,
+      broadcast_host_ratio: Optional[float] = 1.0,
+      lock: Optional[threading.Lock] = None,
       group_size: int = 1,
       skip_tiling: Optional[dict[int, bool]] = None,
       shard_push_schedules: Optional[
@@ -807,6 +810,9 @@ class ReshardPlanner:
       raise ValueError(
           f"pipeline_target_stages must be >= 1, got {pipeline_target_stages}"
       )
+
+    if lock is None:
+      lock = threading.Lock()
 
     computed_schedules = {}
     computed_slices = {}
@@ -1298,20 +1304,6 @@ class ReshardPlanner:
             num_dst_units=max_eq_class_len,
         )
 
-      # Track direct block counts during template expansion when tree broadcast
-      # cannot be triggered (max_eq_class_len <= n_seed) or broadcast is
-      # disabled.
-      can_fast_path_direct = (
-          broadcast_host_ratio <= 0.0
-          or (max_eq_class_len or len(dst_meta_info)) <= n_seed
-      )
-      fast_dst_unit_counts = {}
-      fast_dst_unit_layer_counts = {}
-      fast_dst_endpoint_counts = {}
-      fast_dst_endpoint_layer_counts = {}
-      fast_direct_dsts = []
-      fast_direct_dsts_set = set()
-
       # 3. Generate plan (Intersection) with plan_id dictionary deduplication:
       # Each unique (src_sig, dst_group_sig, skip_tile_flag) is assigned a
       # unique integer `plan_id`. The calculated shard schedule for `plan_id`
@@ -1335,8 +1327,6 @@ class ReshardPlanner:
       ]
       canonical_relay_plans = canonical_relay_plans_by_eq_class[0]
       plan_classification_cache = {}
-      plan_unit_counts_by_pid = {}
-      plan_host_counts_by_pid = {}
 
       for src_unit_idx, src_unit in enumerate(src_units):
         src_vars = src_vars_by_unit.get(src_unit, [])
@@ -1347,8 +1337,6 @@ class ReshardPlanner:
         unit_plans_by_eq_and_id: list[dict[int, Any]] = [
             {} for _ in range(num_eq_classes)
         ]
-        unit_shard_plans_by_id = {}
-        unit_shard_pid_dst_units = {}
 
         with lock:
           src_job_replicas = {
@@ -1594,8 +1582,6 @@ class ReshardPlanner:
             )
 
           canonical_templates_by_eq = [{} for _ in range(num_eq_classes)]
-          tmpl_unit_counts = {}
-          tmpl_host_counts = {}
           is_src_legacy = is_legacy_by_unit.get(src_unit, True)
           for (
               local_src_idx,
@@ -1750,136 +1736,10 @@ class ReshardPlanner:
                       (local_dst_idx, *chunk_desc)
                   )
 
-            if can_fast_path_direct:
-              template_entries = []
-              shard_dst_units_order = []
-              shard_dst_units_seen = set()
-
-              if len(active_slice_chunks) == 1:
-                only_key, converted_chunks = next(
-                    iter(active_slice_chunks.items())
-                )
-                if num_candidates > 1:
-                  cand_cache_key = (dst_group_sig, only_key, num_candidates)
-                  by_cand = slice_candidate_cache.get(cand_cache_key)
-                  if by_cand is None:
-                    by_cand = {}
-                    for item in dst_targets_by_slice[only_key]:
-                      by_cand.setdefault(item[1] % num_candidates, []).append(
-                          item
-                      )
-                    slice_candidate_cache[cand_cache_key] = by_cand
-                  matched_items = by_cand.get(candidate_rank)
-                else:
-                  matched_items = dst_targets_by_slice[only_key]
-
-                if not matched_items:
-                  continue
-
-                if len(matched_items) > 1:
-                  shift = src_host_rank % len(matched_items)
-                  shifted_matched_items = (
-                      matched_items[shift:] + matched_items[:shift]
-                  )
-                else:
-                  shifted_matched_items = matched_items
-
-                num_c = len(converted_chunks)
-                first_chunk = converted_chunks[0]
-                for (
-                    _,
-                    _,
-                    local_dst_idx,
-                    dst_peer,
-                    d_u,
-                    d_h,
-                ) in shifted_matched_items:
-                  if d_u is not None:
-                    tmpl_unit_counts[d_u] = tmpl_unit_counts.get(d_u, 0) + num_c
-                    if d_u not in shard_dst_units_seen:
-                      shard_dst_units_seen.add(d_u)
-                      shard_dst_units_order.append(d_u)
-                    if d_h:
-                      tmpl_host_counts[d_h] = (
-                          tmpl_host_counts.get(d_h, 0) + num_c
-                      )
-                  if num_c == 1:
-                    template_entries.append(
-                        (dst_peer, local_dst_idx, *first_chunk)
-                    )
-                  else:
-                    template_entries.extend(
-                        (dst_peer, local_dst_idx, *chunk_desc)
-                        for chunk_desc in converted_chunks
-                    )
-              else:
-                if len(dst_targets) > 1:
-                  shift = src_host_rank % len(dst_targets)
-                  shifted_dst_targets = (
-                      dst_targets[shift:] + dst_targets[:shift]
-                  )
-                else:
-                  shifted_dst_targets = dst_targets
-                for (
-                    dst_unit,
-                    dst_unit_idx,
-                    is_dst_legacy,
-                    num_dst_shards,
-                    dst_shard_items,
-                ) in shifted_dst_targets:
-                  for local_dst_idx, dst_slice, dst_peer in dst_shard_items:
-                    converted_chunks = active_slice_chunks.get(
-                        (dst_slice, is_dst_legacy)
-                    )
-                    if not converted_chunks:
-                      continue
-                    if num_candidates > 1:
-                      dst_global_idx = (
-                          dst_unit_idx * num_dst_shards + local_dst_idx
-                      )
-                      if dst_global_idx % num_candidates != candidate_rank:
-                        continue
-                    num_c = len(converted_chunks)
-                    d_u = data_address_to_unit.get(dst_peer)
-                    if d_u is not None:
-                      tmpl_unit_counts[d_u] = (
-                          tmpl_unit_counts.get(d_u, 0) + num_c
-                      )
-                      if d_u not in shard_dst_units_seen:
-                        shard_dst_units_seen.add(d_u)
-                        shard_dst_units_order.append(d_u)
-                      d_h = data_address_to_host.get(dst_peer)
-                      if d_h:
-                        tmpl_host_counts[d_h] = (
-                            tmpl_host_counts.get(d_h, 0) + num_c
-                        )
-                    template_entries.extend(
-                        (dst_peer, local_dst_idx, *chunk_desc)
-                        for chunk_desc in converted_chunks
-                    )
-
-              if template_entries:
-                unit_shard_plans_by_id.setdefault(local_src_idx, {})[
-                    plan_id
-                ] = template_entries
-                unit_shard_pid_dst_units[(local_src_idx, plan_id)] = (
-                    shard_dst_units_order
-                )
-
           for eq_idx in range(num_eq_classes):
             unit_plans_by_eq_and_id[eq_idx][plan_id] = (
                 canonical_templates_by_eq[eq_idx]
             )
-          if can_fast_path_direct:
-            layers_tuple = unit_layers_tuple_by_pid.get(plan_id, ())
-            if layers_tuple:
-              pid_key = (plan_id, layers_tuple)
-              pid_u_counts = plan_unit_counts_by_pid.setdefault(pid_key, {})
-              for d_u, cnt in tmpl_unit_counts.items():
-                pid_u_counts[d_u] = pid_u_counts.get(d_u, 0) + cnt
-              pid_h_counts = plan_host_counts_by_pid.setdefault(pid_key, {})
-              for d_h, cnt in tmpl_host_counts.items():
-                pid_h_counts[d_h] = pid_h_counts.get(d_h, 0) + cnt
 
         for eq_idx in range(num_eq_classes):
           variable_plans_by_eq_class[eq_idx][src_unit] = (
@@ -1887,52 +1747,17 @@ class ReshardPlanner:
           )
         variable_to_plan_id[src_unit] = dict(unit_var_to_plan_id)
         unit_ordered_vars_by_unit[src_unit] = unit_ordered_vars
-        if unit_shard_plans_by_id:
-          sorted_local_idxs = sorted(unit_shard_plans_by_id.keys())
-          computed_schedules[src_unit] = {
-              local_src_idx: _PlanReferencedShardSchedule(
-                  unit_shard_plans_by_id[local_src_idx],
-                  unit_var_to_plan_id,
-                  unit_ordered_vars,
-              )
-              for local_src_idx in sorted_local_idxs
-          }
-          if can_fast_path_direct and len(fast_direct_dsts_set) < len(
-              dst_units
-          ):
-            unique_ordered_pids = list(
-                dict.fromkeys(pid for _, pid in unit_ordered_vars)
-            )
-            for local_src_idx in sorted_local_idxs:
-              for pid in unique_ordered_pids:
-                for d_u in unit_shard_pid_dst_units.get(
-                    (local_src_idx, pid), ()
-                ):
-                  if d_u not in fast_direct_dsts_set:
-                    fast_direct_dsts_set.add(d_u)
-                    fast_direct_dsts.append(d_u)
-              if len(fast_direct_dsts_set) == len(dst_units):
-                break
 
-      if can_fast_path_direct:
-        for (_, layers_tuple), pid_u_counts in plan_unit_counts_by_pid.items():
-          num_layers_for_pid = len(layers_tuple)
-          for d_u, cnt in pid_u_counts.items():
-            fast_dst_unit_counts[d_u] = (
-                fast_dst_unit_counts.get(d_u, 0) + cnt * num_layers_for_pid
-            )
-            layer_map = fast_dst_unit_layer_counts.setdefault(d_u, {})
-            for l_idx in layers_tuple:
-              layer_map[l_idx] = layer_map.get(l_idx, 0) + cnt
-        for (_, layers_tuple), pid_h_counts in plan_host_counts_by_pid.items():
-          num_layers_for_pid = len(layers_tuple)
-          for d_h, cnt in pid_h_counts.items():
-            fast_dst_endpoint_counts[d_h] = (
-                fast_dst_endpoint_counts.get(d_h, 0) + cnt * num_layers_for_pid
-            )
-            h_layer_map = fast_dst_endpoint_layer_counts.setdefault(d_h, {})
-            for l_idx in layers_tuple:
-              h_layer_map[l_idx] = h_layer_map.get(l_idx, 0) + cnt
+      # Map layer_idx -> unique list of (u, pid) across src_units
+      layer_to_unit_pids: dict[int, list[tuple[RaidenId, int]]] = (
+          collections.defaultdict(list)
+      )
+      seen_u_layer_pids: set[tuple[int, RaidenId, int]] = set()
+      for u in src_units:
+        for l_idx, pid in unit_ordered_vars_by_unit.get(u, []):
+          if (l_idx, u, pid) not in seen_u_layer_pids:
+            seen_u_layer_pids.add((l_idx, u, pid))
+            layer_to_unit_pids[l_idx].append((u, pid))
 
       for eq_idx, eq_var_plans in enumerate(variable_plans_by_eq_class):
         eq_dst_units = dst_eq_classes[eq_idx]
@@ -1946,9 +1771,9 @@ class ReshardPlanner:
           all_plan_ids.update(u_plans.keys())
 
         eq_relay_plans = canonical_relay_plans_by_eq_class[eq_idx]
-        for pid in all_plan_ids:
+        for l_idx, u_pid_list in layer_to_unit_pids.items():
           blocks_by_dst: dict[tuple[int, int], list[int]] = {}
-          for u in src_units:
+          for u, pid in u_pid_list:
             u_plans = eq_var_plans.get(u, {})
             tuples_by_shard = u_plans.get(pid, {})
             for local_src_idx, tuples_9 in tuples_by_shard.items():
@@ -1963,9 +1788,7 @@ class ReshardPlanner:
                 # row chunks arriving from distinct FSDP source shards (which
                 # carry different t9[5] = dst_offset // dst_block_bytes sub-row
                 # indices) to coalesce into a single whole-buffer relay range.
-                dst_block_id = (
-                    0 if (not eq_is_legacy and num_eq_classes > 1) else t9[5]
-                )
+                dst_block_id = 0 if not eq_is_legacy else t9[5]
                 dst_stride = t9[7]
                 count = t9[8]
                 cur_end = dst_block_offset + (count - 1) * dst_stride + size
@@ -1979,20 +1802,27 @@ class ReshardPlanner:
                   if cur_end > cur[1]:
                     cur[1] = cur_end
 
-          eq_relay_plans[pid] = {}
+          shard_blocks_map: dict[int, list[tuple[int, int, int]]] = {}
           for (local_dst_idx, dst_block_id), (min_off, max_end) in sorted(
               blocks_by_dst.items(),
               key=lambda item: (item[0][0], item[1][0], item[0][1]),
           ):
-            shard_blocks = eq_relay_plans[pid].setdefault(local_dst_idx, [])
+            shard_blocks = shard_blocks_map.setdefault(local_dst_idx, [])
             if not eq_is_legacy and shard_blocks:
               prev_off, prev_size, prev_bid = shard_blocks[-1]
               prev_end = prev_off + prev_size
-              if min_off < prev_end:
+              if min_off <= prev_end:
                 new_end = max(prev_end, max_end)
                 shard_blocks[-1] = (prev_off, new_end - prev_off, prev_bid)
                 continue
             shard_blocks.append((min_off, max_end - min_off, dst_block_id))
+
+          for _, pid in u_pid_list:
+            eq_relay_plans[pid] = shard_blocks_map
+
+        for pid in all_plan_ids:
+          if pid not in eq_relay_plans:
+            eq_relay_plans[pid] = {}
       canonical_relay_plans = canonical_relay_plans_by_eq_class[0]
 
     # Build rpc_addresses for local source workers
@@ -2013,34 +1843,7 @@ class ReshardPlanner:
         if unit in registered_shards:
           data_addresses[unit] = list(registered_shards[unit])
 
-    if not shard_push_schedules and can_fast_path_direct:
-      direct_schedules = {
-          u: {s_idx: entries for s_idx, entries in scheds.items() if entries}
-          for u, scheds in computed_schedules.items()
-          if any(scheds.values())
-      }
-      broadcast_groups = {}
-      dst_unit_counts = fast_dst_unit_counts
-      dst_unit_layer_counts = fast_dst_unit_layer_counts
-      dst_endpoint_counts = fast_dst_endpoint_counts
-      dst_endpoint_layer_counts = fast_dst_endpoint_layer_counts
-      computed_expected_block_count = (
-          max(dst_unit_counts.values()) if dst_unit_counts else 0
-      )
-      direct_dsts = fast_direct_dsts
-      if direct_schedules:
-        vars_info = f"{num_vars} variable(s), " if num_vars > 0 else ""
-        logging.info(
-            "Transfer %s (uuid=%s): generated schedule for %s -> %s"
-            " (%s%d expected blocks)",
-            req_id,
-            uuid,
-            _format_units(src_units),
-            _format_units(dst_units),
-            vars_info,
-            computed_expected_block_count,
-        )
-    elif not shard_push_schedules and not can_fast_path_direct:
+    if not shard_push_schedules:
       direct_schedules = {}
       broadcast_groups = {}
 
@@ -2058,6 +1861,8 @@ class ReshardPlanner:
 
       dst_unit_counts = {}
       dst_unit_layer_counts = {}
+      dst_endpoint_counts = {}
+      dst_endpoint_layer_counts = {}
       for eq_idx, eq_dst_units in enumerate(dst_eq_classes):
         eq_var_plans = variable_plans_by_eq_class[eq_idx]
         eq_relay_plans = canonical_relay_plans_by_eq_class[eq_idx]
@@ -2098,12 +1903,24 @@ class ReshardPlanner:
           broadcast_groups[(eq_idx, lg_idx)] = stage_group
         for d_u in eq_dst_units:
           dst_unit_counts[d_u] = eq_total_seed_blocks
+          d_shards = data_addresses.get(d_u, [])
+          d_host = (
+              data_address_to_host.get(d_shards[0])
+              or _extract_host_ip(d_shards[0])
+              if d_shards
+              else None
+          )
+          if d_host:
+            dst_endpoint_counts[d_host] = (
+                dst_endpoint_counts.get(d_host, 0) + eq_total_seed_blocks
+            )
+            dst_ep_layer = dst_endpoint_layer_counts.setdefault(d_host, {})
+            for l_idx, cnt in dst_unit_layer_counts.get(d_u, {}).items():
+              dst_ep_layer[l_idx] = dst_ep_layer.get(l_idx, 0) + cnt
 
       computed_expected_block_count = (
           max(dst_unit_counts.values()) if dst_unit_counts else 0
       )
-      dst_endpoint_counts = {}
-      dst_endpoint_layer_counts = {}
       direct_dsts = []
       vars_info = f"{num_vars} variable(s), " if num_vars > 0 else ""
       logging.info(
@@ -2175,66 +1992,61 @@ class ReshardPlanner:
             )
             groups.setdefault(key, []).append(val)
 
-      direct_schedules, broadcast_groups = (
-          BroadcastEngine.partition_direct_and_broadcast_groups(
-              groups, n_seed, group_size
-          )
-      )
+      direct_schedules = {}
+      if groups:
+        stage_group = controller_types.StageBroadcastGroup(
+            pool_group=0,
+            layer_group_idx=0,
+            src_units=list(src_units),
+            dst_units=list(dst_units),
+            stage_ordered_vars_by_unit={},
+            canonical_variable_plans={},
+            canonical_relay_plans={},
+            data_addresses=dict(data_addresses),
+        )
+        broadcast_groups = {(0, 0): stage_group}
+      else:
+        broadcast_groups = {}
 
       dst_unit_counts = {}
       dst_unit_layer_counts = {}
       dst_endpoint_counts = {}
       dst_endpoint_layer_counts = {}
       computed_expected_block_count = 0
-      if direct_schedules:
-        for src_unit, schedules in direct_schedules.items():
-          for shard_idx, entries in schedules.items():
-            for entry in entries:
-              dst_peer = entry[0]
-              dst_unit = data_address_to_unit.get(dst_peer)
-              if dst_unit:
-                layer_idx = entry[10] if len(entry) > 10 else 0
-                tasks_count = 1
-                dst_unit_counts[dst_unit] = (
-                    dst_unit_counts.get(dst_unit, 0) + tasks_count
-                )
-                dst_unit_layer_counts.setdefault(dst_unit, {})
-                dst_unit_layer_counts[dst_unit][layer_idx] = (
-                    dst_unit_layer_counts[dst_unit].get(layer_idx, 0)
-                    + tasks_count
-                )
-                dst_host = _extract_host_ip(dst_peer)
-                if dst_host:
-                  dst_endpoint_counts[dst_host] = (
-                      dst_endpoint_counts.get(dst_host, 0) + tasks_count
-                  )
-                  dst_endpoint_layer_counts.setdefault(dst_host, {})
-                  dst_endpoint_layer_counts[dst_host][layer_idx] = (
-                      dst_endpoint_layer_counts[dst_host].get(layer_idx, 0)
-                      + tasks_count
-                  )
-        if dst_unit_counts:
-          computed_expected_block_count = max(dst_unit_counts.values())
-        vars_info = f"{num_vars} variable(s), " if num_vars > 0 else ""
-        logging.info(
-            "Transfer %s (uuid=%s): generated schedule for %s -> %s"
-            " (%s%d expected blocks)",
-            req_id,
-            uuid,
-            _format_units(src_units),
-            _format_units(dst_units),
-            vars_info,
-            computed_expected_block_count,
-        )
+      for key, targets in groups.items():
+        layer_idx = key[7]
+        for val in targets:
+          dst_unit = val[0]
+          dst_peer = val[1]
+          dst_unit_counts[dst_unit] = dst_unit_counts.get(dst_unit, 0) + 1
+          dst_unit_layer_counts.setdefault(dst_unit, {})
+          dst_unit_layer_counts[dst_unit][layer_idx] = (
+              dst_unit_layer_counts[dst_unit].get(layer_idx, 0) + 1
+          )
+          dst_host = _extract_host_ip(dst_peer)
+          if dst_host:
+            dst_endpoint_counts[dst_host] = (
+                dst_endpoint_counts.get(dst_host, 0) + 1
+            )
+            dst_endpoint_layer_counts.setdefault(dst_host, {})
+            dst_endpoint_layer_counts[dst_host][layer_idx] = (
+                dst_endpoint_layer_counts[dst_host].get(layer_idx, 0) + 1
+            )
+      if dst_unit_counts:
+        computed_expected_block_count = max(dst_unit_counts.values())
+      vars_info = f"{num_vars} variable(s), " if num_vars > 0 else ""
+      logging.info(
+          "Transfer %s (uuid=%s): generated schedule for %s -> %s"
+          " (%s%d expected blocks)",
+          req_id,
+          uuid,
+          _format_units(src_units),
+          _format_units(dst_units),
+          vars_info,
+          computed_expected_block_count,
+      )
 
       direct_dsts = []
-      for scheds in direct_schedules.values():
-        for entries in scheds.values():
-          for entry in entries:
-            dst_peer = entry[0]
-            d_node = data_address_to_unit.get(dst_peer)
-            if d_node and d_node not in direct_dsts:
-              direct_dsts.append(d_node)
 
     return _CachedTransferSchedule(
         computed_schedules=computed_schedules,

@@ -71,8 +71,8 @@ class BroadcastEngineTest(absltest.TestCase):
             groups, n_seed=1
         )
     )
-    self.assertIn(src, direct)
-    self.assertLen(bcast, 1)
+    self.assertEmpty(direct)
+    self.assertLen(bcast, 2)
 
     with self.assertRaises(ValueError):
       broadcast_engine.BroadcastEngine.partition_direct_and_broadcast_groups(

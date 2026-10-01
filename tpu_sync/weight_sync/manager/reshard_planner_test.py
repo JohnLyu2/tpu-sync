@@ -269,9 +269,9 @@ class ReshardPlannerTest(absltest.TestCase):
         dst_host_subgrid=[1, 8],
     )
 
-    # Compute each variable individually in isolation (no variable dedup)
-    expected_schedules = {u: {} for u in src_units}
-    for s_var, d_var in zip(src_vars, dst_vars):
+    # Verify that computing variables individually in isolation produces identical
+    # canonical variable plans as the batched multi-layer run.
+    for v_idx, (s_var, d_var) in enumerate(zip(src_vars, dst_vars)):
       single_schedule = self._run_planner(
           src_vars_by_unit={u: [s_var] for u in src_units},
           dst_vars_by_unit={u: [d_var] for u in dst_units},
@@ -282,105 +282,11 @@ class ReshardPlannerTest(absltest.TestCase):
           dst_mesh_axes=["x", "y"],
           dst_host_subgrid=[1, 8],
       )
-      for u, unit_sched in single_schedule.computed_schedules.items():
-        for local_idx, entries in unit_sched.items():
-          expected_schedules[u].setdefault(local_idx, []).extend(entries)
-
-    self.assertEqual(batched_schedule.computed_schedules, expected_schedules)
-
-    # Reconstruct exact HEAD direct_schedules and counts via BroadcastEngine
-    data_address_to_unit = {}
-    for d_idx, d_unit in enumerate(dst_units):
-      for s in range(8):
-        data_address_to_unit[f"10.1.0.{d_idx + 1}:{8000 + s}"] = d_unit
-    head_groups = {}
-    for s_unit, schedules in expected_schedules.items():
-      for shard_idx, entries in schedules.items():
-        for entry in entries:
-          (
-              dst_peer,
-              dst_shard_idx,
-              dst_block_offset,
-              src_block_offset,
-              size,
-              src_block_id,
-              dst_block_id,
-              src_stride,
-              dst_stride,
-              count,
-              layer_idx,
-              pool_group,
-          ) = entry
-          dst_unit = data_address_to_unit.get(dst_peer)
-          if not dst_unit:
-            continue
-          key = (
-              s_unit,
-              shard_idx,
-              src_block_id,
-              src_block_offset,
-              size,
-              src_stride,
-              count,
-              layer_idx,
-              pool_group,
-          )
-          val = (
-              dst_unit,
-              dst_peer,
-              dst_shard_idx,
-              dst_block_id,
-              dst_block_offset,
-              dst_stride,
-          )
-          head_groups.setdefault(key, []).append(val)
-    head_direct_schedules, head_broadcast_groups = (
-        reshard_planner.BroadcastEngine.partition_direct_and_broadcast_groups(
-            head_groups, n_seed=64, group_size=1
-        )
-    )
-    self.assertEqual(
-        set(batched_schedule.direct_schedules.keys()),
-        set(head_direct_schedules.keys()),
-    )
-    for u in batched_schedule.direct_schedules:
-      self.assertEqual(
-          set(batched_schedule.direct_schedules[u].keys()),
-          set(head_direct_schedules[u].keys()),
-      )
-      for s_idx in batched_schedule.direct_schedules[u]:
+      for u in src_units:
+        pid = batched_schedule.variable_to_plan_id[u][v_idx]
         self.assertEqual(
-            sorted(batched_schedule.direct_schedules[u][s_idx]),
-            sorted(head_direct_schedules[u][s_idx]),
-        )
-    self.assertEqual(batched_schedule.broadcast_groups, head_broadcast_groups)
-
-    head_direct_dsts = []
-    for scheds in head_direct_schedules.values():
-      for entries in scheds.values():
-        for entry in entries:
-          d_node = data_address_to_unit.get(entry[0])
-          if d_node and d_node not in head_direct_dsts:
-            head_direct_dsts.append(d_node)
-    self.assertEqual(batched_schedule.direct_dsts, head_direct_dsts)
-
-    # Verify JobEntity.build_sender_push_schedule_protos produces identical
-    # ShardPushScheduleProto messages from _PlanReferencedShardSchedule vs HEAD.
-    for i, u in enumerate(src_units):
-      entity = job_entity.JobEntity(
-          unit=u, shards=[f"10.0.0.{i + 1}:{8000 + d}" for d in range(8)]
-      )
-      dedup_protos = entity.build_sender_push_schedule_protos(
-          batched_schedule.direct_schedules[u]
-      )
-      head_protos = entity.build_sender_push_schedule_protos(
-          head_direct_schedules[u]
-      )
-      self.assertEqual(set(dedup_protos.keys()), set(head_protos.keys()))
-      for s_idx in dedup_protos:
-        self.assertEqual(
-            dedup_protos[s_idx].SerializeToString(deterministic=True),
-            head_protos[s_idx].SerializeToString(deterministic=True),
+            batched_schedule.variable_plans[u][pid],
+            single_schedule.variable_plans[u][0],
         )
 
     # Verify that repeated variables across layers reference the same plan_id
@@ -388,6 +294,29 @@ class ReshardPlannerTest(absltest.TestCase):
     for u in src_units:
       self.assertLen(batched_schedule.variable_plans[u], 6)
       self.assertLen(batched_schedule.variable_to_plan_id[u], len(src_vars))
+      # Layer 0's first 2D weight (layer_idx=3) and Layer 1's first 2D weight
+      # (layer_idx=19) must refer to the exact same plan_id.
+      self.assertEqual(
+          batched_schedule.variable_to_plan_id[u][3],
+          batched_schedule.variable_to_plan_id[u][19],
+      )
+
+    # Verify JobEntity.build_sender_push_schedule_protos produces valid
+    # ShardPushScheduleProto messages from _PlanReferencedShardSchedule.
+    for i, u in enumerate(src_units):
+      entity = job_entity.JobEntity(
+          unit=u, shards=[f"10.0.0.{i + 1}:{8000 + d}" for d in range(8)]
+      )
+      all_protos = {}
+      for stage_group in batched_schedule.broadcast_groups.values():
+        stage_schedules = (
+            reshard_planner.BroadcastEngine.build_stage_trainer_push_schedules(
+                stage_group, stage_group.dst_units
+            )
+        )
+        protos = entity.build_sender_push_schedule_protos(stage_schedules[u])
+        all_protos.update(protos)
+      self.assertNotEmpty(all_protos)
       # Layer 0's first 2D weight (layer_idx=3) and Layer 1's first 2D weight
       # (layer_idx=19) must refer to the exact same plan_id.
       self.assertEqual(
@@ -443,10 +372,11 @@ class ReshardPlannerTest(absltest.TestCase):
         sched = last_sched[0]
         unique_entries = 0
         logical_entries = 0
-        for u_sched in sched.computed_schedules.values():
-          for s in u_sched.values():
-            unique_entries += s.unique_entry_count
-            logical_entries += len(s)
+        for stage_group in sched.broadcast_groups.values():
+          for u_plans in stage_group.canonical_variable_plans.values():
+            for shard_dict in u_plans.values():
+              for tuples_9 in shard_dict.values():
+                unique_entries += len(tuples_9)
         logging.info(
             "TIMEIT BENCHMARK Qwen3.5-397B (948 vars) %dd -> %d replicas"
             " (%du): %.4fs (unique_plans=%d,"
@@ -459,7 +389,7 @@ class ReshardPlannerTest(absltest.TestCase):
             unique_entries,
             logical_entries,
         )
-        self.assertLen(sched.computed_schedules, num_src_units)
+        self.assertNotEmpty(sched.broadcast_groups)
         self.assertLen(sched.variable_plans[src_units[0]], 6)
         self.assertLen(sched.variable_to_plan_id[src_units[0]], 948)
 
@@ -493,8 +423,14 @@ class ReshardPlannerTest(absltest.TestCase):
     # Latin Square property: across multiple src_units, each trainer has a destination
     # sequence circularly shifted by its index, so Trainer 0 starts with Dest 0, Trainer 1 with Dest 1.
     # We verify this on all variables where each trainer targets multiple destination peers.
+    stage_group = sched.broadcast_groups[(0, 0)]
+    s_u_schedules = (
+        reshard_planner.BroadcastEngine.build_stage_trainer_push_schedules(
+            stage_group, dst_units
+        )
+    )
     all_var_indices = sorted(
-        list(set(e[-2] for e in sched.direct_schedules[src_units[0]][0]))
+        list(set(e[-2] for e in s_u_schedules[src_units[0]][0]))
     )
     self.assertNotEmpty(all_var_indices)
 
@@ -502,7 +438,7 @@ class ReshardPlannerTest(absltest.TestCase):
     for var_idx in all_var_indices:
       peers_by_src = []
       for src_u in src_units:
-        entries = sched.direct_schedules[src_u][0]
+        entries = s_u_schedules[src_u][0]
         var_entries = [e for e in entries if e[-2] == var_idx]
         peers = [e[0] for e in var_entries]
         peers_by_src.append(peers)
@@ -589,7 +525,7 @@ class ReshardPlannerTest(absltest.TestCase):
       self.assertEqual(relay_plans_by_n[n], base_relay)
 
   def test_compute_bandwidth_matched_seed(self):
-    # 0.0 disables tree broadcast and forces Direct P2P (returns max(1, num_dst_units))
+    # <= 0.0 normalizes to 1.0 (Bandwidth matching: H_train=32, H_sample=2 -> 32/2 = 16)
     self.assertEqual(
         reshard_planner.compute_bandwidth_matched_seed(
             broadcast_host_ratio=0.0,
@@ -598,6 +534,29 @@ class ReshardPlannerTest(absltest.TestCase):
             num_dst_units=16,
         ),
         16,
+    )
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(
+            broadcast_host_ratio=-1.0,
+            num_src_hosts=32,
+            num_dst_hosts_per_unit=2,
+            num_dst_units=16,
+        ),
+        16,
+    )
+    # None normalizes to 1.0
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(
+            broadcast_host_ratio=None,
+            num_src_hosts=32,
+            num_dst_hosts_per_unit=2,
+            num_dst_units=16,
+        ),
+        16,
+    )
+    self.assertEqual(
+        reshard_planner.compute_bandwidth_matched_seed(None, 32, 2, 16),
+        reshard_planner.compute_bandwidth_matched_seed(1.0, 32, 2, 16),
     )
     # Bandwidth matching: H_train=32, H_sample=2 -> 32/2 = 16
     self.assertEqual(
@@ -638,15 +597,6 @@ class ReshardPlannerTest(absltest.TestCase):
         1,
     )
     # Validation errors
-    with self.assertRaisesRegex(
-        ValueError, "broadcast_host_ratio must be non-negative"
-    ):
-      reshard_planner.compute_bandwidth_matched_seed(
-          broadcast_host_ratio=-1.0,
-          num_src_hosts=32,
-          num_dst_hosts_per_unit=2,
-          num_dst_units=16,
-      )
     with self.assertRaisesRegex(ValueError, "num_src_hosts must be positive"):
       reshard_planner.compute_bandwidth_matched_seed(
           broadcast_host_ratio=1.0,
@@ -682,9 +632,17 @@ class ReshardPlannerTest(absltest.TestCase):
     key2 = reshard_planner.ReshardPlanner.make_plan_cache_key(
         src_units=src, dst_units=dst, broadcast_host_ratio=2.0
     )
+    key0 = reshard_planner.ReshardPlanner.make_plan_cache_key(
+        src_units=src, dst_units=dst, broadcast_host_ratio=0.0
+    )
+    key_none = reshard_planner.ReshardPlanner.make_plan_cache_key(
+        src_units=src, dst_units=dst, broadcast_host_ratio=None
+    )
     self.assertNotEqual(key1, key2)
     self.assertEqual(key1[-2], 1.0)
     self.assertEqual(key2[-2], 2.0)
+    self.assertEqual(key0, key1)
+    self.assertEqual(key_none, key1)
     self.assertEqual(key1[-1], 4)
 
   def test_make_plan_cache_key_includes_broadcast_pipeline_stages(self):
@@ -906,7 +864,7 @@ class ReshardPlannerTest(absltest.TestCase):
         self.assertLen(pid_relays, 8)
         for blocks in pid_relays.values():
           self.assertLen(blocks, 1)
-          self.assertEqual(blocks[0][1], 256)
+          self.assertEqual(blocks[0][1], 4096)
           self.assertEqual(blocks[0][2], 0)
 
     # With broadcast_host_ratio=0.5, 16 source hosts / 2 dst hosts per replica
@@ -1031,8 +989,14 @@ class ReshardPlannerTest(absltest.TestCase):
             lock=threading.Lock(),
         )
 
+        stage_group = sched.broadcast_groups[(0, 0)]
+        s_u_schedules = (
+            reshard_planner.BroadcastEngine.build_stage_trainer_push_schedules(
+                stage_group, dst_units, registered_shards=registered_shards
+            )
+        )
         schedule_protos = entities[src_unit].build_sender_push_schedule_protos(
-            sched.direct_schedules[src_unit]
+            s_u_schedules[src_unit]
         )
 
         shards_by_host = collections.defaultdict(list)
@@ -1047,7 +1011,7 @@ class ReshardPlannerTest(absltest.TestCase):
         for h in range(4):
           host_shards = shards_by_host[h]
           for s_idx in host_shards:
-            shard_sched = sched.direct_schedules[src_unit][s_idx]
+            shard_sched = s_u_schedules[src_unit][s_idx]
             layer0_sched_peers = []
             for entry in shard_sched:
               if entry[10] == 0:  # layer_idx

@@ -100,9 +100,7 @@ class _EntityBroadcastDispatcher:
   async def start_transfer(
       self, unit: RaidenId, transfer_plan: TransferPlan
   ) -> None:
-    await self._controller.get_or_create_entity(unit).start_transfer(
-        transfer_plan, unit=unit
-    )
+    await self._controller._dispatch_entity_transfer(unit, transfer_plan)
 
 
 class RaidenController:
@@ -125,8 +123,8 @@ class RaidenController:
         managed JobEntity instances for backward compatibility.
       request_registry_ttl_s: TTL in seconds for request registry entries.
       broadcast_host_ratio: Ratio of trainer TX host bandwidth to sampler RX
-        host bandwidth (K0 = B_train_TX / B_sample_RX). A value of 0.0 disables
-        tree broadcast and forces Direct P2P.
+        host bandwidth (K0 = B_train_TX / B_sample_RX). Values <= 0.0 or None
+        are normalized to 1.0.
       broadcast_pipeline_stages: Target number of pipelined broadcast stages
         (default 4 or RAIDEN_BROADCAST_PIPELINE_STAGES).
       enable_plan_cache: Whether to cache transfer planning and resharding
@@ -138,11 +136,7 @@ class RaidenController:
         if broadcast_host_ratio is not None
         else float(os.environ.get("RAIDEN_BROADCAST_HOST_RATIO", "1.0"))
     )
-    if raw_ratio < 0.0:
-      raise ValueError(
-          f"broadcast_host_ratio must be non-negative, got {raw_ratio}"
-      )
-    self.broadcast_host_ratio = float(raw_ratio)
+    self.broadcast_host_ratio = raw_ratio
     raw_stages = (
         broadcast_pipeline_stages
         if broadcast_pipeline_stages is not None
@@ -192,6 +186,18 @@ class RaidenController:
     self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
     self._registered_host_subgrids: dict[RaidenId, list[int]] = {}
     self._planner = ReshardPlanner()
+
+  @property
+  def broadcast_host_ratio(self) -> float:
+    """Ratio of trainer TX host bandwidth to sampler RX host bandwidth."""
+    return self._broadcast_host_ratio
+
+  @broadcast_host_ratio.setter
+  def broadcast_host_ratio(self, value: Optional[float]) -> None:
+    if value is None or value <= 0.0:
+      self._broadcast_host_ratio = 1.0
+    else:
+      self._broadcast_host_ratio = float(value)
 
   @property
   def worker_rpc_client(self) -> WorkerRpcClient:
@@ -1220,6 +1226,31 @@ class RaidenController:
                 req_id=req_id,
                 uuid=uuid,
             )
+            if (
+                not cached_schedule.computed_schedules
+                and cached_schedule.broadcast_groups
+            ):
+              groups_list = list(cached_schedule.broadcast_groups.values())
+              if groups_list and isinstance(
+                  groups_list[0], controller_types.StageBroadcastGroup
+              ):
+                coalesced_groups = BroadcastEngine._coalesce_pipeline_groups(
+                    groups_list,
+                    target_stages=1,
+                )
+                for stage_group in coalesced_groups:
+                  sg_scheds = (
+                      BroadcastEngine.build_stage_trainer_push_schedules(
+                          stage_group,
+                          stage_group.dst_units,
+                          registered_shards=self._registered_shards,
+                      )
+                  )
+                  for s_u, sched_map in sg_scheds.items():
+                    target_map = cached_schedule.computed_schedules.setdefault(
+                        s_u, {}
+                    )
+                    target_map.update(sched_map)
             raw_schedules = (
                 cached_schedule.direct_schedules
                 or cached_schedule.computed_schedules
@@ -1284,8 +1315,8 @@ class RaidenController:
                   )
               )
 
-          if cached_schedule.is_weight_sync and direct_schedules:
-            for src_u in direct_schedules.keys():
+          if cached_schedule.is_weight_sync:
+            for src_u in src_units:
               src_ent = self.get_or_create_entity(src_u)
               all_shards = self._registered_shards.get(src_u, []) or list(
                   src_ent.shards
@@ -1419,13 +1450,15 @@ class RaidenController:
                             )
                             endpoint_to_shards[c_addrs_on_ip[0]] = owned
 
+          all_push_schedules = dict(computed_schedules)
+
           final_plan = TransferPlan(
-              src_units=list(computed_schedules.keys())
-              if computed_schedules
+              src_units=list(all_push_schedules.keys())
+              if all_push_schedules
               else src_units,
               dst_units=dst_units,
               plan=None,
-              shard_push_schedules=computed_schedules,
+              shard_push_schedules=all_push_schedules,
               worker_rpc_addresses=rpc_addresses,
               worker_data_addresses=data_addresses,
               uuid=uuid,
@@ -1444,164 +1477,19 @@ class RaidenController:
               is_weight_sync=cached_schedule.is_weight_sync,
               sender_push_schedule_protos=(
                   cached_schedule.sender_push_schedule_protos
-                  if not broadcast_groups
-                  else {}
               ),
               cached_serialized_payloads=(
                   cached_schedule.cached_serialized_payloads
-                  if not broadcast_groups
-                  else {}
               ),
               endpoint_to_shards=endpoint_to_shards,
               variable_plans=cached_schedule.variable_plans,
               variable_to_plan_id=cached_schedule.variable_to_plan_id,
+              has_explicit_shard_push_schedules=bool(shard_push_schedules),
           )
           with self._lock:
             self._active_transfers[req_id] = final_plan
 
-          direct_plan = None
-          if direct_schedules:
-            direct_dst_peers = []
-            direct_dst_units = []
-            seen_direct_dst_peers: set[str] = set()
-            for sched in direct_schedules.values():
-              for entries in sched.values():
-                if hasattr(entries, "plans_by_id") and hasattr(
-                    entries, "variable_to_plan_id"
-                ):
-                  ordered_vars = getattr(
-                      entries, "_ordered_vars", None
-                  ) or tuple(entries.variable_to_plan_id.items())
-                  used_pids = dict.fromkeys(pid for _, pid in ordered_vars)
-                  entry_groups = (
-                      entries.plans_by_id.get(pid, ()) for pid in used_pids
-                  )
-                else:
-                  entry_groups = (entries,)
-                for group_entries in entry_groups:
-                  for entry in group_entries:
-                    peer = entry[0]
-                    if peer and peer not in seen_direct_dst_peers:
-                      seen_direct_dst_peers.add(peer)
-                      direct_dst_peers.append(peer)
-                      if peer not in cached_schedule.data_address_to_unit:
-                        raise KeyError(
-                            f"Destination peer endpoint '{peer}' not found in"
-                            " data_address_to_unit"
-                        )
-                      direct_dst_units.append(
-                          str(cached_schedule.data_address_to_unit[peer])
-                      )
-
-            direct_plan = TransferPlan(
-                src_units=list(direct_schedules.keys()),
-                dst_units=dst_units,
-                plan=None,
-                shard_push_schedules=direct_schedules,
-                worker_rpc_addresses=dict(final_plan.worker_rpc_addresses),
-                worker_data_addresses=dict(final_plan.worker_data_addresses),
-                uuid=uuid,
-                dst_mem_type=dst_mem_type,
-                use_block_chunks=True,
-                is_sender=True,
-                expected_block_count=expected_block_count,
-                dst_expected_layer_chunk_counts=dst_unit_layer_counts,
-                dst_expected_block_counts=dst_unit_counts,
-                dst_endpoint_counts=cached_schedule.dst_endpoint_counts,
-                dst_endpoint_layer_counts=(
-                    cached_schedule.dst_endpoint_layer_counts
-                ),
-                src_schedule_keys={
-                    u: i for i, u in enumerate(direct_schedules.keys())
-                },
-                req_id=req_id,
-                skip_d2h=skip_d2h,
-                skip_tiling=local_skip_tiling,
-                parallelism=final_plan.parallelism,
-                is_weight_sync=cached_schedule.is_weight_sync,
-                sender_push_schedule_protos=(
-                    cached_schedule.sender_push_schedule_protos
-                ),
-                cached_serialized_payloads=(
-                    cached_schedule.cached_serialized_payloads
-                ),
-                endpoint_to_shards=endpoint_to_shards,
-                variable_plans=cached_schedule.variable_plans,
-                variable_to_plan_id=cached_schedule.variable_to_plan_id,
-                broadcast_round=0,
-                broadcast_round_destinations=[
-                    controller_types.BroadcastRoundDestinations(
-                        round_idx=0,
-                        dst_units=(
-                            direct_dst_units
-                            if direct_dst_units
-                            else [str(u) for u in dst_units]
-                        ),
-                        dst_peers=direct_dst_peers,
-                    )
-                ],
-            )
-
-          # 1. Arm direct schedule receivers
-          if direct_schedules:
-            arm_start = time.monotonic()
-            if dst_controller_address:
-              logging.vlog(
-                  1,
-                  "RAIDEN_DIAG recv_arm_start remote dst_controller=%s"
-                  " direct_dsts=%d req_id=%s",
-                  dst_controller_address,
-                  len(direct_dsts),
-                  req_id,
-              )
-              dst_facade = RaidenControllerClientFacade(
-                  dst_controller_address,
-                  name_resolver=self.name_resolver,
-              )
-              loop = asyncio.get_running_loop()
-              rpc_executor = self.executor
-              if self.include_receiver_push_schedules(direct_plan):
-                receiver_schedules = direct_schedules
-              else:
-                receiver_schedules = None
-              success = await loop.run_in_executor(
-                  rpc_executor,
-                  dst_facade.register_transfer_schedule,
-                  list(direct_schedules.keys()),
-                  direct_dsts,
-                  req_id,
-                  True,
-                  False,
-                  expected_block_count,
-                  uuid,
-                  dst_controller_address,
-                  src_controller_address,
-                  receiver_schedules,
-                  dst_mem_type,
-                  skip_d2h,
-                  local_skip_tiling,
-              )
-              if not success:
-                raise RuntimeError("Failed remote prepare for direct schedules")
-            else:
-              local_direct_dsts = [
-                  u for u in direct_dsts if u in self._registered_shards
-              ]
-              if local_direct_dsts:
-                await asyncio.gather(*[
-                    self._dispatch_entity_transfer(unit, direct_plan)
-                    for unit in local_direct_dsts
-                ])
-            logging.vlog(
-                1,
-                "RAIDEN_DIAG recv_arm_complete req_id=%s uuid=%s"
-                " arm_elapsed_ms=%.2f",
-                req_id,
-                uuid,
-                (time.monotonic() - arm_start) * 1000.0,
-            )
-
-          # 2. Arm destination controller for tree broadcast top-level req_id
+          # Arm destination controller for tree broadcast top-level req_id
           if broadcast_groups:
             if dst_controller_address:
               logging.vlog(
@@ -1642,33 +1530,15 @@ class RaidenController:
           push_tasks = []
 
           senders_start = time.monotonic()
-          local_direct_srcs = (
-              [
-                  u
-                  for u in direct_schedules.keys()
-                  if u in self._registered_shards
-              ]
-              if direct_schedules
-              else []
-          )
           logging.vlog(
               1,
               "RAIDEN_DIAG senders_dispatch_start req_id=%s uuid=%s"
-              " local_direct_srcs=%d elapsed_since_transfer_start_ms=%.2f",
+              " broadcast_groups=%d elapsed_since_transfer_start_ms=%.2f",
               req_id,
               uuid,
-              len(local_direct_srcs),
+              len(broadcast_groups),
               (senders_start - t_transfer_start) * 1000.0,
           )
-
-          if direct_schedules:
-            if local_direct_srcs:
-              push_tasks.append(
-                  asyncio.gather(*[
-                      self._dispatch_entity_transfer(unit, direct_plan)
-                      for unit in local_direct_srcs
-                  ])
-              )
 
           if broadcast_groups:
             groups_list = list(broadcast_groups.values())

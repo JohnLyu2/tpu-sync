@@ -114,8 +114,8 @@ class WeightSynchronizerManager:
       worker_rpc_client: Optional worker RPC client facade for dispatching RPCs.
       request_registry_ttl_s: TTL in seconds for request registry entries.
       broadcast_host_ratio: Ratio of trainer TX host bandwidth to sampler RX
-        host bandwidth (K0 = B_train_TX / B_sample_RX). A value of 0.0 disables
-        tree broadcast and forces Direct P2P.
+        host bandwidth (K0 = B_train_TX / B_sample_RX). Values <= 0 or None
+        default to 1.0.
       broadcast_pipeline_stages: Target number of pipelined broadcast stages
         (default 4 or RAIDEN_BROADCAST_PIPELINE_STAGES).
       enable_plan_cache: Whether to cache transfer planning and resharding
