@@ -7,20 +7,39 @@ The settle protocol shared by TPU Sync's session classes
 stops new ones, and a `done_` flag set by whichever of `Finish` or the last
 `EndOp` comes second. The session owns its host staging until it settles.
 
-Citations are to tpu-sync `01ffa3d`, `tpu_sync/core/transfer_receive_session.{h,cc}`.
+Citations are to tpu-sync `01ffa3d`; `recv` is
+`tpu_sync/core/transfer_receive_session.{h,cc}`, `send` is
+`tpu_sync/core/transfer_send_session.{h,cc}`.
 
-| Field        | C++                                         |
-|--------------|---------------------------------------------|
-| `inFlight`   | `in_flight_` (`.h:241`)                     |
-| `draining`   | `draining_` (`.h:243`)                      |
-| `done`       | `done_` (`.h:244`)                          |
-| `statusOk`   | `status_.ok()` (`.h:242`); the first error wins (`.cc:362-364`) |
-| `hasStaging` | `!staging_.empty()` (`.h:229`, `HasStaging` `.h:102-105`) |
+| Field        | recv                     | send                     |
+|--------------|--------------------------|--------------------------|
+| `inFlight`   | `in_flight_` (`.h:241`)  | `in_flight_` (`.h:181`)  |
+| `draining`   | `draining_` (`.h:243`)   | `draining_` (`.h:184`)   |
+| `done`       | `done_` (`.h:244`)       | `done_` (`.h:185`)       |
+| `statusOk`   | `status_.ok()` (`.h:242`) | `status_.ok()` (`.h:177`) |
+| `hasStaging` | `!staging_.empty()` (`.h:229`, `HasStaging` `.h:102-105`) | `!staging_.empty()` (`.h:170`, `HasStaging` `.h:83-86`); see below |
 
-`finishLocked` and `endOpLocked` transcribe `FinishLocked` (`.cc:361-371`) and
-`EndRecvOpLocked` (`.cc:384-394`); `beginOp` transcribes `TryBeginRecvOp`
-(`.h:109-114`). Session models compose their events from these three so the
-settle rules are written down once.
+The two classes settle the same way but decide their status differently:
+
+* `finishLocked` is the receiver's `FinishLocked` (`recv.cc:361-371`): the
+  **first error wins** — a later `Finish(error)` on a session that is already
+  draining still flips the status.
+* `finishOnceLocked` is the sender's `FinishLocked` (`send.cc:167-175`): the
+  **first `Finish` wins** — once draining or done, later calls are ignored,
+  whatever their status.
+
+`endOpLocked` transcribes `EndRecvOpLocked` (`recv.cc:384-394`), whose
+underflow branch is a no-op. The sender's `EndSendOpLocked` (`send.cc:188-194`)
+decrements unconditionally; the send model records an underflow instead of
+reusing the no-op so that its absence can be proved. `beginOp` transcribes
+`TryBeginRecvOp` (`recv.h:109-114`) and the sender's `if (draining_) return;
+++in_flight_` pattern (`send.cc:329-330, 377-381, 413-420`), which refuses on
+`draining_` alone; the two agree under `Consistent`.
+
+The sender acquires its staging inside `StartPush` rather than at creation. Its
+model starts `Lifecycle` with `hasStaging = true` all the same and reads the
+flag as "not yet released": the slot is actually held iff the flag is set and
+the acquisition happened.
 
 `Consistent` is the invariant of the protocol on its own: a settled session has
 nothing in flight and no staging, and a draining session settles as soon as its
@@ -47,11 +66,17 @@ def settleLocked (l : Lifecycle) : Lifecycle :=
     { l with hasStaging := false, done := true }
   else l
 
-/-- `FinishLocked(status)` (`.cc:361-371`). Idempotent: a second call only
-records the status. -/
+/-- The receiver's `FinishLocked(status)` (`recv.cc:361-371`). Idempotent: a
+second call only records the status. -/
 def finishLocked (ok : Bool) (l : Lifecycle) : Lifecycle :=
   let l := if ok = false ∧ l.statusOk = true then { l with statusOk := false } else l
   if l.draining = true then l else settleLocked { l with draining := true }
+
+/-- The sender's `FinishLocked(status)` (`send.cc:167-175`): the first call
+decides the outcome, later ones are ignored. -/
+def finishOnceLocked (ok : Bool) (l : Lifecycle) : Lifecycle :=
+  if l.draining = true ∨ l.done = true then l
+  else settleLocked { l with draining := true, statusOk := ok }
 
 /-- `EndRecvOpLocked` (`.cc:384-394`). The underflow branch (`.cc:385-388`,
 `LOG(DFATAL)`) leaves the state unchanged. -/
@@ -106,6 +131,28 @@ theorem finishLocked_consistent {l : Lifecycle} (ok : Bool) (h : Consistent l) :
   split
   · exact key _ ⟨h.done_draining, h.done_idle, h.prompt, h.staging⟩
   · exact key _ h
+
+theorem finishOnceLocked_consistent {l : Lifecycle} (ok : Bool) (h : Consistent l) :
+    Consistent (finishOnceLocked ok l) := by
+  unfold finishOnceLocked
+  split
+  · exact h
+  · exact settleLocked_consistent (by simp) (by simpa using h.done_idle)
+      (by simpa using h.staging)
+
+/-- Contrapositive of `done_draining`. -/
+theorem Consistent.not_done {l : Lifecycle} (h : Consistent l) (hd : l.draining = false) :
+    l.done = false := by
+  cases hdone : l.done
+  · rfl
+  · have := h.done_draining hdone
+    simp [hd] at this
+
+/-- Taking an op on a session that is not draining (hence not done). -/
+theorem consistent_incr {l : Lifecycle} (h : Consistent l) (hd : l.draining = false) :
+    Consistent { l with inFlight := l.inFlight + 1 } := by
+  have := h.not_done hd
+  constructor <;> simp [hd, this, h.staging]
 
 theorem endOpLocked_consistent {l : Lifecycle} (h : Consistent l) :
     Consistent (endOpLocked l) := by
@@ -207,6 +254,38 @@ OK and this finish is OK. -/
   simp only [finishLocked]
   split <;> split <;> simp_all
 
+/-- `finishOnceLocked` is the identity once the outcome is decided, and
+otherwise starts draining with the given status. -/
+theorem finishOnceLocked_decided {l : Lifecycle} (ok : Bool)
+    (h : l.draining = true ∨ l.done = true) : finishOnceLocked ok l = l := by
+  unfold finishOnceLocked; simp [h]
+
+theorem finishOnceLocked_open {l : Lifecycle} (ok : Bool)
+    (hd : l.draining = false) (hn : l.done = false) :
+    finishOnceLocked ok l = settleLocked { l with draining := true, statusOk := ok } := by
+  unfold finishOnceLocked; simp [hd, hn]
+
+@[simp] theorem finishOnceLocked_inFlight (ok : Bool) (l : Lifecycle) :
+    (finishOnceLocked ok l).inFlight = l.inFlight := by
+  unfold finishOnceLocked; split <;> simp
+
+/-- The first `Finish` decides: the status only changes if nothing had been
+decided yet. -/
+@[simp] theorem finishOnceLocked_statusOk (ok : Bool) (l : Lifecycle) :
+    (finishOnceLocked ok l).statusOk =
+      (if l.draining = true ∨ l.done = true then l.statusOk else ok) := by
+  unfold finishOnceLocked; split <;> simp_all
+
+@[simp] theorem finishOnceLocked_draining (ok : Bool) (l : Lifecycle) :
+    (finishOnceLocked ok l).draining = (l.draining || !l.done) := by
+  unfold finishOnceLocked
+  split
+  · rename_i h
+    rcases h with h | h <;> simp [h]
+  · rename_i h
+    simp only [not_or] at h
+    simp [h.1, h.2]
+
 @[simp] theorem endOpLocked_statusOk (l : Lifecycle) :
     (endOpLocked l).statusOk = l.statusOk := by
   unfold endOpLocked; split <;> simp
@@ -233,6 +312,17 @@ theorem beginOp_draining {l l' : Lifecycle} (hb : beginOp l = some l') :
     · rfl
     · exact absurd (Or.inr hdrain) hn
 
+theorem beginOp_done {l l' : Lifecycle} (hb : beginOp l = some l') :
+    l'.done = false := by
+  unfold beginOp at hb
+  split at hb
+  · cases hb
+  · rename_i hn
+    cases hb
+    cases hdone : l.done
+    · rfl
+    · exact absurd (Or.inl hdone) hn
+
 /-! ## `done` is never cleared -/
 
 theorem settleLocked_done_mono {l : Lifecycle} (h : l.done = true) :
@@ -247,6 +337,10 @@ theorem finishLocked_done_mono {l : Lifecycle} (ok : Bool) (h : l.done = true) :
   · exact settleLocked_done_mono (by simpa using h)
   · exact h
   · exact settleLocked_done_mono (by simpa using h)
+
+theorem finishOnceLocked_done_mono {l : Lifecycle} (ok : Bool) (h : l.done = true) :
+    (finishOnceLocked ok l).done = true := by
+  rw [finishOnceLocked_decided ok (Or.inr h)]; exact h
 
 theorem endOpLocked_done_mono {l : Lifecycle} (h : l.done = true) :
     (endOpLocked l).done = true := by
