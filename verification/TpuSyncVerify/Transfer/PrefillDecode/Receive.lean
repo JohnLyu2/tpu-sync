@@ -588,6 +588,70 @@ theorem reachable_safe {n : Nat} {s : Recv}
     (h : (sysPush n).Reachable s ∨ (sysLoad n).Reachable s) : Safe s :=
   inv_safe (h.elim reachable_inv_push reachable_inv_load)
 
+/-! ## Frame lemmas
+
+What each event leaves alone, and exact specs for the two events the
+composed transfer model (`Pipeline.lean`) attaches memory effects to. Each is
+proved by unfolding `step` for every event and splitting every branch. -/
+
+/-- Unfold `step` for a known event and split every branch, leaving `hs` as
+`some … = some s'` or, for `beginOp` branches, the `Option.map` form. -/
+macro "recv_cases" hs:ident : tactic =>
+  `(tactic| (simp only [step, pushBegin, pushEnd, pullReply, h2dBegin, h2dIssue, h2dReady, h2dDone,
+      netAccount, pollReady, cancel, publish] at $hs:ident <;> (repeat' split at $hs:ident)))
+
+theorem step_numLayers {s s' : Recv} {e : Ev} (hs : step s e = some s') :
+    s'.numLayers = s.numLayers := by
+  cases e <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> (repeat' split) <;> rfl)
+
+theorem step_done_mono {s s' : Recv} {e : Ev} (hs : step s e = some s') (hd : s.life.done = true) :
+    s'.life.done = true := by
+  cases e <;> simp only [step, pushBegin, pushEnd, pullReply, h2dBegin, h2dIssue, h2dReady, h2dDone,
+      netAccount, pollReady, cancel, publish, Lifecycle.beginOp_of_done hd, Option.map_none] at hs <;>
+    (repeat' split at hs) <;> cases hs <;>
+    simp [hd, Lifecycle.endOpLocked_done_mono, Lifecycle.finishLocked_done_mono]
+
+theorem step_published_mono {s s' : Recv} {e : Ev} {b : Bool} (hs : step s e = some s')
+    (hp : s.published = some b) : s'.published = some b := by
+  cases e <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; simpa using hp)
+    | (cases hs <;> (repeat' split) <;> simp_all)
+
+/-- Only `h2dBegin` claims a new layer for the device. -/
+theorem step_issued_pending {s s' : Recv} {e : Ev} (hs : step s e = some s') (he : e ≠ .h2dBegin) :
+    s'.issued + s'.pending ≤ s.issued + s.pending := by
+  cases e <;> (try exact absurd rfl he) <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; simp)
+    | (cases hs <;> (repeat' split) <;> simp <;> omega)
+
+theorem h2dBegin_issued_pending {s s' : Recv} (hs : step s .h2dBegin = some s') :
+    s'.issued + s'.pending = s.issued + s.pending + 1 := by
+  simp only [step, h2dBegin] at hs
+  split at hs
+  · simp only [Option.map_eq_some_iff] at hs
+    obtain ⟨l, _, rfl⟩ := hs; simp; omega
+  · cases hs
+
+/-- Only `h2dReady` lands a layer in HBM. -/
+theorem step_ready {s s' : Recv} {e : Ev} (hs : step s e = some s') (he : e ≠ .h2dReady) :
+    s'.ready = s.ready := by
+  cases e <;> (try exact absurd rfl he) <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> (repeat' split) <;> rfl)
+
+theorem h2dReady_spec {s s' : Recv} (hs : step s .h2dReady = some s') :
+    s.ready < s.issued ∧ s' = { s with ready := s.ready + 1 } := by
+  simp only [step, h2dReady] at hs
+  split at hs
+  · cases hs; exact ⟨‹_›, rfl⟩
+  · cases hs
+
 /-! ## Replay and bounded search
 
 Concrete traces, checked by `decide`, that document the behaviours the model

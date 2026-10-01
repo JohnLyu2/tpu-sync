@@ -148,6 +148,12 @@ theorem Consistent.not_done {l : Lifecycle} (h : Consistent l) (hd : l.draining 
   · have := h.done_draining hdone
     simp [hd] at this
 
+/-- Staging is only released by settling. -/
+theorem Consistent.done_of_released {l : Lifecycle} (h : Consistent l)
+    (hs : l.hasStaging = false) : l.done = true := by
+  have := h.staging
+  cases hdone : l.done <;> simp_all
+
 /-- Taking an op on a session that is not draining (hence not done). -/
 theorem consistent_incr {l : Lifecycle} (h : Consistent l) (hd : l.draining = false) :
     Consistent { l with inFlight := l.inFlight + 1 } := by
@@ -322,6 +328,10 @@ theorem beginOp_done {l l' : Lifecycle} (hb : beginOp l = some l') :
     cases hdone : l.done
     · rfl
     · exact absurd (Or.inl hdone) hn
+
+/-- A settled session refuses new ops. -/
+theorem beginOp_of_done {l : Lifecycle} (hd : l.done = true) : beginOp l = none := by
+  unfold beginOp; simp [hd]
 
 /-! ## `done` is never cleared -/
 

@@ -714,6 +714,63 @@ theorem reachable_inv {n : Nat} {s : Send} (h : (sys n).Reachable s) : Inv s :=
 theorem reachable_safe {n : Nat} {s : Send} (h : (sys n).Reachable s) : Safe s :=
   inv_safe (reachable_inv h)
 
+/-! ## Frame lemmas
+
+What each event leaves alone, and exact specs for the two events the
+composed transfer model (`Pipeline.lean`) attaches memory effects to. -/
+
+/-- Unfold `step` for a known event and split every branch. -/
+macro "send_cases" hs:ident : tactic =>
+  `(tactic| (simp only [step, start, d2hBegin, d2hIssue, d2hDone, d2hEnd, wake, h2hIssue, sendNext,
+      h2hDone, cancel, publish] at $hs:ident <;> (repeat' split at $hs:ident)))
+
+theorem step_numLayers {s s' : Send} {e : Ev} (hs : step s e = some s') :
+    s'.numLayers = s.numLayers := by
+  cases e <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> rfl)
+
+theorem step_done_mono {s s' : Send} {e : Ev} (hs : step s e = some s') (hd : s.life.done = true) :
+    s'.life.done = true := by
+  cases e <;> simp only [step, start, d2hBegin, d2hIssue, d2hDone, d2hEnd, wake, h2hIssue, sendNext,
+      h2hDone, cancel, publish, endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight,
+      Lifecycle.beginOp_of_done hd, Option.map_none] at hs <;>
+    (repeat' split at hs) <;> cases hs <;>
+    simp [hd, Lifecycle.endOpLocked_done_mono, Lifecycle.finishOnceLocked_done_mono]
+
+theorem step_published_mono {s s' : Send} {e : Ev} {b : Bool} (hs : step s e = some s')
+    (hp : s.published = some b) : s'.published = some b := by
+  cases e <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; simpa using hp)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> simp_all)
+
+/-- Only `d2hDone` lands a layer in staging. -/
+theorem step_d2hReady {s s' : Send} {e : Ev} (hs : step s e = some s') (he : e ≠ .d2hDone) :
+    s'.d2hReady = s.d2hReady := by
+  cases e <;> (try exact absurd rfl he) <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> rfl)
+
+theorem d2hDone_spec {s s' : Send} (hs : step s .d2hDone = some s') :
+    s.d2hReady < s.d2hIssued ∧ s' = { s with d2hReady := s.d2hReady + 1 } := by
+  simp only [step, d2hDone] at hs
+  split at hs
+  · cases hs; exact ⟨‹_›, rfl⟩
+  · cases hs
+
+theorem h2hDone_guard {s s' : Send} {ok : Bool} (hs : step s (.h2hDone ok) = some s') :
+    s.h2hRetired < s.h2hIssued := by
+  simp only [step, h2hDone] at hs
+  split at hs
+  · assumption
+  · cases hs
+
 /-! ## Replay and bounded search
 
 Concrete traces, checked by `decide`, that document the behaviours the model

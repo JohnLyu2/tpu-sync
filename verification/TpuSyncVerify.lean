@@ -3,6 +3,7 @@ import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Transfer.Session
 import TpuSyncVerify.Transfer.PrefillDecode.Receive
 import TpuSyncVerify.Transfer.PrefillDecode.Send
+import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 
 /-!
 # TpuSyncVerify
