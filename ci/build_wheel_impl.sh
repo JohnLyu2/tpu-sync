@@ -42,6 +42,9 @@
 #                            against (default "2.11.0 2.12.0 2.13.0", the
 #                            releases torch_tpu ships glue for; "2.11.0" alone
 #                            builds a single-ABI wheel)
+#   RAIDEN_JAX_VERSION       JAX version the jax wheel builds against, read by
+#                            build.sh (default: DEFAULT_VERSION in
+#                            third_party/jax/versions.bzl)
 #   TORCH_TPU_INDEX_URL      pip index the torch_tpu wheel named by
 #                            torch_tpu.version is installed from (default:
 #                            the torch_tpu virtual registry)
