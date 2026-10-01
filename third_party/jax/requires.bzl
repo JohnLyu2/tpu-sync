@@ -31,7 +31,12 @@ def _specs(deps):
     ]
 
 def jax_stack_requires():
-    """Returns select() branches for JAX requirements based on --define raiden_jax."""
+    """Selects the JAX wheel requirements for the configured `--define raiden_jax`.
+
+    Returns:
+      A select() mapping each JAX version setting to its jax, jaxlib, and
+      libtpu requirement specs, defaulting to the default version's specs.
+    """
     branches = {}
     for setting, deps in _DEPS_BY_SETTING.items():
         branches[setting] = _specs(deps)

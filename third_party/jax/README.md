@@ -17,6 +17,7 @@ Each subdirectory corresponds to a supported version containing its dependency p
 Root directory files:
 - `versions.bzl`: Defines `DEFAULT_VERSION` and `SUPPORTED_VERSIONS`.
 - `BUILD`: Defines `:raiden_jax_version` setting the C++ `-DRAIDEN_JAX` flag.
+- `requires.bzl`: Defines `jax_stack_requires()` for wheel dependencies.
 
 ## Python Environment
 
@@ -41,7 +42,7 @@ Pinned revisions must match upstream JAX's `MODULE.bazel` exactly:
 1. Read `xla`, `rules_ml_toolchain`, and `abseil-cpp` revisions from upstream JAX `MODULE.bazel`.
 2. Create `third_party/jax/<version>/deps.bzl`. Set `raiden_jax = major*10000 + minor*100 + patch`.
 3. Add any version-specific patches under `third_party/jax/<version>/patches/`.
-4. Add a `config_setting` and `select` branch in `third_party/jax/BUILD`.
+4. Add a `config_setting` in `third_party/jax/BUILD` and an entry in `third_party/jax/requires.bzl`.
 5. Add the version to `SUPPORTED_VERSIONS` in `third_party/jax/versions.bzl`.
 6. Run tests:
    ```bash
