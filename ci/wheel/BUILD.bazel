@@ -17,7 +17,7 @@ load("@raiden_version//:version.bzl", "WHEEL_VERSION")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:packaging.bzl", "py_package")
-load("//third_party/tpu_raiden/third_party/jax:requires.bzl", "jax_stack_requires")
+load("//third_party/jax:requires.bzl", "jax_stack_requires")
 load(":wheel.bzl", "raiden_framework_wheel")
 
 package(default_visibility = ["//visibility:public"])
