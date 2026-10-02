@@ -677,6 +677,85 @@ TEST(WeightSynchronizerWrapperTest, ForgetPushProgressClearsState) {
   EXPECT_EQ(sub1_raw->last_registered_layer_chunks[0], 4);
 }
 
+TEST(WeightSynchronizerWrapperTest, GlobalShardIndicesMapping) {
+  std::vector<int64_t> global_shards = {10, 11, 12, 13};
+  WeightSynchronizer ws(2, 4, 1024, /*local_port=*/std::nullopt,
+                        /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                        /*bind_ip=*/std::nullopt, /*auto_h2d=*/false,
+                        global_shards);
+
+  auto eps = ws.get_local_endpoints();
+  ASSERT_EQ(eps.size(), 1);
+  EXPECT_EQ(eps[0].shards, global_shards);
+}
+
+TEST(WeightSynchronizerWrapperTest, NonContiguousGlobalShardIndicesMapping) {
+  std::vector<int64_t> global_shards = {0, 1, 4, 5, 8, 9, 12, 13};
+  WeightSynchronizer ws(2, 8, 1024, /*local_port=*/std::nullopt,
+                        /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                        /*bind_ip=*/std::nullopt, /*auto_h2d=*/false,
+                        global_shards);
+
+  auto eps = ws.get_local_endpoints();
+  ASSERT_EQ(eps.size(), 1);
+  EXPECT_EQ(eps[0].shards, global_shards);
+}
+
+TEST(WeightSynchronizerWrapperTest, StoreSkipTilingNonContiguousRouting) {
+  // Simulate 2 NUMA sub-synchronizers with non-contiguous global shard IDs:
+  // sub0 owns global shards {0, 1, 4, 5}
+  // sub1 owns global shards {8, 9, 12, 13}
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  NumaAwareWeightSynchronizer numa_ws(std::move(subs));
+  numa_ws.SetSubmanagerShardsForTesting({{0, 1, 4, 5}, {8, 9, 12, 13}});
+
+  tpu_sync::rpc::StartTransferRequest req;
+  req.set_uuid(99);
+  req.set_is_sender(false);
+
+  auto* sched_proto = req.mutable_shard_push_schedules();
+  auto& s0 = (*sched_proto)[0];
+
+  // Entry 1: dst_shard_idx = 4 (belongs to sub0), layer 0, outer_counts = [3]
+  auto* e1 = s0.add_entries();
+  e1->set_dst_shard_idx(4);
+  e1->set_layer_idx(0);
+  e1->add_outer_counts(3);
+
+  // Entry 2: dst_shard_idx = 12 (belongs to sub1, > total_num_shards=8),
+  // layer 0, outer_counts = [5]
+  auto* e2 = s0.add_entries();
+  e2->set_dst_shard_idx(12);
+  e2->set_layer_idx(0);
+  e2->add_outer_counts(5);
+
+  // Entry 3: dst_shard_idx = 99 (belongs to another host, not on this worker),
+  // layer 0, outer_counts = [7] -> should be ignored on this worker!
+  auto* e3 = s0.add_entries();
+  e3->set_dst_shard_idx(99);
+  e3->set_layer_idx(0);
+  e3->add_outer_counts(7);
+
+  numa_ws.StoreSkipTiling(99, req);
+
+  absl::flat_hash_map<size_t, uint32_t> layer_counts = {{0, 8}};
+  EXPECT_TRUE(numa_ws.RegisterExpectedLayerChunks(99, layer_counts).ok());
+  EXPECT_TRUE(numa_ws.RegisterExpectedChunks(99, 8).ok());
+
+  EXPECT_EQ(sub0_raw->last_registered_chunks, 3);
+  EXPECT_EQ(sub0_raw->last_registered_layer_chunks[0], 3);
+  EXPECT_EQ(sub1_raw->last_registered_chunks, 5);
+  EXPECT_EQ(sub1_raw->last_registered_layer_chunks[0], 5);
+}
+
 }  // namespace
 }  // namespace torch
 }  // namespace tpu_raiden

@@ -73,6 +73,7 @@ class WeightSynchronizer:
       bind_ip: Optional[str] = None,
       unsafe_skip_buffer_lock: bool = True,
       auto_h2d: bool = False,
+      global_shard_indices: Optional[List[int]] = None,
   ):
     """Instantiates the PyTorch Weight Synchronizer shims.
 
@@ -86,7 +87,26 @@ class WeightSynchronizer:
       bind_ip: Sockets server bind IP address.
       unsafe_skip_buffer_lock: Whether to bypass buffer lock safety.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
+      global_shard_indices: Optional list of global shard indices corresponding
+        to each local shard on this process. If None, defaults to [rank *
+        num_shards + i for i in range(num_shards)] when torch.distributed is
+        initialized, or [0, ..., num_shards - 1] otherwise.
     """
+    self._has_explicit_global_shard_indices = global_shard_indices is not None
+    if global_shard_indices is None:
+      num_shards = len(device_tensors[0]) if device_tensors else 0
+      offset = 0
+      if (
+          torch.distributed.is_available()
+          and torch.distributed.is_initialized()
+      ):
+        offset = torch.distributed.get_rank() * num_shards
+      global_shard_indices = [offset + i for i in range(num_shards)]
+
+    self._global_shard_indices = (
+        list(global_shard_indices) if global_shard_indices is not None else []
+    )
+
     self._impl = _weight_synchronizer.WeightSynchronizer(
         device_tensors,
         local_port,
@@ -95,6 +115,7 @@ class WeightSynchronizer:
         bind_ip,
         unsafe_skip_buffer_lock,
         auto_h2d,
+        global_shard_indices,
     )
 
   def push_weights(self, peers: List[str]) -> None:
@@ -137,7 +158,23 @@ class WeightSynchronizer:
 
   def get_local_endpoints(self) -> List[Dict[str, Any]]:
     """Returns the list of transfer endpoints advertised by this instance."""
-    return self._impl.get_local_endpoints()
+    eps = self._impl.get_local_endpoints()
+    if (
+        not self._has_explicit_global_shard_indices
+        and self._global_shard_indices
+    ):
+      g_to_l = {g: i for i, g in enumerate(self._global_shard_indices)}
+      normalized = []
+      for ep in eps:
+        raw_shards = ep["shards"]
+        local_shards = [g_to_l.get(s, s) for s in raw_shards]
+        normalized.append({
+            "endpoint": ep["endpoint"],
+            "shards": local_shards,
+            "global_shards": list(raw_shards),
+        })
+      return normalized
+    return eps
 
   @property
   def local_port(self) -> Optional[int]:

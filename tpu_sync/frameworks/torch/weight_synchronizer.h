@@ -61,7 +61,8 @@ class NumaAwareWeightSynchronizer
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      bool unsafe_skip_buffer_lock = true, bool auto_h2d = false);
+      bool unsafe_skip_buffer_lock = true, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   absl::Status BindWeights(
       const std::vector<std::vector<at::Tensor>>& device_tensors);
@@ -72,8 +73,8 @@ class NumaAwareWeightSynchronizer
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt,
-      bool auto_h2d = false);
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit NumaAwareWeightSynchronizer(
@@ -133,13 +134,15 @@ class NumaAwareWeightSynchronizer
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       std::optional<int> local_port, bool unsafe_skip_buffer_lock,
       int parallelism, std::optional<int> listener_port,
-      std::optional<std::string> bind_ip, bool auto_h2d);
+      std::optional<std::string> bind_ip, bool auto_h2d,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>>
       sub_synchronizers_;
   std::vector<std::pair<int, int>> global_shard_to_submanager_;
   std::vector<std::vector<int64_t>> submanager_to_global_shards_;
   std::vector<std::vector<int>> submanager_to_local_shards_;
+  std::vector<int64_t> global_shard_indices_;
   size_t total_num_shards_ = 0;
   size_t num_layers_ = 0;
   size_t slice_byte_size_ = 0;
@@ -171,20 +174,20 @@ class WeightSynchronizer {
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      bool unsafe_skip_buffer_lock = true, bool auto_h2d = false);
+      bool unsafe_skip_buffer_lock = true, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   absl::Status BindWeights(
       const std::vector<std::vector<at::Tensor>>& device_tensors);
 #endif
 
   // CPU / Mock metadata constructor for tests without PJRT TPU devices
-  WeightSynchronizer(size_t num_layers, size_t num_shards,
-                     size_t slice_byte_size,
-                     std::optional<int> local_port = std::nullopt,
-                     int parallelism = 1,
-                     std::optional<int> listener_port = std::nullopt,
-                     std::optional<std::string> bind_ip = std::nullopt,
-                     bool auto_h2d = false);
+  WeightSynchronizer(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::optional<int> listener_port = std::nullopt,
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit WeightSynchronizer(

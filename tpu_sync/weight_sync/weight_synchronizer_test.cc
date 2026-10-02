@@ -2277,6 +2277,117 @@ TEST_F(WeightSynchronizerTest, TelemetryRecordsOccupancyAndPushMetrics) {
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
 }
 
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedConcurrentCoalescedD2hWaitsForLeaderCompletion) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_OK(client_status_or.status());
+  auto client = std::move(client_status_or.value());
+
+  constexpr size_t kNumLayers = 8;
+  constexpr size_t kSliceByteSize = 16384;
+  auto memory_space_status_or =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_OK(memory_space_status_or.status());
+  xla::PjRtMemorySpace* memory_space = memory_space_status_or.value();
+
+  std::vector<std::vector<uint8_t>> src_device_data(
+      kNumLayers, std::vector<uint8_t>(kSliceByteSize));
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> src_pjrt_buffers;
+  std::vector<std::vector<raiden::RaidenBufferHandle>> src_buffers;
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    std::memset(src_device_data[l].data(), static_cast<int>(0x30 + l),
+                kSliceByteSize);
+    auto buf_or = client->BufferFromHostBuffer(
+        src_device_data[l].data(), xla::U8,
+        {static_cast<int64_t>(kSliceByteSize)},
+        /*byte_strides=*/std::nullopt,
+        xla::PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes,
+        /*on_done_with_host_buffer=*/nullptr, memory_space,
+        /*device_layout=*/nullptr);
+    ASSERT_OK(buf_or.status());
+    src_pjrt_buffers.push_back(std::move(buf_or.value()));
+    auto handle_or =
+        raiden::RaidenBufferHandle::Acquire(src_pjrt_buffers.back().get());
+    ASSERT_OK(handle_or.status());
+    src_buffers.push_back({handle_or.value()});
+  }
+
+  auto ws_source =
+      std::make_unique<WeightSynchronizerBase>(src_buffers, /*local_port=*/0);
+  ws_source->SetPipelineGroupSize(1);
+
+  auto ws_dest1 = std::make_unique<WeightSynchronizerBase>(
+      kNumLayers, /*num_shards=*/1, kSliceByteSize,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest2 = std::make_unique<WeightSynchronizerBase>(
+      kNumLayers, /*num_shards=*/1, kSliceByteSize,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  ASSERT_TRUE(ws_dest1->local_port().has_value());
+  ASSERT_TRUE(ws_dest2->local_port().has_value());
+  std::string dest1_peer = absl::StrCat("127.0.0.1:", *ws_dest1->local_port());
+  std::string dest2_peer = absl::StrCat("127.0.0.1:", *ws_dest2->local_port());
+
+  // Initialize source and destination host staging buffers with zeros so only
+  // completed D2H copies can populate 0x30 + l.
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    std::memset(const_cast<uint8_t*>(ws_source->GetHostPointer(l, 0)), 0x00,
+                kSliceByteSize);
+    std::memset(const_cast<uint8_t*>(ws_dest1->GetHostPointer(l, 0)), 0x00,
+                kSliceByteSize);
+    std::memset(const_cast<uint8_t*>(ws_dest2->GetHostPointer(l, 0)), 0x00,
+                kSliceByteSize);
+  }
+
+  constexpr uint64_t kSharedUuid = 90001;
+  auto make_request = [&](const std::string& peer) {
+    tpu_sync::rpc::StartTransferRequest req;
+    req.set_skip_d2h(false);
+    req.set_uuid(kSharedUuid);
+    auto* schedules = req.mutable_shard_push_schedules();
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      auto* entry = (*schedules)[0].add_entries();
+      entry->set_dst_peer(peer);
+      entry->set_dst_shard_idx(0);
+      entry->set_src_offset_bytes(0);
+      entry->set_dst_offset_bytes(0);
+      entry->set_size_bytes(kSliceByteSize);
+      entry->set_count(1);
+      entry->set_layer_idx(static_cast<int32_t>(l));
+    }
+    return req;
+  };
+
+  ASSERT_OK(ws_dest1->RegisterExpectedChunks(kSharedUuid, kNumLayers));
+  ASSERT_OK(ws_dest2->RegisterExpectedChunks(kSharedUuid, kNumLayers));
+
+  absl::Notification start;
+  auto fut1 = std::async(std::launch::async, [&]() {
+    start.WaitForNotification();
+    return ws_source->PushWeightsResharded(make_request(dest1_peer));
+  });
+  auto fut2 = std::async(std::launch::async, [&]() {
+    start.WaitForNotification();
+    return ws_source->PushWeightsResharded(make_request(dest2_peer));
+  });
+  start.Notify();
+
+  ASSERT_OK(fut1.get());
+  ASSERT_OK(fut2.get());
+  ASSERT_OK(ws_dest1->WaitForTransferCompletion(kSharedUuid));
+  ASSERT_OK(ws_dest2->WaitForTransferCompletion(kSharedUuid));
+
+  EXPECT_EQ(ws_source->GetMetrics().d2h_call_count, 1);
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    const uint8_t expected = static_cast<uint8_t>(0x30 + l);
+    const uint8_t* dst1_ptr = ws_dest1->GetHostPointer(l, 0);
+    const uint8_t* dst2_ptr = ws_dest2->GetHostPointer(l, 0);
+    for (size_t b = 0; b < kSliceByteSize; ++b) {
+      EXPECT_EQ(dst1_ptr[b], expected) << "dest1 layer " << l << " byte " << b;
+      EXPECT_EQ(dst2_ptr[b], expected) << "dest2 layer " << l << " byte " << b;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace weight_sync
 }  // namespace tpu_raiden

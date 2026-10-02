@@ -635,12 +635,14 @@ NB_MODULE(_tpu_raiden_torch, m) {
   nb::class_<WeightSynchronizer>(m, "WeightSynchronizer")
       .def(nb::init<const std::vector<std::vector<at::Tensor>>&,
                     std::optional<int>, int, std::optional<int>,
-                    std::optional<std::string>, bool, bool>(),
+                    std::optional<std::string>, bool, bool,
+                    std::optional<std::vector<int64_t>>>(),
            nb::arg("device_tensors"), nb::arg("local_port") = nb::none(),
            nb::arg("parallelism") = 1, nb::arg("listener_port") = nb::none(),
            nb::arg("bind_ip") = nb::none(),
            nb::arg("unsafe_skip_buffer_lock") = true,
-           nb::arg("auto_h2d") = false)
+           nb::arg("auto_h2d") = false,
+           nb::arg("global_shard_indices") = nb::none())
       .def(
           "PushWeights",
           [](WeightSynchronizer& self, const std::vector<std::string>& peers) {

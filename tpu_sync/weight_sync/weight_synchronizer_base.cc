@@ -1066,6 +1066,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 
   bool already_completed = false;
   uint64_t uuid = request.uuid();
+  std::shared_ptr<UuidD2hState> d2h_state;
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures;
   d2h_layer_futures.reserve(num_layers_);
   auto d2h_start = absl::Now();
@@ -1073,14 +1074,27 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     if (uuid != 0) {
       absl::MutexLock lock(d2h_mu_);
       already_completed = !completed_d2h_uuids_.insert(uuid).second;
+      auto& state_ref = d2h_states_[uuid];
+      if (!state_ref) {
+        state_ref = std::make_shared<UuidD2hState>(num_layers_);
+      }
+      d2h_state = state_ref;
     }
     if (!already_completed) {
       VLOG(1)
           << "PushWeightsResharded: Executing pipelined D2H copies for uuid "
           << uuid;
       for (size_t l = 0; l < num_layers_; ++l) {
-        TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f, D2hLayer(l, uuid));
-        d2h_layer_futures.push_back(std::move(f));
+        auto f_or = D2hLayer(l, uuid);
+        if (!f_or.ok()) {
+          if (d2h_state != nullptr) {
+            absl::MutexLock lock(d2h_state->mu);
+            d2h_state->status = f_or.status();
+            d2h_state->all_ready = true;
+          }
+          return f_or.status();
+        }
+        d2h_layer_futures.push_back(*std::move(f_or));
       }
     } else {
       VLOG(1) << "RAIDEN_DIAG push PushWeightsResharded: Coalescing D2H copy"
@@ -1091,9 +1105,26 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     VLOG(1) << "PushWeightsResharded: Skipping D2H copy.";
   }
 
-  if (!push_pool_) {
-    push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
+  auto d2h_state_cleanup = absl::MakeCleanup(
+      [&d2h_state, already_completed, skip_d2h = request.skip_d2h()]() {
+        if (!skip_d2h && !already_completed && d2h_state != nullptr) {
+          absl::MutexLock lock(d2h_state->mu);
+          if (!d2h_state->all_ready) {
+            if (d2h_state->status.ok()) {
+              d2h_state->status = absl::InternalError(
+                  "D2H leader exited before completing all layers");
+            }
+            d2h_state->all_ready = true;
+          }
+        }
+      });
+
+  {
+    absl::MutexLock lock(d2h_mu_);
+    if (!push_pool_) {
+      push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max(parallelism_, 4));
+    }
   }
 
   auto h2h_start = absl::Now();
@@ -1155,7 +1186,15 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       if (!request.skip_d2h() && !already_completed) {
         absl::Time d2h_wait_start =
             ABSL_PREDICT_FALSE(diag_vlog) ? absl::Now() : absl::InfinitePast();
-        TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
+        absl::Status await_status = d2h_layer_futures[l].Await();
+        if (!await_status.ok()) {
+          if (d2h_state != nullptr) {
+            absl::MutexLock lock(d2h_state->mu);
+            d2h_state->status = await_status;
+            d2h_state->all_ready = true;
+          }
+          return await_status;
+        }
         if (ABSL_PREDICT_FALSE(diag_vlog)) {
           d2h_wait_duration += (absl::Now() - d2h_wait_start);
         }
@@ -1172,6 +1211,37 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         }
         group_tasks.insert(group_tasks.end(), layer_tasks.begin(),
                            layer_tasks.end());
+      }
+    }
+
+    if (!request.skip_d2h() && d2h_state != nullptr && group_end > 0) {
+      if (!already_completed) {
+        absl::MutexLock lock(d2h_state->mu);
+        for (size_t l = group_start; l < group_end; ++l) {
+          d2h_state->layer_ready[l] = true;
+        }
+        if (group_end >= num_layers_) {
+          d2h_state->all_ready = true;
+        }
+      } else {
+        absl::Time d2h_wait_start =
+            ABSL_PREDICT_FALSE(diag_vlog) ? absl::Now() : absl::InfinitePast();
+        {
+          absl::MutexLock lock(d2h_state->mu);
+          struct WaitCtx {
+            const UuidD2hState* state;
+            size_t target_layer;
+          } wait_ctx{d2h_state.get(), group_end - 1};
+          auto cond_fn = +[](WaitCtx* c) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+            return c->state->all_ready ||
+                   c->state->layer_ready[c->target_layer];
+          };
+          d2h_state->mu.Await(absl::Condition(cond_fn, &wait_ctx));
+          TF_RETURN_IF_ERROR(d2h_state->status);
+        }
+        if (ABSL_PREDICT_FALSE(diag_vlog)) {
+          d2h_wait_duration += (absl::Now() - d2h_wait_start);
+        }
       }
     }
 
@@ -1193,6 +1263,11 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
             return PushWeightsChunks(group_tasks, push_parallelism, uuid);
           }));
     }
+  }
+  if (!request.skip_d2h() && !already_completed && d2h_state != nullptr &&
+      num_layers_ == 0) {
+    absl::MutexLock lock(d2h_state->mu);
+    d2h_state->all_ready = true;
   }
 
   for (auto& fut : push_futures) {
@@ -1396,12 +1471,12 @@ absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
   if (!auto_h2d_) {
     return absl::OkStatus();
   }
-  if (!h2d_pool_) {
-    h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
-  }
   {
     absl::MutexLock lock(pending_h2d_mu_);
+    if (!h2d_pool_) {
+      h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max(parallelism_, 4));
+    }
     active_h2d_uuids_.insert(uuid);
     auto& state = pending_h2d_states_[uuid];
     if (state.expected_layers == 0) {
@@ -1644,6 +1719,7 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   {
     absl::MutexLock lock(d2h_mu_);
     completed_d2h_uuids_.erase(uuid);
+    d2h_states_.erase(uuid);
   }
   {
     absl::MutexLock lock(pending_h2d_mu_);

@@ -378,6 +378,32 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     finally:
       os.environ["ENABLE_MULTI_NUMA"] = "0"
 
+  def test_explicit_global_shard_indices(self):
+    tensors = self._make_tensors(num_layers=2, num_shards=2)
+    ws = WeightSynchronizer(
+        tensors,
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[4, 7],
+    )
+    eps = ws.get_local_endpoints()
+    self.assertLen(eps, 1)
+    self.assertEqual(eps[0]["shards"], [4, 7])
+
+  def test_default_global_shard_indices_normalization(self):
+    tensors = self._make_tensors(num_layers=2, num_shards=2)
+    ws = WeightSynchronizer(
+        tensors,
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    eps = ws.get_local_endpoints()
+    self.assertLen(eps, 1)
+    self.assertEqual(eps[0]["shards"], [0, 1])
+    self.assertEqual(eps[0]["global_shards"], [0, 1])
+
 
 if __name__ == "__main__":
   absltest.main()
