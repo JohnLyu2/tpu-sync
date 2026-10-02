@@ -334,6 +334,10 @@ theorem beginOp_done {l l' : Lifecycle} (hb : beginOp l = some l') :
 theorem beginOp_of_done {l : Lifecycle} (hd : l.done = true) : beginOp l = none := by
   unfold beginOp; simp [hd]
 
+/-- A draining session refuses new ops. -/
+theorem beginOp_of_draining {l : Lifecycle} (hdr : l.draining = true) : beginOp l = none := by
+  unfold beginOp; simp [hdr]
+
 /-! ## `done` is never cleared -/
 
 theorem settleLocked_done_mono {l : Lifecycle} (h : l.done = true) :

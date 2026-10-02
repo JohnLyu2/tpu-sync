@@ -127,6 +127,10 @@ All proved on every reachable state (`reachable_safe`):
   `d2hRetired ≤ d2hReady ≤ d2hIssued ≤ numLayers`,
   `woken ≤ queued ≤ d2hIssued`, `woken ≤ d2hReady`,
   `pooled + h2hIssued ≤ woken`, `h2hOk ≤ h2hRetired ≤ h2hIssued`.
+* **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
+  every accounted unit of `in_flight_` has an owner that can advance or retire
+  it (`NoOpLeak`), and every reachable state can drain to `done = true` and
+  release its staging in a finite number of steps (`reachable_can_settle`).
 
 Correspondence notes. (1) The sender's `FinishLocked` ignores every call after
 the first (`Lifecycle.finishOnceLocked`), unlike the receiver's. An OK finish
@@ -321,10 +325,19 @@ def CountersOrdered (s : Send) : Prop :=
     s.pooled + s.h2hIssued ≤ s.woken ∧
     s.h2hRetired ≤ s.h2hIssued ∧ s.h2hOk ≤ s.h2hRetired
 
+/-- Events that advance or retire an in-flight operation. -/
+def drainEvents : List Ev :=
+  [.d2hIssue true, .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext, .h2hDone true]
+
+/-- Every unit of `in_flight_` has an owner that can advance or retire it:
+while `inFlight > 0`, some event in `drainEvents` is enabled. -/
+def NoOpLeak (s : Send) : Prop :=
+  0 < s.life.inFlight → ∃ e ∈ drainEvents, (step s e).isSome = true
+
 /-- Everything we want to know about a reachable send session. -/
 def Safe (s : Send) : Prop :=
   SettleSafe s ∧ Drained s ∧ StagingIntegrity s ∧ SettlesPromptly s ∧ NoUnderflow s ∧
-    Publication s ∧ CountersOrdered s
+    Publication s ∧ CountersOrdered s ∧ NoOpLeak s
 
 /-! ## Inductive invariant -/
 
@@ -353,11 +366,40 @@ theorem inv_init (n : Nat) : Inv (init n) := by
   refine ⟨Lifecycle.consistent_init, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
     simp [init, Accounted, CountersOrdered]
 
+theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
+  intro hif
+  have hacc := h.accounted
+  have hcnt := h.counters
+  unfold Accounted at hacc
+  unfold CountersOrdered at hcnt
+  by_cases hp : s.d2hPending = true
+  · exact ⟨.d2hIssue true, by simp [drainEvents], by simp [step, d2hIssue, hp]⟩
+  · by_cases hrd : s.d2hReady < s.d2hIssued
+    · exact ⟨.d2hReady, by simp [drainEvents], by simp [step, markD2hReady, hrd]⟩
+    · by_cases hret : s.d2hRetired < s.d2hReady
+      · exact ⟨.d2hEnd, by simp [drainEvents], by simp [step, d2hEnd, hret]⟩
+      · by_cases hwk : s.woken < s.queued
+        · have hwr : s.woken < s.d2hReady := by omega
+          refine ⟨.wake true, by simp [drainEvents], ?_⟩
+          simp only [step, wake, hwk, hwr, and_self, ↓reduceIte, Bool.true_eq_false]
+          split <;> rfl
+        · by_cases hpool : 0 < s.pooled
+          · have hne : s.pooled ≠ 0 := by omega
+            refine ⟨.h2hIssue, by simp [drainEvents], ?_⟩
+            simp only [step, h2hIssue, hne, ↓reduceIte]
+            split <;> rfl
+          · by_cases hch : 0 < s.chaining
+            · exact ⟨.sendNext, by simp [drainEvents], by simp [step, sendNext]; omega⟩
+            · have hh2h : s.h2hRetired < s.h2hIssued := by
+                cases hdp : s.d2hPending <;> simp_all <;> omega
+              exact ⟨.h2hDone true, by simp [drainEvents], by simp [step, h2hDone, hh2h]⟩
+
 theorem inv_safe {s : Send} (h : Inv s) : Safe s := by
+  have hnl := inv_noOpLeak h
   obtain ⟨hl, hacc, hu, hcnt, _, _, hpub⟩ := h
   unfold Accounted at hacc
   unfold CountersOrdered at hcnt
-  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, hu, hpub, hcnt⟩
+  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, hu, hpub, hcnt, hnl⟩
   intro hd
   have h0 := hl.done_idle hd
   cases hp : s.d2hPending <;> simp [hp] at hacc ⊢ <;> omega
@@ -719,6 +761,114 @@ theorem reachable_inv {n : Nat} {s : Send} (h : (sys n).Reachable s) : Inv s :=
 theorem reachable_safe {n : Nat} {s : Send} (h : (sys n).Reachable s) : Safe s :=
   inv_safe (reachable_inv h)
 
+/-! ### Progress and eventual settlement -/
+
+/-- Remaining steps needed to drain all in-flight operations once draining. -/
+def drainRank (s : Send) : Nat :=
+  3 * (if s.d2hPending then 1 else 0) + (s.d2hIssued - s.d2hReady) +
+    (s.d2hIssued - s.d2hRetired) + (s.queued - s.woken) +
+    s.pooled + s.chaining + (s.h2hIssued - s.h2hRetired)
+
+theorem trySendNext_of_draining {s : Send} (hdr : s.life.draining = true) :
+    s.trySendNext = s := by
+  unfold trySendNext; split <;> simp [Lifecycle.beginOp_of_draining hdr]
+
+@[simp] theorem endOp_draining (s : Send) :
+    s.endOp.life.draining = s.life.draining := by
+  unfold endOp; split <;> simp
+
+theorem finish_of_draining (ok : Bool) {s : Send} (hdr : s.life.draining = true) :
+    s.finish ok = s := by
+  simp [finish, Lifecycle.finishOnceLocked_decided ok (Or.inl hdr)]
+
+theorem drainRank_endOp (s : Send) : drainRank s.endOp = drainRank s := by
+  unfold endOp; split <;> rfl
+
+/-- While draining and not yet settled, some event in `drainEvents` is enabled,
+preserves `draining`, and strictly decreases `drainRank`. -/
+theorem drain_step {s : Send} (h : Inv s) (hdr : s.life.draining = true)
+    (hnd : s.life.done = false) :
+    ∃ e s', step s e = some s' ∧ s'.life.draining = true ∧ drainRank s' < drainRank s := by
+  have hif : 0 < s.life.inFlight := by
+    cases h0 : s.life.inFlight
+    · have := h.life.prompt hdr h0; simp [hnd] at this
+    · omega
+  have hacc := h.accounted
+  have hcnt := h.counters
+  unfold Accounted at hacc
+  unfold CountersOrdered at hcnt
+  by_cases hp : s.d2hPending = true
+  · have hs₁ : step s (.d2hIssue true) = some { s with d2hPending := false, d2hIssued := s.d2hIssued + 1 } := by
+      simp [step, d2hIssue, hp, trySendNext_of_draining (s := { s with d2hPending := false, d2hIssued := s.d2hIssued + 1 }) hdr]
+    exact ⟨.d2hIssue true, _, hs₁, by simp [hdr], by simp [drainRank, hp]; omega⟩
+  · by_cases hrd : s.d2hReady < s.d2hIssued
+    · have hs₁ : step s .d2hReady = some { s with d2hReady := s.d2hReady + 1 } := by
+        simp [step, markD2hReady, hrd]
+      exact ⟨.d2hReady, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
+    · by_cases hret : s.d2hRetired < s.d2hReady
+      · have hs₁ : step s .d2hEnd = some { s with d2hRetired := s.d2hRetired + 1 }.endOp := by
+          simp [step, d2hEnd, hret]
+        exact ⟨.d2hEnd, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
+      · by_cases hwk : s.woken < s.queued
+        · have hwr : s.woken < s.d2hReady := by omega
+          have hs₁ : step s (.wake true) = some { s with woken := s.woken + 1 }.endOp := by
+            simp [step, wake, hwk, hwr, hdr]
+          exact ⟨.wake true, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
+        · by_cases hpool : 0 < s.pooled
+          · have hs₁ : step s .h2hIssue = some { s with pooled := s.pooled - 1 }.endOp := by
+              simp [step, h2hIssue, Lifecycle.beginOp_of_draining hdr]; omega
+            exact ⟨.h2hIssue, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
+          · by_cases hch : 0 < s.chaining
+            · have hs₁ : step s .sendNext = some { s with chaining := s.chaining - 1 }.endOp := by
+                simp [step, sendNext, trySendNext_of_draining (s := { s with chaining := s.chaining - 1 }) hdr]
+                omega
+              exact ⟨.sendNext, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
+            · have hh2h : s.h2hRetired < s.h2hIssued := by
+                cases hdp : s.d2hPending <;> simp_all <;> omega
+              have hs₁ : step s (.h2hDone true) =
+                  some { s with h2hRetired := s.h2hRetired + 1, h2hOk := s.h2hOk + 1 }.endOp := by
+                simp [step, h2hDone, hh2h,
+                  finish_of_draining true (s := { s with h2hRetired := s.h2hRetired + 1, h2hOk := s.h2hOk + 1 }) hdr]
+              exact ⟨.h2hDone true, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
+
+theorem draining_can_settle_aux (n : Nat) :
+    ∀ (k : Nat) {s : Send}, drainRank s ≤ k → Inv s → s.life.draining = true →
+      ∃ evs s', (sys n).runFrom s evs = some s' ∧
+        s'.life.done = true ∧ s'.life.hasStaging = false
+  | 0, s, hk, h, hdr => by
+    have hacc := h.accounted
+    unfold Accounted at hacc
+    unfold drainRank at hk
+    have hd : s.life.done = true := h.life.prompt hdr (by omega)
+    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
+    exact ⟨[], s, rfl, hd, hst⟩
+  | k + 1, s, hk, h, hdr => by
+    cases hnd : s.life.done
+    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step h hdr hnd
+      obtain ⟨evs, s', hrun, hd', hst'⟩ :=
+        draining_can_settle_aux n k (by omega) (step_inv h hs₁) hdr₁
+      refine ⟨e :: evs, s', ?_, hd', hst'⟩
+      simp only [System.runFrom, sys, List.foldlM_cons, hs₁]
+      exact hrun
+    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
+      exact ⟨[], s, rfl, hnd, hst⟩
+
+/-- Every reachable send session can settle and release its staging buffer in a
+finite number of steps. -/
+theorem reachable_can_settle {n : Nat} {s : Send} (h : (sys n).Reachable s) :
+    ∃ evs s', (sys n).runFrom s evs = some s' ∧
+      s'.life.done = true ∧ s'.life.hasStaging = false := by
+  have hinv := reachable_inv h
+  have hcancel : step s .cancel = some (s.finish false) := rfl
+  have hinv₁ := step_inv hinv hcancel
+  have hdr₁ : (s.finish false).life.draining = true := by
+    rcases finish_cases false hinv.life with ⟨hd, heq⟩ | ⟨hd, hn, heq⟩ <;> simp [heq, hd]
+  obtain ⟨evs, s', hrun, hd', hst'⟩ :=
+    draining_can_settle_aux n (drainRank (s.finish false)) (Nat.le_refl _) hinv₁ hdr₁
+  refine ⟨.cancel :: evs, s', ?_, hd', hst'⟩
+  simp only [System.runFrom, sys, List.foldlM_cons, hcancel]
+  exact hrun
+
 /-! ## Frame lemmas
 
 What each event leaves alone, and specs for the events the composed transfer
@@ -874,7 +1024,8 @@ def violates (s : Send) : Bool :=
   !(s.d2hRetired ≤ s.d2hReady && s.d2hReady ≤ s.d2hIssued &&
     s.d2hIssued + (if s.d2hPending then 1 else 0) ≤ s.numLayers &&
     s.woken ≤ s.queued && s.queued ≤ s.d2hIssued && s.woken ≤ s.d2hReady &&
-    s.pooled + s.h2hIssued ≤ s.woken && s.h2hRetired ≤ s.h2hIssued && s.h2hOk ≤ s.h2hRetired)
+    s.pooled + s.h2hIssued ≤ s.woken && s.h2hRetired ≤ s.h2hIssued && s.h2hOk ≤ s.h2hRetired) ||
+  (0 < s.life.inFlight && !(drainEvents.any fun e => (step s e).isSome))
 
 #guard ModelCheck.check (sys 2) events violates 12 = .outOfFuel
 
@@ -911,6 +1062,27 @@ def d2hIssueUncounted (ok : Bool) (s : Send) : Option Send :=
 #guard (match ModelCheck.check ⟨init 1, fun s e => match e with
           | .sendNext => sendNextUncounted s
           | .d2hIssue ok => d2hIssueUncounted ok s
+          | e => step s e⟩ events violates 8 with
+        | .counterexample _ => true
+        | _ => false)
+
+/-- Mutant for `NoOpLeak`: `SendNextLayer` omits the
+`layer_idx >= d2h_layer_futures_.size()` bounds check at `.cc:379` and takes an
+op unconditionally. After the last layer's pool task calls
+`SendNextLayer(numLayers)` (`.cc:449`), that call claims an op for a
+non-existent layer whose D2H future never becomes ready, leaking the session and
+its staging forever (`SettleSafe` holds vacuously, `NoOpLeak` catches it). -/
+def trySendNextUnbounded (s : Send) : Send :=
+  match s.life.beginOp with
+  | some l => { s with life := l, queued := s.queued + 1 }
+  | none => s
+
+def sendNextUnbounded (s : Send) : Option Send :=
+  if s.chaining = 0 then none
+  else some { s with chaining := s.chaining - 1 }.trySendNextUnbounded.endOp
+
+#guard (match ModelCheck.check ⟨init 1, fun s e => match e with
+          | .sendNext => sendNextUnbounded s
           | e => step s e⟩ events violates 8 with
         | .counterexample _ => true
         | _ => false)

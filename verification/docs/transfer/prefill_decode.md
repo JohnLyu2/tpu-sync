@@ -28,12 +28,13 @@ D2H copy; an H2D dispatch waits for *its* layer to land).
 | … decode never runs attention on stale HBM | `Pipeline.attention_safe` | publication is permanent, and the property holds in every state reachable afterwards |
 | Prefill HBM safety (source buffer safety) | `Pipeline.reachable_safe` (`PrefillHbmSafe`); counter form `Send.Drained` | `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`: no D2H copy is being dispatched or reading prefill HBM when the engine frees it |
 | Staging integrity | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `Pipeline.StagingSafe` | `hasStaging = !done`; a released staging has no copy being dispatched or reading/writing it and no push reading/writing it |
-| Termination | not in scope (see Future work F1) | — |
+| Termination (no op leak / drain to settle) | `Recv.NoOpLeak`, `Recv.reachable_can_settle`, `Send.NoOpLeak`, `Send.reachable_can_settle` | `0 < inFlight → ∃ e ∈ drainEvents, (step s e).isSome`: every accounted unit of `in_flight_` has an enabled step that advances or retires it, and every reachable state can drain to `done = true ∧ hasStaging = false` in finitely many steps |
 
 Counter-level forms of publication are proved per side as well
 (`Recv.Publication`: `done_recving → every H2D callback ran OK`;
 `Send.Publication`: `done_sending → every push completed OK`), together with
-settle safety (`done → inFlight = 0`), prompt settle, readiness soundness
+settle safety (`done → inFlight = 0`), prompt settle, no op leak (`NoOpLeak`),
+constructive drain to settle (`reachable_can_settle`), readiness soundness
 (`IsReadyToComplete → ready = numLayers`) and the counter orderings.
 
 ## Correspondence
@@ -106,6 +107,8 @@ Mutants (each yields a `.counterexample`):
 | `Recv.cancelEager`, `Send.cancelEager` | settle waits for `in_flight_ = 0` | settle safety |
 | `Recv.netAccountUnordered` | layer accounted only after its copy is issued (A4) | readiness soundness |
 | `Send.sendNextUncounted` / `d2hIssueUncounted` | the op `SendNextLayer` takes at `.cc:381` | no underflow / drained |
+| `Recv.h2dIssueLeak` | `EndRecvOpLocked()` on the `done_ \|\| draining_` early return in `ExecuteLayerH2d` (`.cc:607`) | no op leak (`NoOpLeak`; `SettleSafe` holds vacuously because the leaked op prevents settling) |
+| `Send.sendNextUnbounded` | `layer_idx >= d2h_layer_futures_.size()` check in `SendNextLayer` (`.cc:379`) | no op leak (`NoOpLeak`; `SendNextLayer(numLayers)` takes an op whose future never exists) |
 | `Pipeline.dispatchEarly` | `h2dBegin l` after layer `l` landed | publication correctness (junk in HBM) |
 | `Pipeline.h2dReadyByRank` | the H2D copy for layer `l` reads slot `l` (it reads the slot the *counter* points at instead — the shape of a counter-indexed model) | publication correctness: with layer 1 landing first, HBM ends `[kv 1, junk]` |
 | `Pipeline.reseatAtFinish` | staging released at settle, not at `Finish` | publication correctness via the send's staging |
@@ -131,7 +134,7 @@ what remains is where it deliberately stops.
 
 | # | Work | Why | Cost |
 |---|---|---|---|
-| F1 | **Progress / no-leak property.** In every reachable state with `inFlight > 0`, some op-retiring event is enabled (every accounted unit of `in_flight_` has an owner that can end it). Both sessions. | `Accounted` says `in_flight_` is explained, not that each unit can retire. A leaked op is a session that never settles and staging never released — the production failure mode the safety proofs do not catch. Cheap given `Accounted`. This is the proposal's "termination" half of staging integrity. | low |
+| F1 | *(Done)* **Progress / no-leak property.** `NoOpLeak` (`0 < inFlight →` some event in `drainEvents` is enabled) and `reachable_can_settle` (every reachable state can drain to `done = true ∧ hasStaging = false`) proved for both `Recv` and `Send`, with leak mutants `Recv.h2dIssueLeak` and `Send.sendNextUnbounded`. | Closes the vacuity gap of `SettleSafe` when an op is leaked so the session never settles. | done |
 | F2 | **Model validation: Lean traces → C++ scenario tests.** `trace_finish_between_locks`, `trace_poll_before_callbacks`, `trace_cancel_after_ok_finish`, `trace_slow_consumer`, `trace_layers_out_of_order`; `trace_reseat_at_finish` as a fault-injected negative test, using the fault-injection hooks already in `transfer_*_session.cc`. In the other direction, recorded executions replay without relabelling layers, since every pipeline event names its layer. | The correspondence tables are trusted, not checked. Executable scenarios make them checkable and the work legible to tpu-sync owners. Proposal §3.3. | medium |
 | F3 | **Maintenance.** `lake build` in CI on the fork; a citation-check script that stores the cited snippet next to each `file:line` and fails when it drifts. | Citations rot with every upstream commit. | low |
 | F4 | **Discharge Receive A1/A3/A4 by modelling the transport.** Add `block_transport.cc`: per-block accounting, `on_layer_received_called`, several senders per layer. Then `OnLayerReceived`-before-`OnBlocksReceived` and readiness soundness are proved rather than assumed. | A4 is the one assumption whose failure would be a real bug. Multi-sender is where the threshold arithmetic `num_completed_blocks_ / total_blocks_` is subtle and currently unexercised. | medium–high; worth it if multi-sender transfers are used in production |

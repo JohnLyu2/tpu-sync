@@ -107,6 +107,10 @@ All proved on every reachable state (`reachable_safe`):
   stage 4 adds the memory contents.
 * **Counters.** `completed ≤ retired ≤ ready ≤ issued ≤ numLayers` and
   `layersAccounted ≤ issued`.
+* **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
+  every accounted unit of `in_flight_` has an owner that can advance or retire
+  it (`NoOpLeak`), and every reachable state can drain to `done = true` and
+  release its staging in a finite number of steps (`reachable_can_settle`).
 
 Note on the readiness predicate. One might expect `IsReadyToComplete` to
 coincide with "every layer's callback has run OK"; it does not.
@@ -311,10 +315,19 @@ def CountersOrdered (s : Recv) : Prop :=
   s.completed ≤ s.retired ∧ s.retired ≤ s.ready ∧ s.ready ≤ s.issued ∧
     s.issued ≤ s.numLayers ∧ s.layersAccounted ≤ s.issued
 
+/-- Events that advance or retire an in-flight operation. -/
+def drainEvents : List Ev :=
+  [.pushEnd, .pullReply true, .h2dIssue true, .h2dReady, .h2dDone true]
+
+/-- Every unit of `in_flight_` has an owner that can advance or retire it:
+while `inFlight > 0`, some event in `drainEvents` is enabled. -/
+def NoOpLeak (s : Recv) : Prop :=
+  0 < s.life.inFlight → ∃ e ∈ drainEvents, (step s e).isSome = true
+
 /-- Everything we want to know about a reachable receive session. -/
 def Safe (s : Recv) : Prop :=
   SettleSafe s ∧ NoRetiredCallback s ∧ StagingIntegrity s ∧ SettlesPromptly s ∧
-    ReadinessSound s ∧ Publication s ∧ CountersOrdered s
+    ReadinessSound s ∧ Publication s ∧ CountersOrdered s ∧ NoOpLeak s
 
 /-! ## Inductive invariant -/
 
@@ -350,10 +363,34 @@ theorem inv_initLoad (n : Nat) : Inv (initLoad n) := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [initLoad, Accounted]
   constructor <;> simp
 
+theorem inv_noOpLeak {s : Recv} (h : Inv s) : NoOpLeak s := by
+  intro hif
+  have hacc := h.accounted
+  unfold Accounted at hacc
+  have hr := h.retired_le
+  have hy := h.ready_le
+  by_cases hp : 0 < s.pushes
+  · exact ⟨.pushEnd, by simp [drainEvents], by simp [step, pushEnd]; omega⟩
+  · by_cases hq : s.pullPending = true
+    · exact ⟨.pullReply true, by simp [drainEvents], by simp [step, pullReply, hq]⟩
+    · by_cases hpend : 0 < s.pending
+      · have hne : s.pending ≠ 0 := by omega
+        refine ⟨.h2dIssue true, by simp [drainEvents], ?_⟩
+        simp only [step, h2dIssue, hne, ↓reduceIte]
+        split <;> rfl
+      · by_cases hrd : s.ready < s.issued
+        · exact ⟨.h2dReady, by simp [drainEvents], by simp [step, h2dReady, hrd]⟩
+        · have hret : s.retired < s.ready := by
+            cases hqp : s.pullPending <;> simp_all <;> omega
+          refine ⟨.h2dDone true, by simp [drainEvents], ?_⟩
+          simp only [step, h2dDone, hret, ↓reduceIte]
+          split <;> rfl
+
 theorem inv_safe {s : Recv} (h : Inv s) : Safe s := by
+  have hnl := inv_noOpLeak h
   obtain ⟨hl, hacc, hc, hr, hy, hi, ha, hok, hdr, _, hpub⟩ := h
   unfold Accounted at hacc
-  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, ?_, hpub, hc, hr, hy, by omega, ha⟩
+  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, ?_, hpub, ⟨hc, hr, hy, by omega, ha⟩, hnl⟩
   · intro hd
     have h0 := hl.done_idle hd
     omega
@@ -589,6 +626,88 @@ theorem reachable_safe {n : Nat} {s : Recv}
     (h : (sysPush n).Reachable s ∨ (sysLoad n).Reachable s) : Safe s :=
   inv_safe (h.elim reachable_inv_push reachable_inv_load)
 
+/-! ### Progress and eventual settlement -/
+
+/-- Remaining steps needed to drain all in-flight operations once draining. -/
+def drainRank (s : Recv) : Nat :=
+  s.pushes + (if s.pullPending then 1 else 0) + s.pending +
+    (s.issued - s.ready) + (s.issued - s.retired)
+
+/-- While draining and not yet settled, some event in `drainEvents` is enabled,
+preserves `draining`, and strictly decreases `drainRank`. -/
+theorem drain_step {s : Recv} (h : Inv s) (hdr : s.life.draining = true)
+    (hnd : s.life.done = false) :
+    ∃ e s', step s e = some s' ∧ s'.life.draining = true ∧ drainRank s' < drainRank s := by
+  have hif : 0 < s.life.inFlight := by
+    cases h0 : s.life.inFlight
+    · have := h.life.prompt hdr h0; simp [hnd] at this
+    · omega
+  have hacc := h.accounted
+  unfold Accounted at hacc
+  have hr := h.retired_le
+  have hy := h.ready_le
+  by_cases hp : 0 < s.pushes
+  · have hs₁ : step s .pushEnd = some { s with life := s.life.endOpLocked, pushes := s.pushes - 1 } := by
+      simp [step, pushEnd]; omega
+    exact ⟨.pushEnd, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
+  · by_cases hq : s.pullPending = true
+    · have hs₁ : step s (.pullReply true) = some { s with life := s.life.endOpLocked, pullPending := false } := by
+        simp [step, pullReply, hq]
+      exact ⟨.pullReply true, _, hs₁, by simp [hdr], by simp [drainRank, hq]⟩
+    · by_cases hpend : 0 < s.pending
+      · have hs₁ : step s (.h2dIssue true) = some { s with pending := s.pending - 1, life := s.life.endOpLocked } := by
+          simp [step, h2dIssue, hdr]; omega
+        exact ⟨.h2dIssue true, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
+      · by_cases hrd : s.ready < s.issued
+        · have hs₁ : step s .h2dReady = some { s with ready := s.ready + 1 } := by
+            simp [step, h2dReady, hrd]
+          exact ⟨.h2dReady, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
+        · have hret : s.retired < s.ready := by
+            cases hqp : s.pullPending <;> simp_all <;> omega
+          have hs₁ : step s (.h2dDone true) =
+              some { s with retired := s.retired + 1, completed := s.completed + 1, life := s.life.endOpLocked } := by
+            simp [step, h2dDone, hret, hnd, hdr]
+          exact ⟨.h2dDone true, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
+
+theorem draining_can_settle_aux (n : Nat) :
+    ∀ (k : Nat) {s : Recv}, drainRank s ≤ k → Inv s → s.life.draining = true →
+      ∃ evs s', (sysPush n).runFrom s evs = some s' ∧
+        s'.life.done = true ∧ s'.life.hasStaging = false
+  | 0, s, hk, h, hdr => by
+    have hacc := h.accounted
+    unfold Accounted at hacc
+    unfold drainRank at hk
+    have hd : s.life.done = true := h.life.prompt hdr (by omega)
+    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
+    exact ⟨[], s, rfl, hd, hst⟩
+  | k + 1, s, hk, h, hdr => by
+    cases hnd : s.life.done
+    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step h hdr hnd
+      obtain ⟨evs, s', hrun, hd', hst'⟩ :=
+        draining_can_settle_aux n k (by omega) (step_inv h hs₁) hdr₁
+      refine ⟨e :: evs, s', ?_, hd', hst'⟩
+      simp only [System.runFrom, sysPush, List.foldlM_cons, hs₁]
+      exact hrun
+    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
+      exact ⟨[], s, rfl, hnd, hst⟩
+
+/-- Every reachable receive session can settle and release its staging buffer
+in a finite number of steps. -/
+theorem reachable_can_settle {n : Nat} {s : Recv}
+    (h : (sysPush n).Reachable s ∨ (sysLoad n).Reachable s) :
+    ∃ evs s', (sysPush n).runFrom s evs = some s' ∧
+      s'.life.done = true ∧ s'.life.hasStaging = false := by
+  have hinv := h.elim reachable_inv_push reachable_inv_load
+  have hcancel : step s .cancel = some { s with life := s.life.finishLocked false } := rfl
+  have hinv₁ := step_inv hinv hcancel
+  have hdr₁ : ({ s with life := s.life.finishLocked false } : Recv).life.draining = true := by simp
+  obtain ⟨evs, s', hrun, hd', hst'⟩ :=
+    draining_can_settle_aux n (drainRank { s with life := s.life.finishLocked false })
+      (Nat.le_refl _) hinv₁ hdr₁
+  refine ⟨.cancel :: evs, s', ?_, hd', hst'⟩
+  simp only [System.runFrom, sysPush, List.foldlM_cons, hcancel]
+  exact hrun
+
 /-! ## Frame lemmas
 
 What each event leaves alone, and the exact spec for `h2dReady`, which the
@@ -707,7 +826,8 @@ def violates (s : Recv) : Bool :=
   (decide (isReadyToComplete s) && s.ready != s.numLayers) ||
   (s.published == some true && s.completed != s.numLayers) ||
   !(s.completed ≤ s.retired && s.retired ≤ s.ready && s.ready ≤ s.issued &&
-    s.issued ≤ s.numLayers && s.layersAccounted ≤ s.issued)
+    s.issued ≤ s.numLayers && s.layersAccounted ≤ s.issued) ||
+  (0 < s.life.inFlight && !(drainEvents.any fun e => (step s e).isSome))
 
 #guard ModelCheck.check (sysLoad 2) events violates 10 = .outOfFuel
 #guard ModelCheck.check (sysPush 2) events violates 10 = .outOfFuel
@@ -733,6 +853,27 @@ def netAccountUnordered (s : Recv) : Option Recv :=
 
 #guard (match ModelCheck.check ⟨initPush 1, fun s e => match e with
           | .netAccount => netAccountUnordered s
+          | e => step s e⟩ events violates 6 with
+        | .counterexample _ => true
+        | _ => false)
+
+/-- Mutant for `NoOpLeak`: `ExecuteLayerH2d` returns early on `done_ || draining_`
+(`.cc:607`) without calling `EndRecvOpLocked()`. A cancel between the two locks
+leaks the op: `inFlight` stays positive with no enabled drain event, so the
+session never settles (`SettleSafe` holds vacuously, `NoOpLeak` catches it). -/
+def h2dIssueLeak (ok : Bool) (s : Recv) : Option Recv :=
+  if s.pending = 0 then none
+  else
+    let s := { s with pending := s.pending - 1 }
+    if s.life.done = true ∨ s.life.draining = true then
+      some s
+    else if ok then
+      some { s with issued := s.issued + 1 }
+    else
+      some { s with life := (s.life.finishLocked false).endOpLocked }
+
+#guard (match ModelCheck.check ⟨initPush 1, fun s e => match e with
+          | .h2dIssue ok => h2dIssueLeak ok s
           | e => step s e⟩ events violates 6 with
         | .counterexample _ => true
         | _ => false)
