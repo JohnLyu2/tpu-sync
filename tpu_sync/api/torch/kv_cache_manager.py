@@ -14,6 +14,7 @@
 
 """High-performance PyTorch KV Cache Manager (repurposed as TransferEngine)."""
 
+import dataclasses
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 _HOST_IMPL = None
@@ -50,6 +51,33 @@ def _torch_impl():
     # pylint: enable=g-import-not-at-top
     _TORCH_IMPL = impl
   return _TORCH_IMPL
+
+
+@dataclasses.dataclass(frozen=True)
+class SettledTransfer:
+  """What is known about one settled transfer.
+
+  New fields must have defaults, so callers that read only the fields they
+  know keep working.
+
+  Attributes:
+    req_id: The transfer's request ID.
+    completed_ns: When the transfer completed, in time.perf_counter_ns()
+      nanoseconds; None if not recorded.
+  """
+
+  req_id: str
+  completed_ns: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PollStatsWithDetails:
+  """Result of poll_stats_with_details(): transfers settled since last poll."""
+
+  sent: List[SettledTransfer]
+  received: List[SettledTransfer]
+  # Failed sends and receives.
+  failed: List[SettledTransfer]
 
 
 class KVCacheManager:
@@ -465,7 +493,30 @@ class KVCacheManager:
       A tuple of (done_sending, done_recving, failed_recving) lists of request
       IDs.
     """
-    return self._impl.complete_read()
+    sent, received, failed, _ = self._impl.complete_read()
+    return sent, received, failed
+
+  def poll_stats_with_details(self) -> PollStatsWithDetails:
+    """Like poll_stats(), with the details of each settled transfer.
+
+    poll_stats() and poll_stats_with_details() drain the same reports; use one.
+
+    Returns:
+      The settled transfers, one SettledTransfer each.
+    """
+    sent, received, failed, details = self._impl.complete_read()
+
+    def settled(req_ids: List[str]) -> List[SettledTransfer]:
+      return [
+          SettledTransfer(req_id=req_id, **details.get(req_id, {}))
+          for req_id in req_ids
+      ]
+
+    return PollStatsWithDetails(
+        sent=settled(sent),
+        received=settled(received),
+        failed=settled(failed),
+    )
 
   def d2h(
       self,

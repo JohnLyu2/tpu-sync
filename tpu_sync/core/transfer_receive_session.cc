@@ -367,6 +367,7 @@ void TransferReceiveSession::FinishLocked(const absl::Status& status) {
   if (in_flight_ == 0 && !done_) {
     ReleaseStagingLocked();
     done_ = true;
+    completed_at_ = std::chrono::steady_clock::now();
   }
 }
 
@@ -390,6 +391,7 @@ void TransferReceiveSession::EndRecvOpLocked() {
   if (draining_ && in_flight_ == 0 && !done_) {
     ReleaseStagingLocked();
     done_ = true;
+    completed_at_ = std::chrono::steady_clock::now();
   }
 }
 

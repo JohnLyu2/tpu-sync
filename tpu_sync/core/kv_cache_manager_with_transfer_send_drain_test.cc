@@ -50,9 +50,13 @@
 namespace tpu_raiden {
 namespace {
 
+using ::testing::AllOf;
 using ::testing::Contains;
 using ::testing::ElementsAre;
+using ::testing::Ge;
 using ::testing::IsEmpty;
+using ::testing::Le;
+using ::testing::Optional;
 
 constexpr int64_t kSlots = 2;
 constexpr double kTimeoutS = 0.05;
@@ -293,6 +297,12 @@ const std::vector<std::string>& FailedRecving(const Reports& r) {
   return std::get<2>(r);
 }
 
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 TEST(SendDrainTest, ExpiredSendKeepsItsStagingUntilTheCopyEnds) {
   TestManager producer(/*num_layers=*/1);
   ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/7, {0},
@@ -452,6 +462,24 @@ TEST(SendLifecycleTest, SuccessCannotOverrideAnEarlierFailure) {
   EXPECT_EQ(producer.free_slots(), kSlots);
 }
 
+TEST(SendLifecycleTest, DetailsReportWhenTheSendCompleted) {
+  TestManager producer(/*num_layers=*/1);
+  auto session = producer.AddSyntheticSend("req", /*uuid=*/16, /*in_flight=*/1);
+  producer.Decide(session, /*failed=*/false);
+
+  const int64_t before = SteadyNowNs();
+  producer.FinishCopy(0, absl::OkStatus());
+  const int64_t completed = SteadyNowNs();
+  // A late poll must not move the reported completion time.
+  absl::SleepFor(absl::Milliseconds(20));
+  CompleteReadResult completions = producer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.sent, ElementsAre("req"));
+  EXPECT_THAT(completions.details["req"].completed_ns,
+              Optional(AllOf(Ge(before), Le(completed))));
+  EXPECT_THAT(producer.CompleteReadWithDetails().details, IsEmpty());
+}
+
 TEST(RecvLifecycleTest, NetworkCompletionWaitsForH2d) {
   RecvTestManager consumer(/*num_layers=*/1);
   consumer.AddRecv("req", /*uuid=*/20);
@@ -470,6 +498,23 @@ TEST(RecvLifecycleTest, NetworkCompletionWaitsForH2d) {
   EXPECT_THAT(FailedRecving(after), IsEmpty());
   EXPECT_FALSE(consumer.has_recv(20));
   EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+TEST(RecvLifecycleTest, DetailsReportWhenTheLastH2dLanded) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/26);
+  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/26).ok());
+  ASSERT_TRUE(consumer.ReceiveBlocks({0}, /*uuid=*/26).ok());
+
+  const int64_t before = SteadyNowNs();
+  consumer.FinishCopy(0, absl::OkStatus());
+  const int64_t completed = SteadyNowNs();
+  absl::SleepFor(absl::Milliseconds(20));
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.received, ElementsAre("req"));
+  EXPECT_THAT(completions.details["req"].completed_ns,
+              Optional(AllOf(Ge(before), Le(completed))));
 }
 
 TEST(RecvLifecycleTest, InvalidReadShapeDoesNotLeakStaging) {

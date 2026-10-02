@@ -55,6 +55,25 @@ class ReshardSendSession;
 class TransferSendSession;
 class TransferReceiveSession;
 
+// What is known about one settled transfer. Fields are unset when not
+// recorded; new fields must be optional too.
+struct TransferDetails {
+  // When the transfer completed, in steady_clock nanoseconds: CLOCK_MONOTONIC,
+  // the clock of Python's time.perf_counter_ns().
+  std::optional<int64_t> completed_ns;
+};
+
+// Result of CompleteReadWithDetails(): transfers settled since the previous
+// poll.
+struct CompleteReadResult {
+  std::vector<std::string> sent;
+  std::vector<std::string> received;
+  std::vector<std::string> failed;
+  // Details of settled transfers, by req_id. Only transfer send and receive
+  // sessions record details; other settled req_ids have no entry.
+  absl::flat_hash_map<std::string, TransferDetails> details;
+};
+
 struct CopySpec {
   std::vector<int64_t> src_offsets;
   std::vector<int64_t> dst_offsets;
@@ -243,6 +262,12 @@ class KVCacheManagerWithTransfer {
       std::optional<std::chrono::steady_clock::time_point> deadline =
           std::nullopt);
 
+  // Reports each transfer settled since the previous poll, exactly once, with
+  // its details.
+  CompleteReadResult CompleteReadWithDetails();
+
+  // CompleteReadWithDetails() without details: (sent, received, failed). Both
+  // drain the same reports, so a caller uses one or the other.
   virtual std::tuple<std::vector<std::string>, std::vector<std::string>,
                      std::vector<std::string>>
   CompleteReadRaw();
@@ -371,6 +396,9 @@ class KVCacheManagerWithTransfer {
   absl::flat_hash_set<std::string> done_sending_;
   absl::flat_hash_set<std::string> done_recving_;
   absl::flat_hash_set<std::string> failed_recving_;
+  // CompleteReadResult::details not yet reported.
+  absl::flat_hash_map<std::string, TransferDetails> transfer_details_
+      ABSL_GUARDED_BY(mu_);
   absl::Mutex mu_;
   absl::CondVar cv_;
   std::atomic<bool> stopping_{false};

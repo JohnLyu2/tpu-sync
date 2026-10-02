@@ -615,9 +615,22 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::arg("local_host_block_ids") = nb::none())
       .def("complete_read",
            [](KVCacheManager& self) {
-             auto [done_sending, done_recving, failed_recving] =
-                 self.CompleteReadRaw();
-             return nb::make_tuple(done_sending, done_recving, failed_recving);
+             auto completions = [&self] {
+               nb::gil_scoped_release release;
+               return self.CompleteReadWithDetails();
+             }();
+             // {req_id: {field: value}}, with unset fields omitted, so a new
+             // TransferDetails field needs only one more line here.
+             nb::dict details;
+             for (const auto& [req_id, detail] : completions.details) {
+               nb::dict fields;
+               if (detail.completed_ns.has_value()) {
+                 fields["completed_ns"] = *detail.completed_ns;
+               }
+               details[nb::str(req_id.data(), req_id.size())] = fields;
+             }
+             return nb::make_tuple(completions.sent, completions.received,
+                                   completions.failed, details);
            })
       .def(
           "register_kv_backends",

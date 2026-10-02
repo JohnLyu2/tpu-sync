@@ -321,10 +321,8 @@ class KVCacheManager {
                               local_host_block_ids);
   }
 
-  std::tuple<std::vector<std::string>, std::vector<std::string>,
-             std::vector<std::string>>
-  CompleteReadRaw() {
-    return torch_manager_->CompleteReadRaw();
+  CompleteReadResult CompleteReadWithDetails() {
+    return torch_manager_->CompleteReadWithDetails();
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(
