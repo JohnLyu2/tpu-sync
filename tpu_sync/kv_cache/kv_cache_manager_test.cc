@@ -742,6 +742,41 @@ TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
   EXPECT_EQ(receiver_chunks[0].ptr, receiver_base + 192);
 }
 
+// A plan-less push resolves raddr from the peer's reported layer layout to
+// exactly the pointer the peer itself resolves.
+TEST(KVCacheManagerTest, PlanlessPushRaddrUsesPeerLayerAddrs) {
+  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/2,
+                              /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/2,
+                            /*slice_byte_size=*/128, /*host_blocks=*/4);
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
+  for (size_t l = 0; l < 2; ++l) {
+    absl::StatusOr<::tpu_sync::rpc::PoolHostAddrsProto> addrs =
+        receiver.PoolHostBaseAddrs(/*uuid=*/5, l);
+    ASSERT_TRUE(addrs.ok()) << addrs.status();
+    layer_host_addrs.push_back(*std::move(addrs));
+  }
+  sender.SetRemoteLayerAddrs(/*uuid=*/5, layer_host_addrs);
+
+  std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
+      /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{3},
+      /*total_bytes=*/128, /*uuid=*/5, /*sender_node_id=*/0);
+  std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
+      /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{2},
+      /*total_bytes=*/128, /*uuid=*/5, /*sender_node_id=*/-1, /*peer=*/"peer",
+      /*src_block_id=*/-1, /*dst_block_id=*/3);
+  ASSERT_EQ(recv_chunks.size(), 1u);
+  ASSERT_EQ(send_chunks.size(), 1u);
+  EXPECT_EQ(send_chunks[0].raddr, recv_chunks[0].ptr);
+
+  // Without the peer's layout there is no raddr.
+  sender.ClearRemoteLayerAddrs(5);
+  send_chunks = sender.GetBlockChunks(1, 1, std::vector<int64_t>{2}, 128,
+                                      /*uuid=*/5, -1, "peer", -1, 3);
+  ASSERT_EQ(send_chunks.size(), 1u);
+  EXPECT_EQ(send_chunks[0].raddr, nullptr);
+}
+
 class TestD2hKVCacheManager : public TestKVCacheManager {
  public:
   TestD2hKVCacheManager(size_t num_layers, size_t num_shards,

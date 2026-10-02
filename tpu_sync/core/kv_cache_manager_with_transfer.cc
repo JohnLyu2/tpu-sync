@@ -931,6 +931,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
         if (failed) {
           settled_plans.emplace_back(uuid, 0);
         }
+        base_->ClearRemoteLayerAddrs(uuid);
         send_sessions_.erase(it++);
       } else {
         ++it;
@@ -1471,6 +1472,7 @@ KVCacheManagerWithTransfer::HandlePullStream(
       // grace.
       session->ValidateAndBeginPull(req.src_block_ids,
                                     std::chrono::steady_clock::now());
+      base_->SetRemoteLayerAddrs(req.uuid, req.layer_host_addrs);
     }
 
     std::vector<std::string> peer_ips = req.consumer_ips;
