@@ -1963,6 +1963,80 @@ TEST(KVCacheManagerTest, RegisterKVBackendsPropagatesParallelismTpSize) {
   EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp4_r2/"));
 }
 
+class RegisterKVBackendsTopologyTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    scratch_dir_ = absl::StrCat(
+        testing::TempDir(), "/",
+        ::testing::UnitTest::GetInstance()->current_test_info()->name(), "_",
+        getpid());
+    std::filesystem::create_directories(scratch_dir_);
+  }
+  void TearDown() override {
+    std::error_code ec;
+    std::filesystem::remove_all(scratch_dir_, ec);
+  }
+
+  BackendConfig PosixConfig(int tp_rank, int tp_size) const {
+    BackendConfig cfg;
+    cfg.type = "posix";
+    cfg.parallelism.tp_rank = tp_rank;
+    cfg.parallelism.tp_size = tp_size;
+    cfg.SetProperty("root_dir", scratch_dir_);
+    cfg.SetProperty("model_name", "test_model_topology");
+    return cfg;
+  }
+
+  static std::unique_ptr<KVCacheManagerBase> MakeManager() {
+    return std::make_unique<KVCacheManagerBase>(
+        /*layer_buffers=*/
+        std::vector<std::vector<raiden::RaidenBufferHandle>>{},
+        /*local_port=*/std::nullopt,
+        /*host_blocks_to_allocate=*/4,
+        /*unsafe_skip_buffer_lock=*/true,
+        /*parallelism=*/1, /*host_allocator=*/nullptr,
+        /*bind_ip=*/std::nullopt,
+        /*logical_slice_byte_size=*/512);
+  }
+
+  std::string scratch_dir_;
+};
+
+// Regression: tp_size left at its default (-1) used to be stringified into the
+// backend properties and LOG(FATAL) in PosixKVBackend.
+TEST_F(RegisterKVBackendsTopologyTest, DefaultsTpSizeToOne) {
+  auto manager = MakeManager();
+  manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/0, /*tp_size=*/-1)});
+
+  auto backend = manager->GetKVBackend("posix");
+  ASSERT_NE(backend, nullptr);
+  ASSERT_NE(backend->mapper(), nullptr);
+  EXPECT_EQ(backend->mapper()->tp_size(), 1);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, backend->mapper()->MapKey("block_hash"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp1_r0/"));
+}
+
+TEST_F(RegisterKVBackendsTopologyTest, RejectsRankOutOfRangeWithoutCrash) {
+  auto manager = MakeManager();
+  manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/4, /*tp_size=*/4)});
+  EXPECT_EQ(manager->GetKVBackend("posix"), nullptr);
+}
+
+TEST_F(RegisterKVBackendsTopologyTest, IgnoresCallerTpProperties) {
+  auto manager = MakeManager();
+  BackendConfig cfg = PosixConfig(/*tp_rank=*/1, /*tp_size=*/4);
+  cfg.SetProperty("tp_size", "8");
+  cfg.SetProperty("tp_rank", "0");
+  manager->RegisterKVBackends({cfg});
+
+  auto backend = manager->GetKVBackend("posix");
+  ASSERT_NE(backend, nullptr);
+  ASSERT_NE(backend->mapper(), nullptr);
+  EXPECT_EQ(backend->mapper()->tp_size(), 4);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, backend->mapper()->MapKey("block_hash"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp4_r1/"));
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

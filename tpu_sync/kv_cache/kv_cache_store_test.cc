@@ -28,6 +28,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <thread>  // NOLINT(build/c++11)
 #include <tuple>
 #include <utility>
@@ -7854,6 +7855,129 @@ TEST_F(ReadRemoteTest, LoadStillRejectsTwoPeers) {
   EXPECT_THAT(std::string(status.message()),
               ::testing::HasSubstr("Mixed remote node IDs in one call"));
   ExpectNoSideEffects({});
+}
+
+// Storage topology on the coordinator comes from BackendConfig::parallelism,
+// the same config every KVCacheManager receives.
+class SecondaryBackendTopologyTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    scratch_dir_ = std::string(testing::TempDir()) + "/" +
+                   ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    std::filesystem::create_directories(scratch_dir_);
+  }
+  void TearDown() override {
+    std::error_code ec;
+    std::filesystem::remove_all(scratch_dir_, ec);
+  }
+
+  BackendConfig PosixConfig() const {
+    BackendConfig cfg;
+    cfg.type = "posix";
+    cfg.SetProperty("root_dir", scratch_dir_);
+    cfg.SetProperty("model_name", "topology_model");
+    return cfg;
+  }
+
+  // Creates a store with tier 1 built from `posix_cfg` and returns the
+  // coordinator-side posix backend.
+  absl::StatusOr<std::shared_ptr<backends::storage::PosixKVCacheStoreBackend>>
+  CreateStorageTier(const BackendConfig& posix_cfg, int num_shards) {
+    BackendConfig host_cfg;
+    host_cfg.type = "HostOffloadBackend";
+    host_cfg.capacity = 16;
+    const BackendConfig configs[] = {host_cfg, posix_cfg};
+    ABSL_ASSIGN_OR_RETURN(
+        store_, KVCacheStore::Create(absl::MakeConstSpan(configs),
+                                     /*capacity=*/16,
+                                     /*global_registry_address=*/"",
+                                     RaidenId{"topology_job", "0", "kv", 0},
+                                     num_shards, /*shard_size_bytes=*/512,
+                                     /*store_server_ip=*/"127.0.0.1"));
+    if (store_->backends().size() != 2) {
+      return absl::InternalError("expected 2 backend tiers");
+    }
+    auto tier =
+        std::dynamic_pointer_cast<backends::storage::PosixKVCacheStoreBackend>(
+            store_->backends()[1]);
+    if (tier == nullptr) {
+      return absl::InternalError("tier 1 is not a PosixKVCacheStoreBackend");
+    }
+    return tier;
+  }
+
+  std::string scratch_dir_;
+  std::unique_ptr<KVCacheStore> store_;
+};
+
+TEST_F(SecondaryBackendTopologyTest, UsesParallelismTpSize) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.tp_rank = 1;  // Worker-only; ignored by the coordinator.
+  cfg.parallelism.tp_size = 2;
+  TF_ASSERT_OK_AND_ASSIGN(auto tier,
+                          CreateStorageTier(cfg, /*num_shards=*/4));
+  auto mapper = tier->storage_backend()->mapper();
+  ASSERT_NE(mapper, nullptr);
+  EXPECT_EQ(mapper->tp_size(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, mapper->MapKey("hash"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp2_r0/"));
+}
+
+// num_shards counts controller buffer shards, not storage writers (e.g.
+// PCP=8, TP=1), so an unset tp_size defaults to 1, matching KVCacheManager.
+TEST_F(SecondaryBackendTopologyTest, DefaultsToOneWithoutParallelism) {
+  TF_ASSERT_OK_AND_ASSIGN(auto tier,
+                          CreateStorageTier(PosixConfig(), /*num_shards=*/4));
+  EXPECT_EQ(tier->storage_backend()->mapper()->tp_size(), 1);
+}
+
+TEST_F(SecondaryBackendTopologyTest, IgnoresCallerTpSizeProperty) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 2;
+  cfg.SetProperty("tp_size", "8");
+  TF_ASSERT_OK_AND_ASSIGN(auto tier,
+                          CreateStorageTier(cfg, /*num_shards=*/4));
+  EXPECT_EQ(tier->storage_backend()->mapper()->tp_size(), 2);
+}
+
+// The store no longer injects root_dir / model_name; PosixBackendOptions
+// owns those defaults.
+TEST_F(SecondaryBackendTopologyTest, PosixDefaultsComeFromBackendOptions) {
+  BackendConfig cfg;
+  cfg.type = "posix";
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 1;
+  TF_ASSERT_OK_AND_ASSIGN(auto tier,
+                          CreateStorageTier(cfg, /*num_shards=*/1));
+  auto posix = std::dynamic_pointer_cast<backends::storage::PosixKVBackend>(
+      tier->storage_backend());
+  ASSERT_NE(posix, nullptr);
+  const backends::storage::PosixBackendOptions& options = posix->options();
+  EXPECT_EQ(options.root_dir, backends::storage::PosixBackendOptions().root_dir);
+  EXPECT_EQ(options.model_name,
+            backends::storage::PosixBackendOptions().model_name);
+}
+
+// The coordinator and a worker given the same BackendConfig resolve the same
+// shard path for that worker's rank.
+TEST_F(SecondaryBackendTopologyTest, CoordinatorAndWorkerShareShardPaths) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.tp_rank = 1;
+  cfg.parallelism.tp_size = 2;
+  TF_ASSERT_OK_AND_ASSIGN(auto tier,
+                          CreateStorageTier(cfg, /*num_shards=*/4));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto coordinator_key,
+      tier->storage_backend()->mapper()->MapKey(
+          "hash", {.parallelism = {.tp_size = 2, .tp_rank = 1}}));
+
+  backends::storage::PosixPathMapper worker_mapper(
+      scratch_dir_, "topology_model", cfg.parallelism.tp_size,
+      cfg.parallelism.tp_rank);
+  TF_ASSERT_OK_AND_ASSIGN(auto worker_key, worker_mapper.MapKey("hash"));
+  EXPECT_EQ(coordinator_key.resolved_key, worker_key.resolved_key);
+  EXPECT_THAT(worker_key.resolved_key, ::testing::HasSubstr("/tp2_r1/"));
 }
 
 }  // namespace

@@ -964,34 +964,26 @@ using ::tpu_raiden::kv_cache::backends::storage::PosixKVCacheStoreBackend;
 REGISTER_KV_CACHE_STORE_BACKEND(
     ::tpu_raiden::kv_cache::backends::storage::kPosixBackendName,
     [](const ::tpu_raiden::kv_cache::BackendConfig& config,
-       ::tpu_raiden::controller::RaidenController* controller)
+       ::tpu_raiden::controller::RaidenController* /*controller*/)
         -> absl::StatusOr<
             std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend>> {
-      int tp_size = static_cast<int>(config.GetIntProperty("tp_size", 0));
-      if (tp_size <= 0 && controller != nullptr) {
-        size_t registered_workers =
-            controller->worker_registry()->GetRegisteredWorkers().size();
-        if (registered_workers > 0) {
-          tp_size = static_cast<int>(registered_workers);
-        } else if (controller->num_shards() > 0) {
-          tp_size = controller->num_shards();
-        }
-      }
-      if (tp_size <= 0) {
-        tp_size = 1;
-      }
+      const int tp_size =
+          config.parallelism.tp_size > 0 ? config.parallelism.tp_size : 1;
 
       // The coordinator resolves block existence through the rank-0 witness
       // (see PosixKVCacheStoreBackend::Lookup), so its mapper is pinned to
       // rank 0. Per-worker tp_rank lives on the worker's own config.
-      auto properties = config.properties;
-      properties["tp_size"] = absl::StrCat(tp_size);
-      properties["tp_rank"] = "0";
+      ::tpu_raiden::kv_cache::BackendConfig resolved = config;
+      ::tpu_raiden::kv_cache::ApplyParallelismToProperties(
+          {.tp_size = tp_size, .tp_rank = 0}, &resolved);
+      ABSL_ASSIGN_OR_RETURN(
+          const PosixBackendOptions options,
+          PosixBackendOptions::FromProperties(resolved.properties));
 
       const std::string backend_name = std::string(
           ::tpu_raiden::kv_cache::backends::storage::kPosixBackendName);
-      auto backend = std::make_shared<PosixKVBackend>(backend_name, properties);
-      const PosixBackendOptions& options = backend->options();
+      auto backend =
+          std::make_shared<PosixKVBackend>(backend_name, resolved.properties);
       return std::make_shared<PosixKVCacheStoreBackend>(
           std::move(backend), backend_name, options.capacity_bytes,
           options.lookup_batch_size,

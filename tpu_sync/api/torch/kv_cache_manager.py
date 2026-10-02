@@ -130,6 +130,10 @@ class KVCacheManager:
         namespace; this flag supplies the per-manager decision. Managers whose
         host buffers are transient staging must leave it off.
       backend_configs: Optional backend configurations (e.g persistent storage).
+        Pass the same BackendConfig objects given to the store's
+        secondary_backend_configs, with `parallelism.tp_rank` set to this
+        worker's rank (required) and `parallelism.tp_size` matching the store
+        (defaults to 1).
     """
     self._admission_summary = None
     impl = _torch_impl()

@@ -418,10 +418,15 @@ TEST_F(PosixBackendTest, NulContainingHashesDoNotAliasOnDisk) {
 }
 
 // ===========================================================================
-// Theme 2: Factory Construction & Auto-Discovery
+// Theme 2: Factory Construction
 // ===========================================================================
 
-TEST_F(StorageDriverTest, FactoryAutoDiscoversTpSize) {
+std::shared_ptr<PosixKVCacheStoreBackend> AsPosixStoreBackend(
+    const std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend>& b) {
+  return std::dynamic_pointer_cast<PosixKVCacheStoreBackend>(b);
+}
+
+TEST_F(StorageDriverTest, FactoryDefaultsTpSizeToOne) {
   ::tpu_sync::rpc::RaidenIdProto unit;
   unit.set_job_name("test_job");
   unit.set_job_replica_id("0");
@@ -433,18 +438,19 @@ TEST_F(StorageDriverTest, FactoryAutoDiscoversTpSize) {
   config.SetProperty("root_dir", scratch_dir_);
   config.SetProperty("model_name", "auto_model");
 
-  // 1. Auto-discovery from RaidenController shards (num_shards = 4)
+  // num_shards counts controller buffer shards (e.g. chips), not storage
+  // writers, so it must not leak into tp_size.
   auto c1_or = ::tpu_raiden::controller::RaidenController::Create(
       unit, /*num_blocks=*/16, /*num_shards=*/4, /*shard_size_bytes=*/512, "");
   ASSERT_TRUE(c1_or.ok());
   auto b1_or = ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
                    .CreateBackend(config, c1_or->get());
-  ASSERT_TRUE(b1_or.ok());
-  auto b1 = std::dynamic_pointer_cast<PosixKVCacheStoreBackend>(*b1_or);
+  ASSERT_TRUE(b1_or.ok()) << b1_or.status();
+  auto b1 = AsPosixStoreBackend(*b1_or);
   ASSERT_NE(b1, nullptr);
-  EXPECT_EQ(b1->storage_backend()->mapper()->tp_size(), 4);
+  EXPECT_EQ(b1->storage_backend()->mapper()->tp_size(), 1);
 
-  // 2. Auto-discovery from registered workers (2 registered workers)
+  // Neither does the registered worker count.
   auto c2_or = ::tpu_raiden::controller::RaidenController::Create(
       unit, /*num_blocks=*/16, /*num_shards=*/1, /*shard_size_bytes=*/512, "");
   ASSERT_TRUE(c2_or.ok());
@@ -459,10 +465,70 @@ TEST_F(StorageDriverTest, FactoryAutoDiscoversTpSize) {
   ASSERT_TRUE((*c2_or)->worker_registry()->RegisterWorker(w1).ok());
   auto b2_or = ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
                    .CreateBackend(config, c2_or->get());
-  ASSERT_TRUE(b2_or.ok());
-  auto b2 = std::dynamic_pointer_cast<PosixKVCacheStoreBackend>(*b2_or);
+  ASSERT_TRUE(b2_or.ok()) << b2_or.status();
+  auto b2 = AsPosixStoreBackend(*b2_or);
   ASSERT_NE(b2, nullptr);
-  EXPECT_EQ(b2->storage_backend()->mapper()->tp_size(), 2);
+  EXPECT_EQ(b2->storage_backend()->mapper()->tp_size(), 1);
+
+  // And without a controller.
+  auto b3_or = ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+                   .CreateBackend(config, /*controller=*/nullptr);
+  ASSERT_TRUE(b3_or.ok()) << b3_or.status();
+  auto b3 = AsPosixStoreBackend(*b3_or);
+  ASSERT_NE(b3, nullptr);
+  EXPECT_EQ(b3->storage_backend()->mapper()->tp_size(), 1);
+}
+
+TEST_F(StorageDriverTest, FactoryUsesParallelismTpSize) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("model_name", "auto_model");
+  config.parallelism = {.tp_size = 3, .tp_rank = 2};
+
+  auto b_or = ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+                  .CreateBackend(config, /*controller=*/nullptr);
+  ASSERT_TRUE(b_or.ok()) << b_or.status();
+  auto b = AsPosixStoreBackend(*b_or);
+  ASSERT_NE(b, nullptr);
+  EXPECT_EQ(b->storage_backend()->mapper()->tp_size(), 3);
+  // The coordinator is pinned to rank 0; parallelism.tp_rank is worker-only.
+  auto posix = std::dynamic_pointer_cast<PosixKVBackend>(b->storage_backend());
+  ASSERT_NE(posix, nullptr);
+  EXPECT_EQ(posix->options().tp_rank, 0);
+}
+
+TEST_F(StorageDriverTest, FactoryIgnoresTpProperties) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("model_name", "auto_model");
+  config.SetProperty("tp_size", "8");
+  config.SetProperty("tp_rank", "5");
+  config.parallelism = {.tp_size = 2, .tp_rank = 1};
+
+  auto b_or = ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+                  .CreateBackend(config, /*controller=*/nullptr);
+  ASSERT_TRUE(b_or.ok()) << b_or.status();
+  auto b = AsPosixStoreBackend(*b_or);
+  ASSERT_NE(b, nullptr);
+  EXPECT_EQ(b->storage_backend()->mapper()->tp_size(), 2);
+  auto posix = std::dynamic_pointer_cast<PosixKVBackend>(b->storage_backend());
+  ASSERT_NE(posix, nullptr);
+  EXPECT_EQ(posix->options().tp_rank, 0);
+}
+
+TEST_F(StorageDriverTest, FactoryReturnsErrorForInvalidOptions) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("model_name", "auto_model");
+  config.SetProperty("metadata_cache_ttl_secs", "0");
+
+  EXPECT_THAT(::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+                  .CreateBackend(config, /*controller=*/nullptr)
+                  .status(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 // ===========================================================================

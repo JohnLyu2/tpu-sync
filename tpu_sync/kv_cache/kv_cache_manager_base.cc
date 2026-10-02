@@ -3562,17 +3562,32 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
       std::string(backends::storage::kPosixBackendName);
   if (GetKVBackend(canonical_name) != nullptr) return false;
 
-  auto props = config.properties;
-  props["tp_size"] = absl::StrCat(config.parallelism.tp_size);
-  props["tp_rank"] = absl::StrCat(config.parallelism.tp_rank);
+  // Storage topology comes only from BackendConfig::parallelism, resolved the
+  // same way as on the coordinator (see ResolveSecondaryBackendTopology).
+  BackendConfig resolved = config;
+  const backends::ParallelismConfig effective = {
+      .tp_size =
+          config.parallelism.tp_size > 0 ? config.parallelism.tp_size : 1,
+      .tp_rank = config.parallelism.tp_rank};
+  ApplyParallelismToProperties(effective, &resolved);
+  if (absl::Status status =
+          backends::storage::PosixBackendOptions::FromProperties(
+              resolved.properties)
+              .status();
+      !status.ok()) {
+    LOG(ERROR) << "[Worker] invalid " << config.type
+               << " backend config; refusing to register: " << status;
+    return false;
+  }
   auto backend = std::make_shared<backends::storage::PosixKVBackend>(
-      canonical_name, props);
+      canonical_name, resolved.properties);
   {
     absl::MutexLock lock(backends_mu_);
     backends_[canonical_name] = std::move(backend);
   }
   LOG(INFO) << "[Worker] Initialized secondary backend " << canonical_name
-            << " at tp_rank " << config.parallelism.tp_rank;
+            << " at tp_rank " << effective.tp_rank << " of tp_size "
+            << effective.tp_size;
   return true;
 }
 
