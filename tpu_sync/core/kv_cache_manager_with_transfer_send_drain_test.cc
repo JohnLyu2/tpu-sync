@@ -851,6 +851,36 @@ TEST(RecvLifecycleTest,
   EXPECT_THAT(FailedRecving(reports), IsEmpty());
 }
 
+TEST(
+    RecvLifecycleTest,
+    FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/120.0);
+  consumer.AddRecv("req_push_died", /*uuid=*/93, /*blocks_per_layer=*/1);
+  ASSERT_EQ(consumer.free_slots(), kSlots - 1);
+
+  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/93));
+
+  // When an incoming push fails (e.g. socket read timeout or peer disconnect),
+  // EndIncomingPush receives the non-OK push status and immediately fails the
+  // session, releasing the staging slot without waiting for the 120s deadline.
+  EXPECT_THAT(
+      consumer.base()->EndIncomingPush(
+          /*uuid=*/93, absl::DeadlineExceededError("Socket read timed out")),
+      ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  // Subsequent incoming pushes for the same uuid are immediately rejected.
+  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/93),
+              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+
+  // CompleteReadRaw immediately reports the request in failed_recving and
+  // retires the session before the 120s deadline.
+  Reports reports = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(reports), IsEmpty());
+  EXPECT_THAT(FailedRecving(reports), ElementsAre("req_push_died"));
+  EXPECT_FALSE(consumer.has_recv(93));
+}
+
 TEST(RecvLifecycleTest,
      NonSessionTransfersSucceedOverBlockTransportWhileStaleUuidIsRejected) {
   constexpr size_t kSliceBytes = 128;

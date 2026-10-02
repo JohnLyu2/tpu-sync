@@ -261,6 +261,19 @@ class MockDelegate : public BlockTransportDelegate {
     return wait_events_;
   }
 
+  absl::Status EndIncomingPush(
+      uint64_t uuid, const absl::Status& status = absl::OkStatus()) override {
+    (void)uuid;
+    absl::MutexLock lock(end_status_mu_);
+    last_end_incoming_push_status_ = status;
+    return absl::OkStatus();
+  }
+
+  absl::Status last_end_incoming_push_status() const {
+    absl::MutexLock lock(end_status_mu_);
+    return last_end_incoming_push_status_;
+  }
+
  private:
   size_t BufferIndex(size_t layer_idx, size_t shard_idx) const {
     return layer_idx * num_shards_ + shard_idx;
@@ -282,6 +295,8 @@ class MockDelegate : public BlockTransportDelegate {
   std::atomic<int> pool_completion_count_{0};
   absl::Mutex wait_events_mu_;
   std::vector<std::tuple<size_t, size_t, int>> wait_events_;
+  mutable absl::Mutex end_status_mu_;
+  absl::Status last_end_incoming_push_status_ ABSL_GUARDED_BY(end_status_mu_);
   mutable absl::Mutex peer_channels_mu_;
   std::shared_ptr<grpc::Channel> default_channel_
       ABSL_GUARDED_BY(peer_channels_mu_);
@@ -1711,6 +1726,7 @@ TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
   uint8_t ack = 0;
   EXPECT_THAT(lib::ReadExactWithTimeout(fd, &ack, 1, absl::Seconds(2)),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
+  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
 
 TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
@@ -1768,6 +1784,7 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
   EXPECT_THAT(lib::ReadExactWithTimeout(fd, &final_ack, 1, absl::Seconds(2)),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
+  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
 
 INSTANTIATE_TEST_SUITE_P(

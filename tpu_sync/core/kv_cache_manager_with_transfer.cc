@@ -219,7 +219,8 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                    : absl::CancelledError(absl::StrCat(
                          "Receive session for uuid=", uuid, " is draining"));
   };
-  hooks.end_incoming_push = [this](uint64_t uuid) -> absl::Status {
+  hooks.end_incoming_push = [this](uint64_t uuid,
+                                   const absl::Status& status) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;
     std::shared_ptr<ReshardReceiveSession> reshard_session;
     {
@@ -235,6 +236,10 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       }
     }
     if (recv_session != nullptr) {
+      if (!status.ok()) {
+        recv_session->DeferUnregisterOnSettle();
+        recv_session->Finish(status);
+      }
       recv_session->EndRecvOp();
       MaybeUnregisterSettledRecv(uuid, *recv_session);
       return !recv_session->GetStatus().ok()

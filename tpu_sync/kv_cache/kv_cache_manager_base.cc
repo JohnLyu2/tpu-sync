@@ -2580,9 +2580,10 @@ absl::Status KVCacheManagerBase::BeginIncomingPush(uint64_t uuid) {
              : absl::OkStatus();
 }
 
-absl::Status KVCacheManagerBase::EndIncomingPush(uint64_t uuid) {
+absl::Status KVCacheManagerBase::EndIncomingPush(uint64_t uuid,
+                                                 const absl::Status& status) {
   return transfer_hooks_.end_incoming_push
-             ? transfer_hooks_.end_incoming_push(uuid)
+             ? transfer_hooks_.end_incoming_push(uuid, status)
              : absl::OkStatus();
 }
 

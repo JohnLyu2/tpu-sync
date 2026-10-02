@@ -187,7 +187,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     std::function<absl::Status(uint64_t uuid)> unregister_active_plan;
     std::function<int64_t()> get_node_id;
     std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
-    std::function<absl::Status(uint64_t uuid)> end_incoming_push;
+    std::function<absl::Status(uint64_t uuid, const absl::Status& status)>
+        end_incoming_push;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -677,7 +678,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
   absl::Status BeginIncomingPush(uint64_t uuid) override;
-  absl::Status EndIncomingPush(uint64_t uuid) override;
+  absl::Status EndIncomingPush(
+      uint64_t uuid, const absl::Status& status = absl::OkStatus()) override;
 
   absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
   GetPoolPushProgressSpec(size_t pool_idx, uint64_t uuid) const override;

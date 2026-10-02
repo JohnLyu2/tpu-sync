@@ -375,7 +375,10 @@ absl::Status BlockTransport::HandleIncomingPush(
   bool incoming_push_lease_held = true;
   absl::Cleanup end_incoming_push = [&]() {
     if (incoming_push_lease_held) {
-      block_delegate_->EndIncomingPush(header.uuid).IgnoreError();
+      block_delegate_
+          ->EndIncomingPush(header.uuid,
+                            absl::InternalError("Incoming push failed"))
+          .IgnoreError();
     }
   };
 
