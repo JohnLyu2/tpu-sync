@@ -1,10 +1,10 @@
 # JAX 0.11.1
 
 - JAX commit: `2d66622450e2c8633cda2307688ef7aa294bd6eb`
-- XLA commit: `f85cfbe2e260907a52bbbe85942462377c8fdb62`
-- rules_ml_toolchain: `73cb731fed3c9215033c5e21e64906f376cf47e8`
+- XLA commit: `dcf304bc5dca1932b99f740b911dbd73631a1a69`
+- rules_ml_toolchain: `73cb731fed3ccf7551beac710bf1c5dbeb8be298`
 - abseil-cpp: `20260526.0`
-- libtpu: `0.0.48`
+- libtpu: `0.0.46.1`
 - `RAIDEN_JAX`: `1101`
 
 ## Patches
