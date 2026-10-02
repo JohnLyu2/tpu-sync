@@ -12,23 +12,26 @@ was read at that commit when the stage was written.
 | `Transfer/Session.lean` | 1 | the settle protocol shared by the session classes: `in_flight_`, `draining_`, `done_`, staging ownership | `Consistent` is preserved by `beginOp`/`finish*`/`endOp` |
 | `PrefillDecode/Receive.lean` | 1–2 | one `TransferReceiveSession` plus the manager's poll and publication; transport block accounting; `IsReadyToComplete` | `Recv.reachable_safe` |
 | `PrefillDecode/Send.lean` | 3 | one `TransferSendSession`: the D2H loop and the H2H push chain against one `in_flight_` | `Send.reachable_safe` |
-| `PrefillDecode/Pipeline.lean` | 4 | `Send` + `Recv` + five layer-indexed memories (prefill HBM → staging → wire → decode staging → decode HBM), engine reclaim, staging reuse; every memory-touching event names its layer, so layers complete in any order at every stage | `Pipeline.reachable_safe`, `Pipeline.attention_safe` |
+| `PrefillDecode/Pipeline.lean` | 4 | `Send` + `Recv` + five layer-indexed memories (prefill HBM → staging → wire → decode staging → decode HBM), engine reclaim, staging reuse, and the multi-request system (`multiSys`) sharing the four pools across requests; every memory-touching event names its layer, so layers complete in any order at every stage | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress`, `Pipeline.reachable_safe`, `Pipeline.attention_safe`, `Pipeline.reachable_can_settle` |
 
 Stage boundaries are the commits on `experimental` (see the README status
 table). Each later stage uses the earlier models as-is: `Pipeline` composes
 `Send.step` and `Recv.step`, adds the memory effect of each event and the
 per-layer guards the counters cannot express (a push waits for *its* layer's
-D2H copy; an H2D dispatch waits for *its* layer to land).
+D2H copy; an H2D dispatch waits for *its* layer to land), and then composes
+transfers across requests sharing the four memory pools (`multiSys`).
 
 ## Proposal properties → theorems
 
-| Proposal (§2) | Where proved | Statement |
+| Property | Where proved | Statement |
 |---|---|---|
-| Publication correctness | `Pipeline.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n` |
-| … decode never runs attention on stale HBM | `Pipeline.attention_safe` | publication is permanent, and the property holds in every state reachable afterwards |
-| Prefill HBM safety (source buffer safety) | `Pipeline.reachable_safe` (`PrefillHbmSafe`); counter form `Send.Drained` | `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`: no D2H copy is being dispatched or reading prefill HBM when the engine frees it |
-| Staging integrity | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `Pipeline.StagingSafe` | `hasStaging = !done`; a released staging has no copy being dispatched or reading/writing it and no push reading/writing it |
-| Termination (no op leak / drain to settle) | `Recv.NoOpLeak`, `Recv.reachable_can_settle`, `Send.NoOpLeak`, `Send.reachable_can_settle` | `0 < inFlight → ∃ e ∈ drainEvents, (step s e).isSome`: every accounted unit of `in_flight_` has an enabled step that advances or retires it, and every reachable state can drain to `done = true ∧ hasStaging = false` in finitely many steps |
+| **System data correctness & attention safety across requests** | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe` | Across any sequence of requests sharing the four memory pools (`multiSys n`), whenever the active request publishes `done_recving`, `decodeHbm = good n` and stays `good n` across all subsequent active and retired-request transitions until `.nextRequest` |
+| **System progress across requests** | `Pipeline.system_progress` | From any reachable multi-request state, a finite trace settles the active transfer, publishes its outcomes, releases all four shared pools (`PoolsReleased`), and enables `.nextRequest` |
+| Publication correctness (single request) | `Pipeline.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n` |
+| Decode HBM safety & quietness | `DecodeHbmSafe`, `decodeHbm_quiet`, `attention_safe` | `recv.published ≠ none → pending = 0 ∧ retired = issued`, which proves `s'.decodeHbm = s.decodeHbm` for every subsequent transition (`decodeHbm_quiet`) and `s'.decodeHbm = good n` across any post-publication trace (`attention_safe`) |
+| Prefill HBM safety & quietness | `PrefillHbmSafe`, `prefillHbm_quiet`, `prefillHbm_quiet_step` | `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`, which disables `d2hReady` and proves `s'.prefillHbm = s.prefillHbm` after reclaim |
+| Staging integrity & quietness | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `StagingSafe`, `prefillStaging_quiet`, `decodeStaging_quiet` | `hasStaging = !done`; once a staging buffer is released (`hasStaging = false`), `StagingSafe` proves no subsequent transfer step can modify that staging buffer or copy from it |
+| Termination (no op leak / drain to settle) | `Recv.NoOpLeak`, `Recv.reachable_can_settle`, `Send.NoOpLeak`, `Send.reachable_can_settle`, `Pipeline.NoOpLeak`, `Pipeline.reachable_can_settle` | `0 < inFlight → ∃ e ∈ drainEvents, (step s e).isSome`: every accounted unit of `in_flight_` has an enabled step that advances or retires it, and every reachable state can drain to `done = true ∧ hasStaging = false`, publish both outcomes (`published ≠ none`), and reclaim prefill HBM (`reclaimed = true`) in finitely many steps |
 
 Counter-level forms of publication are proved per side as well
 (`Recv.Publication`: `done_recving → every H2D callback ran OK`;

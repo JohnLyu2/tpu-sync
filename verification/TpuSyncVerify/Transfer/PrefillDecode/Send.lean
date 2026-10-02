@@ -944,6 +944,30 @@ theorem h2hDone_guard {s s' : Send} {ok : Bool} (hs : step s (.h2hDone ok) = som
   · assumption
   · cases hs
 
+theorem step_d2hIssued_le {s s' : Send} {e : Ev} (hs : step s e = some s') :
+    s.d2hIssued ≤ s'.d2hIssued := by
+  cases e <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; exact Nat.le_refl _)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> simp)
+
+theorem step_h2hRetired {s s' : Send} {e : Ev} (hs : step s e = some s')
+    (he : ∀ ok, e ≠ .h2hDone ok) : s'.h2hRetired = s.h2hRetired := by
+  cases e <;> (try exact absurd rfl (he _)) <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> rfl)
+
+theorem h2hDone_h2hRetired {s s' : Send} {ok : Bool} (hs : step s (.h2hDone ok) = some s') :
+    s'.h2hRetired = s.h2hRetired + 1 := by
+  simp only [step, h2hDone] at hs
+  split at hs
+  · (repeat' split at hs) <;> cases hs <;>
+      simp only [endOp, finish, Lifecycle.finishOnceLocked_inFlight] <;> (repeat' split) <;> rfl
+  · cases hs
+
 /-! ## Replay and bounded search
 
 Concrete traces, checked by `decide`, that document the behaviours the model

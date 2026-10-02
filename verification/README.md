@@ -30,7 +30,7 @@ Citations are to tpu-sync `01ffa3d`.
 | `Transfer/Session` | settle protocol invariant (`Consistent`) | proved | [prefill_decode.md](docs/transfer/prefill_decode.md) |
 | `Transfer/PrefillDecode/Receive` | settle safety, no retired callback, staging integrity, prompt settle, readiness soundness, publication (counter form), no op leak / termination | proved; bounded search + mutants | same |
 | `Transfer/PrefillDecode/Send` | settle safety, drained, staging integrity, prompt settle, no underflow, publication (counter form), no op leak / termination | proved; bounded search + mutants | same |
-| `Transfer/PrefillDecode/Pipeline` | **publication correctness**, **attention safety**, **prefill HBM safety**, **staging safety**; layer-indexed, so layers complete in any order at every stage | proved; bounded search + mutants | same |
+| `Transfer/PrefillDecode/Pipeline` | **system data correctness & attention safety across requests** (`system_data_correct`, `system_attention_safe`), **system progress across requests** (`system_progress`), proved from single-request **publication correctness**, **decode HBM safety** (`DecodeHbmSafe`, `decodeHbm_quiet`), **prefill HBM safety** (`PrefillHbmSafe`, `prefillHbm_quiet`), **staging safety** (`StagingSafe`, `prefillStaging_quiet`, `decodeStaging_quiet`), and **no op leak / termination** (`NoOpLeak`, `reachable_can_settle`); layer-indexed, so layers complete in any order at every stage | proved; bounded search + mutants | same |
 | `Controller/ReadRemote` | `NoWriteAfterRelease` | shipping code: counterexamples (shapes A, B); deferred-settle fix: safe by exhaustive search | [read_remote.md](docs/controller/read_remote.md) |
 
 Outcome so far: no bugs in the prefill-to-decode transfer path at `01ffa3d`

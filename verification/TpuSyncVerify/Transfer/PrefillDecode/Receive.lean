@@ -756,6 +756,40 @@ theorem h2dReady_spec {s s' : Recv} (hs : step s .h2dReady = some s') :
   · cases hs; exact ⟨‹_›, rfl⟩
   · cases hs
 
+theorem step_pending_issued {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (hb : e ≠ .h2dBegin) (hi : ∀ ok, e ≠ .h2dIssue ok) :
+    s'.pending = s.pending ∧ s'.issued = s.issued := by
+  cases e <;> (try exact absurd rfl hb) <;> (try exact absurd rfl (hi _)) <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩)
+    | (cases hs <;> (repeat' split) <;> exact ⟨rfl, rfl⟩)
+
+theorem h2dBegin_spec {s s' : Recv} (hs : step s .h2dBegin = some s') :
+    s.issued + s.pending < s.numLayers ∧ s'.pending = s.pending + 1 ∧ s'.issued = s.issued := by
+  simp only [step, h2dBegin] at hs
+  split at hs
+  · simp only [Option.map_eq_some_iff] at hs
+    obtain ⟨l, _, rfl⟩ := hs
+    exact ⟨‹_›, rfl, rfl⟩
+  · cases hs
+
+theorem h2dIssue_spec {s s' : Recv} {ok : Bool} (hs : step s (.h2dIssue ok) = some s') :
+    s.pending ≠ 0 ∧ s'.pending = s.pending - 1 ∧
+    s'.issued = (if s.life.done || s.life.draining || !ok then s.issued else s.issued + 1) := by
+  simp only [step, h2dIssue] at hs
+  split at hs
+  · cases hs
+  · rename_i hp
+    split at hs
+    · rename_i hc
+      cases hs; exact ⟨hp, rfl, by simp [hc]⟩
+    · rename_i hc
+      cases ok with
+      | false => cases hs; exact ⟨hp, rfl, by simp⟩
+      | true =>
+        cases hs
+        exact ⟨hp, rfl, by simp_all⟩
+
 /-! ## Replay and bounded search
 
 Concrete traces, checked by `decide`, that document the behaviours the model
