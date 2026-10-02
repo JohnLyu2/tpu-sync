@@ -29,7 +29,6 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <functional>
 #include <future>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -724,17 +723,19 @@ RaidenBlockId PosixKVCacheStoreBackend::MakeSharedStorageBlock() const {
 absl::StatusOr<std::vector<BlockKey>> PosixKVCacheStoreBackend::MapShardKeys(
     const std::string& block_hash) const {
   const std::shared_ptr<BlockKeyMapper> mapper = storage_backend_->mapper();
+  const int tp_size = mapper->tp_size();
+  if (tp_size < 1) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid mapper tp_size: ", tp_size));
+  }
   // In secondary storage each block is partitioned across all TP workers
-  // (r0..rN-1), one file per shard. Only the rank-0 shard is required today:
-  // its presence is taken as a witness for the whole block.
-  // TODO: require every rank in [0, tp_size) for a consistent lookup based on
-  // all shards' availability in the storage layer.
-  constexpr int kRequiredRanks[] = {0};
+  // (r0..rN-1), one file per shard. The block is available only if every
+  // shard is present.
   std::vector<BlockKey> keys;
-  keys.reserve(std::size(kRequiredRanks));
-  for (const int rank : kRequiredRanks) {
+  keys.reserve(tp_size);
+  for (int rank = 0; rank < tp_size; ++rank) {
     const backends::KeyMappingOptions lookup_opts{
-        .parallelism = {.tp_size = mapper->tp_size(), .tp_rank = rank},
+        .parallelism = {.tp_size = tp_size, .tp_rank = rank},
     };
     ABSL_ASSIGN_OR_RETURN(BlockKey key,
                           mapper->MapKey(block_hash, lookup_opts));
@@ -811,9 +812,7 @@ std::vector<bool> PosixKVCacheStoreBackend::ProbeExists(
 //     <root>/<model>/tp<tp_size>_r<r>/<l1>/<l2>/<hex(hash)>.bin
 //   so one block hash maps to up to tp_size storage keys ("shard keys").
 //   MapShardKeys(hash) returns the shard keys that must ALL exist for the block
-//   to count as available. Today that is only the rank-0 shard (a witness for
-//   the whole block).
-//   TODO: change MapShardKeys to report all ranks' keys.
+//   to count as available: one key per rank in [0, tp_size).
 //
 // Metadata cache contents.
 //   When enabled (metadata_cache_max_entries != 0), the cache maps one shard
@@ -828,7 +827,7 @@ std::vector<bool> PosixKVCacheStoreBackend::ProbeExists(
 //   fresh.
 //
 // Algorithm. i = block index (block_hashes[i], request order); j = shard
-// index within MapShardKeys(block_hashes[i]) (today always 0: rank 0).
+// index within MapShardKeys(block_hashes[i]) (j = rank).
 //   Phase 0 (map):   shard_keys[i] = MapShardKeys(block_hashes[i]), in order.
 //                    The first hash that cannot be mapped ends the prefix.
 //   Phase 1 (cache): mark each shard key present if it has a fresh cache
@@ -936,7 +935,8 @@ void PosixKVCacheStoreBackend::Delete(
     return;
   }
   std::vector<std::string> resolved_keys;
-  resolved_keys.reserve(block_hashes.size());
+  resolved_keys.reserve(block_hashes.size() *
+                        std::max(1, storage_backend_->mapper()->tp_size()));
   for (const std::string& hash : block_hashes) {
     absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
     if (!keys.ok()) continue;  // Never cached; keep invalidating the rest.
@@ -970,9 +970,9 @@ REGISTER_KV_CACHE_STORE_BACKEND(
       const int tp_size =
           config.parallelism.tp_size > 0 ? config.parallelism.tp_size : 1;
 
-      // The coordinator resolves block existence through the rank-0 witness
-      // (see PosixKVCacheStoreBackend::Lookup), so its mapper is pinned to
-      // rank 0. Per-worker tp_rank lives on the worker's own config.
+      // The coordinator probes every rank explicitly (see
+      // PosixKVCacheStoreBackend::MapShardKeys), so its default mapper rank is
+      // pinned to 0. Per-worker tp_rank lives on the worker's own config.
       ::tpu_raiden::kv_cache::BackendConfig resolved = config;
       ::tpu_raiden::kv_cache::ApplyParallelismToProperties(
           {.tp_size = tp_size, .tp_rank = 0}, &resolved);

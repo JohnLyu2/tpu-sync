@@ -286,13 +286,13 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   };
 
   // Returns the storage keys ("shard keys") that must all exist for ONE block,
-  // `block_hash`, to be available.
+  // `block_hash`, to be available: one key per rank in [0, tp_size).
   absl::StatusOr<std::vector<BlockKey>> MapShardKeys(
       const std::string& block_hash) const;
 
   // Indexing: i = position of the block in the Lookup request
   // (block_hashes[i]); j = position of the shard key within
-  // MapShardKeys(block_hashes[i]) (today j is always 0, the rank-0 shard).
+  // MapShardKeys(block_hashes[i]) (j = rank).
   // Returns fresh[i][j] = true iff shard_keys[i][j] has a fresh cache entry.
   // Expired entries are erased and reported as absent.
   std::vector<std::vector<bool>> CachedFresh(

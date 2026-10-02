@@ -1469,8 +1469,15 @@ class MetadataCacheTest : public StorageDriverTest {
       std::ofstream file(path, std::ios::binary);
       file << "data";
     }
-    void RemoveBlock(const std::string& hash) {
-      ASSERT_TRUE(fs::remove(PathOf(hash))) << hash;
+    void RemoveBlock(const std::string& hash, int tp_rank = 0) {
+      ASSERT_TRUE(fs::remove(PathOf(hash, tp_rank))) << hash << " r" << tp_rank;
+    }
+    // Writes the shard of every rank in [0, tp_size).
+    void CreateAllShards(const std::string& hash) {
+      for (int r = 0; r < mapper->tp_size(); ++r) CreateBlock(hash, r);
+    }
+    void RemoveAllShards(const std::string& hash) {
+      for (int r = 0; r < mapper->tp_size(); ++r) RemoveBlock(hash, r);
     }
     size_t LookupCount(const std::vector<std::string>& hashes) {
       absl::StatusOr<BlockSliceList> result = store->Lookup(hashes);
@@ -1596,17 +1603,96 @@ TEST_F(MetadataCacheTest, CachedHitSkipsStorageProbe) {
   EXPECT_EQ(env.backend->batch_calls(), 0);
 }
 
-TEST_F(MetadataCacheTest, OnlyTheRankZeroShardIsRequiredAndCached) {
+TEST_F(MetadataCacheTest, NoSingleRankShardIsAWitness) {
   Env env = CreateEnv(Enabled(), /*batch_size=*/4, /*tp_size=*/2);
-  // The rank-1 shard alone does not make the block available.
   env.CreateBlock("a", /*tp_rank=*/1);
   EXPECT_EQ(env.LookupCount({"a"}), 0);
-  EXPECT_EQ(env.store->metadata_cache_size(), 0);
+  env.RemoveBlock("a", /*tp_rank=*/1);
+  env.CreateBlock("b", /*tp_rank=*/0);
+  EXPECT_EQ(env.LookupCount({"b"}), 0);
+}
 
-  // The rank-0 shard does, and it is the one shard entry cached per block.
-  env.CreateBlock("a", /*tp_rank=*/0);
+TEST_F(MetadataCacheTest, AllRankShardsAreRequiredAndCached) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/8, /*tp_size=*/4);
+  for (int r : {0, 1, 2}) env.CreateBlock("a", r);
+  // Rank 3 has not landed yet: miss, but the 3 confirmed shards are cached.
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.store->metadata_cache_size(), 3);
+
+  // Once rank 3 lands, only that shard is probed.
+  env.CreateBlock("a", /*tp_rank=*/3);
+  env.backend->ResetCounts();
   EXPECT_EQ(env.LookupCount({"a"}), 1);
-  EXPECT_EQ(env.store->metadata_cache_size(), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 4);
+
+  // Every shard is now cached.
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+}
+
+TEST_F(MetadataCacheTest, DirectStorageLookupRequiresAllShards) {
+  Env env = CreateEnv(MetadataCacheOptions{}, /*batch_size=*/16,
+                      /*tp_size=*/4);
+  env.CreateAllShards("a");
+  for (int r : {0, 1, 3}) env.CreateBlock("b", r);  // Rank 2's write failed.
+  env.CreateAllShards("c");
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result,
+                          env.store->Lookup({"a", "b", "c"}));
+  ASSERT_EQ(result.size(), 1);
+  EXPECT_EQ(result[0].first, "a");
+  EXPECT_EQ(env.store->metadata_cache_size(), 0);
+}
+
+TEST_F(MetadataCacheTest, ShardsSplitAcrossChunksStopAtMissingShard) {
+  // 4 shards per block in chunks of 3: block boundaries do not align with
+  // chunk boundaries.
+  Env env = CreateEnv(MetadataCacheOptions{}, /*batch_size=*/3,
+                      /*tp_size=*/4);
+  env.CreateAllShards("a");
+  env.CreateAllShards("b");
+  for (int r : {0, 2, 3}) env.CreateBlock("c", r);  // c is missing rank 1.
+  env.CreateAllShards("d");
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result,
+                          env.store->Lookup({"a", "b", "c", "d"}));
+  ASSERT_EQ(result.size(), 2);
+  EXPECT_EQ(result[0].first, "a");
+  EXPECT_EQ(result[1].first, "b");
+  // Flat shard list: a0 a1 a2 | a3 b0 b1 | b2 b3 c0 | c1(absent) c2 c3 | ...
+  // The 4th chunk holds the absent c1, so d's shards are never probed.
+  EXPECT_EQ(env.backend->batch_calls(), 4);
+  EXPECT_EQ(env.backend->probed_keys(), 12);
+}
+
+TEST_F(MetadataCacheTest, PartialCacheHitProbesOnlyMissingShards) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/4, /*tp_size=*/2);
+  env.CreateBlock("a", /*tp_rank=*/0);
+  EXPECT_EQ(env.LookupCount({"a"}), 0);  // Caches r0.
+  ASSERT_EQ(env.store->metadata_cache_size(), 1);
+
+  // r0 is still fresh in the cache even after the file is gone; r1 only on
+  // storage. The block is answered from both.
+  env.RemoveBlock("a", /*tp_rank=*/0);
+  env.CreateBlock("a", /*tp_rank=*/1);
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 1);
+}
+
+TEST_F(MetadataCacheTest, DeleteInvalidatesAllRankShards) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/8, /*tp_size=*/3);
+  env.CreateAllShards("a");
+  env.CreateAllShards("b");
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
+  EXPECT_EQ(env.store->metadata_cache_size(), 6);
+
+  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->metadata_cache_size(), 3);
+
+  // a's rank-2 shard is gone; the re-probe sees it.
+  env.RemoveBlock("a", /*tp_rank=*/2);
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 0);
 }
 
 TEST_F(MetadataCacheTest, StaleEntryServedWithinTtlThenExpires) {

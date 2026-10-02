@@ -7980,6 +7980,46 @@ TEST_F(SecondaryBackendTopologyTest, CoordinatorAndWorkerShareShardPaths) {
   EXPECT_THAT(worker_key.resolved_key, ::testing::HasSubstr("/tp2_r1/"));
 }
 
+// Writes the shard file worker `tp_rank` would write for `hash`.
+void WriteWorkerShard(const std::string& root, const std::string& model,
+                      int tp_size, int tp_rank, const std::string& hash) {
+  backends::storage::PosixPathMapper mapper(root, model, tp_size, tp_rank);
+  absl::StatusOr<backends::BlockKey> key = mapper.MapKey(hash);
+  ASSERT_TRUE(key.ok()) << key.status();
+  std::filesystem::create_directories(
+      std::filesystem::path(key->resolved_key).parent_path());
+  std::ofstream(key->resolved_key) << "shard";
+}
+
+TEST_F(SecondaryBackendTopologyTest, LookupRequiresEveryWorkerShard) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.tp_size = 2;
+  TF_ASSERT_OK_AND_ASSIGN(auto tier,
+                          CreateStorageTier(cfg, /*num_shards=*/4));
+  WriteWorkerShard(scratch_dir_, "topology_model", 2, 0, "h");
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList partial, store_->Lookup({"h"}));
+  EXPECT_TRUE(partial.empty());
+
+  WriteWorkerShard(scratch_dir_, "topology_model", 2, 1, "h");
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList full, store_->Lookup({"h"}));
+  ASSERT_EQ(full.size(), 1);
+  EXPECT_EQ(full[0].second.status, BlockStatus::SHARED_STORAGE);
+}
+
+// parallelism.tp_size, not num_shards, sets how many shards are probed.
+TEST_F(SecondaryBackendTopologyTest, LookupProbesTpSizeRanksNotNumShards) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.tp_size = 2;
+  TF_ASSERT_OK_AND_ASSIGN(auto tier,
+                          CreateStorageTier(cfg, /*num_shards=*/4));
+  for (int r = 0; r < 2; ++r) {
+    WriteWorkerShard(scratch_dir_, "topology_model", 2, r, "h");
+  }
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result, store_->Lookup({"h"}));
+  ASSERT_EQ(result.size(), 1);
+  EXPECT_EQ(result[0].second.status, BlockStatus::SHARED_STORAGE);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden
