@@ -66,8 +66,9 @@ def settleLocked (l : Lifecycle) : Lifecycle :=
     { l with hasStaging := false, done := true }
   else l
 
-/-- The receiver's `FinishLocked(status)` (`recv.cc:361-371`). Idempotent: a
-second call only records the status. -/
+/-- The receiver's `FinishLocked(status)` (`recv.cc:361-371`): `draining` is
+sticky and the first error wins (`ok = false` flips `statusOk` even if already
+draining). -/
 def finishLocked (ok : Bool) (l : Lifecycle) : Lifecycle :=
   let l := if ok = false ∧ l.statusOk = true then { l with statusOk := false } else l
   if l.draining = true then l else settleLocked { l with draining := true }

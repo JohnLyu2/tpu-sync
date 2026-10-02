@@ -28,9 +28,9 @@ settles with the verdict (`:1169-1210`). A detached deadline thread
 `Settle` is idempotent (`:902-909`): the first call sets the promise.
 
 The caller treats a settled promise as "no copy touches my blocks any more":
-the header comment at `:1134-1138` says the staging blocks go back to the
-pool once the read settles, success or failure, and the device blocks are
-the caller's to refill.
+the comment at `:1134-1138` says the staging blocks go back to the pool once
+the read settles, success or failure, and the device blocks are the caller's
+to refill.
 
 ## State and events
 

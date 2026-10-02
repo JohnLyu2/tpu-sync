@@ -45,7 +45,7 @@ private def search (step : S → Ev → Option S) (events : List Ev) (bad : S �
       else search step events bad fuel fresh (seen ++ fresh.map (·.1))
 
 /-- Search `sys` for a state satisfying `bad`, trying every event in `events`
-at every state, to a depth of `fuel` events. -/
+at every state, for `fuel` BFS levels (traces of up to `fuel - 1` events). -/
 def check (sys : System S Ev) (events : List Ev) (bad : S → Bool) (fuel : Nat := 32) :
     Result Ev :=
   search sys.step events bad fuel [(sys.init, [])] [sys.init]

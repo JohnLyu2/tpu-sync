@@ -50,11 +50,11 @@ Ghost fields have no single C++ variable. They record where each unit of
 | `pushBegin`    | `TryBeginRecvOp` (`.h:109-114`) from `begin_incoming_push` (`mgr.cc:191-215`), called at `bt.cc:350` |
 | `pushEnd`      | `EndRecvOp` from `end_incoming_push` (`mgr.cc:216-239`), called at `bt.cc:586` |
 | `pullReply ok` | `on_response` of `ExecutePullRequest` (`.cc:476-505`): `Finish` on error, then the `absl::Cleanup` ends the op. Also the fault-injected `Finish(status); EndRecvOp()` in `StartRead` (`mgr.cc:886-892`) |
-| `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`.cc:580-592`), from `OnLayerReceived` (`bt.cc:575`, `mgr.cc:130-146`) |
+| `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`.cc:580-592`), from `OnLayerReceived` (`bt.cc:576`, `mgr.cc:130-146`) |
 | `h2dIssue ok`  | `ExecuteLayerH2d` from the re-check on (`.cc:601-632`) |
 | `h2dReady`     | the device finishes a copy: its future becomes `IsReady()` |
 | `h2dDone ok`   | H2D completion callback (`.cc:635-693`) |
-| `netAccount`   | `OnBlocksReceived` (`.cc:525-573`) via `bt.cc:583-584` / `mgr.cc:1642-1659`: accounts a layer's blocks, may set `network_completed_`, and finishes the session if every layer is also complete (`.cc:556-563`) |
+| `netAccount`   | `OnBlocksReceived` (`.cc:525-573`) via `bt.cc:583-584` / `mgr.cc:1638-1659`: accounts a layer's blocks, may set `network_completed_`, and finishes the session if every layer is also complete (`.cc:556-563`) |
 | `pollReady`    | `CompleteReadRaw` sees `IsReadyToComplete()` and calls `Finish()` (`mgr.cc:956-960`) |
 | `cancel`       | any `Finish(error)` from outside the session: deadline (`mgr.cc:961-968`), shutdown (`mgr.cc:335-350`), plan unregister (`mgr.cc:692`) |
 | `publish`      | `CompleteReadRaw` moves a settled session into `done_recving_` or `failed_recving_` by its status and drops it (`mgr.cc:971-978`) |
@@ -591,8 +591,8 @@ theorem reachable_safe {n : Nat} {s : Recv}
 
 /-! ## Frame lemmas
 
-What each event leaves alone, and exact specs for the two events the
-composed transfer model (`Pipeline.lean`) attaches memory effects to. Each is
+What each event leaves alone, and the exact spec for `h2dReady`, which the
+composed transfer model (`Pipeline.lean`) attaches a memory effect to. Each is
 proved by unfolding `step` for every event and splitting every branch. -/
 
 /-- Unfold `step` for a known event and split every branch, leaving `hs` as
@@ -622,23 +622,7 @@ theorem step_published_mono {s s' : Recv} {e : Ev} {b : Bool} (hs : step s e = s
     | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; simpa using hp)
     | (cases hs <;> (repeat' split) <;> simp_all)
 
-/-- Only `h2dBegin` claims a new layer for the device. -/
-theorem step_issued_pending {s s' : Recv} {e : Ev} (hs : step s e = some s') (he : e ≠ .h2dBegin) :
-    s'.issued + s'.pending ≤ s.issued + s.pending := by
-  cases e <;> (try exact absurd rfl he) <;> recv_cases hs <;>
-  first
-    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; simp)
-    | (cases hs <;> (repeat' split) <;> simp <;> omega)
-
-theorem h2dBegin_issued_pending {s s' : Recv} (hs : step s .h2dBegin = some s') :
-    s'.issued + s'.pending = s.issued + s.pending + 1 := by
-  simp only [step, h2dBegin] at hs
-  split at hs
-  · simp only [Option.map_eq_some_iff] at hs
-    obtain ⟨l, _, rfl⟩ := hs; simp; omega
-  · cases hs
-
-/-- Only `h2dReady` lands a layer in HBM. -/
+/-- Only `h2dReady` increments `ready`. -/
 theorem step_ready {s s' : Recv} {e : Ev} (hs : step s e = some s') (he : e ≠ .h2dReady) :
     s'.ready = s.ready := by
   cases e <;> (try exact absurd rfl he) <;> recv_cases hs <;>

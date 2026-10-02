@@ -28,7 +28,7 @@ exhausts it: `.safe` here is a proof, not a bound.
 
 `NoWriteAfterRelease`: the caller never reuses the destination blocks while a
 pull into them is in flight (issued and not done). The caller is entitled to
-this by the header comment at `:1134-1138`.
+this by the comment at `:1134-1138`.
 
 ## Results
 

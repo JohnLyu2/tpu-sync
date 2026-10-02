@@ -26,7 +26,7 @@ D2H copy; an H2D dispatch waits for *its* layer to land).
 |---|---|---|
 | Publication correctness | `Pipeline.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n` |
 | … decode never runs attention on stale HBM | `Pipeline.attention_safe` | publication is permanent, and the property holds in every state reachable afterwards |
-| Source buffer safety | `Pipeline.reachable_safe` (`SourceBufferSafe`); counter form `Send.Drained` | `reclaimed → d2hRetired = d2hIssued`: no D2H copy is reading the prefill blocks when the engine frees them |
+| Prefill HBM safety (source buffer safety) | `Pipeline.reachable_safe` (`PrefillHbmSafe`); counter form `Send.Drained` | `reclaimed → d2hRetired = d2hIssued`: no D2H copy is reading prefill HBM when the engine frees it |
 | Staging integrity | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `Pipeline.StagingSafe` | `hasStaging = !done`; a released staging has no copy writing it and no push reading it |
 | Termination | not in scope (see Future work F1) | — |
 
@@ -58,8 +58,8 @@ should know about:
 * **Send A3** — the send model counts copies and pushes without naming
   layers; sound for `Send` alone because it has no per-layer state. The
   pipeline, which does, does not inherit this: its events carry the layer
-  and its ghost sets (`d2hDoneL`, `readyL`, …) record which layers have
-  passed each stage, with `cnt_d2hDone` / `cnt_ready` tying two of them to
+  and its ghost sets (`d2hReadyL`, `h2dReadyL`, …) record which layers have
+  passed each stage, with `cnt_d2hReady` / `cnt_h2dReady` tying two of them to
   the session counters.
 * **Send A5** — no consumer `Ack`: `HandleAck → AckSend → Finish()` has no
   non-test caller at `01ffa3d`, so it is not an event.
@@ -68,7 +68,8 @@ should know about:
   argument (the pushed cell cannot change between issue and callback) and
   the one real trace shape this leaves out (layer landed, callback fails).
 * **Pipeline A4** — the engine contract: decode reads only after
-  `done_recving`, prefill frees only after `done_sending`.
+  `done_recving`, prefill frees only after `poll_stats()` reports the send
+  (`done_sending` or `failed_recving`).
 
 ## Evidence the proofs are not vacuous
 
@@ -91,8 +92,11 @@ Traces (all `decide`):
 
 Bounded searches (`#guard … = .outOfFuel`): `Recv` from both initial states
 (fuel 10, n = 2), `Send` (fuel 12, n = 2), `Pipeline` from `init 1` and from
-`afterProducer` (fuel 10), and from `afterProducer2` — the two-layer producer
-that finished out of order — over every consumer interleaving (fuel 7, n = 2).
+`afterProducer` (fuel 10), from `afterProducer2` — the two-layer producer that
+finished out of order — over the initial consumer landing and dispatch steps
+(fuel 5, n = 2), and from `afterDispatch2` — after out-of-order landing and
+dispatch of both layers — over all H2D completion, callback, publication,
+cancellation and staging-reuse interleavings (fuel 7, n = 2).
 
 Mutants (each yields a `.counterexample`):
 
