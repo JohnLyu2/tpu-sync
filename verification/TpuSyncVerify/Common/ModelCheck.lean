@@ -33,19 +33,21 @@ private def dedupe (seen : List S) (fresh : List (S × List Ev)) : List (S × Li
 
 private def search (step : S → Ev → Option S) (events : List Ev) (bad : S → Bool) :
     Nat → List (S × List Ev) → List S → Result Ev
-  | 0, _, _ => .outOfFuel
-  | fuel + 1, frontier, seen =>
+  | fuel, frontier, seen =>
     match frontier.find? (fun p => bad p.1) with
     | some (_, tr) => .counterexample tr.reverse
     | none =>
-      let next := frontier.flatMap fun (s, tr) =>
-        events.filterMap fun e => (step s e).map fun s' => (s', e :: tr)
-      let fresh := dedupe seen next
-      if fresh.isEmpty then .safe
-      else search step events bad fuel fresh (seen ++ fresh.map (·.1))
+      match fuel with
+      | 0 => .outOfFuel
+      | fuel + 1 =>
+        let next := frontier.flatMap fun (s, tr) =>
+          events.filterMap fun e => (step s e).map fun s' => (s', e :: tr)
+        let fresh := dedupe seen next
+        if fresh.isEmpty then .safe
+        else search step events bad fuel fresh (seen ++ fresh.map (·.1))
 
 /-- Search `sys` for a state satisfying `bad`, trying every event in `events`
-at every state, for `fuel` BFS levels (traces of up to `fuel - 1` events). -/
+at every state, to a depth of `fuel` events. -/
 def check (sys : System S Ev) (events : List Ev) (bad : S → Bool) (fuel : Nat := 32) :
     Result Ev :=
   search sys.step events bad fuel [(sys.init, [])] [sys.init]

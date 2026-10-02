@@ -49,7 +49,9 @@ and per-layer ghost sets record which layers have passed each stage:
 | `d2hReadyL`   | have finished their D2H copy (`prefillStaging[l]` written) | `send.d2hReady` (`cnt_d2hReady`) |
 | `h2hRetiredL` | have run their push callback | — |
 | `landedL`     | the transport has landed in `decodeStaging` | — |
-| `claimedL`    | `OnLayerReceived` has handed to `ExecuteLayerH2d` | — |
+| `claimedL`    | `OnLayerReceived` has entered `ExecuteLayerH2d` for | — |
+| `h2dPendingL` | are between the first and second lock of `ExecuteLayerH2d` | — |
+| `h2dIssuedL`  | `ExecuteLayerH2d` has dispatched to the device | — |
 | `h2dReadyL`   | have finished their H2D copy (`decodeHbm[l]` written) | `recv.ready` (`cnt_h2dReady`) |
 
 `reclaimed` records that the engine has freed prefill HBM.
@@ -61,8 +63,9 @@ and per-layer ghost sets record which layers have passed each stage:
 | `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`send.cc:380-384`), not on any future |
 | `d2hReady l`            | the D2H copy of layer `l` finishes: `prefillStaging[l] := prefillHbm[l]`. Issued iff `l < d2hIssued` (copies are issued in order) |
 | `h2hDone l ok`          | the push callback for layer `l` (`send.cc:428-445`). Push `l` exists iff `l < h2hIssued` (pushes are issued in order). On success `wire[l] := prefillStaging[l]` |
-| `recv e`                | the receive session's event `e`, no memory effect. `h2dBegin` and `h2dReady` are disabled here |
+| `recv e`                | the receive session's event `e`, no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady` are disabled here |
 | `h2dBegin l`            | `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: once per layer (A1), only after layer `l` landed (`bt.cc:528-530`) |
+| `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:601-632`): dispatches layer `l`'s H2D copy unless draining or failed |
 | `h2dReady l`            | the H2D copy of layer `l` finishes: `decodeHbm[l] := decodeStaging[l]` |
 | `land l`                | the transport writes layer `l` from the wire into `decodeStaging[l]`, inside an accepted push (`bt.cc:350` … `bt.cc:586`) |
 | `reclaim`               | the engine frees prefill HBM once `poll_stats()` has reported the send (`mgr.cc:918-925`) |
@@ -115,10 +118,10 @@ All proved on every reachable state (`reachable_safe`):
   state, so decode HBM stays correct for the rest of the run — in particular
   whenever the engine runs attention over it. Second half of `proposal.md` §2
   *Publication correctness*.
-* **Prefill HBM safety.** `reclaimed → d2hRetired = d2hIssued`: when the
-  engine frees prefill HBM no D2H copy is reading it, and (since the
-  send has settled) none will be issued. `proposal.md` §2 *Source buffer
-  safety*.
+* **Prefill HBM safety.** `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`:
+  when the engine frees prefill HBM no D2H copy is dispatching or reading it,
+  and (since the send has settled) none will be issued. `proposal.md` §2
+  *Source buffer safety*.
 * **Staging safety.** A send whose staging was released has no copy writing
   it and no push reading it; a receive whose staging was released has no push
   writing it and no copy reading it. Safety half of `proposal.md` §2 *Staging
@@ -170,8 +173,12 @@ structure Pipeline where
   h2hRetiredL : List Bool
   /-- ghost: layers the transport has landed -/
   landedL : List Bool
-  /-- ghost: layers handed to `ExecuteLayerH2d` -/
+  /-- ghost: layers `OnLayerReceived` has entered `ExecuteLayerH2d` for -/
   claimedL : List Bool
+  /-- ghost: layers between the first and second lock of `ExecuteLayerH2d` -/
+  h2dPendingL : List Bool
+  /-- ghost: layers `ExecuteLayerH2d` has dispatched to the device -/
+  h2dIssuedL : List Bool
   /-- ghost: layers whose H2D copy has finished -/
   h2dReadyL : List Bool
   reclaimed : Bool := false
@@ -192,6 +199,7 @@ def init (n : Nat) : Pipeline :=
     decodeHbm := List.replicate n .junk,
     d2hReadyL := List.replicate n false, h2hRetiredL := List.replicate n false,
     landedL := List.replicate n false, claimedL := List.replicate n false,
+    h2dPendingL := List.replicate n false, h2dIssuedL := List.replicate n false,
     h2dReadyL := List.replicate n false }
 
 inductive Ev where
@@ -200,6 +208,7 @@ inductive Ev where
   | h2hDone (l : Nat) (ok : Bool)
   | recv (e : Recv.Ev)
   | h2dBegin (l : Nat)
+  | h2dIssue (l : Nat) (ok : Bool)
   | h2dReady (l : Nat)
   | land (l : Nat)
   | reclaim
@@ -245,11 +254,12 @@ def h2hDone (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=
       else { s with send := snd, h2hRetiredL := s.h2hRetiredL.set l true }
   else none
 
-/-- A receive event with no memory effect. `h2dBegin` and `h2dReady` are the
-layer-indexed events below and are disabled here. -/
+/-- A receive event with no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady`
+are the layer-indexed events below and are disabled here. -/
 def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   match e with
   | .h2dBegin => none
+  | .h2dIssue _ => none
   | .h2dReady => none
   | _ => (Recv.step s.recv e).map fun rcv => { s with recv := rcv }
 
@@ -258,12 +268,27 @@ once per layer (A1), after layer `l` landed (`bt.cc:528-530`). -/
 def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
   if s.landedL[l]? = some true ∧ s.claimedL[l]? = some false then
     (Recv.step s.recv .h2dBegin).map fun rcv =>
-      { s with recv := rcv, claimedL := s.claimedL.set l true }
+      { s with recv := rcv,
+               claimedL := s.claimedL.set l true,
+               h2dPendingL := s.h2dPendingL.set l true }
+  else none
+
+/-- `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:601-632`): consumes
+layer `l`'s pending claim from `h2dBegin l` and, if the session is still active
+and dispatch succeeds (`ok = true`), marks layer `l`'s copy as issued. -/
+def h2dIssue (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=
+  if s.h2dPendingL[l]? = some true then
+    (Recv.step s.recv (.h2dIssue ok)).map fun rcv =>
+      { s with recv := rcv,
+               h2dPendingL := s.h2dPendingL.set l false,
+               h2dIssuedL :=
+                 if s.recv.life.done || s.recv.life.draining || !ok then s.h2dIssuedL
+                 else s.h2dIssuedL.set l true }
   else none
 
 /-- The H2D copy of layer `l` finishes: `decodeHbm[l] := decodeStaging[l]`. -/
 def h2dReady (s : Pipeline) (l : Nat) : Option Pipeline :=
-  if s.claimedL[l]? = some true ∧ s.h2dReadyL[l]? = some false then
+  if s.h2dIssuedL[l]? = some true ∧ s.h2dReadyL[l]? = some false then
     (Recv.step s.recv .h2dReady).map fun rcv =>
       { s with recv := rcv,
                decodeHbm := s.decodeHbm.set l (s.decodeStaging.getD l .junk),
@@ -305,6 +330,7 @@ def step (s : Pipeline) : Ev → Option Pipeline
   | .h2hDone l ok => s.h2hDone l ok
   | .recv e => s.recvStep e
   | .h2dBegin l => s.h2dBegin l
+  | .h2dIssue l ok => s.h2dIssue l ok
   | .h2dReady l => s.h2dReady l
   | .land l => s.land l
   | .reclaim => s.reclaim
@@ -322,13 +348,15 @@ def PublicationCorrect (s : Pipeline) : Prop :=
 
 /-- When the engine frees prefill HBM, no D2H copy is reading it. -/
 def PrefillHbmSafe (s : Pipeline) : Prop :=
-  s.reclaimed = true → s.send.d2hRetired = s.send.d2hIssued
+  s.reclaimed = true → s.send.d2hPending = false ∧ s.send.d2hRetired = s.send.d2hIssued
 
 /-- Released staging has no copy writing it and no push or copy reading it. -/
 def StagingSafe (s : Pipeline) : Prop :=
   (s.send.life.hasStaging = false →
-    s.send.d2hRetired = s.send.d2hIssued ∧ s.send.h2hRetired = s.send.h2hIssued) ∧
-  (s.recv.life.hasStaging = false → s.recv.pushes = 0 ∧ s.recv.retired = s.recv.issued)
+    s.send.d2hPending = false ∧ s.send.d2hRetired = s.send.d2hIssued ∧
+    s.send.h2hRetired = s.send.h2hIssued) ∧
+  (s.recv.life.hasStaging = false →
+    s.recv.pushes = 0 ∧ s.recv.pending = 0 ∧ s.recv.retired = s.recv.issued)
 
 def Safe (s : Pipeline) : Prop := PublicationCorrect s ∧ PrefillHbmSafe s ∧ StagingSafe s
 
@@ -366,6 +394,16 @@ theorem mem_of_set_true {L : List Bool} {i j : Nat} (h : (L.set i true)[j]? = so
   by_cases hji : j = i
   · exact Or.inl hji
   · right; rwa [List.getElem?_set_ne (Ne.symm hji)] at h
+
+/-- Removing `i` from a set: membership afterwards implies membership before. -/
+theorem mem_of_set_false {L : List Bool} {i j : Nat} (h : (L.set i false)[j]? = some true) :
+    L[j]? = some true := by
+  by_cases hji : j = i
+  · subst hji
+    by_cases hi : j < L.length
+    · rw [List.getElem?_set_self hi] at h; cases h
+    · rw [List.getElem?_eq_none (by rw [List.length_set]; omega)] at h; cases h
+  · rwa [List.getElem?_set_ne (Ne.symm hji)] at h
 
 theorem set_true_self {L : List Bool} {i : Nat} (hi : L[i]? = some false) :
     (L.set i true)[i]? = some true :=
@@ -438,8 +476,10 @@ structure Inv (s : Pipeline) : Prop where
     ∀ l : Nat, s.d2hReadyL[l]? = some true → s.prefillStaging[l]? = some (.kv l)
   /-- Whatever was delivered for layer `k` is layer `k`. -/
   wire_good : ∀ (k : Nat) (c : Cell), s.wire[k]? = some c → c = .blank ∨ c = .kv k
-  /-- A layer enters `ExecuteLayerH2d` only after it landed. -/
-  claimed_landed : ∀ l : Nat, s.claimedL[l]? = some true → s.landedL[l]? = some true
+  /-- A layer is pending in `ExecuteLayerH2d` only after it landed. -/
+  pending_landed : ∀ l : Nat, s.h2dPendingL[l]? = some true → s.landedL[l]? = some true
+  /-- A layer's H2D copy is issued to the device only after it landed. -/
+  issued_landed : ∀ l : Nat, s.h2dIssuedL[l]? = some true → s.landedL[l]? = some true
   /-- While the receive holds its staging, every landed layer is there. -/
   dstaging_good : s.recv.life.done = false →
     ∀ l : Nat, s.landedL[l]? = some true → s.decodeStaging[l]? = some (.kv l)
@@ -459,6 +499,7 @@ theorem inv_init (n : Nat) : Inv (init n) := by
     by simp [init], by simp [init], by simp [init], fun _ => rfl, by simp [init, Send.init],
     by simp [init, Send.init, countTrue_replicate_false], by simp [init, Send.init],
     fun _ l h => (not_mem_replicate_false h).elim, ?_,
+    fun l h => (not_mem_replicate_false h).elim,
     fun l h => (not_mem_replicate_false h).elim,
     fun _ l h => (not_mem_replicate_false h).elim,
     by simp [init, Recv.initLoad, countTrue_replicate_false],
@@ -492,10 +533,11 @@ theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
     · rw [h.cnt_h2dReady, hready, h.len_h2dReadyL]
     · rw [h.len_h2dReadyL]; exact hk
   · intro hr
-    exact (hsS.2.1 (h.reclaimed_done hr)).2.1
+    obtain ⟨h0, h1, -⟩ := hsS.2.1 (h.reclaimed_done hr)
+    exact ⟨h0, h1⟩
   · intro hst
-    obtain ⟨-, h1, -, -, -, h2⟩ := hsS.2.1 (hsend.life.done_of_released hst)
-    exact ⟨h1, h2⟩
+    obtain ⟨h0, h1, -, -, -, h2⟩ := hsS.2.1 (hsend.life.done_of_released hst)
+    exact ⟨h0, h1, h2⟩
   · intro hst
     have hd := hrecv.life.done_of_released hst
     have h0 := hrecv.life.done_idle hd
@@ -503,7 +545,7 @@ theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
     unfold Recv.Accounted at hacc
     have := hrecv.retired_le
     have := hrecv.ready_le
-    constructor <;> omega
+    refine ⟨by omega, by omega, by omega⟩
 
 /-! ### Preservation, one lemma per kind of effect -/
 
@@ -517,7 +559,7 @@ theorem Inv.send_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
   refine ⟨Send.step_inv h.send hs, h.recv, (Send.step_numLayers hs).trans h.n_send, h.n_recv,
     h.len_pstaging, h.len_wire, h.len_dstaging, h.len_dhbm, h.len_h2dReadyL, h.phbm_good,
     fun hr => Send.step_done_mono hs (h.reclaimed_done hr), ?_, hw, ?_, h.wire_good,
-    h.claimed_landed, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
+    h.pending_landed, h.issued_landed, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
   · show countTrue s.d2hReadyL = snd.d2hReady
     rw [Send.step_d2hReady hs he]; exact h.cnt_d2hReady
   · show snd.life.done = false → ∀ l : Nat, s.d2hReadyL[l]? = some true → s.prefillStaging[l]? = some (.kv l)
@@ -559,7 +601,7 @@ theorem Inv.send_d2hReady {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
   refine ⟨Send.step_inv h.send hs, h.recv, (Send.step_numLayers hs).trans h.n_send, h.n_recv,
     ?_, h.len_wire, h.len_dstaging, h.len_dhbm, h.len_h2dReadyL, h.phbm_good,
     fun hr => Send.step_done_mono hs (h.reclaimed_done hr), ?_, ?_, ?_, h.wire_good,
-    h.claimed_landed, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
+    h.pending_landed, h.issued_landed, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
   · show (s.prefillStaging.set _ _).length = _
     rw [List.length_set]; exact h.len_pstaging
   · show countTrue (s.d2hReadyL.set l true) = s.send.d2hReady + 1
@@ -593,8 +635,8 @@ theorem Inv.send_h2hDone {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
   have h' := h.send_frame hs nofun hw (s.h2hRetiredL.set l true)
   refine ⟨h'.send, h'.recv, h'.n_send, h'.n_recv, h'.len_pstaging, ?_, h'.len_dstaging,
     h'.len_dhbm, h'.len_h2dReadyL, h'.phbm_good, h'.reclaimed_done, h'.cnt_d2hReady,
-    h'.woken_d2hReady, h'.pstaging_good, ?_, h'.claimed_landed, h'.dstaging_good, h'.cnt_h2dReady,
-    h'.dhbm_good⟩
+    h'.woken_d2hReady, h'.pstaging_good, ?_, h'.pending_landed, h'.issued_landed,
+    h'.dstaging_good, h'.cnt_h2dReady, h'.dhbm_good⟩
   · show (s.wire.set _ _).length = _
     rw [List.length_set]; exact h.len_wire
   · show ∀ j (c : Cell), (s.wire.set l _)[j]? = some c → c = .blank ∨ c = .kv j
@@ -606,16 +648,18 @@ theorem Inv.send_h2hDone {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
     · rw [List.getElem?_set_ne (Ne.symm hjl)] at hj
       exact h.wire_good j c hj
 
-/-- A receive event that moves no memory. `x` lets the same lemma serve
-`h2dBegin l`, which only records the claim. -/
+/-- A receive event that moves no memory. `c`, `p` and `i` let the same lemma
+serve `h2dBegin l` and `h2dIssue l ok`, which only update the per-layer dispatch
+sets. -/
 theorem Inv.recv_frame {s : Pipeline} {rcv : Recv} {e : Recv.Ev} (h : Inv s)
-    (hs : Recv.step s.recv e = some rcv) (he : e ≠ .h2dReady) (x : List Bool)
-    (hx : ∀ l : Nat, x[l]? = some true → s.landedL[l]? = some true) :
-    Inv { s with recv := rcv, claimedL := x } := by
+    (hs : Recv.step s.recv e = some rcv) (he : e ≠ .h2dReady) (c p i : List Bool)
+    (hp : ∀ l : Nat, p[l]? = some true → s.landedL[l]? = some true)
+    (hi : ∀ l : Nat, i[l]? = some true → s.landedL[l]? = some true) :
+    Inv { s with recv := rcv, claimedL := c, h2dPendingL := p, h2dIssuedL := i } := by
   refine ⟨h.send, Recv.step_inv h.recv hs, h.n_send, (Recv.step_numLayers hs).trans h.n_recv,
     h.len_pstaging, h.len_wire, h.len_dstaging, h.len_dhbm, h.len_h2dReadyL, h.phbm_good,
-    h.reclaimed_done, h.cnt_d2hReady, h.woken_d2hReady, h.pstaging_good, h.wire_good, hx, ?_, ?_,
-    h.dhbm_good⟩
+    h.reclaimed_done, h.cnt_d2hReady, h.woken_d2hReady, h.pstaging_good, h.wire_good, hp, hi,
+    ?_, ?_, h.dhbm_good⟩
   · show rcv.life.done = false → ∀ l : Nat, s.landedL[l]? = some true → s.decodeStaging[l]? = some (.kv l)
     intro hd
     apply h.dstaging_good
@@ -627,7 +671,7 @@ theorem Inv.recv_frame {s : Pipeline} {rcv : Recv} {e : Recv.Ev} (h : Inv s)
 
 /-- The H2D copy of layer `l` lands in decode HBM. -/
 theorem Inv.recv_h2dReady {s : Pipeline} {rcv : Recv} {l : Nat} (h : Inv s)
-    (hc : s.claimedL[l]? = some true) (hf : s.h2dReadyL[l]? = some false)
+    (hc : s.h2dIssuedL[l]? = some true) (hf : s.h2dReadyL[l]? = some false)
     (hs : Recv.step s.recv .h2dReady = some rcv) :
     Inv { s with recv := rcv,
                  decodeHbm := s.decodeHbm.set l (s.decodeStaging.getD l .junk),
@@ -643,13 +687,13 @@ theorem Inv.recv_h2dReady {s : Pipeline} {rcv : Recv} {l : Nat} (h : Inv s)
   have hk : l < s.numLayers := by
     have := lt_length_of_getElem?_eq hf; rw [h.len_h2dReadyL] at this; exact this
   have hsrc : s.decodeStaging.getD l .junk = .kv l := by
-    rw [List.getD_eq_getElem?_getD, h.dstaging_good hd l (h.claimed_landed l hc)]
+    rw [List.getD_eq_getElem?_getD, h.dstaging_good hd l (h.issued_landed l hc)]
     rfl
   rw [hsrc]
   refine ⟨h.send, Recv.step_inv hr hs, h.n_send, (Recv.step_numLayers hs).trans h.n_recv,
     h.len_pstaging, h.len_wire, h.len_dstaging, ?_, ?_, h.phbm_good, h.reclaimed_done,
-    h.cnt_d2hReady, h.woken_d2hReady, h.pstaging_good, h.wire_good, h.claimed_landed,
-    h.dstaging_good, ?_, ?_⟩
+    h.cnt_d2hReady, h.woken_d2hReady, h.pstaging_good, h.wire_good, h.pending_landed,
+    h.issued_landed, h.dstaging_good, ?_, ?_⟩
   · show (s.decodeHbm.set _ _).length = _
     rw [List.length_set]; exact h.len_dhbm
   · show (s.h2dReadyL.set _ _).length = _
@@ -724,13 +768,14 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
   | recv e =>
     cases e
     case h2dBegin => simp only [step, recvStep] at hs; cases hs
+    case h2dIssue ok => simp only [step, recvStep] at hs; cases hs
     case h2dReady => simp only [step, recvStep] at hs; cases hs
     all_goals
       (try (rename_i ok; cases ok))
       all_goals
         simp only [step, recvStep, Option.map_eq_some_iff] at hs
         obtain ⟨rcv, hrcv, rfl⟩ := hs
-        exact h.recv_frame hrcv nofun _ h.claimed_landed
+        exact h.recv_frame hrcv nofun _ _ _ h.pending_landed h.issued_landed
   | h2dBegin l =>
     simp only [step, h2dBegin] at hs
     split at hs
@@ -738,11 +783,27 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       obtain ⟨hld, hf⟩ := hg
       simp only [Option.map_eq_some_iff] at hs
       obtain ⟨rcv, hrcv, rfl⟩ := hs
-      apply h.recv_frame hrcv nofun
+      apply h.recv_frame hrcv nofun _ _ _ _ h.issued_landed
       intro j hj
       rcases mem_of_set_true hj with rfl | hj
       · exact hld
-      · exact h.claimed_landed j hj
+      · exact h.pending_landed j hj
+    · cases hs
+  | h2dIssue l ok =>
+    simp only [step, h2dIssue] at hs
+    split at hs
+    · rename_i hp
+      simp only [Option.map_eq_some_iff] at hs
+      obtain ⟨rcv, hrcv, rfl⟩ := hs
+      apply h.recv_frame hrcv nofun
+      · intro j hj
+        exact h.pending_landed j (mem_of_set_false hj)
+      · intro j hj
+        split at hj
+        · exact h.issued_landed j hj
+        · rcases mem_of_set_true hj with rfl | hj
+          · exact h.pending_landed j hp
+          · exact h.issued_landed j hj
     · cases hs
   | h2dReady l =>
     simp only [step, h2dReady] at hs
@@ -771,12 +832,15 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
         subst hkv
         refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, ?_, h.len_dhbm,
           h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady, h.woken_d2hReady,
-          h.pstaging_good, h.wire_good, ?_, ?_, h.cnt_h2dReady, h.dhbm_good⟩
+          h.pstaging_good, h.wire_good, ?_, ?_, ?_, h.cnt_h2dReady, h.dhbm_good⟩
         · show (s.decodeStaging.set _ _).length = _
           rw [List.length_set]; exact h.len_dstaging
-        · show ∀ j : Nat, s.claimedL[j]? = some true → (s.landedL.set l true)[j]? = some true
+        · show ∀ j : Nat, s.h2dPendingL[j]? = some true → (s.landedL.set l true)[j]? = some true
           intro j hj
-          exact set_true_of_mem hf (h.claimed_landed j hj)
+          exact set_true_of_mem hf (h.pending_landed j hj)
+        · show ∀ j : Nat, s.h2dIssuedL[j]? = some true → (s.landedL.set l true)[j]? = some true
+          intro j hj
+          exact set_true_of_mem hf (h.issued_landed j hj)
         · show _ → ∀ j : Nat, (s.landedL.set l true)[j]? = some true →
             (s.decodeStaging.set l (.kv l))[j]? = some (.kv j)
           intro hd j hj
@@ -794,7 +858,8 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       obtain ⟨b, hb⟩ := Option.ne_none_iff_exists'.mp hp
       refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, h.len_dstaging,
         h.len_dhbm, h.len_h2dReadyL, ?_, ?_, h.cnt_d2hReady, h.woken_d2hReady, h.pstaging_good,
-        h.wire_good, h.claimed_landed, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
+        h.wire_good, h.pending_landed, h.issued_landed, h.dstaging_good, h.cnt_h2dReady,
+        h.dhbm_good⟩
       · show true = false → _
         intro hc; cases hc
       · show _ → s.send.life.done = true
@@ -808,7 +873,8 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       have hd := h.send.life.done_of_released hst
       refine ⟨h.send, h.recv, h.n_send, h.n_recv, ?_, h.len_wire, h.len_dstaging,
         h.len_dhbm, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady, h.woken_d2hReady,
-        ?_, h.wire_good, h.claimed_landed, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
+        ?_, h.wire_good, h.pending_landed, h.issued_landed, h.dstaging_good, h.cnt_h2dReady,
+        h.dhbm_good⟩
       · show (List.replicate _ _).length = _
         exact List.length_replicate
       · show s.send.life.done = false → _
@@ -822,7 +888,8 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       have hd := h.recv.life.done_of_released hst
       refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, ?_,
         h.len_dhbm, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady, h.woken_d2hReady,
-        h.pstaging_good, h.wire_good, h.claimed_landed, ?_, h.cnt_h2dReady, h.dhbm_good⟩
+        h.pstaging_good, h.wire_good, h.pending_landed, h.issued_landed, ?_, h.cnt_h2dReady,
+        h.dhbm_good⟩
       · show (List.replicate _ _).length = _
         exact List.length_replicate
       · show s.recv.life.done = false → _
@@ -842,8 +909,8 @@ theorem reachable_safe {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) : Safe
 /-- Unfold `step` for a known event and split every branch, leaving `hs` as
 `some … = some s'`, as the `Option.map` form, or closed. -/
 macro "pipe_cases" hs:ident : tactic =>
-  `(tactic| (simp only [step, sendStep, recvStep, d2hReady, h2hDone, h2dBegin, h2dReady, land,
-      reclaim, reseatPrefillStaging, reseatDecodeStaging] at $hs:ident <;>
+  `(tactic| (simp only [step, sendStep, recvStep, d2hReady, h2hDone, h2dBegin, h2dIssue,
+      h2dReady, land, reclaim, reseatPrefillStaging, reseatDecodeStaging] at $hs:ident <;>
       (repeat' split at $hs:ident) <;>
       (try simp only [Option.map_eq_some_iff] at $hs:ident)))
 
@@ -906,11 +973,14 @@ def producer : List Ev :=
   [.send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
    .send (.wake true), .send .h2hIssue, .send .sendNext, .h2hDone 0 true, .send .publish]
 
-/-- A one-layer consumer, pull handshake to `done_recving`. -/
+/-- A one-layer consumer, pull handshake to `done_recving`. Within the accepted
+push, `HandleCustomRequest` (`bt.cc:350-586`) lands the chunk, dispatches
+`OnLayerReceived` (`h2dBegin` / `h2dIssue`) and accounts for the chunk
+(`netAccount`) before returning (`pushEnd`). -/
 def consumer : List Ev :=
-  [.recv (.pullReply true), .recv .pushBegin, .land 0, .recv .pushEnd, .h2dBegin 0,
-   .recv (.h2dIssue true), .recv .netAccount, .h2dReady 0, .recv (.h2dDone true),
-   .recv .publish]
+  [.recv (.pullReply true), .recv .pushBegin, .land 0, .h2dBegin 0,
+   .h2dIssue 0 true, .recv .netAccount, .recv .pushEnd, .h2dReady 0,
+   .recv (.h2dDone true), .recv .publish]
 
 /-- Producer then consumer: both sides published as done, the data in decode
 HBM. -/
@@ -934,8 +1004,8 @@ def producer2 : List Ev :=
 and whose H2D copies finish in the order 1, 0. -/
 def consumer2 : List Ev :=
   [.recv (.pullReply true),
-   .recv .pushBegin, .land 1, .recv .pushEnd, .h2dBegin 1, .recv (.h2dIssue true), .recv .netAccount,
-   .recv .pushBegin, .land 0, .recv .pushEnd, .h2dBegin 0, .recv (.h2dIssue true), .recv .netAccount,
+   .recv .pushBegin, .land 1, .h2dBegin 1, .h2dIssue 1 true, .recv .netAccount, .recv .pushEnd,
+   .recv .pushBegin, .land 0, .h2dBegin 0, .h2dIssue 0 true, .recv .netAccount, .recv .pushEnd,
    .h2dReady 1, .h2dReady 0, .recv (.h2dDone true), .recv (.h2dDone true), .recv .publish]
 
 /-- Layers complete out of order at every stage; publication still finds the
@@ -982,22 +1052,38 @@ theorem trace_no_dispatch_before_land :
     (sys 1).run [.recv (.pullReply true), .h2dBegin 0] = none := by
   decide
 
-/-- Every event, for an `n`-layer instance. The four session events that the
+/-- An H2D copy cannot finish for a layer whose `ExecuteLayerH2d` was aborted at
+the re-check (`h2dIssue l false` or draining), even if another layer's copy was
+issued. -/
+theorem trace_aborted_issue_cannot_ready :
+    (sys 2).run
+      (producer2 ++
+       [.recv (.pullReply true),
+        .recv .pushBegin, .land 0, .h2dBegin 0, .h2dIssue 0 true, .recv .netAccount, .recv .pushEnd,
+        .recv .pushBegin, .land 1, .h2dBegin 1, .h2dIssue 1 false, .recv .netAccount, .recv .pushEnd,
+        .h2dReady 1]) = none := by
+  decide
+
+/-- Every event, for an `n`-layer instance. The five session events that the
 pipeline replaces with layer-indexed ones are left out (they are disabled). -/
 def events (n : Nat) : List Ev :=
   (Send.events.filter fun e => e != .d2hReady && e != .h2hDone true && e != .h2hDone false).map .send ++
-    (Recv.events.filter fun e => e != .h2dBegin && e != .h2dReady).map .recv ++
+    (Recv.events.filter fun e =>
+      e != .h2dBegin && e != .h2dIssue true && e != .h2dIssue false && e != .h2dReady).map .recv ++
     (List.range n).flatMap (fun l =>
-      [.d2hReady l, .h2hDone l true, .h2hDone l false, .h2dBegin l, .h2dReady l, .land l]) ++
+      [.d2hReady l, .h2hDone l true, .h2hDone l false,
+       .h2dBegin l, .h2dIssue l true, .h2dIssue l false, .h2dReady l, .land l]) ++
     [.reclaim, .reseatPrefillStaging, .reseatDecodeStaging]
 
 /-- Executable negation of `Safe`. -/
 def violates (s : Pipeline) : Bool :=
   (s.recv.published == some true && s.decodeHbm != good s.numLayers) ||
-  (s.reclaimed && s.send.d2hRetired != s.send.d2hIssued) ||
+  (s.reclaimed && (s.send.d2hPending || s.send.d2hRetired != s.send.d2hIssued)) ||
   (!s.send.life.hasStaging &&
-    (s.send.d2hRetired != s.send.d2hIssued || s.send.h2hRetired != s.send.h2hIssued)) ||
-  (!s.recv.life.hasStaging && (s.recv.pushes != 0 || s.recv.retired != s.recv.issued))
+    (s.send.d2hPending || s.send.d2hRetired != s.send.d2hIssued ||
+     s.send.h2hRetired != s.send.h2hIssued)) ||
+  (!s.recv.life.hasStaging &&
+    (s.recv.pushes != 0 || s.recv.pending != 0 || s.recv.retired != s.recv.issued))
 
 #guard ModelCheck.check (sys 1) (events 1) violates 10 = .outOfFuel
 
@@ -1006,12 +1092,12 @@ again from the state the producer leaves behind: every consumer interleaving
 with reclaim, staging reuse, cancellation and so on is within reach. -/
 def afterProducer : Pipeline := ((sys 1).run producer).getD (init 1)
 
--- Fuel 10 is the least that reaches publication from here (nine consumer
+-- Fuel 10 is the least that reaches publication from here (ten consumer
 -- events). This is the slowest guard in the project (~7 s); do not lower it.
 #guard ModelCheck.check ⟨afterProducer, step⟩ (events 1) violates 10 = .outOfFuel
 
 /-- Two layers, from the out-of-order producer: explores the initial consumer
-landing and dispatch steps (`fuel = 5`, traces of up to 4 events) alongside
+landing and dispatch steps (`fuel = 5`, traces of up to 5 events) alongside
 reclaim and staging reuse; deeper consumer interleavings are covered from
 `afterDispatch2` below. -/
 def afterProducer2 : Pipeline := ((sys 2).run producer2).getD (init 2)
@@ -1031,7 +1117,9 @@ with junk in HBM. -/
 def dispatchEarly (s : Pipeline) (l : Nat) : Option Pipeline :=
   if s.claimedL[l]? = some false then
     (Recv.step s.recv .h2dBegin).map fun rcv =>
-      { s with recv := rcv, claimedL := s.claimedL.set l true }
+      { s with recv := rcv,
+               claimedL := s.claimedL.set l true,
+               h2dPendingL := s.h2dPendingL.set l true }
   else none
 
 def sysDispatchEarly : System Pipeline Ev :=
@@ -1041,7 +1129,7 @@ def sysDispatchEarly : System Pipeline Ev :=
 
 theorem trace_dispatch_early :
     (sysDispatchEarly.run
-      [.recv (.pullReply true), .h2dBegin 0, .recv (.h2dIssue true), .h2dReady 0,
+      [.recv (.pullReply true), .h2dBegin 0, .h2dIssue 0 true, .h2dReady 0,
        .recv (.h2dDone true), .recv .publish]).map
       (fun s => (s.recv.published, s.decodeHbm)) = some (some true, [.junk]) := by
   decide
@@ -1056,7 +1144,7 @@ in order this is invisible; with layer 1 landing first it copies layer 0's
 still-junk slot into layer 1's HBM, and the receive is published as done.
 This is the guard the per-layer events exist to state. -/
 def h2dReadyByRank (s : Pipeline) (l : Nat) : Option Pipeline :=
-  if s.claimedL[l]? = some true ∧ s.h2dReadyL[l]? = some false then
+  if s.h2dIssuedL[l]? = some true ∧ s.h2dReadyL[l]? = some false then
     (Recv.step s.recv .h2dReady).map fun rcv =>
       { s with recv := rcv,
                decodeHbm := s.decodeHbm.set l (s.decodeStaging.getD s.recv.ready .junk),
@@ -1072,10 +1160,10 @@ theorem trace_h2d_by_rank :
     (sysH2dReadyByRank.run
       (producer2 ++
        [.recv (.pullReply true),
-        .recv .pushBegin, .land 1, .recv .pushEnd, .h2dBegin 1, .recv (.h2dIssue true),
-        .recv .netAccount, .h2dReady 1,
-        .recv .pushBegin, .land 0, .recv .pushEnd, .h2dBegin 0, .recv (.h2dIssue true),
-        .recv .netAccount, .h2dReady 0,
+        .recv .pushBegin, .land 1, .h2dBegin 1, .h2dIssue 1 true,
+        .recv .netAccount, .recv .pushEnd, .h2dReady 1,
+        .recv .pushBegin, .land 0, .h2dBegin 0, .h2dIssue 0 true,
+        .recv .netAccount, .recv .pushEnd, .h2dReady 0,
         .recv (.h2dDone true), .recv (.h2dDone true), .recv .publish])).map
       (fun s => (s.recv.published, s.decodeHbm)) = some (some true, [.kv 1, .junk]) := by
   decide
@@ -1096,8 +1184,8 @@ theorem trace_reseat_at_finish :
       [.send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
        .send (.wake true), .send .h2hIssue, .send .cancel, .reseatPrefillStaging,
        .h2hDone 0 true,
-       .recv (.pullReply true), .recv .pushBegin, .land 0, .recv .pushEnd, .h2dBegin 0,
-       .recv (.h2dIssue true), .h2dReady 0, .recv (.h2dDone true), .recv .publish]).map
+       .recv (.pullReply true), .recv .pushBegin, .land 0, .h2dBegin 0,
+       .h2dIssue 0 true, .recv .pushEnd, .h2dReady 0, .recv (.h2dDone true), .recv .publish]).map
       (fun s => (s.send.life.done, s.recv.published, s.decodeHbm)) =
     some (false, some true, [.junk]) := by
   decide

@@ -26,8 +26,8 @@ D2H copy; an H2D dispatch waits for *its* layer to land).
 |---|---|---|
 | Publication correctness | `Pipeline.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n` |
 | … decode never runs attention on stale HBM | `Pipeline.attention_safe` | publication is permanent, and the property holds in every state reachable afterwards |
-| Prefill HBM safety (source buffer safety) | `Pipeline.reachable_safe` (`PrefillHbmSafe`); counter form `Send.Drained` | `reclaimed → d2hRetired = d2hIssued`: no D2H copy is reading prefill HBM when the engine frees it |
-| Staging integrity | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `Pipeline.StagingSafe` | `hasStaging = !done`; a released staging has no copy writing it and no push reading it |
+| Prefill HBM safety (source buffer safety) | `Pipeline.reachable_safe` (`PrefillHbmSafe`); counter form `Send.Drained` | `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`: no D2H copy is being dispatched or reading prefill HBM when the engine frees it |
+| Staging integrity | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `Pipeline.StagingSafe` | `hasStaging = !done`; a released staging has no copy being dispatched or reading/writing it and no push reading/writing it |
 | Termination | not in scope (see Future work F1) | — |
 
 Counter-level forms of publication are proved per side as well
@@ -89,6 +89,7 @@ Traces (all `decide`):
 | `Send.trace_cancel_after_ok_finish` | first-finish-wins on the send side |
 | `Pipeline.trace_slow_consumer` | producer published, reclaimed and reseated before the consumer lands anything; data still right |
 | `Pipeline.trace_no_dispatch_before_land` | `h2dBegin l` needs layer `l` to have landed |
+| `Pipeline.trace_aborted_issue_cannot_ready` | `h2dReady l` needs layer `l`'s own `h2dIssue l` to have issued the copy (cannot borrow another layer's `issued` count) |
 
 Bounded searches (`#guard … = .outOfFuel`): `Recv` from both initial states
 (fuel 10, n = 2), `Send` (fuel 12, n = 2), `Pipeline` from `init 1` and from
