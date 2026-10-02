@@ -41,6 +41,7 @@ here.
 | `kv_cache_store_pin_race_test.cc` | F1 |
 | `build_targets.patch` | `cc_test` targets for the two files above |
 | `candidate_fixes.patch` | fixes for F1, F2 (naive, shape A only) and F4; see "Fix validation" |
+| [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 
 To run: copy the two `.cc` files next to the code they test
 (`tpu_sync/core/controller/`, `tpu_sync/kv_cache/`), `git apply
@@ -56,7 +57,7 @@ cleanly at `01ffa3d`.
 | F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash | CONFIRMED (test) | only via the `ReadRemote` API (no in-tree caller) |
 | F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shape A; proved in Lean for shapes A and B | same |
 | F3 | Data race on `RemoteReadState::lease_id` | CONFIRMED (read) | same |
-| F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched | CONFIRMED (test), both halves | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
+| F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test), both halves | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
 
 ---
 
@@ -232,7 +233,7 @@ cleanly at `01ffa3d`.
   helper that frees the auto-allocated staging, and, if some workers were
   already dispatched, only after joining their futures. A cleaner fix
   resolves and matches every worker *before* allocating or dispatching
-  anything.
+  anything ([google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105)).
 
 ---
 
