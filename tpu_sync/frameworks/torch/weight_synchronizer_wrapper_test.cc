@@ -756,6 +756,27 @@ TEST(WeightSynchronizerWrapperTest, StoreSkipTilingNonContiguousRouting) {
   EXPECT_EQ(sub1_raw->last_registered_layer_chunks[0], 5);
 }
 
+TEST(WeightSynchronizerWrapperTest, GetHostBufferSizeHeterogeneousLayers) {
+  std::vector<size_t> slice_byte_sizes = {512, 4096 * 1024};
+  WeightSynchronizer ws(2, 4, slice_byte_sizes);
+
+  EXPECT_EQ(ws.num_layers(), 2);
+  EXPECT_EQ(ws.num_shards(), 4);
+  EXPECT_EQ(ws.slice_byte_size(), 512);
+
+  for (size_t s = 0; s < ws.num_shards(); ++s) {
+    EXPECT_NE(ws.GetHostBufferPtr(0, s), nullptr);
+    EXPECT_NE(ws.GetHostBufferPtr(1, s), nullptr);
+    EXPECT_GE(ws.GetHostBufferSize(0, s), 512);
+    EXPECT_LT(ws.GetHostBufferSize(0, s), 4096 * 1024);
+    EXPECT_GE(ws.GetHostBufferSize(1, s), 4096 * 1024);
+  }
+
+  // Out-of-bounds layer or shard index returns 0
+  EXPECT_EQ(ws.GetHostBufferSize(2, 0), 0);
+  EXPECT_EQ(ws.GetHostBufferSize(0, 4), 0);
+}
+
 }  // namespace
 }  // namespace torch
 }  // namespace tpu_raiden

@@ -205,6 +205,31 @@ py_test(
 )
 
 py_test(
+    name = "weight_sync_tp_mismatch_torch_test",
+    size = "medium",
+    srcs = ["weight_sync_tp_mismatch_test.py"],
+    args = ["--framework=torch"],
+    main = "weight_sync_tp_mismatch_test.py",
+    tags = [
+        "cpu:4",
+        "no_oss",
+        "requires-mem:16g",
+    ],
+    deps = [
+        "//tpu_sync/api:common",
+        "//tpu_sync/api/torch:weight_synchronizer_torch_py",
+        "//tpu_sync/rpc:raiden_controller",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/logging",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@com_google_absl_py//absl/testing:parameterized",
+        "@pypi//numpy",
+        "@torch_tpu//shims/torch:pytorch",
+    ],
+)
+
+py_test(
     name = "weight_sync_tree_relay_checksum_test",
     size = "medium",
     srcs = ["weight_sync_tree_relay_checksum_test.py"],

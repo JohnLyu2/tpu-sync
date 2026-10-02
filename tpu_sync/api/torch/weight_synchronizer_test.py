@@ -404,6 +404,22 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertEqual(eps[0]["shards"], [0, 1])
     self.assertEqual(eps[0]["global_shards"], [0, 1])
 
+  def test_get_host_buffer_heterogeneous_layers(self):
+    # Layer 0 is small (4 KB), Layer 1 is large (4 MB > Layer 0 + 256 KB)
+    shapes = [(1024,), (1024, 1024)]
+    tensors = [
+        [torch.zeros(shape, dtype=torch.float32, device=self.device)]
+        for shape in shapes
+    ]
+    ws = WeightSynchronizer(
+        tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    buf0 = ws.get_host_buffer(layer_idx=0, shard_idx=0)
+    buf1 = ws.get_host_buffer(layer_idx=1, shard_idx=0)
+    self.assertGreaterEqual(buf0.numel(), 1024 * 4)
+    self.assertLess(buf0.numel(), 1024 * 1024 * 4)
+    self.assertGreaterEqual(buf1.numel(), 1024 * 1024 * 4)
+
 
 if __name__ == "__main__":
   absltest.main()

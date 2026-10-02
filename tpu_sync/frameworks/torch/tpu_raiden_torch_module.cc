@@ -29,6 +29,7 @@
 #include "nanobind/stl/string.h"
 #include "nanobind/stl/string_view.h"
 #include "nanobind/stl/tuple.h"
+#include "nanobind/stl/unique_ptr.h"
 #include "nanobind/stl/vector.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -656,6 +657,55 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("unsafe_skip_buffer_lock") = true,
            nb::arg("auto_h2d") = false,
            nb::arg("global_shard_indices") = nb::none())
+      .def("test_only_set_bandwidth_limit",
+           &WeightSynchronizer::test_only_set_bandwidth_limit,
+           nb::arg("test_only_simulated_egress_gbps") = 0.0,
+           nb::arg("test_only_simulated_ingress_gbps") = 0.0)
+      .def_static(
+          "test_only_create_cpu_instance",
+          [](size_t num_layers, size_t num_shards, size_t slice_byte_size,
+             std::optional<int> local_port, int parallelism,
+             std::optional<int> listener_port,
+             std::optional<std::string> bind_ip, bool auto_h2d,
+             std::optional<std::vector<int64_t>> global_shard_indices,
+             double test_only_simulated_egress_gbps,
+             double test_only_simulated_ingress_gbps) {
+            return WeightSynchronizer::test_only_create_cpu_instance(
+                num_layers, num_shards, slice_byte_size, local_port,
+                parallelism, listener_port, bind_ip, auto_h2d,
+                global_shard_indices, test_only_simulated_egress_gbps,
+                test_only_simulated_ingress_gbps);
+          },
+          nb::arg("num_layers"), nb::arg("num_shards"),
+          nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
+          nb::arg("parallelism") = 1, nb::arg("listener_port") = nb::none(),
+          nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false,
+          nb::arg("global_shard_indices") = nb::none(),
+          nb::arg("test_only_simulated_egress_gbps") = 0.0,
+          nb::arg("test_only_simulated_ingress_gbps") = 0.0)
+      .def_static(
+          "test_only_create_cpu_instance",
+          [](size_t num_layers, size_t num_shards,
+             std::vector<size_t> slice_byte_sizes,
+             std::optional<int> local_port, int parallelism,
+             std::optional<int> listener_port,
+             std::optional<std::string> bind_ip, bool auto_h2d,
+             std::optional<std::vector<int64_t>> global_shard_indices,
+             double test_only_simulated_egress_gbps,
+             double test_only_simulated_ingress_gbps) {
+            return WeightSynchronizer::test_only_create_cpu_instance(
+                num_layers, num_shards, std::move(slice_byte_sizes), local_port,
+                parallelism, listener_port, bind_ip, auto_h2d,
+                global_shard_indices, test_only_simulated_egress_gbps,
+                test_only_simulated_ingress_gbps);
+          },
+          nb::arg("num_layers"), nb::arg("num_shards"),
+          nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
+          nb::arg("parallelism") = 1, nb::arg("listener_port") = nb::none(),
+          nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false,
+          nb::arg("global_shard_indices") = nb::none(),
+          nb::arg("test_only_simulated_egress_gbps") = 0.0,
+          nb::arg("test_only_simulated_ingress_gbps") = 0.0)
       .def(
           "PushWeights",
           [](WeightSynchronizer& self, const std::vector<std::string>& peers) {
@@ -720,7 +770,10 @@ NB_MODULE(_tpu_raiden_torch, m) {
             if (!ptr) {
               throw std::runtime_error("Invalid layer or shard index");
             }
-            size_t size = self.slice_byte_size() + 256 * 1024;
+            size_t size = self.GetHostBufferSize(layer_idx, shard_idx);
+            if (size == 0) {
+              size = self.slice_byte_size() + 256 * 1024;
+            }
             return at::from_blob(const_cast<uint8_t*>(ptr),
                                  {static_cast<int64_t>(size)}, at::kByte);
           },

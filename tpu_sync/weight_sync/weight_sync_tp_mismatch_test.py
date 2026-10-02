@@ -21,6 +21,7 @@ to a TP=1 sampler, reproducing reported hang conditions under bounded timeouts.
 import asyncio
 import dataclasses
 import threading
+from typing import Any
 
 from absl import flags
 from absl import logging
@@ -29,7 +30,6 @@ from absl.testing import parameterized
 import numpy as np
 
 from tpu_sync.api.common import RaidenId
-from tpu_sync.api.jax import weight_synchronizer
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
 
@@ -38,6 +38,13 @@ _TRANSFER_TIMEOUT_SECS = flags.DEFINE_float(
     10.0,
     "Maximum seconds to wait for transfer controller future and destination"
     " completion before declaring a hang failure.",
+)
+
+_FRAMEWORK = flags.DEFINE_enum(
+    "framework",
+    "jax",
+    ["jax", "torch"],
+    "Framework WeightSynchronizer implementation to test ('jax' or 'torch').",
 )
 
 
@@ -390,12 +397,19 @@ def _slice_global_array(
   return global_arr[tuple(slices)]
 
 
+def _host_buffer_as_numpy(buf: Any) -> np.ndarray:
+  """Returns a zero-copy NumPy uint8 view of a JAX ndarray or Torch Tensor host buffer."""
+  if hasattr(buf, "numpy"):
+    return buf.numpy()
+  return buf
+
+
 def _fill_trainer_and_compute_expected_35b(
     specs: list[Scaled35BVarSpec],
     trainer_mesh_axes: list[str],
     trainer_mesh_shape: tuple[int, ...],
     trainer_host_shards: list[list[int]],
-    ws_src_list: list[weight_synchronizer.WeightSynchronizer],
+    ws_src_list: list[Any],
     sampler_mesh_axes: list[str],
     sampler_mesh_shape: tuple[int, ...],
     seed: int = 0x5A,
@@ -451,7 +465,9 @@ def _fill_trainer_and_compute_expected_35b(
       for ws, shards in zip(ws_src_list, trainer_host_shards):
         if j in shards:
           local_slot = shards.index(j)
-          buf = ws.get_host_buffer(layer_idx=l, shard_idx=local_slot)
+          buf = _host_buffer_as_numpy(
+              ws.get_host_buffer(layer_idx=l, shard_idx=local_slot)
+          )
           words = buf.view(shard_arr.dtype)
           words[: shard_arr.size] = shard_arr.ravel()
           shard_assigned = True
@@ -485,7 +501,7 @@ def _fill_trainer_and_compute_expected_35b(
 
 
 def _await_destination_completion(
-    ws: weight_synchronizer.WeightSynchronizer,
+    ws: Any,
     uuid: int,
     errors: list[RuntimeError],
 ) -> None:
@@ -505,8 +521,21 @@ def _await_destination_completion(
 class WeightSyncTpMismatchTest(parameterized.TestCase):
   """Reproduces and tests weight sync hang under TP mismatch (TP=2 -> TP=1)."""
 
+  ws_module: Any = None
+
   def setUp(self):
     super().setUp()
+    # pylint: disable=g-import-not-at-top
+    if _FRAMEWORK.value == "torch":
+      from tpu_sync.api.torch import weight_synchronizer as torch_ws
+
+      self.ws_module = torch_ws
+    else:
+      from tpu_sync.api.jax import weight_synchronizer as jax_ws
+
+      self.ws_module = jax_ws
+    # pylint: enable=g-import-not-at-top
+
     self.timeout_secs = _TRANSFER_TIMEOUT_SECS.value
     self.item_size = 2  # bfloat16 / float16
     self.specs = _make_small_model_specs()
@@ -536,14 +565,14 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
     ):
       self.addCleanup(self.ctrl_client._control_pipe_client.close)
 
-    weight_synchronizer.configure_telemetry(["buffered"])
-    self.addCleanup(lambda: weight_synchronizer.configure_telemetry([]))
+    self.ws_module.configure_telemetry(["buffered"])
+    self.addCleanup(lambda: self.ws_module.configure_telemetry([]))
 
   def _execute_transfer_with_timeout(
       self,
       src_units: list[RaidenId],
       dst_units: list[RaidenId],
-      dst_ws_list: list[weight_synchronizer.WeightSynchronizer],
+      dst_ws_list: list[Any],
       uuid: int,
       req_id: str,
       test_label: str,
@@ -612,7 +641,7 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
 
   def _fill_and_compute_expected_tp1(
       self,
-      ws_src: weight_synchronizer.WeightSynchronizer,
+      ws_src: Any,
       seed: int = 0x33,
   ) -> list[np.ndarray]:
     """Fills TP=1 source with unique pattern and returns expected full arrays.
@@ -627,7 +656,9 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
     expected_arrays = []
     seed_u16 = np.uint16(seed & 0xFF) << np.uint16(8)
     for l, (shape, _, _, _) in enumerate(self.specs):
-      buf = ws_src.get_host_buffer(layer_idx=l, shard_idx=0)
+      buf = _host_buffer_as_numpy(
+          ws_src.get_host_buffer(layer_idx=l, shard_idx=0)
+      )
       words = buf.view(np.uint16)
       num_elements = int(np.prod(shape))
       layer_tag = np.uint16((l + 1) & 0x0F) << np.uint16(4)
@@ -639,7 +670,7 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
 
   def _fill_and_compute_expected_tp2(
       self,
-      trainer_shards: list[tuple[weight_synchronizer.WeightSynchronizer, int]],
+      trainer_shards: list[tuple[Any, int]],
       seed: int = 0x55,
   ) -> list[np.ndarray]:
     """Fills TP=2 trainer shards and returns reassembled ground-truth arrays.
@@ -665,7 +696,9 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
 
         shard_arrays = []
         for s_idx, (ws, local_shard) in enumerate(trainer_shards):
-          buf = ws.get_host_buffer(layer_idx=l, shard_idx=local_shard)
+          buf = _host_buffer_as_numpy(
+              ws.get_host_buffer(layer_idx=l, shard_idx=local_shard)
+          )
           words = buf.view(np.uint16)
           shard_tag = np.uint16(s_idx & 0x03) << np.uint16(2)
           offsets = np.arange(shard_elements, dtype=np.uint16) & np.uint16(
@@ -682,7 +715,9 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         offsets = np.arange(num_elements, dtype=np.uint16) & np.uint16(0x000F)
         pattern = seed_u16 | layer_tag | offsets
         for ws, local_shard in trainer_shards:
-          buf = ws.get_host_buffer(layer_idx=l, shard_idx=local_shard)
+          buf = _host_buffer_as_numpy(
+              ws.get_host_buffer(layer_idx=l, shard_idx=local_shard)
+          )
           words = buf.view(np.uint16)
           words[:num_elements] = pattern
         expected_full_arrays.append(pattern.reshape(shape))
@@ -690,7 +725,7 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
 
   def _verify_sampler_parity(
       self,
-      ws_dst: weight_synchronizer.WeightSynchronizer,
+      ws_dst: Any,
       expected_arrays: list[np.ndarray],
       test_label: str,
   ) -> None:
@@ -703,7 +738,11 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
     """
     for l, expected in enumerate(expected_arrays):
       num_elements = expected.size
-      buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
+      raw_buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
+      if _FRAMEWORK.value == "torch":
+        self.assertTrue(hasattr(raw_buf, "numpy"))
+      buf = _host_buffer_as_numpy(raw_buf)
+      self.assertLen(buf, expected.nbytes + 256 * 1024)
       actual = buf.view(np.uint16)[:num_elements].reshape(expected.shape)
       self.assertTrue(
           np.array_equal(actual, expected),
@@ -723,27 +762,23 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         self.specs, dst_mesh_dict, self.item_size
     )
 
-    ws_src = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=1,
-            slice_byte_size=src_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-        )
+    ws_src = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=1,
+        slice_byte_size=src_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
     )
     self.addCleanup(ws_src.shutdown)
 
-    ws_dst = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=1,
-            slice_byte_size=dst_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-        )
+    ws_dst = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=1,
+        slice_byte_size=dst_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
     )
     self.addCleanup(ws_dst.shutdown)
 
@@ -803,27 +838,23 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         self.specs, dst_mesh_dict, self.item_size
     )
 
-    ws_src = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=2,
-            slice_byte_size=src_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-        )
+    ws_src = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=2,
+        slice_byte_size=src_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
     )
     self.addCleanup(ws_src.shutdown)
 
-    ws_dst = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=1,
-            slice_byte_size=dst_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-        )
+    ws_dst = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=1,
+        slice_byte_size=dst_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
     )
     self.addCleanup(ws_dst.shutdown)
 
@@ -895,27 +926,23 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         self.specs, dst_mesh_dict, self.item_size
     )
 
-    ws_src = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=2,
-            slice_byte_size=src_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-        )
+    ws_src = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=2,
+        slice_byte_size=src_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
     )
     self.addCleanup(ws_src.shutdown)
 
-    ws_dst = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=1,
-            slice_byte_size=dst_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-        )
+    ws_dst = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=1,
+        slice_byte_size=dst_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
     )
     self.addCleanup(ws_dst.shutdown)
 
@@ -981,41 +1008,35 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
         self.specs, dst_mesh_dict, self.item_size
     )
 
-    ws_src0 = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=1,
-            slice_byte_size=src_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-            global_shard_indices=[0],
-        )
+    ws_src0 = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=1,
+        slice_byte_size=src_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[0],
     )
     self.addCleanup(ws_src0.shutdown)
 
-    ws_src1 = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=1,
-            slice_byte_size=src_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-            global_shard_indices=[1],
-        )
+    ws_src1 = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=1,
+        slice_byte_size=src_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[1],
     )
     self.addCleanup(ws_src1.shutdown)
 
-    ws_dst = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=self.num_layers,
-            num_shards=1,
-            slice_byte_size=dst_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-        )
+    ws_dst = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=self.num_layers,
+        num_shards=1,
+        slice_byte_size=dst_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
     )
     self.addCleanup(ws_dst.shutdown)
 
@@ -1088,7 +1109,7 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
 
   def _verify_sampler_parity_35b(
       self,
-      ws_dst: weight_synchronizer.WeightSynchronizer,
+      ws_dst: Any,
       specs: list[Scaled35BVarSpec],
       expected_by_layer: list[list[np.ndarray]],
       test_label: str,
@@ -1105,7 +1126,11 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
       num_shards = len(expected_by_layer[l])
       for k in range(num_shards):
         expected = expected_by_layer[l][k]
-        buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=k)
+        raw_buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=k)
+        if _FRAMEWORK.value == "torch":
+          self.assertTrue(hasattr(raw_buf, "numpy"))
+        buf = _host_buffer_as_numpy(raw_buf)
+        self.assertLen(buf, expected.nbytes + 256 * 1024)
         actual = np.frombuffer(buf, dtype=expected.dtype)[
             : expected.size
         ].reshape(expected.shape)
@@ -1153,31 +1178,27 @@ class WeightSyncTpMismatchTest(parameterized.TestCase):
 
     ws_src_list = []
     for host_shards in trainer_host_shards:
-      ws_src = (
-          weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-              num_layers=num_layers,
-              num_shards=len(host_shards),
-              slice_byte_size=src_slice_sizes,
-              local_port=0,
-              listener_port=0,
-              bind_ip="127.0.0.1",
-              global_shard_indices=host_shards,
-          )
+      ws_src = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+          num_layers=num_layers,
+          num_shards=len(host_shards),
+          slice_byte_size=src_slice_sizes,
+          local_port=0,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+          global_shard_indices=host_shards,
       )
       self.addCleanup(ws_src.shutdown)
       ws_src_list.append(ws_src)
 
     total_sampler_shards = int(np.prod(sampler_mesh_shape))
-    ws_dst = (
-        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
-            num_layers=num_layers,
-            num_shards=total_sampler_shards,
-            slice_byte_size=dst_slice_sizes,
-            local_port=0,
-            listener_port=0,
-            bind_ip="127.0.0.1",
-            global_shard_indices=list(range(total_sampler_shards)),
-        )
+    ws_dst = self.ws_module.WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=num_layers,
+        num_shards=total_sampler_shards,
+        slice_byte_size=dst_slice_sizes,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        global_shard_indices=list(range(total_sampler_shards)),
     )
     self.addCleanup(ws_dst.shutdown)
 
