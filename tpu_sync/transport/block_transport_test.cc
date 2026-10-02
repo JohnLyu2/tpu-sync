@@ -35,6 +35,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
 #include "absl/status/status.h"
@@ -59,8 +60,11 @@
 #include "tpu_sync/telemetry/prometheus_exporter.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/chunk.h"
+#include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -1644,6 +1648,126 @@ TEST_P(BlockTransportTest, PollEINTRIsBenign) {
       /*dst_offset_bytes=*/kDstOffset, push_payload.data(), push_payload.size(),
       /*uuid=*/0);
   ABSL_EXPECT_OK(push_res) << push_res.message();
+}
+
+TEST(DecodeReadTimeoutTest, TimeoutConfigFromEnv) {
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  });
+  MockDelegate delegate(/*slice_size=*/64);
+
+  unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+  }
+
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "1.5", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "12.5", 1);
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.handshake_read_timeout(), absl::Milliseconds(1500));
+    EXPECT_EQ(transport.payload_read_timeout(), absl::Milliseconds(12500));
+  }
+
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "-3", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "invalid", 1);
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+  }
+}
+
+TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "0.1", 1);
+
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/2);
+  BlockTransport receiver(&delegate, /*local_port=*/0);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      int fd,
+      lib::ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
+  auto close_fd = absl::MakeCleanup([fd] { close(fd); });
+
+  // Send an Op 6 header for 2 blocks, then stall before sending block IDs.
+  lib::ChunkHeader header = {};
+  header.version = 1;
+  header.op = 6;
+  header.flags = static_cast<uint8_t>(MajorOrder::kLayerMajor);
+  header.reserved = 1;
+  header.local_id = 0;
+  header.count_or_size = 2;
+  header.uuid = 77;
+  const auto s_header = lib::SerializeChunkHeader(header);
+  ASSERT_EQ(::send(fd, s_header.data(), s_header.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_header.size()));
+
+  uint8_t ack = 0;
+  EXPECT_THAT(lib::ReadExactWithTimeout(fd, &ack, 1, absl::Seconds(2)),
+              StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
+}
+
+TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  });
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "1.0", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "0.1", 1);
+
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/2);
+  BlockTransport receiver(&delegate, /*local_port=*/0);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      int fd,
+      lib::ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
+  auto close_fd = absl::MakeCleanup([fd] { close(fd); });
+
+  // Complete the Op 6 handshake for 1 block, then stall mid-payload.
+  lib::ChunkHeader header = {};
+  header.version = 1;
+  header.op = 6;
+  header.flags = static_cast<uint8_t>(MajorOrder::kLayerMajor);
+  header.reserved = 1;
+  header.local_id = 0;
+  header.count_or_size = 1;
+  header.uuid = 88;
+  const auto s_header = lib::SerializeChunkHeader(header);
+  ASSERT_EQ(::send(fd, s_header.data(), s_header.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_header.size()));
+
+  const int bid = 0;
+  const auto s_ids = lib::SerializeBlockIds(absl::MakeConstSpan(&bid, 1));
+  ASSERT_EQ(::send(fd, s_ids.data(), s_ids.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_ids.size()));
+  ASSERT_EQ(::send(fd, s_ids.data(), s_ids.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_ids.size()));
+
+  uint8_t handshake_ack = 0;
+  ABSL_ASSERT_OK(
+      lib::ReadExactWithTimeout(fd, &handshake_ack, 1, absl::Seconds(2)));
+  EXPECT_EQ(handshake_ack, 1);
+
+  // Send the 4-byte chunk size (64 bytes) and only 16 bytes of payload, then
+  // stall.
+  const auto s_size = lib::SerializeChunkSize(64);
+  ASSERT_EQ(::send(fd, s_size.data(), s_size.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_size.size()));
+  const std::vector<uint8_t> partial_payload(16, 0x5A);
+  ASSERT_EQ(
+      ::send(fd, partial_payload.data(), partial_payload.size(), MSG_NOSIGNAL),
+      16);
+
+  uint8_t final_ack = 0;
+  EXPECT_THAT(lib::ReadExactWithTimeout(fd, &final_ack, 1, absl::Seconds(2)),
+              StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(

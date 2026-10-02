@@ -18,16 +18,20 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,8 +48,14 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
 
 namespace tpu_raiden::transport::lib {
 
@@ -308,6 +318,110 @@ std::string SockAddrToEndpoint(int fd, int (*get_fn)(int, struct sockaddr*,
                                   : absl::StrCat(host, ":", serv);
 }
 }  // namespace
+
+absl::Status ReadExactWithTimeout(int fd, void* buf, size_t len,
+                                  std::optional<absl::Duration> timeout) {
+  if (!timeout.has_value()) {
+    return ::peregrine::ReadExact(fd, buf, len);
+  }
+  const absl::Time deadline = absl::Now() + *timeout;
+  uint8_t* ptr = static_cast<uint8_t*>(buf);
+  size_t remaining = len;
+  while (remaining > 0) {
+    const int64_t wait_ms =
+        std::max<int64_t>(0, absl::ToInt64Milliseconds(deadline - absl::Now()));
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    const int p = ::poll(&pfd, 1, static_cast<int>(wait_ms));
+    if (p == 0) {
+      return absl::DeadlineExceededError(absl::StrCat(
+          "Socket read timed out after ", absl::FormatDuration(*timeout)));
+    }
+    if (p < 0) {
+      if (errno == EINTR) continue;
+      return absl::InternalError(
+          absl::StrCat("poll failed: ", std::strerror(errno)));
+    }
+    const ssize_t n = ::recv(fd, ptr, remaining, MSG_DONTWAIT);
+    if (n > 0) {
+      ptr += n;
+      remaining -= static_cast<size_t>(n);
+    } else if (n == 0) {
+      return absl::InternalError("recv eof");
+    } else {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      return absl::InternalError(
+          absl::StrCat("recv failed: ", std::strerror(errno)));
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ReadVExactWithTimeout(int fd, absl::Span<const struct iovec> iovs,
+                                   std::optional<absl::Duration> timeout) {
+  if (!timeout.has_value()) {
+    return ::peregrine::ReadVExact(fd, iovs);
+  }
+  if (iovs.empty() || iovs.size() > IOV_MAX) {
+    return absl::InvalidArgumentError(absl::StrCat("#iovs=", iovs.size()));
+  }
+  size_t total_len = 0;
+  for (const auto& iov : iovs) {
+    total_len += iov.iov_len;
+  }
+  if (total_len == 0) {
+    return absl::OkStatus();
+  }
+
+  std::vector<struct iovec> vecs(iovs.begin(), iovs.end());
+  const size_t n = vecs.size();
+  size_t rcvd = 0;
+  size_t i = 0;
+  const absl::Time deadline = absl::Now() + *timeout;
+  while (i < n && rcvd < total_len) {
+    const int64_t wait_ms =
+        std::max<int64_t>(0, absl::ToInt64Milliseconds(deadline - absl::Now()));
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    const int p = ::poll(&pfd, 1, static_cast<int>(wait_ms));
+    if (p == 0) {
+      return absl::DeadlineExceededError(absl::StrCat(
+          "Socket readv timed out after ", absl::FormatDuration(*timeout)));
+    }
+    if (p < 0) {
+      if (errno == EINTR) continue;
+      return absl::InternalError(
+          absl::StrCat("poll failed: ", std::strerror(errno)));
+    }
+    struct msghdr msg = {};
+    msg.msg_iov = &vecs[i];
+    msg.msg_iovlen = n - i;
+    const ssize_t bytes = ::recvmsg(fd, &msg, MSG_DONTWAIT);
+    if (bytes > 0) {
+      rcvd += static_cast<size_t>(bytes);
+      if (rcvd >= total_len) break;
+      size_t b = static_cast<size_t>(bytes);
+      while (i < n && vecs[i].iov_len <= b) {
+        b -= vecs[i].iov_len;
+        ++i;
+      }
+      if (i >= n) break;
+      if (b > 0) {
+        vecs[i].iov_base = static_cast<uint8_t*>(vecs[i].iov_base) + b;
+        vecs[i].iov_len -= b;
+      }
+    } else if (bytes == 0) {
+      return absl::InternalError("readv eof");
+    } else {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      return absl::InternalError(
+          absl::StrCat("readv failed: ", std::strerror(errno)));
+    }
+  }
+  return absl::OkStatus();
+}
 
 std::string GetLocalEndpoint(int fd) {
   return SockAddrToEndpoint(fd, ::getsockname);

@@ -32,6 +32,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -62,6 +63,21 @@ class BlockTransport final {
 
   // Destructor closes all sockets and joins all threads.
   ~BlockTransport();
+
+  struct Config {
+    std::optional<absl::Duration> handshake_read_timeout = std::nullopt;
+    std::optional<absl::Duration> payload_read_timeout = std::nullopt;
+    size_t coalesce_window_bytes = 0;
+  };
+
+  const Config& config() const { return config_; }
+
+  std::optional<absl::Duration> handshake_read_timeout() const {
+    return config_.handshake_read_timeout;
+  }
+  std::optional<absl::Duration> payload_read_timeout() const {
+    return config_.payload_read_timeout;
+  }
 
   // Return the TCP listening socket port.
   int local_port() const { return raw_transport_.local_port(); }
@@ -228,6 +244,7 @@ class BlockTransport final {
  private:
   BlockTransportDelegate* const block_delegate_;
   const int parallelism_;
+  const Config config_;
 
   absl::Mutex active_sends_mu_;
   SendMap active_sends_ ABSL_GUARDED_BY(active_sends_mu_);

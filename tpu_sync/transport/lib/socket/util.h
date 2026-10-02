@@ -15,11 +15,18 @@
 #ifndef TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
 #define TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
 
+#include <sys/uio.h>
+
+#include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "grpcpp/channel.h"
 
 namespace tpu_raiden::transport::lib {
@@ -36,6 +43,18 @@ absl::StatusOr<int> ConnectToPeer(
     absl::string_view peer, absl::string_view local_ip = "",
     bool require_psp = false, std::shared_ptr<grpc::Channel> channel = nullptr,
     ConnectTiming* timing = nullptr);
+
+// Reads exactly `len` bytes from `fd` into `buf`. When `timeout` is `nullopt`,
+// delegates to `::peregrine::ReadExact`; otherwise bounds the total wait by
+// `*timeout` and returns DeadlineExceededError on timeout.
+absl::Status ReadExactWithTimeout(int fd, void* buf, size_t len,
+                                  std::optional<absl::Duration> timeout);
+
+// Reads all bytes described by `iovs` from `fd`. When `timeout` is `nullopt`,
+// delegates to `::peregrine::ReadVExact`; otherwise bounds the total wait by
+// `*timeout` and returns DeadlineExceededError on timeout.
+absl::Status ReadVExactWithTimeout(int fd, absl::Span<const struct iovec> iovs,
+                                   std::optional<absl::Duration> timeout);
 
 // Returns the local endpoint ("ip:port") for the socket `fd`.
 std::string GetLocalEndpoint(int fd);

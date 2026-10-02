@@ -73,19 +73,42 @@ namespace {
 
 constexpr absl::Duration kTransportMetricsPollInterval = absl::Seconds(1);
 
-size_t GetCoalesceWindowBytes() {
-  const char* env = std::getenv("RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES");
-  if (env != nullptr && *env != '\0') {
-    size_t val = 0;
-    if (absl::SimpleAtoi(env, &val)) {
-      return val;
+BlockTransport::Config ReadConfigFromEnv() {
+  BlockTransport::Config config;
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.handshake_read_timeout = absl::Seconds(parsed);
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
     }
   }
-  return 0;
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.payload_read_timeout = absl::Seconds(parsed);
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val = std::getenv("RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES");
+      val != nullptr && val[0] != '\0') {
+    size_t parsed = 0;
+    if (absl::SimpleAtoi(val, &parsed)) {
+      config.coalesce_window_bytes = parsed;
+    }
+  }
+  return config;
 }
 
-using ::peregrine::ReadExact;
-using ::peregrine::ReadVExact;
 using ::peregrine::WriteExact;
 using ::peregrine::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
@@ -230,12 +253,13 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
                                int parallelism)
     : block_delegate_(delegate),
       parallelism_(parallelism),
+      config_(ReadConfigFromEnv()),
       raw_transport_(
           delegate, local_port, local_ips,
           [this](int client_fd, const lib::ChunkHeader& header) {
             return HandleCustomRequest(client_fd, header);
           },
-          GetCoalesceWindowBytes()),
+          config_.coalesce_window_bytes),
       peregrine_control_(
           std::make_unique<lib::PeregrineControlServiceImpl>(&raw_transport_)),
       transport_adapter_(std::make_unique<lib::SocketTransportAdapter>(
@@ -364,10 +388,12 @@ absl::Status BlockTransport::HandleIncomingPush(
   } else {
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
     FaultInjectSocket(hooks::kBlockTransportRecvBlockIds, client_fd);
-    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
+        client_fd, ids_buf.data(), ids_buf.size(), handshake_read_timeout()));
     allocated_ids = lib::DeserializeBlockIds(ids_buf);
 
-    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
+        client_fd, ids_buf.data(), ids_buf.size(), handshake_read_timeout()));
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
     uint8_t ack = 1;
     FaultInjectSocket(hooks::kBlockTransportRecvSendHandshakeAck, client_fd);
@@ -392,7 +418,8 @@ absl::Status BlockTransport::HandleIncomingPush(
           FaultInjectSocket(hooks::kBlockTransportRecvPayload, client_fd);
         }
         uint8_t size_buf[lib::kChunkSizeFieldSize];
-        ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
+        ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
+            client_fd, size_buf, sizeof(size_buf), payload_read_timeout()));
         const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
 
         const int64_t block_id_val = dst_id;
@@ -431,7 +458,8 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
 
         if (expected_size > 0) {
-          ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks)));
+          ABSL_RETURN_IF_ERROR(lib::ReadVExactWithTimeout(
+              client_fd, ToIovec(chunks), payload_read_timeout()));
           total_received_bytes += expected_size;
         }
         return absl::OkStatus();
