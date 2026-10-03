@@ -1,0 +1,590 @@
+import TpuSyncVerify.Transfer.PrefillDecode.Receive
+
+/-!
+# Receive session: what the poll-side readiness check contributes
+
+An audit of `IsReadyToComplete` (`.cc:427-433`) and of the manager's poll
+that acts on it (`mgr.cc:956-960`), on the receive model of `Receive.lean`.
+Citations and abbreviations are as there (tpu-sync `01ffa3d`).
+
+`TransferReceiveSession` has two ways to finish successfully:
+
+* the H2D callback that completes the last layer calls `FinishLocked()`
+  (`.cc:658-665`) and records the end-of-transfer metrics (`.cc:679-689`);
+* the manager's poll calls `Finish()` when `IsReadyToComplete()` holds, i.e.
+  `(network_completed_ || num_completed_layers_ == total_layers) &&
+  AllH2dDoneLocked()`.
+
+`TransferSendSession` has only the first. The proposal under review removes
+the second (and with it `h2d_futures_`, `network_completed_` and the dead
+`if (all_complete)` finish in `OnBlocksReceived`, `.cc:556-571`). This module
+asks what the second way does today, and what changes without it.
+
+## Results
+
+On every reachable state of the shipping model:
+
+* `CallbackFinishes` (`reachable_callbackFinishes`): with at least one layer,
+  `num_completed_layers_ == num_layers()` already implies `draining_` — the
+  callback that completed the last layer finished the session — and an error
+  status implies `draining_`.
+* `pollReady_window`: with at least one layer the poll can only fire through
+  `network_completed_`, in the window after every copy's future is ready and
+  before the last callback has bumped `num_completed_layers_`. The other
+  disjunct of `IsReadyToComplete` is dead code there.
+* `netAccount_frame`: `OnBlocksReceived` never finishes the session; when its
+  `all_complete` test could pass the session is already draining and the
+  handler has returned early (`.cc:537-539`).
+* `pollReady_no_settle`: firing in that window never settles the session — a
+  callback is still in flight, so `done_` and publication wait for it exactly
+  as they would without the poll. The poll moves the start of draining
+  earlier; it does not move settlement or the published outcome.
+
+What the earlier draining changes is the last callback's bookkeeping: it
+finds `draining_` set and skips `RecordTransferDuration`, `RecordH2dComplete`
+and `RecordEnd`. `RecvM` adds a ghost bit `metrics` for those calls and
+`stepM poll` runs the model with (`poll = true`, the shipping code) or without
+(`poll = false`, the proposal) the poll:
+
+* with the poll, `published = some true ∧ metrics = false` is reachable
+  (`trace_poll_skips_metrics`; the bounded search finds it too);
+* without it, `published = some true → metrics = true` is an invariant
+  (`noPoll_metrics_on_success`), every property of `Receive.lean` still
+  holds (`noPoll_safe`), every reachable state can still settle and release
+  its staging (`noPoll_can_settle`), and the normal completion is unchanged
+  (`trace_noPoll_normal`).
+
+The one case where the poll is load-bearing is `num_layers() == 0`: nothing
+else ever calls `FinishLocked()` (`noPoll_zero_layers_never_succeeds`),
+whereas with the poll the session is complete at once
+(`trace_zero_layers_poll`). A change that drops the poll has to finish a
+zero-layer receive at creation, as `TransferSendSession::StartPush` does for
+a zero-layer send (`send.cc:300-303`).
+-/
+
+namespace TpuSyncVerify.Transfer
+
+namespace Lifecycle
+
+/-- `FinishLocked` cannot settle a session that still has work in flight. -/
+theorem finishLocked_done_of_inFlight {l : Lifecycle} (ok : Bool) (h : l.inFlight ≠ 0) :
+    (finishLocked ok l).done = l.done := by
+  unfold finishLocked settleLocked
+  by_cases hc : ok = false ∧ l.statusOk = true <;> simp [hc, h] <;> split <;> rfl
+
+end Lifecycle
+
+namespace PrefillDecode
+
+namespace Recv
+
+/-! ## Reachability on either creation path -/
+
+/-- Reachable as a push-plan receiver or as a `StartRead` receiver. -/
+abbrev ReachableAny (n : Nat) (s : Recv) : Prop :=
+  (sysPush n).Reachable s ∨ (sysLoad n).Reachable s
+
+theorem ReachableAny.inv {n : Nat} {s : Recv} (h : ReachableAny n s) : Inv s :=
+  Or.elim h reachable_inv_push reachable_inv_load
+
+theorem ReachableAny.step {n : Nat} {s s' : Recv} {e : Ev} (h : ReachableAny n s)
+    (hs : step s e = some s') : ReachableAny n s' :=
+  Or.elim h (fun h => Or.inl (System.Reachable.step h hs))
+    (fun h => Or.inr (System.Reachable.step h hs))
+
+theorem reachable_numLayers {n : Nat} {s : Recv} (h : ReachableAny n s) : s.numLayers = n :=
+  Or.elim h
+    (fun h => (sysPush n).reachable_induction (P := fun s => s.numLayers = n) rfl
+      (fun _ _ _ ih hs => (step_numLayers hs).trans ih) h)
+    (fun h => (sysLoad n).reachable_induction (P := fun s => s.numLayers = n) rfl
+      (fun _ _ _ ih hs => (step_numLayers hs).trans ih) h)
+
+/-! ## Effect lemmas
+
+What one event does to `draining`, `statusOk`, `completed` and `published`,
+by unfolding `step` for every event and splitting every branch. -/
+
+/-- `draining_` is never cleared. -/
+theorem step_draining_mono {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (hd : s.life.draining = true) : s'.life.draining = true := by
+  cases e <;> simp only [step, pushBegin, pushEnd, pullReply, h2dBegin, h2dIssue, h2dReady, h2dDone,
+      netAccount, pollReady, cancel, publish, Lifecycle.beginOp_of_draining hd, Option.map_none] at hs <;>
+    (repeat' split at hs) <;> cases hs <;> simp [hd]
+
+/-- An error status is never cleared. -/
+theorem step_statusOk_mono {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (hst : s.life.statusOk = false) : s'.life.statusOk = false := by
+  cases e <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, hb, rfl⟩ := hs
+       simp [Lifecycle.beginOp_statusOk hb, hst])
+    | (cases hs <;> (repeat' split) <;> simp_all)
+
+/-- Only a successful callback bumps `completed`, and if that reaches
+`numLayers` the session is draining afterwards (`.cc:658-665`). -/
+theorem step_completed {s s' : Recv} {e : Ev} (hs : step s e = some s') :
+    s'.completed = s.completed ∨
+      (s'.completed = s.completed + 1 ∧ (s'.completed = s'.numLayers → s'.life.draining = true)) := by
+  cases e <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, hb, rfl⟩ := hs; simp)
+    | (cases hs <;> (repeat' split) <;> simp_all)
+
+/-- An error is only ever recorded by a `FinishLocked`, which starts draining. -/
+theorem step_error_draining {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (hok : s.life.statusOk = true) (hok' : s'.life.statusOk = false) : s'.life.draining = true := by
+  cases e <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, hb, rfl⟩ := hs
+       simp [Lifecycle.beginOp_statusOk hb, hok] at hok')
+    | (cases hs <;> (repeat' split) <;> simp_all)
+
+/-- The callback that completes the last layer finishes the session and
+records the end-of-transfer metrics (`.cc:659-665`, `.cc:679-689`) iff, with
+the lock held, the copy is live, the session is not settled, this success
+completes the last layer and nobody has started draining. `h2dDone true` takes
+its finish branch under exactly this condition. -/
+def recordsMetrics (s : Recv) : Prop :=
+  s.retired < s.ready ∧ s.life.done = false ∧ s.completed + 1 = s.numLayers ∧
+    s.life.draining = false
+
+instance : DecidablePred recordsMetrics :=
+  fun s => inferInstanceAs (Decidable (s.retired < s.ready ∧ s.life.done = false ∧
+    s.completed + 1 = s.numLayers ∧ s.life.draining = false))
+
+/-- The only events that start draining with an OK status: the poll, the last
+successful callback, and the `all_complete` branch of `OnBlocksReceived`. -/
+theorem step_finish_ok {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (hdr : s.life.draining = false) (hdr' : s'.life.draining = true)
+    (hok' : s'.life.statusOk = true) :
+    e = .pollReady ∨ (e = .h2dDone true ∧ recordsMetrics s ∧ s'.completed = s'.numLayers) ∨
+      e = .netAccount := by
+  cases e <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, hb, rfl⟩ := hs
+       simp [Lifecycle.beginOp_draining hb] at hdr')
+    | (cases hs <;> (repeat' split) <;> simp_all [recordsMetrics])
+
+/-- `published` only moves in `publish`, from a settled session. -/
+theorem step_published {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (hp : s'.published = some true) :
+    s.published = some true ∨ (s.life.done = true ∧ s.life.statusOk = true) := by
+  cases e <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, hb, rfl⟩ := hs; exact Or.inl hp)
+    | (cases hs <;> (repeat' split) <;> simp_all)
+
+/-! ## The callback finishes first -/
+
+/-- With at least one layer, once `num_completed_layers_ == num_layers()` the
+session is draining: the callback that completed the last layer finished it.
+And an error status implies draining. Inductive on its own. -/
+def CallbackFinishes (s : Recv) : Prop :=
+  (0 < s.numLayers → s.completed = s.numLayers → s.life.draining = true) ∧
+  (s.life.statusOk = false → s.life.draining = true)
+
+theorem callbackFinishes_init (n : Nat) :
+    CallbackFinishes (initPush n) ∧ CallbackFinishes (initLoad n) := by
+  refine ⟨⟨?_, ?_⟩, ⟨?_, ?_⟩⟩ <;> simp [initPush, initLoad] <;> omega
+
+theorem step_callbackFinishes {s s' : Recv} {e : Ev} (hp : CallbackFinishes s)
+    (hs : step s e = some s') : CallbackFinishes s' := by
+  obtain ⟨hcd, hed⟩ := hp
+  have hn := step_numLayers hs
+  refine ⟨?_, ?_⟩
+  · intro hpos hc
+    cases hdr' : s'.life.draining
+    · exfalso
+      have hdr : s.life.draining = false := by
+        cases hdr0 : s.life.draining
+        · rfl
+        · rw [step_draining_mono hs hdr0] at hdr'
+          cases hdr'
+      rcases step_completed hs with hcc | ⟨_, himp⟩
+      · rw [hn] at hpos hc
+        rw [hcc] at hc
+        rw [hcd hpos hc] at hdr
+        cases hdr
+      · rw [himp hc] at hdr'
+        cases hdr'
+    · rfl
+  · intro hst'
+    cases hst : s.life.statusOk
+    · exact step_draining_mono hs (hed hst)
+    · exact step_error_draining hs hst hst'
+
+theorem reachable_callbackFinishes {n : Nat} {s : Recv} (h : ReachableAny n s) :
+    CallbackFinishes s :=
+  Or.elim h
+    (fun h => (sysPush n).reachable_induction (P := CallbackFinishes) (callbackFinishes_init n).1
+      (fun _ _ _ hp hs => step_callbackFinishes hp hs) h)
+    (fun h => (sysLoad n).reachable_induction (P := CallbackFinishes) (callbackFinishes_init n).2
+      (fun _ _ _ hp hs => step_callbackFinishes hp hs) h)
+
+/-- With at least one layer, the poll can only finish the session through
+`network_completed_`, in the window after every issued copy's future is ready
+and before the last callback has run. -/
+theorem pollReady_window {n : Nat} {s s' : Recv} (h : ReachableAny n s) (hn : 0 < s.numLayers)
+    (hs : step s .pollReady = some s') :
+    networkCompleted s ∧ s.completed < s.numLayers ∧ s.issued = s.numLayers ∧
+      s.ready = s.numLayers := by
+  have hinv := h.inv
+  have hcf := reachable_callbackFinishes h
+  simp only [step, pollReady] at hs
+  split at hs
+  · rename_i hrd
+    obtain ⟨hndr, hor, hall⟩ := hrd
+    have hc := hinv.completed_le
+    have hr := hinv.retired_le
+    have hy := hinv.ready_le
+    have hi := hinv.issued_le
+    have ha := hinv.accounted_le
+    unfold allH2dDone at hall
+    have hlt : s.completed < s.numLayers := by
+      rcases Nat.lt_or_eq_of_le (show s.completed ≤ s.numLayers by omega) with hlt | heq
+      · exact hlt
+      · have := hcf.1 hn heq
+        rw [this] at hndr
+        cases hndr
+    have hnet : networkCompleted s := by
+      rcases hor with hnet | hcomp
+      · exact hnet
+      · omega
+    unfold networkCompleted at hnet
+    exact ⟨hnet, hlt, by omega, by omega⟩
+  · cases hs
+
+/-- `OnBlocksReceived` never finishes the session: when its `all_complete`
+test could pass, the last callback has already started draining and the
+handler returned early (`.cc:537-539`). -/
+theorem netAccount_frame {n : Nat} {s s' : Recv} (h : ReachableAny n s)
+    (hs : step s .netAccount = some s') : s'.life = s.life := by
+  have hinv := h.inv
+  have hcf := reachable_callbackFinishes h
+  simp only [step, netAccount] at hs
+  split at hs
+  · cases hs
+  · rename_i hact
+    split at hs
+    · rename_i hlt
+      split at hs
+      · rename_i hfin
+        exfalso
+        have hn : 0 < s.numLayers := by
+          have := hinv.issued_le
+          omega
+        have hc : s.completed = s.numLayers := hfin.2
+        exact hact (Or.inr (hcf.1 hn hc))
+      · cases hs
+        rfl
+    · cases hs
+
+/-- The poll never settles a session with layers: in its window a callback is
+still outstanding, so `done_` (and so publication) waits for it. -/
+theorem pollReady_no_settle {n : Nat} {s s' : Recv} (h : ReachableAny n s) (hn : 0 < s.numLayers)
+    (hs : step s .pollReady = some s') : s'.life.done = false ∧ 0 < s'.life.inFlight := by
+  have hinv := h.inv
+  have hcf := reachable_callbackFinishes h
+  obtain ⟨_, hlt, hiss, hrdy⟩ := pollReady_window h hn hs
+  simp only [step, pollReady] at hs
+  split at hs
+  · rename_i hrd
+    cases hs
+    have hndr : s.life.draining = false := hrd.1
+    have hok : s.life.statusOk = true := by
+      cases hst : s.life.statusOk
+      · have := hcf.2 hst
+        rw [this] at hndr
+        cases hndr
+      · rfl
+    have hcr := hinv.ok_completed hok
+    have hacc := hinv.accounted
+    unfold Accounted at hacc
+    have hif : s.life.inFlight ≠ 0 := by omega
+    have hnd : s.life.done = false := hinv.life.not_done hndr
+    refine ⟨?_, ?_⟩
+    · show (s.life.finishLocked true).done = false
+      rw [Lifecycle.finishLocked_done_of_inFlight true hif]
+      exact hnd
+    · show 0 < (s.life.finishLocked true).inFlight
+      rw [Lifecycle.finishLocked_inFlight]
+      omega
+  · cases hs
+
+/-! ## With and without the poll: the end-of-transfer metrics -/
+
+/-- A receive session with a ghost bit: whether the last callback recorded the
+end-of-transfer metrics (`.cc:679-689`). -/
+structure RecvM where
+  s : Recv
+  metrics : Bool := false
+  deriving Repr, DecidableEq
+
+/-- `Recv.step` carrying the ghost. `poll = true` is the shipping code;
+`poll = false` removes the manager's `IsReadyToComplete` finish
+(`mgr.cc:956-960`) and nothing else. -/
+def stepM (poll : Bool) (m : RecvM) (e : Ev) : Option RecvM :=
+  if e = .pollReady ∧ poll = false then none
+  else (step m.s e).map fun s' =>
+    ⟨s', m.metrics || (decide (e = .h2dDone true) && decide (recordsMetrics m.s))⟩
+
+def sysMPush (poll : Bool) (n : Nat) : System RecvM Ev := ⟨⟨initPush n, false⟩, stepM poll⟩
+
+def sysMLoad (poll : Bool) (n : Nat) : System RecvM Ev := ⟨⟨initLoad n, false⟩, stepM poll⟩
+
+/-- When the engine is told `done_recving`, the end-of-transfer metrics were
+recorded. -/
+def MetricsOnSuccess (m : RecvM) : Prop := m.s.published = some true → m.metrics = true
+
+theorem stepM_step {poll : Bool} {m m' : RecvM} {e : Ev} (hs : stepM poll m e = some m') :
+    step m.s e = some m'.s := by
+  unfold stepM at hs
+  split at hs
+  · cases hs
+  · simp only [Option.map_eq_some_iff] at hs
+    obtain ⟨s', hs', rfl⟩ := hs
+    exact hs'
+
+theorem stepM_metrics {poll : Bool} {m m' : RecvM} {e : Ev} (hs : stepM poll m e = some m') :
+    m'.metrics = (m.metrics || (decide (e = .h2dDone true) && decide (recordsMetrics m.s))) := by
+  unfold stepM at hs
+  split at hs
+  · cases hs
+  · simp only [Option.map_eq_some_iff] at hs
+    obtain ⟨s', hs', rfl⟩ := hs
+    rfl
+
+theorem sysMPush_reachable {poll : Bool} {n : Nat} {m : RecvM}
+    (h : (sysMPush poll n).Reachable m) : (sysPush n).Reachable m.s := by
+  induction h with
+  | init => exact System.Reachable.init
+  | step _ hs ih => exact System.Reachable.step ih (stepM_step hs)
+
+theorem sysMLoad_reachable {poll : Bool} {n : Nat} {m : RecvM}
+    (h : (sysMLoad poll n).Reachable m) : (sysLoad n).Reachable m.s := by
+  induction h with
+  | init => exact System.Reachable.init
+  | step _ hs ih => exact System.Reachable.step ih (stepM_step hs)
+
+theorem reachableAny_of_noPoll {n : Nat} {m : RecvM}
+    (h : (sysMPush false n).Reachable m ∨ (sysMLoad false n).Reachable m) :
+    ReachableAny n m.s :=
+  Or.elim h (fun h => Or.inl (sysMPush_reachable h)) (fun h => Or.inr (sysMLoad_reachable h))
+
+/-- Induction over the no-poll system on either creation path, with the
+underlying session known to be reachable in the shipping model. -/
+theorem noPoll_induction {n : Nat} {P : RecvM → Prop}
+    (hp : P ⟨initPush n, false⟩) (hl : P ⟨initLoad n, false⟩)
+    (hstep : ∀ m e m', ReachableAny n m.s → P m → stepM false m e = some m' → P m')
+    {m : RecvM} (h : (sysMPush false n).Reachable m ∨ (sysMLoad false n).Reachable m) : P m := by
+  rcases h with h | h
+  · exact ((sysMPush false n).reachable_induction (P := fun m => ReachableAny n m.s ∧ P m)
+      ⟨Or.inl System.Reachable.init, hp⟩
+      (fun m e m' hm hs => ⟨hm.1.step (stepM_step hs), hstep m e m' hm.1 hm.2 hs⟩) h).2
+  · exact ((sysMLoad false n).reachable_induction (P := fun m => ReachableAny n m.s ∧ P m)
+      ⟨Or.inr System.Reachable.init, hl⟩
+      (fun m e m' hm hs => ⟨hm.1.step (stepM_step hs), hstep m e m' hm.1 hm.2 hs⟩) h).2
+
+/-- Everything `Receive.lean` proves still holds without the poll: the no-poll
+model's reachable states are reachable states of the shipping model. -/
+theorem noPoll_safe {n : Nat} {m : RecvM}
+    (h : (sysMPush false n).Reachable m ∨ (sysMLoad false n).Reachable m) : Safe m.s :=
+  reachable_safe (reachableAny_of_noPoll h)
+
+/-- Inductive invariant of the no-poll model: draining with an OK status means
+the last callback ran and recorded the metrics. -/
+def NoPollInv (m : RecvM) : Prop :=
+  (m.s.life.draining = true → m.s.life.statusOk = true →
+      m.s.completed = m.s.numLayers ∧ m.metrics = true) ∧
+  MetricsOnSuccess m
+
+theorem step_noPollInv {n : Nat} {m m' : RecvM} {e : Ev} (hr : ReachableAny n m.s)
+    (hm : NoPollInv m) (hs : stepM false m e = some m') : NoPollInv m' := by
+  have hs' := stepM_step hs
+  have hinv' := step_inv hr.inv hs'
+  have hmet := stepM_metrics hs
+  have hn := step_numLayers hs'
+  obtain ⟨hdm, hpm⟩ := hm
+  refine ⟨?_, ?_⟩
+  · intro hdr' hok'
+    have hok : m.s.life.statusOk = true := by
+      cases h0 : m.s.life.statusOk
+      · rw [step_statusOk_mono hs' h0] at hok'
+        cases hok'
+      · rfl
+    cases hdr : m.s.life.draining
+    · rcases step_finish_ok hs' hdr hdr' hok' with hpoll | ⟨hev, hrec, hc⟩ | hnet
+      · subst hpoll
+        simp [stepM] at hs
+      · subst hev
+        refine ⟨hc, ?_⟩
+        rw [hmet]
+        simp [hrec]
+      · subst hnet
+        rw [netAccount_frame hr hs'] at hdr'
+        rw [hdr] at hdr'
+        cases hdr'
+    · obtain ⟨hc, hmm⟩ := hdm hdr hok
+      refine ⟨?_, by rw [hmet, hmm]; rfl⟩
+      rcases step_completed hs' with hcc | ⟨hcc, _⟩
+      · rw [hcc, hn]
+        exact hc
+      · exfalso
+        have := hinv'.completed_le
+        have := hinv'.retired_le
+        have := hinv'.ready_le
+        have := hinv'.issued_le
+        omega
+  · intro hp'
+    rcases step_published hs' hp' with hp | ⟨hd, hok⟩
+    · rw [hmet, hpm hp]
+      rfl
+    · have hdr : m.s.life.draining = true := hr.inv.life.done_draining hd
+      obtain ⟨_, hmm⟩ := hdm hdr hok
+      rw [hmet, hmm]
+      rfl
+
+theorem noPoll_reachable_inv {n : Nat} {m : RecvM}
+    (h : (sysMPush false n).Reachable m ∨ (sysMLoad false n).Reachable m) : NoPollInv m :=
+  noPoll_induction (P := NoPollInv)
+    (by constructor <;> simp [initPush, MetricsOnSuccess])
+    (by constructor <;> simp [initLoad, MetricsOnSuccess])
+    (fun _ _ _ hr hm hs => step_noPollInv hr hm hs) h
+
+/-- Without the poll, a receive published as done has recorded its metrics. -/
+theorem noPoll_metrics_on_success {n : Nat} {m : RecvM}
+    (h : (sysMPush false n).Reachable m ∨ (sysMLoad false n).Reachable m) :
+    MetricsOnSuccess m :=
+  (noPoll_reachable_inv h).2
+
+/-- The drain argument of `Receive.lean` never used the poll (the poll is
+disabled while draining), so it lifts to the no-poll model as it is. -/
+theorem noPoll_draining_can_settle_aux (n : Nat) :
+    ∀ (k : Nat) (s : Recv) (b : Bool), drainRank s ≤ k → Inv s → s.life.draining = true →
+      ∃ evs m', (sysMPush false n).runFrom ⟨s, b⟩ evs = some m' ∧
+        m'.s.life.done = true ∧ m'.s.life.hasStaging = false
+  | 0, s, b, hk, h, hdr => by
+    have hacc := h.accounted
+    unfold Accounted at hacc
+    unfold drainRank at hk
+    have hd : s.life.done = true := h.life.prompt hdr (by omega)
+    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
+    exact ⟨[], ⟨s, b⟩, rfl, hd, hst⟩
+  | k + 1, s, b, hk, h, hdr => by
+    cases hnd : s.life.done
+    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step h hdr hnd
+      have hne : e ≠ .pollReady := by
+        intro he
+        subst he
+        simp [step, pollReady, hdr] at hs₁
+      obtain ⟨evs, m', hrun, hd', hst'⟩ :=
+        noPoll_draining_can_settle_aux n k s₁
+          (b || (decide (e = .h2dDone true) && decide (recordsMetrics s)))
+          (by omega) (step_inv h hs₁) hdr₁
+      refine ⟨e :: evs, m', ?_, hd', hst'⟩
+      have hstep : stepM false ⟨s, b⟩ e =
+          some ⟨s₁, b || (decide (e = .h2dDone true) && decide (recordsMetrics s))⟩ := by
+        simp [stepM, hne, hs₁]
+      simp only [System.runFrom, sysMPush, List.foldlM_cons, hstep]
+      exact hrun
+    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
+      exact ⟨[], ⟨s, b⟩, rfl, hnd, hst⟩
+
+/-- Without the poll, every reachable session can still settle and release
+its staging in finitely many steps. -/
+theorem noPoll_can_settle {n : Nat} {m : RecvM}
+    (h : (sysMPush false n).Reachable m ∨ (sysMLoad false n).Reachable m) :
+    ∃ evs m', (sysMPush false n).runFrom m evs = some m' ∧
+      m'.s.life.done = true ∧ m'.s.life.hasStaging = false := by
+  have hinv := (reachableAny_of_noPoll h).inv
+  have hcancel : step m.s .cancel = some { m.s with life := m.s.life.finishLocked false } := rfl
+  have hinv₁ := step_inv hinv hcancel
+  have hdr₁ : ({ m.s with life := m.s.life.finishLocked false } : Recv).life.draining = true := by
+    simp
+  obtain ⟨evs, m', hrun, hd', hst'⟩ :=
+    noPoll_draining_can_settle_aux n _ _ m.metrics (Nat.le_refl _) hinv₁ hdr₁
+  refine ⟨.cancel :: evs, m', ?_, hd', hst'⟩
+  have hstep : stepM false m .cancel =
+      some ⟨{ m.s with life := m.s.life.finishLocked false }, m.metrics⟩ := by
+    simp [stepM, step, cancel]
+  simp only [System.runFrom, sysMPush, List.foldlM_cons, hstep]
+  exact hrun
+
+/-! ## Zero layers: the one case the poll decides -/
+
+/-- With no layers no callback ever runs, so the ghost never flips. -/
+theorem noPoll_metrics_zero {m : RecvM}
+    (h : (sysMPush false 0).Reachable m ∨ (sysMLoad false 0).Reachable m) : m.metrics = false :=
+  noPoll_induction (P := fun m => m.metrics = false) rfl rfl
+    (fun m _ _ hr hm hs => by
+      have hinv := hr.inv
+      have hn := reachable_numLayers hr
+      rw [stepM_metrics hs, hm, Bool.false_or]
+      have hno : ¬ recordsMetrics m.s := fun hrec => by
+        have := hinv.ready_le
+        have := hinv.issued_le
+        have := hrec.1
+        omega
+      simp [hno]) h
+
+/-- Without the poll a zero-layer receive is never published as done: nothing
+else calls `FinishLocked()` with an OK status. -/
+theorem noPoll_zero_layers_never_succeeds {m : RecvM}
+    (h : (sysMPush false 0).Reachable m ∨ (sysMLoad false 0).Reachable m) :
+    m.s.published ≠ some true := fun hp => by
+  have h1 := noPoll_metrics_on_success h hp
+  rw [noPoll_metrics_zero h] at h1
+  cases h1
+
+/-! ## Replay and bounded search -/
+
+/-- Shipping code, one layer: the poll fires in the window, the callback then
+sees `draining_` and skips the metrics, and the engine is told `done_recving`
+for a transfer whose end was never recorded. -/
+theorem trace_poll_skips_metrics :
+    ((sysMPush true 1).run
+      [.h2dBegin, .h2dIssue true, .netAccount, .h2dReady, .pollReady, .h2dDone true, .publish]).map
+      (fun m => (m.s.published, m.s.completed, m.metrics)) = some (some true, 1, false) := by
+  decide
+
+/-- The same transfer without the poll: the callback finishes and records. -/
+theorem trace_noPoll_normal :
+    ((sysMPush false 1).run
+      [.h2dBegin, .h2dIssue true, .netAccount, .h2dReady, .h2dDone true, .publish]).map
+      (fun m => (m.s.published, m.s.completed, m.metrics)) = some (some true, 1, true) ∧
+    ((sysMLoad false 2).run
+      [.pullReply true, .h2dBegin, .h2dIssue true, .h2dBegin, .h2dIssue true, .netAccount,
+       .netAccount, .h2dReady, .h2dReady, .h2dDone true, .h2dDone true, .publish]).map
+      (fun m => (m.s.published, m.s.completed, m.metrics)) = some (some true, 2, true) := by
+  decide
+
+/-- With no layers `IsReadyToComplete` holds at once, and only the poll
+finishes the session. -/
+theorem trace_zero_layers_poll :
+    ((sysMPush true 0).run [.pollReady, .publish]).map (fun m => m.s.published) =
+      some (some true) ∧
+    ((sysMLoad true 0).run [.pullReply true, .pollReady, .publish]).map (fun m => m.s.published) =
+      some (some true) ∧
+    (sysMPush false 0).run [.pollReady] = none := by
+  decide
+
+/-- Executable negation of `MetricsOnSuccess`. -/
+def violatesMetrics (m : RecvM) : Bool := m.s.published == some true && !m.metrics
+
+#guard (match ModelCheck.check (sysMPush true 1) events violatesMetrics 8 with
+        | .counterexample _ => true
+        | _ => false)
+#guard ModelCheck.check (sysMPush false 2) events violatesMetrics 10 = .outOfFuel
+#guard ModelCheck.check (sysMLoad false 2) events violatesMetrics 10 = .outOfFuel
+
+-- Sanity check that the no-poll model is not vacuous: the search, asked to
+-- *find* a successful publication, finds one.
+#guard (match ModelCheck.check (sysMPush false 2) events (fun m => m.s.published == some true) 10 with
+        | .counterexample _ => true
+        | _ => false)
+
+end Recv
+
+end PrefillDecode
+
+end TpuSyncVerify.Transfer

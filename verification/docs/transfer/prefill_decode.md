@@ -11,6 +11,7 @@ was read at that commit when the stage was written.
 |---|---|---|---|
 | `Transfer/Session.lean` | 1 | the settle protocol shared by the session classes: `in_flight_`, `draining_`, `done_`, staging ownership | `Consistent` is preserved by `beginOp`/`finish*`/`endOp` |
 | `PrefillDecode/Receive.lean` | 1–2 | one `TransferReceiveSession` plus the manager's poll and publication; transport block accounting; `IsReadyToComplete` | `Recv.reachable_safe` |
+| `PrefillDecode/ReceivePoll.lean` | 2 (audit) | what the poll-side `IsReadyToComplete` finish contributes, with and without it (`stepM poll`); a `metrics` ghost for the last callback's `RecordEnd`/`RecordH2dComplete` | `Recv.reachable_callbackFinishes`, `Recv.pollReady_window`, `Recv.pollReady_no_settle`, `Recv.netAccount_frame`, `Recv.noPoll_metrics_on_success`, `Recv.noPoll_safe`, `Recv.noPoll_can_settle`, `Recv.noPoll_zero_layers_never_succeeds` |
 | `PrefillDecode/Send.lean` | 3 | one `TransferSendSession`: the D2H loop and the H2H push chain against one `in_flight_` | `Send.reachable_safe` |
 | `PrefillDecode/Pipeline.lean` | 4 | `Send` + `Recv` + five layer-indexed memories (prefill HBM → staging → wire → decode staging → decode HBM), engine reclaim, staging reuse, and the multi-request system (`multiSys`) sharing the four pools across requests; every memory-touching event names its layer, so layers complete in any order at every stage | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress`, `Pipeline.reachable_safe`, `Pipeline.attention_safe`, `Pipeline.reachable_can_settle` |
 
@@ -85,6 +86,9 @@ Traces (all `decide`):
 | `Pipeline.trace_layers_out_of_order` | two layers: D2H finishes 1 then 0, pushes complete 1 then 0, layer 1 lands and is dispatched first, H2D finishes 1 then 0 — publication finds `[kv 0, kv 1]`. The proposal's out-of-order question, answered inside the model |
 | `Pipeline.trace_wake_needs_own_layer` | `SendNextLayer(0)` does not proceed on layer 1's finished copy |
 | `Recv.trace_poll_before_callbacks` | `IsReadyToComplete` can be true before the callbacks ran; publication waits |
+| `Recv.trace_poll_skips_metrics` | shipping code, one layer: the poll finishes in that window, the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd`, the engine still sees `done_recving` |
+| `Recv.trace_noPoll_normal` | the same transfer with the poll removed: the callback finishes and records |
+| `Recv.trace_zero_layers_poll` | with `num_layers() == 0` only the poll ever finishes the session (`noPoll_zero_layers_never_succeeds` is the general statement) |
 | `Recv.trace_deadline_during_copy`, `Send.trace_deadline_during_copy` | a deadline under an in-flight copy drains but does not settle until the op ends |
 | `Recv.trace_finish_between_locks` | the race the `.cc:601-612` re-check closes |
 | `Recv.trace_no_push_after_finish`, `Pipeline.trace_no_push_after_settle` | nothing lands in a settled receive's staging |
@@ -126,7 +130,7 @@ cited assumptions. Observations (not bugs) worth passing on:
 | `SendAck` / `HandleAck → AckSend → Finish()` has no non-test caller | `mgr.cc:1529-1532`, `1595-1606` | dead path; excluded (Send A5) |
 | a failed **send** is reported in `failed_recving_` | `mgr.cc:920` | naming/semantics quirk visible through `poll_stats()` |
 | first `Finish` wins on the send side; a later cancel is ignored | `send.cc:167-175` | intended; `trace_cancel_after_ok_finish` |
-| `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:427-433` | harmless; `done` still waits for every callback through `in_flight_` |
+| `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:427-433` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:659-665, 679-689`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlocksReceived` are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). `ReceivePoll.lean` |
 | `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:188-194` vs `recv.cc:385-388` | underflow proved unreachable (`NoUnderflow`) |
 | `LOG(DFATAL) "H2D callback for retired receive"` is unreachable | `recv.cc:651-653` | proved (`NoRetiredCallback`) |
 
