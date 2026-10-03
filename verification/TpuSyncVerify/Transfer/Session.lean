@@ -364,6 +364,113 @@ theorem endOpLocked_done_mono {l : Lifecycle} (h : l.done = true) :
   · exact h
   · exact settleLocked_done_mono (by simpa using h)
 
+/-! ## Redundant `done_` guards
+
+Audit of the `done_` mentions in the receiver's lifecycle guards (`recv` at
+`01ffa3d`; the same code sits at `b68161a` lines `.cc:365`, `.cc:388`,
+`.cc:520`, `.cc:565`, `.h:111`). `Consistent` already decides each of them:
+
+* `FinishLocked` `.cc:367`: past the `if (draining_) return` (`.cc:365`),
+  `!done_` holds — `Consistent.not_done`;
+* `EndRecvOpLocked` `.cc:390`: past the underflow return (`.cc:385-388`),
+  `!done_` holds — `Consistent.not_done_of_inFlight`;
+* `done_ || draining_` in `TryBeginRecvOp` (`.h:111`), `OnBlocksReceived`
+  (`.cc:537`) and `ExecuteLayerH2d` (`.cc:582`, `.cc:608`) is `draining_` —
+  `Consistent.done_or_draining`.
+
+The sender has the same two: `send.cc:168` (`draining_ || done_`) and
+`send.cc:190` (`!done_`).
+
+The primed functions below are the transcriptions with those guards removed.
+They agree with the originals on every `Consistent` lifecycle, and every
+model built on this file keeps `Consistent` as part of its invariant
+(`Recv.Inv.life`, `Send.Inv.life`), so dropping the guards changes no
+transition of any reachable state. The `LOG(DFATAL)` branches
+(`.cc:385-388`, `.cc:651-653`) are a different matter: they are assertions,
+unreachable by `Accounted` and `NoRetiredCallback` respectively, not
+redundant tests of an already-known value. -/
+
+/-- `settleLocked` without the `!done_` conjunct. -/
+def settleLocked' (l : Lifecycle) : Lifecycle :=
+  if l.draining = true ∧ l.inFlight = 0 then { l with hasStaging := false, done := true }
+  else l
+
+/-- `FinishLocked` without the `!done_` at `.cc:367`. -/
+def finishLocked' (ok : Bool) (l : Lifecycle) : Lifecycle :=
+  let l := if ok = false ∧ l.statusOk = true then { l with statusOk := false } else l
+  if l.draining = true then l else settleLocked' { l with draining := true }
+
+/-- `EndRecvOpLocked` without the `!done_` at `.cc:390`. -/
+def endOpLocked' (l : Lifecycle) : Lifecycle :=
+  if l.inFlight = 0 then l else settleLocked' { l with inFlight := l.inFlight - 1 }
+
+/-- `TryBeginRecvOp` refusing on `draining_` alone (the sender's pattern). -/
+def beginOp' (l : Lifecycle) : Option Lifecycle :=
+  if l.draining = true then none else some { l with inFlight := l.inFlight + 1 }
+
+/-- Contrapositive of `done_idle`: a session with work in flight is not done. -/
+theorem Consistent.not_done_of_inFlight {l : Lifecycle} (h : Consistent l)
+    (hi : l.inFlight ≠ 0) : l.done = false := by
+  cases hd : l.done
+  · rfl
+  · exact absurd (h.done_idle hd) hi
+
+/-- `done_ || draining_` is `draining_`. -/
+theorem Consistent.done_or_draining {l : Lifecycle} (h : Consistent l) :
+    (l.done || l.draining) = l.draining := by
+  cases hd : l.done
+  · simp
+  · simp [h.done_draining hd]
+
+theorem settleLocked'_eq {l : Lifecycle}
+    (h : l.draining = true → l.inFlight = 0 → l.done = false) :
+    settleLocked' l = settleLocked l := by
+  unfold settleLocked' settleLocked
+  split <;> split
+  · rfl
+  · rename_i hc hc'
+    exact absurd ⟨hc.1, hc.2, h hc.1 hc.2⟩ hc'
+  · rename_i hc hc'
+    exact absurd ⟨hc'.1, hc'.2.1⟩ hc
+  · rfl
+
+theorem finishLocked'_eq {l : Lifecycle} (ok : Bool) (h : Consistent l) :
+    finishLocked' ok l = finishLocked ok l := by
+  have key : ∀ l' : Lifecycle, (l'.done = true → l'.draining = true) →
+      (if l'.draining = true then l' else settleLocked' { l' with draining := true })
+        = (if l'.draining = true then l' else settleLocked { l' with draining := true }) := by
+    intro l' hdd
+    split
+    · rfl
+    · rename_i hn
+      apply settleLocked'_eq
+      intro _ _
+      show l'.done = false
+      cases hd : l'.done
+      · rfl
+      · exact absurd (hdd hd) hn
+  simp only [finishLocked', finishLocked]
+  split
+  · exact key _ h.done_draining
+  · exact key _ h.done_draining
+
+theorem endOpLocked'_eq {l : Lifecycle} (h : Consistent l) :
+    endOpLocked' l = endOpLocked l := by
+  unfold endOpLocked' endOpLocked
+  split
+  · rfl
+  · rename_i hn
+    apply settleLocked'_eq
+    intro _ _
+    show l.done = false
+    exact h.not_done_of_inFlight hn
+
+theorem beginOp'_eq {l : Lifecycle} (h : Consistent l) : beginOp' l = beginOp l := by
+  unfold beginOp' beginOp
+  cases hdr : l.draining
+  · simp [h.not_done hdr]
+  · simp
+
 end Lifecycle
 
 end TpuSyncVerify.Transfer
