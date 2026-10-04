@@ -293,6 +293,31 @@ decided yet. -/
     simp only [not_or] at h
     simp [h.1, h.2]
 
+theorem Consistent.finishOnceLocked_draining {l : Lifecycle} (ok : Bool) (h : Consistent l) :
+    (finishOnceLocked ok l).draining = true := by
+  rw [Lifecycle.finishOnceLocked_draining]
+  cases hd : l.done
+  · simp
+  · simp [h.done_draining hd]
+
+theorem Consistent.finishOnceLocked_false_statusOk {l : Lifecycle} (h : Consistent l)
+    (hok : (finishOnceLocked false l).statusOk = true) :
+    l.statusOk = true ∧ l.draining = true := by
+  rw [finishOnceLocked_statusOk] at hok
+  split at hok
+  · rename_i hd
+    refine ⟨hok, ?_⟩
+    rcases hd with hd | hd
+    · exact hd
+    · exact h.done_draining hd
+  · cases hok
+
+/-- `FinishLocked` cannot settle a session that still has work in flight. -/
+theorem finishLocked_done_of_inFlight {l : Lifecycle} (ok : Bool) (h : l.inFlight ≠ 0) :
+    (finishLocked ok l).done = l.done := by
+  unfold finishLocked settleLocked
+  by_cases hc : ok = false ∧ l.statusOk = true <;> simp [hc, h] <;> split <;> rfl
+
 @[simp] theorem endOpLocked_statusOk (l : Lifecycle) :
     (endOpLocked l).statusOk = l.statusOk := by
   unfold endOpLocked; split <;> simp

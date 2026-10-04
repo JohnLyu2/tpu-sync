@@ -62,21 +62,7 @@ zero-layer receive at creation, as `TransferSendSession::StartPush` does for
 a zero-layer send (`send.cc:300-303`).
 -/
 
-namespace TpuSyncVerify.Transfer
-
-namespace Lifecycle
-
-/-- `FinishLocked` cannot settle a session that still has work in flight. -/
-theorem finishLocked_done_of_inFlight {l : Lifecycle} (ok : Bool) (h : l.inFlight ≠ 0) :
-    (finishLocked ok l).done = l.done := by
-  unfold finishLocked settleLocked
-  by_cases hc : ok = false ∧ l.statusOk = true <;> simp [hc, h] <;> split <;> rfl
-
-end Lifecycle
-
-namespace PrefillDecode
-
-namespace Recv
+namespace TpuSyncVerify.Transfer.PrefillDecode.Recv
 
 /-! ## Reachability on either creation path -/
 
@@ -583,8 +569,4 @@ def violatesMetrics (m : RecvM) : Bool := m.s.published == some true && !m.metri
         | .counterexample _ => true
         | _ => false)
 
-end Recv
-
-end PrefillDecode
-
-end TpuSyncVerify.Transfer
+end TpuSyncVerify.Transfer.PrefillDecode.Recv

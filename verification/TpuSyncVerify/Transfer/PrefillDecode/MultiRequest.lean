@@ -46,19 +46,7 @@ request `idx`:
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 
-/-- True if `e` is one of the environment buffer-overwrite events (`.reclaim`,
-`.reseatPrefillStaging`, `.reseatDecodeStaging`). -/
-def isRecycleEv (e : Ev) : Bool :=
-  e == .reclaim || e == .reseatPrefillStaging || e == .reseatDecodeStaging
-
-/-- Per-buffer write-after-release detector: checks whether a transition `r → r'`
-modified any of the four buffers after `r` had already released that specific
-buffer. -/
-def wroteReleased (r r' : Pipeline) : Bool :=
-  (r.send.published != none && r'.prefillHbm != r.prefillHbm) ||
-  (!r.send.life.hasStaging && r'.prefillStaging != r.prefillStaging) ||
-  (!r.recv.life.hasStaging && r'.decodeStaging != r.decodeStaging) ||
-  (r.recv.published != none && r'.decodeHbm != r.decodeHbm)
+/-! ## Multi-request transition system -/
 
 /-- Corrupt all four buffers of a pipeline with `.junk` (triggered if any
 request commits a write-after-release on any buffer). -/
@@ -68,49 +56,6 @@ def corruptBuffers (s : Pipeline) : Pipeline :=
     prefillStaging := List.replicate s.numLayers .junk,
     decodeStaging := List.replicate s.numLayers .junk,
     decodeHbm := List.replicate s.numLayers .junk }
-
-/-- Overwrite a request's prefill buffers (`prefillHbm` and `prefillStaging`)
-with `.junk` when a later request recycles them (`recyclePrefill`). Any
-straggling D2H or H2H read by `s` would observe `.junk`. -/
-def recyclePrefillBufs (s : Pipeline) : Pipeline :=
-  { s with
-    prefillHbm := List.replicate s.numLayers .junk,
-    reclaimed := true,
-    prefillStaging := List.replicate s.numLayers .junk }
-
-/-- Overwrite a request's `prefillHbm`, `prefillStaging`, and `decodeStaging`
-with `.junk` when a later request recycles all buffers (`nextRequest`). -/
-def recycleAllBufs (s : Pipeline) : Pipeline :=
-  { s with
-    prefillHbm := List.replicate s.numLayers .junk,
-    reclaimed := true,
-    prefillStaging := List.replicate s.numLayers .junk,
-    decodeStaging := List.replicate s.numLayers .junk }
-
-theorem Inv.recyclePrefillBufs {s : Pipeline} (h : Inv s) (hp : PrefillReleased s) :
-    Inv (Pipeline.recyclePrefillBufs s) := by
-  unfold Pipeline.recyclePrefillBufs
-  have hd : s.send.life.done = true := h.send.life.done_of_released hp.1
-  refine ⟨h.send, h.recv, h.n_send, h.n_recv, List.length_replicate, h.len_wire,
-    h.len_dstaging, h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL,
-    h.len_h2dPendingL, h.len_h2dIssuedL, h.len_h2dReadyL, ?_, ?_,
-    h.cnt_d2hReady, h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady,
-    ?_, h.wire_good, h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
-    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
-  · show true = false → _
-    intro hc; cases hc
-  · show _ → s.send.life.done = true
-    intro _; exact hd
-  · show s.send.life.done = false → _
-    intro hn; rw [hd] at hn; cases hn
-
-theorem Inv.recycleAllBufs {s : Pipeline} (h : Inv s) (hp : HandedOff s) :
-    Inv (Pipeline.recycleAllBufs s) := by
-  have h₁ : Inv (Pipeline.recyclePrefillBufs s) := h.recyclePrefillBufs hp.prefillReleased
-  have hs : step (Pipeline.recyclePrefillBufs s) .reseatDecodeStaging =
-      some (Pipeline.recycleAllBufs s) := by
-    simp [step, reseatDecodeStaging, Pipeline.recyclePrefillBufs, Pipeline.recycleAllBufs, hp.2.1]
-  exact step_inv h₁ hs
 
 /-- Multi-request system state: all started requests `reqs : List Pipeline`,
 which may execute concurrently and recycle buffers across requests. -/
@@ -137,6 +82,10 @@ inductive MultiEv where
 def multiInit (n : Nat) : MultiState :=
   { numLayers := n, reqs := [init n] }
 
+/-- Replace `reqs[idx]` with `r'` and spawn a fresh request `init ms.numLayers`. -/
+def MultiState.spawnAfterRecycle (ms : MultiState) (idx : Nat) (r' : Pipeline) : MultiState :=
+  { ms with reqs := (ms.reqs.set idx r') ++ [init ms.numLayers] }
+
 def multiStep (ms : MultiState) : MultiEv → Option MultiState
   | .reqStep idx e =>
     match ms.reqs[idx]? with
@@ -153,17 +102,19 @@ def multiStep (ms : MultiState) : MultiEv → Option MultiState
     | none => none
     | some r =>
       if PrefillReleased r then
-        some { ms with reqs := (ms.reqs.set idx (recyclePrefillBufs r)) ++ [init ms.numLayers] }
+        some (ms.spawnAfterRecycle idx (recyclePrefillBufs r))
       else none
   | .nextRequest idx =>
     match ms.reqs[idx]? with
     | none => none
     | some r =>
       if HandedOff r then
-        some { ms with reqs := (ms.reqs.set idx (recycleAllBufs r)) ++ [init ms.numLayers] }
+        some (ms.spawnAfterRecycle idx (recycleAllBufs r))
       else none
 
 def multiSys (n : Nat) : System MultiState MultiEv := ⟨multiInit n, multiStep⟩
+
+/-! ## Multi-request inductive invariant -/
 
 structure MultiInv (n : Nat) (ms : MultiState) : Prop where
   n_eq : ms.numLayers = n
@@ -176,41 +127,17 @@ theorem multiInv_init (n : Nat) : MultiInv n (multiInit n) := by
   subst hr
   exact ⟨inv_init n, rfl⟩
 
-/-- Key per-buffer non-interference lemma: for any request `r` satisfying `Inv r`,
-no transfer step ever modifies any of the four buffers after `r` has released
-that specific buffer (`wroteReleased r r' = false`). Proved from
-`prefillHbm_quiet_step`, `prefillStaging_quiet`, `decodeStaging_quiet`, and
-`decodeHbm_quiet`. -/
-theorem wroteReleased_eq_false {r r' : Pipeline} {e : Ev} (h : Inv r)
-    (hne₀ : e ≠ .reclaim)
-    (hne₁ : e ≠ .reseatPrefillStaging) (hne₂ : e ≠ .reseatDecodeStaging)
-    (hs : step r e = some r') :
-    wroteReleased r r' = false := by
-  have hq₀ : r'.prefillHbm = r.prefillHbm := prefillHbm_quiet_step hne₀ hs
-  have hq₁ : (!r.send.life.hasStaging && r'.prefillStaging != r.prefillStaging) = false := by
-    cases hst : r.send.life.hasStaging
-    · simp [(prefillStaging_quiet h hst hne₁ hs).1]
-    · simp
-  have hq₂ : (!r.recv.life.hasStaging && r'.decodeStaging != r.decodeStaging) = false := by
-    cases hst : r.recv.life.hasStaging
-    · simp [(decodeStaging_quiet h hst hne₂ hs).1]
-    · simp
-  have hq₃ : (r.recv.published != none && r'.decodeHbm != r.decodeHbm) = false := by
-    cases hp : r.recv.published with
-    | none => simp
-    | some b =>
-      have hne : r.recv.published ≠ none := by simp [hp]
-      simp [decodeHbm_quiet h hne hs]
-  simp [wroteReleased, hq₀, hq₁, hq₂, hq₃]
-
-theorem not_isRecycleEv_and_wroteReleased_eq_false {r r' : Pipeline} {e : Ev}
-    (h : Inv r) (hs : step r e = some r') :
-    (!isRecycleEv e && wroteReleased r r') = false := by
-  by_cases he : isRecycleEv e = true
-  · simp [he]
-  · simp only [isRecycleEv, Bool.or_eq_true, beq_iff_eq, not_or] at he
-    rw [wroteReleased_eq_false h he.1.1 he.1.2 he.2 hs]
-    simp
+theorem MultiInv.spawnAfterRecycle {n idx : Nat} {ms : MultiState} {r' : Pipeline}
+    (h : MultiInv n ms) (hr' : Inv r') (hn' : r'.numLayers = n) :
+    MultiInv n (ms.spawnAfterRecycle idx r') := by
+  refine ⟨h.n_eq, ?_⟩
+  intro x hx
+  simp only [MultiState.spawnAfterRecycle, List.mem_append, List.mem_singleton] at hx
+  rcases hx with hx | rfl
+  · rcases mem_set_cases hx with rfl | hx
+    · exact ⟨hr', hn'⟩
+    · exact h.reqs_inv x hx
+  · exact ⟨h.n_eq ▸ inv_init n, h.n_eq⟩
 
 theorem multiStep_inv {n : Nat} {ms ms' : MultiState} {ev : MultiEv}
     (h : MultiInv n ms) (hs : multiStep ms ev = some ms') : MultiInv n ms' := by
@@ -240,14 +167,7 @@ theorem multiStep_inv {n : Nat} {ms ms' : MultiState} {ev : MultiEv}
       · rename_i hrel
         cases hs
         have ⟨hr_inv, hr_n⟩ := h.reqs_inv r (getElem?_mem hget)
-        refine ⟨h.n_eq, ?_⟩
-        intro x hx
-        simp only [List.mem_append, List.mem_singleton] at hx
-        rcases hx with hx | rfl
-        · rcases mem_set_cases hx with rfl | hx
-          · exact ⟨hr_inv.recyclePrefillBufs hrel, hr_n⟩
-          · exact h.reqs_inv x hx
-        · exact ⟨h.n_eq ▸ inv_init n, h.n_eq⟩
+        exact h.spawnAfterRecycle (hr_inv.recyclePrefillBufs hrel) hr_n
       · cases hs
   | nextRequest idx =>
     simp only [multiStep] at hs
@@ -259,21 +179,16 @@ theorem multiStep_inv {n : Nat} {ms ms' : MultiState} {ev : MultiEv}
       · rename_i hrel
         cases hs
         have ⟨hr_inv, hr_n⟩ := h.reqs_inv r (getElem?_mem hget)
-        refine ⟨h.n_eq, ?_⟩
-        intro x hx
-        simp only [List.mem_append, List.mem_singleton] at hx
-        rcases hx with hx | rfl
-        · rcases mem_set_cases hx with rfl | hx
-          · exact ⟨hr_inv.recycleAllBufs hrel, hr_n⟩
-          · exact h.reqs_inv x hx
-        · exact ⟨h.n_eq ▸ inv_init n, h.n_eq⟩
+        exact h.spawnAfterRecycle (hr_inv.recycleAllBufs hrel) hr_n
       · cases hs
 
 theorem reachable_multiInv {n : Nat} {ms : MultiState}
     (h : (multiSys n).Reachable ms) : MultiInv n ms :=
   (multiSys n).reachable_induction (multiInv_init n) (fun _ _ _ hi hs => multiStep_inv hi hs) h
 
-/-- **System Property 1a (Data correctness at publication across requests):**
+/-! ## Top-level system theorems across requests -/
+
+/-- **Publication correctness across requests:**
 In any reachable multi-request state — across any number of concurrent,
 overlapped, succeeded, failed, or cancelled requests — whenever any request `r`
 at index `idx` publishes `done_recving`, its `decodeHbm` holds `good n`. -/
@@ -286,6 +201,21 @@ theorem system_data_correct {n : Nat} {ms : MultiState} {idx : Nat} {r : Pipelin
   have ⟨hr_inv, hr_n⟩ := hinv.reqs_inv r (getElem?_mem hreq)
   rw [← hr_n]
   exact (inv_safe hr_inv).1 hp
+
+theorem spawnAfterRecycle_decodeHbm_quiet {ms : MultiState} {idx j : Nat} {r rj' : Pipeline}
+    (hreq : ms.reqs[idx]? = some r) (hp : r.recv.published ≠ none)
+    (hd : j = idx → rj'.decodeHbm = r.decodeHbm ∧ rj'.recv.published = r.recv.published) :
+    ∃ r', (ms.spawnAfterRecycle j rj').reqs[idx]? = some r' ∧
+      r'.decodeHbm = r.decodeHbm ∧ r'.recv.published ≠ none := by
+  have hlt : idx < ms.reqs.length := lt_length_of_getElem?_eq hreq
+  have hlen_set : idx < (ms.reqs.set j rj').length := by rw [List.length_set]; exact hlt
+  by_cases hji : j = idx
+  · subst hji
+    obtain ⟨hd', hp'⟩ := hd rfl
+    refine ⟨rj', ?_, hd', hp' ▸ hp⟩
+    simp [MultiState.spawnAfterRecycle, List.getElem?_append_left hlen_set, List.getElem?_set_self hlt]
+  · refine ⟨r, ?_, rfl, hp⟩
+    simp [MultiState.spawnAfterRecycle, List.getElem?_append_left hlen_set, List.getElem?_set_ne hji, hreq]
 
 theorem multiStep_decodeHbm_quiet {n : Nat} {ms ms' : MultiState} {idx : Nat} {r : Pipeline}
     {ev : MultiEv} (hinv : MultiInv n ms) (hreq : ms.reqs[idx]? = some r)
@@ -319,15 +249,9 @@ theorem multiStep_decodeHbm_quiet {n : Nat} {ms ms' : MultiState} {idx : Nat} {r
       simp only [hget] at hs
       split at hs
       · cases hs
-        have hlen_set : idx < (ms.reqs.set j (recyclePrefillBufs rj)).length := by
-          rw [List.length_set]; exact hlt
-        by_cases hji : j = idx
-        · subst hji
-          rw [hreq, Option.some.injEq] at hget; subst hget
-          refine ⟨recyclePrefillBufs r, ?_, rfl, hp⟩
-          rw [List.getElem?_append_left hlen_set, List.getElem?_set_self hlt]
-        · refine ⟨r, ?_, rfl, hp⟩
-          rw [List.getElem?_append_left hlen_set, List.getElem?_set_ne hji, hreq]
+        refine spawnAfterRecycle_decodeHbm_quiet hreq hp fun hji => ?_
+        subst hji; rw [hreq, Option.some.injEq] at hget; subst hget
+        exact ⟨rfl, rfl⟩
       · cases hs
   | nextRequest j =>
     simp only [multiStep] at hs
@@ -337,15 +261,9 @@ theorem multiStep_decodeHbm_quiet {n : Nat} {ms ms' : MultiState} {idx : Nat} {r
       simp only [hget] at hs
       split at hs
       · cases hs
-        have hlen_set : idx < (ms.reqs.set j (recycleAllBufs rj)).length := by
-          rw [List.length_set]; exact hlt
-        by_cases hji : j = idx
-        · subst hji
-          rw [hreq, Option.some.injEq] at hget; subst hget
-          refine ⟨recycleAllBufs r, ?_, rfl, hp⟩
-          rw [List.getElem?_append_left hlen_set, List.getElem?_set_self hlt]
-        · refine ⟨r, ?_, rfl, hp⟩
-          rw [List.getElem?_append_left hlen_set, List.getElem?_set_ne hji, hreq]
+        refine spawnAfterRecycle_decodeHbm_quiet hreq hp fun hji => ?_
+        subst hji; rw [hreq, Option.some.injEq] at hget; subst hget
+        exact ⟨rfl, rfl⟩
       · cases hs
 
 theorem multiRunFrom_decodeHbm_quiet {n idx : Nat} :
@@ -367,7 +285,7 @@ theorem multiRunFrom_decodeHbm_quiet {n idx : Nat} :
         @multiRunFrom_decodeHbm_quiet n idx evs _ _ r₁ (multiStep_inv hinv hse) hreq₁ hp₁ hr
       exact ⟨r', hreq', hd'.trans hd₁⟩
 
-/-- **System Property 1b (Attention safety across requests):**
+/-- **Decoding safety across requests:**
 Once any request `r` at index `idx` publishes `done_recving`, its `decodeHbm`
 stays equal to `good n` across any subsequent sequence of multi-request
 transitions `evs` (including steps of `idx`, steps of earlier or later
@@ -410,7 +328,7 @@ theorem runFrom_reqSteps {n idx : Nat} :
         List.getElem?_set_self (lt_length_of_getElem?_eq hreq)
       exact @runFrom_reqSteps n idx evs _ _ _ hinv₁ hreq₁ hr
 
-/-- **System Property 2 (Progress and buffer return for every request):**
+/-- **Progress and buffer release across requests:**
 From any reachable multi-request state and any request `idx`
 (`ms.reqs[idx]? = some r`), there exists a finite trace `evs` that drains all
 in-flight operations of `idx`, returns both host staging buffers to `BufferPool`,

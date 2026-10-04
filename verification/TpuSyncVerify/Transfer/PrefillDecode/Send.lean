@@ -413,18 +413,6 @@ theorem endOp_eq {s : Send} (h : 0 < s.life.inFlight) :
   · omega
   · rfl
 
-theorem finish_cases (ok : Bool) {s : Send} (hl : s.life.Consistent) :
-    (s.life.draining = true ∧ s.finish ok = s) ∨
-    (s.life.draining = false ∧ s.life.done = false ∧
-      s.finish ok = { s with life := Lifecycle.settleLocked
-                                { s.life with draining := true, statusOk := ok } }) := by
-  cases hd : s.life.draining
-  · have hn := hl.not_done hd
-    right
-    exact ⟨rfl, hn, by simp [finish, Lifecycle.finishOnceLocked_open ok hd hn]⟩
-  · left
-    exact ⟨rfl, by simp [finish, Lifecycle.finishOnceLocked_decided ok (Or.inl hd)]⟩
-
 theorem trySendNext_cases (s : Send) :
     s.trySendNext = s ∨
     (s.queued < s.d2hIssued ∧ s.life.draining = false ∧ s.life.done = false ∧
@@ -455,24 +443,13 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     simp only [step, start] at hs
     split at hs
     · cases hs
-    · rename_i hn
-      simp only [not_or] at hn
-      obtain ⟨_, hndr, hnd⟩ := hn
-      have hndr' : s.life.draining = false := by simpa using hndr
-      have hnd' : s.life.done = false := by simpa using hnd
-      split at hs
-      · rename_i h0
-        cases hs
-        rcases finish_cases true hl with ⟨hd, heq⟩ | ⟨_, _, heq⟩
-        · simp [hndr'] at hd
-        · rw [heq]
-          refine ⟨Lifecycle.settleLocked_consistent (by simp) (by simp [hnd']) (by simp [hl.staging, hnd']),
-            ?_, hu, hcnt, ?_, ?_, hpub⟩
-          · unfold Accounted; simpa using hacc
-          · intro _ _; simp; omega
-          · intro b hp
-            have := hpd b hp
-            simp [hnd'] at this
+    · split at hs
+      · cases hs
+        dsimp only [finish]
+        refine ⟨Lifecycle.finishOnceLocked_consistent true hl,
+          by unfold Accounted; simpa using hacc, hu, hcnt,
+          by intro _ _; simp; omega,
+          fun b hp => Lifecycle.finishOnceLocked_done_mono true (hpd b hp), hpub⟩
       · cases hs
         exact ⟨hl, by unfold Accounted; simpa using hacc, hu,
           by unfold CountersOrdered; simpa using hcnt, hdr, hpd, hpub⟩
@@ -485,7 +462,6 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       obtain ⟨l, hb, rfl⟩ := hs
       have := Lifecycle.beginOp_inFlight hb
       have hact := Lifecycle.beginOp_active hb
-      have hok' := Lifecycle.beginOp_statusOk hb
       have hdr' := Lifecycle.beginOp_draining hb
       refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hu, ?_, ?_, ?_, hpub⟩
       · unfold Accounted; simp [hp] at hacc; simp; omega
@@ -509,8 +485,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       · cases hs
         -- success: the copy is counted already; maybe `SendNextLayer(0)`
         split
-        · rename_i hlast
-          rcases trySendNext_cases { s with d2hPending := false, d2hIssued := s.d2hIssued + 1 }
+        · rcases trySendNext_cases { s with d2hPending := false, d2hIssued := s.d2hIssued + 1 }
             with heq | ⟨hlt, hdr', hd', heq⟩
           · rw [heq]
             refine ⟨hl, ?_, hu, ?_, hdr, hpd, hpub⟩
@@ -529,25 +504,17 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
           · unfold Accounted; simp; omega
           · unfold CountersOrdered; simp; omega
       · cases hs
-        rcases finish_cases false (s := { s with d2hPending := false }) hl
-          with ⟨hd, heq⟩ | ⟨hd, hn, heq⟩ <;> rw [heq] <;> simp at hd
-        · rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, hpub⟩
-          · unfold Accounted; simp; omega
-          · unfold CountersOrdered; simp; omega
-          · simpa using hdr
-          · exact fun b hq => Lifecycle.endOpLocked_done_mono (hpd b hq)
-        · simp at hn
-          rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent
-              (Lifecycle.settleLocked_consistent (by simp) (by simp [hn]) (by simp [hl.staging, hn])),
-            ?_, hu, ?_, ?_, ?_, hpub⟩
-          · unfold Accounted; simp; omega
-          · unfold CountersOrdered; simp; omega
-          · simp
-          · intro b hq
-            have := hpd b hq
-            simp [hn] at this
+        dsimp only [finish]
+        rw [endOp_eq (by simp; omega)]
+        refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent false hl),
+          ?_, hu, ?_, ?_, ?_, hpub⟩
+        · unfold Accounted; simp; omega
+        · unfold CountersOrdered; simp; omega
+        · intro hok _
+          obtain ⟨h1, h2⟩ := hl.finishOnceLocked_false_statusOk (by simpa using hok)
+          exact hdr h1 h2
+        · exact fun b hq =>
+            Lifecycle.endOpLocked_done_mono (Lifecycle.finishOnceLocked_done_mono false (hpd b hq))
   | d2hReady =>
     simp only [step, markD2hReady] at hs
     split at hs
@@ -569,29 +536,20 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
   | wake ok =>
     simp only [step, wake] at hs
     split at hs
-    · rename_i hg
-      split at hs
+    · split at hs
       · -- the copy failed: Finish(error), then the cleanup ends the op
         cases hs
-        rcases finish_cases false (s := { s with woken := s.woken + 1 }) hl
-          with ⟨hd, heq⟩ | ⟨hd, hn, heq⟩ <;> rw [heq] <;> simp at hd
-        · rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, hpub⟩
-          · unfold Accounted; simp; omega
-          · unfold CountersOrdered; simp; omega
-          · simpa using hdr
-          · exact fun b hq => Lifecycle.endOpLocked_done_mono (hpd b hq)
-        · simp at hn
-          rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent
-              (Lifecycle.settleLocked_consistent (by simp) (by simp [hn]) (by simp [hl.staging, hn])),
-            ?_, hu, ?_, ?_, ?_, hpub⟩
-          · unfold Accounted; simp; omega
-          · unfold CountersOrdered; simp; omega
-          · simp
-          · intro b hq
-            have := hpd b hq
-            simp [hn] at this
+        dsimp only [finish]
+        rw [endOp_eq (by simp; omega)]
+        refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent false hl),
+          ?_, hu, ?_, ?_, ?_, hpub⟩
+        · unfold Accounted; simp; omega
+        · unfold CountersOrdered; simp; omega
+        · intro hok _
+          obtain ⟨h1, h2⟩ := hl.finishOnceLocked_false_statusOk (by simpa using hok)
+          exact hdr h1 h2
+        · exact fun b hq =>
+            Lifecycle.endOpLocked_done_mono (Lifecycle.finishOnceLocked_done_mono false (hpd b hq))
       · split at hs
         · -- draining: the layer is dropped, the op ends
           cases hs
@@ -611,13 +569,11 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     simp only [step, h2hIssue] at hs
     split at hs
     · cases hs
-    · rename_i hp
-      split at hs
+    · split at hs
       · rename_i l hb
         cases hs
         have := Lifecycle.beginOp_inFlight hb
         have hact := Lifecycle.beginOp_active hb
-        have hok' := Lifecycle.beginOp_statusOk hb
         have hdr' := Lifecycle.beginOp_draining hb
         refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hu, ?_, ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
@@ -637,8 +593,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     simp only [step, sendNext] at hs
     split at hs
     · cases hs
-    · rename_i hc
-      cases hs
+    · cases hs
       rcases trySendNext_cases { s with chaining := s.chaining - 1 }
         with heq | ⟨hlt, hdr', hd', heq⟩ <;> rw [heq]
       · rw [endOp_eq (by simp; omega)]
@@ -660,8 +615,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
   | h2hDone ok =>
     simp only [step, h2hDone] at hs
     split at hs
-    · rename_i hg
-      -- a push is outstanding, so the session is not settled, so not published
+    · -- a push is outstanding, so the session is not settled, so not published
       have hnp : s.published = none := by
         cases hq : s.published with
         | none => rfl
@@ -672,31 +626,16 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       · cases hs
         split
         · -- the last push: Finish() then the cleanup ends the op
-          rename_i hlast
-          try simp at hlast
-          rcases finish_cases true
-              (s := { s with h2hRetired := s.h2hRetired + 1, h2hOk := s.h2hOk + 1 }) hl
-            with ⟨hd, heq⟩ | ⟨hd, hn, heq⟩ <;> rw [heq] <;> simp at hd
-          · rw [endOp_eq (by simp; omega)]
-            refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, ?_⟩
-            · unfold Accounted; simp; omega
-            · unfold CountersOrdered; simp; omega
-            · intro _ _; simp; omega
-            · simp [hnp]
-            · simp [hnp]
-          · simp at hn
-            rw [endOp_eq (by simp; omega)]
-            refine ⟨Lifecycle.endOpLocked_consistent
-                (Lifecycle.settleLocked_consistent (by simp) (by simp [hn])
-                  (by simp [hl.staging, hn])),
-              ?_, hu, ?_, ?_, ?_, ?_⟩
-            · unfold Accounted; simp; omega
-            · unfold CountersOrdered; simp; omega
-            · intro _ _; simp; omega
-            · simp [hnp]
-            · simp [hnp]
-        · rename_i hnl
+          dsimp only [finish]
           rw [endOp_eq (by simp; omega)]
+          refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent true hl),
+            ?_, hu, ?_, ?_, ?_, ?_⟩
+          · unfold Accounted; simp; omega
+          · unfold CountersOrdered; simp; omega
+          · intro _ _; simp; omega
+          · simp [hnp]
+          · simp [hnp]
+        · rw [endOp_eq (by simp; omega)]
           refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, ?_⟩
           · unfold Accounted; simp; omega
           · unfold CountersOrdered; simp; omega
@@ -707,40 +646,29 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
           · simp [hnp]
           · simp [hnp]
       · cases hs
-        rcases finish_cases false (s := { s with h2hRetired := s.h2hRetired + 1 }) hl
-          with ⟨hd, heq⟩ | ⟨hd, hn, heq⟩ <;> rw [heq] <;> simp at hd
-        · rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, ?_⟩
-          · unfold Accounted; simp; omega
-          · unfold CountersOrdered; simp; omega
-          · simpa using hdr
-          · simp [hnp]
-          · simp [hnp]
-        · simp at hn
-          rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent
-              (Lifecycle.settleLocked_consistent (by simp) (by simp [hn]) (by simp [hl.staging, hn])),
-            ?_, hu, ?_, ?_, ?_, ?_⟩
-          · unfold Accounted; simp; omega
-          · unfold CountersOrdered; simp; omega
-          · simp
-          · simp [hnp]
-          · simp [hnp]
+        dsimp only [finish]
+        rw [endOp_eq (by simp; omega)]
+        refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent false hl),
+          ?_, hu, ?_, ?_, ?_, ?_⟩
+        · unfold Accounted; simp; omega
+        · unfold CountersOrdered; simp; omega
+        · intro hok _
+          obtain ⟨h1, h2⟩ := hl.finishOnceLocked_false_statusOk (by simpa using hok)
+          exact hdr h1 h2
+        · simp [hnp]
+        · simp [hnp]
     · cases hs
   | cancel =>
     simp only [step, cancel] at hs
     cases hs
-    rcases finish_cases false hl with ⟨hd, heq⟩ | ⟨hd, hn, heq⟩ <;> rw [heq]
-    · exact ⟨hl, by unfold Accounted; exact hacc, hu,
-        by unfold CountersOrdered; exact hcnt, hdr, hpd, hpub⟩
-    · refine ⟨Lifecycle.settleLocked_consistent (by simp) (by simp [hn]) (by simp [hl.staging, hn]),
-        ?_, hu, ?_, ?_, ?_, hpub⟩
-      · unfold Accounted; simpa using hacc
-      · unfold CountersOrdered; simpa using hcnt
-      · simp
-      · intro b hq
-        have := hpd b hq
-        simp [hn] at this
+    dsimp only [finish]
+    refine ⟨Lifecycle.finishOnceLocked_consistent false hl,
+      by unfold Accounted; simpa using hacc, hu,
+      by unfold CountersOrdered; simpa using hcnt, ?_,
+      fun b hq => Lifecycle.finishOnceLocked_done_mono false (hpd b hq), hpub⟩
+    intro hok _
+    obtain ⟨h1, h2⟩ := hl.finishOnceLocked_false_statusOk (by simpa using hok)
+    exact hdr h1 h2
   | publish =>
     simp only [step, publish] at hs
     split at hs
@@ -861,8 +789,8 @@ theorem reachable_can_settle {n : Nat} {s : Send} (h : (sys n).Reachable s) :
   have hinv := reachable_inv h
   have hcancel : step s .cancel = some (s.finish false) := rfl
   have hinv₁ := step_inv hinv hcancel
-  have hdr₁ : (s.finish false).life.draining = true := by
-    rcases finish_cases false hinv.life with ⟨hd, heq⟩ | ⟨hd, hn, heq⟩ <;> simp [heq, hd]
+  have hdr₁ : (s.finish false).life.draining = true :=
+    hinv.life.finishOnceLocked_draining false
   obtain ⟨evs, s', hrun, hd', hst'⟩ :=
     draining_can_settle_aux n (drainRank (s.finish false)) (Nat.le_refl _) hinv₁ hdr₁
   refine ⟨.cancel :: evs, s', ?_, hd', hst'⟩

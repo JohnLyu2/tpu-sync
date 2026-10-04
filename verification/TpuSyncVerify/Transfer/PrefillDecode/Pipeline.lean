@@ -404,7 +404,19 @@ theorem getElem?_set_kv {l : List Cell} {k j : Nat} (hk : k < l.length)
   · subst hjk; exact List.getElem?_set_self hk
   · rw [List.getElem?_set_ne (Ne.symm hjk)]; exact hj hjk
 
-/-! ## Inductive invariant -/
+/-! ## Inductive invariant
+
+`Inv` combines the session invariants (`Send.Inv` and `Recv.Inv`, which enforce
+the settle gate and `in_flight_` conservation) with the per-layer pipeline
+invariants:
+- **Per-layer stage ordering & data validity:** `phbm_good`, `reclaimed_done`,
+  `d2hReady_lt`, `woken_d2hReady`, `pstaging_good`, `wire_good`,
+  `pending_landed`, `issued_landed`, `pending_claimed`, `issued_claimed`,
+  `dstaging_good`, and `dhbm_good`.
+- **At-most-once layer counting:** `cnt_d2hReady`, `cnt_h2hRetired`,
+  `cnt_h2dPending`, `cnt_h2dIssued`, and `cnt_h2dReady` equate each session's
+  integer counter to the number of `true` entries in the corresponding
+  per-layer boolean checklist. -/
 
 structure Inv (s : Pipeline) : Prop where
   send : s.send.Inv
@@ -634,18 +646,19 @@ theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
 
 /-! ### Preservation, one lemma per kind of effect -/
 
-/-- A send event that moves no memory, given that the layers `SendNextLayer`
-has consumed afterwards all have their copy finished. `x` lets the same lemma
-serve `h2hDone l false`, which records the callback without moving data. -/
-theorem Inv.send_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
+/-- A send event that updates `send`, `h2hRetiredL`, and `wire`, given that the
+layers `SendNextLayer` has consumed afterwards all have their copy finished. -/
+theorem Inv.send_wire_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
     (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady)
     (hw : ∀ l < snd.woken, s.d2hReadyL[l]? = some true) (x : List Bool)
-    (hxlen : x.length = s.numLayers) (hxcnt : countTrue x = snd.h2hRetired) :
-    Inv { s with send := snd, h2hRetiredL := x } := by
+    (hxlen : x.length = s.numLayers) (hxcnt : countTrue x = snd.h2hRetired)
+    (w : List Cell) (hwlen : w.length = s.numLayers)
+    (hwgood : ∀ (k : Nat) (c : Cell), w[k]? = some c → c = .blank ∨ c = .kv k) :
+    Inv { s with send := snd, h2hRetiredL := x, wire := w } := by
   refine ⟨Send.step_inv h.send hs, h.recv, (Send.step_numLayers hs).trans h.n_send, h.n_recv,
-    h.len_pstaging, h.len_wire, h.len_dstaging, h.len_dhbm, h.len_d2hReadyL, hxlen,
+    h.len_pstaging, hwlen, h.len_dstaging, h.len_dhbm, h.len_d2hReadyL, hxlen,
     h.len_claimedL, h.len_h2dPendingL, h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good,
-    fun hr => Send.step_done_mono hs (h.reclaimed_done hr), ?_, ?_, hxcnt, hw, ?_, h.wire_good,
+    fun hr => Send.step_done_mono hs (h.reclaimed_done hr), ?_, ?_, hxcnt, hw, ?_, hwgood,
     h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
     h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
   · show countTrue s.d2hReadyL = snd.d2hReady
@@ -659,6 +672,14 @@ theorem Inv.send_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
     cases hd0 : s.send.life.done
     · rfl
     · rw [Send.step_done_mono hs hd0] at hd; cases hd
+
+/-- A send event that moves no memory. -/
+theorem Inv.send_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
+    (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady)
+    (hw : ∀ l < snd.woken, s.d2hReadyL[l]? = some true) (x : List Bool)
+    (hxlen : x.length = s.numLayers) (hxcnt : countTrue x = snd.h2hRetired) :
+    Inv { s with send := snd, h2hRetiredL := x } :=
+  h.send_wire_frame hs he hw x hxlen hxcnt s.wire h.len_wire h.wire_good
 
 /-- A send that still has a copy or push outstanding has not settled. -/
 theorem send_not_done_of_outstanding {t : Send} (h : t.Inv)
@@ -732,27 +753,17 @@ theorem Inv.send_h2hDone {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
   have hsrc : s.prefillStaging.getD l .junk = .kv l := by
     rw [List.getD_eq_getElem?_getD, h.pstaging_good hd l hdl]; rfl
   rw [hsrc]
-  have hxlen : (s.h2hRetiredL.set l true).length = s.numLayers := by
-    rw [List.length_set]; exact h.len_h2hRetiredL
-  have hxcnt : countTrue (s.h2hRetiredL.set l true) = snd.h2hRetired := by
-    rw [countTrue_set_true hf, h.cnt_h2hRetired, Send.h2hDone_h2hRetired hs]
-  have h' := h.send_frame hs nofun hw (s.h2hRetiredL.set l true) hxlen hxcnt
-  refine ⟨h'.send, h'.recv, h'.n_send, h'.n_recv, h'.len_pstaging, ?_, h'.len_dstaging,
-    h'.len_dhbm, h'.len_d2hReadyL, h'.len_h2hRetiredL, h'.len_claimedL, h'.len_h2dPendingL,
-    h'.len_h2dIssuedL, h'.len_h2dReadyL, h'.phbm_good, h'.reclaimed_done, h'.cnt_d2hReady,
-    h'.d2hReady_lt, h'.cnt_h2hRetired, h'.woken_d2hReady, h'.pstaging_good, ?_,
-    h'.pending_landed, h'.issued_landed, h'.pending_claimed, h'.issued_claimed,
-    h'.cnt_h2dPending, h'.cnt_h2dIssued, h'.dstaging_good, h'.cnt_h2dReady, h'.dhbm_good⟩
-  · show (s.wire.set _ _).length = _
-    rw [List.length_set]; exact h.len_wire
-  · show ∀ j (c : Cell), (s.wire.set l _)[j]? = some c → c = .blank ∨ c = .kv j
-    intro j c hj
-    by_cases hjl : j = l
-    · subst hjl
-      rw [List.getElem?_set_self (by rw [h.len_wire]; exact hk)] at hj
-      cases hj; exact Or.inr rfl
-    · rw [List.getElem?_set_ne (Ne.symm hjl)] at hj
-      exact h.wire_good j c hj
+  apply h.send_wire_frame hs nofun hw (s.h2hRetiredL.set l true)
+    (by rw [List.length_set]; exact h.len_h2hRetiredL)
+    (by rw [countTrue_set_true hf, h.cnt_h2hRetired, Send.h2hDone_h2hRetired hs])
+    (s.wire.set l (.kv l)) (by rw [List.length_set]; exact h.len_wire)
+  intro j c hj
+  by_cases hjl : j = l
+  · subst hjl
+    rw [List.getElem?_set_self (by rw [h.len_wire]; exact hk)] at hj
+    cases hj; exact Or.inr rfl
+  · rw [List.getElem?_set_ne (Ne.symm hjl)] at hj
+    exact h.wire_good j c hj
 
 /-- A receive event that moves no memory. `c`, `p` and `i` let the same lemma
 serve `h2dBegin l` and `h2dIssue l ok`, which only update the per-layer dispatch
@@ -820,6 +831,51 @@ theorem Inv.recv_h2dReady {s : Pipeline} {rcv : Recv} {l : Nat} (h : Inv s)
     apply getElem?_set_kv (by rw [h.len_dhbm]; exact hk)
     intro hjl
     exact h.dhbm_good j ((mem_of_set_true hj).resolve_left hjl)
+
+/-- Landing a delivered layer `l` into decode staging. -/
+theorem Inv.land_layer {s : Pipeline} {l : Nat} {c : Cell} (h : Inv s)
+    (hf : s.landedL[l]? = some false) (hc : s.wire[l]? = some c) (hcb : c ≠ .blank) :
+    Inv { s with decodeStaging := s.decodeStaging.set l c,
+                 landedL := s.landedL.set l true } := by
+  have hkv : c = .kv l := (h.wire_good _ _ hc).resolve_left hcb
+  have hlen : l < s.numLayers := by
+    have := lt_length_of_getElem?_eq hc
+    rw [h.len_wire] at this; exact this
+  subst hkv
+  refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, ?_, h.len_dhbm,
+    h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
+    h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
+    h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good,
+    ?_, ?_, h.pending_claimed, h.issued_claimed, h.cnt_h2dPending, h.cnt_h2dIssued,
+    ?_, h.cnt_h2dReady, h.dhbm_good⟩
+  · rw [List.length_set]; exact h.len_dstaging
+  · exact fun j hj => set_true_of_mem hf (h.pending_landed j hj)
+  · exact fun j hj => set_true_of_mem hf (h.issued_landed j hj)
+  · intro hd j hj
+    apply getElem?_set_kv (by rw [h.len_dstaging]; exact hlen)
+    intro hjl
+    exact h.dstaging_good hd j ((mem_of_set_true hj).resolve_left hjl)
+
+/-- Frame lemma for the environment's buffer-reclaim and staging-reseat
+operations (`reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging`,
+`recyclePrefillBufs`, `recycleAllBufs`). -/
+theorem Inv.env_frame {s : Pipeline} (h : Inv s)
+    (phbm : List Cell) (rec : Bool) (pstg dstg : List Cell)
+    (hp_len : pstg.length = s.numLayers) (hd_len : dstg.length = s.numLayers)
+    (hphbm : rec = false → phbm = good s.numLayers)
+    (hrec : rec = true → s.send.life.done = true)
+    (hpstg : s.send.life.done = false →
+      ∀ l : Nat, s.d2hReadyL[l]? = some true → pstg[l]? = some (.kv l))
+    (hdstg : s.recv.life.done = false →
+      ∀ l : Nat, s.landedL[l]? = some true → dstg[l]? = some (.kv l)) :
+    Inv { s with prefillHbm := phbm, reclaimed := rec,
+                 prefillStaging := pstg, decodeStaging := dstg } :=
+  ⟨h.send, h.recv, h.n_send, h.n_recv, hp_len, h.len_wire, hd_len, h.len_dhbm,
+   h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
+   h.len_h2dIssuedL, h.len_h2dReadyL, hphbm, hrec, h.cnt_d2hReady, h.d2hReady_lt,
+   h.cnt_h2hRetired, h.woken_d2hReady, hpstg, h.wire_good, h.pending_landed,
+   h.issued_landed, h.pending_claimed, h.issued_claimed, h.cnt_h2dPending,
+   h.cnt_h2dIssued, hdstg, h.cnt_h2dReady, h.dhbm_good⟩
 
 /-- Layers `SendNextLayer` has consumed after a `wake`: the ones before, plus
 the one the guard checked. -/
@@ -1000,33 +1056,9 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       · rename_i c hc
         split at hs
         · cases hs
-        rename_i hcb
-        cases hs
-        have hkv : c = .kv l := (h.wire_good _ _ hc).resolve_left hcb
-        have hlen : l < s.numLayers := by
-          have := lt_length_of_getElem?_eq hc
-          rw [h.len_wire] at this; exact this
-        subst hkv
-        refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, ?_, h.len_dhbm,
-          h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
-          h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
-          h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good,
-          ?_, ?_, h.pending_claimed, h.issued_claimed, h.cnt_h2dPending, h.cnt_h2dIssued,
-          ?_, h.cnt_h2dReady, h.dhbm_good⟩
-        · show (s.decodeStaging.set _ _).length = _
-          rw [List.length_set]; exact h.len_dstaging
-        · show ∀ j : Nat, s.h2dPendingL[j]? = some true → (s.landedL.set l true)[j]? = some true
-          intro j hj
-          exact set_true_of_mem hf (h.pending_landed j hj)
-        · show ∀ j : Nat, s.h2dIssuedL[j]? = some true → (s.landedL.set l true)[j]? = some true
-          intro j hj
-          exact set_true_of_mem hf (h.issued_landed j hj)
-        · show _ → ∀ j : Nat, (s.landedL.set l true)[j]? = some true →
-            (s.decodeStaging.set l (.kv l))[j]? = some (.kv j)
-          intro hd j hj
-          apply getElem?_set_kv (by rw [h.len_dstaging]; exact hlen)
-          intro hjl
-          exact h.dstaging_good hd j ((mem_of_set_true hj).resolve_left hjl)
+        · rename_i hcb
+          cases hs
+          exact h.land_layer hf hc hcb
       · cases hs
     · cases hs
   | reclaim =>
@@ -1036,16 +1068,8 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       obtain ⟨hp, -⟩ := hg
       cases hs
       obtain ⟨b, hb⟩ := Option.ne_none_iff_exists'.mp hp
-      refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, h.len_dstaging,
-        h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
-        h.len_h2dIssuedL, h.len_h2dReadyL, ?_, ?_, h.cnt_d2hReady, h.d2hReady_lt,
-        h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good, h.pending_landed,
-        h.issued_landed, h.pending_claimed, h.issued_claimed, h.cnt_h2dPending,
-        h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
-      · show true = false → _
-        intro hc; cases hc
-      · show _ → s.send.life.done = true
-        intro _; exact h.send.published_done b hb
+      exact h.env_frame _ true s.prefillStaging s.decodeStaging h.len_pstaging h.len_dstaging
+        nofun (fun _ => h.send.published_done b hb) h.pstaging_good h.dstaging_good
     · cases hs
   | reseatPrefillStaging =>
     simp only [step, reseatPrefillStaging] at hs
@@ -1053,16 +1077,9 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
     · rename_i hst
       cases hs
       have hd := h.send.life.done_of_released hst
-      refine ⟨h.send, h.recv, h.n_send, h.n_recv, ?_, h.len_wire, h.len_dstaging,
-        h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
-        h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
-        h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, ?_, h.wire_good, h.pending_landed,
-        h.issued_landed, h.pending_claimed, h.issued_claimed, h.cnt_h2dPending,
-        h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
-      · show (List.replicate _ _).length = _
-        exact List.length_replicate
-      · show s.send.life.done = false → _
-        intro hn; rw [hd] at hn; cases hn
+      exact h.env_frame s.prefillHbm s.reclaimed _ s.decodeStaging
+        List.length_replicate h.len_dstaging h.phbm_good h.reclaimed_done
+        (by rw [hd]; nofun) h.dstaging_good
     · cases hs
   | reseatDecodeStaging =>
     simp only [step, reseatDecodeStaging] at hs
@@ -1070,16 +1087,9 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
     · rename_i hst
       cases hs
       have hd := h.recv.life.done_of_released hst
-      refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, ?_,
-        h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
-        h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
-        h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good,
-        h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
-        h.cnt_h2dPending, h.cnt_h2dIssued, ?_, h.cnt_h2dReady, h.dhbm_good⟩
-      · show (List.replicate _ _).length = _
-        exact List.length_replicate
-      · show s.recv.life.done = false → _
-        intro hn; rw [hd] at hn; cases hn
+      exact h.env_frame s.prefillHbm s.reclaimed s.prefillStaging _
+        h.len_pstaging List.length_replicate h.phbm_good h.reclaimed_done
+        h.pstaging_good (by rw [hd]; nofun)
     · cases hs
 
 theorem reachable_inv {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) : Inv s :=
@@ -1257,16 +1267,15 @@ theorem draining_can_settle_aux (n : Nat) :
         have hstR : s.recv.life.hasStaging = false := by rw [h.recv.life.staging, hndR]; rfl
         exact ⟨[], s, rfl, hndS, hstS, hndR, hstR⟩
 
-theorem runFrom_append {n : Nat} :
-    ∀ (evs₁ evs₂ : List Ev) {s s₁ s₂ : Pipeline},
-      (sys n).runFrom s evs₁ = some s₁ →
-      (sys n).runFrom s₁ evs₂ = some s₂ →
-      (sys n).runFrom s (evs₁ ++ evs₂) = some s₂ :=
-  (sys n).runFrom_append
+/-- The remaining finalization events once both sessions have settled: publish
+any unpublished session outcome and reclaim prefill HBM if not yet reclaimed. -/
+def finalizeEvs (s : Pipeline) : List Ev :=
+  (if s.send.published.isNone then [.send .publish] else []) ++
+  (if s.recv.published.isNone then [.recv .publish] else []) ++
+  (if s.reclaimed then [] else [.reclaim])
 
-/-- Once both sessions have settled (`done = true`), a short trace of at most
-three events (`.send .publish`, `.recv .publish`, `.reclaim`) publishes both
-outcomes and reclaims prefill HBM. -/
+/-- Once both sessions have settled (`done = true`), `finalizeEvs s` publishes
+both outcomes and reclaims prefill HBM in at most three steps. -/
 theorem settled_can_finalize (n : Nat) {s : Pipeline}
     (hdS : s.send.life.done = true) (hstS : s.send.life.hasStaging = false)
     (hdR : s.recv.life.done = true) (hstR : s.recv.life.hasStaging = false) :
@@ -1274,55 +1283,20 @@ theorem settled_can_finalize (n : Nat) {s : Pipeline}
       s'.send.life.done = true ∧ s'.send.life.hasStaging = false ∧
       s'.recv.life.done = true ∧ s'.recv.life.hasStaging = false ∧
       s'.send.published ≠ none ∧ s'.recv.published ≠ none ∧ s'.reclaimed = true := by
-  have ⟨evs₁, s₁, hr₁, hdS₁, hstS₁, hdR₁, hstR₁, hpubS₁⟩ :
-      ∃ evs₁ s₁, (sys n).runFrom s evs₁ = some s₁ ∧
-        s₁.send.life.done = true ∧ s₁.send.life.hasStaging = false ∧
-        s₁.recv.life.done = true ∧ s₁.recv.life.hasStaging = false ∧
-        s₁.send.published ≠ none := by
-    cases hp : s.send.published with
-    | none =>
-      refine ⟨[.send .publish], { s with send := { s.send with published := some s.send.life.statusOk } }, ?_,
-        hdS, hstS, hdR, hstR, by simp⟩
-      simp [System.runFrom, sys, step, sendStep, Send.step, Send.publish, hdS, hp]
-    | some b =>
-      exact ⟨[], s, rfl, hdS, hstS, hdR, hstR, by simp [hp]⟩
-  have ⟨evs₂, s₂, hr₂, hdS₂, hstS₂, hdR₂, hstR₂, hpubS₂, hpubR₂⟩ :
-      ∃ evs₂ s₂, (sys n).runFrom s₁ evs₂ = some s₂ ∧
-        s₂.send.life.done = true ∧ s₂.send.life.hasStaging = false ∧
-        s₂.recv.life.done = true ∧ s₂.recv.life.hasStaging = false ∧
-        s₂.send.published ≠ none ∧ s₂.recv.published ≠ none := by
-    cases hp : s₁.recv.published with
-    | none =>
-      refine ⟨[.recv .publish], { s₁ with recv := { s₁.recv with published := some s₁.recv.life.statusOk } }, ?_,
-        hdS₁, hstS₁, hdR₁, hstR₁, hpubS₁, by simp⟩
-      simp [System.runFrom, sys, step, recvStep, Recv.step, Recv.publish, hdR₁, hp]
-    | some b =>
-      exact ⟨[], s₁, rfl, hdS₁, hstS₁, hdR₁, hstR₁, hpubS₁, by simp [hp]⟩
-  have ⟨evs₃, s₃, hr₃, hdS₃, hstS₃, hdR₃, hstR₃, hpubS₃, hpubR₃, hrec₃⟩ :
-      ∃ evs₃ s₃, (sys n).runFrom s₂ evs₃ = some s₃ ∧
-        s₃.send.life.done = true ∧ s₃.send.life.hasStaging = false ∧
-        s₃.recv.life.done = true ∧ s₃.recv.life.hasStaging = false ∧
-        s₃.send.published ≠ none ∧ s₃.recv.published ≠ none ∧ s₃.reclaimed = true := by
-    cases hrec : s₂.reclaimed with
-    | false =>
-      refine ⟨[.reclaim], { s₂ with prefillHbm := List.replicate s₂.numLayers .junk, reclaimed := true }, ?_,
-        hdS₂, hstS₂, hdR₂, hstR₂, hpubS₂, hpubR₂, rfl⟩
-      simp [System.runFrom, sys, step, reclaim, hpubS₂, hrec]
-    | true =>
-      exact ⟨[], s₂, rfl, hdS₂, hstS₂, hdR₂, hstR₂, hpubS₂, hpubR₂, hrec⟩
-  exact ⟨evs₁ ++ evs₂ ++ evs₃, s₃,
-    runFrom_append (evs₁ ++ evs₂) evs₃ (runFrom_append evs₁ evs₂ hr₁ hr₂) hr₃,
-    hdS₃, hstS₃, hdR₃, hstR₃, hpubS₃, hpubR₃, hrec₃⟩
+  refine ⟨finalizeEvs s, ?_⟩
+  cases hpS : s.send.published <;> cases hpR : s.recv.published <;> cases hrec : s.reclaimed <;>
+    simp [finalizeEvs, System.runFrom, sys, step, sendStep, recvStep,
+      Send.step, Send.publish, Recv.step, Recv.publish, reclaim,
+      hdS, hstS, hdR, hstR, hpS, hpR, hrec]
 
-/-- Every reachable pipeline state can settle both sessions, release both
-staging buffers, publish both outcomes, and reclaim prefill HBM in a finite
-number of steps. -/
-theorem reachable_can_settle {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) :
+/-- From any pipeline state satisfying `Inv`, a finite trace settles both
+sessions, releases both staging buffers, publishes both outcomes, and reclaims
+prefill HBM. -/
+theorem inv_can_settle (n : Nat) {s : Pipeline} (hinv : Inv s) :
     ∃ evs s', (sys n).runFrom s evs = some s' ∧
       s'.send.life.done = true ∧ s'.send.life.hasStaging = false ∧
       s'.recv.life.done = true ∧ s'.recv.life.hasStaging = false ∧
       s'.send.published ≠ none ∧ s'.recv.published ≠ none ∧ s'.reclaimed = true := by
-  have hinv := reachable_inv h
   have hcS : step s (.send .cancel) = some { s with send := s.send.finish false } := rfl
   let s₁ : Pipeline := { s with send := s.send.finish false }
   have hinv₁ : Inv s₁ := step_inv hinv hcS
@@ -1330,9 +1304,8 @@ theorem reachable_can_settle {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) 
       some { s₁ with recv := { s₁.recv with life := s₁.recv.life.finishLocked false } } := rfl
   let s₂ : Pipeline := { s₁ with recv := { s₁.recv with life := s₁.recv.life.finishLocked false } }
   have hinv₂ : Inv s₂ := step_inv hinv₁ hcR
-  have hdrS₂ : s₂.send.life.draining = true := by
-    show (s.send.finish false).life.draining = true
-    rcases Send.finish_cases false hinv.send.life with ⟨hd, heq⟩ | ⟨hd, _, heq⟩ <;> simp [heq, hd]
+  have hdrS₂ : s₂.send.life.draining = true :=
+    hinv.send.life.finishOnceLocked_draining false
   have hdrR₂ : s₂.recv.life.draining = true := by simp [s₂]
   obtain ⟨evs_d, s_d, hrd, hdS, hstS, hdR, hstR⟩ :=
     draining_can_settle_aux n (drainRank s₂) (Nat.le_refl _) hinv₂ hdrS₂ hdrR₂
@@ -1341,17 +1314,27 @@ theorem reachable_can_settle {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) 
   have hr_cancel : (sys n).runFrom s [.send .cancel, .recv .cancel] = some s₂ := by
     simp [System.runFrom, sys, hcS, hcR, s₁, s₂]
   exact ⟨[.send .cancel, .recv .cancel] ++ evs_d ++ evs_f, s',
-    runFrom_append _ evs_f (runFrom_append _ evs_d hr_cancel hrd) hrf,
+    (sys n).runFrom_append _ evs_f ((sys n).runFrom_append _ evs_d hr_cancel hrd) hrf,
     hdS', hstS', hdR', hstR', hpubS', hpubR', hrec'⟩
 
-/-! ### Buffer quietness after release
+/-- Every reachable pipeline state can settle both sessions, release both
+staging buffers, publish both outcomes, and reclaim prefill HBM in a finite
+number of steps. -/
+theorem reachable_can_settle {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) :
+    ∃ evs s', (sys n).runFrom s evs = some s' ∧
+      s'.send.life.done = true ∧ s'.send.life.hasStaging = false ∧
+      s'.recv.life.done = true ∧ s'.recv.life.hasStaging = false ∧
+      s'.send.published ≠ none ∧ s'.recv.published ≠ none ∧ s'.reclaimed = true :=
+  inv_can_settle n (reachable_inv h)
+
+/-! ### Buffer quietness and non-interference after release
 
 `DecodeHbmSafe`, `PrefillHbmSafe`, and `StagingSafe` state that when a buffer is
 released, the session's internal counters for that buffer are drained. The
 theorems below turn those counter equalities into the memory-level
 non-interference property needed across requests: once a transfer releases a
 buffer, no subsequent transition of that transfer can ever read or write that
-buffer. -/
+buffer, and overwriting released buffers with `.junk` preserves `Inv`. -/
 
 /-- Unfold `step` for a known event and split every branch, leaving `hs` as
 `some … = some s'`, as the `Option.map` form, or closed. -/
@@ -1396,14 +1379,6 @@ theorem step_published_ne_none {s s' : Pipeline} {e : Ev} (hs : step s e = some 
   cases h : s.recv.published with
   | none => exact absurd h hp
   | some b => rw [step_published_mono hs h]; simp
-
-theorem step_reclaimed_mono {s s' : Pipeline} {e : Ev} (hs : step s e = some s')
-    (hr : s.reclaimed = true) : s'.reclaimed = true := by
-  cases e <;> (try (rename_i e; cases e)) <;> (try (rename_i ok; cases ok)) <;> pipe_cases hs <;>
-  first
-    | (obtain ⟨_, _, rfl⟩ := hs; exact hr)
-    | (cases hs <;> first | exact hr | rfl)
-    | cases hs
 
 theorem step_send_done_mono {s s' : Pipeline} {e : Ev} (hs : step s e = some s')
     (hd : s.send.life.done = true) : s'.send.life.done = true := by
@@ -1531,12 +1506,63 @@ theorem attention_safe {n : Nat} {s s' : Pipeline} (h : (sys n).Reachable s)
   rw [runFrom_decodeHbm_quiet evs hinv (by simp [hp]) hr, ← numLayers_eq h]
   exact (inv_safe hinv).1 hp
 
-/-! ### Buffer handoff predicates and single-request handoff
+/-! ### Buffer release predicates, non-interference, and single-request handoff
 
 The predicates `PrefillReleased` and `HandedOff` capture when a request's
-prefill buffers or all four buffers have been released and published, and
-`handedOff_quiet` and `inv_can_handoff` package the single-request quietness
-and drain properties for the multi-request composition in `MultiRequest.lean`. -/
+prefill buffers or all four buffers have been released, `wroteReleased_eq_false`
+and `Inv.recyclePrefillBufs` / `Inv.recycleAllBufs` package the single-request
+write-after-release and read-after-release guarantees, and `inv_can_handoff`
+packages single-request eventual drain for `MultiRequest.lean`. -/
+
+/-- True if `e` is one of the environment buffer-overwrite events (`.reclaim`,
+`.reseatPrefillStaging`, `.reseatDecodeStaging`). -/
+def isRecycleEv (e : Ev) : Bool :=
+  e == .reclaim || e == .reseatPrefillStaging || e == .reseatDecodeStaging
+
+/-- Per-buffer write-after-release detector: checks whether a transition `r → r'`
+modified any of the four buffers after `r` had already released that specific
+buffer. -/
+def wroteReleased (r r' : Pipeline) : Bool :=
+  (r.send.published != none && r'.prefillHbm != r.prefillHbm) ||
+  (!r.send.life.hasStaging && r'.prefillStaging != r.prefillStaging) ||
+  (!r.recv.life.hasStaging && r'.decodeStaging != r.decodeStaging) ||
+  (r.recv.published != none && r'.decodeHbm != r.decodeHbm)
+
+/-- Key per-buffer non-interference lemma: for any request `r` satisfying `Inv r`,
+no transfer step ever modifies any of the four buffers after `r` has released
+that specific buffer (`wroteReleased r r' = false`). Proved from
+`prefillHbm_quiet_step`, `prefillStaging_quiet`, `decodeStaging_quiet`, and
+`decodeHbm_quiet`. -/
+theorem wroteReleased_eq_false {r r' : Pipeline} {e : Ev} (h : Inv r)
+    (hne₀ : e ≠ .reclaim)
+    (hne₁ : e ≠ .reseatPrefillStaging) (hne₂ : e ≠ .reseatDecodeStaging)
+    (hs : step r e = some r') :
+    wroteReleased r r' = false := by
+  have hq₀ : r'.prefillHbm = r.prefillHbm := prefillHbm_quiet_step hne₀ hs
+  have hq₁ : (!r.send.life.hasStaging && r'.prefillStaging != r.prefillStaging) = false := by
+    cases hst : r.send.life.hasStaging
+    · simp [(prefillStaging_quiet h hst hne₁ hs).1]
+    · simp
+  have hq₂ : (!r.recv.life.hasStaging && r'.decodeStaging != r.decodeStaging) = false := by
+    cases hst : r.recv.life.hasStaging
+    · simp [(decodeStaging_quiet h hst hne₂ hs).1]
+    · simp
+  have hq₃ : (r.recv.published != none && r'.decodeHbm != r.decodeHbm) = false := by
+    cases hp : r.recv.published with
+    | none => simp
+    | some b =>
+      have hne : r.recv.published ≠ none := by simp [hp]
+      simp [decodeHbm_quiet h hne hs]
+  simp [wroteReleased, hq₀, hq₁, hq₂, hq₃]
+
+theorem not_isRecycleEv_and_wroteReleased_eq_false {r r' : Pipeline} {e : Ev}
+    (h : Inv r) (hs : step r e = some r') :
+    (!isRecycleEv e && wroteReleased r r') = false := by
+  by_cases he : isRecycleEv e = true
+  · simp [he]
+  · simp only [isRecycleEv, Bool.or_eq_true, beq_iff_eq, not_or] at he
+    rw [wroteReleased_eq_false h he.1.1 he.1.2 he.2 hs]
+    simp
 
 /-- The prefill side of a request has released both of its buffers: its host
 staging buffer has been returned to `BufferPool` (`send.life.hasStaging = false`)
@@ -1565,6 +1591,37 @@ instance (s : Pipeline) : Decidable (HandedOff s) :=
 
 theorem HandedOff.prefillReleased {s : Pipeline} (h : HandedOff s) : PrefillReleased s :=
   ⟨h.1, h.2.2.1⟩
+
+/-- Overwrite a request's prefill buffers (`prefillHbm` and `prefillStaging`)
+with `.junk` when a later request recycles them (`recyclePrefill`). Any
+straggling D2H or H2H read by `s` would observe `.junk`. -/
+def recyclePrefillBufs (s : Pipeline) : Pipeline :=
+  { s with
+    prefillHbm := List.replicate s.numLayers .junk,
+    reclaimed := true,
+    prefillStaging := List.replicate s.numLayers .junk }
+
+/-- Overwrite a request's `prefillHbm`, `prefillStaging`, and `decodeStaging`
+with `.junk` when a later request recycles all buffers (`nextRequest`). -/
+def recycleAllBufs (s : Pipeline) : Pipeline :=
+  { s with
+    prefillHbm := List.replicate s.numLayers .junk,
+    reclaimed := true,
+    prefillStaging := List.replicate s.numLayers .junk,
+    decodeStaging := List.replicate s.numLayers .junk }
+
+theorem Inv.recyclePrefillBufs {s : Pipeline} (h : Inv s) (hp : PrefillReleased s) :
+    Inv (Pipeline.recyclePrefillBufs s) := by
+  have hd : s.send.life.done = true := h.send.life.done_of_released hp.1
+  exact h.env_frame _ true _ s.decodeStaging List.length_replicate h.len_dstaging
+    nofun (fun _ => hd) (by rw [hd]; nofun) h.dstaging_good
+
+theorem Inv.recycleAllBufs {s : Pipeline} (h : Inv s) (hp : HandedOff s) :
+    Inv (Pipeline.recycleAllBufs s) := by
+  have hdS : s.send.life.done = true := h.send.life.done_of_released hp.1
+  have hdR : s.recv.life.done = true := h.recv.life.done_of_released hp.2.1
+  exact h.env_frame _ true _ _ List.length_replicate List.length_replicate
+    nofun (fun _ => hdS) (by rw [hdS]; nofun) (by rw [hdR]; nofun)
 
 theorem step_handedOff {s s' : Pipeline} {e : Ev} (h : Inv s)
     (hp : HandedOff s) (hs : step s e = some s') : HandedOff s' := by
@@ -1602,26 +1659,8 @@ sessions, releases both host staging buffers to `BufferPool`, and publishes both
 HBM outcomes (`HandedOff`). -/
 theorem inv_can_handoff (n : Nat) {s : Pipeline} (hinv : Inv s) :
     ∃ evs s', (sys n).runFrom s evs = some s' ∧ HandedOff s' := by
-  have hcS : step s (.send .cancel) = some { s with send := s.send.finish false } := rfl
-  let s₁ : Pipeline := { s with send := s.send.finish false }
-  have hinv₁ : Inv s₁ := step_inv hinv hcS
-  have hcR : step s₁ (.recv .cancel) =
-      some { s₁ with recv := { s₁.recv with life := s₁.recv.life.finishLocked false } } := rfl
-  let s₂ : Pipeline := { s₁ with recv := { s₁.recv with life := s₁.recv.life.finishLocked false } }
-  have hinv₂ : Inv s₂ := step_inv hinv₁ hcR
-  have hdrS₂ : s₂.send.life.draining = true := by
-    show (s.send.finish false).life.draining = true
-    rcases Send.finish_cases false hinv.send.life with ⟨hd, heq⟩ | ⟨hd, _, heq⟩ <;> simp [heq, hd]
-  have hdrR₂ : s₂.recv.life.draining = true := by simp [s₂]
-  obtain ⟨evs_d, s_d, hrd, hdS, hstS, hdR, hstR⟩ :=
-    draining_can_settle_aux n (drainRank s₂) (Nat.le_refl _) hinv₂ hdrS₂ hdrR₂
-  obtain ⟨evs_f, s', hrf, _, hstS', _, hstR', hpubS', hpubR', _⟩ :=
-    settled_can_finalize n hdS hstS hdR hstR
-  have hr_cancel : (sys n).runFrom s [.send .cancel, .recv .cancel] = some s₂ := by
-    simp [System.runFrom, sys, hcS, hcR, s₁, s₂]
-  exact ⟨[.send .cancel, .recv .cancel] ++ evs_d ++ evs_f, s',
-    runFrom_append _ evs_f (runFrom_append _ evs_d hr_cancel hrd) hrf,
-    hstS', hstR', hpubS', hpubR'⟩
+  obtain ⟨evs, s', hr, _, hstS, _, hstR, hpubS, hpubR, _⟩ := inv_can_settle n hinv
+  exact ⟨evs, s', hr, hstS, hstR, hpubS, hpubR⟩
 
 end Pipeline
 
