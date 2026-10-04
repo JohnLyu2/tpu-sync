@@ -73,6 +73,22 @@ theorem run_reachable {evs : List Ev} {s : S} (h : sys.run evs = some s) :
     sys.Reachable s :=
   sys.runFrom_reachable Reachable.init evs h
 
+/-- Replaying `evs₁ ++ evs₂` is the same as replaying `evs₁` then `evs₂`. -/
+theorem runFrom_append :
+    ∀ (evs₁ evs₂ : List Ev) {s s₁ s₂ : S},
+      sys.runFrom s evs₁ = some s₁ →
+      sys.runFrom s₁ evs₂ = some s₂ →
+      sys.runFrom s (evs₁ ++ evs₂) = some s₂
+  | [], evs₂, _, _, _, h₁, h₂ => by
+    simp [runFrom] at h₁; subst h₁; exact h₂
+  | e :: evs₁, evs₂, s, _, _, h₁, h₂ => by
+    simp only [runFrom, List.cons_append, List.foldlM_cons] at h₁ ⊢
+    cases hse : sys.step s e with
+    | none => simp [hse] at h₁
+    | some s' =>
+      simp only [hse] at h₁ ⊢
+      exact runFrom_append evs₁ evs₂ h₁ h₂
+
 end System
 
 end TpuSyncVerify

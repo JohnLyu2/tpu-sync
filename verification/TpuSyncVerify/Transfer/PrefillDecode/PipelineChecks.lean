@@ -1,0 +1,277 @@
+import TpuSyncVerify.Transfer.PrefillDecode.MultiRequest
+import TpuSyncVerify.Common.ModelCheck
+
+/-!
+# Pipeline and multi-request replay, bounded search, and mutants
+
+Concrete traces, checked by `decide`, that document the behaviours the
+single-request (`Pipeline`) and multi-request (`multiSys`) models admit — in
+particular layers completing out of order at every stage and overlapped
+requests recycling prefill buffers while an earlier request's receive side is
+still running; bounded searches on the one- and two-layer instances; and
+mutants that show the memory model is sensitive to the guards the proof rests
+on, including the per-layer ones.
+-/
+
+namespace TpuSyncVerify.Transfer.PrefillDecode.Pipeline
+
+/-- A one-layer producer, start to `done_sending`. -/
+def producer : List Ev :=
+  [.send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
+   .send (.wake true), .send .h2hIssue, .send .sendNext, .h2hDone 0 true, .send .publish]
+
+/-- A one-layer consumer, pull handshake to `done_recving`. Within the accepted
+push, `HandleCustomRequest` (`bt.cc:350-586`) lands the chunk, dispatches
+`OnLayerReceived` (`h2dBegin` / `h2dIssue`) and accounts for the chunk
+(`netAccount`) before returning (`pushEnd`). -/
+def consumer : List Ev :=
+  [.recv (.pullReply true), .recv .pushBegin, .land 0, .h2dBegin 0,
+   .h2dIssue 0 true, .recv .netAccount, .recv .pushEnd, .h2dReady 0,
+   .recv (.h2dDone true), .recv .publish]
+
+/-- Producer then consumer: both sides published as done, the data in decode
+HBM. -/
+theorem trace_normal :
+    ((sys 1).run (producer ++ consumer)).map
+      (fun s => (s.send.published, s.recv.published, s.decodeHbm)) =
+    some (some true, some true, [.kv 0]) := by
+  decide
+
+/-- A two-layer producer whose D2H copies finish in reverse order and whose
+pushes complete in reverse order. The push *chain* is still 0 then 1
+(`SendNextLayer`), and `wake` for layer 0 waits for layer 0's copy. -/
+def producer2 : List Ev :=
+  [.send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin, .send (.d2hIssue true),
+   .d2hReady 1, .d2hReady 0, .send .d2hEnd, .send .d2hEnd,
+   .send (.wake true), .send .h2hIssue, .send .sendNext,
+   .send (.wake true), .send .h2hIssue, .send .sendNext,
+   .h2hDone 1 true, .h2hDone 0 true, .send .publish]
+
+/-- A two-layer consumer that lands layer 1 first, dispatches its H2D first,
+and whose H2D copies finish in the order 1, 0. -/
+def consumer2 : List Ev :=
+  [.recv (.pullReply true),
+   .recv .pushBegin, .land 1, .h2dBegin 1, .h2dIssue 1 true, .recv .netAccount, .recv .pushEnd,
+   .recv .pushBegin, .land 0, .h2dBegin 0, .h2dIssue 0 true, .recv .netAccount, .recv .pushEnd,
+   .h2dReady 1, .h2dReady 0, .recv (.h2dDone true), .recv (.h2dDone true), .recv .publish]
+
+/-- Layers complete out of order at every stage; publication still finds the
+right data in the right slots. This is the proposal's out-of-order question
+answered inside the model. -/
+theorem trace_layers_out_of_order :
+    ((sys 2).run (producer2 ++ consumer2)).map
+      (fun s => (s.send.published, s.recv.published, s.decodeHbm)) =
+    some (some true, some true, [.kv 0, .kv 1]) := by
+  decide
+
+/-- The push chain is ordered: `SendNextLayer(0)` cannot proceed on layer 1's
+copy, however early it finished. -/
+theorem trace_wake_needs_own_layer :
+    (sys 2).run
+      [.send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin,
+       .send (.d2hIssue true), .d2hReady 1, .send (.wake true)] = none ∧
+    ((sys 2).run
+      [.send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin,
+       .send (.d2hIssue true), .d2hReady 1, .d2hReady 0, .send (.wake true)]).isSome = true := by
+  decide
+
+/-- The producer is long gone — published, prefill HBM reclaimed, staging reused —
+before the consumer lands the layer; the data is still right (A2). -/
+theorem trace_slow_consumer :
+    ((sys 1).run (producer ++ [.reclaim, .reseatPrefillStaging] ++ consumer)).map
+      (fun s => (s.reclaimed, s.prefillHbm, s.prefillStaging, s.recv.published, s.decodeHbm)) =
+    some (true, [.junk], [.junk], some true, [.kv 0]) := by
+  decide
+
+/-- A receive that has settled takes no push: once its staging is somebody
+else's buffer, nothing can land in it. -/
+theorem trace_no_push_after_settle :
+    ((sys 1).run [.recv .cancel, .recv (.pullReply true), .recv .publish, .reseatDecodeStaging]).map
+      (fun s => (s.recv.published, s.recv.life.hasStaging)) = some (some false, false) ∧
+    (sys 1).run [.recv .cancel, .recv (.pullReply true), .recv .publish, .reseatDecodeStaging,
+      .recv .pushBegin] = none ∧
+    (sys 1).run [.recv .cancel, .recv (.pullReply true), .recv .publish, .reseatDecodeStaging,
+      .land 0] = none := by
+  decide
+
+/-- The layer must land before the device is asked to copy it. -/
+theorem trace_no_dispatch_before_land :
+    (sys 1).run [.recv (.pullReply true), .h2dBegin 0] = none := by
+  decide
+
+/-- An H2D copy cannot finish for a layer whose `ExecuteLayerH2d` was aborted at
+the re-check (`h2dIssue l false` or draining), even if another layer's copy was
+issued. -/
+theorem trace_aborted_issue_cannot_ready :
+    (sys 2).run
+      (producer2 ++
+       [.recv (.pullReply true),
+        .recv .pushBegin, .land 0, .h2dBegin 0, .h2dIssue 0 true, .recv .netAccount, .recv .pushEnd,
+        .recv .pushBegin, .land 1, .h2dBegin 1, .h2dIssue 1 false, .recv .netAccount, .recv .pushEnd,
+        .h2dReady 1]) = none := by
+  decide
+
+/-- Multi-request trace: request $R_0$ starts, cancels mid-flight, drains,
+publishes failed outcomes, and hands off all four shared memory pools;
+`.nextRequest 0` recycles the pools to request $R_1$, which completes a full
+transfer and publishes `done_recving` with `decodeHbm = [.kv 0]`. -/
+theorem trace_multi_request :
+    ((multiSys 1).run
+      (([.send .start, .send .d2hBegin, .send .cancel, .recv .cancel,
+         .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
+         .recv (.pullReply true), .send .publish, .recv .publish].map
+        (MultiEv.reqStep 0)) ++
+       [.nextRequest 0] ++
+       ((producer ++ consumer).map (MultiEv.reqStep 1)))).map
+      (fun ms => ms.reqs.map (fun r => (r.recv.published, r.decodeHbm))) =
+    some [(some false, [.junk]), (some true, [.kv 0])] := by
+  decide
+
+/-- Overlapped multi-request trace: request $R_0$ finishes its send side
+(`producer`), `.recyclePrefill 0` immediately recycles $R_0$'s prefill HBM and
+prefill staging (overwriting them with `.junk`) and starts request $R_1$ while
+$R_0$'s receive side has not even started yet; $R_1$'s send side (`producer`)
+and $R_0$'s receive side (`consumer`) then run concurrently, followed by $R_1$'s
+receive side (`consumer`), and both $R_0$ and $R_1$ publish `done_recving` with
+`decodeHbm = [.kv 0]`. -/
+theorem trace_overlapped_requests :
+    ((multiSys 1).run
+      ((producer.map (MultiEv.reqStep 0)) ++
+       [.recyclePrefill 0] ++
+       (producer.map (MultiEv.reqStep 1)) ++
+       (consumer.map (MultiEv.reqStep 0)) ++
+       (consumer.map (MultiEv.reqStep 1)))).map
+      (fun ms => ms.reqs.map (fun r => (r.reclaimed, r.recv.published, r.decodeHbm))) =
+    some [(true, some true, [.kv 0]), (false, some true, [.kv 0])] := by
+  decide
+
+/-- Every event, for an `n`-layer instance. The five session events that the
+pipeline replaces with layer-indexed ones are left out (they are disabled). -/
+def events (n : Nat) : List Ev :=
+  (Send.events.filter fun e => e != .d2hReady && e != .h2hDone true && e != .h2hDone false).map .send ++
+    (Recv.events.filter fun e =>
+      e != .h2dBegin && e != .h2dIssue true && e != .h2dIssue false && e != .h2dReady).map .recv ++
+    (List.range n).flatMap (fun l =>
+      [.d2hReady l, .h2hDone l true, .h2hDone l false,
+       .h2dBegin l, .h2dIssue l true, .h2dIssue l false, .h2dReady l, .land l]) ++
+    [.reclaim, .reseatPrefillStaging, .reseatDecodeStaging]
+
+/-- Executable negation of `Safe`. -/
+def violates (s : Pipeline) : Bool :=
+  (s.recv.published == some true && s.decodeHbm != good s.numLayers) ||
+  (s.recv.published != none && (s.recv.pending != 0 || s.recv.retired != s.recv.issued)) ||
+  (s.send.published != none && (s.send.d2hPending || s.send.d2hRetired != s.send.d2hIssued)) ||
+  (!s.send.life.hasStaging &&
+    (s.send.d2hPending || s.send.d2hRetired != s.send.d2hIssued ||
+     s.send.h2hRetired != s.send.h2hIssued)) ||
+  (!s.recv.life.hasStaging &&
+    (s.recv.pushes != 0 || s.recv.pending != 0 || s.recv.retired != s.recv.issued)) ||
+  ((0 < s.send.life.inFlight || 0 < s.recv.life.inFlight) &&
+    !((drainEvents s.numLayers).any fun e => (step s e).isSome))
+
+#guard ModelCheck.check (sys 1) (events 1) violates 10 = .outOfFuel
+
+/-- Publication needs more events than the search above reaches, so search
+again from the state the producer leaves behind: every consumer interleaving
+with reclaim, staging reuse, cancellation and so on is within reach. -/
+def afterProducer : Pipeline := ((sys 1).run producer).getD (init 1)
+
+-- Fuel 10 is the least that reaches publication from here (ten consumer
+-- events). This is the slowest guard in the project (~7 s); do not lower it.
+#guard ModelCheck.check ⟨afterProducer, step⟩ (events 1) violates 10 = .outOfFuel
+
+/-- Two layers, from the out-of-order producer: explores the initial consumer
+landing and dispatch steps (`fuel = 5`, traces of up to 5 events) alongside
+reclaim and staging reuse; deeper consumer interleavings are covered from
+`afterDispatch2` below. -/
+def afterProducer2 : Pipeline := ((sys 2).run producer2).getD (init 2)
+
+#guard ModelCheck.check ⟨afterProducer2, step⟩ (events 2) violates 5 = .outOfFuel
+
+/-- Two layers, from the state where layer 1 landed and was dispatched before
+layer 0: every order of the two H2D completions, the two callbacks,
+publication, cancellation and staging reuse from there. -/
+def afterDispatch2 : Pipeline := ((sys 2).run (producer2 ++ consumer2.take 13)).getD (init 2)
+
+#guard ModelCheck.check ⟨afterDispatch2, step⟩ (events 2) violates 7 = .outOfFuel
+
+/-- Mutant: `ExecuteLayerH2d` entered before the layer has landed. The copy
+moves whatever the staging buffer held, and the receive is published as done
+with junk in HBM. -/
+def dispatchEarly (s : Pipeline) (l : Nat) : Option Pipeline :=
+  if s.claimedL[l]? = some false then
+    (Recv.step s.recv .h2dBegin).map fun rcv =>
+      { s with recv := rcv,
+               claimedL := s.claimedL.set l true,
+               h2dPendingL := s.h2dPendingL.set l true }
+  else none
+
+def sysDispatchEarly : System Pipeline Ev :=
+  ⟨init 1, fun s e => match e with
+    | .h2dBegin l => s.dispatchEarly l
+    | e => step s e⟩
+
+theorem trace_dispatch_early :
+    (sysDispatchEarly.run
+      [.recv (.pullReply true), .h2dBegin 0, .h2dIssue 0 true, .h2dReady 0,
+       .recv (.h2dDone true), .recv .publish]).map
+      (fun s => (s.recv.published, s.decodeHbm)) = some (some true, [.junk]) := by
+  decide
+
+#guard (match ModelCheck.check sysDispatchEarly (events 1) violates 8 with
+        | .counterexample _ => true
+        | _ => false)
+
+/-- Mutant: the H2D copy for layer `l` reads whichever staging slot the
+*counter* points at (`decodeStaging[ready]`) instead of its own. With layers
+in order this is invisible; with layer 1 landing first it copies layer 0's
+still-junk slot into layer 1's HBM, and the receive is published as done.
+This is the guard the per-layer events exist to state. -/
+def h2dReadyByRank (s : Pipeline) (l : Nat) : Option Pipeline :=
+  if s.h2dIssuedL[l]? = some true ∧ s.h2dReadyL[l]? = some false then
+    (Recv.step s.recv .h2dReady).map fun rcv =>
+      { s with recv := rcv,
+               decodeHbm := s.decodeHbm.set l (s.decodeStaging.getD s.recv.ready .junk),
+               h2dReadyL := s.h2dReadyL.set l true }
+  else none
+
+def sysH2dReadyByRank : System Pipeline Ev :=
+  ⟨init 2, fun s e => match e with
+    | .h2dReady l => s.h2dReadyByRank l
+    | e => step s e⟩
+
+theorem trace_h2d_by_rank :
+    (sysH2dReadyByRank.run
+      (producer2 ++
+       [.recv (.pullReply true),
+        .recv .pushBegin, .land 1, .h2dBegin 1, .h2dIssue 1 true,
+        .recv .netAccount, .recv .pushEnd, .h2dReady 1,
+        .recv .pushBegin, .land 0, .h2dBegin 0, .h2dIssue 0 true,
+        .recv .netAccount, .recv .pushEnd, .h2dReady 0,
+        .recv (.h2dDone true), .recv (.h2dDone true), .recv .publish])).map
+      (fun s => (s.recv.published, s.decodeHbm)) = some (some true, [.kv 1, .junk]) := by
+  decide
+
+/-- Mutant: the send's staging goes back to the pool at `Finish` instead of at
+settle, i.e. while a push may still be reading it. The pushed data is junk,
+the receiver accepts it, and is published as done. This is the failure the
+`in_flight_` protocol exists to prevent. -/
+def reseatAtFinish (s : Pipeline) : Option Pipeline :=
+  if s.send.life.draining = true then
+    some { s with prefillStaging := List.replicate s.numLayers .junk }
+  else none
+
+theorem trace_reseat_at_finish :
+    ((⟨init 1, fun s e => match e with
+        | .reseatPrefillStaging => s.reseatAtFinish
+        | e => step s e⟩ : System Pipeline Ev).run
+      [.send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
+       .send (.wake true), .send .h2hIssue, .send .cancel, .reseatPrefillStaging,
+       .h2hDone 0 true,
+       .recv (.pullReply true), .recv .pushBegin, .land 0, .h2dBegin 0,
+       .h2dIssue 0 true, .recv .pushEnd, .h2dReady 0, .recv (.h2dDone true), .recv .publish]).map
+      (fun s => (s.send.life.done, s.recv.published, s.decodeHbm)) =
+    some (false, some true, [.junk]) := by
+  decide
+
+end TpuSyncVerify.Transfer.PrefillDecode.Pipeline
