@@ -325,16 +325,16 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
       src_ids.push_back(src_id);
       dst_ids.push_back(dst_id);
     }
-    transport_srv->AsyncPush(
-        {peer}, src_ids, dst_ids, parallelism_,
-        transport::MajorOrder::kLayerMajor, uuid_, static_cast<int>(pool_idx),
-        [self = shared_from_this(),
-         &manager](absl::StatusOr<std::vector<int>> result) {
+    transport_srv
+        ->AsyncPush({peer}, src_ids, dst_ids, parallelism_,
+                    transport::MajorOrder::kLayerMajor, uuid_,
+                    static_cast<int>(pool_idx), wire_pool_idx)
+        .OnReady([self = shared_from_this(),
+                  &manager](const absl::StatusOr<std::vector<int>>& result) {
           absl::Cleanup end_op = [self]() { self->EndOp(); };
           self->RecordPushCompletion(
               manager, result.ok() ? absl::OkStatus() : result.status());
-        },
-        wire_pool_idx);
+        });
   }
 }
 

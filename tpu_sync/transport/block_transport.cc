@@ -27,7 +27,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <future>  // NOLINT
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -52,6 +51,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -781,48 +781,37 @@ uint32_t BlockTransport::GetChunksTotalSize(
   return total;
 }
 
-absl::StatusOr<std::vector<int>> BlockTransport::SyncPush(
-    const std::vector<std::string>& peers,
-    const std::vector<int>& src_block_ids,
-    const std::vector<int>& dst_block_ids, int parallelism,
-    MajorOrder major_order, uint64_t uuid, int layer_idx) {
-  auto promise =
-      std::make_shared<std::promise<absl::StatusOr<std::vector<int>>>>();
-  auto future = promise->get_future();
-  AsyncPush(peers, src_block_ids, dst_block_ids, parallelism, major_order, uuid,
-            layer_idx, [promise](absl::StatusOr<std::vector<int>> res) {
-              promise->set_value(std::move(res));
-            });
-  return future.get();
-}
-
-void BlockTransport::AsyncPush(
+tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<std::string>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
-    std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete,
     std::optional<int> wire_layer_idx) {
-  auto on_complete = [raw_on_complete](absl::StatusOr<std::vector<int>> res) {
+  auto [promise, future] = tsl::MakePromise<std::vector<int>>();
+  // The adapter's completion callback must be copyable, while tsl::Promise is
+  // move-only.
+  auto shared_promise =
+      std::make_shared<tsl::Promise<std::vector<int>>>(std::move(promise));
+  auto on_complete = [shared_promise](absl::StatusOr<std::vector<int>> res) {
     if (!res.ok()) {
       RecordTransferFailure(res.status(), metric_labels::kDirectionPush);
     }
-    raw_on_complete(std::move(res));
+    shared_promise->Set(std::move(res));
   };
   size_t num_blocks = src_block_ids.size();
   if (num_blocks == 0) {
     on_complete(absl::InvalidArgumentError("Block list cannot be empty"));
-    return;
+    return std::move(future);
   }
   if (peers.empty()) {
     on_complete(absl::InvalidArgumentError("Peer list cannot be empty"));
-    return;
+    return std::move(future);
   }
 
   int P = parallelism;
   if (P <= 0) {
     on_complete(absl::InvalidArgumentError("parallelism must be positive"));
-    return;
+    return std::move(future);
   }
   if (static_cast<int>(num_blocks) < P) P = num_blocks;
 
@@ -834,14 +823,17 @@ void BlockTransport::AsyncPush(
                          uuid, layer_idx, P, wire_layer_idx);
   if (!requests.ok()) {
     on_complete(requests.status());
-    return;
+    return std::move(future);
   }
 
+  // Post reports its own errors through `on_complete`, so the returned status
+  // carries no additional information.
   transport_adapter_
       ->Post(peers, *requests, src_block_ids, dst_block_ids,
              std::move(on_complete))
       .status()
       .IgnoreError();
+  return std::move(future);
 }
 
 absl::StatusOr<std::vector<int>> BlockTransport::SyncPull(

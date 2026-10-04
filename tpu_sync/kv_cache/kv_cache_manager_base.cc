@@ -2971,10 +2971,12 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
 
       if (src_block_ids.empty()) continue;
 
-      transport_server->AsyncPush(
-          {peer}, src_block_ids, dst_block_ids, /*parallelism=*/1,
-          transport::MajorOrder::kLayerMajor, request.uuid(),
-          /*layer_idx=*/-1, [uuid = request.uuid(), peer](auto push_res) {
+      transport_server
+          ->AsyncPush({peer}, src_block_ids, dst_block_ids, /*parallelism=*/1,
+                      transport::MajorOrder::kLayerMajor, request.uuid(),
+                      /*layer_idx=*/-1)
+          .OnReady([uuid = request.uuid(),
+                    peer](const absl::StatusOr<std::vector<int>>& push_res) {
             if (!push_res.ok()) {
               LOG(ERROR) << "Resharded push to " << peer << " failed for uuid "
                          << uuid << ": " << push_res.status().ToString();
