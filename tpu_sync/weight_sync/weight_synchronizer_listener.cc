@@ -217,22 +217,39 @@ void WeightSynchronizerListener::ExecuteControlRequest(
         LOG(ERROR) << "Invalid expected_block_count: " << expected_block_count;
         return;
       }
-      engine->StoreSkipTiling(uuid, req.start_transfer_request());
-
       const auto& layer_counts_proto =
           req.start_transfer_request().expected_layer_chunk_counts();
-      if (!layer_counts_proto.empty()) {
-        absl::flat_hash_map<size_t, uint32_t> layer_counts;
-        for (const auto& [layer_idx, count] : layer_counts_proto) {
-          layer_counts[static_cast<size_t>(layer_idx)] =
-              static_cast<uint32_t>(count);
-        }
-        absl::Status layer_status =
-            engine->RegisterExpectedLayerChunks(uuid, layer_counts);
-        if (!layer_status.ok()) {
-          LOG(WARNING) << "RegisterExpectedLayerChunks failed: "
-                       << layer_status;
-        }
+      // Every received chunk must be attributed to a layer so that each layer
+      // with data fires OnLayerDataReceived before OnDataReceived.
+      int64_t total_layer_chunks = 0;
+      for (const auto& entry : layer_counts_proto) {
+        total_layer_chunks += entry.second;
+      }
+      if (layer_counts_proto.empty() ||
+          total_layer_chunks != expected_block_count) {
+        resp->set_success(false);
+        resp->set_message(absl::StrCat(
+            "expected_layer_chunk_counts must be non-empty and sum to "
+            "expected_block_count=",
+            expected_block_count, "; got ", layer_counts_proto.size(),
+            " layer(s) summing to ", total_layer_chunks));
+        LOG(ERROR) << resp->message();
+        return;
+      }
+      engine->StoreSkipTiling(uuid, req.start_transfer_request());
+
+      absl::flat_hash_map<size_t, uint32_t> layer_counts;
+      for (const auto& [layer_idx, count] : layer_counts_proto) {
+        layer_counts[static_cast<size_t>(layer_idx)] =
+            static_cast<uint32_t>(count);
+      }
+      absl::Status layer_status =
+          engine->RegisterExpectedLayerChunks(uuid, layer_counts);
+      if (!layer_status.ok()) {
+        resp->set_success(false);
+        resp->set_message(std::string(layer_status.message()));
+        LOG(ERROR) << "RegisterExpectedLayerChunks failed: " << layer_status;
+        return;
       }
 
       absl::Status status = engine->RegisterExpectedChunks(

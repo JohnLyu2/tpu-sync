@@ -1032,6 +1032,11 @@ class BroadcastEngine:
                     remote_schedules,
                     dst_mem_type,
                     skip_d2h=r_plan.skip_d2h,
+                    expected_layer_chunk_counts=(
+                        r_plan.dst_expected_layer_chunk_counts.get(
+                            d_unit, r_plan.expected_layer_chunk_counts
+                        )
+                    ),
                 ),
             )
             if not success:
@@ -1062,6 +1067,11 @@ class BroadcastEngine:
                   remote_schedules,
                   dst_mem_type,
                   skip_d2h=plan.skip_d2h,
+                  expected_layer_chunk_counts=(
+                      plan.dst_expected_layer_chunk_counts.get(
+                          d_node, plan.expected_layer_chunk_counts
+                      )
+                  ),
               ),
           )
           if not success:

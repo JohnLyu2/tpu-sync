@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
@@ -32,6 +33,7 @@
 namespace tpu_raiden {
 namespace weight_sync {
 
+using ::testing::HasSubstr;
 using ::tpu_sync::rpc::ControlRequest;
 using ::tpu_sync::rpc::ControlResponse;
 using ::tpu_sync::rpc::ShardPushEntryProto;
@@ -195,6 +197,7 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
   dst_start_req->set_is_sender(false);
   dst_start_req->set_uuid(test_uuid);
   dst_start_req->set_expected_block_count(8);
+  (*dst_start_req->mutable_expected_layer_chunk_counts())[0] = 8;
 
   std::string dst_payload;
   ASSERT_TRUE(dst_req.SerializeToString(&dst_payload));
@@ -305,6 +308,7 @@ TEST(WeightSynchronizerListenerTest,
   start_req->set_uuid(8888);
   start_req->set_broadcast_round(0);
   start_req->set_expected_block_count(1);
+  (*start_req->mutable_expected_layer_chunk_counts())[0] = 1;
 
   auto* src_unit = start_req->add_src_units();
   src_unit->set_job_name("trainer");
@@ -341,6 +345,50 @@ TEST(WeightSynchronizerListenerTest,
   EXPECT_EQ(resp.message(), "SUCCESS");
   EXPECT_EQ(start_req->broadcast_round(), 0);
   EXPECT_EQ(start_req->broadcast_round_destinations_size(), 3);
+}
+
+TEST(WeightSynchronizerListenerTest,
+     ReceiverStartTransferRejectsMissingLayerChunkCounts) {
+  WeightSynchronizerBase engine(
+      /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  StartTransferRequest* start_req = req.mutable_start_transfer_request();
+  start_req->set_is_sender(false);
+  start_req->set_uuid(7777);
+  start_req->set_expected_block_count(3);
+
+  ControlResponse resp;
+  WeightSynchronizerListener::ExecuteControlRequest(&engine, req, &resp,
+                                                    []() {});
+  EXPECT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("expected_layer_chunk_counts"));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     ReceiverStartTransferRejectsLayerChunkCountsNotSummingToTotal) {
+  WeightSynchronizerBase engine(
+      /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  StartTransferRequest* start_req = req.mutable_start_transfer_request();
+  start_req->set_is_sender(false);
+  start_req->set_uuid(7778);
+  start_req->set_expected_block_count(3);
+  (*start_req->mutable_expected_layer_chunk_counts())[0] = 1;
+  (*start_req->mutable_expected_layer_chunk_counts())[1] = 1;
+
+  ControlResponse resp;
+  WeightSynchronizerListener::ExecuteControlRequest(&engine, req, &resp,
+                                                    []() {});
+  EXPECT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("summing to 2"));
 }
 
 }  // namespace

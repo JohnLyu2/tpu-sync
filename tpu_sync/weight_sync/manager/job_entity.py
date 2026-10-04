@@ -1163,6 +1163,23 @@ class JobEntity:
       if host_ip in getattr(transfer_plan, "dst_endpoint_layer_counts", {}):
         layer_counts = transfer_plan.dst_endpoint_layer_counts[host_ip]
 
+    # Receivers rely on per-layer counts to schedule per-layer post-processing
+    # (tiling/H2D). Every received chunk must be attributed to a layer, so the
+    # per-layer counts must sum to the total expected block count.
+    if (
+        not is_sender
+        and transfer_plan.use_block_chunks
+        and not transfer_plan.pool_groups
+    ):
+      total_layer_chunks = sum(layer_counts.values())
+      if not layer_counts or total_layer_chunks != expected_block_count:
+        raise ValueError(
+            f"Receiver {target_id} (endpoint={address}) requires per-layer"
+            " chunk counts summing to expected_block_count="
+            f"{expected_block_count}; got {len(layer_counts)} layer(s)"
+            f" summing to {total_layer_chunks}"
+        )
+
     start_req = self._proto_module.StartTransferRequest(
         src_units=[
             self._raiden_id_to_proto(u) for u in transfer_plan.src_units

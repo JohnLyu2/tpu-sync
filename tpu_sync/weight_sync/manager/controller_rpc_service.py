@@ -365,6 +365,9 @@ class RaidenControllerServer:
                   shard_push_schedules=shard_push_schedules,
                   skip_d2h=start_req.skip_d2h,
                   skip_tiling=skip_tiling,
+                  expected_layer_chunk_counts=dict(
+                      start_req.expected_layer_chunk_counts
+                  ),
               )
             if future.try_start():
               loop.run_until_complete(future.wait())
@@ -587,6 +590,7 @@ class RaidenControllerClientFacade:
       dst_mem_type: RaidenMemoryType = RaidenMemoryType.DRAM,
       skip_d2h: bool = False,
       skip_tiling: Optional[dict[int, bool]] = None,
+      expected_layer_chunk_counts: Optional[dict[int, int]] = None,
   ) -> bool:
     """Inter-controller RPC to register computed push schedules and prepare receivers."""
     del dst_controller_address, src_controller_address
@@ -604,6 +608,9 @@ class RaidenControllerClientFacade:
     if skip_tiling:
       for layer_idx, skip in skip_tiling.items():
         start_req.skip_tiling[layer_idx] = skip
+    if expected_layer_chunk_counts:
+      for layer_idx, count in expected_layer_chunk_counts.items():
+        start_req.expected_layer_chunk_counts[layer_idx] = count
 
     if shard_push_schedules:
       for src_unit, push_schedules in shard_push_schedules.items():

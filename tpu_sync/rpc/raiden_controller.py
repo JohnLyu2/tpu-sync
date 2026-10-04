@@ -980,6 +980,7 @@ class RaidenController:
       skip_tiling: Optional[dict[int, bool]] = None,
       group_size: int = 1,
       use_cached_plan: bool = True,
+      expected_layer_chunk_counts: Optional[dict[int, int]] = None,
   ) -> RaidenFuture:
     """Generates a transfer plan for the requested entities and dispatches it."""
     if group_size <= 0:
@@ -1141,6 +1142,9 @@ class RaidenController:
               use_block_chunks=True,
               is_sender=False,
               expected_block_count=expected_block_count,
+              expected_layer_chunk_counts=dict(
+                  expected_layer_chunk_counts or {}
+              ),
               req_id=req_id,
               skip_d2h=skip_d2h,
               skip_tiling=skip_tiling or {},

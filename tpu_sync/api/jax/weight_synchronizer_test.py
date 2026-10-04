@@ -603,6 +603,7 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
               is_sender=False,
               uuid=uuid,
               expected_block_count=1,
+              expected_layer_chunk_counts={0: 1},
           ),
       )
       _send_ctrl_req(ws_dest.listener_port, dst_req)
