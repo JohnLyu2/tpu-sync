@@ -1436,12 +1436,6 @@ absl::Status WeightSynchronizerBase::RegisterExpectedChunks(
 
 absl::Status WeightSynchronizerBase::RegisterExpectedChunksLocal(
     uint64_t uuid, uint32_t expected_chunks) {
-  {
-    absl::MutexLock lock(pending_h2d_mu_);
-    if (pending_h2d_states_[uuid].expected_layers == 0) {
-      pending_h2d_states_[uuid].expected_layers = num_layers_;
-    }
-  }
   return RaidenManagerBase::RegisterExpectedChunks(uuid, expected_chunks);
 }
 
@@ -1458,9 +1452,15 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunks(
 absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
+  // The transport fires OnLayerDataReceived only for layers with a non-zero
+  // expected count.
+  size_t expected_layers = 0;
+  for (const auto& [layer_idx, count] : expected_layer_chunks) {
+    if (count > 0) ++expected_layers;
+  }
   {
     absl::MutexLock lock(pending_h2d_mu_);
-    pending_h2d_states_[uuid].expected_layers = expected_layer_chunks.size();
+    pending_h2d_states_[uuid].expected_layers = expected_layers;
   }
   return RaidenManagerBase::RegisterExpectedLayerChunks(uuid,
                                                         expected_layer_chunks);
@@ -1479,9 +1479,6 @@ absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
     }
     active_h2d_uuids_.insert(uuid);
     auto& state = pending_h2d_states_[uuid];
-    if (state.expected_layers == 0) {
-      state.expected_layers = num_layers_;
-    }
     state.layer_futures[layer_idx] = h2d_pool_->Schedule(
         assigned_numa_node_,
         [this, layer_idx, uuid]() { return H2dLayer(layer_idx, uuid); });
@@ -1526,6 +1523,17 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
       layer_futures_map;
   {
     absl::MutexLock lock(pending_h2d_mu_);
+    // The transport releases its progress lock before invoking callbacks, so
+    // another thread's OnLayerDataReceived may still be in flight when the
+    // final chunk triggers OnDataReceived. Wait until every expected layer has
+    // scheduled its future.
+    auto all_layers_scheduled =
+        [this, uuid]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pending_h2d_mu_) {
+          auto it = pending_h2d_states_.find(uuid);
+          return it == pending_h2d_states_.end() ||
+                 it->second.layer_futures.size() >= it->second.expected_layers;
+        };
+    pending_h2d_mu_.Await(absl::Condition(&all_layers_scheduled));
     auto it = pending_h2d_states_.find(uuid);
     if (it != pending_h2d_states_.end()) {
       layer_futures_map = std::move(it->second.layer_futures);
@@ -1534,18 +1542,10 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
   }
 
   std::vector<raiden::PjRtCopyFuture> futures_to_await;
-  futures_to_await.reserve(num_layers_);
-  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    auto it = layer_futures_map.find(layer_idx);
-    if (it != layer_futures_map.end() && it->second.valid()) {
-      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                          it->second.get());
-      futures_to_await.push_back(std::move(layer_future));
-    } else {
-      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                          H2dLayer(layer_idx, uuid));
-      futures_to_await.push_back(std::move(layer_future));
-    }
+  futures_to_await.reserve(layer_futures_map.size());
+  for (auto& [layer_idx, layer_future] : layer_futures_map) {
+    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture copy_future, layer_future.get());
+    futures_to_await.push_back(std::move(copy_future));
   }
   if (!futures_to_await.empty()) {
     raiden::PjRtCopyFuture joined_future =
@@ -1625,19 +1625,11 @@ void WeightSynchronizerBase::DrainPendingH2d() {
 
   for (auto& [uuid, state] : pending_states) {
     std::vector<raiden::PjRtCopyFuture> futures_to_await;
-    futures_to_await.reserve(num_layers_);
-    for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-      auto it = state.layer_futures.find(layer_idx);
-      if (it != state.layer_futures.end() && it->second.valid()) {
-        auto status_or_future = it->second.get();
-        if (status_or_future.ok()) {
-          futures_to_await.push_back(std::move(*status_or_future));
-        }
-      } else {
-        auto status_or_future = H2dLayer(layer_idx, uuid);
-        if (status_or_future.ok()) {
-          futures_to_await.push_back(std::move(*status_or_future));
-        }
+    futures_to_await.reserve(state.layer_futures.size());
+    for (auto& [layer_idx, layer_future] : state.layer_futures) {
+      absl::StatusOr<raiden::PjRtCopyFuture> copy_future = layer_future.get();
+      if (copy_future.ok()) {
+        futures_to_await.push_back(*std::move(copy_future));
       }
     }
     if (!futures_to_await.empty()) {

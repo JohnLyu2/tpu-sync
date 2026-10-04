@@ -348,7 +348,11 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   bool auto_h2d_ = false;
 
   struct PendingH2dState {
+    // Number of layers with a non-zero expected chunk count, set by
+    // RegisterExpectedLayerChunksLocal. OnDataReceived waits until
+    // |layer_futures| holds this many entries.
     size_t expected_layers = 0;
+    // Per-layer futures scheduled by OnLayerDataReceived, keyed by layer index.
     absl::flat_hash_map<size_t,
                         std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
         layer_futures;

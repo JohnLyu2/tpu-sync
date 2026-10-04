@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
@@ -1611,6 +1612,40 @@ TEST_F(WeightSynchronizerTest, DrainPendingH2dDrainsActivePendingFutures) {
   // DrainPendingH2d should drain all scheduled futures and mark uuid completed
   ws->DrainPendingH2d();
 
+  EXPECT_TRUE(ws->WaitForTransferCompletion(uuid).ok());
+  ws->ForgetPushProgress(uuid);
+}
+
+TEST_F(WeightSynchronizerTest, OnDataReceivedWaitsForAllExpectedLayers) {
+  auto ws = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/3, /*num_shards=*/1, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+      /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/
+      std::vector<std::string>{"layer_0", "layer_1", "layer_2"},
+      /*auto_h2d=*/true);
+
+  const uint64_t uuid = 65432;
+  // Layer 2 has a zero count and never fires OnLayerDataReceived.
+  ASSERT_TRUE(
+      ws->RegisterExpectedLayerChunks(uuid, {{0, 1}, {1, 1}, {2, 0}}).ok());
+  ASSERT_TRUE(ws->OnLayerDataReceived(0, uuid).ok());
+
+  absl::Notification data_received_done;
+  absl::Status data_received_status;
+  std::thread receiver([&] {
+    data_received_status = ws->OnDataReceived(uuid);
+    data_received_done.Notify();
+  });
+
+  // Layer 1's callback has not arrived yet, so OnDataReceived must block.
+  EXPECT_FALSE(
+      data_received_done.WaitForNotificationWithTimeout(absl::Seconds(1)));
+
+  ASSERT_TRUE(ws->OnLayerDataReceived(1, uuid).ok());
+  receiver.join();
+  EXPECT_TRUE(data_received_done.HasBeenNotified());
+  EXPECT_TRUE(data_received_status.ok()) << data_received_status;
   EXPECT_TRUE(ws->WaitForTransferCompletion(uuid).ok());
   ws->ForgetPushProgress(uuid);
 }
