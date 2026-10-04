@@ -133,6 +133,12 @@ class MockSubWeightSynchronizer : public weight_sync::WeightSynchronizerBase {
 
   void DrainPendingH2d() override { drain_pending_h2d_calls++; }
 
+  int unbind_weights_calls = 0;
+  void UnbindWeights() override {
+    unbind_weights_calls++;
+    WeightSynchronizerBase::UnbindWeights();
+  }
+
   void ResetMetrics() override {
     reset_metrics_calls++;
     WeightSynchronizerBase::ResetMetrics();
@@ -577,6 +583,23 @@ TEST(WeightSynchronizerWrapperTest, SetSkipTilingDispatchesToAllSubs) {
   ws.SetSkipTiling(skip_vec);
   EXPECT_EQ(sub0_raw->skip_tiling_vec_calls, 1);
   EXPECT_EQ(sub1_raw->skip_tiling_vec_calls, 1);
+}
+
+TEST(WeightSynchronizerWrapperTest, UnbindWeightsDispatchesToAllSubs) {
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  WeightSynchronizer ws(std::move(subs));
+
+  ws.UnbindWeights();
+  EXPECT_EQ(sub0_raw->unbind_weights_calls, 1);
+  EXPECT_EQ(sub1_raw->unbind_weights_calls, 1);
 }
 
 TEST(WeightSynchronizerWrapperTest, DrainPendingH2dThroughFacade) {

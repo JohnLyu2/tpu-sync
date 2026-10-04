@@ -468,6 +468,11 @@ void WeightSynchronizerBase::UpdateAllocatedOccupancyMetric(size_t delta) {
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
     size_t layer_idx, uint64_t uuid) {
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before H2d.");
+  }
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -571,6 +576,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
     uint64_t uuid) {
   RAIDEN_TRACE("WeightSynchronizerBase::H2d");
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before H2d.");
+  }
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -620,6 +630,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
     size_t layer_idx, uint64_t uuid,
     std::shared_ptr<std::atomic<double>> max_detile_ms) {
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before D2h.");
+  }
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -737,6 +752,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
     uint64_t uuid) {
   RAIDEN_TRACE("WeightSynchronizerBase::D2h");
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before D2h.");
+  }
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -1359,6 +1379,10 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 absl::Status WeightSynchronizerBase::BindWeights(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers) {
   RAIDEN_TRACE("WeightSynchronizerBase::BindWeights");
+  if (layer_buffers.empty()) {
+    UnbindWeights();
+    return absl::OkStatus();
+  }
   if (layer_buffers.size() != num_layers_) {
     return absl::InvalidArgumentError("Number of layers mismatch");
   }
@@ -1423,7 +1447,14 @@ absl::Status WeightSynchronizerBase::BindWeights(
     }
     buffer_holds_.push_back(std::move(hold_info));
   }
+  weights_unbound_ = false;
   return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::UnbindWeights() {
+  RAIDEN_TRACE("WeightSynchronizerBase::UnbindWeights");
+  buffer_holds_.clear();
+  weights_unbound_ = true;
 }
 
 absl::Status WeightSynchronizerBase::RegisterExpectedChunks(

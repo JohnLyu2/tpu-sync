@@ -179,8 +179,33 @@ class WeightSynchronizer:
       self._impl.set_skip_tiling(list(skip))
 
   def bind_weights(self, device_tensors: List[List[torch.Tensor]]) -> None:
-    """Dynamically re-binds new device weights in-place without daemon restart."""
+    """Dynamically re-binds new device weights in-place without daemon restart.
+
+    Args:
+      device_tensors: New per-layer, per-shard device tensors to bind. Must
+        match the layer/shard/size configuration from construction. An empty
+        list is equivalent to calling `unbind_weights()`.
+    """
+    if not device_tensors:
+      self.unbind_weights()
+      return
     self._impl.bind_weights(device_tensors)
+
+  def unbind_weights(self) -> None:
+    """Releases all bound device tensors and their TPU HBM holds immediately.
+
+    The synchronizer itself (pinned host staging buffers, listeners, controller
+    registration) stays alive, so a later `bind_weights()` is cheap and does not
+    require re-creating or re-registering the WeightSynchronizer. Use this right
+    after a transfer completes so temporary send tensors do not stay pinned in
+    HBM during the next training step.
+
+    After unbinding, `d2h()`, `h2d()`, and any controller-driven push that
+    performs D2H raise until `bind_weights()` is called again.
+
+    Must not be called while a D2H/H2D/push on this synchronizer is in flight.
+    """
+    self._impl.unbind_weights()
 
   def d2h(self) -> None:
     """Triggers asynchronous D2H copy of current weights to Host buffer."""

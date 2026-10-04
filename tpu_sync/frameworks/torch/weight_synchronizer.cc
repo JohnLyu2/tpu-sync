@@ -77,12 +77,16 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
 absl::Status NumaAwareWeightSynchronizer::BindWeights(
     const std::vector<std::vector<at::Tensor>>& device_tensors) {
   try {
+    if (device_tensors.empty()) {
+      UnbindWeights();
+      return absl::OkStatus();
+    }
     UnpackedTensors unpacked =
         UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock_);
     const auto& layer_buffers = unpacked.buffers;
     if (layer_buffers.empty()) {
-      return absl::InvalidArgumentError(
-          "Empty layer buffers provided to BindWeights");
+      UnbindWeights();
+      return absl::OkStatus();
     }
     if (layer_buffers.size() != num_layers_) {
       return absl::InvalidArgumentError(
@@ -121,6 +125,17 @@ absl::Status NumaAwareWeightSynchronizer::BindWeights(
   }
 }
 #endif
+
+void NumaAwareWeightSynchronizer::UnbindWeights() {
+#ifndef WITHOUT_PYTHON
+  buffer_refs_.clear();
+#endif
+  for (auto& sub : sub_synchronizers_) {
+    if (sub) {
+      sub->UnbindWeights();
+    }
+  }
+}
 
 NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
@@ -1003,6 +1018,12 @@ absl::Status WeightSynchronizer::BindWeights(
   return numa_manager_->BindWeights(device_tensors);
 }
 #endif
+
+void WeightSynchronizer::UnbindWeights() {
+  if (numa_manager_) {
+    numa_manager_->UnbindWeights();
+  }
+}
 
 WeightSynchronizer::WeightSynchronizer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,

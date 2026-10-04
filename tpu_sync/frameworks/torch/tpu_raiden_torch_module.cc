@@ -729,6 +729,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
             }
           },
           nb::arg("device_tensors"), nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "unbind_weights",
+          [](WeightSynchronizer& self) {
+            self.UnbindWeights();
+          },
+          nb::call_guard<nb::gil_scoped_release>())
 
       .def(
           "D2h",

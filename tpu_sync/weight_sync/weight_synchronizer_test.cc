@@ -1208,6 +1208,133 @@ TEST_F(WeightSynchronizerTest, BindWeights) {
   }
 }
 
+// CPU-only instances never bind device buffers and must keep their legacy
+// no-op D2h/H2d behavior; UnbindWeights() must not be required to use them.
+TEST_F(WeightSynchronizerTest, CpuOnlyInstanceD2hH2dRemainNoOp) {
+  auto ws = std::make_unique<WeightSynchronizerBase>(
+      num_layers_, num_shards_, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  auto d2h_or = ws->D2h();
+  ASSERT_TRUE(d2h_or.ok()) << d2h_or.status().message();
+  EXPECT_OK(d2h_or.value().Await());
+
+  auto h2d_or = ws->H2d();
+  ASSERT_TRUE(h2d_or.ok()) << h2d_or.status().message();
+  EXPECT_OK(h2d_or.value().Await());
+}
+
+TEST_F(WeightSynchronizerTest, UnbindWeightsFailsTransfersUntilRebound) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
+  auto client = std::move(client_status_or.value());
+
+  size_t slice_byte_size = 1024;
+  auto memory_space_status_or =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_TRUE(memory_space_status_or.ok())
+      << memory_space_status_or.status().message();
+  xla::PjRtMemorySpace* memory_space = memory_space_status_or.value();
+
+  auto make_buffer = [&](uint8_t fill) {
+    std::vector<uint8_t> data(slice_byte_size, fill);
+    auto buf_or = client->BufferFromHostBuffer(
+        data.data(), xla::U8, {static_cast<int64_t>(slice_byte_size)},
+        /*byte_strides=*/std::nullopt,
+        xla::PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes,
+        /*on_done_with_host_buffer=*/nullptr, memory_space,
+        /*device_layout=*/nullptr);
+    EXPECT_TRUE(buf_or.ok()) << buf_or.status().message();
+    return std::move(buf_or.value());
+  };
+
+  // Buffers are declared before synchronizers so they outlive them.
+  auto src_pjrt_buffer = make_buffer(0x11);
+  auto dest_pjrt_buffer = make_buffer(0x00);
+  auto new_src_pjrt_buffer = make_buffer(0x33);
+  auto new_dest_pjrt_buffer = make_buffer(0x00);
+
+  auto acquire = [](xla::PjRtBuffer* buf) {
+    auto h = raiden::RaidenBufferHandle::Acquire(buf);
+    EXPECT_TRUE(h.ok()) << h.status().message();
+    return std::vector<std::vector<raiden::RaidenBufferHandle>>{{h.value()}};
+  };
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      acquire(src_pjrt_buffer.get()), /*local_port=*/0);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      acquire(dest_pjrt_buffer.get()), /*local_port=*/0);
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  auto make_request = [&](uint64_t uuid) {
+    tpu_sync::rpc::StartTransferRequest request;
+    request.set_skip_d2h(false);
+    request.set_uuid(uuid);
+    auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+    entry->set_dst_peer(dest_peer);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(slice_byte_size);
+    entry->set_count(1);
+    entry->set_layer_idx(0);
+    return request;
+  };
+
+  // 1. Baseline transfer works while bound.
+  {
+    auto request = make_request(1);
+    ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+    ASSERT_OK(ws_source->PushWeightsResharded(request));
+    ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+    auto h2d_or = ws_dest->H2d();
+    ASSERT_TRUE(h2d_or.ok()) << h2d_or.status().message();
+    ASSERT_OK(h2d_or.value().Await());
+  }
+
+  // 2. Unbind both sides (explicit API on source, empty-bind alias on dest).
+  ws_source->UnbindWeights();
+  ASSERT_OK(ws_dest->BindWeights({}));
+
+  // 3. Direct device entry points must fail with FailedPrecondition.
+  EXPECT_EQ(ws_source->D2h().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(ws_dest->H2d().status().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  // 4. Controller-driven push with skip_d2h=false must also fail rather than
+  //    silently shipping stale host staging bytes.
+  {
+    auto request = make_request(2);
+    absl::Status status = ws_source->PushWeightsResharded(request);
+    EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition)
+        << status.message();
+  }
+
+  // 5. Re-binding on the same instances fully recovers (no re-creation).
+  ASSERT_OK(ws_source->BindWeights(acquire(new_src_pjrt_buffer.get())));
+  ASSERT_OK(ws_dest->BindWeights(acquire(new_dest_pjrt_buffer.get())));
+  {
+    auto request = make_request(3);
+    ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+    ASSERT_OK(ws_source->PushWeightsResharded(request));
+    ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+    auto h2d_or = ws_dest->H2d();
+    ASSERT_TRUE(h2d_or.ok()) << h2d_or.status().message();
+    ASSERT_OK(h2d_or.value().Await());
+  }
+
+  std::vector<uint8_t> readback(slice_byte_size, 0);
+  ASSERT_OK(new_dest_pjrt_buffer
+                ->CopyRawToHost(readback.data(), 0, slice_byte_size)
+                .Await());
+  for (size_t i = 0; i < slice_byte_size; ++i) {
+    EXPECT_EQ(readback[i], 0x33) << "Mismatch at byte " << i;
+  }
+}
+
 TEST_F(WeightSynchronizerTest, TilingSkipScenarios) {
   auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
   ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();

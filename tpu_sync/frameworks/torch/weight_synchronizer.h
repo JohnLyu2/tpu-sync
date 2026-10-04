@@ -67,6 +67,11 @@ class NumaAwareWeightSynchronizer
   absl::Status BindWeights(
       const std::vector<std::vector<at::Tensor>>& device_tensors);
 #endif
+  // Releases all bound device tensors (buffer_refs_) and TPU HBM buffer holds
+  // across every sub-synchronizer while keeping host staging memory, metadata,
+  // and listeners alive. Must not be called while a D2H/H2D/push is in flight.
+  // See WeightSynchronizerBase::UnbindWeights for the full contract.
+  void UnbindWeights();
 
   // CPU / Mock metadata constructor for tests without PJRT TPU devices
   NumaAwareWeightSynchronizer(
@@ -191,6 +196,12 @@ class WeightSynchronizer {
   absl::Status BindWeights(
       const std::vector<std::vector<at::Tensor>>& device_tensors);
 #endif
+  // Releases all bound device tensors and TPU HBM buffer holds while keeping
+  // the synchronizer (host staging memory, listeners, controller registration)
+  // alive for a later BindWeights(). D2h()/H2d()/pushes fail with
+  // FailedPrecondition until weights are re-bound. Must not be called while a
+  // D2H/H2D/push is in flight.
+  void UnbindWeights();
 
   // CPU / Mock metadata constructor for tests without PJRT TPU devices
   WeightSynchronizer(

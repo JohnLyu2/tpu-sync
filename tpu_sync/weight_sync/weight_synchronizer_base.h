@@ -245,6 +245,22 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       const std::vector<std::vector<raiden::RaidenBufferHandle>>&
           layer_buffers);
 
+  // Unbinds all device buffers and releases all TPU HBM buffer holds while
+  // keeping allocated host memory staging buffers, layer/shard metadata, and
+  // listeners intact. A subsequent BindWeights() re-arms the synchronizer
+  // without re-allocating host memory or re-registering with the controller.
+  //
+  // After this call, D2h()/H2d() (and any controller-driven push with
+  // skip_d2h=false) return FailedPrecondition until BindWeights() is called
+  // again. BindWeights({}) is an alias for UnbindWeights().
+  //
+  // Thread-safety: buffer_holds_ is not mutex-protected. Callers must not
+  // invoke this while a D2H/H2D/push on this synchronizer is in flight (e.g.
+  // call it only after the controller's start_transfer future has resolved).
+  // DMA copies already scheduled remain safe: their futures own their own
+  // buffer holds.
+  virtual void UnbindWeights();
+
   virtual void StoreSkipTiling(
       uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request);
   virtual void StoreSkipTilingLocal(
@@ -324,6 +340,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   // Separate PJRT active holds matrix E2E!
   std::vector<std::vector<raiden::BufferHoldAndAlias>> buffer_holds_;
+
+  // Set by UnbindWeights() and cleared by BindWeights(). While set, D2h()/H2d()
+  // return FailedPrecondition instead of silently no-op'ing on the (now empty)
+  // buffer_holds_, so a missing re-bind cannot ship stale host staging data.
+  // CPU-only instances never set this flag and keep their no-op behavior.
+  bool weights_unbound_ = false;
 
   // Override parent AllocateBlocks as simple identity indices since we sync
   // entire buffers E2E!
