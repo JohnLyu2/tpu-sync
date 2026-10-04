@@ -1077,6 +1077,111 @@ class ReshardPlannerTest(absltest.TestCase):
             "All 4 hosts must have distinct first destination units",
         )
 
+  def test_skip_tiling_identical_specs_requires_tile_alignment(self):
+    """Verifies identical src/dst variable specs only skip tiling when local shards are (8, 128)-aligned."""
+    src_units = [RaidenId("trainer", str(i), "weights", 0) for i in range(4)]
+    dst_units = [RaidenId("sampler", str(i), "weights", 0) for i in range(4)]
+
+    identical_vars = [
+        # Layer 0: 1D tensor -> rank < 2 -> False
+        controller_types.VariableMetadata(
+            name="layer_0.norm",
+            shape=[5120],
+            mesh_shape=[1],
+            layout=[0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=[""],
+        ),
+        # Layer 1: 2D local shard [256, 5120] -> (8, 128)-aligned -> True
+        controller_types.VariableMetadata(
+            name="layer_0.q_proj",
+            shape=[8192, 5120],
+            mesh_shape=[32, 1],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["tp", ""],
+        ),
+        # Layer 2: 2D local shard [4, 5120] -> row 4 % 8 != 0 -> False
+        controller_types.VariableMetadata(
+            name="layer_0.k_proj",
+            shape=[128, 5120],
+            mesh_shape=[32, 1],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=2,
+            sharding_spec=["tp", ""],
+        ),
+        # Layer 3: 2D local shard [5120, 64] -> col 64 % 128 != 0 -> False
+        controller_types.VariableMetadata(
+            name="layer_0.o_proj",
+            shape=[5120, 2048],
+            mesh_shape=[1, 32],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=3,
+            sharding_spec=["", "tp"],
+        ),
+        # Layer 4: 2D replicated tensor [2048, 1] -> col 1 % 128 != 0 -> False
+        controller_types.VariableMetadata(
+            name="layer_0.shared_expert_gate",
+            shape=[2048, 1],
+            mesh_shape=[1, 1],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=4,
+            sharding_spec=["", ""],
+        ),
+        # Layer 5: 3D local shard [1, 512, 2048] -> (8, 128)-aligned -> True
+        controller_types.VariableMetadata(
+            name="layer_0.moe_aligned",
+            shape=[32, 512, 2048],
+            mesh_shape=[32, 1, 1],
+            layout=[2, 1, 0],
+            item_size=2,
+            layer_idx=5,
+            sharding_spec=["tp", "", ""],
+        ),
+        # Layer 6: 3D local shard [32, 512, 64] -> col 64 % 128 != 0 -> False
+        controller_types.VariableMetadata(
+            name="layer_0.moe_unaligned_col",
+            shape=[32, 512, 2048],
+            mesh_shape=[1, 1, 32],
+            layout=[2, 1, 0],
+            item_size=2,
+            layer_idx=6,
+            sharding_spec=["", "", "tp"],
+        ),
+    ]
+
+    for v in identical_vars:
+      self.assertTrue(controller_types.is_variable_spec_identical(v, v))
+
+    sched = self._run_planner(
+        src_vars_by_unit={u: identical_vars for u in src_units},
+        dst_vars_by_unit={u: identical_vars for u in dst_units},
+        src_phys_mesh=[1, 32],
+        src_mesh_axes=["data", "tp"],
+        src_host_subgrid=[1, 8],
+        dst_phys_mesh=[1, 32],
+        dst_mesh_axes=["data", "tp"],
+        dst_host_subgrid=[1, 8],
+    )
+
+    self.assertEqual(
+        sched.local_skip_tiling,
+        {
+            0: False,
+            1: True,
+            2: False,
+            3: False,
+            4: False,
+            5: True,
+            6: False,
+        },
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

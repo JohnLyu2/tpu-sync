@@ -1095,7 +1095,6 @@ class ReshardPlanner:
               )
               aligned_decision = skip_tiling_by_geom.get(geom_key)
               if aligned_decision is None:
-                is_identical = _is_variable_spec_identical(src_var, dst_var)
                 s_nd_slices = computed_nd_slices.get(
                     reference_src_unit, {}
                 ).get(src_var.name, [])
@@ -1115,10 +1114,7 @@ class ReshardPlanner:
                   if not all_aligned:
                     break
                 is_2d_or_more = len(src_var.shape) >= 2
-                is_2d_identical = is_identical and is_2d_or_more
-                aligned_decision = is_2d_or_more and (
-                    is_2d_identical or all_aligned
-                )
+                aligned_decision = is_2d_or_more and all_aligned
                 skip_tiling_by_geom[geom_key] = aligned_decision
               local_skip_tiling[layer_idx] = aligned_decision
 
