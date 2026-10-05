@@ -916,9 +916,18 @@ theorem trace_normal :
       some (true, some true, 2, 0) := by
   decide
 
-/-- "One nobody pulled is reported now" (`mgr.cc:912-913`): the deadline on an
-idle send settles it at once. -/
+/-- "One nobody pulled is reported now" (`mgr.cc:912-913`;
+`SendLifecycleTest.UnpulledSendAtOrBeforeItsDeadlineIsNotFailed` in
+`kv_cache_manager_with_transfer_control_test.cc:433-460` and
+`SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` in
+`kv_cache_manager_with_transfer_pool_reshard_test.cc:338-347`): before the
+deadline an unpulled send holds its staging and cannot be published; once the
+deadline fires on the idle send it settles at once, releases its staging,
+publishes failure (`some false`), and rejects any late `.start`. -/
 theorem trace_never_pulled :
+    ((sys 2).run []).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (false, true, none) ∧
+    (sys 2).run [.publish] = none ∧
     ((sys 2).run [.cancel, .publish]).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) ∧
     (sys 2).run [.cancel, .start] = none := by

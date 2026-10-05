@@ -90,11 +90,19 @@ Traces (all `decide`):
 | `Recv.trace_noPoll_normal` | the same transfer with the poll removed: the callback finishes and records |
 | `Recv.trace_zero_layers_poll` | with `num_layers() == 0` only the poll ever finishes the session (`noPoll_zero_layers_never_succeeds` is the general statement) |
 | `Recv.trace_deadline_during_copy`, `Send.trace_deadline_during_copy` | a deadline under an in-flight copy drains but does not settle until the op ends |
+| `Recv.trace_deadline_during_handshake` | a deadline on `sysLoad` while the pull handshake is pending keeps staging pinned until `pullReply` ends the op (`ExpiredReceiveKeepsStagingUntilHandshakeEnds`) |
+| `Recv.trace_net_completion_waits_for_h2d` | `network_completed_` is set while an H2D copy is still running; neither the poll nor publication can complete until the copy finishes (`NetworkCompletionWaitsForH2d`) |
+| `Recv.trace_late_net_account_after_retire` | a fast H2D callback finishes and retires the session before `OnBlocksReceived`; the late `netAccount` is ignored (`LateBlockAccountingAfterRetirementIsANoOp`) |
+| `Recv.trace_failed_h2d_waits_for_other_layer` | two layers' H2D copies issued; one fails while the other runs; staging and failure publication wait for the remaining copy (`FailedLayerWaitsForOtherH2dCopies`) |
+| `Recv.trace_push_lease_pins_staging_on_cancel` | an open incoming push lease (`pushBegin`) keeps staging pinned across `cancel` and rejects new pushes until `pushEnd` (`IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`) |
+| `Recv.trace_push_lease_outlives_h2d` | H2D copy and callback finish while the incoming push lease is still open; `done` stays `false` and `hasStaging` stays `true` until `pushEnd` (`IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`) |
 | `Recv.trace_finish_between_locks` | the race the `.cc:601-612` re-check closes |
 | `Recv.trace_no_push_after_finish`, `Pipeline.trace_no_push_after_settle` | nothing lands in a settled receive's staging |
 | `Send.trace_never_pulled`, `Send.trace_zero_layers` | the two degenerate sends |
 | `Send.trace_push_fails` | a failed push drains the chain |
-| `Send.trace_cancel_after_ok_finish` | first-finish-wins on the send side |
+| `Send.trace_drain_h2h_and_d2h` | `cancel` with layer 0 H2H and layer 1 D2H both in flight: layer 0 H2H finishes first (`done` stays `false`), then layer 1 D2H finishes and `wake` drops layer 1 H2H and settles (`DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone`) |
+| `Send.trace_failed_d2h_waits_for_other_layer` | layer 0 D2H fails while layer 1 D2H runs; failure and staging release wait for layer 1 D2H (`FailedLayerWaitsForTheOtherLayersCopies`) |
+| `Send.trace_cancel_after_ok_finish`, `Send.trace_ok_after_cancel_keeps_failure` | first-finish-wins on the send side in both directions (`FailureCannotOverrideAnEarlierSuccess`, `SuccessCannotOverrideAnEarlierFailure`) |
 | `Pipeline.trace_slow_consumer` | producer published, reclaimed and reseated before the consumer lands anything; data still right |
 | `Pipeline.trace_no_dispatch_before_land` | `h2dBegin l` needs layer `l` to have landed |
 | `Pipeline.trace_aborted_issue_cannot_ready` | `h2dReady l` needs layer `l`'s own `h2dIssue l` to have issued the copy (cannot borrow another layer's `issued` count) |
@@ -119,6 +127,51 @@ Mutants (each yields a `.counterexample`):
 | `Pipeline.dispatchEarly` | `h2dBegin l` after layer `l` landed | publication correctness (junk in HBM) |
 | `Pipeline.h2dReadyByRank` | the H2D copy for layer `l` reads slot `l` (it reads the slot the *counter* points at instead — the shape of a counter-indexed model) | publication correctness: with layer 1 landing first, HBM ends `[kv 1, junk]` |
 | `Pipeline.reseatAtFinish` | staging released at settle, not at `Finish` | publication correctness via the send's staging |
+
+## Test suite correspondence (C++ unit tests & `tpu-raiden` skill tests → Lean)
+
+How the existing C++ unit tests (`tools/run_cc_tests.sh` / `tpu-raiden` Blaze
+targets) and the `tpu-raiden-tpuvm-release-test` Python E2E tests
+(`run_tests.sh`) correspond to the Lean trace theorems (`trace_*`) and general
+safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`,
+`system_progress`):
+
+### 1. Producer session tests (`TransferSendSession` → `Send.lean`)
+
+| Test | File & lines | Lean trace theorem | General theorem |
+|---|---|---|---|
+| `DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `transfer_send_session_test.cc:50-137` | `Send.trace_drain_h2h_and_d2h` | `Send.reachable_safe` (`SettleSafe`, `Drained`, `StagingIntegrity`) |
+| `FailedLayerWaitsForTheOtherLayersCopies` | `kv_cache_manager_with_transfer_send_drain_test.cc:154-205` | `Send.trace_failed_d2h_waits_for_other_layer` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe` |
+| `DeadlineMidD2hWaitsForInFlightCopy` | `kv_cache_manager_with_transfer_send_drain_test.cc:209-258` | `Send.trace_deadline_during_copy` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe` |
+| `SendFailureIsReportedInFailedRecvingAndFreesTheSlot` | `kv_cache_manager_with_transfer_control_test.cc:295-333` | `Send.trace_push_fails` | `Send.reachable_safe`, `Send.reachable_can_settle` |
+| `SuccessCannotOverrideAnEarlierFailure` | `kv_cache_manager_with_transfer_control_test.cc:335-380` | `Send.trace_ok_after_cancel_keeps_failure` | `Send.Inv.ok_draining`, `Send.Publication` |
+| `FailureCannotOverrideAnEarlierSuccess` | `kv_cache_manager_with_transfer_control_test.cc:382-392` | `Send.trace_cancel_after_ok_finish` | `Lifecycle.finishOnceLocked_consistent` |
+| `UnpulledSendAtOrBeforeItsDeadlineIsNotFailed` | `kv_cache_manager_with_transfer_control_test.cc:433-460` | `Send.trace_never_pulled` | `Send.Inv.published_done`, `Send.StagingIntegrity` |
+| `ExpiredSendSessionFailsInsteadOfReportingDone` | `kv_cache_manager_with_transfer_pool_reshard_test.cc:338-347` | `Send.trace_never_pulled` | `Send.reachable_safe` (`SettlesPromptly`, `StagingIntegrity`) |
+
+### 2. Consumer session & control tests (`TransferReceiveSession` → `Receive.lean`)
+
+| Test | File & lines | Lean trace theorem | General theorem |
+|---|---|---|---|
+| `ExpiredReceiveKeepsStagingUntilHandshakeEnds` | `kv_cache_manager_with_transfer_control_test.cc:394-431` | `Recv.trace_deadline_during_handshake` | `Recv.reachable_safe` (`SettleSafe`, `StagingIntegrity`) |
+| `ReceiveWithoutTrafficFailsAtItsDeadline` | `kv_cache_manager_with_transfer_control_test.cc:462-477` | `Recv.trace_deadline_during_handshake` | `Recv.SettlesPromptly`, `Recv.StagingIntegrity` |
+| `UnregisteringIdleReceiverReleasesPlanAtOnce`, `DemandStagedReceiverPlanUnregistersWhenItSettles` | `kv_cache_manager_with_transfer_pool_reshard_test.cc:409-434, 538-561` | `Recv.trace_deadline_during_handshake` | `Recv.SettlesPromptly`, `Recv.StagingIntegrity` |
+| `FailedLayerWaitsForOtherH2dCopies` | `kv_cache_manager_with_transfer_send_drain_test.cc:262-316` | `Recv.trace_failed_h2d_waits_for_other_layer` | `Recv.reachable_safe`, `Pipeline.DecodeHbmSafe` |
+| `SingleFailedH2dReportsFailureAndReturnsStaging` | `kv_cache_manager_with_transfer_control_test.cc:479-501` | `Recv.trace_failed_h2d_waits_for_other_layer` | `Recv.reachable_safe`, `Recv.reachable_can_settle` |
+| `IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining` | `kv_cache_manager_with_transfer_control_test.cc:503-529` | `Recv.trace_push_lease_pins_staging_on_cancel`, `Recv.trace_no_push_after_finish` | `Recv.StagingIntegrity`, `Pipeline.StagingSafe` |
+| `UnregisteringInFlightReceiverDefersUntilItSettles` | `kv_cache_manager_with_transfer_pool_reshard_test.cc:436-476` | `Recv.trace_push_lease_pins_staging_on_cancel` | `Recv.StagingIntegrity`, `Pipeline.StagingSafe` |
+| `IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing` | `kv_cache_manager_with_transfer_control_test.cc:531-565` | `Recv.trace_push_lease_outlives_h2d` | `Recv.Accounted`, `Recv.SettleSafe` |
+| `NetworkCompletionWaitsForH2d` | `kv_cache_manager_with_transfer_control_test.cc:567-598` | `Recv.trace_net_completion_waits_for_h2d` | `Recv.ReadinessSound`, `Recv.Publication` |
+| `LateBlockAccountingAfterRetirementIsANoOp` | `kv_cache_manager_with_transfer_control_test.cc:600-628` | `Recv.trace_late_net_account_after_retire` | `Recv.step_done_mono`, `Recv.reachable_safe` |
+
+### 3. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
+
+| Test | File & lines | Lean theorem | Notes |
+|---|---|---|---|
+| `SingleDeviceTransfer`, `MultiDeviceTransfer` | `kv_cache_manager_with_transfer_test.cc:135-380` | `Pipeline.trace_normal`, `Recv.noPoll_metrics_on_success` | E2E D2H → H2H → H2D transfer, `poll_stats()` publication, and duration metric observation (`ReceivePoll.lean` also proves `Recv.trace_poll_skips_metrics` when `pollReady` wins the pre-callback window) |
+| `test_e2e_transfer_polling`, `test_parallel_pull` | `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py` | `Pipeline.trace_normal`, `Pipeline.trace_layers_out_of_order`, `Pipeline.reachable_safe` | 2-layer E2E producer (`register_read`) → consumer (`start_read`) → `poll_stats()` verification that `dst_caches` match `src_refs` across all layers |
+| Single-host disaggregated serving E2E (`examples/single_host_disagg/run_all.sh`) | `tpu-raiden-tpuvm-release-test` Step 4b | `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests`, `Pipeline.system_data_correct`, `Pipeline.system_progress` | Multi-request prefill-to-decode serving stream recycling HBM and host staging buffers across prompts |
+| `test_non_contiguous_blocks`, `test_host_reordering`, `test_large_complex_non_contiguous_and_reorder` | `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py` | Abstracted at layer granularity (`Pipeline` A1) | Session lifecycle and per-layer order are covered by `Pipeline.reachable_safe`; within-layer block-index permutation (`remote_block_ids` → `local_block_ids`) is below `Pipeline`'s one-`Cell`-per-layer abstraction |
 
 ## Outcome at `01ffa3d`
 

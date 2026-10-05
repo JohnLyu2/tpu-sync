@@ -212,4 +212,52 @@ theorem deferred_settle_settles :
       (fun s => s.settled) = some false := by
   decide
 
+/-! ## C++ unit test correspondence (`ReadRemotePullTest` in `raiden_controller_test.cc`) -/
+
+/-- `ReadRemotePullTest.FullSuccessPathUsesAuthoritativeIdsAndSrcEndpoints`
+(`raiden_controller_test.cc:632-659`, plus `HbmModeBuildsStagingPlusDeviceDst`
+`:661-684`, `HostModeBuildsDramDstWithNoStaging` `:686-701`,
+`TransferFailureStillReleasesTheLease` `:815-831`, and
+`RevokedVerdictFailsTheRead` `:833-853`): `AcquireReadLease` succeeds,
+`PullAndRelease` issues and completes the pull, releases the lease, and settles
+the promise before the caller reuses the destination blocks. -/
+theorem trace_full_success (impl : Impl) :
+    ((sys impl).run [.acquireReply true, .pullDone, .callerReuse]).map
+      (fun s => (s.pullIssued, s.pullDone, s.settled, s.reused, violates s)) =
+    some (true, true, true, true, false) := by
+  cases impl <;> decide
+
+/-- `ReadRemotePullTest.AcquireNotFoundFailsFastWithoutTransfer`
+(`raiden_controller_test.cc:795-813`): `AcquireReadLease` fails at the source
+(`ok = false`); the acquire callback settles immediately without issuing a pull,
+and the caller safely reuses its destination blocks. -/
+theorem trace_acquire_fails_fast (impl : Impl) :
+    ((sys impl).run [.acquireReply false, .callerReuse]).map
+      (fun s => (s.pullIssued, s.settled, s.reused, violates s)) =
+    some (false, true, true, false) := by
+  cases impl <;> decide
+
+/-- `ReadRemotePullTest.ControllerTeardownMidReadIsSafe`
+(`raiden_controller_test.cc:855-880`, teardown before the acquire reply):
+the controller is destroyed (`shutdown`) while `AcquireReadLease` is in flight;
+when the reply arrives, the callback sees `lifetime->ctrl == nullptr`, settles
+with `Cancelled` without issuing a pull, and the caller safely reuses its
+destination blocks. -/
+theorem trace_teardown_before_acquire (impl : Impl) :
+    ((sys impl).run [.shutdown, .acquireReply true, .callerReuse]).map
+      (fun s => (s.pullIssued, s.settled, s.reused, violates s)) =
+    some (false, true, true, false) := by
+  cases impl <;> decide
+
+/-- `ReadRemotePullTest.ControllerTeardownMidReadIsSafe`
+(`raiden_controller_test.cc:855-880`, teardown after the pull was issued):
+the controller is destroyed while the pull is in flight; the shared-state
+continuation completes the pull, releases the lease, and settles cleanly. -/
+theorem trace_teardown_during_pull (impl : Impl) :
+    ((sys impl).run [.acquireReply true, .shutdown, .pullDone, .callerReuse]).map
+      (fun s => (s.pullIssued, s.pullDone, s.settled, s.reused, violates s)) =
+    some (true, true, true, true, false) := by
+  cases impl <;> decide
+
 end TpuSyncVerify.Controller.ReadRemote
+

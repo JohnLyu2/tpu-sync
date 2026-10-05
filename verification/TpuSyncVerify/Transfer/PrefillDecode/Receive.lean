@@ -884,7 +884,10 @@ theorem trace_failed_h2d_waits_for_other_layer :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
-/-- `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`:
+/-- `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`
+(`kv_cache_manager_with_transfer_control_test.cc:503-529`) and
+`DemandStagingTest.UnregisteringInFlightReceiverDefersUntilItSettles`
+(`kv_cache_manager_with_transfer_pool_reshard_test.cc:436-476`):
 an open incoming push lease (`pushBegin`) keeps staging pinned across `cancel`
 while rejecting new pushes, and releases staging when `pushEnd` completes. -/
 theorem trace_push_lease_pins_staging_on_cancel :
@@ -908,10 +911,16 @@ theorem trace_push_lease_outlives_h2d :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) := by
   decide
 
-/-- `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds` (and
-`RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline` when no handshake is
-in flight): on `sysLoad 1`, a deadline while the pull handshake is still pending
-keeps staging pinned until `pullReply` ends the handshake op. -/
+/-- `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds`
+(`kv_cache_manager_with_transfer_control_test.cc:394-431`), plus the idle
+push-plan cases `RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline`
+(`:462-477`), `DemandStagingTest.UnregisteringIdleReceiverReleasesPlanAtOnce`
+(`kv_cache_manager_with_transfer_pool_reshard_test.cc:409-434`), and
+`DemandStagingTest.DemandStagedReceiverPlanUnregistersWhenItSettles`
+(`:538-561`): on `sysLoad 1`, a deadline while the pull handshake is still
+pending keeps staging pinned until `pullReply` ends the handshake op; on
+`sysPush 1` with no admitted push, cancelling or timing out settles and releases
+staging at once. -/
 theorem trace_deadline_during_handshake :
     ((sysLoad 1).run [.cancel]).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧

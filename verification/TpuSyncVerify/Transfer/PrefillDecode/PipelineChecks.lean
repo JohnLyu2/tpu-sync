@@ -30,7 +30,9 @@ def consumer : List Ev :=
    .recv (.h2dDone true), .recv .publish]
 
 /-- Producer then consumer: both sides published as done, the data in decode
-HBM. -/
+HBM (`KVCacheManagerTransferTest.SingleDeviceTransfer` / `MultiDeviceTransfer`
+in `kv_cache_manager_with_transfer_test.cc`, and `test_e2e_transfer_polling` /
+`test_parallel_pull` in `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py`). -/
 theorem trace_normal :
     ((sys 1).run (producer ++ consumer)).map
       (fun s => (s.send.published, s.recv.published, s.decodeHbm)) =
@@ -56,8 +58,9 @@ def consumer2 : List Ev :=
    .h2dReady 1, .h2dReady 0, .recv (.h2dDone true), .recv (.h2dDone true), .recv .publish]
 
 /-- Layers complete out of order at every stage; publication still finds the
-right data in the right slots. This is the proposal's out-of-order question
-answered inside the model. -/
+right data in the right slots (`test_e2e_transfer_polling` / `test_parallel_pull`
+with `num_layers = 2` in `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py`).
+This is the proposal's out-of-order question answered inside the model. -/
 theorem trace_layers_out_of_order :
     ((sys 2).run (producer2 ++ consumer2)).map
       (fun s => (s.send.published, s.recv.published, s.decodeHbm)) =

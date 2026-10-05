@@ -39,12 +39,36 @@ this by the comment at `:1134-1138`.
 | `naive_fix_closes_lateIssue`, `naive_fix_counterexample` | the naive fix closes A; its first counterexample is B |
 | `deferred_settle_is_safe` | `.safe`: deferring the deadline's settle while a pull is in flight has no violation anywhere in the state space |
 | `deferred_settle_settles` | the deferred design still settles once the pull resolves |
+| `trace_full_success` | `[acquireReply true, pullDone, callerReuse]` — happy path / completed pull settles and allows safe caller reuse (`violates = false`) across all three `Impl`s |
+| `trace_acquire_fails_fast` | `[acquireReply false, callerReuse]` — acquire RPC failure settles immediately without issuing a pull (`pullIssued = false`, `violates = false`) |
+| `trace_teardown_before_acquire` | `[shutdown, acquireReply true, callerReuse]` — controller torn down before acquire reply settles with `Cancelled` without issuing a pull (`pullIssued = false`, `violates = false`) |
+| `trace_teardown_during_pull` | `[acquireReply true, shutdown, pullDone, callerReuse]` — controller torn down during pull still completes and settles cleanly (`pullDone = true`, `violates = false`) |
 
 Shape A is confirmed on unmodified code by
 `findings/raiden_controller_bughunt_test.cc`; shape B is the case the deadline
 exists for and has no deterministic test. The deferred-settle design's cost
 is that a hung pull holds the caller until it resolves; a complete fix needs
 cancellation, or settle-with-error while the blocks stay quarantined.
+
+## Test suite correspondence (`tpu-raiden` C++ unit tests → Lean)
+
+The `ReadRemote` C++ unit tests in `tpu_sync/core/controller/raiden_controller_test.cc`
+(run by `tools/run_cc_tests.sh` and the `tpu-raiden` Blaze suite
+`//third_party/tpu_raiden/tpu_sync/core/controller:raiden_controller_test`) and
+the bug-hunt repro in `findings/raiden_controller_bughunt_test.cc` map to
+`ReadRemote.lean` as follows:
+
+| C++ test | File & lines | Lean theorem | Notes |
+|---|---|---|---|
+| `ReadRemotePullTest.FullSuccessPathUsesAuthoritativeIdsAndSrcEndpoints` | `raiden_controller_test.cc:632-659` | `trace_full_success` | Acquire succeeds, pull issues & completes, lease released, promise settles before caller reuse |
+| `ReadRemotePullTest.HbmModeBuildsStagingPlusDeviceDst` | `raiden_controller_test.cc:661-684` | `trace_full_success` | Same settle lifecycle; C++ test also checks staging + device destination buffer construction |
+| `ReadRemotePullTest.HostModeBuildsDramDstWithNoStaging` | `raiden_controller_test.cc:686-701` | `trace_full_success` | Same settle lifecycle; C++ test checks DRAM-only destination buffer construction |
+| `ReadRemotePullTest.AcquireNotFoundFailsFastWithoutTransfer` | `raiden_controller_test.cc:795-813` | `trace_acquire_fails_fast` | Source returns `NOT_FOUND` (`acquireReply false`); settles immediately with `pullIssued = false` |
+| `ReadRemotePullTest.TransferFailureStillReleasesTheLease` | `raiden_controller_test.cc:815-831` | `trace_full_success` | Pull future resolves with error (`pullDone`), releases lease, and settles |
+| `ReadRemotePullTest.RevokedVerdictFailsTheRead` | `raiden_controller_test.cc:833-853` | `trace_full_success` | Pull completes (`pullDone`), lease release returns `REVOKED`, settles with `FailedPrecondition` |
+| `ReadRemotePullTest.ControllerTeardownMidReadIsSafe` | `raiden_controller_test.cc:855-880` | `trace_teardown_before_acquire`, `trace_teardown_during_pull` | Controller destroyed either before `acquireReply` (skips pull, settles `Cancelled`) or during `pullInFlight` (finishes pull via shared state and settles) |
+| `BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` | `findings/raiden_controller_bughunt_test.cc:65-114` | `shipping_lateIssue`, `shipping_counterexample`, `naive_fix_closes_lateIssue` | Reproduces shape A (`[.deadline, .callerReuse, .acquireReply true]`) |
+| `ReadRemotePullTest.DeviceIdSizeMismatchRejectedBeforeAcquire`, `EmptyControllerAddressRejectedBeforeAcquire`, `EmptyHashesRejected`, `PeerChurnDoesNotGrowTheStubCacheWithoutBound` | `raiden_controller_test.cc:703-793` | Pre-RPC validation / gRPC stub cache | Synchronous argument checks before `AcquireReadLease` (or channel LRU sizing), prior to the state machine's initial state |
 
 ## Status
 
@@ -54,3 +78,4 @@ cancellation, or settle-with-error while the blocks stay quarantined.
 | Tests in `findings/` | last run on `d16701e`; not re-run on `01ffa3d` |
 | Patches in `findings/` | re-based; `git apply --check` clean at `01ffa3d` |
 | Upstream fix | none known |
+
