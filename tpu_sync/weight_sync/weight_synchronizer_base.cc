@@ -93,7 +93,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip,
           raiden::DetectNumaNodes(layer_buffers)),
-      auto_h2d_(auto_h2d) {
+      auto_h2d_(auto_h2d),
+      push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max(parallelism_, 4))) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
     for (size_t i = 0; i < num_layers_; ++i) {
@@ -229,8 +231,6 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
         std::max(parallelism_, 4));
   }
-  push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-      std::max(parallelism_, 4));
 
   tiled_scratchpads_.reserve(num_shards_);
   for (size_t i = 0; i < num_shards_; ++i) {
@@ -270,7 +270,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           num_layers, num_shards,
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
           parallelism, bind_ip),
-      auto_h2d_(auto_h2d) {
+      auto_h2d_(auto_h2d),
+      push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max(parallelism_, 4))) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
     for (size_t i = 0; i < num_layers_; ++i) {
@@ -326,8 +328,6 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
         std::max(parallelism_, 4));
   }
-  push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-      std::max(parallelism_, 4));
 
   tiled_scratchpads_.reserve(num_shards_);
   for (size_t i = 0; i < num_shards_; ++i) {
@@ -1190,14 +1190,6 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
           }
         }
       });
-
-  {
-    absl::MutexLock lock(d2h_mu_);
-    if (!push_pool_) {
-      push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-          std::max(parallelism_, 4));
-    }
-  }
 
   auto h2h_start = absl::Now();
   {

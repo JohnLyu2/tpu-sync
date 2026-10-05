@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -381,7 +382,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   };
 
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
-  std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
+  absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
   std::unique_ptr<HostMemoryAllocator> host_allocator_;
 
   // Shared reusable scratchpad per shard (one per local device/chip) to avoid
