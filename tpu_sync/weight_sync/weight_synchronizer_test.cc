@@ -41,6 +41,7 @@
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -1522,6 +1523,89 @@ TEST_F(WeightSynchronizerTest, TilingActiveByDefault) {
     // Verify that the data IS permuted on device (tiling occurred)
     EXPECT_NE(dst_host_raw[4], 4.0f);
     EXPECT_EQ(dst_host_raw[16], 4.0f);
+  }
+}
+
+TEST_F(WeightSynchronizerTest, H2dTilesAllShardsAndLayersConcurrently) {
+  constexpr int kNumShards = 4;
+  constexpr int kNumLayers = 3;
+  constexpr int kRows = 8;
+  constexpr int kCols = 8;
+  constexpr int kElems = kRows * kCols;
+  xla::CpuClientOptions options;
+  options.cpu_device_count = kNumShards;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
+                          xla::GetXlaPjrtCpuClient(options));
+  ASSERT_GE(client->addressable_devices().size(), kNumShards);
+
+  const xla::Layout layout =
+      xla::LayoutUtil::MakeLayout({1, 0}, {xla::Tile({4, 4})});
+  std::vector<float> placeholder(kElems, 0.0f);
+  std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>> pjrt_buffers(
+      kNumLayers);
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers(
+      kNumLayers);
+  for (int l = 0; l < kNumLayers; ++l) {
+    for (int s = 0; s < kNumShards; ++s) {
+      TF_ASSERT_OK_AND_ASSIGN(
+          xla::PjRtMemorySpace * memory_space,
+          client->addressable_devices()[s]->default_memory_space());
+      TF_ASSERT_OK_AND_ASSIGN(
+          std::unique_ptr<xla::PjRtBuffer> pjrt_buffer,
+          client->BufferFromHostBuffer(
+              placeholder.data(), xla::PrimitiveType::F32, {kRows, kCols},
+              /*byte_strides=*/std::nullopt,
+              xla::PjRtClient::HostBufferSemantics::
+                  kImmutableUntilTransferCompletes,
+              /*on_done_with_host_buffer=*/nullptr, memory_space,
+              /*device_layout=*/nullptr));
+      TF_ASSERT_OK_AND_ASSIGN(
+          raiden::RaidenBufferHandle handle,
+          raiden::RaidenBufferHandle::Acquire(pjrt_buffer.get()));
+      handle.shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+          xla::PrimitiveType::F32, {kRows, kCols}, layout.minor_to_major(),
+          layout.tiles());
+      layer_buffers[l].push_back(handle);
+      pjrt_buffers[l].push_back(std::move(pjrt_buffer));
+    }
+  }
+  auto ws =
+      std::make_unique<WeightSynchronizerBase>(layer_buffers, /*local_port=*/0);
+
+  auto value_at = [](int l, int s, int i) {
+    return static_cast<float>(1000 * l + 100 * s + i);
+  };
+  for (int l = 0; l < kNumLayers; ++l) {
+    for (int s = 0; s < kNumShards; ++s) {
+      float* host = reinterpret_cast<float*>(ws->GetHostPointer(l, s));
+      ASSERT_NE(host, nullptr);
+      for (int i = 0; i < kElems; ++i) host[i] = value_at(l, s, i);
+    }
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_future, ws->H2d());
+  ABSL_ASSERT_OK(h2d_future.Await());
+
+  for (int l = 0; l < kNumLayers; ++l) {
+    for (int s = 0; s < kNumShards; ++s) {
+      TF_ASSERT_OK_AND_ASSIGN(
+          raiden::RaidenBufferHandle handle,
+          raiden::RaidenBufferHandle::Acquire(pjrt_buffers[l][s].get()));
+      std::vector<float> device(kElems, -1.0f);
+      ABSL_ASSERT_OK(
+          handle.CopyRawDeviceToHost(device.data(), 0, kElems * sizeof(float))
+              .Await());
+      for (int r = 0; r < kRows; ++r) {
+        for (int c = 0; c < kCols; ++c) {
+          // Row-major 4x4 tiles: tiles are laid out row-major, as are the
+          // elements within each tile.
+          const int physical =
+              ((r / 4) * (kCols / 4) + c / 4) * 16 + (r % 4) * 4 + c % 4;
+          EXPECT_EQ(device[physical], value_at(l, s, r * kCols + c))
+              << "layer " << l << " shard " << s << " r " << r << " c " << c;
+        }
+      }
+    }
   }
 }
 

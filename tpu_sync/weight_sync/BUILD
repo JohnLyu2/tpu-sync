@@ -120,6 +120,7 @@ cc_test(
         "@xla//xla:shape_util",
         "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )
 

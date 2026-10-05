@@ -466,6 +466,94 @@ void WeightSynchronizerBase::UpdateAllocatedOccupancyMetric(size_t delta) {
       static_cast<double>(total));
 }
 
+std::vector<bool> WeightSynchronizerBase::GetActiveSkipTiling(uint64_t uuid) {
+  absl::MutexLock lock(skip_tiling_mu_);
+  if (uuid != 0) {
+    auto it = uuid_to_skip_tiling_.find(uuid);
+    if (it != uuid_to_skip_tiling_.end() && !it->second.empty()) {
+      return it->second;
+    }
+  }
+  if (!latest_skip_tiling_.empty()) {
+    return latest_skip_tiling_;
+  }
+  return std::vector<bool>(num_layers_, false);
+}
+
+absl::StatusOr<xla::Future<raiden::BufferHolder>>
+WeightSynchronizerBase::H2dShard(size_t layer_idx, size_t shard_idx,
+                                 const std::vector<bool>& active_skip) {
+  auto& shard_info = layers_[layer_idx].shards[shard_idx];
+  const auto& shard_hold = buffer_holds_[layer_idx][shard_idx];
+
+  const xla::Layout* xla_layout = nullptr;
+  if (shard_hold.shape.has_layout()) {
+    xla_layout = &shard_hold.shape.layout();
+  }
+  bool is_tiled = xla_layout && !xla_layout->tiles().empty();
+  bool skip_flag = layer_idx < active_skip.size() && active_skip[layer_idx];
+  if (skip_flag) {
+    is_tiled = false;
+  }
+  VLOG(1) << "[WeightSynchronizerBase] H2dLayer " << layer_idx << " shard "
+          << shard_idx << " (layer: "
+          << (layer_idx < layer_names_.size() ? layer_names_[layer_idx]
+                                              : "unknown")
+          << ", is_tiled=" << is_tiled << ", skip_flag=" << skip_flag
+          << ", shape=" << shard_hold.shape.ToString()
+          << ", size=" << shard_info.device_size << " bytes)";
+
+  std::vector<xla::Future<>> shard_futures;
+  if (is_tiled) {
+    int64_t itemsize = xla::ShapeUtil::ByteSizeOfPrimitiveType(
+        shard_hold.shape.element_type());
+    size_t physical_bytes =
+        tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
+        itemsize;
+
+    if (shard_idx >= tiled_scratchpads_.size() ||
+        !tiled_scratchpads_[shard_idx]) {
+      return absl::InternalError("Shard index out of range for scratchpad");
+    }
+    auto& sp = *tiled_scratchpads_[shard_idx];
+    absl::MutexLock lock(sp.mu);
+    TF_ASSIGN_OR_RETURN(
+        uint8_t* tiled_buffer_ptr,
+        AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
+    if (tiled_buffer_ptr == nullptr) {
+      return absl::InternalError(
+          "Tiled buffer pointer is null for tiled shape");
+    }
+    auto tile_start = absl::Now();
+    auto status = tpu_raiden::weight_sync::TileBuffer(
+        shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout,
+        /*pool=*/nullptr);
+    if (!status.ok()) {
+      return status;
+    }
+    double tile_time_ms = absl::ToDoubleMilliseconds(absl::Now() - tile_start);
+    {
+      absl::MutexLock metrics_lock(metrics_mu_);
+      metrics_.last_tiling_time_ms =
+          std::max(metrics_.last_tiling_time_ms, tile_time_ms);
+      metrics_.total_tiling_time_ms += tile_time_ms;
+      metrics_.last_tiled_bytes += physical_bytes;
+      metrics_.total_tiled_bytes += physical_bytes;
+    }
+
+    xla::Future<> future =
+        shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, physical_bytes);
+    sp.in_flight_future = future;
+    shard_futures.push_back(future);
+  } else {
+    xla::Future<> future = shard_hold.CopyRawHostToDevice(
+        shard_info.host_ptr, 0, shard_info.device_size);
+    shard_futures.push_back(std::move(future));
+  }
+  return raiden::CreateBufferFuture(std::move(shard_futures), shard_hold.c_hold,
+                                    shard_hold.common_hold);
+}
+
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
     size_t layer_idx, uint64_t uuid) {
   if (weights_unbound_) {
@@ -476,101 +564,25 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
-  std::vector<bool> active_skip;
-  {
-    absl::MutexLock lock(skip_tiling_mu_);
-    if (uuid != 0) {
-      auto it = uuid_to_skip_tiling_.find(uuid);
-      if (it != uuid_to_skip_tiling_.end()) {
-        active_skip = it->second;
-      }
-    }
-    if (active_skip.empty()) {
-      if (!latest_skip_tiling_.empty()) {
-        active_skip = latest_skip_tiling_;
-      } else {
-        active_skip = std::vector<bool>(num_layers_, false);
-      }
-    }
-  }
-
-  auto& layer_info = layers_[layer_idx];
-  const auto& layer_holds = buffer_holds_[layer_idx];
+  const std::vector<bool> active_skip = GetActiveSkipTiling(uuid);
   std::vector<xla::Future<raiden::BufferHolder>> shard_futures_to_join;
-
+  shard_futures_to_join.reserve(num_shards_);
   for (size_t i = 0; i < num_shards_; ++i) {
-    auto& shard_info = layer_info.shards[i];
-    const auto& shard_hold = layer_holds[i];
-
-    const xla::Layout* xla_layout = nullptr;
-    if (shard_hold.shape.has_layout()) {
-      xla_layout = &shard_hold.shape.layout();
-    }
-    bool is_tiled = xla_layout && !xla_layout->tiles().empty();
-    bool skip_flag = layer_idx < active_skip.size() && active_skip[layer_idx];
-    if (skip_flag) {
-      is_tiled = false;
-    }
-    VLOG(1) << "[WeightSynchronizerBase] H2dLayer " << layer_idx << " shard "
-            << i << " (layer: "
-            << (layer_idx < layer_names_.size() ? layer_names_[layer_idx]
-                                                : "unknown")
-            << ", is_tiled=" << is_tiled << ", skip_flag=" << skip_flag
-            << ", shape=" << shard_hold.shape.ToString()
-            << ", size=" << shard_info.device_size << " bytes)";
-
-    std::vector<xla::Future<>> shard_futures;
-    if (is_tiled) {
-      int64_t itemsize = xla::ShapeUtil::ByteSizeOfPrimitiveType(
-          shard_hold.shape.element_type());
-      size_t physical_bytes =
-          tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
-          itemsize;
-
-      if (i >= tiled_scratchpads_.size() || !tiled_scratchpads_[i]) {
-        return absl::InternalError("Shard index out of range for scratchpad");
-      }
-      auto& sp = *tiled_scratchpads_[i];
-      absl::MutexLock lock(sp.mu);
-      TF_ASSIGN_OR_RETURN(
-          uint8_t* tiled_buffer_ptr,
-          AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
-      if (tiled_buffer_ptr == nullptr) {
-        return absl::InternalError(
-            "Tiled buffer pointer is null for tiled shape");
-      }
-      auto tile_start = absl::Now();
-      auto status = tpu_raiden::weight_sync::TileBuffer(
-          shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout,
-          /*pool=*/nullptr);
-      if (!status.ok()) {
-        return status;
-      }
-      double tile_time_ms =
-          absl::ToDoubleMilliseconds(absl::Now() - tile_start);
-      {
-        absl::MutexLock metrics_lock(metrics_mu_);
-        metrics_.last_tiling_time_ms =
-            std::max(metrics_.last_tiling_time_ms, tile_time_ms);
-        metrics_.total_tiling_time_ms += tile_time_ms;
-        metrics_.last_tiled_bytes += physical_bytes;
-        metrics_.total_tiled_bytes += physical_bytes;
-      }
-
-      xla::Future<> future =
-          shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, physical_bytes);
-      sp.in_flight_future = future;
-      shard_futures.push_back(future);
-    } else {
-      xla::Future<> future = shard_hold.CopyRawHostToDevice(
-          shard_info.host_ptr, 0, shard_info.device_size);
-      shard_futures.push_back(std::move(future));
-    }
-    shard_futures_to_join.push_back(raiden::CreateBufferFuture(
-        std::move(shard_futures), shard_hold.c_hold, shard_hold.common_hold));
+    TF_ASSIGN_OR_RETURN(xla::Future<raiden::BufferHolder> shard_future,
+                        H2dShard(layer_idx, i, active_skip));
+    shard_futures_to_join.push_back(std::move(shard_future));
   }
   return raiden::PjRtCopyFuture::FromFuture(
       xla::JoinFutures(absl::MakeSpan(shard_futures_to_join)));
+}
+
+tpu_raiden::NumaThreadPool* WeightSynchronizerBase::GetH2dShardPool() {
+  absl::MutexLock lock(h2d_shard_pool_mu_);
+  if (h2d_shard_pool_ == nullptr) {
+    h2d_shard_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
+        std::max<size_t>(num_shards_, 1));
+  }
+  return h2d_shard_pool_.get();
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
@@ -592,16 +604,56 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
     metrics_.last_tiling_time_ms = 0.0;
     metrics_.last_tiled_bytes = 0;
   }
-  std::vector<raiden::PjRtCopyFuture> layer_futures;
-  layer_futures.reserve(num_layers_);
-  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                        H2dLayer(layer_idx, uuid));
-    layer_futures.push_back(std::move(layer_future));
+  const std::vector<bool> active_skip = GetActiveSkipTiling(uuid);
+  using ShardFutures = std::vector<xla::Future<raiden::BufferHolder>>;
+  // Each shard has its own device and tiling scratchpad, so shards are tiled
+  // and copied concurrently. Layers of a shard stay in order because they
+  // share the scratchpad.
+  auto h2d_shard_layers =
+      [this, &active_skip](size_t shard_idx) -> absl::StatusOr<ShardFutures> {
+    ShardFutures futures;
+    futures.reserve(num_layers_);
+    for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+      TF_ASSIGN_OR_RETURN(xla::Future<raiden::BufferHolder> future,
+                          H2dShard(layer_idx, shard_idx, active_skip));
+      futures.push_back(std::move(future));
+    }
+    return futures;
+  };
+  std::vector<std::future<absl::StatusOr<ShardFutures>>> shard_tasks;
+  if (num_shards_ > 1) {
+    tpu_raiden::NumaThreadPool* pool = GetH2dShardPool();
+    shard_tasks.reserve(num_shards_ - 1);
+    for (size_t shard_idx = 1; shard_idx < num_shards_; ++shard_idx) {
+      shard_tasks.push_back(
+          pool->Schedule(assigned_numa_node_, [&h2d_shard_layers, shard_idx]() {
+            return h2d_shard_layers(shard_idx);
+          }));
+    }
   }
-  VLOG(1) << "Done with scheduling H2d across " << num_layers_
-          << " layers (uuid=" << uuid << ").";
-  raiden::PjRtCopyFuture joined = raiden::JoinPjRtCopyFutures(layer_futures);
+  std::vector<absl::StatusOr<ShardFutures>> shard_results;
+  shard_results.reserve(num_shards_);
+  if (num_shards_ > 0) {
+    shard_results.push_back(h2d_shard_layers(0));
+  }
+  // Wait for every task before returning: they reference |active_skip| and
+  // |h2d_shard_layers|.
+  for (auto& task : shard_tasks) {
+    shard_results.push_back(task.get());
+  }
+  ShardFutures all_futures;
+  all_futures.reserve(num_layers_ * num_shards_);
+  for (auto& result : shard_results) {
+    TF_RETURN_IF_ERROR(result.status());
+    for (auto& future : *result) {
+      all_futures.push_back(std::move(future));
+    }
+  }
+  VLOG(1) << "Done with scheduling H2d across " << num_layers_ << " layers x "
+          << num_shards_ << " shards (uuid=" << uuid << ") in "
+          << absl::ToDoubleMilliseconds(absl::Now() - start_time) << " ms.";
+  raiden::PjRtCopyFuture joined = raiden::PjRtCopyFuture::FromFuture(
+      xla::JoinFutures(absl::MakeSpan(all_futures)));
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
     double tiling_time_ms = 0.0;

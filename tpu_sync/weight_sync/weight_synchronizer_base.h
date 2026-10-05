@@ -401,6 +401,27 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       ShardScratchpad& sp, size_t required_bytes,
       const xla::PjRtDevice* device);
 
+  // Returns the per-layer skip-tiling mask for |uuid|, falling back to the
+  // latest mask set via SetSkipTiling() and then to all-false.
+  std::vector<bool> GetActiveSkipTiling(uint64_t uuid);
+
+  // Tiles (if needed) shard |shard_idx| of layer |layer_idx| into the shard's
+  // scratchpad and starts its host-to-device copy. |active_skip| is the
+  // per-layer skip-tiling mask. Tiling runs on the calling thread before this
+  // returns; the copy is asynchronous. Safe to call concurrently for distinct
+  // shards; calls for the same shard serialize on its scratchpad.
+  absl::StatusOr<xla::Future<raiden::BufferHolder>> H2dShard(
+      size_t layer_idx, size_t shard_idx, const std::vector<bool>& active_skip);
+
+  // Returns the pool that runs H2d()'s per-shard tasks, creating it on first
+  // use. It is separate from |h2d_pool_| so that H2d() never waits on tasks
+  // queued behind its own caller.
+  tpu_raiden::NumaThreadPool* GetH2dShardPool();
+
+  absl::Mutex h2d_shard_pool_mu_;
+  std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_shard_pool_
+      ABSL_GUARDED_BY(h2d_shard_pool_mu_);
+
   mutable absl::Mutex skip_tiling_mu_;
   absl::flat_hash_map<uint64_t, std::vector<bool>> uuid_to_skip_tiling_
       ABSL_GUARDED_BY(skip_tiling_mu_);
