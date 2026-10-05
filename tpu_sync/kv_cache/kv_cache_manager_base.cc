@@ -2405,11 +2405,12 @@ KVCacheManagerBase::PoolHostBaseAddrs(uint64_t uuid, size_t pool_idx) const {
 std::vector<::tpu_sync::rpc::PoolHostAddrsProto>
 KVCacheManagerBase::LayerHostAddrs(uint64_t uuid) const {
   if (explicit_pools_) return {};
+  absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of;
   {
     absl::MutexLock l(plans_mu_);
     auto it = active_plans_.find(uuid);
-    if (it != active_plans_.end() && !it->second->host_block_of.empty()) {
-      return {};
+    if (it != active_plans_.end()) {
+      host_block_of = it->second->host_block_of;
     }
   }
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
@@ -2422,6 +2423,12 @@ KVCacheManagerBase::LayerHostAddrs(uint64_t uuid) const {
             ? PoolHostBaseAddrs(uuid, l)
             : absl::NotFoundError("layer has no pool");
     if (!addrs.ok()) return {};
+    if (!host_block_of.empty() && !addrs->host_slot_by_block().empty()) {
+      return {};
+    }
+    for (const auto& [block_id, host_block] : host_block_of) {
+      (*addrs->mutable_host_slot_by_block())[block_id] = host_block;
+    }
     layer_host_addrs.push_back(*std::move(addrs));
   }
   return layer_host_addrs;
