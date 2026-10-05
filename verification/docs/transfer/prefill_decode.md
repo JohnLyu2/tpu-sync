@@ -106,14 +106,21 @@ Traces (all `decide`):
 | `Pipeline.trace_slow_consumer` | producer published, reclaimed and reseated before the consumer lands anything; data still right |
 | `Pipeline.trace_no_dispatch_before_land` | `h2dBegin l` needs layer `l` to have landed |
 | `Pipeline.trace_aborted_issue_cannot_ready` | `h2dReady l` needs layer `l`'s own `h2dIssue l` to have issued the copy (cannot borrow another layer's `issued` count) |
+| `PeerIsolation.trace_tcp_sick_peer_blocks_healthy` | on `tcpBlocking`, `poolSize` handshakes to `Peer.sick` hold all workers (`freeWorkers = 0`) and block a `Peer.healthy` handshake until a `.sick` handshake times out (Issue #888) |
+| `PeerIsolation.trace_grpc_sick_peer_does_not_delay_healthy`, `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | on `grpcAsync`, waiting handshakes to `Peer.sick` hold no worker (`freeWorkers = poolSize`), so `Peer.healthy` transfers complete and publish `done_recving` while `Peer.sick` reads stay stalled (`GrpcSickPeerDoesNotDelayHandshakeToHealthyPeer`, `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains`) |
+| `PeerIsolation.trace_consumer_gives_up_and_drains` | stalled reads to `Peer.sick` give up on handshake timeout (`pullReply false`), publish failure (`published = some false`), and return all staging slots (`ConsumerGivesUpOnProducerThatNeverAnswers`) |
+| `PeerIsolation.trace_sick_peer_starves_staging_slots`, `PeerIsolation.trace_per_peer_quota_admits_healthy` | under `unboundedPerPeer`, `numSlots` wedged reads to `Peer.sick` exhaust `freeSlots = 0` (even after `.cancel`) and reject `Peer.healthy` (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`); under `perPeerQuota 1`, the second `.sick` read is refused and `Peer.healthy` is admitted and completes |
 
 Bounded searches (`#guard … = .outOfFuel`): `Recv` from both initial states
 (fuel 10, n = 2), `Send` (fuel 12, n = 2), `Pipeline` from `init 1` and from
 `afterProducer` (fuel 10), from `afterProducer2` — the two-layer producer that
 finished out of order — over the initial consumer landing and dispatch steps
-(fuel 5, n = 2), and from `afterDispatch2` — after out-of-order landing and
+(fuel 5, n = 2), from `afterDispatch2` — after out-of-order landing and
 dispatch of both layers — over all H2D completion, callback, publication,
-cancellation and staging-reuse interleavings (fuel 7, n = 2).
+cancellation and staging-reuse interleavings (fuel 7, n = 2), and
+`PeerIsolation` under `perPeerQuota 1` confirming the first `Peer.healthy` read
+is never starved across any interleaving (fuel 5, whereas `unboundedPerPeer`
+yields a `.counterexample` at fuel 4).
 
 Mutants (each yields a `.counterexample`):
 
@@ -164,7 +171,17 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | `NetworkCompletionWaitsForH2d` | `kv_cache_manager_with_transfer_control_test.cc:567-598` | `Recv.trace_net_completion_waits_for_h2d` | `Recv.ReadinessSound`, `Recv.Publication` |
 | `LateBlockAccountingAfterRetirementIsANoOp` | `kv_cache_manager_with_transfer_control_test.cc:600-628` | `Recv.trace_late_net_account_after_retire` | `Recv.step_done_mono`, `Recv.reachable_safe` |
 
-### 3. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
+### 3. Multi-peer fault isolation & staging-slot starvation tests (`ControlHandshakeTest` → `PeerIsolation.lean`)
+
+| Test | File & lines | Lean trace theorem | General theorem |
+|---|---|---|---|
+| `ConsumerGivesUpOnProducerThatNeverAnswers` | `kv_cache_manager_with_transfer_control_test.cc:684-716` | `PeerIsolation.trace_consumer_gives_up_and_drains` | `PeerIsolation.reachable_inv` (`slots` conservation), `PeerIsolation.reachable_sessions_safe` |
+| Issue #888 TCP blocking handshake pool | `kv_cache_manager_with_transfer_control_test.cc:841-846` | `PeerIsolation.trace_tcp_sick_peer_blocks_healthy` | `PeerIsolation.tcp_healthy_blocked_when_pool_full` |
+| `GrpcSickPeerDoesNotDelayHandshakeToHealthyPeer` | `kv_cache_manager_with_transfer_control_test.cc:924-964` | `PeerIsolation.trace_grpc_sick_peer_does_not_delay_healthy` | `PeerIsolation.grpc_freeWorkers_eq_poolSize`, `PeerIsolation.grpc_healthy_can_complete` |
+| `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains` | `kv_cache_manager_with_transfer_control_test.cc:971-1028` | `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | `PeerIsolation.grpc_freeWorkers_eq_poolSize`, `PeerIsolation.grpc_healthy_can_complete` |
+| `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` | `kv_cache_manager_with_transfer_control_test.cc:1030-1089` | `PeerIsolation.trace_sick_peer_starves_staging_slots` (`unboundedPerPeer` counterexample), `PeerIsolation.trace_per_peer_quota_admits_healthy` (`perPeerQuota` fix) | `PeerIsolation.reachable_sick_staging_le_quota`, `PeerIsolation.reachable_quota_admits_healthy` |
+
+### 4. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
 
 | Test | File & lines | Lean theorem | Notes |
 |---|---|---|---|
