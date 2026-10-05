@@ -110,6 +110,9 @@ Traces (all `decide`):
 | `PeerIsolation.trace_grpc_sick_peer_does_not_delay_healthy`, `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | on `grpcAsync`, waiting handshakes to `Peer.sick` hold no worker (`freeWorkers = poolSize`), so `Peer.healthy` transfers complete and publish `done_recving` while `Peer.sick` reads stay stalled (`GrpcSickPeerDoesNotDelayHandshakeToHealthyPeer`, `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains`) |
 | `PeerIsolation.trace_consumer_gives_up_and_drains` | stalled reads to `Peer.sick` give up on handshake timeout (`pullReply false`), publish failure (`published = some false`), and return all staging slots (`ConsumerGivesUpOnProducerThatNeverAnswers`) |
 | `PeerIsolation.trace_sick_peer_starves_staging_slots`, `PeerIsolation.trace_per_peer_quota_admits_healthy` | under `unboundedPerPeer`, `numSlots` wedged reads to `Peer.sick` exhaust `freeSlots = 0` (even after `.cancel`) and reject `Peer.healthy` (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`); under `perPeerQuota 1`, the second `.sick` read is refused and `Peer.healthy` is admitted and completes |
+| `UuidTable.trace_duplicate_uuid_rejected_until_drained` | an expired receive session (`draining = true, done = false`) with an in-flight H2D copy rejects `.registerRecv` on the same UUID without leaking staging slots; once the copy finishes (`done = true`), `.registerRecv` retires the settled incumbent inline and seats the replacement (`DuplicateUuidIsRejectedUntilExpiredReceiveDrains`) |
+| `UuidTable.trace_duplicate_receive_different_req_id`, `UuidTable.trace_repeated_receive_same_req_id_idempotent` | on `.startRead`, a colliding UUID with a different `reqId` reports `failedRecving = [reqId]` without replacing the incumbent or allocating staging (`DuplicateReceiveDoesNotReplaceOrLeakFirstRead`), whereas a repeated announcement with the same `reqId` is an idempotent no-op (`RepeatedReceiveAnnouncementIsIdempotent`) |
+| `UuidTable.trace_duplicate_send_cannot_replace_live_offer`, `UuidTable.trace_start_read_retires_settled_incumbent_inline` | `.notifyForRead` rejects a duplicate UUID while a live send offer is active (`!done`) and permits reuse after `sweepSend` (`DuplicateRegistrationCannotReplaceLiveOffer`); `.startRead` retires a settled (`done = true`) incumbent inline before seating the new session |
 
 Bounded searches (`#guard … = .outOfFuel`): `Recv` from both initial states
 (fuel 10, n = 2), `Send` (fuel 12, n = 2), `Pipeline` from `init 1` and from
@@ -117,10 +120,12 @@ Bounded searches (`#guard … = .outOfFuel`): `Recv` from both initial states
 finished out of order — over the initial consumer landing and dispatch steps
 (fuel 5, n = 2), from `afterDispatch2` — after out-of-order landing and
 dispatch of both layers — over all H2D completion, callback, publication,
-cancellation and staging-reuse interleavings (fuel 7, n = 2), and
-`PeerIsolation` under `perPeerQuota 1` confirming the first `Peer.healthy` read
-is never starved across any interleaving (fuel 5, whereas `unboundedPerPeer`
-yields a `.counterexample` at fuel 4).
+cancellation and staging-reuse interleavings (fuel 7, n = 2), `PeerIsolation`
+under `perPeerQuota 1` confirming the first `Peer.healthy` read is never
+starved across any interleaving (fuel 5, whereas `unboundedPerPeer` yields a
+`.counterexample` at fuel 4), and `UuidTable` confirming `violatesSlotConservation`
+is unreachable across all UUID registration, drain, and sweep interleavings
+(fuel 5).
 
 Mutants (each yields a `.counterexample`):
 
@@ -134,6 +139,7 @@ Mutants (each yields a `.counterexample`):
 | `Pipeline.dispatchEarly` | `h2dBegin l` after layer `l` landed | publication correctness (junk in HBM) |
 | `Pipeline.h2dReadyByRank` | the H2D copy for layer `l` reads slot `l` (it reads the slot the *counter* points at instead — the shape of a counter-indexed model) | publication correctness: with layer 1 landing first, HBM ends `[kv 1, junk]` |
 | `Pipeline.reseatAtFinish` | staging released at settle, not at `Finish` | publication correctness via the send's staging |
+| `UuidTable.stepOverwriteDraining` | `EmplaceRecvSessionLocked` waits for `done()` rather than overwriting an expired (`draining = true, done = false`) incumbent | staging slot conservation (`freeSlots + activeStaging = numSlots`) |
 
 ## Test suite correspondence (C++ unit tests & `tpu-raiden` skill tests → Lean)
 
@@ -181,7 +187,16 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains` | `kv_cache_manager_with_transfer_control_test.cc:971-1028` | `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | `PeerIsolation.grpc_freeWorkers_eq_poolSize`, `PeerIsolation.grpc_healthy_can_complete` |
 | `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` | `kv_cache_manager_with_transfer_control_test.cc:1030-1089` | `PeerIsolation.trace_sick_peer_starves_staging_slots` (`unboundedPerPeer` counterexample), `PeerIsolation.trace_per_peer_quota_admits_healthy` (`perPeerQuota` fix) | `PeerIsolation.reachable_sick_staging_le_quota`, `PeerIsolation.reachable_quota_admits_healthy` |
 
-### 4. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
+### 4. Manager UUID registration table & drain-before-reuse tests (`RecvDrainTest`, `SendLifecycleTest`, `ControlHandshakeTest` → `UuidTable.lean`)
+
+| Test | File & lines | Lean trace theorem | General theorem |
+|---|---|---|---|
+| `DuplicateUuidIsRejectedUntilExpiredReceiveDrains` | `kv_cache_manager_with_transfer_send_drain_test.cc:588-637` | `UuidTable.trace_duplicate_uuid_rejected_until_drained` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` (`slots` conservation) |
+| `DuplicateReceiveDoesNotReplaceOrLeakFirstRead` | `kv_cache_manager_with_transfer_control_test.cc:718-752` | `UuidTable.trace_duplicate_receive_different_req_id` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` |
+| `RepeatedReceiveAnnouncementIsIdempotent` | `kv_cache_manager_with_transfer_control_test.cc:754-790` | `UuidTable.trace_repeated_receive_same_req_id_idempotent` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` |
+| `DuplicateRegistrationCannotReplaceLiveOffer` | `kv_cache_manager_with_transfer_send_drain_test.cc:353-370` | `UuidTable.trace_duplicate_send_cannot_replace_live_offer` | `UuidTable.active_send_preserved`, `UuidTable.reachable_send_safe` |
+
+### 5. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
 
 | Test | File & lines | Lean theorem | Notes |
 |---|---|---|---|

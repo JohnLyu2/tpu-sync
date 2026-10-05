@@ -8,6 +8,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Send
 import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 import TpuSyncVerify.Transfer.PrefillDecode.MultiRequest
 import TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation
+import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
 import TpuSyncVerify.Controller.ReadRemote
 
