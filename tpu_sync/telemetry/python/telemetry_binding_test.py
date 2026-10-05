@@ -225,7 +225,7 @@ class TelemetryBindingTest(absltest.TestCase):
     self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
 
     # Verify weight sync metrics
-    self.assertEqual(len(metrics), 24)
+    self.assertEqual(len(metrics), 28)
     self.assertEqual(
         metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
     )
@@ -264,6 +264,16 @@ class TelemetryBindingTest(absltest.TestCase):
     self.assertEqual(
         metrics_by_name["weight_sync_buffer_allocated_bytes"].label_names, []
     )
+
+    # Verify peregrine metrics
+    self.assertEqual(
+        metrics_by_name["peregrine_e2e_latency_us"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["peregrine_request_size_bytes"].label_names, []
+    )
+    self.assertEqual(metrics_by_name["peregrine_bytes_total"].label_names, [])
+    self.assertEqual(metrics_by_name["peregrine_errors_total"].label_names, [])
 
   def test_increment_counter_and_observe_in_buffered_backend(self):
     telemetry_ext.configure_telemetry(["buffered"])
