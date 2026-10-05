@@ -959,6 +959,48 @@ theorem trace_zero_layers :
     ((sys 0).run [.start, .publish]).map (fun s => s.published) = some (some true) := by
   decide
 
+/-- `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone`:
+two layers; layer 0's H2H push and layer 1's D2H copy are both in flight when
+`Finish(DeadlineExceeded)` fires; layer 0's H2H completes first (`done` stays
+`false`, `hasStaging` stays `true`); when layer 1's D2H completes, `wake` sees
+`draining`, drops layer 1's H2H (`h2hIssued = 1`), and settles (`done = true`,
+`hasStaging = false`), after which `.start` is rejected. -/
+theorem trace_drain_h2h_and_d2h :
+    let pre := [.start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
+                .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
+                .cancel, .h2hDone true]
+    ((sys 2).run pre).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    ((sys 2).run (pre ++ [.d2hReady, .d2hEnd, .wake true, .publish])).map
+      (fun s => (s.life.done, s.life.hasStaging, s.h2hIssued, s.published)) =
+      some (true, false, 1, some false) ∧
+    (sys 2).run (pre ++ [.d2hReady, .d2hEnd, .wake true, .start]) = none := by
+  decide
+
+/-- `SendDrainTest.FailedLayerWaitsForTheOtherLayersCopies`: two layers; layer 0's
+D2H copy fails while layer 1's D2H copy is still running; the failure and
+staging slot are held back until layer 1's copy finishes. -/
+theorem trace_failed_d2h_waits_for_other_layer :
+    let pre := [.start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
+                .d2hReady, .wake false, .d2hEnd]
+    ((sys 2).run pre).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    (sys 2).run (pre ++ [.publish]) = none ∧
+    ((sys 2).run (pre ++ [.d2hReady, .d2hEnd, .publish])).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
+  decide
+
+/-- `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure`: dual of
+`trace_cancel_after_ok_finish`. If `Finish(error)` runs while the last push is
+in flight, a subsequent OK push completion (`h2hDone true` calling `finish true`)
+cannot override the earlier failure. -/
+theorem trace_ok_after_cancel_keeps_failure :
+    ((sys 1).run
+      [.start, .d2hBegin, .d2hIssue true, .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
+       .cancel, .h2hDone true, .publish]).map
+      (fun s => (s.life.done, s.life.statusOk, s.published)) = some (true, false, some false) := by
+  decide
+
 def events : List Ev :=
   [.start, .d2hBegin, .d2hIssue true, .d2hIssue false, .d2hReady, .d2hEnd,
    .wake true, .wake false, .h2hIssue, .sendNext, .h2hDone true, .h2hDone false,

@@ -846,6 +846,82 @@ theorem trace_no_push_after_finish :
     (sysPush 1).run [.cancel, .pushBegin] = none := by
   decide
 
+/-- `RecvLifecycleTest.NetworkCompletionWaitsForH2d`: `OnBlocksReceived`
+(`netAccount`) sets `network_completed_` while the H2D copy is still running on
+the device; neither the poll nor publication can complete the session until the
+H2D copy finishes. -/
+theorem trace_net_completion_waits_for_h2d :
+    let pre := [.h2dBegin, .h2dIssue true, .netAccount]
+    ((sysPush 1).run pre).map
+      (fun s => (s.layersAccounted, s.life.done, s.life.hasStaging)) = some (1, false, true) ∧
+    (sysPush 1).run (pre ++ [.pollReady]) = none ∧
+    (sysPush 1).run (pre ++ [.publish]) = none ∧
+    ((sysPush 1).run (pre ++ [.h2dReady, .h2dDone true, .publish])).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) := by
+  decide
+
+/-- `RecvLifecycleTest.LateBlockAccountingAfterRetirementIsANoOp`: a fast H2D
+callback finishes and retires the session before `OnBlocksReceived` runs; the
+late `netAccount` is ignored (`.cc:537-539`). -/
+theorem trace_late_net_account_after_retire :
+    let pre := [.h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true, .publish]
+    ((sysPush 1).run pre).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) ∧
+    (sysPush 1).run (pre ++ [.netAccount]) = none := by
+  decide
+
+/-- `RecvDrainTest.FailedLayerWaitsForOtherH2dCopies` (and the 1-layer case
+`RecvLifecycleTest.SingleFailedH2dReportsFailureAndReturnsStaging`): two layers'
+H2D copies are issued; one fails while the other is still in flight; the session
+drains and keeps its staging until the remaining copy finishes, then publishes
+failure. -/
+theorem trace_failed_h2d_waits_for_other_layer :
+    let pre := [.h2dBegin, .h2dIssue true, .h2dBegin, .h2dIssue true, .h2dReady, .h2dDone false]
+    ((sysPush 2).run pre).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    (sysPush 2).run (pre ++ [.publish]) = none ∧
+    ((sysPush 2).run (pre ++ [.h2dReady, .h2dDone true, .publish])).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
+  decide
+
+/-- `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`:
+an open incoming push lease (`pushBegin`) keeps staging pinned across `cancel`
+while rejecting new pushes, and releases staging when `pushEnd` completes. -/
+theorem trace_push_lease_pins_staging_on_cancel :
+    ((sysPush 1).run [.pushBegin, .cancel]).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    (sysPush 1).run [.pushBegin, .cancel, .pushBegin] = none ∧
+    ((sysPush 1).run [.pushBegin, .cancel, .pushEnd, .publish]).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
+  decide
+
+/-- `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`:
+even if the H2D copy and its callback finish inside `HandleIncomingPush` before
+`EndIncomingPush` runs, the open push lease (`pushes = 1`) keeps `done = false`
+and `hasStaging = true` until `pushEnd`. -/
+theorem trace_push_lease_outlives_h2d :
+    let pre := [.pushBegin, .h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true]
+    ((sysPush 1).run pre).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    (sysPush 1).run (pre ++ [.publish]) = none ∧
+    ((sysPush 1).run (pre ++ [.pushEnd, .publish])).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) := by
+  decide
+
+/-- `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds` (and
+`RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline` when no handshake is
+in flight): on `sysLoad 1`, a deadline while the pull handshake is still pending
+keeps staging pinned until `pullReply` ends the handshake op. -/
+theorem trace_deadline_during_handshake :
+    ((sysLoad 1).run [.cancel]).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    (sysLoad 1).run [.cancel, .publish] = none ∧
+    ((sysLoad 1).run [.cancel, .pullReply false, .publish]).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) ∧
+    ((sysPush 1).run [.cancel, .publish]).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
+  decide
+
 def events : List Ev :=
   [.pushBegin, .pushEnd, .pullReply true, .pullReply false, .h2dBegin,
    .h2dIssue true, .h2dIssue false, .h2dReady, .h2dDone true, .h2dDone false,
