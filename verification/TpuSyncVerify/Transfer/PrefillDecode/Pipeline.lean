@@ -61,10 +61,12 @@ and per-layer ghost sets record which layers have passed each stage:
 
 | Event                   | What it is |
 |-------------------------|-----------|
-| `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`send.cc:380-384`), not on any future |
+| `notifyForRead`         | `NotifyForRead` registers the offer in `send_sessions_[uuid]` (`registered := true`) and calls `cv_.SignalAll()` (`mgr.cc:448-454`) |
+| `pullWait`              | `HandlePullStream` arrives before `NotifyForRead` (`registered = false`) and enters `cv_.WaitWithTimeout` (`pullWaiting := true`, `mgr.cc:1427-1438`) |
+| `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `beginPull` (`ValidateAndBeginPull`) requires `registered = true` and clears `pullWaiting`. `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`send.cc:380-384`), not on any future |
 | `d2hReady l`            | the D2H copy of layer `l` finishes: `prefillStaging[l] := prefillHbm[l]`. Issued iff `l < d2hIssued` (copies are issued in order) |
 | `h2hDone l ok`          | the push callback for layer `l` (`send.cc:428-445`). Push `l` exists iff `l < h2hIssued` (pushes are issued in order). On success `wire[l] := prefillStaging[l]` |
-| `recv e`                | the receive session's event `e`, no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady` are disabled here |
+| `recv e`                | the receive session's event `e`, no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady` are disabled here. `pullReply ok` requires `ok = false ∨ send.pullStarted = true` and clears `pullWaiting` |
 | `h2dBegin l`            | `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: once per layer (A1), only after layer `l` landed (`bt.cc:528-530`) |
 | `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:601-632`): dispatches layer `l`'s H2D copy unless draining or failed |
 | `h2dReady l`            | the H2D copy of layer `l` finishes: `decodeHbm[l] := decodeStaging[l]` |
@@ -109,7 +111,8 @@ that reads at issue time admits no violation this one does not.
 
 ## Properties
 
-All proved on every reachable state (`reachable_safe`):
+All proved on every reachable state (`reachable_safe` and
+`reachable_unregistered_safe`):
 
 * **Publication correctness.** `recv.published = some true → decodeHbm = good n`:
   when the engine is told `done_recving`, decode HBM holds every layer of the
@@ -128,6 +131,13 @@ All proved on every reachable state (`reachable_safe`):
   writing it and no copy reading it. Safety half of `proposal.md` §2 *Staging
   integrity & termination*. Both follow from `done → inFlight = 0` and the
   sessions' accounting of `in_flight_`.
+* **Handshake rendezvous safety** (`HandshakeSafe`). `StartPush`
+  (`send.started = true`) and all D2H/H2H activity require the offer to have
+  been registered by `NotifyForRead` (`registered = true`) and atomically
+  claimed by `ValidateAndBeginPull` (`send.pullStarted = true`), and while
+  `HandlePullStream` is in its grace wait (`pullWaiting = true`), the consumer's
+  `PullStream` RPC remains pending (`recv.pullPending = true`) and
+  `pull_started_` remains unclaimed (`send.pullStarted = false`).
 
 Why the proof goes through, in one paragraph. A copy that completes is still
 in flight, so its session is not settled; a session that is not settled still
@@ -178,6 +188,10 @@ structure Pipeline where
   /-- ghost: layers whose H2D copy has finished -/
   h2dReadyL : List Bool
   reclaimed : Bool := false
+  /-- Whether `NotifyForRead` has registered the offer in `send_sessions_[uuid]` (`mgr.cc:448-454`). -/
+  registered : Bool := true
+  /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout` (`mgr.cc:1427-1438`). -/
+  pullWaiting : Bool := false
   deriving Repr, DecidableEq
 
 namespace Pipeline
@@ -198,7 +212,15 @@ def init (n : Nat) : Pipeline :=
     h2dPendingL := List.replicate n false, h2dIssuedL := List.replicate n false,
     h2dReadyL := List.replicate n false }
 
+/-- An `n`-layer transfer before `NotifyForRead` has registered the offer in
+`send_sessions_[uuid]`: models the `PullAheadOfRegistration` grace-wait and
+unregistered-pull rejection paths (`mgr.cc:1427-1444`). -/
+def initUnregistered (n : Nat) : Pipeline :=
+  { init n with registered := false }
+
 inductive Ev where
+  | notifyForRead
+  | pullWait
   | send (e : Send.Ev)
   | d2hReady (l : Nat)
   | h2hDone (l : Nat) (ok : Bool)
@@ -212,14 +234,34 @@ inductive Ev where
   | reseatDecodeStaging
   deriving Repr, DecidableEq
 
+/-- `NotifyForRead` registers the send session under `transfer_uuid` in
+`send_sessions_` and calls `cv_.SignalAll()` (`mgr.cc:448-454`). -/
+def notifyForRead (s : Pipeline) : Option Pipeline :=
+  if s.registered = false then
+    some { s with registered := true }
+  else none
+
+/-- `HandlePullStream` arrives before `NotifyForRead` has registered the offer
+and enters the `cv_.WaitWithTimeout` grace wait (`mgr.cc:1427-1438`). -/
+def pullWait (s : Pipeline) : Option Pipeline :=
+  if s.registered = false ∧ s.pullWaiting = false ∧ s.recv.pullPending = true then
+    some { s with pullWaiting := true }
+  else none
+
 /-- A send event with no memory effect. The two that move data are the
-layer-indexed `d2hReady l` / `h2hDone l ok` and are disabled here. `wake` gets
-the per-layer guard the counter model cannot state: `SendNextLayer(woken)`
-waits on layer `woken`'s own future. -/
+layer-indexed `d2hReady l` / `h2hDone l ok` and are disabled here. `beginPull`
+(`ValidateAndBeginPull`, `mgr.cc:1452`) requires the offer to be registered in
+`send_sessions_` (`s.registered = true`) and clears any grace-wait state
+(`pullWaiting := false`). `wake` gets the per-layer guard the counter model
+cannot state: `SendNextLayer(woken)` waits on layer `woken`'s own future. -/
 def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   match e with
   | .d2hReady => none
   | .h2hDone _ => none
+  | .beginPull =>
+    if s.registered = true then
+      (Send.step s.send .beginPull).map fun snd => { s with send := snd, pullWaiting := false }
+    else none
   | .wake _ =>
     if s.d2hReadyL[s.send.woken]? = some true then
       (Send.step s.send e).map fun snd => { s with send := snd }
@@ -251,12 +293,19 @@ def h2hDone (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=
   else none
 
 /-- A receive event with no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady`
-are the layer-indexed events below and are disabled here. -/
+are the layer-indexed events below and are disabled here. A successful pull
+handshake reply (`pullReply true`) requires `ValidateAndBeginPull` to have
+claimed the producer (`s.send.pullStarted = true`), and any pull reply ends
+`HandlePullStream`'s grace wait (`pullWaiting := false`). -/
 def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   match e with
   | .h2dBegin => none
   | .h2dIssue _ => none
   | .h2dReady => none
+  | .pullReply ok =>
+    if ok = false ∨ s.send.pullStarted = true then
+      (Recv.step s.recv (.pullReply ok)).map fun rcv => { s with recv := rcv, pullWaiting := false }
+    else none
   | _ => (Recv.step s.recv e).map fun rcv => { s with recv := rcv }
 
 /-- `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: fires
@@ -321,6 +370,8 @@ def reseatDecodeStaging (s : Pipeline) : Option Pipeline :=
   else none
 
 def step (s : Pipeline) : Ev → Option Pipeline
+  | .notifyForRead => s.notifyForRead
+  | .pullWait => s.pullWait
   | .send e => s.sendStep e
   | .d2hReady l => s.d2hReady l
   | .h2hDone l ok => s.h2hDone l ok
@@ -335,6 +386,9 @@ def step (s : Pipeline) : Ev → Option Pipeline
 
 /-- An `n`-layer transfer. -/
 def sys (n : Nat) : System Pipeline Ev := ⟨init n, step⟩
+
+/-- An `n`-layer transfer starting before `NotifyForRead` registers the offer. -/
+def sysUnregistered (n : Nat) : System Pipeline Ev := ⟨initUnregistered n, step⟩
 
 /-! ## Properties -/
 
@@ -363,11 +417,26 @@ def StagingSafe (s : Pipeline) : Prop :=
   (s.recv.life.hasStaging = false →
     s.recv.pushes = 0 ∧ s.recv.pending = 0 ∧ s.recv.retired = s.recv.issued)
 
+/-- Handshake rendezvous invariant (`mgr.cc:448-454`, `mgr.cc:1427-1494`,
+`send.cc:116-130`):
+1. `StartPush` (`send.started = true`) and all D2H/H2H activity require the
+   offer to have been registered (`registered = true`) and claimed by
+   `ValidateAndBeginPull` (`send.pullStarted = true`).
+2. While `HandlePullStream` is in its grace wait (`pullWaiting = true`), the
+   consumer's `PullStream` RPC is still in flight (`recv.pullPending = true`)
+   and `pull_started_` has not yet been claimed (`send.pullStarted = false`). -/
+def HandshakeSafe (s : Pipeline) : Prop :=
+  (s.send.started = true → s.send.pullStarted = true ∧ s.registered = true) ∧
+  (s.send.pullStarted = true → s.registered = true) ∧
+  ((s.send.d2hPending = true ∨ 0 < s.send.d2hIssued ∨ 0 < s.send.h2hIssued) →
+    s.send.pullStarted = true ∧ s.registered = true) ∧
+  (s.pullWaiting = true → s.recv.pullPending = true ∧ s.send.pullStarted = false)
+
 /-- Events that advance or retire an in-flight operation on either side. -/
 def drainEvents (n : Nat) : List Ev :=
   [.send (.d2hIssue true), .send .d2hEnd, .send (.wake true),
    .send .h2hIssue, .send .sendNext,
-   .recv .pushEnd, .recv (.pullReply true), .recv (.h2dDone true)] ++
+   .recv .pushEnd, .recv (.pullReply false), .recv (.h2dDone true)] ++
   (List.range n).flatMap fun l =>
     [.d2hReady l, .h2hDone l true, .h2dIssue l true, .h2dReady l]
 
@@ -378,7 +447,8 @@ def NoOpLeak (s : Pipeline) : Prop :=
     ∃ e ∈ drainEvents s.numLayers, (step s e).isSome = true
 
 def Safe (s : Pipeline) : Prop :=
-  PublicationCorrect s ∧ DecodeHbmSafe s ∧ PrefillHbmSafe s ∧ StagingSafe s ∧ NoOpLeak s
+  PublicationCorrect s ∧ DecodeHbmSafe s ∧ PrefillHbmSafe s ∧ StagingSafe s ∧
+    HandshakeSafe s ∧ NoOpLeak s
 
 /-! ## Facts about `good`, per-layer sets and `countTrue` -/
 
@@ -416,7 +486,8 @@ invariants:
 - **At-most-once layer counting:** `cnt_d2hReady`, `cnt_h2hRetired`,
   `cnt_h2dPending`, `cnt_h2dIssued`, and `cnt_h2dReady` equate each session's
   integer counter to the number of `true` entries in the corresponding
-  per-layer boolean checklist. -/
+  per-layer boolean checklist.
+- **Handshake rendezvous:** `pullStarted_registered` and `pullWaiting_state`. -/
 
 structure Inv (s : Pipeline) : Prop where
   send : s.send.Inv
@@ -470,6 +541,13 @@ structure Inv (s : Pipeline) : Prop where
   cnt_h2dReady : countTrue s.h2dReadyL = s.recv.ready
   /-- Every finished copy put its layer in decode HBM. -/
   dhbm_good : ∀ l : Nat, s.h2dReadyL[l]? = some true → s.decodeHbm[l]? = some (.kv l)
+  /-- `ValidateAndBeginPull` can only claim the send session once `NotifyForRead`
+  has registered the offer in `send_sessions_[uuid]`. -/
+  pullStarted_registered : s.send.pullStarted = true → s.registered = true
+  /-- While `HandlePullStream` is in its grace wait (`cv_.WaitWithTimeout`),
+  the consumer's pull RPC is still pending and `pull_started_` is still false. -/
+  pullWaiting_state : s.pullWaiting = true →
+    s.recv.pullPending = true ∧ s.send.pullStarted = false
 
 theorem inv_init (n : Nat) : Inv (init n) := by
   refine ⟨Send.inv_init n, Recv.inv_initLoad n, rfl, rfl, by simp [init], by simp [init],
@@ -488,12 +566,23 @@ theorem inv_init (n : Nat) : Inv (init n) := by
     by simp [init, Recv.initLoad, countTrue_replicate_false],
     fun _ l h => (not_mem_replicate_false h).elim,
     by simp [init, Recv.initLoad, countTrue_replicate_false],
-    fun l h => (not_mem_replicate_false h).elim⟩
+    fun l h => (not_mem_replicate_false h).elim,
+    fun _ => rfl, nofun⟩
   intro k c hk
   simp only [init, List.getElem?_replicate] at hk
   split at hk
   · cases hk; exact Or.inl rfl
   · cases hk
+
+theorem inv_initUnregistered (n : Nat) : Inv (initUnregistered n) := by
+  have h := inv_init n
+  refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, h.len_dstaging,
+    h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
+    h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
+    h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good,
+    h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
+    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good,
+    nofun, nofun⟩
 
 theorem mem_drainEvents_d2hReady {n l : Nat} (hl : l < n) :
     Ev.d2hReady l ∈ drainEvents n := by
@@ -569,7 +658,7 @@ theorem inv_noOpLeak {s : Pipeline} (h : Inv s) : NoOpLeak s := by
     · refine ⟨.recv .pushEnd, by simp [drainEvents], ?_⟩
       simp [step, recvStep, Recv.step, Recv.pushEnd]; omega
     · by_cases hq : s.recv.pullPending = true
-      · refine ⟨.recv (.pullReply true), by simp [drainEvents], ?_⟩
+      · refine ⟨.recv (.pullReply false), by simp [drainEvents], ?_⟩
         simp [step, recvStep, Recv.step, Recv.pullReply, hq]
       · by_cases hpend : 0 < s.recv.pending
         · have hne : s.recv.pending ≠ 0 := by omega
@@ -593,13 +682,27 @@ theorem inv_noOpLeak {s : Pipeline} (h : Inv s) : NoOpLeak s := by
             simp only [step, recvStep, Recv.step, Recv.h2dDone, hret, ↓reduceIte]
             split <;> rfl
 
+theorem inv_handshakeSafe {s : Pipeline} (h : Inv s) : HandshakeSafe s := by
+  have hcnt := h.send.counters
+  have ⟨hpc₁, hpc₂⟩ := h.send.pull_claimed
+  unfold Send.CountersOrdered at hcnt
+  refine ⟨fun hs => ⟨hpc₁ hs, h.pullStarted_registered (hpc₁ hs)⟩,
+    h.pullStarted_registered, ?_, h.pullWaiting_state⟩
+  rintro (hdp | hd2h | hh2h)
+  · have hs := hpc₂ (Or.inl hdp)
+    exact ⟨hpc₁ hs, h.pullStarted_registered (hpc₁ hs)⟩
+  · have hs := hpc₂ (Or.inr hd2h)
+    exact ⟨hpc₁ hs, h.pullStarted_registered (hpc₁ hs)⟩
+  · have hs := hpc₂ (Or.inr (by omega))
+    exact ⟨hpc₁ hs, h.pullStarted_registered (hpc₁ hs)⟩
+
 theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
   have hsend := h.send
   have hrecv := h.recv
   have hsS := Send.inv_safe hsend
   have hcnt := hsend.counters
   unfold Send.CountersOrdered at hcnt
-  refine ⟨?_, ?_, ?_, ⟨?_, ?_⟩, inv_noOpLeak h⟩
+  refine ⟨?_, ?_, ?_, ⟨?_, ?_⟩, inv_handshakeSafe h, inv_noOpLeak h⟩
   · intro hp
     apply eq_good h.len_dhbm
     intro k hk
@@ -649,7 +752,7 @@ theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
 /-- A send event that updates `send`, `h2hRetiredL`, and `wire`, given that the
 layers `SendNextLayer` has consumed afterwards all have their copy finished. -/
 theorem Inv.send_wire_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
-    (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady)
+    (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady) (he_bp : e ≠ .beginPull)
     (hw : ∀ l < snd.woken, s.d2hReadyL[l]? = some true) (x : List Bool)
     (hxlen : x.length = s.numLayers) (hxcnt : countTrue x = snd.h2hRetired)
     (w : List Cell) (hwlen : w.length = s.numLayers)
@@ -660,7 +763,9 @@ theorem Inv.send_wire_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s
     h.len_claimedL, h.len_h2dPendingL, h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good,
     fun hr => Send.step_done_mono hs (h.reclaimed_done hr), ?_, ?_, hxcnt, hw, ?_, hwgood,
     h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
-    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
+    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good,
+    by rw [Send.step_pullStarted_of_ne_beginPull hs he_bp]; exact h.pullStarted_registered,
+    by rw [Send.step_pullStarted_of_ne_beginPull hs he_bp]; exact h.pullWaiting_state⟩
   · show countTrue s.d2hReadyL = snd.d2hReady
     rw [Send.step_d2hReady hs he]; exact h.cnt_d2hReady
   · show ∀ l : Nat, s.d2hReadyL[l]? = some true → l < snd.d2hIssued
@@ -675,11 +780,11 @@ theorem Inv.send_wire_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s
 
 /-- A send event that moves no memory. -/
 theorem Inv.send_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
-    (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady)
+    (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady) (he_bp : e ≠ .beginPull)
     (hw : ∀ l < snd.woken, s.d2hReadyL[l]? = some true) (x : List Bool)
     (hxlen : x.length = s.numLayers) (hxcnt : countTrue x = snd.h2hRetired) :
     Inv { s with send := snd, h2hRetiredL := x } :=
-  h.send_wire_frame hs he hw x hxlen hxcnt s.wire h.len_wire h.wire_good
+  h.send_wire_frame hs he he_bp hw x hxlen hxcnt s.wire h.len_wire h.wire_good
 
 /-- A send that still has a copy or push outstanding has not settled. -/
 theorem send_not_done_of_outstanding {t : Send} (h : t.Inv)
@@ -715,7 +820,8 @@ theorem Inv.send_d2hReady {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
     h.len_claimedL, h.len_h2dPendingL, h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good,
     fun hr => Send.step_done_mono hs (h.reclaimed_done hr), ?_, ?_, h.cnt_h2hRetired, ?_, ?_, h.wire_good,
     h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
-    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good⟩
+    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good,
+    h.pullStarted_registered, h.pullWaiting_state⟩
   · show (s.prefillStaging.set _ _).length = _
     rw [List.length_set]; exact h.len_pstaging
   · show (s.d2hReadyL.set _ _).length = _
@@ -753,7 +859,7 @@ theorem Inv.send_h2hDone {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
   have hsrc : s.prefillStaging.getD l .junk = .kv l := by
     rw [List.getD_eq_getElem?_getD, h.pstaging_good hd l hdl]; rfl
   rw [hsrc]
-  apply h.send_wire_frame hs nofun hw (s.h2hRetiredL.set l true)
+  apply h.send_wire_frame hs nofun nofun hw (s.h2hRetiredL.set l true)
     (by rw [List.length_set]; exact h.len_h2hRetiredL)
     (by rw [countTrue_set_true hf, h.cnt_h2hRetired, Send.h2hDone_h2hRetired hs])
     (s.wire.set l (.kv l)) (by rw [List.length_set]; exact h.len_wire)
@@ -769,7 +875,8 @@ theorem Inv.send_h2hDone {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
 serve `h2dBegin l` and `h2dIssue l ok`, which only update the per-layer dispatch
 sets. -/
 theorem Inv.recv_frame {s : Pipeline} {rcv : Recv} {e : Recv.Ev} (h : Inv s)
-    (hs : Recv.step s.recv e = some rcv) (he : e ≠ .h2dReady) (c p i : List Bool)
+    (hs : Recv.step s.recv e = some rcv) (he : e ≠ .h2dReady)
+    (he_pr : ∀ ok, e ≠ .pullReply ok) (c p i : List Bool)
     (hclen : c.length = s.numLayers) (hplen : p.length = s.numLayers)
     (hilen : i.length = s.numLayers)
     (hp : ∀ l : Nat, p[l]? = some true → s.landedL[l]? = some true)
@@ -783,7 +890,8 @@ theorem Inv.recv_frame {s : Pipeline} {rcv : Recv} {e : Recv.Ev} (h : Inv s)
     h.len_pstaging, h.len_wire, h.len_dstaging, h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL,
     hclen, hplen, hilen, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
     h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good, hp, hi,
-    hpc, hic, hpcnt, hicnt, ?_, ?_, h.dhbm_good⟩
+    hpc, hic, hpcnt, hicnt, ?_, ?_, h.dhbm_good, h.pullStarted_registered,
+    by rw [Recv.step_pullPending_of_ne_pullReply hs he_pr]; exact h.pullWaiting_state⟩
   · show rcv.life.done = false → ∀ l : Nat, s.landedL[l]? = some true → s.decodeStaging[l]? = some (.kv l)
     intro hd
     apply h.dstaging_good
@@ -819,7 +927,8 @@ theorem Inv.recv_h2dReady {s : Pipeline} {rcv : Recv} {l : Nat} (h : Inv s)
     h.len_claimedL, h.len_h2dPendingL, h.len_h2dIssuedL, ?_, h.phbm_good, h.reclaimed_done,
     h.cnt_d2hReady, h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good,
     h.wire_good, h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
-    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, ?_, ?_⟩
+    h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, ?_, ?_,
+    h.pullStarted_registered, h.pullWaiting_state⟩
   · show (s.decodeHbm.set _ _).length = _
     rw [List.length_set]; exact h.len_dhbm
   · show (s.h2dReadyL.set _ _).length = _
@@ -847,7 +956,7 @@ theorem Inv.land_layer {s : Pipeline} {l : Nat} {c : Cell} (h : Inv s)
     h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
     h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good,
     ?_, ?_, h.pending_claimed, h.issued_claimed, h.cnt_h2dPending, h.cnt_h2dIssued,
-    ?_, h.cnt_h2dReady, h.dhbm_good⟩
+    ?_, h.cnt_h2dReady, h.dhbm_good, h.pullStarted_registered, h.pullWaiting_state⟩
   · rw [List.length_set]; exact h.len_dstaging
   · exact fun j hj => set_true_of_mem hf (h.pending_landed j hj)
   · exact fun j hj => set_true_of_mem hf (h.issued_landed j hj)
@@ -875,7 +984,8 @@ theorem Inv.env_frame {s : Pipeline} (h : Inv s)
    h.len_h2dIssuedL, h.len_h2dReadyL, hphbm, hrec, h.cnt_d2hReady, h.d2hReady_lt,
    h.cnt_h2hRetired, h.woken_d2hReady, hpstg, h.wire_good, h.pending_landed,
    h.issued_landed, h.pending_claimed, h.issued_claimed, h.cnt_h2dPending,
-   h.cnt_h2dIssued, hdstg, h.cnt_h2dReady, h.dhbm_good⟩
+   h.cnt_h2dIssued, hdstg, h.cnt_h2dReady, h.dhbm_good,
+   h.pullStarted_registered, h.pullWaiting_state⟩
 
 /-- Layers `SendNextLayer` has consumed after a `wake`: the ones before, plus
 the one the guard checked. -/
@@ -897,17 +1007,67 @@ theorem woken_after_other {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
 
 theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s') : Inv s' := by
   cases e with
+  | notifyForRead =>
+    simp only [step, notifyForRead] at hs
+    split at hs
+    · cases hs
+      exact ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, h.len_dstaging,
+        h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
+        h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
+        h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good,
+        h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
+        h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good,
+        fun _ => rfl, h.pullWaiting_state⟩
+    · cases hs
+  | pullWait =>
+    simp only [step, pullWait] at hs
+    split at hs
+    · rename_i hg
+      cases hs
+      refine ⟨h.send, h.recv, h.n_send, h.n_recv, h.len_pstaging, h.len_wire, h.len_dstaging,
+        h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL, h.len_claimedL, h.len_h2dPendingL,
+        h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good, h.reclaimed_done, h.cnt_d2hReady,
+        h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady, h.pstaging_good, h.wire_good,
+        h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
+        h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good,
+        h.pullStarted_registered, ?_⟩
+      intro _
+      refine ⟨hg.2.2, ?_⟩
+      cases hps : s.send.pullStarted
+      · rfl
+      · have := h.pullStarted_registered hps; rw [hg.1] at this; cases this
+    · cases hs
   | send e =>
     cases e
     case d2hReady => simp only [step, sendStep] at hs; cases hs
     case h2hDone ok => simp only [step, sendStep] at hs; cases hs
+    case beginPull =>
+      simp only [step, sendStep] at hs
+      split at hs
+      · rename_i hg
+        simp only [Option.map_eq_some_iff] at hs
+        obtain ⟨snd, hsnd, rfl⟩ := hs
+        have hw := woken_after_other h hsnd nofun
+        refine ⟨Send.step_inv h.send hsnd, h.recv, (Send.step_numLayers hsnd).trans h.n_send, h.n_recv,
+          h.len_pstaging, h.len_wire, h.len_dstaging, h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL,
+          h.len_claimedL, h.len_h2dPendingL, h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good,
+          fun hr => Send.step_done_mono hsnd (h.reclaimed_done hr),
+          by rw [Send.step_d2hReady hsnd nofun]; exact h.cnt_d2hReady,
+          fun l hl => Nat.lt_of_lt_of_le (h.d2hReady_lt l hl) (Send.step_d2hIssued_le hsnd),
+          by rw [Send.step_h2hRetired hsnd nofun]; exact h.cnt_h2hRetired,
+          hw,
+          fun hd => h.pstaging_good (by cases hd0 : s.send.life.done; rfl; rw [Send.step_done_mono hsnd hd0] at hd; cases hd),
+          h.wire_good, h.pending_landed, h.issued_landed, h.pending_claimed, h.issued_claimed,
+          h.cnt_h2dPending, h.cnt_h2dIssued, h.dstaging_good, h.cnt_h2dReady, h.dhbm_good,
+          fun _ => hg, nofun⟩
+      · cases hs
     case wake ok =>
       simp only [step, sendStep] at hs
       split at hs
       · rename_i hg
         simp only [Option.map_eq_some_iff] at hs
         obtain ⟨snd, hsnd, rfl⟩ := hs
-        exact h.send_frame hsnd nofun (woken_after_wake h hsnd hg) _ h.len_h2hRetiredL
+        exact h.send_frame hsnd nofun nofun (woken_after_wake h hsnd hg) _ h.len_h2hRetiredL
           (by rw [Send.step_h2hRetired hsnd nofun]; exact h.cnt_h2hRetired)
       · cases hs
     all_goals
@@ -915,7 +1075,7 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       all_goals
         simp only [step, sendStep, Option.map_eq_some_iff] at hs
         obtain ⟨snd, hsnd, rfl⟩ := hs
-        exact h.send_frame hsnd nofun (woken_after_other h hsnd nofun) _ h.len_h2hRetiredL
+        exact h.send_frame hsnd nofun nofun (woken_after_other h hsnd nofun) _ h.len_h2hRetiredL
           (by rw [Send.step_h2hRetired hsnd nofun]; exact h.cnt_h2hRetired)
   | d2hReady l =>
     simp only [step, d2hReady] at hs
@@ -935,7 +1095,7 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       obtain ⟨snd, hsnd, rfl⟩ := hs
       have hw := woken_after_other h hsnd nofun
       cases ok
-      · exact h.send_frame hsnd nofun hw _
+      · exact h.send_frame hsnd nofun nofun hw _
           (by rw [List.length_set]; exact h.len_h2hRetiredL)
           (by rw [countTrue_set_true hf, h.cnt_h2hRetired, Send.h2hDone_h2hRetired hsnd])
       · exact h.send_h2hDone hl hf hsnd hw
@@ -945,13 +1105,30 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
     case h2dBegin => simp only [step, recvStep] at hs; cases hs
     case h2dIssue ok => simp only [step, recvStep] at hs; cases hs
     case h2dReady => simp only [step, recvStep] at hs; cases hs
+    case pullReply ok =>
+      simp only [step, recvStep] at hs
+      split at hs
+      · simp only [Option.map_eq_some_iff] at hs
+        obtain ⟨rcv, hrcv, rfl⟩ := hs
+        have hpi := Recv.step_pending_issued hrcv nofun nofun
+        refine ⟨h.send, Recv.step_inv h.recv hrcv, h.n_send, (Recv.step_numLayers hrcv).trans h.n_recv,
+          h.len_pstaging, h.len_wire, h.len_dstaging, h.len_dhbm, h.len_d2hReadyL, h.len_h2hRetiredL,
+          h.len_claimedL, h.len_h2dPendingL, h.len_h2dIssuedL, h.len_h2dReadyL, h.phbm_good,
+          h.reclaimed_done, h.cnt_d2hReady, h.d2hReady_lt, h.cnt_h2hRetired, h.woken_d2hReady,
+          h.pstaging_good, h.wire_good, h.pending_landed, h.issued_landed, h.pending_claimed,
+          h.issued_claimed, by rw [hpi.1]; exact h.cnt_h2dPending,
+          by rw [hpi.2]; exact h.cnt_h2dIssued,
+          fun hd => h.dstaging_good (by cases hd0 : s.recv.life.done; rfl; rw [Recv.step_done_mono hrcv hd0] at hd; cases hd),
+          by rw [Recv.step_ready hrcv nofun]; exact h.cnt_h2dReady,
+          h.dhbm_good, h.pullStarted_registered, nofun⟩
+      · cases hs
     all_goals
       (try (rename_i ok; cases ok))
       all_goals
         simp only [step, recvStep, Option.map_eq_some_iff] at hs
         obtain ⟨rcv, hrcv, rfl⟩ := hs
         have hpi := Recv.step_pending_issued hrcv nofun nofun
-        exact h.recv_frame hrcv nofun _ _ _ h.len_claimedL h.len_h2dPendingL h.len_h2dIssuedL
+        exact h.recv_frame hrcv nofun nofun _ _ _ h.len_claimedL h.len_h2dPendingL h.len_h2dIssuedL
           h.pending_landed h.issued_landed h.pending_claimed h.issued_claimed
           (by rw [hpi.1]; exact h.cnt_h2dPending) (by rw [hpi.2]; exact h.cnt_h2dIssued)
   | h2dBegin l =>
@@ -968,7 +1145,7 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
       have hif : s.h2dIssuedL[l]? = some false :=
         false_of_not_true (h.len_claimedL.trans h.len_h2dIssuedL.symm) hf
           (fun hi => by rw [(h.issued_claimed l hi).1] at hf; cases hf)
-      apply h.recv_frame hrcv nofun _ _ _
+      apply h.recv_frame hrcv nofun nofun _ _ _
         (by rw [List.length_set]; exact h.len_claimedL)
         (by rw [List.length_set]; exact h.len_h2dPendingL)
         h.len_h2dIssuedL
@@ -1005,7 +1182,7 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
         · rw [heq, hb]
         · rw [hb] at heq
           rw [(h.issued_claimed l heq).2] at hp; cases hp
-      apply h.recv_frame hrcv nofun _ _ _
+      apply h.recv_frame hrcv nofun nofun _ _ _
         h.len_claimedL
         (by rw [List.length_set]; exact h.len_h2dPendingL)
         (by split <;> simp [h.len_h2dIssuedL])
@@ -1095,10 +1272,21 @@ theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s'
 theorem reachable_inv {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) : Inv s :=
   (sys n).reachable_induction (inv_init n) (fun _ _ _ hi hs => step_inv hi hs) h
 
+theorem reachable_unregistered_inv {n : Nat} {s : Pipeline}
+    (h : (sysUnregistered n).Reachable s) : Inv s :=
+  (sysUnregistered n).reachable_induction (inv_initUnregistered n)
+    (fun _ _ _ hi hs => step_inv hi hs) h
+
 /-- Main result: every reachable state of the pipeline satisfies all the
 properties. -/
 theorem reachable_safe {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) : Safe s :=
   inv_safe (reachable_inv h)
+
+/-- Every state reachable from an initially unregistered pipeline
+(`initUnregistered n`) also satisfies all safety and handshake properties. -/
+theorem reachable_unregistered_safe {n : Nat} {s : Pipeline}
+    (h : (sysUnregistered n).Reachable s) : Safe s :=
+  inv_safe (reachable_unregistered_inv h)
 
 /-! ### Progress and eventual settlement -/
 
@@ -1194,10 +1382,11 @@ theorem drain_recv_step {s : Pipeline} (h : Inv s)
       simp [step, recvStep, Recv.step, Recv.pushEnd]; omega
     exact ⟨.recv .pushEnd, _, hs₁, by simp [hdr], rfl, by simp [Recv.drainRank]; omega⟩
   · by_cases hq : s.recv.pullPending = true
-    · have hs₁ : step s (.recv (.pullReply true)) =
-          some { s with recv := { s.recv with life := s.recv.life.endOpLocked, pullPending := false } } := by
+    · have hs₁ : step s (.recv (.pullReply false)) =
+          some { s with recv := { s.recv with life := (s.recv.life.finishLocked false).endOpLocked, pullPending := false },
+                        pullWaiting := false } := by
         simp [step, recvStep, Recv.step, Recv.pullReply, hq]
-      exact ⟨.recv (.pullReply true), _, hs₁, by simp [hdr], rfl, by simp [Recv.drainRank, hq]⟩
+      exact ⟨.recv (.pullReply false), _, hs₁, by simp, rfl, by simp [Recv.drainRank, hq]⟩
     · by_cases hpend : 0 < s.recv.pending
       · obtain ⟨l, _, hpl⟩ := exists_true_of_countTrue_pos (by rw [h.cnt_h2dPending]; exact hpend)
         have hs₁ : step s (.h2dIssue l true) =
@@ -1339,8 +1528,9 @@ buffer, and overwriting released buffers with `.junk` preserves `Inv`. -/
 /-- Unfold `step` for a known event and split every branch, leaving `hs` as
 `some … = some s'`, as the `Option.map` form, or closed. -/
 macro "pipe_cases" hs:ident : tactic =>
-  `(tactic| (simp only [step, sendStep, recvStep, d2hReady, h2hDone, h2dBegin, h2dIssue,
-      h2dReady, land, reclaim, reseatPrefillStaging, reseatDecodeStaging] at $hs:ident <;>
+  `(tactic| (simp only [step, notifyForRead, pullWait, sendStep, recvStep, d2hReady, h2hDone,
+      h2dBegin, h2dIssue, h2dReady, land, reclaim, reseatPrefillStaging, reseatDecodeStaging]
+      at $hs:ident <;>
       (repeat' split at $hs:ident) <;>
       (try simp only [Option.map_eq_some_iff] at $hs:ident)))
 

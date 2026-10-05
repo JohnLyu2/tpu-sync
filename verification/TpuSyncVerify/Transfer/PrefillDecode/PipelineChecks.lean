@@ -15,9 +15,9 @@ on, including the per-layer ones.
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 
-/-- A one-layer producer, start to `done_sending`. -/
+/-- A one-layer producer, pull claim + start to `done_sending`. -/
 def producer : List Ev :=
-  [.send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
+  [.send .beginPull, .send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
    .send (.wake true), .send .h2hIssue, .send .sendNext, .h2hDone 0 true, .send .publish]
 
 /-- A one-layer consumer, pull handshake to `done_recving`. Within the accepted
@@ -43,7 +43,7 @@ theorem trace_normal :
 pushes complete in reverse order. The push *chain* is still 0 then 1
 (`SendNextLayer`), and `wake` for layer 0 waits for layer 0's copy. -/
 def producer2 : List Ev :=
-  [.send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin, .send (.d2hIssue true),
+  [.send .beginPull, .send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin, .send (.d2hIssue true),
    .d2hReady 1, .d2hReady 0, .send .d2hEnd, .send .d2hEnd,
    .send (.wake true), .send .h2hIssue, .send .sendNext,
    .send (.wake true), .send .h2hIssue, .send .sendNext,
@@ -71,10 +71,10 @@ theorem trace_layers_out_of_order :
 copy, however early it finished. -/
 theorem trace_wake_needs_own_layer :
     (sys 2).run
-      [.send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin,
+      [.send .beginPull, .send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin,
        .send (.d2hIssue true), .d2hReady 1, .send (.wake true)] = none ∧
     ((sys 2).run
-      [.send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin,
+      [.send .beginPull, .send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin,
        .send (.d2hIssue true), .d2hReady 1, .d2hReady 0, .send (.wake true)]).isSome = true := by
   decide
 
@@ -89,17 +89,17 @@ theorem trace_slow_consumer :
 /-- A receive that has settled takes no push: once its staging is somebody
 else's buffer, nothing can land in it. -/
 theorem trace_no_push_after_settle :
-    ((sys 1).run [.recv .cancel, .recv (.pullReply true), .recv .publish, .reseatDecodeStaging]).map
+    ((sys 1).run [.recv .cancel, .recv (.pullReply false), .recv .publish, .reseatDecodeStaging]).map
       (fun s => (s.recv.published, s.recv.life.hasStaging)) = some (some false, false) ∧
-    (sys 1).run [.recv .cancel, .recv (.pullReply true), .recv .publish, .reseatDecodeStaging,
+    (sys 1).run [.recv .cancel, .recv (.pullReply false), .recv .publish, .reseatDecodeStaging,
       .recv .pushBegin] = none ∧
-    (sys 1).run [.recv .cancel, .recv (.pullReply true), .recv .publish, .reseatDecodeStaging,
+    (sys 1).run [.recv .cancel, .recv (.pullReply false), .recv .publish, .reseatDecodeStaging,
       .land 0] = none := by
   decide
 
 /-- The layer must land before the device is asked to copy it. -/
 theorem trace_no_dispatch_before_land :
-    (sys 1).run [.recv (.pullReply true), .h2dBegin 0] = none := by
+    (sys 1).run [.send .beginPull, .recv (.pullReply true), .h2dBegin 0] = none := by
   decide
 
 /-- An H2D copy cannot finish for a layer whose `ExecuteLayerH2d` was aborted at
@@ -114,13 +114,73 @@ theorem trace_aborted_issue_cannot_ready :
         .h2dReady 1]) = none := by
   decide
 
+/-- `ControlHandshakeTest.RegisteredPullIsAcknowledged` and
+`DuplicatePullIsRejectedBeforeAcknowledgement`
+(`kv_cache_manager_with_transfer_control_test.cc:353-379`):
+a registered offer is claimed by `.send .beginPull` and acknowledged by
+`.recv (.pullReply true)`, whereas a duplicate `.send .beginPull` is rejected
+even before the pull acknowledgement is delivered. -/
+theorem trace_registered_and_duplicate_pull :
+    ((sys 1).run [.send .beginPull, .recv (.pullReply true)]).map
+      (fun s => (s.send.pullStarted, s.recv.pullPending, s.recv.life.statusOk)) =
+    some (true, false, true) ∧
+    (sys 1).run [.send .beginPull, .send .beginPull] = none := by
+  decide
+
+/-- `ControlHandshakeTest.PullWithoutRegistrationIsRejected` and
+`PullAfterRegistrationDeadlineIsRejected`
+(`kv_cache_manager_with_transfer_control_test.cc:381-393`):
+when `NotifyForRead` never registers the offer (`sysUnregistered 1`), neither
+`ValidateAndBeginPull` (`.send .beginPull`) nor a positive pull reply
+(`.recv (.pullReply true)`) nor `StartPush` (`.send .start`) can run;
+`HandlePullStream` enters the grace wait (`.pullWait`), times out with
+`.recv (.pullReply false)`, and the consumer settles and publishes failure. -/
+theorem trace_unregistered_pull_rejected :
+    (sysUnregistered 1).run [.send .beginPull] = none ∧
+    (sysUnregistered 1).run [.recv (.pullReply true)] = none ∧
+    (sysUnregistered 1).run [.send .start] = none ∧
+    ((sysUnregistered 1).run [.pullWait, .recv (.pullReply false), .recv .publish]).map
+      (fun s => (s.registered, s.pullWaiting, s.send.pullStarted,
+                 s.recv.life.hasStaging, s.recv.published)) =
+    some (false, false, false, false, some false) := by
+  decide
+
+/-- `ControlHandshakeTest.PullAheadOfRegistrationIsAcknowledgedOnceRegistered`
+(`kv_cache_manager_with_transfer_control_test.cc:395-413`):
+`HandlePullStream` arrives before `NotifyForRead` and waits in
+`cv_.WaitWithTimeout` (`.pullWait`); once `NotifyForRead` registers the offer
+(`.notifyForRead`), `ValidateAndBeginPull` claims the session and the full
+1-layer transfer completes to `done_sending` and `done_recving`. -/
+theorem trace_pull_ahead_of_registration :
+    ((sysUnregistered 1).run [.pullWait]).map
+      (fun s => (s.registered, s.pullWaiting, s.send.pullStarted, s.recv.pullPending)) =
+    some (false, true, false, true) ∧
+    ((sysUnregistered 1).run (([.pullWait, .notifyForRead] ++ producer ++ consumer))).map
+      (fun s => (s.registered, s.pullWaiting, s.send.published, s.recv.published, s.decodeHbm)) =
+    some (true, false, some true, some true, [.kv 0]) := by
+  decide
+
+/-- `ControlHandshakeTest.ShutdownUnblocksPendingPull`
+(`kv_cache_manager_with_transfer_control_test.cc:415-441`):
+while `HandlePullStream` is waiting in `cv_.WaitWithTimeout` for an unregistered
+offer (`.pullWait`), shutdown cancels the sessions and fails the pending pull
+(`.recv (.pullReply false)`), unblocking the consumer and settling both sides. -/
+theorem trace_shutdown_unblocks_pending_pull :
+    ((sysUnregistered 1).run
+      [.pullWait, .send .cancel, .recv .cancel, .recv (.pullReply false),
+       .send .publish, .recv .publish]).map
+      (fun s => (s.pullWaiting, s.send.life.done, s.recv.life.done,
+                 s.send.published, s.recv.published)) =
+    some (false, true, true, some false, some false) := by
+  decide
+
 /-- Multi-request trace: request $R_0$ starts, cancels mid-flight, drains,
 publishes failed outcomes, and hands off all four shared memory pools;
 `.nextRequest 0` recycles the pools to request $R_1$, which completes a full
 transfer and publishes `done_recving` with `decodeHbm = [.kv 0]`. -/
 theorem trace_multi_request :
     ((multiSys 1).run
-      (([.send .start, .send .d2hBegin, .send .cancel, .recv .cancel,
+      (([.send .beginPull, .send .start, .send .d2hBegin, .send .cancel, .recv .cancel,
          .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
          .recv (.pullReply true), .send .publish, .recv .publish].map
         (MultiEv.reqStep 0)) ++
@@ -151,6 +211,7 @@ theorem trace_overlapped_requests :
 /-- Every event, for an `n`-layer instance. The five session events that the
 pipeline replaces with layer-indexed ones are left out (they are disabled). -/
 def events (n : Nat) : List Ev :=
+  [.notifyForRead, .pullWait] ++
   (Send.events.filter fun e => e != .d2hReady && e != .h2hDone true && e != .h2hDone false).map .send ++
     (Recv.events.filter fun e =>
       e != .h2dBegin && e != .h2dIssue true && e != .h2dIssue false && e != .h2dReady).map .recv ++
@@ -169,10 +230,16 @@ def violates (s : Pipeline) : Bool :=
      s.send.h2hRetired != s.send.h2hIssued)) ||
   (!s.recv.life.hasStaging &&
     (s.recv.pushes != 0 || s.recv.pending != 0 || s.recv.retired != s.recv.issued)) ||
+  (s.send.started && (!s.send.pullStarted || !s.registered)) ||
+  (s.send.pullStarted && !s.registered) ||
+  ((s.send.d2hPending || 0 < s.send.d2hIssued || 0 < s.send.h2hIssued) &&
+    (!s.send.pullStarted || !s.registered)) ||
+  (s.pullWaiting && (!s.recv.pullPending || s.send.pullStarted)) ||
   ((0 < s.send.life.inFlight || 0 < s.recv.life.inFlight) &&
     !((drainEvents s.numLayers).any fun e => (step s e).isSome))
 
 #guard ModelCheck.check (sys 1) (events 1) violates 10 = .outOfFuel
+#guard ModelCheck.check (sysUnregistered 1) (events 1) violates 8 = .outOfFuel
 
 /-- Publication needs more events than the search above reaches, so search
 again from the state the producer leaves behind: every consumer interleaving
@@ -216,7 +283,7 @@ def sysDispatchEarly : System Pipeline Ev :=
 
 theorem trace_dispatch_early :
     (sysDispatchEarly.run
-      [.recv (.pullReply true), .h2dBegin 0, .h2dIssue 0 true, .h2dReady 0,
+      [.send .beginPull, .recv (.pullReply true), .h2dBegin 0, .h2dIssue 0 true, .h2dReady 0,
        .recv (.h2dDone true), .recv .publish]).map
       (fun s => (s.recv.published, s.decodeHbm)) = some (some true, [.junk]) := by
   decide
@@ -268,8 +335,8 @@ theorem trace_reseat_at_finish :
     ((⟨init 1, fun s e => match e with
         | .reseatPrefillStaging => s.reseatAtFinish
         | e => step s e⟩ : System Pipeline Ev).run
-      [.send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
-       .send (.wake true), .send .h2hIssue, .send .cancel, .reseatPrefillStaging,
+      [.send .beginPull, .send .start, .send .d2hBegin, .send (.d2hIssue true), .d2hReady 0,
+       .send .d2hEnd, .send (.wake true), .send .h2hIssue, .send .cancel, .reseatPrefillStaging,
        .h2hDone 0 true,
        .recv (.pullReply true), .recv .pushBegin, .land 0, .h2dBegin 0,
        .h2dIssue 0 true, .recv .pushEnd, .h2dReady 0, .recv (.h2dDone true), .recv .publish]).map

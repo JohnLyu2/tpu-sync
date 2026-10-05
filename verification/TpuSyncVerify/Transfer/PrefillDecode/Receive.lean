@@ -790,6 +790,13 @@ theorem h2dIssue_spec {s s' : Recv} {ok : Bool} (hs : step s (.h2dIssue ok) = so
         cases hs
         exact ⟨hp, rfl, by simp_all⟩
 
+theorem step_pullPending_of_ne_pullReply {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (he : ∀ ok, e ≠ .pullReply ok) : s'.pullPending = s.pullPending := by
+  cases e <;> (try exact absurd rfl (he _)) <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> (repeat' split) <;> rfl)
+
 /-! ## Replay and bounded search
 
 Concrete traces, checked by `decide`, that document the behaviours the model

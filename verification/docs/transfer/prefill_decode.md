@@ -9,29 +9,37 @@ was read at that commit when the stage was written.
 
 | Module | Stage | Models | Main theorem |
 |---|---|---|---|
+| `Common/ListAux.lean` | — | generic `List` indexing, `List.set`, and `countTrue` pigeonhole lemmas | `all_true_of_countTrue_eq_length`, `exists_false_lt`, `all_true_lt_of_countTrue` |
 | `Transfer/Session.lean` | 1 | the settle protocol shared by the session classes: `in_flight_`, `draining_`, `done_`, staging ownership | `Consistent` is preserved by `beginOp`/`finish*`/`endOp` |
-| `PrefillDecode/Receive.lean` | 1–2 | one `TransferReceiveSession` plus the manager's poll and publication; transport block accounting; `IsReadyToComplete` | `Recv.reachable_safe` |
+| `PrefillDecode/Receive.lean` | 1–2 | one `TransferReceiveSession` plus the manager's poll and publication; transport block accounting; `IsReadyToComplete` | `Recv.reachable_safe`, `Recv.reachable_can_settle` |
 | `PrefillDecode/ReceivePoll.lean` | 2 (audit) | what the poll-side `IsReadyToComplete` finish contributes, with and without it (`stepM poll`); a `metrics` ghost for the last callback's `RecordEnd`/`RecordH2dComplete` | `Recv.reachable_callbackFinishes`, `Recv.pollReady_window`, `Recv.pollReady_no_settle`, `Recv.netAccount_frame`, `Recv.noPoll_metrics_on_success`, `Recv.noPoll_safe`, `Recv.noPoll_can_settle`, `Recv.noPoll_zero_layers_never_succeeds` |
-| `PrefillDecode/Send.lean` | 3 | one `TransferSendSession`: the D2H loop and the H2H push chain against one `in_flight_` | `Send.reachable_safe` |
-| `PrefillDecode/Pipeline.lean` | 4 | `Send` + `Recv` + five layer-indexed memories (prefill HBM → staging → wire → decode staging → decode HBM), engine reclaim, staging reuse, and the multi-request system (`multiSys`) sharing the four pools across requests; every memory-touching event names its layer, so layers complete in any order at every stage | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress`, `Pipeline.reachable_safe`, `Pipeline.attention_safe`, `Pipeline.reachable_can_settle` |
+| `PrefillDecode/Send.lean` | 3 | one `TransferSendSession`: `ValidateAndBeginPull` (`pull_started_` atomic claim), `StartPush`, the D2H loop, and the H2H push chain against one `in_flight_` | `Send.reachable_safe` (`PullClaimed`), `Send.reachable_can_settle` |
+| `PrefillDecode/Pipeline.lean` | 4 | single-request pipeline: `Send` + `Recv` + control handshake rendezvous (`notifyForRead`, `pullWait`, `registered`, `pullWaiting`) + five layer-indexed memories (prefill HBM → staging → wire → decode staging → decode HBM), engine reclaim, staging reuse, buffer quietness, and single-request handoff (`PrefillReleased`, `HandedOff`) | `Pipeline.reachable_safe` (`HandshakeSafe`), `Pipeline.reachable_unregistered_safe`, `Pipeline.attention_safe`, `Pipeline.reachable_can_settle`, `Pipeline.handedOff_quiet`, `Pipeline.inv_can_handoff` |
+| `PrefillDecode/MultiRequest.lean` | 4 | multi-request system (`multiSys`): `reqs : List Pipeline` concurrently sharing the four buffers with per-buffer read-after-release (`recyclePrefill`, `nextRequest`) and write-after-release (`wroteReleased`) checks | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress` |
+| `PrefillDecode/PeerIsolation.lean` | 4 (multi-peer) | decode consumer pulling from `Peer.sick` and `Peer.healthy` prefill producers concurrently across `StagingBlockAllocator` (`numSlots`, `unboundedPerPeer` vs. `perPeerQuota maxPerPeer`) and `push_pool_` (`poolSize`, `tcpBlocking` vs. `grpcAsync`) | `PeerIsolation.reachable_inv`, `PeerIsolation.tcp_healthy_blocked_when_pool_full`, `PeerIsolation.grpc_healthy_can_complete`, `PeerIsolation.reachable_quota_admits_healthy` |
+| `PrefillDecode/UuidTable.lean` | 4 (manager table) | manager UUID registration tables (`active_recv_sessions_[uuid]`, `send_sessions_[uuid]`), drain-before-reuse discipline (`EmplaceRecvSessionLocked`, `StartRead`, `NotifyForRead`), request-ID differentiation, and `PollStats` sweep | `UuidTable.reachable_inv`, `UuidTable.active_recv_preserved`, `UuidTable.active_send_preserved`, `UuidTable.reachable_recv_safe`, `UuidTable.reachable_send_safe` |
+| `PrefillDecode/PipelineChecks.lean` | 4 | executable `decide` traces (including out-of-order layers, handshake rendezvous, and concurrent/overlapped requests), `#guard` bounded searches, and mutants | `Pipeline.trace_normal`, `Pipeline.trace_layers_out_of_order`, `Pipeline.trace_pull_ahead_of_registration`, `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests` |
 
 Stage boundaries are the commits on `experimental` (see the README status
 table). Each later stage uses the earlier models as-is: `Pipeline` composes
 `Send.step` and `Recv.step`, adds the memory effect of each event and the
 per-layer guards the counters cannot express (a push waits for *its* layer's
-D2H copy; an H2D dispatch waits for *its* layer to land), and then composes
-transfers across requests sharing the four memory pools (`multiSys`).
+D2H copy; an H2D dispatch waits for *its* layer to land), `MultiRequest`
+composes transfers across concurrent and overlapped requests reusing the four
+memories (`multiSys`), and `PipelineChecks` contains the executable traces,
+bounded searches, and mutants.
 
 ## Proposal properties → theorems
 
 | Property | Where proved | Statement |
 |---|---|---|
-| **System data correctness & attention safety across requests** | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe` | Across any sequence of requests sharing the four memory pools (`multiSys n`), whenever the active request publishes `done_recving`, `decodeHbm = good n` and stays `good n` across all subsequent active and retired-request transitions until `.nextRequest` |
-| **System progress across requests** | `Pipeline.system_progress` | From any reachable multi-request state, a finite trace settles the active transfer, publishes its outcomes, releases all four shared pools (`PoolsReleased`), and enables `.nextRequest` |
+| **System data correctness & attention safety across requests** | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe` | Across any reachable state of `multiSys n` (`reqs : List Pipeline`, modeling concurrent/overlapped requests plus per-buffer read-after-release and write-after-release via `wroteReleased`), whenever any request `r` at index `idx` publishes `done_recving`, `r.decodeHbm = good n` and stays `good n` across all subsequent multi-request transitions (`reqStep`, `recyclePrefill`, `nextRequest`) |
+| **System progress across requests** | `Pipeline.system_progress` | From any reachable multi-request state and any request `idx`, a finite trace settles `idx`, releases both host staging buffers to `BufferPool` and publishes both HBM outcomes (`HandedOff`), and enables both `.recyclePrefill idx` and `.nextRequest idx` |
 | Publication correctness (single request) | `Pipeline.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n` |
 | Decode HBM safety & quietness | `DecodeHbmSafe`, `decodeHbm_quiet`, `attention_safe` | `recv.published ≠ none → pending = 0 ∧ retired = issued`, which proves `s'.decodeHbm = s.decodeHbm` for every subsequent transition (`decodeHbm_quiet`) and `s'.decodeHbm = good n` across any post-publication trace (`attention_safe`) |
-| Prefill HBM safety & quietness | `PrefillHbmSafe`, `prefillHbm_quiet`, `prefillHbm_quiet_step` | `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`, which disables `d2hReady` and proves `s'.prefillHbm = s.prefillHbm` after reclaim |
-| Staging integrity & quietness | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `StagingSafe`, `prefillStaging_quiet`, `decodeStaging_quiet` | `hasStaging = !done`; once a staging buffer is released (`hasStaging = false`), `StagingSafe` proves no subsequent transfer step can modify that staging buffer or copy from it |
+| Prefill HBM safety & quietness | `PrefillHbmSafe`, `prefillHbm_quiet`, `prefillHbm_quiet_step` | `send.published ≠ none → d2hPending = false ∧ d2hRetired = d2hIssued`, which disables `d2hReady` once `poll_stats()` reports the send outcome (so the caller can safely reclaim `prefillHbm`) |
+| Staging integrity & quietness | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `StagingSafe`, `prefillStaging_quiet`, `decodeStaging_quiet`, `wroteReleased_eq_false` | `hasStaging = !done`; once a staging buffer is released (`hasStaging = false`), `StagingSafe` proves no subsequent transfer step can modify that staging buffer or copy from it, and `wroteReleased_eq_false` combines all four into per-buffer post-release non-interference |
+| Handshake rendezvous & single-pull claim | `Send.PullClaimed`, `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` | `StartPush` (`send.started = true`) and all D2H/H2H activity require `NotifyForRead` registration (`registered = true`) and `ValidateAndBeginPull` (`send.pullStarted = true`), discharging `Send` Assumption A1; while `HandlePullStream` waits in `cv_.WaitWithTimeout` (`pullWaiting = true`), `recv.pullPending = true` and `send.pullStarted = false` |
 | Termination (no op leak / drain to settle) | `Recv.NoOpLeak`, `Recv.reachable_can_settle`, `Send.NoOpLeak`, `Send.reachable_can_settle`, `Pipeline.NoOpLeak`, `Pipeline.reachable_can_settle` | `0 < inFlight → ∃ e ∈ drainEvents, (step s e).isSome`: every accounted unit of `in_flight_` has an enabled step that advances or retires it, and every reachable state can drain to `done = true ∧ hasStaging = false`, publish both outcomes (`published ≠ none`), and reclaim prefill HBM (`reclaimed = true`) in finitely many steps |
 
 Counter-level forms of publication are proved per side as well
@@ -99,13 +107,20 @@ Traces (all `decide`):
 | `Recv.trace_finish_between_locks` | the race the `.cc:601-612` re-check closes |
 | `Recv.trace_no_push_after_finish`, `Pipeline.trace_no_push_after_settle` | nothing lands in a settled receive's staging |
 | `Send.trace_never_pulled`, `Send.trace_zero_layers` | the two degenerate sends |
+| `Send.trace_duplicate_pull_rejected`, `Send.trace_pull_spawn_failure_cleanup` | `ValidateAndBeginPull` sets `pull_started_` atomically and rejects duplicate pulls (`DuplicatePullIsRejectedBeforeAcknowledgement`), while `StartPush` requires `pullStarted = true` and `push_pool_->Schedule` spawn failure calls `Finish(error)` before `StartPush` (`kKvCacheManagerPullSpawn`) |
 | `Send.trace_push_fails` | a failed push drains the chain |
 | `Send.trace_drain_h2h_and_d2h` | `cancel` with layer 0 H2H and layer 1 D2H both in flight: layer 0 H2H finishes first (`done` stays `false`), then layer 1 D2H finishes and `wake` drops layer 1 H2H and settles (`DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone`) |
 | `Send.trace_failed_d2h_waits_for_other_layer` | layer 0 D2H fails while layer 1 D2H runs; failure and staging release wait for layer 1 D2H (`FailedLayerWaitsForTheOtherLayersCopies`) |
 | `Send.trace_cancel_after_ok_finish`, `Send.trace_ok_after_cancel_keeps_failure` | first-finish-wins on the send side in both directions (`FailureCannotOverrideAnEarlierSuccess`, `SuccessCannotOverrideAnEarlierFailure`) |
+| `Pipeline.trace_registered_and_duplicate_pull` | registered offer is claimed by `.send .beginPull` and acknowledged by `.recv (.pullReply true)`; duplicate `.send .beginPull` is rejected (`RegisteredPullIsAcknowledged`, `DuplicatePullIsRejectedBeforeAcknowledgement`) |
+| `Pipeline.trace_unregistered_pull_rejected` | on `sysUnregistered 1`, `.send .beginPull`, `.recv (.pullReply true)`, and `.send .start` are all rejected; `.pullWait` followed by `.recv (.pullReply false)` settles and publishes failure (`PullWithoutRegistrationIsRejected`, `PullAfterRegistrationDeadlineIsRejected`) |
+| `Pipeline.trace_pull_ahead_of_registration` | on `sysUnregistered 1`, `HandlePullStream` waits in `cv_.WaitWithTimeout` (`.pullWait`), `NotifyForRead` registers the offer (`.notifyForRead`), and the full transfer completes to `done_sending` and `done_recving` (`PullAheadOfRegistrationIsAcknowledgedOnceRegistered`) |
+| `Pipeline.trace_shutdown_unblocks_pending_pull` | while `.pullWait` is waiting on an unregistered offer, shutdown cancels both sessions and fails the pending pull (`.recv (.pullReply false)`), unblocking the consumer and settling both sides (`ShutdownUnblocksPendingPull`) |
 | `Pipeline.trace_slow_consumer` | producer published, reclaimed and reseated before the consumer lands anything; data still right |
 | `Pipeline.trace_no_dispatch_before_land` | `h2dBegin l` needs layer `l` to have landed |
 | `Pipeline.trace_aborted_issue_cannot_ready` | `h2dReady l` needs layer `l`'s own `h2dIssue l` to have issued the copy (cannot borrow another layer's `issued` count) |
+| `Pipeline.trace_multi_request` | request $R_0$ cancels mid-flight, drains, publishes failed outcomes, and hands off all four buffers via `.nextRequest 0` to request $R_1$, which completes a full transfer to `decodeHbm = [.kv 0]` |
+| `Pipeline.trace_overlapped_requests` | request $R_0$ finishes its send side, `.recyclePrefill 0` immediately recycles prefill HBM and prefill staging to start request $R_1$ while $R_0$'s receive side has not yet started; $R_1$'s send side and $R_0$'s receive side run concurrently, and both finish with `decodeHbm = [.kv 0]` |
 | `PeerIsolation.trace_tcp_sick_peer_blocks_healthy` | on `tcpBlocking`, `poolSize` handshakes to `Peer.sick` hold all workers (`freeWorkers = 0`) and block a `Peer.healthy` handshake until a `.sick` handshake times out (Issue #888) |
 | `PeerIsolation.trace_grpc_sick_peer_does_not_delay_healthy`, `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | on `grpcAsync`, waiting handshakes to `Peer.sick` hold no worker (`freeWorkers = poolSize`), so `Peer.healthy` transfers complete and publish `done_recving` while `Peer.sick` reads stay stalled (`GrpcSickPeerDoesNotDelayHandshakeToHealthyPeer`, `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains`) |
 | `PeerIsolation.trace_consumer_gives_up_and_drains` | stalled reads to `Peer.sick` give up on handshake timeout (`pullReply false`), publish failure (`published = some false`), and return all staging slots (`ConsumerGivesUpOnProducerThatNeverAnswers`) |
@@ -187,7 +202,7 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains` | `kv_cache_manager_with_transfer_control_test.cc:971-1028` | `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | `PeerIsolation.grpc_freeWorkers_eq_poolSize`, `PeerIsolation.grpc_healthy_can_complete` |
 | `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` | `kv_cache_manager_with_transfer_control_test.cc:1030-1089` | `PeerIsolation.trace_sick_peer_starves_staging_slots` (`unboundedPerPeer` counterexample), `PeerIsolation.trace_per_peer_quota_admits_healthy` (`perPeerQuota` fix) | `PeerIsolation.reachable_sick_staging_le_quota`, `PeerIsolation.reachable_quota_admits_healthy` |
 
-### 4. Manager UUID registration table & drain-before-reuse tests (`RecvDrainTest`, `SendLifecycleTest`, `ControlHandshakeTest` → `UuidTable.lean`)
+### 4. Manager UUID registration table, drain-before-reuse & control handshake tests (`RecvDrainTest`, `SendLifecycleTest`, `ControlHandshakeTest` → `UuidTable.lean`, `Send.lean`, `Pipeline.lean`)
 
 | Test | File & lines | Lean trace theorem | General theorem |
 |---|---|---|---|
@@ -195,6 +210,11 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | `DuplicateReceiveDoesNotReplaceOrLeakFirstRead` | `kv_cache_manager_with_transfer_control_test.cc:718-752` | `UuidTable.trace_duplicate_receive_different_req_id` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` |
 | `RepeatedReceiveAnnouncementIsIdempotent` | `kv_cache_manager_with_transfer_control_test.cc:754-790` | `UuidTable.trace_repeated_receive_same_req_id_idempotent` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` |
 | `DuplicateRegistrationCannotReplaceLiveOffer` | `kv_cache_manager_with_transfer_send_drain_test.cc:353-370` | `UuidTable.trace_duplicate_send_cannot_replace_live_offer` | `UuidTable.active_send_preserved`, `UuidTable.reachable_send_safe` |
+| `RegisteredPullIsAcknowledged` | `kv_cache_manager_with_transfer_control_test.cc:353-365` | `Pipeline.trace_registered_and_duplicate_pull` | `Send.PullClaimed`, `Pipeline.HandshakeSafe` |
+| `DuplicatePullIsRejectedBeforeAcknowledgement` | `kv_cache_manager_with_transfer_control_test.cc:367-379` | `Send.trace_duplicate_pull_rejected`, `Pipeline.trace_registered_and_duplicate_pull` | `Send.PullClaimed`, `Pipeline.HandshakeSafe` |
+| `PullWithoutRegistrationIsRejected`, `PullAfterRegistrationDeadlineIsRejected` | `kv_cache_manager_with_transfer_control_test.cc:381-393` | `Pipeline.trace_unregistered_pull_rejected` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` |
+| `PullAheadOfRegistrationIsAcknowledgedOnceRegistered` | `kv_cache_manager_with_transfer_control_test.cc:395-413` | `Pipeline.trace_pull_ahead_of_registration` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` |
+| `ShutdownUnblocksPendingPull` | `kv_cache_manager_with_transfer_control_test.cc:415-441` | `Pipeline.trace_shutdown_unblocks_pending_pull` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` |
 
 ### 5. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
 

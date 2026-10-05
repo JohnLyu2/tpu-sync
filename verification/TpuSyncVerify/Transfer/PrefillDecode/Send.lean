@@ -43,6 +43,7 @@ The settle protocol is `Transfer.Lifecycle`. On top of it:
 | Field        | C++                                             | Role |
 |--------------|-------------------------------------------------|------|
 | `numLayers`  | `base_->num_layers()`                           | fixed |
+| `pullStarted`| `pull_started_` (`.h:182`)                      | `ValidateAndBeginPull` (`.cc:116-130`) claimed the offer |
 | `started`    | `StartPush` passed its locked section (`.cc:295-313`) | staging acquired, copies may start |
 | `d2hPending` | ghost                                           | the D2H loop is between `++in_flight_` (`.cc:330`) and the dispatch's outcome |
 | `d2hIssued`  | `d2h_layer_futures_.size()` (`.h:186`)          | copies handed to the device |
@@ -67,7 +68,8 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
 
 | Event          | C++ |
 |----------------|-----|
-| `start`        | `StartPush` from the acquisition (`.cc:286-291`) through its locked section (`.cc:295-313`): a zero-layer send finishes OK at once (`.cc:300-303`) |
+| `beginPull`    | `ValidateAndBeginPull` (`.cc:116-130`, called from `HandlePullStream` at `mgr.cc:1452`): rejects if expired/draining (`.cc:120-123`) or `pull_started_` is already set (`.cc:125-128`), otherwise sets `pull_started_ = true` (`.cc:129`) |
+| `start`        | `StartPush` from the acquisition (`.cc:286-291`) through its locked section (`.cc:295-313`), spawned after `ValidateAndBeginPull`: a zero-layer send finishes OK at once (`.cc:300-303`) |
 | `d2hBegin`     | one iteration of the D2H loop up to `++in_flight_` (`.cc:325-331`) |
 | `d2hIssue ok`  | the dispatch (`.cc:332-341`): failure finishes the session and ends the op (`.cc:342-350`); success records the future (`.cc:352-356`). For the last layer, `SendNextLayer(0)` (`.cc:363`, `.cc:375-382`) is attempted as part of the event |
 | `d2hReady`     | the device finishes a copy: its future becomes `IsReady()` |
@@ -76,13 +78,15 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
 | `h2hIssue`     | the pool task up to the push (`.cc:407-424`): a draining session drops the layer and ends the op (`.cc:411-416`); otherwise a second op is taken (`.cc:420`) and the push issued |
 | `sendNext`     | the pool task's `SendNextLayer(l+1)` (`.cc:449`, `.cc:369-382`) followed by the release of the carried-over op (`.cc:407`) |
 | `h2hDone ok`   | the push callback (`.cc:428-445`): failure finishes the session (`.cc:429-434`); the last OK push finishes it OK (`.cc:440-444`); the op ends either way |
-| `cancel`       | any `Finish(error)` from outside the data path: deadline (`mgr.cc:911-917`), shutdown (`mgr.cc:331-337`), staging acquisition failure (`.cc:288-291`), bad arguments (`.cc:280-285`), pull-worker exceptions (`mgr.cc:1500-1505`) |
+| `cancel`       | any `Finish(error)` from outside the data path: deadline (`mgr.cc:911-917`), shutdown (`mgr.cc:331-337`), pull-worker spawn failure (`mgr.cc:1486-1494`), staging acquisition failure (`.cc:288-291`), bad arguments (`.cc:280-285`), pull-worker exceptions (`mgr.cc:1500-1505`) |
 | `publish`      | `CompleteReadRaw` moves a settled session into `done_sending_` or `failed_recving_` by its status and drops it (`mgr.cc:918-925`) |
 
 ## Assumptions
 
-* **A1 (one `StartPush`).** `ValidateAndBeginPull` rejects a second pull
-  (`.cc:125-129`), so `StartPush` runs at most once; `start` is enabled once.
+* **A1 (discharged — at-most-once `StartPush`).** Previously assumed; now
+  modelled directly via `pullStarted` and `beginPull` (`ValidateAndBeginPull`,
+  `.cc:116-130`), which rejects any duplicate pull or expired offer and gates
+  `start` (`PullClaimed`).
 * **A2 (sequential loop).** The D2H loop is one thread, so at most one
   dispatch is between its `++in_flight_` and its outcome: `d2hPending` is a
   `Bool`.
@@ -127,6 +131,9 @@ All proved on every reachable state (`reachable_safe`):
   `d2hRetired ≤ d2hReady ≤ d2hIssued ≤ numLayers`,
   `woken ≤ queued ≤ d2hIssued`, `woken ≤ d2hReady`,
   `pooled + h2hIssued ≤ woken`, `h2hOk ≤ h2hRetired ≤ h2hIssued`.
+* **Pull claim (`PullClaimed`).** `(started → pullStarted) ∧ ((d2hPending ∨ 0 < d2hIssued) → started)`:
+  `StartPush` never runs unless `ValidateAndBeginPull` claimed `pull_started_`,
+  and no D2H copy is pending or issued unless `StartPush` started.
 * **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and
@@ -150,6 +157,7 @@ open TpuSyncVerify.Transfer (Lifecycle)
 structure Send where
   numLayers : Nat
   life : Lifecycle := {}
+  pullStarted : Bool := false
   started : Bool := false
   d2hPending : Bool := false
   d2hIssued : Nat := 0
@@ -191,6 +199,7 @@ def trySendNext (s : Send) : Send :=
   else s
 
 inductive Ev where
+  | beginPull
   | start
   | d2hBegin
   | d2hIssue (ok : Bool)
@@ -204,11 +213,21 @@ inductive Ev where
   | publish
   deriving Repr, DecidableEq
 
-/-- `StartPush` with staging acquired. A failed acquisition is `Finish(error)`
-with nothing in flight, i.e. `cancel`. On a session that finished meanwhile
-the call returns (`.cc:297-299`) and nothing changes. -/
+/-- `ValidateAndBeginPull` (`.cc:116-130`): rejects an expired/draining offer
+(`.cc:120-123`) or a duplicate pull (`.cc:125-128`), and otherwise claims
+`pull_started_ = true` (`.cc:129`) before `HandlePullStream` spawns the
+`StartPush` worker thread (`mgr.cc:1452-1508`). -/
+def beginPull (s : Send) : Option Send :=
+  if s.pullStarted = true ∨ s.life.draining = true ∨ s.life.done = true then none
+  else some { s with pullStarted := true }
+
+/-- `StartPush` with staging acquired (`.cc:268-313`), spawned after
+`ValidateAndBeginPull` claimed `pull_started_` (`mgr.cc:1452-1508`). A failed
+acquisition or worker spawn failure (`mgr.cc:1486-1494`) is `Finish(error)` with
+nothing in flight, i.e. `cancel`. On a session that finished meanwhile the call
+returns (`.cc:297-299`) and nothing changes. -/
 def start (s : Send) : Option Send :=
-  if s.started = true ∨ s.life.draining = true ∨ s.life.done = true then none
+  if s.pullStarted = false ∨ s.started = true ∨ s.life.draining = true ∨ s.life.done = true then none
   else if s.numLayers = 0 then some (s.finish true)
   else some { s with started := true }
 
@@ -284,6 +303,7 @@ def publish (s : Send) : Option Send :=
   else none
 
 def step (s : Send) : Ev → Option Send
+  | .beginPull => s.beginPull
   | .start => s.start
   | .d2hBegin => s.d2hBegin
   | .d2hIssue ok => s.d2hIssue ok
@@ -325,6 +345,13 @@ def CountersOrdered (s : Send) : Prop :=
     s.pooled + s.h2hIssued ≤ s.woken ∧
     s.h2hRetired ≤ s.h2hIssued ∧ s.h2hOk ≤ s.h2hRetired
 
+/-- `StartPush` (`started = true`) only runs after `ValidateAndBeginPull`
+claimed `pull_started_` (`pullStarted = true`), and no D2H copy is pending or
+issued before `StartPush` starts. -/
+def PullClaimed (s : Send) : Prop :=
+  (s.started = true → s.pullStarted = true) ∧
+  ((s.d2hPending = true ∨ 0 < s.d2hIssued) → s.started = true)
+
 /-- Events that advance or retire an in-flight operation. -/
 def drainEvents : List Ev :=
   [.d2hIssue true, .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext, .h2hDone true]
@@ -337,7 +364,7 @@ def NoOpLeak (s : Send) : Prop :=
 /-- Everything we want to know about a reachable send session. -/
 def Safe (s : Send) : Prop :=
   SettleSafe s ∧ Drained s ∧ StagingIntegrity s ∧ SettlesPromptly s ∧ NoUnderflow s ∧
-    Publication s ∧ CountersOrdered s ∧ NoOpLeak s
+    Publication s ∧ CountersOrdered s ∧ NoOpLeak s ∧ PullClaimed s
 
 /-! ## Inductive invariant -/
 
@@ -355,6 +382,7 @@ structure Inv (s : Send) : Prop where
   accounted : Accounted s
   no_underflow : s.underflow = false
   counters : CountersOrdered s
+  pull_claimed : PullClaimed s
   /-- A send that started draining without an error had pushed every layer. -/
   ok_draining : s.life.statusOk = true → s.life.draining = true → s.h2hOk = s.numLayers
   /-- Only settled sessions are published. -/
@@ -363,8 +391,8 @@ structure Inv (s : Send) : Prop where
   published_ok : s.published = some true → s.h2hOk = s.numLayers
 
 theorem inv_init (n : Nat) : Inv (init n) := by
-  refine ⟨Lifecycle.consistent_init, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
-    simp [init, Accounted, CountersOrdered]
+  refine ⟨Lifecycle.consistent_init, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+    simp [init, Accounted, CountersOrdered, PullClaimed]
 
 theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
   intro hif
@@ -396,10 +424,10 @@ theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
 
 theorem inv_safe {s : Send} (h : Inv s) : Safe s := by
   have hnl := inv_noOpLeak h
-  obtain ⟨hl, hacc, hu, hcnt, _, _, hpub⟩ := h
+  obtain ⟨hl, hacc, hu, hcnt, hpc, _, _, hpub⟩ := h
   unfold Accounted at hacc
   unfold CountersOrdered at hcnt
-  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, hu, hpub, hcnt, hnl⟩
+  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, hu, hpub, hcnt, hnl, hpc⟩
   intro hd
   have h0 := hl.done_idle hd
   cases hp : s.d2hPending <;> simp [hp] at hacc ⊢ <;> omega
@@ -435,35 +463,49 @@ theorem trySendNext_cases (s : Send) :
 
 /-- Each event preserves the invariant. -/
 theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : Inv s' := by
-  obtain ⟨hl, hacc, hu, hcnt, hdr, hpd, hpub⟩ := h
+  obtain ⟨hl, hacc, hu, hcnt, hpc, hdr, hpd, hpub⟩ := h
   unfold Accounted at hacc
   unfold CountersOrdered at hcnt
   cases e with
+  | beginPull =>
+    simp only [step, beginPull] at hs
+    split at hs
+    · cases hs
+    · cases hs
+      refine ⟨hl, by unfold Accounted; simpa using hacc, hu,
+        by unfold CountersOrdered; simpa using hcnt,
+        ⟨fun _ => rfl, hpc.2⟩, hdr, hpd, hpub⟩
   | start =>
     simp only [step, start] at hs
     split at hs
     · cases hs
-    · split at hs
+    · rename_i hng
+      have hpulled : s.pullStarted = true := by
+        cases hps : s.pullStarted
+        · exact absurd (Or.inl hps) hng
+        · rfl
+      split at hs
       · cases hs
         dsimp only [finish]
         refine ⟨Lifecycle.finishOnceLocked_consistent true hl,
-          by unfold Accounted; simpa using hacc, hu, hcnt,
+          by unfold Accounted; simpa using hacc, hu, hcnt, hpc,
           by intro _ _; simp; omega,
           fun b hp => Lifecycle.finishOnceLocked_done_mono true (hpd b hp), hpub⟩
       · cases hs
         exact ⟨hl, by unfold Accounted; simpa using hacc, hu,
-          by unfold CountersOrdered; simpa using hcnt, hdr, hpd, hpub⟩
+          by unfold CountersOrdered; simpa using hcnt,
+          ⟨fun _ => hpulled, fun _ => rfl⟩, hdr, hpd, hpub⟩
   | d2hBegin =>
     simp only [step, d2hBegin] at hs
     split at hs
     · rename_i hg
-      obtain ⟨_, hp, _⟩ := hg
+      obtain ⟨hst, hp, _⟩ := hg
       simp only [Option.map_eq_some_iff] at hs
       obtain ⟨l, hb, rfl⟩ := hs
       have := Lifecycle.beginOp_inFlight hb
       have hact := Lifecycle.beginOp_active hb
       have hdr' := Lifecycle.beginOp_draining hb
-      refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hu, ?_, ?_, ?_, hpub⟩
+      refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hu, ?_, ⟨hpc.1, fun _ => hst⟩, ?_, ?_, hpub⟩
       · unfold Accounted; simp [hp] at hacc; simp; omega
       · unfold CountersOrdered; simp [hp] at hcnt; simp; omega
       · simp [hdr']
@@ -480,6 +522,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         cases hq : s.d2hPending
         · exact absurd hq hp
         · rfl
+      have hst : s.started = true := hpc.2 (Or.inl hp')
       simp [hp'] at hacc hcnt
       split at hs
       · cases hs
@@ -488,26 +531,26 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         · rcases trySendNext_cases { s with d2hPending := false, d2hIssued := s.d2hIssued + 1 }
             with heq | ⟨hlt, hdr', hd', heq⟩
           · rw [heq]
-            refine ⟨hl, ?_, hu, ?_, hdr, hpd, hpub⟩
+            refine ⟨hl, ?_, hu, ?_, ⟨hpc.1, fun _ => hst⟩, hdr, hpd, hpub⟩
             · unfold Accounted; simp; omega
             · unfold CountersOrdered; simp; omega
           · rw [heq]
             simp at hlt hdr' hd'
-            refine ⟨Lifecycle.consistent_incr hl hdr', ?_, hu, ?_, ?_, ?_, hpub⟩
+            refine ⟨Lifecycle.consistent_incr hl hdr', ?_, hu, ?_, ⟨hpc.1, fun _ => hst⟩, ?_, ?_, hpub⟩
             · unfold Accounted; simp; omega
             · unfold CountersOrdered; simp; omega
             · simp [hdr']
             · intro b hq
               have := hpd b hq
               simp [hd'] at this
-        · refine ⟨hl, ?_, hu, ?_, hdr, hpd, hpub⟩
+        · refine ⟨hl, ?_, hu, ?_, ⟨hpc.1, fun _ => hst⟩, hdr, hpd, hpub⟩
           · unfold Accounted; simp; omega
           · unfold CountersOrdered; simp; omega
       · cases hs
         dsimp only [finish]
         rw [endOp_eq (by simp; omega)]
         refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent false hl),
-          ?_, hu, ?_, ?_, ?_, hpub⟩
+          ?_, hu, ?_, ⟨hpc.1, fun _ => hst⟩, ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
         · unfold CountersOrdered; simp; omega
         · intro hok _
@@ -520,14 +563,14 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     split at hs
     · cases hs
       exact ⟨hl, by unfold Accounted; simpa using hacc, hu,
-        by unfold CountersOrdered; simp; omega, hdr, hpd, hpub⟩
+        by unfold CountersOrdered; simp; omega, hpc, hdr, hpd, hpub⟩
     · cases hs
   | d2hEnd =>
     simp only [step, d2hEnd] at hs
     split at hs
     · cases hs
       rw [endOp_eq (by simp; omega)]
-      refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, hpub⟩
+      refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, hpc, ?_, ?_, hpub⟩
       · unfold Accounted; simp; omega
       · unfold CountersOrdered; simp; omega
       · simpa using hdr
@@ -542,7 +585,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         dsimp only [finish]
         rw [endOp_eq (by simp; omega)]
         refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent false hl),
-          ?_, hu, ?_, ?_, ?_, hpub⟩
+          ?_, hu, ?_, hpc, ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
         · unfold CountersOrdered; simp; omega
         · intro hok _
@@ -554,14 +597,14 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         · -- draining: the layer is dropped, the op ends
           cases hs
           rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, hpub⟩
+          refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, hpc, ?_, ?_, hpub⟩
           · unfold Accounted; simp; omega
           · unfold CountersOrdered; simp; omega
           · simpa using hdr
           · exact fun b hq => Lifecycle.endOpLocked_done_mono (hpd b hq)
         · -- scheduled on the push pool; the op is carried over
           cases hs
-          refine ⟨hl, ?_, hu, ?_, hdr, hpd, hpub⟩
+          refine ⟨hl, ?_, hu, ?_, hpc, hdr, hpd, hpub⟩
           · unfold Accounted; simp; omega
           · unfold CountersOrdered; simp; omega
     · cases hs
@@ -575,7 +618,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         have := Lifecycle.beginOp_inFlight hb
         have hact := Lifecycle.beginOp_active hb
         have hdr' := Lifecycle.beginOp_draining hb
-        refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hu, ?_, ?_, ?_, hpub⟩
+        refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hu, ?_, hpc, ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
         · unfold CountersOrdered; simp; omega
         · simp [hdr']
@@ -584,7 +627,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
           simp [hact.1] at this
       · cases hs
         rw [endOp_eq (by simp; omega)]
-        refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, hpub⟩
+        refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, hpc, ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
         · unfold CountersOrdered; simp; omega
         · simpa using hdr
@@ -597,7 +640,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       rcases trySendNext_cases { s with chaining := s.chaining - 1 }
         with heq | ⟨hlt, hdr', hd', heq⟩ <;> rw [heq]
       · rw [endOp_eq (by simp; omega)]
-        refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, hpub⟩
+        refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, hpc, ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
         · unfold CountersOrdered; simp; omega
         · simpa using hdr
@@ -605,7 +648,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       · simp at hlt hdr' hd'
         rw [endOp_eq (by simp)]
         refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.consistent_incr hl hdr'), ?_, hu, ?_,
-          ?_, ?_, hpub⟩
+          hpc, ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
         · unfold CountersOrdered; simp; omega
         · simp [hdr']
@@ -629,14 +672,14 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
           dsimp only [finish]
           rw [endOp_eq (by simp; omega)]
           refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent true hl),
-            ?_, hu, ?_, ?_, ?_, ?_⟩
+            ?_, hu, ?_, hpc, ?_, ?_, ?_⟩
           · unfold Accounted; simp; omega
           · unfold CountersOrdered; simp; omega
           · intro _ _; simp; omega
           · simp [hnp]
           · simp [hnp]
         · rw [endOp_eq (by simp; omega)]
-          refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, ?_, ?_, ?_⟩
+          refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hu, ?_, hpc, ?_, ?_, ?_⟩
           · unfold Accounted; simp; omega
           · unfold CountersOrdered; simp; omega
           · intro h1 h2
@@ -649,7 +692,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         dsimp only [finish]
         rw [endOp_eq (by simp; omega)]
         refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishOnceLocked_consistent false hl),
-          ?_, hu, ?_, ?_, ?_, ?_⟩
+          ?_, hu, ?_, hpc, ?_, ?_, ?_⟩
         · unfold Accounted; simp; omega
         · unfold CountersOrdered; simp; omega
         · intro hok _
@@ -664,7 +707,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     dsimp only [finish]
     refine ⟨Lifecycle.finishOnceLocked_consistent false hl,
       by unfold Accounted; simpa using hacc, hu,
-      by unfold CountersOrdered; simpa using hcnt, ?_,
+      by unfold CountersOrdered; simpa using hcnt, hpc, ?_,
       fun b hq => Lifecycle.finishOnceLocked_done_mono false (hpd b hq), hpub⟩
     intro hok _
     obtain ⟨h1, h2⟩ := hl.finishOnceLocked_false_statusOk (by simpa using hok)
@@ -676,7 +719,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       obtain ⟨hdone, _⟩ := hd
       cases hs
       refine ⟨hl, by unfold Accounted; simpa using hacc, hu,
-        by unfold CountersOrdered; simpa using hcnt, hdr, fun _ _ => hdone, ?_⟩
+        by unfold CountersOrdered; simpa using hcnt, hpc, hdr, fun _ _ => hdone, ?_⟩
       simp
       intro hst
       exact hdr hst (hl.done_draining hdone)
@@ -804,7 +847,7 @@ model (`Pipeline.lean`) attaches memory effects or layer guards to. -/
 
 /-- Unfold `step` for a known event and split every branch. -/
 macro "send_cases" hs:ident : tactic =>
-  `(tactic| (simp only [step, start, d2hBegin, d2hIssue, markD2hReady, d2hEnd, wake, h2hIssue,
+  `(tactic| (simp only [step, beginPull, start, d2hBegin, d2hIssue, markD2hReady, d2hEnd, wake, h2hIssue,
       sendNext, h2hDone, cancel, publish] at $hs:ident <;> (repeat' split at $hs:ident)))
 
 theorem step_numLayers {s s' : Send} {e : Ev} (hs : step s e = some s') :
@@ -815,9 +858,25 @@ theorem step_numLayers {s s' : Send} {e : Ev} (hs : step s e = some s') :
     | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
         (repeat' split) <;> rfl)
 
+theorem step_pullStarted_mono {s s' : Send} {e : Ev} (hs : step s e = some s')
+    (hp : s.pullStarted = true) : s'.pullStarted = true := by
+  cases e <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; simpa using hp)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> simp_all)
+
+theorem step_pullStarted_of_ne_beginPull {s s' : Send} {e : Ev} (hs : step s e = some s')
+    (he : e ≠ .beginPull) : s'.pullStarted = s.pullStarted := by
+  cases e <;> (try exact absurd rfl he) <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> rfl)
+
 theorem step_done_mono {s s' : Send} {e : Ev} (hs : step s e = some s') (hd : s.life.done = true) :
     s'.life.done = true := by
-  cases e <;> simp only [step, start, d2hBegin, d2hIssue, markD2hReady, d2hEnd, wake, h2hIssue,
+  cases e <;> simp only [step, beginPull, start, d2hBegin, d2hIssue, markD2hReady, d2hEnd, wake, h2hIssue,
       sendNext, h2hDone, cancel, publish, endOp, finish, trySendNext,
       Lifecycle.finishOnceLocked_inFlight, Lifecycle.beginOp_of_done hd, Option.map_none] at hs <;>
     (repeat' split at hs) <;> cases hs <;>
@@ -862,7 +921,7 @@ theorem wake_woken {s s' : Send} {ok : Bool} (hs : step s (.wake ok) = some s') 
   simp only [step, wake] at hs
   split at hs
   · (repeat' split at hs) <;> cases hs <;>
-      simp only [endOp, finish, Lifecycle.finishOnceLocked_inFlight] <;> (repeat' split) <;> rfl
+       simp only [endOp, finish, Lifecycle.finishOnceLocked_inFlight] <;> (repeat' split) <;> rfl
   · cases hs
 
 theorem h2hDone_guard {s s' : Send} {ok : Bool} (hs : step s (.h2hDone ok) = some s') :
@@ -908,7 +967,7 @@ the push chain: layer 1's push is only issued after layer 0's, and
 `sendNext` after the last layer takes no op. -/
 theorem trace_normal :
     ((sys 2).run
-      [.start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
+      [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
        .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
        .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
        .h2hDone true, .h2hDone true, .publish]).map
@@ -923,23 +982,47 @@ theorem trace_normal :
 `kv_cache_manager_with_transfer_pool_reshard_test.cc:338-347`): before the
 deadline an unpulled send holds its staging and cannot be published; once the
 deadline fires on the idle send it settles at once, releases its staging,
-publishes failure (`some false`), and rejects any late `.start`. -/
+publishes failure (`some false`), and rejects any late `.beginPull` or `.start`. -/
 theorem trace_never_pulled :
     ((sys 2).run []).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (false, true, none) ∧
     (sys 2).run [.publish] = none ∧
+    (sys 2).run [.start] = none ∧
     ((sys 2).run [.cancel, .publish]).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) ∧
+    (sys 2).run [.cancel, .beginPull] = none ∧
     (sys 2).run [.cancel, .start] = none := by
+  decide
+
+/-- `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement`
+(`kv_cache_manager_with_transfer_control_test.cc:367-379`): once `ValidateAndBeginPull`
+(`.beginPull`) has claimed `pull_started_ = true`, any duplicate pull is
+rejected both before and after `StartPush` (`.start`) begins. -/
+theorem trace_duplicate_pull_rejected :
+    ((sys 1).run [.beginPull]).map (fun s => (s.pullStarted, s.started)) = some (true, false) ∧
+    (sys 1).run [.beginPull, .beginPull] = none ∧
+    (sys 1).run [.beginPull, .start, .beginPull] = none := by
+  decide
+
+/-- `HandlePullStream` worker spawn failure (`mgr.cc:1486-1494`,
+`hooks::kKvCacheManagerPullSpawn`): if `ValidateAndBeginPull` (`.beginPull`)
+succeeds but spawning the `StartPush` thread fails, `counter_cleanup` calls
+`session->Finish(InternalError)` (`.cancel`), which settles the session at once,
+releases staging, reports failure, and blocks any late `.start`. -/
+theorem trace_pull_spawn_failure_cleanup :
+    ((sys 1).run [.beginPull, .cancel, .publish]).map
+      (fun s => (s.pullStarted, s.started, s.life.done, s.life.hasStaging, s.published)) =
+      some (true, false, true, false, some false) ∧
+    (sys 1).run [.beginPull, .cancel, .start] = none := by
   decide
 
 /-- The deadline fires while a copy runs: the send drains, keeps its staging,
 issues nothing more, and settles when the copy's `OnReady` ends the op. -/
 theorem trace_deadline_during_copy :
-    ((sys 2).run [.start, .d2hBegin, .d2hIssue true, .cancel]).map
+    ((sys 2).run [.beginPull, .start, .d2hBegin, .d2hIssue true, .cancel]).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
-    (sys 2).run [.start, .d2hBegin, .d2hIssue true, .cancel, .d2hBegin] = none ∧
-    ((sys 2).run [.start, .d2hBegin, .d2hIssue true, .cancel, .d2hReady, .d2hEnd, .publish]).map
+    (sys 2).run [.beginPull, .start, .d2hBegin, .d2hIssue true, .cancel, .d2hBegin] = none ∧
+    ((sys 2).run [.beginPull, .start, .d2hBegin, .d2hIssue true, .cancel, .d2hReady, .d2hEnd, .publish]).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
@@ -947,7 +1030,7 @@ theorem trace_deadline_during_copy :
 dropped by `h2hIssue`'s re-check, and the send is published as failed. -/
 theorem trace_push_fails :
     ((sys 2).run
-      [.start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
+      [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
        .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
        .d2hReady, .d2hEnd, .wake true, .h2hDone false, .h2hIssue, .publish]).map
       (fun s => (s.life.done, s.h2hIssued, s.published)) = some (true, 1, some false) := by
@@ -958,14 +1041,14 @@ while a D2H `OnReady` may still be outstanding; a `Finish(error)` in that
 window is ignored. -/
 theorem trace_cancel_after_ok_finish :
     ((sys 1).run
-      [.start, .d2hBegin, .d2hIssue true, .d2hReady, .wake true, .h2hIssue, .sendNext,
+      [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady, .wake true, .h2hIssue, .sendNext,
        .h2hDone true, .cancel, .d2hEnd, .publish]).map
       (fun s => (s.life.statusOk, s.published)) = some (true, some true) := by
   decide
 
 /-- A zero-layer send finishes OK inside `StartPush`. -/
 theorem trace_zero_layers :
-    ((sys 0).run [.start, .publish]).map (fun s => s.published) = some (some true) := by
+    ((sys 0).run [.beginPull, .start, .publish]).map (fun s => s.published) = some (some true) := by
   decide
 
 /-- `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone`:
@@ -975,7 +1058,7 @@ two layers; layer 0's H2H push and layer 1's D2H copy are both in flight when
 `draining`, drops layer 1's H2H (`h2hIssued = 1`), and settles (`done = true`,
 `hasStaging = false`), after which `.start` is rejected. -/
 theorem trace_drain_h2h_and_d2h :
-    let pre := [.start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
+    let pre := [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
                 .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
                 .cancel, .h2hDone true]
     ((sys 2).run pre).map
@@ -990,7 +1073,7 @@ theorem trace_drain_h2h_and_d2h :
 D2H copy fails while layer 1's D2H copy is still running; the failure and
 staging slot are held back until layer 1's copy finishes. -/
 theorem trace_failed_d2h_waits_for_other_layer :
-    let pre := [.start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
+    let pre := [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
                 .d2hReady, .wake false, .d2hEnd]
     ((sys 2).run pre).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
@@ -1005,13 +1088,13 @@ in flight, a subsequent OK push completion (`h2hDone true` calling `finish true`
 cannot override the earlier failure. -/
 theorem trace_ok_after_cancel_keeps_failure :
     ((sys 1).run
-      [.start, .d2hBegin, .d2hIssue true, .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
+      [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
        .cancel, .h2hDone true, .publish]).map
       (fun s => (s.life.done, s.life.statusOk, s.published)) = some (true, false, some false) := by
   decide
 
 def events : List Ev :=
-  [.start, .d2hBegin, .d2hIssue true, .d2hIssue false, .d2hReady, .d2hEnd,
+  [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hIssue false, .d2hReady, .d2hEnd,
    .wake true, .wake false, .h2hIssue, .sendNext, .h2hDone true, .h2hDone false,
    .cancel, .publish]
 
@@ -1028,7 +1111,9 @@ def violates (s : Send) : Bool :=
     s.d2hIssued + (if s.d2hPending then 1 else 0) ≤ s.numLayers &&
     s.woken ≤ s.queued && s.queued ≤ s.d2hIssued && s.woken ≤ s.d2hReady &&
     s.pooled + s.h2hIssued ≤ s.woken && s.h2hRetired ≤ s.h2hIssued && s.h2hOk ≤ s.h2hRetired) ||
-  (0 < s.life.inFlight && !(drainEvents.any fun e => (step s e).isSome))
+  (0 < s.life.inFlight && !(drainEvents.any fun e => (step s e).isSome)) ||
+  (s.started && !s.pullStarted) ||
+  ((s.d2hPending || 0 < s.d2hIssued) && !s.started)
 
 #guard ModelCheck.check (sys 2) events violates 12 = .outOfFuel
 
@@ -1065,7 +1150,7 @@ def d2hIssueUncounted (ok : Bool) (s : Send) : Option Send :=
 #guard (match ModelCheck.check ⟨init 1, fun s e => match e with
           | .sendNext => sendNextUncounted s
           | .d2hIssue ok => d2hIssueUncounted ok s
-          | e => step s e⟩ events violates 8 with
+          | e => step s e⟩ events violates 9 with
         | .counterexample _ => true
         | _ => false)
 
@@ -1086,7 +1171,7 @@ def sendNextUnbounded (s : Send) : Option Send :=
 
 #guard (match ModelCheck.check ⟨init 1, fun s e => match e with
           | .sendNext => sendNextUnbounded s
-          | e => step s e⟩ events violates 8 with
+          | e => step s e⟩ events violates 9 with
         | .counterexample _ => true
         | _ => false)
 
