@@ -111,27 +111,41 @@ absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
   return absl::OkStatus();
 }
 
+const ::tpu_sync::rpc::PoolHostAddrsProto* FindReceiverAddrs(
+    const ::tpu_sync::rpc::StartTransferRequest& request,
+    absl::string_view peer, int32_t idx) {
+  if (peer.empty()) return nullptr;
+  auto receiver_it = request.receiver_addrs().find(std::string(peer));
+  if (receiver_it == request.receiver_addrs().end()) return nullptr;
+  const auto& pools = receiver_it->second.pools();
+  auto pool_it = pools.find(idx);
+  if (pool_it == pools.end() || pool_it->second.host_base_addrs().empty()) {
+    return nullptr;
+  }
+  return &pool_it->second;
+}
+
 // Returns the receiver's host addresses for the sender's local pool
 // `pool_idx`, or nullptr if the sender cannot compute remote addresses.
 const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverPoolAddrs(
     const ::tpu_sync::rpc::StartTransferRequest& request,
     absl::string_view peer, size_t pool_idx) {
-  if (request.pool_groups_size() == 0 || peer.empty()) return nullptr;
-  auto receiver_it = request.receiver_addrs().find(std::string(peer));
-  if (receiver_it == request.receiver_addrs().end()) return nullptr;
-  // Receivers report addresses under their own (wire) pool index; a sender
-  // rewritten into its own index space maps local -> wire.
+  if (request.pool_groups_size() == 0) return nullptr;
   int32_t wire_pool_idx = static_cast<int32_t>(pool_idx);
   if (auto wire_it = request.wire_pool_indices().find(wire_pool_idx);
       wire_it != request.wire_pool_indices().end()) {
     wire_pool_idx = wire_it->second;
   }
-  const auto& pools = receiver_it->second.pools();
-  auto pool_it = pools.find(wire_pool_idx);
-  if (pool_it == pools.end() || pool_it->second.host_base_addrs().empty()) {
-    return nullptr;
-  }
-  return &pool_it->second;
+  return FindReceiverAddrs(request, peer, wire_pool_idx);
+}
+
+// Returns the receiver's host addresses for layer `layer_idx` of a planned
+// transfer.
+const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverLayerAddrs(
+    const ::tpu_sync::rpc::StartTransferRequest& request,
+    absl::string_view peer, size_t layer_idx) {
+  if (request.pool_groups_size() > 0) return nullptr;
+  return FindReceiverAddrs(request, peer, static_cast<int32_t>(layer_idx));
 }
 
 // Returns the chunk's address in the receiver's host memory, or nullptr if
@@ -2391,6 +2405,13 @@ KVCacheManagerBase::PoolHostBaseAddrs(uint64_t uuid, size_t pool_idx) const {
 std::vector<::tpu_sync::rpc::PoolHostAddrsProto>
 KVCacheManagerBase::LayerHostAddrs(uint64_t uuid) const {
   if (explicit_pools_) return {};
+  {
+    absl::MutexLock l(plans_mu_);
+    auto it = active_plans_.find(uuid);
+    if (it != active_plans_.end() && !it->second->host_block_of.empty()) {
+      return {};
+    }
+  }
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
   layer_host_addrs.reserve(num_layers_);
   for (size_t l = 0; l < num_layers_; ++l) {
@@ -3329,10 +3350,13 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     return std::find(indices.begin(), indices.end(),
                      static_cast<int32_t>(layer_idx)) != indices.end();
   };
-  const ::tpu_sync::rpc::PoolHostAddrsProto* dst_pool =
-      is_sender && explicit_pools_
-          ? GetReceiverPoolAddrs(request, peer, layer_idx)
-          : nullptr;
+
+  const ::tpu_sync::rpc::PoolHostAddrsProto* dst_addrs = nullptr;
+  if (is_sender) {
+    dst_addrs = explicit_pools_
+                    ? GetReceiverPoolAddrs(request, peer, layer_idx)
+                    : GetReceiverLayerAddrs(request, peer, layer_idx);
+  }
 
   std::vector<tpu_raiden::transport::BlockChunk> chunks;
   size_t accumulated_bytes = 0;
@@ -3385,7 +3409,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
               block_resolved_chunks.push_back(
                   {.ptr = block_base + src_offset,
                    .size = size,
-                   .raddr = RemoteAddress(dst_pool, entry.dst_shard_idx(),
+                   .raddr = RemoteAddress(dst_addrs, entry.dst_shard_idx(),
                                           entry.dst_block_id(), dst_offset,
                                           entry.size_bytes())});
             }

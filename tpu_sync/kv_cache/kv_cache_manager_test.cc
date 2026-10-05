@@ -777,6 +777,52 @@ TEST(KVCacheManagerTest, PlanlessPushRaddrUsesPeerLayerAddrs) {
   EXPECT_EQ(send_chunks[0].raddr, nullptr);
 }
 
+TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverLayerAddrs) {
+  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/2,
+                              /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/2,
+                            /*slice_byte_size=*/128, /*host_blocks=*/4);
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(9);
+  auto* entry = (*request.mutable_shard_push_schedules())[1].add_entries();
+  entry->set_dst_peer("peer");
+  entry->set_dst_shard_idx(1);
+  entry->set_dst_offset_bytes(32);
+  entry->set_src_offset_bytes(0);
+  entry->set_size_bytes(64);
+  entry->set_src_block_id(2);
+  entry->set_dst_block_id(3);
+  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false));
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
+      receiver.LayerHostAddrs(/*uuid=*/9);
+  ASSERT_EQ(layer_host_addrs.size(), 2u);
+  auto& pools = *(*request.mutable_receiver_addrs())["peer"].mutable_pools();
+  for (int32_t l = 0; l < 2; ++l) pools[l] = layer_host_addrs[l];
+  ABSL_ASSERT_OK(sender.RegisterActivePlan(9, request, /*is_sender=*/true));
+
+  std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
+      /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{3},
+      /*total_bytes=*/64, /*uuid=*/9, /*sender_node_id=*/1, /*peer=*/"peer");
+  std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
+      /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{2},
+      /*total_bytes=*/64, /*uuid=*/9, /*sender_node_id=*/-1, /*peer=*/"peer");
+  ASSERT_EQ(recv_chunks.size(), 1u);
+  ASSERT_EQ(send_chunks.size(), 1u);
+  EXPECT_EQ(send_chunks[0].raddr, recv_chunks[0].ptr);
+}
+
+// A plan staging blocks away from their own ids is not described by layers.
+TEST(KVCacheManagerTest, LayerHostAddrsEmptyWhenPlanRemapsHostBlocks) {
+  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/1,
+                              /*slice_byte_size=*/128, /*host_blocks=*/4);
+  EXPECT_EQ(receiver.LayerHostAddrs(/*uuid=*/9).size(), 2u);
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(9);
+  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false,
+                                             /*host_block_of=*/{{3, 1}}));
+  EXPECT_TRUE(receiver.LayerHostAddrs(/*uuid=*/9).empty());
+}
+
 class TestD2hKVCacheManager : public TestKVCacheManager {
  public:
   TestD2hKVCacheManager(size_t num_layers, size_t num_shards,
