@@ -19,10 +19,26 @@
 #include <string>
 
 #include "absl/log/log.h"
+#include "absl/status/status.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/cord.h"
 #include "absl/strings/string_view.h"
 
 namespace tpu_raiden {
+
+namespace {
+constexpr absl::string_view kNotSentPayloadUrl =
+    "tpu_raiden.control_pipe.not_sent";
+}  // namespace
+
+absl::Status MarkControlPipeNotSent(absl::Status status) {
+  status.SetPayload(kNotSentPayloadUrl, absl::Cord());
+  return status;
+}
+
+bool IsControlPipeNotSent(const absl::Status& status) {
+  return status.GetPayload(kNotSentPayloadUrl).has_value();
+}
 
 std::optional<ControlPipeBackendType> ParseControlPipeBackendType(
     absl::string_view name) {

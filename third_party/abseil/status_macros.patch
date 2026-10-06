@@ -1,0 +1,244 @@
+diff -Naur a/absl/status/BUILD.bazel b/absl/status/BUILD.bazel
+--- a/absl/status/BUILD.bazel
++++ b/absl/status/BUILD.bazel
+@@ -209,3 +209,21 @@
+         "@googletest//:gtest_main",
+     ],
+ )
++
++# Added by tpu-raiden: ABSL_RETURN_IF_ERROR and ABSL_ASSIGN_OR_RETURN.
++cc_library(
++    name = "status_macros",
++    hdrs = ["status_macros.h"],
++    copts = ABSL_DEFAULT_COPTS,
++    linkopts = ABSL_DEFAULT_LINKOPTS,
++    visibility = ["//visibility:public"],
++    deps = [
++        ":status",
++        ":statusor",
++        "//absl/base:core_headers",
++        "//absl/base:log_severity",
++        "//absl/log",
++        "//absl/strings",
++        "//absl/strings:cord",
++    ],
++)
+diff -Naur a/absl/status/status_macros.h b/absl/status/status_macros.h
+--- a/absl/status/status_macros.h
++++ b/absl/status/status_macros.h
+@@ -0,0 +1,215 @@
++// Backport of ABSL_RETURN_IF_ERROR and ABSL_ASSIGN_OR_RETURN for Abseil releases
++// predating them. Added by tpu-raiden for JAX 0.10.x compatibility.
++
++#ifndef ABSL_STATUS_STATUS_MACROS_H_
++#define ABSL_STATUS_STATUS_MACROS_H_
++
++#include <optional>
++#include <sstream>
++#include <string>
++#include <type_traits>
++#include <utility>
++
++#include "absl/base/attributes.h"
++#include "absl/base/log_severity.h"
++#include "absl/base/optimization.h"
++#include "absl/log/log.h"
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/cord.h"
++#include "absl/strings/str_cat.h"
++#include "absl/strings/string_view.h"
++
++namespace absl {
++namespace status_macros_backport_internal {
++
++// Header-only subset of absl::StatusBuilder (abseil 20260526.0): `<<`,
++// SetAppend/SetPrepend/SetNoLogging, Log/LogInfo/LogWarning/LogError, VLog,
++// SetPayload and With. Logging happens when the builder is converted.
++class ABSL_MUST_USE_RESULT StatusBuilder {
++ public:
++  explicit StatusBuilder(const absl::Status& status) : status_(status) {}
++  explicit StatusBuilder(absl::Status&& status) : status_(std::move(status)) {}
++  explicit StatusBuilder(absl::StatusCode code) : status_(code, "") {}
++
++  StatusBuilder& SetPrepend() & {
++    join_ = Join::kPrepend;
++    return *this;
++  }
++  StatusBuilder&& SetPrepend() && { return std::move(SetPrepend()); }
++
++  StatusBuilder& SetAppend() & {
++    join_ = Join::kAppend;
++    return *this;
++  }
++  StatusBuilder&& SetAppend() && { return std::move(SetAppend()); }
++
++  StatusBuilder& SetNoLogging() & {
++    log_ = LogMode::kNone;
++    return *this;
++  }
++  StatusBuilder&& SetNoLogging() && { return std::move(SetNoLogging()); }
++
++  StatusBuilder& Log(absl::LogSeverity level) & {
++    log_ = LogMode::kLog;
++    severity_ = level;
++    return *this;
++  }
++  StatusBuilder&& Log(absl::LogSeverity level) && {
++    return std::move(Log(level));
++  }
++  StatusBuilder& LogError() & { return Log(absl::LogSeverity::kError); }
++  StatusBuilder&& LogError() && { return std::move(LogError()); }
++  StatusBuilder& LogWarning() & { return Log(absl::LogSeverity::kWarning); }
++  StatusBuilder&& LogWarning() && { return std::move(LogWarning()); }
++  StatusBuilder& LogInfo() & { return Log(absl::LogSeverity::kInfo); }
++  StatusBuilder&& LogInfo() && { return std::move(LogInfo()); }
++
++  StatusBuilder& VLog(int verbose_level) & {
++    log_ = LogMode::kVLog;
++    verbose_level_ = verbose_level;
++    return *this;
++  }
++  StatusBuilder&& VLog(int verbose_level) && {
++    return std::move(VLog(verbose_level));
++  }
++
++  template <typename T>
++  StatusBuilder& operator<<(const T& value) & {
++    std::ostringstream os;
++    os << value;
++    message_ += os.str();
++    return *this;
++  }
++  template <typename T>
++  StatusBuilder&& operator<<(const T& value) && {
++    return std::move(*this << value);
++  }
++
++  StatusBuilder& SetPayload(absl::string_view type_url, absl::Cord payload) & {
++    status_.SetPayload(type_url, std::move(payload));
++    return *this;
++  }
++  StatusBuilder&& SetPayload(absl::string_view type_url,
++                             absl::Cord payload) && {
++    return std::move(SetPayload(type_url, std::move(payload)));
++  }
++
++  // Returns `adaptor(std::move(*this))`, e.g. a lambda taking StatusBuilder&&.
++  template <typename Adaptor>
++  auto With(Adaptor&& adaptor) & -> decltype(std::forward<Adaptor>(adaptor)(
++      std::declval<StatusBuilder&&>())) {
++    return std::forward<Adaptor>(adaptor)(std::move(*this));
++  }
++  template <typename Adaptor>
++  auto With(Adaptor&& adaptor) && -> decltype(std::forward<Adaptor>(adaptor)(
++      std::declval<StatusBuilder&&>())) {
++    return std::forward<Adaptor>(adaptor)(std::move(*this));
++  }
++
++  bool ok() const { return status_.ok(); }
++  absl::StatusCode code() const { return status_.code(); }
++
++  operator absl::Status() const& { return CreateStatus(); }
++  operator absl::Status() && { return CreateStatus(); }
++
++  template <typename T, typename = std::enable_if_t<
++                            !std::is_same_v<std::decay_t<T>, absl::Status> &&
++                            std::is_constructible_v<T, absl::Status>>>
++  operator T() const {
++    return T(CreateStatus());
++  }
++
++ private:
++  enum class Join { kAnnotate, kPrepend, kAppend };
++  enum class LogMode { kNone, kLog, kVLog };
++
++  absl::Status CreateStatus() const {
++    absl::Status result = JoinMessage();
++    if (!result.ok()) {
++      if (log_ == LogMode::kLog) {
++        LOG(LEVEL(severity_)) << result;
++      } else if (log_ == LogMode::kVLog) {
++        VLOG(verbose_level_) << result;
++      }
++    }
++    return result;
++  }
++
++  absl::Status JoinMessage() const {
++    if (status_.ok() || message_.empty()) return status_;
++    std::string joined;
++    switch (join_) {
++      case Join::kAnnotate:
++        joined = status_.message().empty()
++                     ? message_
++                     : absl::StrCat(status_.message(), "; ", message_);
++        break;
++      case Join::kPrepend:
++        joined = absl::StrCat(message_, status_.message());
++        break;
++      case Join::kAppend:
++        joined = absl::StrCat(status_.message(), message_);
++        break;
++    }
++    absl::Status result(status_.code(), joined);
++    status_.ForEachPayload(
++        [&result](absl::string_view type_url, const absl::Cord& payload) {
++          result.SetPayload(type_url, payload);
++        });
++    return result;
++  }
++
++  absl::Status status_;
++  std::string message_;
++  Join join_ = Join::kAnnotate;
++  LogMode log_ = LogMode::kNone;
++  absl::LogSeverity severity_ = absl::LogSeverity::kInfo;
++  int verbose_level_ = 0;
++};
++
++}  // namespace status_macros_backport_internal
++}  // namespace absl
++
++#define ABSL_STATUS_MACROS_CONCAT_INNER_(x, y) x##y
++#define ABSL_STATUS_MACROS_CONCAT_(x, y) ABSL_STATUS_MACROS_CONCAT_INNER_(x, y)
++
++#define ABSL_RETURN_IF_ERROR(expr)                                          \
++  ABSL_RETURN_IF_ERROR_IMPL_(ABSL_STATUS_MACROS_CONCAT_(_status, __COUNTER__), \
++                             expr)
++
++#define ABSL_RETURN_IF_ERROR_IMPL_(status, expr)  \
++  auto status = (expr);                           \
++  if (ABSL_PREDICT_FALSE(!status.ok())) {         \
++    return status;                                \
++  }
++
++#define ABSL_ASSIGN_OR_RETURN(...)                                     \
++  ABSL_STATUS_MACROS_VARIADIC_(__VA_ARGS__, ABSL_ASSIGN_OR_RETURN_3_,  \
++                               ABSL_ASSIGN_OR_RETURN_2_)(__VA_ARGS__)
++
++#define ABSL_STATUS_MACROS_VARIADIC_(_1, _2, _3, NAME, ...) NAME
++
++#define ABSL_ASSIGN_OR_RETURN_2_(lhs, rexpr) \
++  ABSL_ASSIGN_OR_RETURN_3_(lhs, rexpr, _)
++
++#define ABSL_ASSIGN_OR_RETURN_3_(lhs, rexpr, error_expr)                     \
++  ABSL_ASSIGN_OR_RETURN_IMPL_(                                               \
++      ABSL_STATUS_MACROS_CONCAT_(_status_or, __COUNTER__), lhs, rexpr,          \
++      error_expr)
++
++#define ABSL_ASSIGN_OR_RETURN_IMPL_(statusor, lhs, rexpr, error_expr)         \
++  auto statusor = (rexpr);                                                    \
++  if (ABSL_PREDICT_FALSE(!statusor.ok())) {                                   \
++    [[maybe_unused]] ::absl::status_macros_backport_internal::StatusBuilder _( \
++        std::move(statusor).status());                                        \
++    return (error_expr);                                                      \
++  }                                                                           \
++  lhs = std::move(statusor).value()
++
++#ifdef ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS
++#define ASSIGN_OR_RETURN(...) ABSL_ASSIGN_OR_RETURN(__VA_ARGS__)
++#define RETURN_IF_ERROR(...) ABSL_RETURN_IF_ERROR(__VA_ARGS__)
++#endif  // ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS
++
++#endif  // ABSL_STATUS_STATUS_MACROS_H_

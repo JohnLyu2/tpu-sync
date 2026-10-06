@@ -196,6 +196,26 @@ TEST(KVCacheStoreBackendFactoryTest, KVCacheStoreCreateIntegration) {
   EXPECT_EQ(store->backend()->name(), "HostOffloadBackend");
 }
 
+TEST(ApplyParallelismToPropertiesTest, SetsTopologyProperties) {
+  BackendConfig config;
+  config.type = "posix";
+  ApplyParallelismToProperties({.tp_size = 4, .tp_rank = 2}, &config);
+  EXPECT_EQ(config.GetProperty("tp_size"), "4");
+  EXPECT_EQ(config.GetProperty("tp_rank"), "2");
+}
+
+TEST(ApplyParallelismToPropertiesTest, OverridesCallerTopologyProperties) {
+  BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("tp_size", "8");
+  config.SetProperty("tp_rank", "7");
+  config.SetProperty("root_dir", "/some/dir");
+  ApplyParallelismToProperties({.tp_size = 4, .tp_rank = 1}, &config);
+  EXPECT_EQ(config.GetProperty("tp_size"), "4");
+  EXPECT_EQ(config.GetProperty("tp_rank"), "1");
+  EXPECT_EQ(config.GetProperty("root_dir"), "/some/dir");
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

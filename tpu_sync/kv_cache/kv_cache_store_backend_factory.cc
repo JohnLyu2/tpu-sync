@@ -31,6 +31,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -77,6 +78,12 @@ void BackendConfig::SetProperty(absl::string_view key,
 
 bool BackendConfig::HasProperty(absl::string_view key) const {
   return properties.contains(key);
+}
+
+void ApplyParallelismToProperties(
+    const backends::ParallelismConfig& parallelism, BackendConfig* config) {
+  config->SetProperty("tp_size", absl::StrCat(parallelism.tp_size));
+  config->SetProperty("tp_rank", absl::StrCat(parallelism.tp_rank));
 }
 
 KVCacheStoreBackendFactory& KVCacheStoreBackendFactory::Instance() {

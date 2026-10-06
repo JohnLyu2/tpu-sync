@@ -33,6 +33,7 @@
 namespace raiden {
 namespace {
 
+#if RAIDEN_JAX >= 1100
 // Returns the runtime jaxlib version as (major * 10000 + minor * 100 + patch),
 // e.g., 0.11.0 -> 1100, 0.11.1 -> 1101, 0.11.2 -> 1102.
 int GetRuntimeJaxVersion() {
@@ -66,20 +67,23 @@ int GetRuntimeJaxVersion() {
   }();
   return version;
 }
+#endif  // RAIDEN_JAX >= 1100
 
-// Mirrors jaxlib's private PyArrayObject layout. Fields must match jaxlib
-// exactly across Python versions: Python < 3.12 includes weakrefs and dict.
+// Mirrors jaxlib's private PyArrayObject from py_array.cc.
 struct PyArrayObject {
   PyObject_HEAD;
-#if PY_VERSION_HEX < 0x030C0000
+#if RAIDEN_JAX < 1100 && PY_VERSION_HEX < 0x030C0000
   PyObject* weakrefs;
   PyObject* dict;
-#endif  // PY_VERSION_HEX < 0x030C0000
+#endif
   bool initialized;
   alignas(
       jax::PyArray::Storage) char array_storage[sizeof(jax::PyArray::Storage)];
 };
 
+// Runtime dispatch across 0.11.x jaxlibs. 0.10.x builds use their own headers'
+// layout directly.
+#if RAIDEN_JAX >= 1100
 // In JAX 0.11.0 and 0.11.1, PyArray_Storage placed ifrt_array at byte offset 80
 // (aval [8B], weak_type + pad [8B], dtype [8B], shape [24B], sharding [8B],
 // npy_value [8B], committed + pad [8B], py_client [8B]). In JAX 0.11.2+,
@@ -90,52 +94,25 @@ struct PyArrayStorage_0_11_0 {
   xla::ifrt::ArrayRef ifrt_array;
 };
 static_assert(offsetof(PyArrayStorage_0_11_0, ifrt_array) == 80);
+#if RAIDEN_JAX >= 1102
 static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 88);
-
-// Vtable layout of xla::ifrt::PjRtCompatibleArray in JAX 0.11.0, where
-// xla::ifrt::Value inherited from llvm::RTTIRoot (+3 virtual slots:
-// dynamicClassID, isA, anchor) and xla::ifrt::Array did not yet declare
-// array_spec() (-1 virtual slot), placing pjrt_buffers() at vtable slot 21
-// instead of slot 19 (JAX 0.11.1+).
-class PjRtCompatibleArray_0_11_0 {
- public:
-  virtual ~PjRtCompatibleArray_0_11_0() = default;
-  // llvm::RTTIRoot (3 slots)
-  virtual void vslot_02() = 0;
-  virtual void vslot_03() = 0;
-  virtual void vslot_04() = 0;
-  // xla::ifrt::Value (6 slots)
-  virtual void vslot_05() = 0;
-  virtual void vslot_06() = 0;
-  virtual void vslot_07() = 0;
-  virtual void vslot_08() = 0;
-  virtual void vslot_09() = 0;
-  virtual void vslot_10() = 0;
-  // xla::ifrt::Array (10 slots in 0.11.0)
-  virtual void vslot_11() = 0;
-  virtual void vslot_12() = 0;
-  virtual void vslot_13() = 0;
-  virtual void vslot_14() = 0;
-  virtual void vslot_15() = 0;
-  virtual void vslot_16() = 0;
-  virtual void vslot_17() = 0;
-  virtual void vslot_18() = 0;
-  virtual void vslot_19() = 0;
-  virtual void vslot_20() = 0;
-  // xla::ifrt::PjRtCompatibleArray::pjrt_buffers() (slot 21)
-  virtual absl::Span<const std::shared_ptr<xla::PjRtBuffer>> pjrt_buffers() = 0;
-};
+#else
+static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 80);
+#endif
+#endif  // RAIDEN_JAX >= 1100
 
 xla::ifrt::Array* GetIfrtArray(PyObject* obj) ABSL_NO_THREAD_SAFETY_ANALYSIS {
   auto* py_array_object = reinterpret_cast<PyArrayObject*>(obj);
   if (!py_array_object->initialized) {
     throw std::runtime_error("PyArrayObject not initialized");
   }
+#if RAIDEN_JAX >= 1100
   if (GetRuntimeJaxVersion() < 1102) {
     return std::launder(reinterpret_cast<PyArrayStorage_0_11_0*>(
                             py_array_object->array_storage))
         ->ifrt_array.get();
   }
+#endif
   return std::launder(reinterpret_cast<jax::PyArray::Storage*>(
                           py_array_object->array_storage))
       ->ifrt_array.get();
@@ -148,10 +125,14 @@ xla::ifrt::PjRtCompatibleArray* CastToPjRtCompatibleArray(
   // CopyArraysToHostBufferShards; skip the runtime_type() check there and
   // static_cast directly (cross-DSO dynamic_cast is unavailable in OSS builds
   // because _jax.so hides RTTI symbols).
+#if RAIDEN_JAX >= 1100
   if (GetRuntimeJaxVersion() >= 1102 &&
       ifrt_array->client()->runtime_type() != "pjrt_ifrt") {
     return nullptr;
   }
+#else
+  if (ifrt_array->client()->runtime_type() != "pjrt_ifrt") return nullptr;
+#endif
   return static_cast<xla::ifrt::PjRtCompatibleArray*>(ifrt_array);
 }
 
@@ -163,12 +144,8 @@ xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj)
   if (arr == nullptr) {
     throw std::runtime_error("Not a PjRt compatible array");
   }
-  if (GetRuntimeJaxVersion() < 1101) {
-    return reinterpret_cast<PjRtCompatibleArray_0_11_0*>(arr)
-        ->pjrt_buffers()
-        .front()
-        .get();
-  }
+  // The extension is built against the selected JAX's own headers, so the
+  // direct virtual call uses the correct vtable slot.
   return arr->pjrt_buffers().front().get();
 }
 

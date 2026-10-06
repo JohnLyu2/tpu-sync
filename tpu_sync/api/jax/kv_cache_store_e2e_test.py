@@ -445,14 +445,15 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           "[JAX E2E Storage][Step 2/11] Configuring POSIX secondary storage"
           f" backend (direct_io={direct_io}):\n  root_dir: {temp_dir}\n "
           " model_name: llama_70b_jax\n "
-          f" tp_size: {self.num_devices}, tp_rank: 0\n  shard_size_bytes:"
+          " tp_size: 1, tp_rank: 0\n  shard_size_bytes:"
           f" {shard_size_bytes} B",
           flush=True,
       )
       cfg = kv_cache_store._impl.BackendConfig()
       cfg.type = "posix"
       cfg.parallelism.tp_rank = 0
-      cfg.parallelism.tp_size = self.num_devices
+      # One process writes every chip's data to tp1_r0.
+      cfg.parallelism.tp_size = 1
       cfg.set_property("root_dir", temp_dir)
       cfg.set_property("model_name", "llama_70b_jax")
       if direct_io:
@@ -595,12 +596,12 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
             flush=True,
         )
         # Expected shard path:
-        #   {storage_root}/llama_70b_jax/tp{self.num_devices}_r0/{hash[:3]}/{hash[3:5]}/{hash}.bin
+        #   {storage_root}/llama_70b_jax/tp1_r0/{hash[:3]}/{hash[3:5]}/{hash}.bin
         bin_files = glob.glob(
             os.path.join(
                 temp_dir,
                 "llama_70b_jax",
-                f"tp{self.num_devices}_r0",
+                "tp1_r0",
                 "**",
                 "*.bin",
             ),
@@ -854,7 +855,8 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     cfg = kv_cache_store._impl.BackendConfig()
     cfg.type = "posix"
     cfg.parallelism.tp_rank = 0
-    cfg.parallelism.tp_size = self.num_devices
+    # One process writes every chip's data to tp1_r0.
+    cfg.parallelism.tp_size = 1
     cfg.set_property("root_dir", root)
     cfg.set_property("model_name", model_name)
     return cfg

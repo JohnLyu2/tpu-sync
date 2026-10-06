@@ -22,6 +22,7 @@
 #include <string>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 
@@ -52,6 +53,10 @@ struct ControlContext {
   // Optional key-value metadata headers attached to the request envelope.
   absl::flat_hash_map<std::string, std::string> metadata;
 };
+
+// Marks a client request that failed before any byte was written.
+absl::Status MarkControlPipeNotSent(absl::Status status);
+bool IsControlPipeNotSent(const absl::Status& status);
 
 struct ControlPipeConfig {
   // Active transport backend (`kTcp`, `kGrpc`, or `kZmq`).

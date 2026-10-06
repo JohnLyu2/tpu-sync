@@ -187,7 +187,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     std::function<absl::Status(uint64_t uuid)> unregister_active_plan;
     std::function<int64_t()> get_node_id;
     std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
-    std::function<absl::Status(uint64_t uuid)> end_incoming_push;
+    std::function<absl::Status(uint64_t uuid, const absl::Status& status)>
+        end_incoming_push;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -378,15 +379,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   //   storage.
   //   2. Recall: destination slices to scatter-read from secondary storage ->
   //   host DRAM.
+  // Returns empty if the block has no host bytes.
   virtual std::vector<backends::HostBufferDescriptor> ResolveBlockSlices(
       int staging_block_id) const;
 
-  absl::Status WriteSingleBlockToBackendSync(
-      std::shared_ptr<backends::KVBackend> backend,
-      const backends::BlockKey& key, int staging_block_id);
-  absl::Status ReadSingleBlockFromBackendSync(
-      std::shared_ptr<backends::KVBackend> backend,
-      const backends::BlockKey& key, int staging_block_id);
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
       std::string peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& local_block_ids,
@@ -655,6 +651,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<::tpu_sync::rpc::PoolHostAddrsProto> PoolHostBaseAddrs(
       uint64_t uuid, size_t pool_idx) const;
 
+  // Returns the local host addresses of every layer for a transfer, one per
+  // layer.
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> LayerHostAddrs(
+      uint64_t uuid) const;
+
   const PoolSpec* pool(size_t pool_idx) const;
 
   size_t num_pools() const;
@@ -682,7 +683,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
   absl::Status BeginIncomingPush(uint64_t uuid) override;
-  absl::Status EndIncomingPush(uint64_t uuid) override;
+  absl::Status EndIncomingPush(
+      uint64_t uuid, const absl::Status& status = absl::OkStatus()) override;
 
   absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
   GetPoolPushProgressSpec(size_t pool_idx, uint64_t uuid) const override;
@@ -716,6 +718,12 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     absl::MutexLock l(plans_mu_);
     return active_plans_.contains(uuid);
   }
+
+  // Peer host addresses, one per layer, for plan-less pushes under `uuid`.
+  void SetRemoteLayerAddrs(
+      uint64_t uuid,
+      std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs);
+  void ClearRemoteLayerAddrs(uint64_t uuid);
 
   // The generation of the plan registered under `uuid`, if any.
   std::optional<uint64_t> ActivePlanGeneration(uint64_t uuid) const {
@@ -1018,6 +1026,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // previous copy semantics exactly.
   absl::flat_hash_map<uint64_t, std::shared_ptr<const RegisteredPlan>>
       active_plans_ ABSL_GUARDED_BY(plans_mu_);
+
+  absl::flat_hash_map<
+      uint64_t,
+      std::shared_ptr<const std::vector<::tpu_sync::rpc::PoolHostAddrsProto>>>
+      remote_layer_addrs_ ABSL_GUARDED_BY(plans_mu_);
 
   // An asynchronous FFI task item representing a queued H2D or D2H copy
   // request. Bundles the work lambda with the XLA promise that signals Python

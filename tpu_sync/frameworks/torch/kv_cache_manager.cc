@@ -252,13 +252,11 @@ absl::Status TorchKVCacheManager::PushRegisteredPlan(
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
-  auto status_or =
-      transport->SyncPush({peer}, src_block_ids, dst_block_ids, parallelism,
-                          transport::MajorOrder::kLayerMajor, uuid, layer_idx);
-  if (!status_or.ok()) {
-    return status_or.status();
-  }
-  return absl::OkStatus();
+  return transport
+      ->AsyncPush({peer}, src_block_ids, dst_block_ids, parallelism,
+                  transport::MajorOrder::kLayerMajor, uuid, layer_idx)
+      .Await()
+      .status();
 }
 
 absl::StatusOr<std::string> TorchKVCacheManager::ReadBlockBytes(

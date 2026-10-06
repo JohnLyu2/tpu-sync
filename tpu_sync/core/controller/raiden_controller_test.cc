@@ -1423,7 +1423,6 @@ kv_cache::BackendConfig PosixTestConfig(int tp_rank = 0, int tp_size = 1) {
   cfg.type = "posix";
   cfg.parallelism.tp_rank = tp_rank;
   cfg.parallelism.tp_size = tp_size;
-  cfg.SetProperty("tp_size", absl::StrCat(tp_size));
   return cfg;
 }
 

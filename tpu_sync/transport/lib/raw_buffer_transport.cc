@@ -726,6 +726,11 @@ void RawBufferTransport::ListenerLoop() {
                        reinterpret_cast<struct sockaddr*>(&client_addr),
                        &clilen);
       if (client_fd < 0) {
+        if (!stopping_) {
+          const int err = errno;
+          LOG_EVERY_N_SEC(ERROR, 1) << "accept() failed: " << std::strerror(err)
+                                    << " (errno=" << err << ")";
+        }
         break;
       }
       if (require_psp_tcp_ && !PspEnabled(client_fd)) {

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import socket
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -22,6 +23,7 @@ import torch_tpu  # pylint: disable=unused-import
 from tpu_sync.api.torch.weight_synchronizer import (
     WeightSynchronizer,
 )
+from tpu_sync.rpc import raiden_service_pb2
 
 
 class WeightSynchronizerTorchTest(parameterized.TestCase):
@@ -229,6 +231,199 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
       ("fp32", torch.float32),
       ("bf16", torch.bfloat16),
   )
+  def test_unbind_weights(self, dtype):
+    shape = (self.block_size, 128, 8)
+
+    src_tensors = [
+        [torch.full(shape, fill_value=5.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    dst_tensors = [
+        [torch.zeros(shape, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+
+    ws_source = WeightSynchronizer(
+        src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    ws_dest = WeightSynchronizer(
+        dst_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    peer_dest = f"127.0.0.1:{ws_dest.local_port}"
+
+    # --- Sync 1 (V1: 5.0 -> 0.0) ---
+    ws_source.push_weights([peer_dest])
+    ws_dest.h2d()
+
+    for l in range(self.num_layers):
+      self.assertTrue(
+          torch.equal(dst_tensors[l][0].cpu(), src_tensors[l][0].cpu())
+      )
+
+    # --- Explicit Unbind ---
+    ws_source.unbind_weights()
+    ws_dest.unbind_weights()
+
+    # --- Re-bind weights to V2 on existing synchronizers ---
+    new_src_tensors = [
+        [torch.full(shape, fill_value=10.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    ws_source.bind_weights(new_src_tensors)
+    ws_source.d2h()
+
+    new_dst_tensors = [
+        [torch.full(shape, fill_value=-1.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    ws_dest.bind_weights(new_dst_tensors)
+
+    # --- Sync 2 (V2: 10.0 -> -1.0) ---
+    ws_source.push_weights([peer_dest])
+    ws_dest.h2d()
+
+    # Verify Sync 2 updated new_dst_tensors to 10.0
+    for l in range(self.num_layers):
+      self.assertTrue(
+          torch.equal(new_dst_tensors[l][0].cpu(), new_src_tensors[l][0].cpu())
+      )
+
+    # Verify original V1 dst_tensors were NOT overwritten (still 5.0)
+    for l in range(self.num_layers):
+      self.assertTrue(
+          torch.equal(dst_tensors[l][0].cpu(), src_tensors[l][0].cpu())
+      )
+
+    # Unbind again
+    ws_source.unbind_weights()
+    ws_dest.unbind_weights()
+
+  def test_transfer_after_unbind_raises(self):
+    """Unbound synchronizers must fail loudly instead of shipping stale data."""
+    shape = (self.block_size, 128, 8)
+    dtype = torch.float32
+
+    src_tensors = [
+        [torch.full(shape, fill_value=5.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    dst_tensors = [
+        [torch.zeros(shape, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+
+    ws_source = WeightSynchronizer(
+        src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    ws_dest = WeightSynchronizer(
+        dst_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    peer_dest = f"127.0.0.1:{ws_dest.local_port}"
+
+    # Baseline sync works.
+    ws_source.push_weights([peer_dest])
+    ws_dest.h2d()
+    for l in range(self.num_layers):
+      self.assertTrue(
+          torch.equal(dst_tensors[l][0].cpu(), src_tensors[l][0].cpu())
+      )
+
+    ws_source.unbind_weights()
+    ws_dest.unbind_weights()
+
+    # Every device-touching entry point must raise while unbound.
+    with self.assertRaisesRegex(RuntimeError, "unbound"):
+      ws_source.d2h()
+    with self.assertRaisesRegex(RuntimeError, "unbound"):
+      ws_source.push_weights([peer_dest])
+    with self.assertRaisesRegex(RuntimeError, "unbound"):
+      ws_dest.h2d()
+
+    # Re-binding on the same instances fully recovers.
+    new_src_tensors = [
+        [torch.full(shape, fill_value=7.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    new_dst_tensors = [
+        [torch.zeros(shape, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    ws_source.bind_weights(new_src_tensors)
+    ws_dest.bind_weights(new_dst_tensors)
+    ws_source.push_weights([peer_dest])
+    ws_dest.h2d()
+    for l in range(self.num_layers):
+      self.assertTrue(
+          torch.equal(new_dst_tensors[l][0].cpu(), new_src_tensors[l][0].cpu())
+      )
+
+  @parameterized.named_parameters(
+      ("fp32", torch.float32),
+      ("bf16", torch.bfloat16),
+  )
+  def test_bind_weights_empty_list_unbinds(self, dtype):
+    shape = (self.block_size, 128, 8)
+
+    src_tensors = [
+        [torch.full(shape, fill_value=5.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    dst_tensors = [
+        [torch.zeros(shape, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+
+    ws_source = WeightSynchronizer(
+        src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    ws_dest = WeightSynchronizer(
+        dst_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    peer_dest = f"127.0.0.1:{ws_dest.local_port}"
+
+    # --- Sync 1 ---
+    ws_source.push_weights([peer_dest])
+    ws_dest.h2d()
+
+    for l in range(self.num_layers):
+      self.assertTrue(
+          torch.equal(dst_tensors[l][0].cpu(), src_tensors[l][0].cpu())
+      )
+
+    # --- bind_weights([]) as alias for unbind ---
+    ws_source.bind_weights([])
+    ws_dest.bind_weights([])
+
+    # --- Re-bind weights to V2 ---
+    new_src_tensors = [
+        [torch.full(shape, fill_value=12.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    ws_source.bind_weights(new_src_tensors)
+    ws_source.d2h()
+
+    new_dst_tensors = [
+        [torch.full(shape, fill_value=-2.0, dtype=dtype, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    ws_dest.bind_weights(new_dst_tensors)
+
+    # --- Sync 2 ---
+    ws_source.push_weights([peer_dest])
+    ws_dest.h2d()
+
+    for l in range(self.num_layers):
+      self.assertTrue(
+          torch.equal(new_dst_tensors[l][0].cpu(), new_src_tensors[l][0].cpu())
+      )
+
+    ws_source.bind_weights([])
+    ws_dest.bind_weights([])
+
+  @parameterized.named_parameters(
+      ("fp32", torch.float32),
+      ("bf16", torch.bfloat16),
+  )
   def test_heterogeneous_layers_small_first(self, dtype):
     shapes = [(1024,), (1024, 3072), (2048, 2048)]
     src_tensors = [
@@ -347,6 +542,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
       metrics = ws.get_metrics()
       self.assertIn("last_d2h_time_ms", metrics)
       self.assertIn("total_d2h_time_ms", metrics)
+      self.assertIn("total_h2h_bandwidth_gbps", metrics)
       ws.reset_metrics()
     finally:
       os.environ["ENABLE_MULTI_NUMA"] = "0"
@@ -377,6 +573,133 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
       ws_dst.h2d()
     finally:
       os.environ["ENABLE_MULTI_NUMA"] = "0"
+
+  def test_explicit_global_shard_indices(self):
+    tensors = self._make_tensors(num_layers=2, num_shards=2)
+    ws = WeightSynchronizer(
+        tensors,
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[4, 7],
+    )
+    eps = ws.get_local_endpoints()
+    self.assertLen(eps, 1)
+    self.assertEqual(eps[0]["shards"], [4, 7])
+
+  def test_default_global_shard_indices_normalization(self):
+    tensors = self._make_tensors(num_layers=2, num_shards=2)
+    ws = WeightSynchronizer(
+        tensors,
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    eps = ws.get_local_endpoints()
+    self.assertLen(eps, 1)
+    self.assertEqual(eps[0]["shards"], [0, 1])
+    self.assertEqual(eps[0]["global_shards"], [0, 1])
+
+  def test_get_host_buffer_heterogeneous_layers(self):
+    # Layer 0 is small (4 KB), Layer 1 is large (4 MB > Layer 0 + 256 KB)
+    shapes = [(1024,), (1024, 1024)]
+    tensors = [
+        [torch.zeros(shape, dtype=torch.float32, device=self.device)]
+        for shape in shapes
+    ]
+    ws = WeightSynchronizer(
+        tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    buf0 = ws.get_host_buffer(layer_idx=0, shard_idx=0)
+    buf1 = ws.get_host_buffer(layer_idx=1, shard_idx=0)
+    self.assertGreaterEqual(buf0.numel(), 1024 * 4)
+    self.assertLess(buf0.numel(), 1024 * 1024 * 4)
+    self.assertGreaterEqual(buf1.numel(), 1024 * 1024 * 4)
+
+  def test_metrics_accumulation_bandwidth_and_reset(self):
+    ws_source = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=1,
+        num_shards=1,
+        slice_byte_size=1024,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    ws_dest = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=1,
+        num_shards=1,
+        slice_byte_size=1024,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    self.addCleanup(ws_dest.shutdown)
+
+    m0 = ws_source.get_metrics()
+    self.assertEqual(m0["total_h2h_bytes"], 0)
+    self.assertEqual(m0["total_h2h_time_ms"], 0.0)
+    self.assertEqual(m0["total_h2h_bandwidth_gbps"], 0.0)
+
+    def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
+      payload = req.SerializeToString()
+      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len = int.from_bytes(sock.recv(4), "big")
+      resp_bytes = sock.recv(resp_len)
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+      self.assertTrue(resp.success, resp.message)
+      sock.close()
+
+    for step in range(2):
+      uuid = 70001 + step
+      dst_req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+          start_transfer_request=raiden_service_pb2.StartTransferRequest(
+              is_sender=False,
+              uuid=uuid,
+              expected_block_count=1,
+              expected_layer_chunk_counts={0: 1},
+          ),
+      )
+      _send_ctrl_req(ws_dest.listener_port, dst_req)
+
+      src_transfer_req = raiden_service_pb2.StartTransferRequest(
+          is_sender=True,
+          uuid=uuid,
+          skip_d2h=True,
+      )
+      sched = src_transfer_req.shard_push_schedules[0]
+      entry = sched.entries.add()
+      entry.dst_peer = f"127.0.0.1:{ws_dest.local_port}"
+      entry.dst_shard_idx = 0
+      entry.src_offset_bytes = 0
+      entry.dst_offset_bytes = 0
+      entry.size_bytes = 1024
+      entry.count = 1
+      entry.layer_idx = 0
+
+      src_req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+          start_transfer_request=src_transfer_req,
+      )
+      _send_ctrl_req(ws_source.listener_port, src_req)
+      ws_dest.wait_for_transfer_completion(uuid)
+
+    m2 = ws_source.get_metrics()
+    self.assertEqual(m2["total_h2h_bytes"], 2048)
+    self.assertGreater(m2["total_h2h_time_ms"], 0.0)
+    self.assertGreater(m2["total_h2h_bandwidth_gbps"], 0.0)
+    self.assertEqual(m2["push_resharded_call_count"], 2)
+
+    ws_source.reset_metrics()
+    m_reset = ws_source.get_metrics()
+    self.assertEqual(m_reset["total_h2h_bytes"], 0)
+    self.assertEqual(m_reset["total_h2h_time_ms"], 0.0)
+    self.assertEqual(m_reset["total_h2h_bandwidth_gbps"], 0.0)
+    self.assertEqual(m_reset["push_resharded_call_count"], 0)
 
 
 if __name__ == "__main__":

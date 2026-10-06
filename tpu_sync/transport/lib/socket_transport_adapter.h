@@ -21,6 +21,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>  // NOLINT
 #include <vector>
@@ -31,6 +32,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -60,6 +62,20 @@ class SocketTransportAdapter : public TransportAdapter {
       CompletionCallback on_complete = nullptr) override;
 
   absl::StatusOr<Status> Poll(Handle handle) override;
+
+  struct Config {
+    std::optional<absl::Duration> handshake_ack_read_timeout = std::nullopt;
+    std::optional<absl::Duration> final_ack_read_timeout = std::nullopt;
+  };
+
+  const Config& config() const { return config_; }
+
+  std::optional<absl::Duration> handshake_ack_read_timeout() const {
+    return config_.handshake_ack_read_timeout;
+  }
+  std::optional<absl::Duration> final_ack_read_timeout() const {
+    return config_.final_ack_read_timeout;
+  }
 
  private:
   struct WriteTask {
@@ -103,6 +119,7 @@ class SocketTransportAdapter : public TransportAdapter {
  private:
   RawBufferTransport* const raw_transport_;
   const int parallelism_;
+  const Config config_;
 
   absl::Mutex scheduler_mu_;
   absl::CondVar scheduler_cv_;

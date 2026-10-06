@@ -289,6 +289,11 @@ class KVCacheManager {
     return torch_manager_->base()->PlanHostBlocks(uuid, block_ids);
   }
 
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> LayerHostAddrs(
+      uint64_t uuid) const {
+    return torch_manager_->base()->LayerHostAddrs(uuid);
+  }
+
   absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
                             int64_t expected_block_count) {
     return torch_manager_->RegisterRecv(uuid, req_id, expected_block_count);
@@ -321,10 +326,8 @@ class KVCacheManager {
                               local_host_block_ids);
   }
 
-  std::tuple<std::vector<std::string>, std::vector<std::string>,
-             std::vector<std::string>>
-  CompleteReadRaw() {
-    return torch_manager_->CompleteReadRaw();
+  CompleteReadResult CompleteReadWithDetails() {
+    return torch_manager_->CompleteReadWithDetails();
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(

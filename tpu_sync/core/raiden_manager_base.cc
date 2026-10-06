@@ -245,9 +245,11 @@ absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hWriteDirect(
     return absl::StrCat("blocks=", src_block_ids.size(),
                         " peers=", peers.size(), " uuid=", uuid);
   });
-  return server_->SyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
-                           tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
-                           layer_idx);
+  return server_
+      ->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
+                  tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
+                  layer_idx)
+      .Await();
 }
 
 void RaidenManagerBase::H2hWriteDirectAsync(
@@ -264,9 +266,11 @@ void RaidenManagerBase::H2hWriteDirectAsync(
     on_complete(status);
     return;
   }
-  server_->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
-                     tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
-                     layer_idx, std::move(on_complete));
+  server_
+      ->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
+                  tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
+                  layer_idx)
+      .OnReady(std::move(on_complete));
 }
 
 absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hReadDirect(

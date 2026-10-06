@@ -27,16 +27,20 @@
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
+#include "tpu_sync/kv_cache/lru_cache.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -84,10 +88,40 @@ struct PosixBackendOptions {
   // fails with InvalidArgument. There is no buffered fallback.
   bool direct_io = false;
 
+  // Capacity of the coordinator-side PosixKVCacheStoreBackend metadata cache,
+  // which remembers storage files confirmed to exist so repeated lookups of a
+  // hot prefix skip the existence syscall. Counted in shard entries (one per
+  // file). 0 disables the cache (default); kUnboundedMetadataCache (-1) means
+  // unbounded. Least recently used entries are dropped past the cap.
+  int64_t metadata_cache_max_entries = 0;
+  // Idle TTL, in seconds, of a cached existence entry: it expires once it has
+  // gone this long without a cache hit or a storage re-confirmation. Stale
+  // entries for deleted files are also dropped when a recall from this tier
+  // fails. kUnboundedMetadataCache (-1) means entries never expire.
+  int64_t metadata_cache_ttl_secs = 60;
+
   // Parses and validates `properties`. Returns InvalidArgumentError for an
   // unparseable value, a negative thread-pool size, or a missing tp_rank.
   static absl::StatusOr<PosixBackendOptions> FromProperties(
       const absl::flat_hash_map<std::string, std::string>& properties);
+};
+
+// Sentinel for metadata_cache_max_entries / metadata_cache_ttl_secs.
+inline constexpr int64_t kUnboundedMetadataCache = -1;
+
+// Runtime configuration of PosixKVCacheStoreBackend's existence cache.
+struct MetadataCacheOptions {
+  // Shard entries. 0 disables the cache; std::numeric_limits<size_t>::max()
+  // means unbounded.
+  size_t max_entries = 0;
+  // Idle TTL. absl::InfiniteDuration() means entries never expire.
+  absl::Duration ttl = absl::Seconds(60);
+
+  bool enabled() const { return max_entries > 0; }
+
+  // Converts the validated POSIX options into runtime cache options.
+  static MetadataCacheOptions FromPosixOptions(
+      const PosixBackendOptions& options);
 };
 
 // Alignment required for O_DIRECT buffers, lengths and file offsets: the
@@ -175,22 +209,31 @@ class PosixPathMapper : public BlockKeyMapper {
 };
 
 // PosixKVCacheStoreBackend probes persistent storage (e.g., Lustre, POSIX).
+//
+// Optional metadata cache: when enabled, Lookup remembers which shard files it
+// has confirmed on storage and answers later lookups of them without a storage
+// probe. See Lookup for the block-to-shard-key mapping and cache contents.
 class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
  public:
   PosixKVCacheStoreBackend(std::shared_ptr<KVBackend> storage_backend,
                            std::string name = std::string(kPosixBackendName),
                            size_t capacity_bytes = 0,
-                           size_t lookup_batch_size = kDefaultLookupBatchSize)
-      : storage_backend_(std::move(storage_backend)),
-        name_(std::move(name)),
-        capacity_bytes_(capacity_bytes),
-        lookup_batch_size_(lookup_batch_size > 0 ? lookup_batch_size
-                                                 : kDefaultLookupBatchSize) {}
+                           size_t lookup_batch_size = kDefaultLookupBatchSize,
+                           MetadataCacheOptions cache_options = {});
 
   std::string name() const override { return name_; }
 
   size_t lookup_batch_size() const { return lookup_batch_size_; }
 
+  const MetadataCacheOptions& metadata_cache_options() const {
+    return cache_options_;
+  }
+
+  // Number of entries currently held by the metadata cache (0 if disabled).
+  size_t metadata_cache_size() const;
+
+  // Returns the longest prefix of `block_hashes` available on storage. See the
+  // definition for the algorithm and the metadata cache contents.
   absl::StatusOr<BlockSliceList> Lookup(
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override;
@@ -218,8 +261,12 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override {
     return 0;
   }
+  // Storage files are never removed through this tier. When the metadata
+  // cache is enabled, this drops the cached shard keys of `block_hashes` so the
+  // next Lookup re-probes storage; KVCacheStore calls it when a recall from
+  // this tier fails. `slices` is unused. No-op when the cache is disabled.
   void Delete(absl::Span<const std::string> block_hashes,
-              absl::Span<const RaidenBlockId> slices) override {}
+              absl::Span<const RaidenBlockId> slices) override;
   bool Pin(absl::Span<const std::string> block_hashes) override { return true; }
   void Release(absl::Span<const std::string> block_hashes) override {}
   int GetPinCount(const std::string& hash) const override { return 0; }
@@ -232,10 +279,44 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   }
 
  private:
+  struct ExistenceEntry {
+    // Last cache hit or storage confirmation of the shard file. Anchor of the
+    // idle TTL.
+    absl::Time last_used;
+  };
+
+  // Returns the storage keys ("shard keys") that must all exist for ONE block,
+  // `block_hash`, to be available: one key per rank in [0, tp_size).
+  absl::StatusOr<std::vector<BlockKey>> MapShardKeys(
+      const std::string& block_hash) const;
+
+  // Indexing: i = position of the block in the Lookup request
+  // (block_hashes[i]); j = position of the shard key within
+  // MapShardKeys(block_hashes[i]) (j = rank).
+  // Returns fresh[i][j] = true iff shard_keys[i][j] has a fresh cache entry.
+  // Expired entries are erased and reported as absent.
+  std::vector<std::vector<bool>> CachedFresh(
+      absl::Span<const std::vector<BlockKey>> shard_keys);
+
+  // Records storage-confirmed shard keys. A key that is already cached keeps
+  // its original timestamp.
+  void CacheInsert(absl::Span<const BlockKey* const> keys);
+
+  // Synchronously probes storage for `keys`. Returns one entry per key; a
+  // short or failed answer is reported as absent from that point on.
+  std::vector<bool> ProbeExists(absl::Span<const BlockKey> keys);
+
+  RaidenBlockId MakeSharedStorageBlock() const;
+
   std::shared_ptr<KVBackend> storage_backend_;
   std::string name_ = std::string(kPosixBackendName);
   size_t capacity_bytes_ = 0;
   size_t lookup_batch_size_ = 32;
+  const MetadataCacheOptions cache_options_;
+
+  // Never held across storage I/O or key mapping.
+  mutable absl::Mutex cache_mu_;
+  LRUCache<std::string, ExistenceEntry> cache_ ABSL_GUARDED_BY(cache_mu_);
 };
 
 }  // namespace storage

@@ -47,6 +47,7 @@
 #include "tpu_sync/core/transfer_send_session.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
@@ -367,6 +368,7 @@ void TransferReceiveSession::FinishLocked(const absl::Status& status) {
   if (in_flight_ == 0 && !done_) {
     ReleaseStagingLocked();
     done_ = true;
+    completed_at_ = std::chrono::steady_clock::now();
   }
 }
 
@@ -390,6 +392,7 @@ void TransferReceiveSession::EndRecvOpLocked() {
   if (draining_ && in_flight_ == 0 && !done_) {
     ReleaseStagingLocked();
     done_ = true;
+    completed_at_ = std::chrono::steady_clock::now();
   }
 }
 
@@ -468,6 +471,7 @@ void TransferReceiveSession::ExecutePullRequest(
   req_spec.ep_idx = 0;
   req_spec.consumer_data_port = static_cast<uint32_t>(manager.local_data_port_);
   req_spec.consumer_ips = base_->local_ips();
+  req_spec.layer_host_addrs = base_->LayerHostAddrs(uuid_);
 
   LOG(INFO) << "StartRead (connecting): req_id=" << session_req_id
             << ", uuid=" << uuid_ << ", numa=" << target_node.value_or(-1);

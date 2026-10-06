@@ -174,5 +174,39 @@ class KVCacheManagerHostTest(unittest.TestCase):
       manager.experimental_map_shared_memory(4096, 4096)
 
 
+class _FakeDetailsImpl:
+
+  def complete_read(self):
+    return (
+        ["sent"],
+        ["received"],
+        ["failed"],
+        {"sent": {"completed_ns": 10}, "received": {"completed_ns": 20}},
+    )
+
+
+class PollStatsWithDetailsTest(unittest.TestCase):
+
+  def test_attaches_details_to_each_req_id(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = _FakeDetailsImpl()  # pylint: disable=protected-access
+
+    stats = manager.poll_stats_with_details()
+
+    settled = kv_cache_manager.SettledTransfer
+    self.assertEqual(stats.sent, [settled("sent", completed_ns=10)])
+    self.assertEqual(stats.received, [settled("received", completed_ns=20)])
+    self.assertEqual(stats.failed, [settled("failed")])
+    self.assertIsNone(stats.failed[0].completed_ns)
+
+  def test_poll_stats_keeps_its_shape(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = _FakeDetailsImpl()  # pylint: disable=protected-access
+
+    self.assertEqual(
+        manager.poll_stats(), (["sent"], ["received"], ["failed"])
+    )
+
+
 if __name__ == "__main__":
   unittest.main()

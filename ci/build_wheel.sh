@@ -35,6 +35,8 @@
 # value builds a wheel with the bare pyproject.toml version (a release).
 # RAIDEN_TORCH_ABIS lists the torch releases the torch wheel ships an
 # extension variant for (see ci/build_wheel_impl.sh).
+# RAIDEN_JAX_VERSION selects the JAX version the jax wheel builds against
+# (see third_party/jax/versions.bzl); unset means the default version.
 
 set -exu -o pipefail
 
@@ -90,6 +92,7 @@ docker run --rm \
   -e BUILD_MODE="${BUILD_MODE}" \
   -e WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}" \
   -e RAIDEN_TORCH_ABIS="${RAIDEN_TORCH_ABIS}" \
+  -e RAIDEN_JAX_VERSION="${RAIDEN_JAX_VERSION:-}" \
   -e BAZEL_CACHE_DIR=/cache \
   ${DOCKER_ENV[@]+"${DOCKER_ENV[@]}"} \
   "${CONTAINER_IMAGE}" \

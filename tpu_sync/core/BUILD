@@ -326,6 +326,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
+        "//third_party/jax:raiden_jax_version",
     ],
 )
 
@@ -537,6 +538,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
@@ -616,6 +618,7 @@ cc_library(
         ":control_plane_backend_hdrs",
         ":grpc_control_plane_backend",
         ":tcp_control_plane_backend",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -639,6 +642,7 @@ cc_test(
         ":control_plane_backend",
         ":grpc_control_plane_backend",
         ":tcp_control_plane_backend",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

@@ -71,6 +71,7 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
     ],
 )
@@ -474,6 +475,7 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
     ],
 )
@@ -503,6 +505,7 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",

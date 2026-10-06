@@ -108,6 +108,14 @@ struct BackendConfig {
   bool HasProperty(absl::string_view key) const;
 };
 
+// Writes the storage topology in `parallelism` into config->properties as
+// "tp_size" / "tp_rank", the keys storage backends consume. Storage topology
+// comes only from BackendConfig::parallelism: caller-supplied tp_* properties
+// are overwritten. Callers resolve defaults first, so
+// `parallelism.tp_size` is expected to be >= 1 and `parallelism.tp_rank` >= 0.
+void ApplyParallelismToProperties(
+    const backends::ParallelismConfig& parallelism, BackendConfig* config);
+
 // Factory registry for dynamic creation of KVCacheStoreBackend instances.
 class KVCacheStoreBackendFactory {
  public:

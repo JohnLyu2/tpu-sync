@@ -36,6 +36,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
@@ -193,7 +194,8 @@ class ReshardClient {
 
  private:
   absl::StatusOr<tpu_sync::rpc::ControllerResponse> CallController(
-      const tpu_sync::rpc::ControllerRequest& request);
+      const tpu_sync::rpc::ControllerRequest& request,
+      absl::Duration connect_retry_budget = absl::ZeroDuration());
   absl::StatusOr<tpu_sync::rpc::ControlResponse> CallRaiden(
       const tpu_sync::rpc::ControlRequest& request);
 

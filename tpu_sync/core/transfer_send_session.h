@@ -75,6 +75,12 @@ class TransferSendSession
 
   absl::Status AwaitForDone() override;
 
+  // When Done() became true. Meaningless before then.
+  std::chrono::steady_clock::time_point CompletedAt() const {
+    absl::MutexLock lock(mu_);
+    return completed_at_;
+  }
+
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
     return draining_;
@@ -183,6 +189,7 @@ class TransferSendSession
   // waits for its in-flight work before it is reported.
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
+  std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
