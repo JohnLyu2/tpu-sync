@@ -331,7 +331,7 @@ clone reset. Results, verbatim:
   `01ffa3d` by reading (cited `raiden_controller.cc` regions identical;
   `kv_cache_store.cc` lines moved by −15); both patches re-based and apply
   cleanly. Tests not re-run.
-- 2026-10-06: upstream `50b0774` merged into `experimental` (`8f03107`).
+- 2026-10-06: upstream `50b0774` merged into `experimental` (`77eeec8`).
   Re-checked by diff: `raiden_controller.cc` byte-identical to `01ffa3d`
   (F2, F3, F4 numbers hold); the F1 regions of `kv_cache_store.cc`
   (`ValidateAndPinHostBlocks`, `Evict`/`Insert`) unchanged, lines moved by
