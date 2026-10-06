@@ -7,31 +7,31 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 Models a decode consumer (`KVCacheManagerWithTransfer`) pulling KV caches from
 multiple prefill producers concurrently (`Peer.sick` vs. `Peer.healthy`) across
 the two finite consumer resources shared by `StartRead`
-(`tpu_sync/core/kv_cache_manager_with_transfer.cc:800-895`,
-`tpu_sync/core/transfer_receive_session.cc:213-259, 456-523`,
+(`tpu_sync/core/kv_cache_manager_with_transfer.cc:811-906`,
+`tpu_sync/core/transfer_receive_session.cc:214-260, 459-527`,
 `tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc:684-1089`,
-tpu-sync `01ffa3d`):
+tpu-sync `50b0774`, re-pinned from `01ffa3d` on 2026-10-06):
 
 1. **Host staging slots (`StagingBlockAllocator`, capacity `numSlots`):**
    `StartRead` calls `TransferReceiveSession::Create → AllocateStagingForLoad`
-   (`mgr.cc:852-860`, `recv.cc:228-240`) **before** contacting the producer,
+   (`mgr.cc:863-871`, `recv.cc:229-241`) **before** contacting the producer,
    because `PullStreamRequestSpec` sends the allocated host block IDs
-   (`dst_block_ids`) to the producer (`recv.cc:465`). The session starts at
+   (`dst_block_ids`) to the producer (`recv.cc:468`). The session starts at
    `Recv.initLoad numLayers` (`inFlight = 1, pullPending = true, hasStaging = true`)
    and holds its staging slot until `SettleLocked()` sets `hasStaging = false`
-   when `draining = true ∧ inFlight = 0` (`mgr.cc:1273`). If no staging slot can
+   when `draining = true ∧ inFlight = 0` (`mgr.cc:1294`). If no staging slot can
    be acquired, `StartRead` immediately records the request in
-   `failed_recving_` (`mgr.cc:858`).
+   `failed_recving_` (`mgr.cc:869`).
 
 2. **Outbound handshake worker pool (`push_pool_`, capacity `poolSize`):**
-   `ExecutePullRequest` (`recv.cc:509-522`) schedules a task on `push_pool_` to
+   `ExecutePullRequest` (`recv.cc:513-526`) schedules a task on `push_pool_` to
    call `control_backend_->SendPullRequest`:
    - On `Backend.tcpBlocking` (`TcpControlPlaneBackend::SendPullRequestBlocking`,
      `tcp_control_plane_backend.cc:585-660`), the worker thread blocks waiting
      for the producer's reply (`pullReply`), holding one worker from
      `dispatchPull` until `pullReply`.
    - On `Backend.grpcAsync` (`GrpcControlPlaneBackend::SendPullRequest`,
-     `grpc_control_plane_backend.cc:294-322`), the worker issues an async RPC
+     `grpc_control_plane_backend.cc:298-326`), the worker issues an async RPC
      and returns immediately, holding no worker while waiting on the wire.
 
 ## What this module proves
@@ -58,14 +58,14 @@ tpu-sync `01ffa3d`):
      `trace_grpc_healthy_progresses_under_backlog`).
 
 3. **Staging-slot starvation counterexample & per-peer quota fix
-   (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`, `:1030-1089`):**
+   (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`, `:1034-1093`):**
    - Under the shipping `SlotPolicy.unboundedPerPeer`, `numSlots` wedged reads
      to `Peer.sick` exhaust `freeSlots = 0` (even if their session deadlines
      expire via `.cancel`, since `inFlight = 1` keeps their staging pinned until
      `pullReply false`). A subsequent `StartRead` to `Peer.healthy` fails slot
      allocation immediately (`trace_sick_peer_starves_staging_slots`, plus the
      bounded model check counterexample).
-   - Under `SlotPolicy.perPeerQuota maxPerPeer` (`:1038-1040`), `Peer.sick` can
+   - Under `SlotPolicy.perPeerQuota maxPerPeer` (`:1042-1044`), `Peer.sick` can
      hold at most `maxPerPeer` slots (`reachable_sick_staging_le_quota`). Thus
      whenever `maxPerPeer < numSlots` and `Peer.healthy` has fewer than
      `min maxPerPeer (numSlots - maxPerPeer)` active sessions (in particular,
@@ -87,14 +87,14 @@ inductive Peer where
   | healthy
   deriving Repr, DecidableEq
 
-/-- Control-plane handshake backend (`transfer_receive_session.cc:506-522`). -/
+/-- Control-plane handshake backend (`transfer_receive_session.cc:510-526`). -/
 inductive Backend where
   | tcpBlocking
   | grpcAsync
   deriving Repr, DecidableEq
 
-/-- Host staging slot admission policy at `StartRead` (`mgr.cc:852-860`,
-`transfer_receive_session.cc:228-240`). -/
+/-- Host staging slot admission policy at `StartRead` (`mgr.cc:863-871`,
+`transfer_receive_session.cc:229-241`). -/
 inductive SlotPolicy where
   | unboundedPerPeer
   | perPeerQuota (maxPerPeer : Nat)
@@ -146,7 +146,7 @@ structure State where
   freeWorkers : Nat
   sessions : List Entry := []
   /-- Whether a `StartRead` to `Peer.healthy` failed staging allocation up front
-  and was dropped into `failed_recving_` (`mgr.cc:858`). -/
+  and was dropped into `failed_recving_` (`mgr.cc:869`). -/
   rejectedHealthy : Bool := false
   /-- Whether a `StartRead` to `Peer.sick` failed staging allocation up front. -/
   rejectedSick : Bool := false
@@ -179,10 +179,10 @@ def allowedForPeer (p : Peer) (e : Recv.Ev) : Bool :=
     | _ => true
 
 inductive Ev where
-  /-- `StartRead` for target `peer` (`mgr.cc:800-895`). -/
+  /-- `StartRead` for target `peer` (`mgr.cc:811-906`). -/
   | startRead (peer : Peer)
   /-- `push_pool_` worker dispatches `SendPullRequest` for session `idx`
-  (`recv.cc:509-522`). -/
+  (`recv.cc:513-526`). -/
   | dispatchPull (idx : Nat)
   /-- Session `idx` takes a `Recv.Ev` step `e` (`Receive.lean`). -/
   | sessStep (idx : Nat) (e : Recv.Ev)

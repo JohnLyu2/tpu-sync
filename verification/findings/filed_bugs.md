@@ -37,4 +37,4 @@ Both problems are confirmed by unit tests, which will be added in the CL (they f
 
 All of the function's early returns happen before the first job is sent. After that, the returned future completes only when every sent job's RPC has finished.
 
-**Fix:** [google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105).
+**Fix:** [google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105) — still open, not merged as of upstream `50b0774` (2026-10-06).

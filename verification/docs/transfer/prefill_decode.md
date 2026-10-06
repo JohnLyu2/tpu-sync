@@ -2,8 +2,11 @@
 
 The model of `proposal.md` §3, built in four stages under
 `TpuSyncVerify/Transfer/PrefillDecode/`. Citations in the Lean files are to
-tpu-sync **`01ffa3d`** (the commit this tree is based on); every cited region
-was read at that commit when the stage was written.
+tpu-sync **`50b0774`** (upstream `main` as merged into `experimental` on
+2026-10-06). The stages were written against `01ffa3d`, and every cited region
+was read at that commit; the citations were re-pinned to `50b0774` with
+`tools/repin_citations.py`, see [Upstream re-checks](#upstream-re-checks) for
+what changed in between.
 
 ## Modules
 
@@ -58,12 +61,12 @@ constructive drain to settle (`reachable_can_settle`), readiness soundness
 The module docstrings carry the full tables (field → C++, event → C++). What
 was checked when:
 
-| Stage | Files read at `01ffa3d` | Notable |
+| Stage | Files read at `01ffa3d`, re-read at `50b0774` | Notable |
 |---|---|---|
-| 1 | `transfer_receive_session.{h,cc}` | `ExecuteLayerH2d` re-checks `done_ || draining_` under its second lock (`.cc:601-612`); fault injection adds dispatch/completion failure paths; `in_flight_` starts at 1 for a load plan (`.cc:342`). All encoded. |
-| 2 | `block_transport.cc`, `kv_cache_manager_with_transfer.cc` (`CompleteReadRaw`, `begin/end_incoming_push`, `OnBlocksReceived` path) | `OnLayerReceived` fires once per layer (`bt.cc:528-530`) and before `OnBlocksReceived` on the same thread (`bt.cc:570-584`): assumption A4 of `Receive.lean`. |
+| 1 | `transfer_receive_session.{h,cc}` | `ExecuteLayerH2d` re-checks `done_ || draining_` under its second lock (`.cc:605-616`); fault injection adds dispatch/completion failure paths; `in_flight_` starts at 1 for a load plan (`.cc:343`). All encoded. |
+| 2 | `block_transport.cc`, `kv_cache_manager_with_transfer.cc` (`CompleteReadRaw`, `begin/end_incoming_push`, `OnBlocksReceived` path) | `OnLayerReceived` fires once per layer (`bt.cc:559-561`) and before `OnBlocksReceived` on the same thread (`bt.cc:601-615`): assumption A4 of `Receive.lean`. At `50b0774` the poll lives in `CompleteReadWithDetails` (`mgr.cc:908-1039`; `CompleteReadRaw`, `:1041-1047`, is a wrapper over it) and `end_incoming_push` finishes the session itself when the push failed (`4efb0dd`, `mgr.cc:239-242`). |
 | 3 | `transfer_send_session.{h,cc}`, `mgr.cc` pull worker and deadline | two op chains on one counter; `SendNextLayer` carries an op across the pool task; `FinishLocked` is first-call-wins. |
-| 4 | the above plus `bt.cc:436-470` (landing), `mgr.cc:918-925` (send publication), `send.cc:324` / `:449` (D2H copies and pushes are *issued* in layer order), `send.cc:380-384` (`SendNextLayer(l)` waits on layer `l`'s own future), `send.cc:217-291` (`ValidateRequestedBlocks`), `recv.cc:262-319` (`BuildLoadCopyPlan`), `copy_spec_builder.h:42-92` (`BuildCoalescedSpec`) | layer granularity (`Pipeline` A1, discharged at block granularity by `BlockOrdering.lean` via `BlockPipeline.step_pipe`), delivery modelled after the callback (A2), one sender per layer (A3). Completion order is **not** assumed: every memory-touching event is layer-indexed. |
+| 4 | the above plus `bt.cc:467-501` (landing), `mgr.cc:925-935` (send publication), `send.cc:326` / `:451` (D2H copies and pushes are *issued* in layer order), `send.cc:382-386` (`SendNextLayer(l)` waits on layer `l`'s own future), `send.cc:97-114` (`ValidateRequestedBlocksLocked`), `recv.cc:262-330` (`BuildLoadCopyPlan`), `send.cc:203-232` (`BuildCoalescedCopySpec`) | layer granularity (`Pipeline` A1, discharged at block granularity by `BlockOrdering.lean` via `BlockPipeline.step_pipe`), delivery modelled after the callback (A2), one sender per layer (A3). Completion order is **not** assumed: every memory-touching event is layer-indexed. |
 
 Assumptions are numbered per module (`Receive` A1–A4, `Send` A1–A6,
 `Pipeline` A1–A4) and each names the guard that encodes it. The ones a reader
@@ -79,7 +82,7 @@ should know about:
   passed each stage, with `cnt_d2hReady` / `cnt_h2dReady` tying two of them to
   the session counters.
 * **Send A5** — no consumer `Ack`: `HandleAck → AckSend → Finish()` has no
-  non-test caller at `01ffa3d`, so it is not an event.
+  non-test caller at `01ffa3d` or `50b0774`, so it is not an event.
 * **Pipeline A1 (discharged by `BlockOrdering.lean`)** — `Pipeline.lean` models
   each layer's payload as a single `Cell`. `BlockOrdering.lean` refines each
   layer's memory into a block-indexed array (`List BlockVal`), models
@@ -115,7 +118,7 @@ Traces (all `decide`):
 | `Recv.trace_failed_h2d_waits_for_other_layer` | two layers' H2D copies issued; one fails while the other runs; staging and failure publication wait for the remaining copy (`FailedLayerWaitsForOtherH2dCopies`) |
 | `Recv.trace_push_lease_pins_staging_on_cancel` | an open incoming push lease (`pushBegin`) keeps staging pinned across `cancel` and rejects new pushes until `pushEnd` (`IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`) |
 | `Recv.trace_push_lease_outlives_h2d` | H2D copy and callback finish while the incoming push lease is still open; `done` stays `false` and `hasStaging` stays `true` until `pushEnd` (`IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`) |
-| `Recv.trace_finish_between_locks` | the race the `.cc:601-612` re-check closes |
+| `Recv.trace_finish_between_locks` | the race the `.cc:605-616` re-check closes |
 | `Recv.trace_no_push_after_finish`, `Pipeline.trace_no_push_after_settle` | nothing lands in a settled receive's staging |
 | `Send.trace_never_pulled`, `Send.trace_zero_layers` | the two degenerate sends |
 | `Send.trace_duplicate_pull_rejected`, `Send.trace_pull_spawn_failure_cleanup` | `ValidateAndBeginPull` sets `pull_started_` atomically and rejects duplicate pulls (`DuplicatePullIsRejectedBeforeAcknowledgement`), while `StartPush` requires `pullStarted = true` and `push_pool_->Schedule` spawn failure calls `Finish(error)` before `StartPush` (`kKvCacheManagerPullSpawn`) |
@@ -162,9 +165,9 @@ Mutants (each yields a `.counterexample` or refutation trace):
 |---|---|---|
 | `Recv.cancelEager`, `Send.cancelEager` | settle waits for `in_flight_ = 0` | settle safety |
 | `Recv.netAccountUnordered` | layer accounted only after its copy is issued (A4) | readiness soundness |
-| `Send.sendNextUncounted` / `d2hIssueUncounted` | the op `SendNextLayer` takes at `.cc:381` | no underflow / drained |
-| `Recv.h2dIssueLeak` | `EndRecvOpLocked()` on the `done_ \|\| draining_` early return in `ExecuteLayerH2d` (`.cc:607`) | no op leak (`NoOpLeak`; `SettleSafe` holds vacuously because the leaked op prevents settling) |
-| `Send.sendNextUnbounded` | `layer_idx >= d2h_layer_futures_.size()` check in `SendNextLayer` (`.cc:379`) | no op leak (`NoOpLeak`; `SendNextLayer(numLayers)` takes an op whose future never exists) |
+| `Send.sendNextUncounted` / `d2hIssueUncounted` | the op `SendNextLayer` takes at `.cc:383` | no underflow / drained |
+| `Recv.h2dIssueLeak` | `EndRecvOpLocked()` on the `done_ \|\| draining_` early return in `ExecuteLayerH2d` (`.cc:611`) | no op leak (`NoOpLeak`; `SettleSafe` holds vacuously because the leaked op prevents settling) |
+| `Send.sendNextUnbounded` | `layer_idx >= d2h_layer_futures_.size()` check in `SendNextLayer` (`.cc:381`) | no op leak (`NoOpLeak`; `SendNextLayer(numLayers)` takes an op whose future never exists) |
 | `Pipeline.dispatchEarly` | `h2dBegin l` after layer `l` landed | publication correctness (junk in HBM) |
 | `Pipeline.h2dReadyByRank` | the H2D copy for layer `l` reads slot `l` (it reads the slot the *counter* points at instead — the shape of a counter-indexed model) | publication correctness: with layer 1 landing first, HBM ends `[kv 1, junk]` |
 | `Pipeline.reseatAtFinish` | staging released at settle, not at `Finish` | publication correctness via the send's staging |
@@ -184,8 +187,8 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | Test | File & lines | Lean trace theorem | General theorem |
 |---|---|---|---|
 | `DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `transfer_send_session_test.cc:50-137` | `Send.trace_drain_h2h_and_d2h` | `Send.reachable_safe` (`SettleSafe`, `Drained`, `StagingIntegrity`) |
-| `FailedLayerWaitsForTheOtherLayersCopies` | `kv_cache_manager_with_transfer_send_drain_test.cc:154-205` | `Send.trace_failed_d2h_waits_for_other_layer` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe` |
-| `DeadlineMidD2hWaitsForInFlightCopy` | `kv_cache_manager_with_transfer_send_drain_test.cc:209-258` | `Send.trace_deadline_during_copy` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe` |
+| `FailedLayerWaitsForTheOtherLayersCopies` | `kv_cache_manager_with_transfer_send_drain_test.cc:158-209` | `Send.trace_failed_d2h_waits_for_other_layer` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe` |
+| `DeadlineMidD2hWaitsForInFlightCopy` | `kv_cache_manager_with_transfer_send_drain_test.cc:213-262` | `Send.trace_deadline_during_copy` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe` |
 | `SendFailureIsReportedInFailedRecvingAndFreesTheSlot` | `kv_cache_manager_with_transfer_control_test.cc:295-333` | `Send.trace_push_fails` | `Send.reachable_safe`, `Send.reachable_can_settle` |
 | `SuccessCannotOverrideAnEarlierFailure` | `kv_cache_manager_with_transfer_control_test.cc:335-380` | `Send.trace_ok_after_cancel_keeps_failure` | `Send.Inv.ok_draining`, `Send.Publication` |
 | `FailureCannotOverrideAnEarlierSuccess` | `kv_cache_manager_with_transfer_control_test.cc:382-392` | `Send.trace_cancel_after_ok_finish` | `Lifecycle.finishOnceLocked_consistent` |
@@ -199,9 +202,10 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | `ExpiredReceiveKeepsStagingUntilHandshakeEnds` | `kv_cache_manager_with_transfer_control_test.cc:394-431` | `Recv.trace_deadline_during_handshake` | `Recv.reachable_safe` (`SettleSafe`, `StagingIntegrity`) |
 | `ReceiveWithoutTrafficFailsAtItsDeadline` | `kv_cache_manager_with_transfer_control_test.cc:462-477` | `Recv.trace_deadline_during_handshake` | `Recv.SettlesPromptly`, `Recv.StagingIntegrity` |
 | `UnregisteringIdleReceiverReleasesPlanAtOnce`, `DemandStagedReceiverPlanUnregistersWhenItSettles` | `kv_cache_manager_with_transfer_pool_reshard_test.cc:409-434, 538-561` | `Recv.trace_deadline_during_handshake` | `Recv.SettlesPromptly`, `Recv.StagingIntegrity` |
-| `FailedLayerWaitsForOtherH2dCopies` | `kv_cache_manager_with_transfer_send_drain_test.cc:262-316` | `Recv.trace_failed_h2d_waits_for_other_layer` | `Recv.reachable_safe`, `Pipeline.DecodeHbmSafe` |
+| `FailedLayerWaitsForOtherH2dCopies` | `kv_cache_manager_with_transfer_send_drain_test.cc:266-326` | `Recv.trace_failed_h2d_waits_for_other_layer` | `Recv.reachable_safe`, `Pipeline.DecodeHbmSafe` |
 | `SingleFailedH2dReportsFailureAndReturnsStaging` | `kv_cache_manager_with_transfer_control_test.cc:479-501` | `Recv.trace_failed_h2d_waits_for_other_layer` | `Recv.reachable_safe`, `Recv.reachable_can_settle` |
 | `IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining` | `kv_cache_manager_with_transfer_control_test.cc:503-529` | `Recv.trace_push_lease_pins_staging_on_cancel`, `Recv.trace_no_push_after_finish` | `Recv.StagingIntegrity`, `Pipeline.StagingSafe` |
+| `FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline` (added by `4efb0dd`) | `kv_cache_manager_with_transfer_send_drain_test.cc:854-882` | `Recv.trace_push_lease_pins_staging_on_cancel` (the `cancel`, `pushEnd`, `publish` steps: `end_incoming_push` now runs `Finish(status)` before `EndRecvOp`) | `Recv.StagingIntegrity`, `Recv.SettlesPromptly` |
 | `UnregisteringInFlightReceiverDefersUntilItSettles` | `kv_cache_manager_with_transfer_pool_reshard_test.cc:436-476` | `Recv.trace_push_lease_pins_staging_on_cancel` | `Recv.StagingIntegrity`, `Pipeline.StagingSafe` |
 | `IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing` | `kv_cache_manager_with_transfer_control_test.cc:531-565` | `Recv.trace_push_lease_outlives_h2d` | `Recv.Accounted`, `Recv.SettleSafe` |
 | `NetworkCompletionWaitsForH2d` | `kv_cache_manager_with_transfer_control_test.cc:567-598` | `Recv.trace_net_completion_waits_for_h2d` | `Recv.ReadinessSound`, `Recv.Publication` |
@@ -221,10 +225,10 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 
 | Test | File & lines | Lean trace theorem | General theorem |
 |---|---|---|---|
-| `DuplicateUuidIsRejectedUntilExpiredReceiveDrains` | `kv_cache_manager_with_transfer_send_drain_test.cc:588-637` | `UuidTable.trace_duplicate_uuid_rejected_until_drained` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` (`slots` conservation) |
+| `DuplicateUuidIsRejectedUntilExpiredReceiveDrains` | `kv_cache_manager_with_transfer_send_drain_test.cc:633-682` | `UuidTable.trace_duplicate_uuid_rejected_until_drained` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` (`slots` conservation) |
 | `DuplicateReceiveDoesNotReplaceOrLeakFirstRead` | `kv_cache_manager_with_transfer_control_test.cc:718-752` | `UuidTable.trace_duplicate_receive_different_req_id` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` |
 | `RepeatedReceiveAnnouncementIsIdempotent` | `kv_cache_manager_with_transfer_control_test.cc:754-790` | `UuidTable.trace_repeated_receive_same_req_id_idempotent` | `UuidTable.active_recv_preserved`, `UuidTable.reachable_inv` |
-| `DuplicateRegistrationCannotReplaceLiveOffer` | `kv_cache_manager_with_transfer_send_drain_test.cc:353-370` | `UuidTable.trace_duplicate_send_cannot_replace_live_offer` | `UuidTable.active_send_preserved`, `UuidTable.reachable_send_safe` |
+| `DuplicateRegistrationCannotReplaceLiveOffer` | `kv_cache_manager_with_transfer_send_drain_test.cc:363-380` | `UuidTable.trace_duplicate_send_cannot_replace_live_offer` | `UuidTable.active_send_preserved`, `UuidTable.reachable_send_safe` |
 | `RegisteredPullIsAcknowledged` | `kv_cache_manager_with_transfer_control_test.cc:353-365` | `Pipeline.trace_registered_and_duplicate_pull` | `Send.PullClaimed`, `Pipeline.HandshakeSafe` |
 | `DuplicatePullIsRejectedBeforeAcknowledgement` | `kv_cache_manager_with_transfer_control_test.cc:367-379` | `Send.trace_duplicate_pull_rejected`, `Pipeline.trace_registered_and_duplicate_pull` | `Send.PullClaimed`, `Pipeline.HandshakeSafe` |
 | `PullWithoutRegistrationIsRejected`, `PullAfterRegistrationDeadlineIsRejected` | `kv_cache_manager_with_transfer_control_test.cc:381-393` | `Pipeline.trace_unregistered_pull_rejected` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` |
@@ -247,20 +251,29 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | Single-host disaggregated serving E2E (`examples/single_host_disagg/run_all.sh`) | `tpu-raiden-tpuvm-release-test` Step 4b | `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests`, `Pipeline.system_data_correct`, `Pipeline.system_progress` | Multi-request prefill-to-decode serving stream recycling HBM and host staging buffers across prompts |
 | `test_non_contiguous_blocks`, `test_host_reordering`, `test_large_complex_non_contiguous_and_reorder` | `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py` | `BlockOrdering.trace_non_contiguous_blocks`, `BlockOrdering.trace_host_reordering`, `BlockOrdering.trace_large_complex_non_contiguous_and_reorder`, `BlockOrdering.BlockPipeline.reachable_safe`, `BlockOrdering.execCoalesced_buildCoalescedSpec` | Full within-layer block-index gather, dual-permutation `BuildLoadCopyPlan`, and contiguous-run DMA coalescing across arbitrary non-contiguous `remote_block_ids` and out-of-order `local_block_ids` (discharging `Pipeline` A1) |
 
-## Outcome at `01ffa3d`
+## Outcome at `01ffa3d`, re-checked at `50b0774`
 
 No bugs in the transfer path. All proposal properties are proved under the
 cited assumptions. Observations (not bugs) worth passing on:
 
 | Observation | Where | Note |
 |---|---|---|
-| `SendAck` / `HandleAck → AckSend → Finish()` has no non-test caller | `mgr.cc:1529-1532`, `1595-1606` | dead path; excluded (Send A5) |
-| a failed **send** is reported in `failed_recving_` | `mgr.cc:920` | naming/semantics quirk visible through `poll_stats()` |
-| first `Finish` wins on the send side; a later cancel is ignored | `send.cc:167-175` | intended; `trace_cancel_after_ok_finish` |
-| `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:427-433` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:659-665, 679-689`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlocksReceived` are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). `ReceivePoll.lean` |
-| `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:188-194` vs `recv.cc:385-388` | underflow proved unreachable (`NoUnderflow`) |
-| `LOG(DFATAL) "H2D callback for retired receive"` is unreachable | `recv.cc:651-653` | proved (`NoRetiredCallback`) |
-| `done_` is redundant in six lifecycle guards | `recv.cc:367, 390, 537, 582, 608`, `recv.h:111` (same on the send side: `send.cc:168, 190`) | `done → draining` and `done → in_flight_ == 0` are `Lifecycle.Consistent`, which every model keeps in its invariant (`Inv.life`); the guards without `done_` are the same functions on consistent states (`finishLocked'_eq`, `endOpLocked'_eq`, `beginOp'_eq`, `Consistent.done_or_draining`). Defensive code, not a bug. The two `LOG(DFATAL)` branches (`recv.cc:385-388`, `651-653`) are assertions — unreachable by `Accounted` / `NoRetiredCallback` — and stay. `Session.lean` |
+| `SendAck` / `HandleAck → AckSend → Finish()` has no non-test caller | `mgr.cc:1551-1554`, `1617-1628` | dead path; excluded (Send A5) |
+| a failed **send** is reported in `failed_recving_` | `mgr.cc:927` | naming/semantics quirk visible through `poll_stats()` |
+| first `Finish` wins on the send side; a later cancel is ignored | `send.cc:167-176` | intended; `trace_cancel_after_ok_finish` |
+| `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:430-436` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:663-669, 683-693`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlocksReceived` are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). `ReceivePoll.lean` |
+| `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:189-196` vs `recv.cc:387-390` | underflow proved unreachable (`NoUnderflow`) |
+| `LOG(DFATAL) "H2D callback for retired receive"` is unreachable | `recv.cc:655-657` | proved (`NoRetiredCallback`) |
+| `done_` is redundant in six lifecycle guards | `recv.cc:368, 392, 541, 586, 612`, `recv.h:117` (same on the send side: `send.cc:168, 191`) | `done → draining` and `done → in_flight_ == 0` are `Lifecycle.Consistent`, which every model keeps in its invariant (`Inv.life`); the guards without `done_` are the same functions on consistent states (`finishLocked'_eq`, `endOpLocked'_eq`, `beginOp'_eq`, `Consistent.done_or_draining`). Defensive code, not a bug. The two `LOG(DFATAL)` branches (`recv.cc:387-390`, `655-657`) are assertions — unreachable by `Accounted` / `NoRetiredCallback` — and stay. `Session.lean` |
+| a failed incoming push reaches the session as a flat `InternalError("Incoming push failed")` | `bt.cc:376-381` → `mgr.cc:239-242` (`4efb0dd`) | the actual cause (read timeout, size mismatch, `OnLayerReceived` error) is only in the transport log, so `failed_recving` cannot tell them apart. Observability, not correctness; the model does not distinguish error statuses. |
+
+## Upstream re-checks
+
+| Date | From → to | What changed in the cited code | What was done |
+|---|---|---|---|
+| 2026-10-06 | `01ffa3d` → `50b0774` (44 upstream commits; merge `8f03107` on `experimental`) | **One behavioural change.** `4efb0dd`: a failed incoming push now runs `DeferUnregisterOnSettle(); Finish(status)` before `EndRecvOp()` (`mgr.cc:239-242`, `bt.cc:376-381`) instead of leaving the session to its deadline — already a trace of the model (`cancel` then `pushEnd`), now with its own C++ test (above). **Additive only:** `completed_at_` set beside every `done_ = true` (`a58a357`); `CompleteReadRaw` became a wrapper over `CompleteReadWithDetails`, poll loop unchanged (`mgr.cc:962-994`); per-read socket timeouts in `HandleIncomingPush`, env-gated and off by default (`e7c933f`, `61b6c76`); `AsyncPush` returns a `tsl::Future` (`50fa652`, `4e9f0a5`, `c4ca33c`). **Unchanged:** A4's ordering (`bt.cc:559-561`, `:601-615`), `StartRead` admission, `IsReadyToComplete` and `AllH2dDoneLocked`, `raiden_controller.cc` (byte-identical), every cited test. No finding fixed; `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` still disabled. | All `file:line` citations in the Lean modules and this file re-pinned with `tools/repin_citations.py` (354 rewritten mechanically, 2 that spanned a hunk by hand, 8 spot-checked against the tree); `Receive.lean` `pushEnd` row and `trace_push_lease_pins_staging_on_cancel` docstring extended; `BlockOrdering.lean` and `PipelineChecks.lean` given the commit statement they lacked; two wrong citations in Stage 4 above corrected (`ValidateRequestedBlocks` pointed into `BuildCoalescedCopySpec`; `copy_spec_builder.h` does not exist in tpu-sync). `lake build` clean, no warnings. |
+
+To repeat after the next sync: `cd verification && python3 tools/repin_citations.py <old> <new>` (dry run), read every `CHECK` and `skip` line, then `--apply`, fix the `CHECK` ones by hand, update the commit sentence in each module preamble, and add a row here.
 
 ## Future work
 

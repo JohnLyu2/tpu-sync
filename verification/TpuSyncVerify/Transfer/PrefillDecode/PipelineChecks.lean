@@ -11,6 +11,9 @@ requests recycling prefill buffers while an earlier request's receive side is
 still running; bounded searches on the one- and two-layer instances; and
 mutants that show the memory model is sensitive to the guards the proof rests
 on, including the per-layer ones.
+
+Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06);
+abbreviations as in `Pipeline.lean`.
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.Pipeline
@@ -21,7 +24,7 @@ def producer : List Ev :=
    .send (.wake true), .send .h2hIssue, .send .sendNext, .h2hDone 0 true, .send .publish]
 
 /-- A one-layer consumer, pull handshake to `done_recving`. Within the accepted
-push, `HandleCustomRequest` (`bt.cc:350-586`) lands the chunk, dispatches
+push, `HandleCustomRequest` (`bt.cc:374-617`) lands the chunk, dispatches
 `OnLayerReceived` (`h2dBegin` / `h2dIssue`) and accounts for the chunk
 (`netAccount`) before returning (`pushEnd`). -/
 def consumer : List Ev :=

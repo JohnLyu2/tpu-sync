@@ -3,21 +3,22 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 /-!
 # Receive session: what the poll-side readiness check contributes
 
-An audit of `IsReadyToComplete` (`.cc:427-433`) and of the manager's poll
-that acts on it (`mgr.cc:956-960`), on the receive model of `Receive.lean`.
-Citations and abbreviations are as there (tpu-sync `01ffa3d`).
+An audit of `IsReadyToComplete` (`.cc:430-436`) and of the manager's poll
+that acts on it (`mgr.cc:966-970`), on the receive model of `Receive.lean`.
+Citations and abbreviations are as there (tpu-sync `50b0774`, re-pinned from
+`01ffa3d` on 2026-10-06).
 
 `TransferReceiveSession` has two ways to finish successfully:
 
 * the H2D callback that completes the last layer calls `FinishLocked()`
-  (`.cc:658-665`) and records the end-of-transfer metrics (`.cc:679-689`);
+  (`.cc:662-669`) and records the end-of-transfer metrics (`.cc:683-693`);
 * the manager's poll calls `Finish()` when `IsReadyToComplete()` holds, i.e.
   `(network_completed_ || num_completed_layers_ == total_layers) &&
   AllH2dDoneLocked()`.
 
 `TransferSendSession` has only the first. The proposal under review removes
 the second (and with it `h2d_futures_`, `network_completed_` and the dead
-`if (all_complete)` finish in `OnBlocksReceived`, `.cc:556-571`). This module
+`if (all_complete)` finish in `OnBlocksReceived`, `.cc:560-575`). This module
 asks what the second way does today, and what changes without it.
 
 ## Results
@@ -34,7 +35,7 @@ On every reachable state of the shipping model:
   disjunct of `IsReadyToComplete` is dead code there.
 * `netAccount_frame`: `OnBlocksReceived` never finishes the session; when its
   `all_complete` test could pass the session is already draining and the
-  handler has returned early (`.cc:537-539`).
+  handler has returned early (`.cc:541-543`).
 * `pollReady_no_settle`: firing in that window never settles the session — a
   callback is still in flight, so `done_` and publication wait for it exactly
   as they would without the poll. The poll moves the start of draining
@@ -59,7 +60,7 @@ else ever calls `FinishLocked()` (`noPoll_zero_layers_never_succeeds`),
 whereas with the poll the session is complete at once
 (`trace_zero_layers_poll`). A change that drops the poll has to finish a
 zero-layer receive at creation, as `TransferSendSession::StartPush` does for
-a zero-layer send (`send.cc:300-303`).
+a zero-layer send (`send.cc:302-305`).
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.Recv
@@ -107,7 +108,7 @@ theorem step_statusOk_mono {s s' : Recv} {e : Ev} (hs : step s e = some s')
     | (cases hs <;> (repeat' split) <;> simp_all)
 
 /-- Only a successful callback bumps `completed`, and if that reaches
-`numLayers` the session is draining afterwards (`.cc:658-665`). -/
+`numLayers` the session is draining afterwards (`.cc:662-669`). -/
 theorem step_completed {s s' : Recv} {e : Ev} (hs : step s e = some s') :
     s'.completed = s.completed ∨
       (s'.completed = s.completed + 1 ∧ (s'.completed = s'.numLayers → s'.life.draining = true)) := by
@@ -126,7 +127,7 @@ theorem step_error_draining {s s' : Recv} {e : Ev} (hs : step s e = some s')
     | (cases hs <;> (repeat' split) <;> simp_all)
 
 /-- The callback that completes the last layer finishes the session and
-records the end-of-transfer metrics (`.cc:659-665`, `.cc:679-689`) iff, with
+records the end-of-transfer metrics (`.cc:663-669`, `.cc:683-693`) iff, with
 the lock held, the copy is live, the session is not settled, this success
 completes the last layer and nobody has started draining. `h2dDone true` takes
 its finish branch under exactly this condition. -/
@@ -242,7 +243,7 @@ theorem pollReady_window {n : Nat} {s s' : Recv} (h : ReachableAny n s) (hn : 0 
 
 /-- `OnBlocksReceived` never finishes the session: when its `all_complete`
 test could pass, the last callback has already started draining and the
-handler returned early (`.cc:537-539`). -/
+handler returned early (`.cc:541-543`). -/
 theorem netAccount_frame {n : Nat} {s s' : Recv} (h : ReachableAny n s)
     (hs : step s .netAccount = some s') : s'.life = s.life := by
   have hinv := h.inv
@@ -300,7 +301,7 @@ theorem pollReady_no_settle {n : Nat} {s s' : Recv} (h : ReachableAny n s) (hn :
 /-! ## With and without the poll: the end-of-transfer metrics -/
 
 /-- A receive session with a ghost bit: whether the last callback recorded the
-end-of-transfer metrics (`.cc:679-689`). -/
+end-of-transfer metrics (`.cc:683-693`). -/
 structure RecvM where
   s : Recv
   metrics : Bool := false
@@ -308,7 +309,7 @@ structure RecvM where
 
 /-- `Recv.step` carrying the ghost. `poll = true` is the shipping code;
 `poll = false` removes the manager's `IsReadyToComplete` finish
-(`mgr.cc:956-960`) and nothing else. -/
+(`mgr.cc:966-970`) and nothing else. -/
 def stepM (poll : Bool) (m : RecvM) (e : Ev) : Option RecvM :=
   if e = .pollReady ∧ poll = false then none
   else (step m.s e).map fun s' =>

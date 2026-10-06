@@ -14,7 +14,8 @@ the proposal's publication correctness: when the decode engine is told
 properties of the proposal (prefill HBM reclaimed, staging released) turn
 out to be corollaries of the sessions' settle protocol and are stated here too.
 
-Citations are to tpu-sync `01ffa3d`: `send.cc` is
+Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06):
+`send.cc` is
 `tpu_sync/core/transfer_send_session.cc`, `recv.cc` is
 `tpu_sync/core/transfer_receive_session.cc`, `bt.cc` is
 `tpu_sync/transport/block_transport.cc`, `mgr.cc` is
@@ -30,17 +31,17 @@ or `.blank` (never written). Layer `l` of a memory is correct iff it is
 | Memory           | Role | Written by |
 |------------------|------|------------|
 | `prefillHbm`     | the request's KV cache in prefill HBM | `reclaim` (the engine frees prefill HBM) |
-| `prefillStaging` | the send's host staging (`send.cc:286-291`) | `d2hReady l` (D2H copy, `send.cc:332-341`), `reseatPrefillStaging` |
-| `wire`           | data delivered by a direct H2H write (`send.cc:424-445`) | `h2hDone l true` |
-| `decodeStaging`  | the receive's host staging | `land l` (transport, `bt.cc:436-470`), `reseatDecodeStaging` |
-| `decodeHbm`      | the decode request's KV cache in decode HBM | `h2dReady l` (H2D copy, `recv.cc:575-696`) |
+| `prefillStaging` | the send's host staging (`send.cc:288-293`) | `d2hReady l` (D2H copy, `send.cc:334-343`), `reseatPrefillStaging` |
+| `wire`           | data delivered by a direct H2H write (`send.cc:426-447`) | `h2hDone l true` |
+| `decodeStaging`  | the receive's host staging | `land l` (transport, `bt.cc:467-501`), `reseatDecodeStaging` |
+| `decodeHbm`      | the decode request's KV cache in decode HBM | `h2dReady l` (H2D copy, `recv.cc:579-700`) |
 
 ## Layers complete in any order
 
 The sessions count copies; they do not say which layer a copy was for. The
-real system issues D2H copies in layer order (`send.cc:324`) and pushes in
-layer order (`send.cc:449`), but D2H futures resolve in any order, pushes
-travel over separate connections and land in any order (`bt.cc:528-530`
+real system issues D2H copies in layer order (`send.cc:326`) and pushes in
+layer order (`send.cc:451`), but D2H futures resolve in any order, pushes
+travel over separate connections and land in any order (`bt.cc:559-561`
 reports each layer when *its* last block is in), and H2D futures resolve in
 any order. So every event that touches a memory carries the layer it is for,
 and per-layer ghost sets record which layers have passed each stage:
@@ -61,17 +62,17 @@ and per-layer ghost sets record which layers have passed each stage:
 
 | Event                   | What it is |
 |-------------------------|-----------|
-| `notifyForRead`         | `NotifyForRead` registers the offer in `send_sessions_[uuid]` (`registered := true`) and calls `cv_.SignalAll()` (`mgr.cc:448-454`) |
-| `pullWait`              | `HandlePullStream` arrives before `NotifyForRead` (`registered = false`) and enters `cv_.WaitWithTimeout` (`pullWaiting := true`, `mgr.cc:1427-1438`) |
-| `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `beginPull` (`ValidateAndBeginPull`) requires `registered = true` and clears `pullWaiting`. `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`send.cc:380-384`), not on any future |
+| `notifyForRead`         | `NotifyForRead` registers the offer in `send_sessions_[uuid]` (`registered := true`) and calls `cv_.SignalAll()` (`mgr.cc:459-465`) |
+| `pullWait`              | `HandlePullStream` arrives before `NotifyForRead` (`registered = false`) and enters `cv_.WaitWithTimeout` (`pullWaiting := true`, `mgr.cc:1448-1459`) |
+| `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `beginPull` (`ValidateAndBeginPull`) requires `registered = true` and clears `pullWaiting`. `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`send.cc:382-386`), not on any future |
 | `d2hReady l`            | the D2H copy of layer `l` finishes: `prefillStaging[l] := prefillHbm[l]`. Issued iff `l < d2hIssued` (copies are issued in order) |
-| `h2hDone l ok`          | the push callback for layer `l` (`send.cc:428-445`). Push `l` exists iff `l < h2hIssued` (pushes are issued in order). On success `wire[l] := prefillStaging[l]` |
+| `h2hDone l ok`          | the push callback for layer `l` (`send.cc:430-447`). Push `l` exists iff `l < h2hIssued` (pushes are issued in order). On success `wire[l] := prefillStaging[l]` |
 | `recv e`                | the receive session's event `e`, no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady` are disabled here. `pullReply ok` requires `ok = false ∨ send.pullStarted = true` and clears `pullWaiting` |
-| `h2dBegin l`            | `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: once per layer (A1), only after layer `l` landed (`bt.cc:528-530`) |
-| `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:601-632`): dispatches layer `l`'s H2D copy unless draining or failed |
+| `h2dBegin l`            | `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: once per layer (A1), only after layer `l` landed (`bt.cc:559-561`) |
+| `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:605-636`): dispatches layer `l`'s H2D copy unless draining or failed |
 | `h2dReady l`            | the H2D copy of layer `l` finishes: `decodeHbm[l] := decodeStaging[l]` |
-| `land l`                | the transport writes layer `l` from the wire into `decodeStaging[l]`, inside an accepted push (`bt.cc:350` … `bt.cc:586`) |
-| `reclaim`               | the engine frees prefill HBM once `poll_stats()` has reported the send (`mgr.cc:918-925`) |
+| `land l`                | the transport writes layer `l` from the wire into `decodeStaging[l]`, inside an accepted push (`bt.cc:374` … `bt.cc:617`) |
+| `reclaim`               | the engine frees prefill HBM once `poll_stats()` has reported the send (`mgr.cc:925-935`) |
 | `reseatPrefillStaging`  | the host staging pool hands the send's released staging to someone else, who writes to it |
 | `reseatDecodeStaging`   | likewise for the receive's staging |
 
@@ -85,12 +86,12 @@ that reads at issue time admits no violation this one does not.
 * **A1 (layers move whole).** Blocks are not modelled: a layer is copied as a
   unit. The transport delivers a layer's blocks individually but reports the
   layer only once the last block is in (`on_layer_received_called`,
-  `bt.cc:528-530`), and both device copies are per layer.
+  `bt.cc:559-561`), and both device copies are per layer.
 * **A2 (delivery ordered after the callback).** In the model, the sender's
   push callback (`h2hDone l true`) puts layer `l` on the wire and the
   receiver lands it (`land l`) at or after that step. In the real system the
   write lands *before* the callback fires (the receiver acks after
-  `EndIncomingPush`, `bt.cc:586-589`). This reversal is sound because
+  `EndIncomingPush`, `bt.cc:617-620`). This reversal is sound because
   `prefillStaging[l]` is invariant throughout `[h2hIssue, h2hDone]`: the push
   holds an op (`in_flight_ > 0`), so the send cannot settle and its staging
   cannot be reseated, and `d2hReady l` has already run before
@@ -188,9 +189,9 @@ structure Pipeline where
   /-- ghost: layers whose H2D copy has finished -/
   h2dReadyL : List Bool
   reclaimed : Bool := false
-  /-- Whether `NotifyForRead` has registered the offer in `send_sessions_[uuid]` (`mgr.cc:448-454`). -/
+  /-- Whether `NotifyForRead` has registered the offer in `send_sessions_[uuid]` (`mgr.cc:459-465`). -/
   registered : Bool := true
-  /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout` (`mgr.cc:1427-1438`). -/
+  /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout` (`mgr.cc:1448-1459`). -/
   pullWaiting : Bool := false
   deriving Repr, DecidableEq
 
@@ -214,7 +215,7 @@ def init (n : Nat) : Pipeline :=
 
 /-- An `n`-layer transfer before `NotifyForRead` has registered the offer in
 `send_sessions_[uuid]`: models the `PullAheadOfRegistration` grace-wait and
-unregistered-pull rejection paths (`mgr.cc:1427-1444`). -/
+unregistered-pull rejection paths (`mgr.cc:1448-1465`). -/
 def initUnregistered (n : Nat) : Pipeline :=
   { init n with registered := false }
 
@@ -235,14 +236,14 @@ inductive Ev where
   deriving Repr, DecidableEq
 
 /-- `NotifyForRead` registers the send session under `transfer_uuid` in
-`send_sessions_` and calls `cv_.SignalAll()` (`mgr.cc:448-454`). -/
+`send_sessions_` and calls `cv_.SignalAll()` (`mgr.cc:459-465`). -/
 def notifyForRead (s : Pipeline) : Option Pipeline :=
   if s.registered = false then
     some { s with registered := true }
   else none
 
 /-- `HandlePullStream` arrives before `NotifyForRead` has registered the offer
-and enters the `cv_.WaitWithTimeout` grace wait (`mgr.cc:1427-1438`). -/
+and enters the `cv_.WaitWithTimeout` grace wait (`mgr.cc:1448-1459`). -/
 def pullWait (s : Pipeline) : Option Pipeline :=
   if s.registered = false ∧ s.pullWaiting = false ∧ s.recv.pullPending = true then
     some { s with pullWaiting := true }
@@ -250,7 +251,7 @@ def pullWait (s : Pipeline) : Option Pipeline :=
 
 /-- A send event with no memory effect. The two that move data are the
 layer-indexed `d2hReady l` / `h2hDone l ok` and are disabled here. `beginPull`
-(`ValidateAndBeginPull`, `mgr.cc:1452`) requires the offer to be registered in
+(`ValidateAndBeginPull`, `mgr.cc:1473`) requires the offer to be registered in
 `send_sessions_` (`s.registered = true`) and clears any grace-wait state
 (`pullWaiting := false`). `wake` gets the per-layer guard the counter model
 cannot state: `SendNextLayer(woken)` waits on layer `woken`'s own future. -/
@@ -269,7 +270,7 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   | _ => (Send.step s.send e).map fun snd => { s with send := snd }
 
 /-- The D2H copy of layer `l` finishes: `prefillStaging[l] := prefillHbm[l]`.
-Copies are issued in layer order (`send.cc:324`), so layer `l`'s exists iff
+Copies are issued in layer order (`send.cc:326`), so layer `l`'s exists iff
 `l < d2hIssued`; which finishes first is up to the device. -/
 def d2hReady (s : Pipeline) (l : Nat) : Option Pipeline :=
   if l < s.send.d2hIssued ∧ s.d2hReadyL[l]? = some false then
@@ -279,7 +280,7 @@ def d2hReady (s : Pipeline) (l : Nat) : Option Pipeline :=
                d2hReadyL := s.d2hReadyL.set l true }
   else none
 
-/-- The push callback for layer `l` (`send.cc:428-445`). Pushes are issued in
+/-- The push callback for layer `l` (`send.cc:430-447`). Pushes are issued in
 layer order by the `SendNextLayer` chain, so push `l` exists iff
 `l < h2hIssued`; pushes complete in any order. A successful push delivers
 `prefillStaging[l]`. -/
@@ -309,7 +310,7 @@ def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   | _ => (Recv.step s.recv e).map fun rcv => { s with recv := rcv }
 
 /-- `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: fires
-once per layer (A1), after layer `l` landed (`bt.cc:528-530`). -/
+once per layer (A1), after layer `l` landed (`bt.cc:559-561`). -/
 def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
   if s.landedL[l]? = some true ∧ s.claimedL[l]? = some false then
     (Recv.step s.recv .h2dBegin).map fun rcv =>
@@ -318,7 +319,7 @@ def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
                h2dPendingL := s.h2dPendingL.set l true }
   else none
 
-/-- `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:601-632`): consumes
+/-- `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:605-636`): consumes
 layer `l`'s pending claim from `h2dBegin l` and, if the session is still active
 and dispatch succeeds (`ok = true`), marks layer `l`'s copy as issued. -/
 def h2dIssue (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=
@@ -417,7 +418,7 @@ def StagingSafe (s : Pipeline) : Prop :=
   (s.recv.life.hasStaging = false →
     s.recv.pushes = 0 ∧ s.recv.pending = 0 ∧ s.recv.retired = s.recv.issued)
 
-/-- Handshake rendezvous invariant (`mgr.cc:448-454`, `mgr.cc:1427-1494`,
+/-- Handshake rendezvous invariant (`mgr.cc:459-465`, `mgr.cc:1448-1516`,
 `send.cc:116-130`):
 1. `StartPush` (`send.started = true`) and all D2H/H2H activity require the
    offer to have been registered (`registered = true`) and claimed by

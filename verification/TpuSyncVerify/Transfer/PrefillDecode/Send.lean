@@ -12,25 +12,26 @@ drives it. The sender stages each layer's device blocks into host staging
 let the engine reuse the device blocks, or the allocator reseat the staging,
 while any copy or push is still running. Memory contents come in stage 4.
 
-Citations are to tpu-sync `01ffa3d`. Unqualified `.h`/`.cc` are
+Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06).
+Unqualified `.h`/`.cc` are
 `tpu_sync/core/transfer_send_session.{h,cc}`; `mgr.cc` is
 `tpu_sync/core/kv_cache_manager_with_transfer.cc`.
 
 ## How a send runs
 
-`StartPush` (`.cc:268-364`) runs once on a worker thread spawned by the
-consumer's pull request (`mgr.cc:1497-1507`). It acquires staging
-(`.cc:286-291`), then issues one D2H copy per layer in a loop (`.cc:324-361`),
+`StartPush` (`.cc:270-366`) runs once on a worker thread spawned by the
+consumer's pull request (`mgr.cc:1519-1529`). It acquires staging
+(`.cc:288-293`), then issues one D2H copy per layer in a loop (`.cc:326-363`),
 each counted in `in_flight_` from before its dispatch until its future's
-`OnReady` ends the op (`.cc:357-360`). After the loop it calls
-`SendNextLayer(0)` (`.cc:363`).
+`OnReady` ends the op (`.cc:359-362`). After the loop it calls
+`SendNextLayer(0)` (`.cc:365`).
 
-`SendNextLayer(l)` (`.cc:366-452`) takes an op (`.cc:375-382`) and waits on
-layer `l`'s D2H future. When it is ready (`.cc:384-406`) the layer is handed to
-the push pool, whose task (`.cc:406-450`) takes a second op for the H2H push,
+`SendNextLayer(l)` (`.cc:368-454`) takes an op (`.cc:377-384`) and waits on
+layer `l`'s D2H future. When it is ready (`.cc:386-408`) the layer is handed to
+the push pool, whose task (`.cc:408-452`) takes a second op for the H2H push,
 issues it, calls `SendNextLayer(l+1)`, and only then releases the first op.
-The push's callback (`.cc:428-445`) releases the second op and, when the last
-layer's push completes, finishes the session OK (`.cc:440-444`).
+The push's callback (`.cc:430-447`) releases the second op and, when the last
+layer's push completes, finishes the session OK (`.cc:442-446`).
 
 So two chains run against the same `in_flight_`: the D2H copies, all issued up
 front, and the pushes, strictly one layer after another. The session settles
@@ -43,43 +44,43 @@ The settle protocol is `Transfer.Lifecycle`. On top of it:
 | Field        | C++                                             | Role |
 |--------------|-------------------------------------------------|------|
 | `numLayers`  | `base_->num_layers()`                           | fixed |
-| `pullStarted`| `pull_started_` (`.h:182`)                      | `ValidateAndBeginPull` (`.cc:116-130`) claimed the offer |
-| `started`    | `StartPush` passed its locked section (`.cc:295-313`) | staging acquired, copies may start |
-| `d2hPending` | ghost                                           | the D2H loop is between `++in_flight_` (`.cc:330`) and the dispatch's outcome |
-| `d2hIssued`  | `d2h_layer_futures_.size()` (`.h:186`)          | copies handed to the device |
+| `pullStarted`| `pull_started_` (`.h:188`)                      | `ValidateAndBeginPull` (`.cc:116-130`) claimed the offer |
+| `started`    | `StartPush` passed its locked section (`.cc:297-315`) | staging acquired, copies may start |
+| `d2hPending` | ghost                                           | the D2H loop is between `++in_flight_` (`.cc:332`) and the dispatch's outcome |
+| `d2hIssued`  | `d2h_layer_futures_.size()` (`.h:193`)          | copies handed to the device |
 | `d2hReady`   | futures with `IsReady()`                        | copies finished |
-| `d2hRetired` | ghost                                           | copies whose `OnReady` at `.cc:357-360` has ended their op |
-| `queued`     | ghost                                           | `SendNextLayer(l)` calls that took their op (`.cc:381`) |
-| `woken`      | ghost                                           | of those, the future callback (`.cc:384`) has run |
-| `pooled`     | ghost                                           | layers scheduled on `push_pool` (`.cc:406`) whose task has not run |
-| `h2hIssued`  | ghost                                           | pushes handed to the transport (`.cc:424`) |
-| `chaining`   | ghost                                           | pool tasks that issued their push and still hold the `SendNextLayer` op (`.cc:424-449`) |
-| `h2hRetired` | ghost                                           | push callbacks that have run (`.cc:428`) |
-| `h2hOk`      | `num_layers - remaining_h2h_layers_` (`.h:190`) | pushes that completed OK |
-| `published`  | membership in `done_sending_` / `failed_recving_` (`mgr.cc:920`) | what `poll_stats()` shows the engine |
+| `d2hRetired` | ghost                                           | copies whose `OnReady` at `.cc:359-362` has ended their op |
+| `queued`     | ghost                                           | `SendNextLayer(l)` calls that took their op (`.cc:383`) |
+| `woken`      | ghost                                           | of those, the future callback (`.cc:386`) has run |
+| `pooled`     | ghost                                           | layers scheduled on `push_pool` (`.cc:408`) whose task has not run |
+| `h2hIssued`  | ghost                                           | pushes handed to the transport (`.cc:426`) |
+| `chaining`   | ghost                                           | pool tasks that issued their push and still hold the `SendNextLayer` op (`.cc:426-451`) |
+| `h2hRetired` | ghost                                           | push callbacks that have run (`.cc:430`) |
+| `h2hOk`      | `num_layers - remaining_h2h_layers_` (`.h:197`) | pushes that completed OK |
+| `published`  | membership in `done_sending_` / `failed_recving_` (`mgr.cc:927`) | what `poll_stats()` shows the engine |
 | `underflow`  | —                                               | `EndSendOpLocked` ran with `in_flight_ == 0` |
 
 Ghost fields record where each unit of `in_flight_` came from, which is what
 `Accounted` is about. `underflow` exists because `EndSendOpLocked`
-(`.cc:188-194`) decrements without a guard; the model records the event
+(`.cc:189-196`) decrements without a guard; the model records the event
 instead of silently saturating so that `NoUnderflow` is a theorem.
 
 ## Events
 
 | Event          | C++ |
 |----------------|-----|
-| `beginPull`    | `ValidateAndBeginPull` (`.cc:116-130`, called from `HandlePullStream` at `mgr.cc:1452`): rejects if expired/draining (`.cc:120-123`) or `pull_started_` is already set (`.cc:125-128`), otherwise sets `pull_started_ = true` (`.cc:129`) |
-| `start`        | `StartPush` from the acquisition (`.cc:286-291`) through its locked section (`.cc:295-313`), spawned after `ValidateAndBeginPull`: a zero-layer send finishes OK at once (`.cc:300-303`) |
-| `d2hBegin`     | one iteration of the D2H loop up to `++in_flight_` (`.cc:325-331`) |
-| `d2hIssue ok`  | the dispatch (`.cc:332-341`): failure finishes the session and ends the op (`.cc:342-350`); success records the future (`.cc:352-356`). For the last layer, `SendNextLayer(0)` (`.cc:363`, `.cc:375-382`) is attempted as part of the event |
+| `beginPull`    | `ValidateAndBeginPull` (`.cc:116-130`, called from `HandlePullStream` at `mgr.cc:1473`): rejects if expired/draining (`.cc:120-123`) or `pull_started_` is already set (`.cc:125-128`), otherwise sets `pull_started_ = true` (`.cc:129`) |
+| `start`        | `StartPush` from the acquisition (`.cc:288-293`) through its locked section (`.cc:297-315`), spawned after `ValidateAndBeginPull`: a zero-layer send finishes OK at once (`.cc:302-305`) |
+| `d2hBegin`     | one iteration of the D2H loop up to `++in_flight_` (`.cc:327-333`) |
+| `d2hIssue ok`  | the dispatch (`.cc:334-343`): failure finishes the session and ends the op (`.cc:344-352`); success records the future (`.cc:354-358`). For the last layer, `SendNextLayer(0)` (`.cc:365`, `.cc:377-384`) is attempted as part of the event |
 | `d2hReady`     | the device finishes a copy: its future becomes `IsReady()` |
-| `d2hEnd`       | the copy's `OnReady` at `.cc:357-360` ends its op |
-| `wake ok`      | `SendNextLayer`'s future callback (`.cc:384-406`): a failed copy finishes the session (`.cc:391-396`); a draining session drops the layer (`.cc:397-403`); otherwise the layer is scheduled on the push pool and the op is carried over (`.cc:405-406`) |
-| `h2hIssue`     | the pool task up to the push (`.cc:407-424`): a draining session drops the layer and ends the op (`.cc:411-416`); otherwise a second op is taken (`.cc:420`) and the push issued |
-| `sendNext`     | the pool task's `SendNextLayer(l+1)` (`.cc:449`, `.cc:369-382`) followed by the release of the carried-over op (`.cc:407`) |
-| `h2hDone ok`   | the push callback (`.cc:428-445`): failure finishes the session (`.cc:429-434`); the last OK push finishes it OK (`.cc:440-444`); the op ends either way |
-| `cancel`       | any `Finish(error)` from outside the data path: deadline (`mgr.cc:911-917`), shutdown (`mgr.cc:331-337`), pull-worker spawn failure (`mgr.cc:1486-1494`), staging acquisition failure (`.cc:288-291`), bad arguments (`.cc:280-285`), pull-worker exceptions (`mgr.cc:1500-1505`) |
-| `publish`      | `CompleteReadRaw` moves a settled session into `done_sending_` or `failed_recving_` by its status and drops it (`mgr.cc:918-925`) |
+| `d2hEnd`       | the copy's `OnReady` at `.cc:359-362` ends its op |
+| `wake ok`      | `SendNextLayer`'s future callback (`.cc:386-408`): a failed copy finishes the session (`.cc:393-398`); a draining session drops the layer (`.cc:399-405`); otherwise the layer is scheduled on the push pool and the op is carried over (`.cc:407-408`) |
+| `h2hIssue`     | the pool task up to the push (`.cc:409-426`): a draining session drops the layer and ends the op (`.cc:413-418`); otherwise a second op is taken (`.cc:422`) and the push issued |
+| `sendNext`     | the pool task's `SendNextLayer(l+1)` (`.cc:451`, `.cc:371-384`) followed by the release of the carried-over op (`.cc:409`) |
+| `h2hDone ok`   | the push callback (`.cc:430-447`): failure finishes the session (`.cc:431-436`); the last OK push finishes it OK (`.cc:442-446`); the op ends either way |
+| `cancel`       | any `Finish(error)` from outside the data path: deadline (`mgr.cc:918-924`), shutdown (`mgr.cc:342-348`), pull-worker spawn failure (`mgr.cc:1508-1516`), staging acquisition failure (`.cc:290-293`), bad arguments (`.cc:282-287`), pull-worker exceptions (`mgr.cc:1522-1527`) |
+| `publish`      | `CompleteReadRaw` moves a settled session into `done_sending_` or `failed_recving_` by its status and drops it (`mgr.cc:925-935`) |
 
 ## Assumptions
 
@@ -100,13 +101,13 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
   admits.
 * **A4 (no double end).** Each op ends once: every op-ending event is guarded
   by the ghost counter that opened it.
-* **A5 (no consumer Ack).** `HandleAck → AckSend → Finish()` (`mgr.cc:1529-1532,
-  1595-1606`) would finish a send OK from outside. No code in the repository at
-  `01ffa3d` sends an Ack (`SendAck` has only test callers), so it is not an
+* **A5 (no consumer Ack).** `HandleAck → AckSend → Finish()` (`mgr.cc:1551-1554,
+  1617-1628`) would finish a send OK from outside. No code in the repository at
+  `01ffa3d` or `50b0774` sends an Ack (`SendAck` has only test callers), so it is not an
   event. With it, `Publication` below would read "the consumer acked", not
   "every layer was pushed".
 * **A6 (fold of `SendNextLayer(0)`).** Between recording the last future
-  (`.cc:355`) and `SendNextLayer(0)`'s lock (`.cc:375`) only a `Finish` can
+  (`.cc:357`) and `SendNextLayer(0)`'s lock (`.cc:377`) only a `Finish` can
   change the outcome of the attempt, and it has the same effect ordered before
   the event; the two are one event.
 
@@ -119,7 +120,7 @@ All proved on every reachable state (`reachable_safe`):
   callback, pool task or push is outstanding. In particular no D2H copy still
   reads the device blocks (so the engine may reuse them) or writes the staging,
   and no push still reads the staging (so the allocator may reseat it). This is
-  what the comments at `.h:179-180` and `mgr.cc:912-916` promise.
+  what the comments at `.h:185-186` and `mgr.cc:919-923` promise.
 * **Staging integrity.** `hasStaging = !done`: staging, once acquired, is held
   exactly until the session settles.
 * **Prompt settle.** `draining → inFlight = 0 → done`.
@@ -144,8 +145,8 @@ the first (`Lifecycle.finishOnceLocked`), unlike the receiver's. An OK finish
 happens inside the last push callback while D2H `OnReady`s may still be
 outstanding, so a shutdown or deadline in that window leaves the status OK
 (`trace_cancel_after_ok_finish`); harmless, since the send did complete.
-(2) A failed send is reported in `failed_recving_` (`mgr.cc:920`), there is no
-`failed_sending_`. (3) The D2H loop's `if (draining_) return;` (`.cc:329`)
+(2) A failed send is reported in `failed_recving_` (`mgr.cc:927`), there is no
+`failed_sending_`. (3) The D2H loop's `if (draining_) return;` (`.cc:331`)
 also skips `SendNextLayer(0)`, which is fine because every later
 `SendNextLayer` re-checks `draining_`.
 -/
@@ -176,20 +177,20 @@ structure Send where
 
 namespace Send
 
-/-- A registered send (`NotifyForRead`, `mgr.cc:432-452`) that nobody has
+/-- A registered send (`NotifyForRead`, `mgr.cc:443-463`) that nobody has
 pulled yet. -/
 def init (numLayers : Nat) : Send := { numLayers }
 
-/-- `EndSendOpLocked` (`.cc:188-194`): `--in_flight_` and settle. The C++ has
+/-- `EndSendOpLocked` (`.cc:189-196`): `--in_flight_` and settle. The C++ has
 no underflow check; the model records one instead of ignoring it. -/
 def endOp (s : Send) : Send :=
   if s.life.inFlight = 0 then { s with underflow := true }
   else { s with life := s.life.endOpLocked }
 
-/-- `Finish(status)` / `FinishLocked(status)` (`.cc:167-180`). -/
+/-- `Finish(status)` / `FinishLocked(status)` (`.cc:167-181`). -/
 def finish (ok : Bool) (s : Send) : Send := { s with life := s.life.finishOnceLocked ok }
 
-/-- `SendNextLayer(l)` up to its lock (`.cc:369-382`) for `l = queued`: takes an
+/-- `SendNextLayer(l)` up to its lock (`.cc:371-384`) for `l = queued`: takes an
 op unless the session is draining or layer `l`'s copy was never issued. -/
 def trySendNext (s : Send) : Send :=
   if s.queued < s.d2hIssued then
@@ -216,30 +217,30 @@ inductive Ev where
 /-- `ValidateAndBeginPull` (`.cc:116-130`): rejects an expired/draining offer
 (`.cc:120-123`) or a duplicate pull (`.cc:125-128`), and otherwise claims
 `pull_started_ = true` (`.cc:129`) before `HandlePullStream` spawns the
-`StartPush` worker thread (`mgr.cc:1452-1508`). -/
+`StartPush` worker thread (`mgr.cc:1473-1530`). -/
 def beginPull (s : Send) : Option Send :=
   if s.pullStarted = true ∨ s.life.draining = true ∨ s.life.done = true then none
   else some { s with pullStarted := true }
 
-/-- `StartPush` with staging acquired (`.cc:268-313`), spawned after
-`ValidateAndBeginPull` claimed `pull_started_` (`mgr.cc:1452-1508`). A failed
-acquisition or worker spawn failure (`mgr.cc:1486-1494`) is `Finish(error)` with
+/-- `StartPush` with staging acquired (`.cc:270-315`), spawned after
+`ValidateAndBeginPull` claimed `pull_started_` (`mgr.cc:1473-1530`). A failed
+acquisition or worker spawn failure (`mgr.cc:1508-1516`) is `Finish(error)` with
 nothing in flight, i.e. `cancel`. On a session that finished meanwhile the call
-returns (`.cc:297-299`) and nothing changes. -/
+returns (`.cc:299-301`) and nothing changes. -/
 def start (s : Send) : Option Send :=
   if s.pullStarted = false ∨ s.started = true ∨ s.life.draining = true ∨ s.life.done = true then none
   else if s.numLayers = 0 then some (s.finish true)
   else some { s with started := true }
 
-/-- One iteration of the D2H loop up to `++in_flight_` (`.cc:325-331`). -/
+/-- One iteration of the D2H loop up to `++in_flight_` (`.cc:327-333`). -/
 def d2hBegin (s : Send) : Option Send :=
   if s.started = true ∧ s.d2hPending = false ∧ s.d2hIssued < s.numLayers then
     s.life.beginOp.map fun l => { s with life := l, d2hPending := true }
   else none
 
 /-- The dispatch's outcome. Failure: `FinishLocked(status); EndSendOpLocked()`
-(`.cc:347-349`). Success: the future is recorded (`.cc:355`), and after the
-last layer `SendNextLayer(0)` is attempted (`.cc:363`, A6). -/
+(`.cc:349-351`). Success: the future is recorded (`.cc:357`), and after the
+last layer `SendNextLayer(0)` is attempted (`.cc:365`, A6). -/
 def d2hIssue (ok : Bool) (s : Send) : Option Send :=
   if s.d2hPending = false then none
   else
@@ -253,12 +254,12 @@ def d2hIssue (ok : Bool) (s : Send) : Option Send :=
 def markD2hReady (s : Send) : Option Send :=
   if s.d2hReady < s.d2hIssued then some { s with d2hReady := s.d2hReady + 1 } else none
 
-/-- The copy's `OnReady` at `.cc:357-360` ends its op. -/
+/-- The copy's `OnReady` at `.cc:359-362` ends its op. -/
 def d2hEnd (s : Send) : Option Send :=
   if s.d2hRetired < s.d2hReady then some { s with d2hRetired := s.d2hRetired + 1 }.endOp
   else none
 
-/-- `SendNextLayer`'s future callback (`.cc:384-406`) for layer `woken`, which
+/-- `SendNextLayer`'s future callback (`.cc:386-408`) for layer `woken`, which
 needs its copy ready. -/
 def wake (ok : Bool) (s : Send) : Option Send :=
   if s.woken < s.queued ∧ s.woken < s.d2hReady then
@@ -268,7 +269,7 @@ def wake (ok : Bool) (s : Send) : Option Send :=
     else some { s with pooled := s.pooled + 1 }
   else none
 
-/-- The pool task up to and including the push (`.cc:407-424`). -/
+/-- The pool task up to and including the push (`.cc:409-426`). -/
 def h2hIssue (s : Send) : Option Send :=
   if s.pooled = 0 then none
   else
@@ -277,13 +278,13 @@ def h2hIssue (s : Send) : Option Send :=
     | some l => some { s with life := l, h2hIssued := s.h2hIssued + 1, chaining := s.chaining + 1 }
     | none => some s.endOp
 
-/-- The pool task's tail: `SendNextLayer(l+1)` (`.cc:449`), then the cleanup
-at `.cc:407` ends the op it carried. -/
+/-- The pool task's tail: `SendNextLayer(l+1)` (`.cc:451`), then the cleanup
+at `.cc:409` ends the op it carried. -/
 def sendNext (s : Send) : Option Send :=
   if s.chaining = 0 then none
   else some { s with chaining := s.chaining - 1 }.trySendNext.endOp
 
-/-- The push callback (`.cc:428-445`). -/
+/-- The push callback (`.cc:430-447`). -/
 def h2hDone (ok : Bool) (s : Send) : Option Send :=
   if s.h2hRetired < s.h2hIssued then
     let s := { s with h2hRetired := s.h2hRetired + 1 }
@@ -296,7 +297,7 @@ def h2hDone (ok : Bool) (s : Send) : Option Send :=
 /-- `Finish(error)` from outside the data path; enabled at any time. -/
 def cancel (s : Send) : Option Send := some (s.finish false)
 
-/-- `CompleteReadRaw` publishes a settled session (`mgr.cc:918-925`). -/
+/-- `CompleteReadRaw` publishes a settled session (`mgr.cc:925-935`). -/
 def publish (s : Send) : Option Send :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }
@@ -975,7 +976,7 @@ theorem trace_normal :
       some (true, some true, 2, 0) := by
   decide
 
-/-- "One nobody pulled is reported now" (`mgr.cc:912-913`;
+/-- "One nobody pulled is reported now" (`mgr.cc:919-920`;
 `SendLifecycleTest.UnpulledSendAtOrBeforeItsDeadlineIsNotFailed` in
 `kv_cache_manager_with_transfer_control_test.cc:433-460` and
 `SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` in
@@ -1004,7 +1005,7 @@ theorem trace_duplicate_pull_rejected :
     (sys 1).run [.beginPull, .start, .beginPull] = none := by
   decide
 
-/-- `HandlePullStream` worker spawn failure (`mgr.cc:1486-1494`,
+/-- `HandlePullStream` worker spawn failure (`mgr.cc:1508-1516`,
 `hooks::kKvCacheManagerPullSpawn`): if `ValidateAndBeginPull` (`.beginPull`)
 succeeds but spawning the `StartPush` thread fails, `counter_cleanup` calls
 `session->Finish(InternalError)` (`.cancel`), which settles the session at once,
@@ -1128,7 +1129,7 @@ def cancelEager (s : Send) : Option Send :=
         | .counterexample _ => true
         | _ => false)
 
-/-- And the point of the op `SendNextLayer` takes at `.cc:381`: without it a
+/-- And the point of the op `SendNextLayer` takes at `.cc:383`: without it a
 send whose copies have all ended settles under a `Finish`, and the pool task
 that then runs ends an op the session no longer owns. -/
 def trySendNextUncounted (s : Send) : Send :=
@@ -1155,9 +1156,9 @@ def d2hIssueUncounted (ok : Bool) (s : Send) : Option Send :=
         | _ => false)
 
 /-- Mutant for `NoOpLeak`: `SendNextLayer` omits the
-`layer_idx >= d2h_layer_futures_.size()` bounds check at `.cc:379` and takes an
+`layer_idx >= d2h_layer_futures_.size()` bounds check at `.cc:381` and takes an
 op unconditionally. After the last layer's pool task calls
-`SendNextLayer(numLayers)` (`.cc:449`), that call claims an op for a
+`SendNextLayer(numLayers)` (`.cc:451`), that call claims an op for a
 non-existent layer whose D2H future never becomes ready, leaking the session and
 its staging forever (`SettleSafe` holds vacuously, `NoOpLeak` catches it). -/
 def trySendNextUnbounded (s : Send) : Send :=

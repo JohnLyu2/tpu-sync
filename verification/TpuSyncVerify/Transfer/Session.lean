@@ -7,33 +7,35 @@ The settle protocol shared by TPU Sync's session classes
 stops new ones, and a `done_` flag set by whichever of `Finish` or the last
 `EndOp` comes second. The session owns its host staging until it settles.
 
-Citations are to tpu-sync `01ffa3d`; `recv` is
+Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06;
+the only change to the cited lifecycle code is the `completed_at_` timestamp
+set next to `done_ = true`); `recv` is
 `tpu_sync/core/transfer_receive_session.{h,cc}`, `send` is
 `tpu_sync/core/transfer_send_session.{h,cc}`.
 
 | Field        | recv                     | send                     |
 |--------------|--------------------------|--------------------------|
-| `inFlight`   | `in_flight_` (`.h:241`)  | `in_flight_` (`.h:181`)  |
-| `draining`   | `draining_` (`.h:243`)   | `draining_` (`.h:184`)   |
-| `done`       | `done_` (`.h:244`)       | `done_` (`.h:185`)       |
-| `statusOk`   | `status_.ok()` (`.h:242`) | `status_.ok()` (`.h:177`) |
-| `hasStaging` | `!staging_.empty()` (`.h:229`, `HasStaging` `.h:102-105`) | `!staging_.empty()` (`.h:170`, `HasStaging` `.h:83-86`); see below |
+| `inFlight`   | `in_flight_` (`.h:247`)  | `in_flight_` (`.h:187`)  |
+| `draining`   | `draining_` (`.h:249`)   | `draining_` (`.h:190`)   |
+| `done`       | `done_` (`.h:250`)       | `done_` (`.h:191`)       |
+| `statusOk`   | `status_.ok()` (`.h:248`) | `status_.ok()` (`.h:183`) |
+| `hasStaging` | `!staging_.empty()` (`.h:235`, `HasStaging` `.h:108-111`) | `!staging_.empty()` (`.h:176`, `HasStaging` `.h:89-92`); see below |
 
 The two classes settle the same way but decide their status differently:
 
-* `finishLocked` is the receiver's `FinishLocked` (`recv.cc:361-371`): the
+* `finishLocked` is the receiver's `FinishLocked` (`recv.cc:362-373`): the
   **first error wins** — a later `Finish(error)` on a session that is already
   draining still flips the status.
-* `finishOnceLocked` is the sender's `FinishLocked` (`send.cc:167-175`): the
+* `finishOnceLocked` is the sender's `FinishLocked` (`send.cc:167-176`): the
   **first `Finish` wins** — once draining or done, later calls are ignored,
   whatever their status.
 
-`endOpLocked` transcribes `EndRecvOpLocked` (`recv.cc:384-394`), whose
-underflow branch is a no-op. The sender's `EndSendOpLocked` (`send.cc:188-194`)
+`endOpLocked` transcribes `EndRecvOpLocked` (`recv.cc:386-397`), whose
+underflow branch is a no-op. The sender's `EndSendOpLocked` (`send.cc:189-196`)
 decrements unconditionally; the send model records an underflow instead of
 reusing the no-op so that its absence can be proved. `beginOp` transcribes
-`TryBeginRecvOp` (`recv.h:109-114`) and the sender's `if (draining_) return;
-++in_flight_` pattern (`send.cc:329-330, 377-381, 413-420`), which refuses on
+`TryBeginRecvOp` (`recv.h:115-120`) and the sender's `if (draining_) return;
+++in_flight_` pattern (`send.cc:331-332, 379-383, 415-422`), which refuses on
 `draining_` alone; the two agree under `Consistent`.
 
 The sender acquires its staging inside `StartPush` rather than at creation. Its
@@ -58,33 +60,33 @@ structure Lifecycle where
 
 namespace Lifecycle
 
-/-- The settle check at the end of both `FinishLocked` (`.cc:367-370`) and
-`EndRecvOpLocked` (`.cc:390-393`): draining with nothing in flight releases
+/-- The settle check at the end of both `FinishLocked` (`.cc:368-372`) and
+`EndRecvOpLocked` (`.cc:392-396`): draining with nothing in flight releases
 staging and marks the session done. -/
 def settleLocked (l : Lifecycle) : Lifecycle :=
   if l.draining = true ∧ l.inFlight = 0 ∧ l.done = false then
     { l with hasStaging := false, done := true }
   else l
 
-/-- The receiver's `FinishLocked(status)` (`recv.cc:361-371`): `draining` is
+/-- The receiver's `FinishLocked(status)` (`recv.cc:362-373`): `draining` is
 sticky and the first error wins (`ok = false` flips `statusOk` even if already
 draining). -/
 def finishLocked (ok : Bool) (l : Lifecycle) : Lifecycle :=
   let l := if ok = false ∧ l.statusOk = true then { l with statusOk := false } else l
   if l.draining = true then l else settleLocked { l with draining := true }
 
-/-- The sender's `FinishLocked(status)` (`send.cc:167-175`): the first call
+/-- The sender's `FinishLocked(status)` (`send.cc:167-176`): the first call
 decides the outcome, later ones are ignored. -/
 def finishOnceLocked (ok : Bool) (l : Lifecycle) : Lifecycle :=
   if l.draining = true ∨ l.done = true then l
   else settleLocked { l with draining := true, statusOk := ok }
 
-/-- `EndRecvOpLocked` (`.cc:384-394`). The underflow branch (`.cc:385-388`,
+/-- `EndRecvOpLocked` (`.cc:386-397`). The underflow branch (`.cc:387-390`,
 `LOG(DFATAL)`) leaves the state unchanged. -/
 def endOpLocked (l : Lifecycle) : Lifecycle :=
   if l.inFlight = 0 then l else settleLocked { l with inFlight := l.inFlight - 1 }
 
-/-- `TryBeginRecvOp` (`.h:109-114`): refused once settled or draining. -/
+/-- `TryBeginRecvOp` (`.h:115-120`): refused once settled or draining. -/
 def beginOp (l : Lifecycle) : Option Lifecycle :=
   if l.done = true ∨ l.draining = true then none
   else some { l with inFlight := l.inFlight + 1 }
@@ -392,26 +394,28 @@ theorem endOpLocked_done_mono {l : Lifecycle} (h : l.done = true) :
 /-! ## Redundant `done_` guards
 
 Audit of the `done_` mentions in the receiver's lifecycle guards (`recv` at
-`01ffa3d`; the same code sits at `b68161a` lines `.cc:365`, `.cc:388`,
-`.cc:520`, `.cc:565`, `.h:111`). `Consistent` already decides each of them:
+`50b0774`; the same code sat at `01ffa3d` lines `.cc:367`, `.cc:390`,
+`.cc:537`, `.cc:582`, `.cc:608`, `.h:111`, and at `b68161a` lines `.cc:365`,
+`.cc:388`, `.cc:520`, `.cc:565`, `.h:111`). `Consistent` already decides each
+of them:
 
-* `FinishLocked` `.cc:367`: past the `if (draining_) return` (`.cc:365`),
+* `FinishLocked` `.cc:368`: past the `if (draining_) return` (`.cc:366`),
   `!done_` holds — `Consistent.not_done`;
-* `EndRecvOpLocked` `.cc:390`: past the underflow return (`.cc:385-388`),
+* `EndRecvOpLocked` `.cc:392`: past the underflow return (`.cc:387-390`),
   `!done_` holds — `Consistent.not_done_of_inFlight`;
-* `done_ || draining_` in `TryBeginRecvOp` (`.h:111`), `OnBlocksReceived`
-  (`.cc:537`) and `ExecuteLayerH2d` (`.cc:582`, `.cc:608`) is `draining_` —
+* `done_ || draining_` in `TryBeginRecvOp` (`.h:117`), `OnBlocksReceived`
+  (`.cc:541`) and `ExecuteLayerH2d` (`.cc:586`, `.cc:612`) is `draining_` —
   `Consistent.done_or_draining`.
 
 The sender has the same two: `send.cc:168` (`draining_ || done_`) and
-`send.cc:190` (`!done_`).
+`send.cc:191` (`!done_`).
 
 The primed functions below are the transcriptions with those guards removed.
 They agree with the originals on every `Consistent` lifecycle, and every
 model built on this file keeps `Consistent` as part of its invariant
 (`Recv.Inv.life`, `Send.Inv.life`), so dropping the guards changes no
 transition of any reachable state. The `LOG(DFATAL)` branches
-(`.cc:385-388`, `.cc:651-653`) are a different matter: they are assertions,
+(`.cc:387-390`, `.cc:655-657`) are a different matter: they are assertions,
 unreachable by `Accounted` and `NoRetiredCallback` respectively, not
 redundant tests of an already-known value. -/
 
@@ -420,12 +424,12 @@ def settleLocked' (l : Lifecycle) : Lifecycle :=
   if l.draining = true ∧ l.inFlight = 0 then { l with hasStaging := false, done := true }
   else l
 
-/-- `FinishLocked` without the `!done_` at `.cc:367`. -/
+/-- `FinishLocked` without the `!done_` at `.cc:368`. -/
 def finishLocked' (ok : Bool) (l : Lifecycle) : Lifecycle :=
   let l := if ok = false ∧ l.statusOk = true then { l with statusOk := false } else l
   if l.draining = true then l else settleLocked' { l with draining := true }
 
-/-- `EndRecvOpLocked` without the `!done_` at `.cc:390`. -/
+/-- `EndRecvOpLocked` without the `!done_` at `.cc:392`. -/
 def endOpLocked' (l : Lifecycle) : Lifecycle :=
   if l.inFlight = 0 then l else settleLocked' { l with inFlight := l.inFlight - 1 }
 
