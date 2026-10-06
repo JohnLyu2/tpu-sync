@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -482,7 +483,7 @@ NumaAwareKVCacheManager::get_local_data_endpoints() const {
         shards = submanager_to_global_shards_[s];
       }
       for (const auto& sub_ep : sub_eps) {
-        res.push_back({sub_ep.endpoint, shards});
+        res.push_back({sub_ep.endpoint, shards, sub_ep.layer_host_addrs});
       }
     }
   }
@@ -500,7 +501,7 @@ NumaAwareKVCacheManager::get_local_endpoints() const {
         shards = submanager_to_global_shards_[s];
       }
       for (const auto& sub_ep : sub_eps) {
-        res.push_back({sub_ep.endpoint, shards});
+        res.push_back({sub_ep.endpoint, shards, sub_ep.layer_host_addrs});
       }
     }
   }
@@ -777,20 +778,30 @@ NumaAwareKVCacheManager::H2hWrite(
 
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     const auto& sub_shards = submanager_to_global_shards_[s];
-    std::string matched_ep;
+    const RaidenTransferEndpoint* matched_desc = nullptr;
     for (const auto& desc : remote_descriptors) {
       for (int64_t gsh : sub_shards) {
         if (std::find(desc.shards.begin(), desc.shards.end(), gsh) !=
             desc.shards.end()) {
-          matched_ep = desc.endpoint;
+          matched_desc = &desc;
           break;
         }
       }
-      if (!matched_ep.empty()) break;
+      if (matched_desc != nullptr) break;
     }
-    if (matched_ep.empty() && !remote_descriptors.empty()) {
-      matched_ep = remote_descriptors[0].endpoint;
+    if (matched_desc == nullptr && !remote_descriptors.empty()) {
+      matched_desc = &remote_descriptors[0];
     }
+
+    std::string matched_ep =
+        matched_desc != nullptr ? matched_desc->endpoint : "";
+    sub_managers_[s]->base()->SetRemoteLayerAddrs(
+        uuid, matched_desc != nullptr
+                  ? matched_desc->layer_host_addrs
+                  : std::vector<::tpu_sync::rpc::PoolHostAddrsProto>{});
+    absl::Cleanup clear_remote_addrs = [&]() {
+      sub_managers_[s]->base()->ClearRemoteLayerAddrs(uuid);
+    };
 
     ABSL_ASSIGN_OR_RETURN(auto res, sub_managers_[s]->base()->H2hWrite(
                                         matched_ep, src_block_ids,

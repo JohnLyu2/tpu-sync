@@ -46,6 +46,10 @@ cc_library(
     ],
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/proto:worker_service_cc_proto",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+    ],
 )
 
 cc_library(
@@ -437,6 +441,7 @@ cc_library(
         ":raw_transfer_core",
         "//tpu_sync/kv_cache/backends:backend",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",

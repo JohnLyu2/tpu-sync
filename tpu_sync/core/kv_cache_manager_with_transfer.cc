@@ -771,12 +771,14 @@ std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
   for (size_t i = 0; i < base_->num_shards(); ++i) {
     all_shards[i] = static_cast<int64_t>(i);
   }
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
+      base_->LayerHostAddrs(/*uuid=*/0);
   std::vector<RaidenTransferEndpoint> eps;
   for (const auto& ip : base_->local_ips()) {
     std::string endpoint = absl::StrContains(ip, ':')
                                ? absl::StrCat("[", ip, "]:", port)
                                : absl::StrCat(ip, ":", port);
-    eps.push_back({endpoint, all_shards});
+    eps.push_back({endpoint, all_shards, layer_host_addrs});
   }
   return eps;
 }
