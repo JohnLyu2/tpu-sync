@@ -376,6 +376,8 @@ class TransferPlan:
       default_factory=list
   )
   has_explicit_shard_push_schedules: bool = False
+  # raiden_service_pb2.HostTilingMode of the host buffers moved by this plan.
+  host_tiling_mode: int = raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED
 
 
 class RaidenFuture:

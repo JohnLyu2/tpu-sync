@@ -1037,6 +1037,13 @@ class JobEntity:
     skip_d2h_val = bool(getattr(transfer_plan, "skip_d2h", False))
     broadcast_round_val = getattr(transfer_plan, "broadcast_round", None)
     is_sender = target_id in transfer_plan.src_units and transfer_plan.is_sender
+    tiling_mode_val = int(
+        getattr(
+            transfer_plan,
+            "host_tiling_mode",
+            raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED,
+        )
+    )
     is_ws = getattr(transfer_plan, "is_weight_sync", False)
     ep_count = len(target_eps)
     include_recv_sched = self.include_receiver_push_schedules(transfer_plan)
@@ -1063,6 +1070,7 @@ class JobEntity:
         req_id_val,
         skip_d2h_val,
         is_sender,
+        tiling_mode_val,
         is_ws,
         ep_count,
         include_recv_sched,
@@ -1078,6 +1086,7 @@ class JobEntity:
         uuid_val,
         skip_d2h_val,
         is_sender,
+        tiling_mode_val,
         is_ws,
         ep_count,
         include_recv_sched,
@@ -1092,6 +1101,7 @@ class JobEntity:
         owned_shards_key,
         broadcast_round_val,
         is_sender,
+        tiling_mode_val,
         is_ws,
         int(transfer_plan.dst_mem_type),
         bool(transfer_plan.use_block_chunks),
@@ -1195,6 +1205,8 @@ class JobEntity:
         pool_dtype_tags=transfer_plan.pool_dtype_tags,
         parallelism=transfer_plan.parallelism,
     )
+    if tiling_mode_val != raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED:
+      start_req.host_tiling_mode = tiling_mode_val
     for layer_idx, skip in transfer_plan.skip_tiling.items():
       start_req.skip_tiling[layer_idx] = skip
 

@@ -368,6 +368,7 @@ class RaidenControllerServer:
                   expected_layer_chunk_counts=dict(
                       start_req.expected_layer_chunk_counts
                   ),
+                  host_tiling_mode=start_req.host_tiling_mode,
               )
             if future.try_start():
               loop.run_until_complete(future.wait())
@@ -591,6 +592,7 @@ class RaidenControllerClientFacade:
       skip_d2h: bool = False,
       skip_tiling: Optional[dict[int, bool]] = None,
       expected_layer_chunk_counts: Optional[dict[int, int]] = None,
+      host_tiling_mode: int = raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED,
   ) -> bool:
     """Inter-controller RPC to register computed push schedules and prepare receivers."""
     del dst_controller_address, src_controller_address
@@ -605,6 +607,8 @@ class RaidenControllerClientFacade:
         dst_mem_type=int(dst_mem_type),
         skip_d2h=skip_d2h,
     )
+    if host_tiling_mode != raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED:
+      start_req.host_tiling_mode = host_tiling_mode
     if skip_tiling:
       for layer_idx, skip in skip_tiling.items():
         start_req.skip_tiling[layer_idx] = skip

@@ -981,6 +981,7 @@ class RaidenController:
       group_size: int = 1,
       use_cached_plan: bool = True,
       expected_layer_chunk_counts: Optional[dict[int, int]] = None,
+      host_tiling_mode: int = raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED,
   ) -> RaidenFuture:
     """Generates a transfer plan for the requested entities and dispatches it."""
     if group_size <= 0:
@@ -1156,6 +1157,7 @@ class RaidenController:
                       for u in (*src_units, *dst_units)
                   )
               ),
+              host_tiling_mode=host_tiling_mode,
           )
 
           if expected_block_count > 0:
