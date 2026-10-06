@@ -225,10 +225,24 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // Returns the list of layer names associated with the weight synchronizer.
   const std::vector<std::string>& layer_names() const { return layer_names_; }
 
-  // Copies the host staging buffers of all layers to device, tiling each
-  // layer into the per-shard scratchpads unless skip_tiling is set for it
-  // under |uuid|.
+  // Copies the host staging buffers of all layers to device. For each layer:
+  // - If the layer was armed with HOST_TILING_MODE_ON_ARRIVAL or
+  //   HOST_TILING_MODE_PRE_TILED (see StartTransferRequest.host_tiling_mode),
+  //   waits until the layer has been received (and, for ON_ARRIVAL, tiled
+  //   in place by TileLayer()) and copies the host bytes as is. The
+  //   transport acks the final chunk before running the receive callbacks,
+  //   so this wait covers callers that start H2D as soon as the sender
+  //   reports completion.
+  // - Otherwise the host buffers hold logical-layout bytes; tiles them into
+  //   the per-shard scratchpads and copies those.
+  // Must not be called from the receive path (OnLayerDataReceived /
+  // OnDataReceived) since it may block on tiling scheduled there.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
+  // Tiles the host staging buffers of |layer_idx| into device layout and
+  // copies the tiled bytes back into the same host buffers. No-op for shards
+  // without tiled layouts or when skip_tiling is set for |layer_idx| under
+  // |uuid|.
+  absl::Status TileLayer(size_t layer_idx, uint64_t uuid = 0);
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(
       size_t layer_idx, uint64_t uuid = 0,
@@ -373,6 +387,25 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // upon complete host buffer writes.
   bool auto_h2d_ = false;
 
+  // Signals that a received layer's host buffers hold device-layout bytes,
+  // i.e. the layer has arrived and, if needed, been tiled in place.
+  // Thread-safe.
+  class LayerTileReady {
+   public:
+    // Records |status| and wakes all waiters. Calls after the first are
+    // ignored.
+    void Set(absl::Status status) ABSL_LOCKS_EXCLUDED(mu_);
+    // Blocks until Set() has been called and returns the recorded status.
+    absl::Status Wait() ABSL_LOCKS_EXCLUDED(mu_);
+    // Returns true if Set() has been called.
+    bool IsSet() ABSL_LOCKS_EXCLUDED(mu_);
+
+   private:
+    absl::Mutex mu_;
+    bool done_ ABSL_GUARDED_BY(mu_) = false;
+    absl::Status status_ ABSL_GUARDED_BY(mu_);
+  };
+
   struct PendingH2dState {
     // Number of layers with a non-zero expected chunk count, set by
     // RegisterExpectedLayerChunksLocal. OnDataReceived waits until
@@ -382,6 +415,11 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     absl::flat_hash_map<size_t,
                         std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
         layer_futures;
+    // Per-layer readiness signals created when the uuid was armed with a
+    // non-deferred tiling mode, keyed by layer index. OnLayerDataReceived
+    // takes each one and sets it once the layer is ready for a raw H2D;
+    // signals still here when the uuid is dropped are cancelled.
+    absl::flat_hash_map<size_t, std::shared_ptr<LayerTileReady>> tile_ready;
   };
 
   // Blocks until every expected layer of |uuid| has scheduled its future via
@@ -395,6 +433,19 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // back to the latest stored skip_tiling when |uuid| is unknown.
   bool IsTilingSkipped(size_t layer_idx, uint64_t uuid)
       ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
+  // Returns the StartTransferRequest.host_tiling_mode the receiver was armed
+  // with for |uuid|, normalized so that UNSPECIFIED becomes
+  // HOST_TILING_MODE_DEFERRED.
+  tpu_sync::rpc::HostTilingMode GetReceiverTiling(uint64_t uuid)
+      ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
+  // Sets the in-place tiling signal of |layer_idx|; nullptr marks the layer's
+  // host buffers as holding logical-layout bytes.
+  void SetLayerTileReady(size_t layer_idx,
+                         std::shared_ptr<LayerTileReady> ready)
+      ABSL_LOCKS_EXCLUDED(tile_ready_mu_);
+  // Marks the host staging buffers of all layers as holding logical-layout
+  // bytes, so that the next H2d() tiles them.
+  void MarkHostBufferUntiled() ABSL_LOCKS_EXCLUDED(tile_ready_mu_);
 
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
@@ -465,11 +516,23 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_shard_pool_
       ABSL_GUARDED_BY(h2d_shard_pool_mu_);
 
+  // Per-layer in-place tiling state of the host staging buffers, indexed by
+  // layer. A non-null entry means the layer's host buffers hold device-layout
+  // bytes once the signal is set; null means they hold logical-layout bytes.
+  // Lock order: pending_h2d_mu_ before tile_ready_mu_.
+  absl::Mutex tile_ready_mu_;
+  std::vector<std::shared_ptr<LayerTileReady>> layer_tile_ready_
+      ABSL_GUARDED_BY(tile_ready_mu_);
+
   mutable absl::Mutex skip_tiling_mu_;
   absl::flat_hash_map<uint64_t, std::vector<bool>> uuid_to_skip_tiling_
       ABSL_GUARDED_BY(skip_tiling_mu_);
   std::vector<bool> latest_skip_tiling_ ABSL_GUARDED_BY(skip_tiling_mu_);
   absl::flat_hash_map<uint64_t, std::string> uuid_to_req_id_
+      ABSL_GUARDED_BY(skip_tiling_mu_);
+  // Receiver uuids armed with a non-default
+  // StartTransferRequest.host_tiling_mode.
+  absl::flat_hash_map<uint64_t, tpu_sync::rpc::HostTilingMode> receiver_tiling_
       ABSL_GUARDED_BY(skip_tiling_mu_);
 
   struct UuidD2hState {

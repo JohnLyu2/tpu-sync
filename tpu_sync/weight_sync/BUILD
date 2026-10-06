@@ -57,7 +57,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":tiling_utils",
-        "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/common:trace",
         "//tpu_sync/common/control_pipe",
         "//tpu_sync/core:host_memory_allocator",
@@ -112,6 +111,7 @@ cc_test(
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport/lib:test_only_rate_limiter",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
