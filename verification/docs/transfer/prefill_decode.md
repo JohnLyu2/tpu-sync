@@ -18,16 +18,19 @@ was read at that commit when the stage was written.
 | `PrefillDecode/MultiRequest.lean` | 4 | multi-request system (`multiSys`): `reqs : List Pipeline` concurrently sharing the four buffers with per-buffer read-after-release (`recyclePrefill`, `nextRequest`) and write-after-release (`wroteReleased`) checks | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress` |
 | `PrefillDecode/PeerIsolation.lean` | 4 (multi-peer) | decode consumer pulling from `Peer.sick` and `Peer.healthy` prefill producers concurrently across `StagingBlockAllocator` (`numSlots`, `unboundedPerPeer` vs. `perPeerQuota maxPerPeer`) and `push_pool_` (`poolSize`, `tcpBlocking` vs. `grpcAsync`) | `PeerIsolation.reachable_inv`, `PeerIsolation.tcp_healthy_blocked_when_pool_full`, `PeerIsolation.grpc_healthy_can_complete`, `PeerIsolation.reachable_quota_admits_healthy` |
 | `PrefillDecode/UuidTable.lean` | 4 (manager table) | manager UUID registration tables (`active_recv_sessions_[uuid]`, `send_sessions_[uuid]`), drain-before-reuse discipline (`EmplaceRecvSessionLocked`, `StartRead`, `NotifyForRead`), request-ID differentiation, and `PollStats` sweep | `UuidTable.reachable_inv`, `UuidTable.active_recv_preserved`, `UuidTable.active_send_preserved`, `UuidTable.reachable_recv_safe`, `UuidTable.reachable_send_safe` |
+| `PrefillDecode/BlockOrdering.lean` | 4 (block-level) | within-layer block-index gather, dual-permutation `BuildLoadCopyPlan` (`transportBlocks` + `h2dSrc`/`h2dDst`), contiguous-run DMA coalescing (`BuildCoalescedSpec`), producer block registration & subset/uniqueness validation (`ValidateRequestedBlocks`), custom host staging (`kCustomHostBlocks`), and multi-layer `BlockPipeline` coupled via `step_pipe` to `Pipeline.step` | `BlockOrdering.execCoalesced_buildCoalescedSpec`, `BlockOrdering.landStage_get_requested`, `BlockOrdering.h2dStage_get_requested`, `BlockOrdering.BlockPipeline.step_pipe`, `BlockOrdering.BlockPipeline.reachable_safe` |
 | `PrefillDecode/PipelineChecks.lean` | 4 | executable `decide` traces (including out-of-order layers, handshake rendezvous, and concurrent/overlapped requests), `#guard` bounded searches, and mutants | `Pipeline.trace_normal`, `Pipeline.trace_layers_out_of_order`, `Pipeline.trace_pull_ahead_of_registration`, `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests` |
 
 Stage boundaries are the commits on `experimental` (see the README status
 table). Each later stage uses the earlier models as-is: `Pipeline` composes
 `Send.step` and `Recv.step`, adds the memory effect of each event and the
 per-layer guards the counters cannot express (a push waits for *its* layer's
-D2H copy; an H2D dispatch waits for *its* layer to land), `MultiRequest`
-composes transfers across concurrent and overlapped requests reusing the four
-memories (`multiSys`), and `PipelineChecks` contains the executable traces,
-bounded searches, and mutants.
+D2H copy; an H2D dispatch waits for *its* layer to land), `BlockOrdering`
+refines `Pipeline`'s per-layer memory cell into a block-indexed array with a
+lockstep forward simulation (`BlockPipeline.step_pipe`) over `Pipeline.step`,
+`MultiRequest` composes transfers across concurrent and overlapped requests
+reusing the four memories (`multiSys`), and `PipelineChecks` contains the
+executable traces, bounded searches, and mutants.
 
 ## Proposal properties → theorems
 
@@ -36,10 +39,11 @@ bounded searches, and mutants.
 | **System data correctness & attention safety across requests** | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe` | Across any reachable state of `multiSys n` (`reqs : List Pipeline`, modeling concurrent/overlapped requests plus per-buffer read-after-release and write-after-release via `wroteReleased`), whenever any request `r` at index `idx` publishes `done_recving`, `r.decodeHbm = good n` and stays `good n` across all subsequent multi-request transitions (`reqStep`, `recyclePrefill`, `nextRequest`) |
 | **System progress across requests** | `Pipeline.system_progress` | From any reachable multi-request state and any request `idx`, a finite trace settles `idx`, releases both host staging buffers to `BufferPool` and publishes both HBM outcomes (`HandedOff`), and enables both `.recyclePrefill idx` and `.nextRequest idx` |
 | Publication correctness (single request) | `Pipeline.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n` |
+| **Within-layer block gather, dual-permutation reordering, DMA coalescing & custom host staging** | `BlockOrdering.execCoalesced_buildCoalescedSpec`, `BlockOrdering.landStage_get_requested`, `BlockOrdering.h2dStage_get_requested`, `BlockOrdering.BlockPipeline.reachable_safe` (`BlockValidationSafe`, `BlockPublicationCorrect`, `CustomHostStagingCorrect`) | Contiguous-run DMA coalescing is observationally identical to elementwise block copy (`execCoalesced = execElementwise`); dual-permutation sorting in `BuildLoadCopyPlan` (`transportBlocks` sorted by `dst_block_id`, `h2dSrc`/`h2dDst` sorted by `host_block_id`) algebraically cancels across arbitrary non-contiguous `remote_block_ids`, out-of-order `local_block_ids`, and custom `host_block_ids`, so on `done_recving` every layer `l` and request position `i` satisfies `decodeHbm[l][localBlocks[i]] = prefillHbm[l][requestedRemote[i]]` (`CustomHostStagingCorrect` on `decodeStaging[l][hostBlocks[i]]`) while unrequested HBM and staging blocks are untouched |
 | Decode HBM safety & quietness | `DecodeHbmSafe`, `decodeHbm_quiet`, `attention_safe` | `recv.published ≠ none → pending = 0 ∧ retired = issued`, which proves `s'.decodeHbm = s.decodeHbm` for every subsequent transition (`decodeHbm_quiet`) and `s'.decodeHbm = good n` across any post-publication trace (`attention_safe`) |
 | Prefill HBM safety & quietness | `PrefillHbmSafe`, `prefillHbm_quiet`, `prefillHbm_quiet_step` | `send.published ≠ none → d2hPending = false ∧ d2hRetired = d2hIssued`, which disables `d2hReady` once `poll_stats()` reports the send outcome (so the caller can safely reclaim `prefillHbm`) |
 | Staging integrity & quietness | `Recv.StagingIntegrity`, `Send.StagingIntegrity`, `StagingSafe`, `prefillStaging_quiet`, `decodeStaging_quiet`, `wroteReleased_eq_false` | `hasStaging = !done`; once a staging buffer is released (`hasStaging = false`), `StagingSafe` proves no subsequent transfer step can modify that staging buffer or copy from it, and `wroteReleased_eq_false` combines all four into per-buffer post-release non-interference |
-| Handshake rendezvous & single-pull claim | `Send.PullClaimed`, `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` | `StartPush` (`send.started = true`) and all D2H/H2H activity require `NotifyForRead` registration (`registered = true`) and `ValidateAndBeginPull` (`send.pullStarted = true`), discharging `Send` Assumption A1; while `HandlePullStream` waits in `cv_.WaitWithTimeout` (`pullWaiting = true`), `recv.pullPending = true` and `send.pullStarted = false` |
+| Handshake rendezvous, subset/uniqueness validation & single-pull claim | `Send.PullClaimed`, `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe`, `BlockOrdering.validateRegistration_iff`, `BlockOrdering.validateRequestedBlocks_iff`, `BlockOrdering.BlockPipeline.reachable_safe` (`BlockValidationSafe`) | `StartPush` (`send.started = true`) and all D2H/H2H activity require `NotifyForRead` registration (`registered = true` with non-empty duplicate-free `registeredBlocks`) and `ValidateAndBeginPull` (`send.pullStarted = true` with non-empty duplicate-free `requestedRemote ⊆ registeredBlocks`), discharging `Send` Assumption A1; while `HandlePullStream` waits in `cv_.WaitWithTimeout` (`pullWaiting = true`), `recv.pullPending = true` and `send.pullStarted = false` |
 | Termination (no op leak / drain to settle) | `Recv.NoOpLeak`, `Recv.reachable_can_settle`, `Send.NoOpLeak`, `Send.reachable_can_settle`, `Pipeline.NoOpLeak`, `Pipeline.reachable_can_settle` | `0 < inFlight → ∃ e ∈ drainEvents, (step s e).isSome`: every accounted unit of `in_flight_` has an enabled step that advances or retires it, and every reachable state can drain to `done = true ∧ hasStaging = false`, publish both outcomes (`published ≠ none`), and reclaim prefill HBM (`reclaimed = true`) in finitely many steps |
 
 Counter-level forms of publication are proved per side as well
@@ -59,7 +63,7 @@ was checked when:
 | 1 | `transfer_receive_session.{h,cc}` | `ExecuteLayerH2d` re-checks `done_ || draining_` under its second lock (`.cc:601-612`); fault injection adds dispatch/completion failure paths; `in_flight_` starts at 1 for a load plan (`.cc:342`). All encoded. |
 | 2 | `block_transport.cc`, `kv_cache_manager_with_transfer.cc` (`CompleteReadRaw`, `begin/end_incoming_push`, `OnBlocksReceived` path) | `OnLayerReceived` fires once per layer (`bt.cc:528-530`) and before `OnBlocksReceived` on the same thread (`bt.cc:570-584`): assumption A4 of `Receive.lean`. |
 | 3 | `transfer_send_session.{h,cc}`, `mgr.cc` pull worker and deadline | two op chains on one counter; `SendNextLayer` carries an op across the pool task; `FinishLocked` is first-call-wins. |
-| 4 | the above plus `bt.cc:436-470` (landing), `mgr.cc:918-925` (send publication), `send.cc:324` / `:449` (D2H copies and pushes are *issued* in layer order), `send.cc:380-384` (`SendNextLayer(l)` waits on layer `l`'s own future) | layer granularity (A1), delivery modelled after the callback (A2), one sender per layer (A3). Completion order is **not** assumed: every memory-touching event is layer-indexed. |
+| 4 | the above plus `bt.cc:436-470` (landing), `mgr.cc:918-925` (send publication), `send.cc:324` / `:449` (D2H copies and pushes are *issued* in layer order), `send.cc:380-384` (`SendNextLayer(l)` waits on layer `l`'s own future), `send.cc:217-291` (`ValidateRequestedBlocks`), `recv.cc:262-319` (`BuildLoadCopyPlan`), `copy_spec_builder.h:42-92` (`BuildCoalescedSpec`) | layer granularity (`Pipeline` A1, discharged at block granularity by `BlockOrdering.lean` via `BlockPipeline.step_pipe`), delivery modelled after the callback (A2), one sender per layer (A3). Completion order is **not** assumed: every memory-touching event is layer-indexed. |
 
 Assumptions are numbered per module (`Receive` A1–A4, `Send` A1–A6,
 `Pipeline` A1–A4) and each names the guard that encodes it. The ones a reader
@@ -76,6 +80,13 @@ should know about:
   the session counters.
 * **Send A5** — no consumer `Ack`: `HandleAck → AckSend → Finish()` has no
   non-test caller at `01ffa3d`, so it is not an event.
+* **Pipeline A1 (discharged by `BlockOrdering.lean`)** — `Pipeline.lean` models
+  each layer's payload as a single `Cell`. `BlockOrdering.lean` refines each
+  layer's memory into a block-indexed array (`List BlockVal`), models
+  `ValidateRequestedBlocks`, contiguous-run DMA coalescing (`BuildCoalescedSpec`),
+  and the dual-permutation `BuildLoadCopyPlan` (`transportBlocks` + `h2dSrc`/`h2dDst`),
+  and proves a lockstep forward simulation (`BlockPipeline.step_pipe`) over
+  `Pipeline.step`.
 * **Pipeline A2** — the push callback is modelled *before* the landing it
   reports; the real order is the reverse. The docstring gives the simulation
   argument (the pushed cell cannot change between issue and callback) and
@@ -128,6 +139,9 @@ Traces (all `decide`):
 | `UuidTable.trace_duplicate_uuid_rejected_until_drained` | an expired receive session (`draining = true, done = false`) with an in-flight H2D copy rejects `.registerRecv` on the same UUID without leaking staging slots; once the copy finishes (`done = true`), `.registerRecv` retires the settled incumbent inline and seats the replacement (`DuplicateUuidIsRejectedUntilExpiredReceiveDrains`) |
 | `UuidTable.trace_duplicate_receive_different_req_id`, `UuidTable.trace_repeated_receive_same_req_id_idempotent` | on `.startRead`, a colliding UUID with a different `reqId` reports `failedRecving = [reqId]` without replacing the incumbent or allocating staging (`DuplicateReceiveDoesNotReplaceOrLeakFirstRead`), whereas a repeated announcement with the same `reqId` is an idempotent no-op (`RepeatedReceiveAnnouncementIsIdempotent`) |
 | `UuidTable.trace_duplicate_send_cannot_replace_live_offer`, `UuidTable.trace_start_read_retires_settled_incumbent_inline` | `.notifyForRead` rejects a duplicate UUID while a live send offer is active (`!done`) and permits reuse after `sweepSend` (`DuplicateRegistrationCannotReplaceLiveOffer`); `.startRead` retires a settled (`done = true`) incumbent inline before seating the new session |
+| `BlockOrdering.trace_duplicate_registration_rejected`, `BlockOrdering.trace_subset_pull_acknowledged`, `BlockOrdering.trace_unregistered_block_rejected`, `BlockOrdering.trace_duplicate_source_block_rejected`, `BlockOrdering.trace_empty_pull_rejected` | `NotifyForRead` rejects empty or duplicate `block_ids` (`DuplicateBlocksAreRejectedAtRegistration`); `ValidateAndBeginPull` acknowledges a non-empty duplicate-free subset (`UniqueRegisteredSubsetIsAcknowledged`) and rejects unregistered blocks (`PullOfUnregisteredBlockIsRejected`), duplicate source blocks (`PullWithDuplicateSourceBlockIsRejected`), or empty requests (`EmptyPullIsRejected`) |
+| `BlockOrdering.trace_local_orchestrated_transfer`, `BlockOrdering.trace_custom_host_block_transfer` | 2-layer local orchestrated transfer to device HBM (`LocalOrchestratedTransfer`) and to caller-supplied `host_block_ids` in `kCustomHostBlocks` mode without touching HBM (`LocalOrchestratedTransferToCustomHostBlock`) |
+| `BlockOrdering.trace_non_contiguous_blocks`, `BlockOrdering.trace_host_reordering`, `BlockOrdering.trace_large_complex_non_contiguous_and_reorder` | 2-layer transfers with non-contiguous source/destination block IDs (`test_non_contiguous_blocks`), out-of-order destination block IDs sorted by `BuildLoadCopyPlan` (`test_host_reordering`), and combined 8-block non-contiguous gather + reverse/interleaved reordering with contiguous-run DMA coalescing (`test_large_complex_non_contiguous_and_reorder`) |
 
 Bounded searches (`#guard … = .outOfFuel`): `Recv` from both initial states
 (fuel 10, n = 2), `Send` (fuel 12, n = 2), `Pipeline` from `init 1` and from
@@ -142,7 +156,7 @@ starved across any interleaving (fuel 5, whereas `unboundedPerPeer` yields a
 is unreachable across all UUID registration, drain, and sweep interleavings
 (fuel 5).
 
-Mutants (each yields a `.counterexample`):
+Mutants (each yields a `.counterexample` or refutation trace):
 
 | Mutant | Guard removed | Property that catches it |
 |---|---|---|
@@ -155,6 +169,7 @@ Mutants (each yields a `.counterexample`):
 | `Pipeline.h2dReadyByRank` | the H2D copy for layer `l` reads slot `l` (it reads the slot the *counter* points at instead — the shape of a counter-indexed model) | publication correctness: with layer 1 landing first, HBM ends `[kv 1, junk]` |
 | `Pipeline.reseatAtFinish` | staging released at settle, not at `Finish` | publication correctness via the send's staging |
 | `UuidTable.stepOverwriteDraining` | `EmplaceRecvSessionLocked` waits for `done()` rather than overwriting an expired (`draining = true, done = false`) incumbent | staging slot conservation (`freeSlots + activeStaging = numSlots`) |
+| `BlockOrdering.trace_mutant_mismatched_transport_order` | `BuildLoadCopyPlan` sorts `h2dDst` by `dst_block_id` without permuting `transportBlocks` (`host_block_ids`) to match | within-layer block publication correctness (`BlockPublicationCorrect` fails on out-of-order `local_block_ids = [2, 0, 3, 1]`) |
 
 ## Test suite correspondence (C++ unit tests & `tpu-raiden` skill tests → Lean)
 
@@ -202,7 +217,7 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains` | `kv_cache_manager_with_transfer_control_test.cc:971-1028` | `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | `PeerIsolation.grpc_freeWorkers_eq_poolSize`, `PeerIsolation.grpc_healthy_can_complete` |
 | `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` | `kv_cache_manager_with_transfer_control_test.cc:1030-1089` | `PeerIsolation.trace_sick_peer_starves_staging_slots` (`unboundedPerPeer` counterexample), `PeerIsolation.trace_per_peer_quota_admits_healthy` (`perPeerQuota` fix) | `PeerIsolation.reachable_sick_staging_le_quota`, `PeerIsolation.reachable_quota_admits_healthy` |
 
-### 4. Manager UUID registration table, drain-before-reuse & control handshake tests (`RecvDrainTest`, `SendLifecycleTest`, `ControlHandshakeTest` → `UuidTable.lean`, `Send.lean`, `Pipeline.lean`)
+### 4. Manager UUID registration table, drain-before-reuse & control handshake tests (`RecvDrainTest`, `SendLifecycleTest`, `ControlHandshakeTest` → `UuidTable.lean`, `Send.lean`, `Pipeline.lean`, `BlockOrdering.lean`)
 
 | Test | File & lines | Lean trace theorem | General theorem |
 |---|---|---|---|
@@ -215,15 +230,22 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | `PullWithoutRegistrationIsRejected`, `PullAfterRegistrationDeadlineIsRejected` | `kv_cache_manager_with_transfer_control_test.cc:381-393` | `Pipeline.trace_unregistered_pull_rejected` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` |
 | `PullAheadOfRegistrationIsAcknowledgedOnceRegistered` | `kv_cache_manager_with_transfer_control_test.cc:395-413` | `Pipeline.trace_pull_ahead_of_registration` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` |
 | `ShutdownUnblocksPendingPull` | `kv_cache_manager_with_transfer_control_test.cc:415-441` | `Pipeline.trace_shutdown_unblocks_pending_pull` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe` |
+| `DuplicateBlocksAreRejectedAtRegistration` | `kv_cache_manager_with_transfer_control_test.cc:341-351` | `BlockOrdering.trace_duplicate_registration_rejected` | `BlockOrdering.validateRegistration_iff`, `BlockOrdering.BlockPipeline.reachable_safe` (`BlockValidationSafe`) |
+| `UniqueRegisteredSubsetIsAcknowledged` | `kv_cache_manager_with_transfer_control_test.cc:443-457` | `BlockOrdering.trace_subset_pull_acknowledged` | `BlockOrdering.validateRequestedBlocks_iff`, `BlockOrdering.BlockPipeline.reachable_safe` (`BlockValidationSafe`) |
+| `PullOfUnregisteredBlockIsRejected` | `kv_cache_manager_with_transfer_control_test.cc:459-473` | `BlockOrdering.trace_unregistered_block_rejected` | `BlockOrdering.validateRequestedBlocks_iff`, `BlockOrdering.BlockPipeline.reachable_safe` (`BlockValidationSafe`) |
+| `PullWithDuplicateSourceBlockIsRejected` | `kv_cache_manager_with_transfer_control_test.cc:475-489` | `BlockOrdering.trace_duplicate_source_block_rejected` | `BlockOrdering.validateRequestedBlocks_iff`, `BlockOrdering.BlockPipeline.reachable_safe` (`BlockValidationSafe`) |
+| `EmptyPullIsRejected` | `kv_cache_manager_with_transfer_control_test.cc:491-503` | `BlockOrdering.trace_empty_pull_rejected` | `BlockOrdering.validateRequestedBlocks_iff`, `BlockOrdering.BlockPipeline.reachable_safe` (`BlockValidationSafe`) |
+| `LocalOrchestratedTransfer` | `kv_cache_manager_with_transfer_control_test.cc:505-558` | `BlockOrdering.trace_local_orchestrated_transfer` | `BlockOrdering.BlockPipeline.reachable_safe` (`BlockPublicationCorrect`) |
+| `LocalOrchestratedTransferToCustomHostBlock` | `kv_cache_manager_with_transfer_control_test.cc:560-619` | `BlockOrdering.trace_custom_host_block_transfer` | `BlockOrdering.BlockPipeline.reachable_safe` (`CustomHostStagingCorrect`) |
 
-### 5. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
+### 5. End-to-end prefill-to-decode transfer tests (`tpu-raiden` & `tpu-raiden-tpuvm-release-test` skills → `Pipeline.lean`, `BlockOrdering.lean`, `MultiRequest.lean`, `ReceivePoll.lean`)
 
 | Test | File & lines | Lean theorem | Notes |
 |---|---|---|---|
 | `SingleDeviceTransfer`, `MultiDeviceTransfer` | `kv_cache_manager_with_transfer_test.cc:135-380` | `Pipeline.trace_normal`, `Recv.noPoll_metrics_on_success` | E2E D2H → H2H → H2D transfer, `poll_stats()` publication, and duration metric observation (`ReceivePoll.lean` also proves `Recv.trace_poll_skips_metrics` when `pollReady` wins the pre-callback window) |
 | `test_e2e_transfer_polling`, `test_parallel_pull` | `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py` | `Pipeline.trace_normal`, `Pipeline.trace_layers_out_of_order`, `Pipeline.reachable_safe` | 2-layer E2E producer (`register_read`) → consumer (`start_read`) → `poll_stats()` verification that `dst_caches` match `src_refs` across all layers |
 | Single-host disaggregated serving E2E (`examples/single_host_disagg/run_all.sh`) | `tpu-raiden-tpuvm-release-test` Step 4b | `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests`, `Pipeline.system_data_correct`, `Pipeline.system_progress` | Multi-request prefill-to-decode serving stream recycling HBM and host staging buffers across prompts |
-| `test_non_contiguous_blocks`, `test_host_reordering`, `test_large_complex_non_contiguous_and_reorder` | `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py` | Abstracted at layer granularity (`Pipeline` A1) | Session lifecycle and per-layer order are covered by `Pipeline.reachable_safe`; within-layer block-index permutation (`remote_block_ids` → `local_block_ids`) is below `Pipeline`'s one-`Cell`-per-layer abstraction |
+| `test_non_contiguous_blocks`, `test_host_reordering`, `test_large_complex_non_contiguous_and_reorder` | `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py` | `BlockOrdering.trace_non_contiguous_blocks`, `BlockOrdering.trace_host_reordering`, `BlockOrdering.trace_large_complex_non_contiguous_and_reorder`, `BlockOrdering.BlockPipeline.reachable_safe`, `BlockOrdering.execCoalesced_buildCoalescedSpec` | Full within-layer block-index gather, dual-permutation `BuildLoadCopyPlan`, and contiguous-run DMA coalescing across arbitrary non-contiguous `remote_block_ids` and out-of-order `local_block_ids` (discharging `Pipeline` A1) |
 
 ## Outcome at `01ffa3d`
 
@@ -253,6 +275,5 @@ what remains is where it deliberately stops.
 | F4 | **Discharge Receive A1/A3/A4 by modelling the transport.** Add `block_transport.cc`: per-block accounting, `on_layer_received_called`, several senders per layer. Then `OnLayerReceived`-before-`OnBlocksReceived` and readiness soundness are proved rather than assumed. | A4 is the one assumption whose failure would be a real bug. Multi-sender is where the threshold arithmetic `num_completed_blocks_ / total_blocks_` is subtle and currently unexercised. | medium–high; worth it if multi-sender transfers are used in production |
 | F5 | Completeness: `Pipeline` on the push-plan path (`Recv.initPush` + `StartPush` via `HandlePullStream`); a mixed-outcome push (layer landed, callback failed — see Pipeline A2); the mutant table above kept in sync automatically. | rounds things out; low discovery potential | low |
 
-Explicitly not planned: block-granularity memories for their own sake;
-staging-pool contention (`AcquireStagingWithRetry`) — a liveness/resource
-question needing a scheduler model, unlikely to pay off.
+Explicitly not planned: staging-pool contention (`AcquireStagingWithRetry`) — a
+liveness/resource question needing a scheduler model, unlikely to pay off.
