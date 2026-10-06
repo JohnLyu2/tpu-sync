@@ -4,7 +4,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 /-!
 # Within-Layer Block-Index Gather, Reordering, Subset Validation & Custom Host Staging
 
-Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06);
+Citations are to tpu-sync `50b0774`;
 `send.cc`, `recv.cc`, `bt.cc` and `mgr.cc` abbreviate as in `Pipeline.lean`.
 
 Stage 4 (spatial block refinement) of the prefill-to-decode model: refines

@@ -14,9 +14,7 @@ adds the transport's block accounting, the readiness predicate
 `failed_recving`. Layer data, memory contents and the producer come in later
 stages.
 
-Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06;
-the one behavioural change in the cited code since then is `4efb0dd`, see
-`pushEnd` below). Unqualified `.h`/`.cc` are
+Citations are to tpu-sync `50b0774`. Unqualified `.h`/`.cc` are
 `tpu_sync/core/transfer_receive_session.{h,cc}`; `mgr.cc` is
 `tpu_sync/core/kv_cache_manager_with_transfer.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`.

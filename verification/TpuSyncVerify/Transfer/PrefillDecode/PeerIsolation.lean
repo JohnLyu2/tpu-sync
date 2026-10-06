@@ -10,7 +10,7 @@ the two finite consumer resources shared by `StartRead`
 (`tpu_sync/core/kv_cache_manager_with_transfer.cc:811-906`,
 `tpu_sync/core/transfer_receive_session.cc:214-260, 459-527`,
 `tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc:684-1089`,
-tpu-sync `50b0774`, re-pinned from `01ffa3d` on 2026-10-06):
+tpu-sync `50b0774`):
 
 1. **Host staging slots (`StagingBlockAllocator`, capacity `numSlots`):**
    `StartRead` calls `TransferReceiveSession::Create → AllocateStagingForLoad`

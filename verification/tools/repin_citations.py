@@ -4,9 +4,9 @@ commit to another.
 
     tools/repin_citations.py OLD NEW [--apply] [--skip SRC:LINE ...] [SOURCE ...]
 
-Run from `verification/`. Default sources: `TpuSyncVerify/**/*.lean` and
-`docs/**/*.md`. OLD and NEW are any two tpu-sync revisions known to the
-enclosing git repository (e.g. `01ffa3d upstream-main-2026-10-06`).
+Run from `verification/`. Default sources: `TpuSyncVerify/**/*.lean`,
+`docs/**/*.md` and `findings/*.md`. OLD and NEW are any two tpu-sync revisions
+known to the enclosing git repository (e.g. `01ffa3d upstream-main-2026-10-06`).
 
 For every citation, the cited OLD line range is mapped through
 `git diff -U0 OLD NEW -- <file>` and one report line is printed:
@@ -296,7 +296,8 @@ def main():
 
     sources = args.sources
     if not sources:
-        for root, exts in (("TpuSyncVerify", (".lean",)), ("docs", (".md",))):
+        for root, exts in (("TpuSyncVerify", (".lean",)), ("docs", (".md",)),
+                           ("findings", (".md",))):
             for dp, _, fns in os.walk(root):
                 sources += [os.path.join(dp, f) for f in sorted(fns)
                             if f.endswith(exts)]

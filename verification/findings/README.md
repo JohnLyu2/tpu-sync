@@ -1,11 +1,8 @@
 # Bug-hunt findings
 
 Defects found while modelling tpu-sync, with the evidence for each. Line
-numbers are for tpu-sync `01ffa3d` (the commit this tree is based on) unless
-a block of test output says otherwise; the tests were run on `b68161a` and
-re-run on `d16701e`, and the cited code is unchanged at `01ffa3d` (checked by
-reading; `raiden_controller.cc` is identical in the cited regions,
-`kv_cache_store.cc` only moved).
+numbers are for tpu-sync `50b0774` unless a block of test output says
+otherwise; the tests were run on `b68161a` and re-run on `d16701e`.
 
 Caller checked: `vllm-torchtpu` @ `6a9132a84`.
 
@@ -48,7 +45,7 @@ To run: copy the two `.cc` files next to the code they test
 verification/findings/build_targets.patch`, then
 `bazel test //tpu_sync/core/controller:raiden_controller_bughunt_test
 //tpu_sync/kv_cache:kv_cache_store_pin_race_test`. Both patches apply
-cleanly at `01ffa3d`.
+cleanly at `50b0774`.
 
 ## Summary
 
@@ -76,18 +73,18 @@ cleanly at `01ffa3d`.
   ValidateAndPinHostBlocks returned host block 5 but h0 now lives at 9; the returned block holds hash 'other'. The pin protects block 9, not the block the reader will pull.
   [  FAILED  ] KVCacheStorePinRaceTest.EvictAndReinsertBetweenLookupAndPinReturnsStaleHostBlockId (10 ms)
   ```
-- **Where:** `tpu_sync/kv_cache/kv_cache_store.cc:1655-1683`
+- **Where:** `tpu_sync/kv_cache/kv_cache_store.cc:1666-1694`
   (`KVCacheStore::ValidateAndPinHostBlocks`).
 - **Defect:** The function calls `backend()->Lookup(hashes)` with default
-  options (`:1658`; `pin_found = false` by default,
+  options (`:1669`; `pin_found = false` by default,
   `kv_cache_store_backend.h:104`), copies `host_block_id`, and only then calls
-  `backend()->Pin(hashes)` (`:1677`). The backend mutex is released between
-  the two calls. The only lock held across them is `KVCacheStore::mutex_`,
-  and neither of the following takes it:
-  - `KVCacheStore::Evict` (`:1840`). The comment at `:1843-1845` says "We do
+  `backend()->Pin(hashes)` (`kv_cache_store.cc:1688`). The backend mutex is
+  released between the two calls. The only lock held across them is
+  `KVCacheStore::mutex_`, and neither of the following takes it:
+  - `KVCacheStore::Evict` (`:1851`). The comment at `:1855-1857` says "We do
     not hold store mutex_". It is called from `SweepOnce` and
     `AllocateBlockIds`.
-  - `KVCacheStore::Insert` (`:1053`).
+  - `KVCacheStore::Insert` (`:1059`).
 - **Bad interleaving:**
   1. T1 runs `Lookup(h)` and gets host block 5.
   2. T2 evicts `h`; block 5 goes back to the pool.
@@ -106,7 +103,7 @@ cleanly at `01ffa3d`.
     from the LRU)" (`kv_cache_store.h:388-389`).
 - **Reachability:**
   - The source side runs whenever a peer calls `AcquireReadLease` on this
-    controller; the hook is registered at `kv_cache_store.cc:1642-1652`.
+    controller; the hook is registered at `kv_cache_store.cc:1653-1663`.
   - The only initiator of that RPC in this tree is
     `RaidenController::ReadRemote`, which has **no production C++ caller**.
     `KVCacheStore::Load`'s remote branch uses `backend()->Load`. So in this
@@ -242,7 +239,7 @@ cleanly at `01ffa3d`.
 ### R-A. Premature completion in `TransferReceiveSession::IsReadyToComplete()`: REFUTED
 
 The transport dispatches a layer before counting its blocks
-(`block_transport.cc:576` then `:584`); `total_blocks_` is summed across
+(`block_transport.cc:607` then `:615`); `total_blocks_` is summed across
 senders; the `network_completed_` disjunct is an intentional fast path. The
 stage-2 model proves readiness sound under this ordering
 (`Transfer/PrefillDecode/Receive.lean`, assumption A4, `ReadinessSound`).
@@ -339,4 +336,5 @@ clone reset. Results, verbatim:
   (F2, F3, F4 numbers hold); the F1 regions of `kv_cache_store.cc`
   (`ValidateAndPinHostBlocks`, `Evict`/`Insert`) unchanged, lines moved by
   +11 (`:1655-1683` → `:1666-1694`); F4 fix PR #1105 still open, not merged.
-  No finding fixed. Line numbers in this file stay at `01ffa3d`.
+  No finding fixed. Line numbers in this file and in `filed_bugs.md`
+  re-pinned to `50b0774`; both patches still apply cleanly.

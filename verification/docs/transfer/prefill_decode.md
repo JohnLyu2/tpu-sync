@@ -1,12 +1,8 @@
 # Prefill-to-decode transfer: model and results
 
 The model of `proposal.md` §3, built in four stages under
-`TpuSyncVerify/Transfer/PrefillDecode/`. Citations in the Lean files are to
-tpu-sync **`50b0774`** (upstream `main` as merged into `experimental` on
-2026-10-06). The stages were written against `01ffa3d`, and every cited region
-was read at that commit; the citations were re-pinned to `50b0774` with
-`tools/repin_citations.py`, see [Upstream re-checks](#upstream-re-checks) for
-what changed in between.
+`TpuSyncVerify/Transfer/PrefillDecode/`. Citations in the Lean files and in
+this document are to tpu-sync **`50b0774`**.
 
 ## Modules
 
@@ -61,7 +57,7 @@ constructive drain to settle (`reachable_can_settle`), readiness soundness
 The module docstrings carry the full tables (field → C++, event → C++). What
 was checked when:
 
-| Stage | Files read at `01ffa3d`, re-read at `50b0774` | Notable |
+| Stage | Files read (`50b0774`) | Notable |
 |---|---|---|
 | 1 | `transfer_receive_session.{h,cc}` | `ExecuteLayerH2d` re-checks `done_ || draining_` under its second lock (`.cc:605-616`); fault injection adds dispatch/completion failure paths; `in_flight_` starts at 1 for a load plan (`.cc:343`). All encoded. |
 | 2 | `block_transport.cc`, `kv_cache_manager_with_transfer.cc` (`CompleteReadRaw`, `begin/end_incoming_push`, `OnBlocksReceived` path) | `OnLayerReceived` fires once per layer (`bt.cc:559-561`) and before `OnBlocksReceived` on the same thread (`bt.cc:601-615`): assumption A4 of `Receive.lean`. At `50b0774` the poll lives in `CompleteReadWithDetails` (`mgr.cc:908-1039`; `CompleteReadRaw`, `:1041-1047`, is a wrapper over it) and `end_incoming_push` finishes the session itself when the push failed (`4efb0dd`, `mgr.cc:239-242`). |
@@ -82,7 +78,7 @@ should know about:
   passed each stage, with `cnt_d2hReady` / `cnt_h2dReady` tying two of them to
   the session counters.
 * **Send A5** — no consumer `Ack`: `HandleAck → AckSend → Finish()` has no
-  non-test caller at `01ffa3d` or `50b0774`, so it is not an event.
+  non-test caller at `50b0774`, so it is not an event.
 * **Pipeline A1 (discharged by `BlockOrdering.lean`)** — `Pipeline.lean` models
   each layer's payload as a single `Cell`. `BlockOrdering.lean` refines each
   layer's memory into a block-indexed array (`List BlockVal`), models
@@ -251,7 +247,7 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | Single-host disaggregated serving E2E (`examples/single_host_disagg/run_all.sh`) | `tpu-raiden-tpuvm-release-test` Step 4b | `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests`, `Pipeline.system_data_correct`, `Pipeline.system_progress` | Multi-request prefill-to-decode serving stream recycling HBM and host staging buffers across prompts |
 | `test_non_contiguous_blocks`, `test_host_reordering`, `test_large_complex_non_contiguous_and_reorder` | `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py` | `BlockOrdering.trace_non_contiguous_blocks`, `BlockOrdering.trace_host_reordering`, `BlockOrdering.trace_large_complex_non_contiguous_and_reorder`, `BlockOrdering.BlockPipeline.reachable_safe`, `BlockOrdering.execCoalesced_buildCoalescedSpec` | Full within-layer block-index gather, dual-permutation `BuildLoadCopyPlan`, and contiguous-run DMA coalescing across arbitrary non-contiguous `remote_block_ids` and out-of-order `local_block_ids` (discharging `Pipeline` A1) |
 
-## Outcome at `01ffa3d`, re-checked at `50b0774`
+## Outcome at `50b0774`
 
 No bugs in the transfer path. All proposal properties are proved under the
 cited assumptions. Observations (not bugs) worth passing on:
@@ -273,7 +269,7 @@ cited assumptions. Observations (not bugs) worth passing on:
 |---|---|---|---|
 | 2026-10-06 | `01ffa3d` → `50b0774` (44 upstream commits; merge `8f03107` on `experimental`) | **One behavioural change.** `4efb0dd`: a failed incoming push now runs `DeferUnregisterOnSettle(); Finish(status)` before `EndRecvOp()` (`mgr.cc:239-242`, `bt.cc:376-381`) instead of leaving the session to its deadline — already a trace of the model (`cancel` then `pushEnd`), now with its own C++ test (above). **Additive only:** `completed_at_` set beside every `done_ = true` (`a58a357`); `CompleteReadRaw` became a wrapper over `CompleteReadWithDetails`, poll loop unchanged (`mgr.cc:962-994`); per-read socket timeouts in `HandleIncomingPush`, env-gated and off by default (`e7c933f`, `61b6c76`); `AsyncPush` returns a `tsl::Future` (`50fa652`, `4e9f0a5`, `c4ca33c`). **Unchanged:** A4's ordering (`bt.cc:559-561`, `:601-615`), `StartRead` admission, `IsReadyToComplete` and `AllH2dDoneLocked`, `raiden_controller.cc` (byte-identical), every cited test. No finding fixed; `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` still disabled. | All `file:line` citations in the Lean modules and this file re-pinned with `tools/repin_citations.py` (354 rewritten mechanically, 2 that spanned a hunk by hand, 8 spot-checked against the tree); `Receive.lean` `pushEnd` row and `trace_push_lease_pins_staging_on_cancel` docstring extended; `BlockOrdering.lean` and `PipelineChecks.lean` given the commit statement they lacked; two wrong citations in Stage 4 above corrected (`ValidateRequestedBlocks` pointed into `BuildCoalescedCopySpec`; `copy_spec_builder.h` does not exist in tpu-sync). `lake build` clean, no warnings. |
 
-To repeat after the next sync: `cd verification && python3 tools/repin_citations.py <old> <new>` (dry run), read every `CHECK` and `skip` line, then `--apply`, fix the `CHECK` ones by hand, update the commit sentence in each module preamble, and add a row here.
+To repeat after the next sync: `cd verification && python3 tools/repin_citations.py <old> <new>` (dry run), read every `CHECK` and `skip` line, then `--apply`, fix the `CHECK` ones by hand, update the commit sentence in each module preamble and in `findings/`, and add a row here.
 
 ## Future work
 

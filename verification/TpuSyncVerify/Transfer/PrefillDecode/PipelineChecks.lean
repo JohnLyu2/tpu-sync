@@ -12,7 +12,7 @@ still running; bounded searches on the one- and two-layer instances; and
 mutants that show the memory model is sensitive to the guards the proof rests
 on, including the per-layer ones.
 
-Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06);
+Citations are to tpu-sync `50b0774`;
 abbreviations as in `Pipeline.lean`.
 -/
 

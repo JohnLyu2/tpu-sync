@@ -7,9 +7,7 @@ The settle protocol shared by TPU Sync's session classes
 stops new ones, and a `done_` flag set by whichever of `Finish` or the last
 `EndOp` comes second. The session owns its host staging until it settles.
 
-Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06;
-the only change to the cited lifecycle code is the `completed_at_` timestamp
-set next to `done_ = true`); `recv` is
+Citations are to tpu-sync `50b0774`; `recv` is
 `tpu_sync/core/transfer_receive_session.{h,cc}`, `send` is
 `tpu_sync/core/transfer_send_session.{h,cc}`.
 
@@ -394,10 +392,7 @@ theorem endOpLocked_done_mono {l : Lifecycle} (h : l.done = true) :
 /-! ## Redundant `done_` guards
 
 Audit of the `done_` mentions in the receiver's lifecycle guards (`recv` at
-`50b0774`; the same code sat at `01ffa3d` lines `.cc:367`, `.cc:390`,
-`.cc:537`, `.cc:582`, `.cc:608`, `.h:111`, and at `b68161a` lines `.cc:365`,
-`.cc:388`, `.cc:520`, `.cc:565`, `.h:111`). `Consistent` already decides each
-of them:
+`50b0774`). `Consistent` already decides each of them:
 
 * `FinishLocked` `.cc:368`: past the `if (draining_) return` (`.cc:366`),
   `!done_` holds — `Consistent.not_done`;

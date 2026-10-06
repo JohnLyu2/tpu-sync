@@ -14,7 +14,7 @@ the proposal's publication correctness: when the decode engine is told
 properties of the proposal (prefill HBM reclaimed, staging released) turn
 out to be corollaries of the sessions' settle protocol and are stated here too.
 
-Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06):
+Citations are to tpu-sync `50b0774`:
 `send.cc` is
 `tpu_sync/core/transfer_send_session.cc`, `recv.cc` is
 `tpu_sync/core/transfer_receive_session.cc`, `bt.cc` is

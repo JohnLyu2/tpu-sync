@@ -5,8 +5,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 
 An audit of `IsReadyToComplete` (`.cc:430-436`) and of the manager's poll
 that acts on it (`mgr.cc:966-970`), on the receive model of `Receive.lean`.
-Citations and abbreviations are as there (tpu-sync `50b0774`, re-pinned from
-`01ffa3d` on 2026-10-06).
+Citations and abbreviations are as there (tpu-sync `50b0774`).
 
 `TransferReceiveSession` has two ways to finish successfully:
 

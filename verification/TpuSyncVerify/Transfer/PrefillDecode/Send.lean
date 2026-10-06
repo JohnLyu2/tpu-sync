@@ -12,7 +12,7 @@ drives it. The sender stages each layer's device blocks into host staging
 let the engine reuse the device blocks, or the allocator reseat the staging,
 while any copy or push is still running. Memory contents come in stage 4.
 
-Citations are to tpu-sync `50b0774` (re-pinned from `01ffa3d` on 2026-10-06).
+Citations are to tpu-sync `50b0774`.
 Unqualified `.h`/`.cc` are
 `tpu_sync/core/transfer_send_session.{h,cc}`; `mgr.cc` is
 `tpu_sync/core/kv_cache_manager_with_transfer.cc`.
@@ -103,7 +103,7 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
   by the ghost counter that opened it.
 * **A5 (no consumer Ack).** `HandleAck → AckSend → Finish()` (`mgr.cc:1551-1554,
   1617-1628`) would finish a send OK from outside. No code in the repository at
-  `01ffa3d` or `50b0774` sends an Ack (`SendAck` has only test callers), so it is not an
+  `50b0774` sends an Ack (`SendAck` has only test callers), so it is not an
   event. With it, `Publication` below would read "the consumer acked", not
   "every layer was pushed".
 * **A6 (fold of `SendNextLayer(0)`).** Between recording the last future

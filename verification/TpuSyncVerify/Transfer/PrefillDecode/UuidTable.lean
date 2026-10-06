@@ -12,7 +12,7 @@ on the prefill producer) and its terminal report sets (`done_sending_`,
 UUIDs, and session retries (`tpu_sync/core/kv_cache_manager_with_transfer.cc:443-492,
 842-882, 908-994`, `tpu_sync/core/kv_cache_manager_with_transfer_send_drain_test.cc:363-380,
 633-682`, `tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc:718-790`,
-tpu-sync `50b0774`, re-pinned from `01ffa3d` on 2026-10-06).
+tpu-sync `50b0774`).
 
 ## Protocol rules encoded
 
