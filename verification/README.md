@@ -27,7 +27,7 @@ verification/
 ## Status
 
 All citations (models, `docs/`, `findings/`) are to tpu-sync `50b0774`
-(upstream `main` as merged into `experimental` on 2026-10-06).
+(upstream `main` as merged into this fork on 2026-10-06).
 
 | Model | Properties | State | Doc |
 |---|---|---|---|
@@ -64,10 +64,10 @@ A clean build takes about half a minute; every `theorem` is checked and every
 
 ## Maintenance after an upstream sync
 
-Upstream is merged into `experimental`; the fork's `main` fast-forwards from it
-(`git push origin experimental:main`), never by squash or rebase, so commit
-hashes cited here and in the notes stay valid. Citations rot with every
-upstream commit. After merging a new upstream `main`:
+All work happens on `main`; upstream is merged into it with a merge commit,
+never by squash or rebase, so commit hashes cited here and in the notes stay
+valid. Citations rot with every upstream commit. After merging a new upstream
+`main`:
 
 ```sh
 cd verification

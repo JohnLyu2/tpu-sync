@@ -20,8 +20,8 @@ this document are to tpu-sync **`50b0774`**.
 | `PrefillDecode/BlockOrdering.lean` | 4 (block-level) | within-layer block-index gather, dual-permutation `BuildLoadCopyPlan` (`transportBlocks` + `h2dSrc`/`h2dDst`), contiguous-run DMA coalescing (`BuildCoalescedSpec`), producer block registration & subset/uniqueness validation (`ValidateRequestedBlocks`), custom host staging (`kCustomHostBlocks`), and multi-layer `BlockPipeline` coupled via `step_pipe` to `Pipeline.step` | `BlockOrdering.execCoalesced_buildCoalescedSpec`, `BlockOrdering.landStage_get_requested`, `BlockOrdering.h2dStage_get_requested`, `BlockOrdering.BlockPipeline.step_pipe`, `BlockOrdering.BlockPipeline.reachable_safe` |
 | `PrefillDecode/PipelineChecks.lean` | 4 | executable `decide` traces (including out-of-order layers, handshake rendezvous, and concurrent/overlapped requests), `#guard` bounded searches, and mutants | `Pipeline.trace_normal`, `Pipeline.trace_layers_out_of_order`, `Pipeline.trace_pull_ahead_of_registration`, `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests` |
 
-Stage boundaries are the commits on `experimental` (see the README status
-table). Each later stage uses the earlier models as-is: `Pipeline` composes
+Stage boundaries are the fork's commits (see the README status table). Each
+later stage uses the earlier models as-is: `Pipeline` composes
 `Send.step` and `Recv.step`, adds the memory effect of each event and the
 per-layer guards the counters cannot express (a push waits for *its* layer's
 D2H copy; an H2D dispatch waits for *its* layer to land), `BlockOrdering`
