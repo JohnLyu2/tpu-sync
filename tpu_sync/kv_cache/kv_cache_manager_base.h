@@ -353,7 +353,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   // Initializes and registers secondary backends eagerly during worker startup
   // from caller-supplied BackendConfig values. This is the only route; there is
-  // no environment fallback.
+  // no environment fallback. A config with an empty type, or for a backend that
+  // is already registered, is ignored. An unsupported type, an invalid
+  // topology, a config that declares no parallelism axis, or any other invalid
+  // backend property is a LOG(FATAL).
   virtual void RegisterKVBackends(
       absl::Span<const BackendConfig> backend_configs);
 

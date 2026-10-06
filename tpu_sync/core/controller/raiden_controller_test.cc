@@ -1416,8 +1416,8 @@ TEST_F(RaidenControllerTest, TransferBuffersRemoteDramToLocalHbmSuccess) {
   EXPECT_THAT(mock_mgr.last_dst_offsets, ElementsAre(1));
 }
 
-// Builds a minimal valid secondary-backend config. tp_rank is always explicit:
-// the worker rejects a config without one.
+// Builds a minimal valid secondary-backend config with the tp axis declared:
+// the worker rejects a tp_rank without a tp_size.
 kv_cache::BackendConfig PosixTestConfig(int tp_rank = 0, int tp_size = 1) {
   kv_cache::BackendConfig cfg;
   cfg.type = "posix";
@@ -1443,13 +1443,39 @@ TEST_F(RaidenControllerTest, WorkerBackendLookup) {
   EXPECT_EQ(holder.GetKVBackend("nonexistent"), nullptr);
 }
 
-TEST_F(RaidenControllerTest, WorkerBackendRejectsConfigWithoutTpRank) {
+// The worker aborts on an invalid storage config; MockTransferManager mirrors
+// that contract. These tests need no fixture: they never start a server.
+TEST(RaidenControllerDeathTest, WorkerBackendDiesOnTpRankWithoutTpSize) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   MockTransferManager mgr;
   KVManagerHolder holder(&mgr);
-  kv_cache::BackendConfig cfg;
-  cfg.type = "posix";  // tp_rank left at -1
+  EXPECT_DEATH(holder.RegisterKVBackends({PosixTestConfig(/*tp_rank=*/0,
+                                                          /*tp_size=*/-1)}),
+               "tp_rank 0 was given without tp_size");
+}
+
+TEST(RaidenControllerDeathTest, WorkerBackendDiesOnPpRankWithoutPpSize) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  kv_cache::BackendConfig cfg = PosixTestConfig();
+  cfg.parallelism.pp_rank = 1;  // pp_size left undeclared.
+  MockTransferManager mgr;
+  KVManagerHolder holder(&mgr);
+  EXPECT_DEATH(holder.RegisterKVBackends({cfg}),
+               "pp_rank 1 was given without pp_size");
+}
+
+TEST_F(RaidenControllerTest, WorkerBackendAcceptsPpAxis) {
+  kv_cache::BackendConfig cfg = PosixTestConfig();
+  cfg.parallelism.pp_size = 2;
+  cfg.parallelism.pp_rank = 1;
+  MockTransferManager mgr;
+  KVManagerHolder holder(&mgr);
   holder.RegisterKVBackends({cfg});
-  EXPECT_EQ(holder.GetKVBackend("posix"), nullptr);
+  auto backend = holder.GetKVBackend("posix");
+  ASSERT_NE(backend, nullptr);
+  ASSERT_NE(backend->mapper(), nullptr);
+  EXPECT_EQ(backend->mapper()->pp_size(), 2);
+  EXPECT_EQ(backend->mapper()->shards_per_block(), 2);
 }
 
 TEST_F(RaidenControllerTest, InitializeSecondaryBackendsProgrammaticConfig) {

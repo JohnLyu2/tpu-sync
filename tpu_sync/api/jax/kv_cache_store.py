@@ -165,16 +165,15 @@ class KVCacheStore:
 
     Args:
       capacity: Maximum number of cache blocks this store can hold.
-      global_registry_address: Address of the global registry service; empty
-        for a standalone local store.
+      global_registry_address: Address of the global registry service; empty for
+        a standalone local store.
       raiden_id: Optional RaidenId identifying this store instance.
-      num_shards: Shard count for this store's RaidenController; must be
-        >= 1.
+      num_shards: Shard count for this store's RaidenController; must be >= 1.
       store_server_ip: IP that peers use to reach this store. Bind-and-
         advertise: this store's KVCacheStoreService and RaidenController both
-        bind it, and it is the host published to the global registry. Must be
-        an IP (or hostname) this process can bind -- not empty, not a
-        wildcard.
+          bind it, and it is the host published to the global registry. Must be
+          an IP (or hostname) this process can bind -- not empty, not a
+          wildcard.
       shard_size_bytes: Size in bytes of each shard buffer; 0 uses default.
       raiden_controller_port: Port for this store's RaidenController; 0 lets
         gRPC choose. Note that the IP address of the controller reuses
@@ -188,10 +187,9 @@ class KVCacheStore:
         (e.g. persistent storage) to register with this store coordinator at
         initialization for offload and recall operations. Pass the same
         BackendConfig objects given to every KVCacheManager(backend_configs=).
-        Storage topology comes only from `parallelism`: set
-        `parallelism.tp_size` to the number of worker processes writing to
-        storage (`parallelism.tp_rank` is ignored by the store). If it is
-        unset, it defaults to 1, as in KVCacheManager, and logs a warning.
+        The posix backend derives its storage topology from `parallelism`:
+        declare the same axes and sizes (`<axis>_size`) as the workers. Ranks
+        are ignored. An invalid config fails construction.
     """
     raw_raiden_id = RaidenId()
     if raiden_id is not None:

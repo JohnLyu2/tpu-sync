@@ -3633,38 +3633,45 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     const BackendConfig& config) {
   if (config.type.empty()) return false;
 
+  const std::string received = FormatParallelism(config.parallelism);
+  LOG(INFO) << "[Worker] secondary backend " << config.type
+            << " received topology: " << received;
+
   if (!absl::EqualsIgnoreCase(config.type,
                               backends::storage::kPosixBackendName)) {
-    LOG(WARNING) << "[Worker] Unsupported secondary backend: " << config.type;
-    return false;
-  }
-  if (config.parallelism.tp_rank < 0) {
-    LOG(ERROR) << "[Worker] secondary backend config for " << config.type
-               << " has no tp_rank; refusing to register. Every worker would "
-                  "otherwise share the rank-0 shard directory.";
-    return false;
+    LOG(FATAL) << "[Worker] unsupported secondary backend type '" << config.type
+               << "' (received topology: " << received
+               << "); supported: " << backends::storage::kPosixBackendName;
   }
 
   const std::string canonical_name =
       std::string(backends::storage::kPosixBackendName);
   if (GetKVBackend(canonical_name) != nullptr) return false;
 
-  // Storage topology comes only from BackendConfig::parallelism, resolved the
-  // same way as on the coordinator (see ResolveSecondaryBackendTopology).
-  BackendConfig resolved = config;
-  const backends::ParallelismConfig effective = {
-      .tp_size =
-          config.parallelism.tp_size > 0 ? config.parallelism.tp_size : 1,
-      .tp_rank = config.parallelism.tp_rank};
-  ApplyParallelismToProperties(effective, &resolved);
-  if (absl::Status status =
-          backends::storage::PosixBackendOptions::FromProperties(
-              resolved.properties)
-              .status();
+  // Storage topology comes only from BackendConfig::parallelism. Each declared
+  // axis (tp, pcp, pp) must carry this worker's rank; a rank without a size and
+  // a rank outside [0, size) are rejected.
+  if (absl::Status status = ValidateWorkerParallelism(config.parallelism);
       !status.ok()) {
-    LOG(ERROR) << "[Worker] invalid " << config.type
-               << " backend config; refusing to register: " << status;
-    return false;
+    LOG(FATAL) << "[Worker] invalid " << config.type
+               << " backend config (received topology: " << received
+               << "): " << status.message();
+  }
+  // With no axis declared every worker would write the same shard files.
+  if (!HasDeclaredAxis(config.parallelism)) {
+    LOG(FATAL) << "[Worker] invalid " << config.type
+               << " backend config (received topology: " << received
+               << "): declares no parallelism axis";
+  }
+  BackendConfig resolved = config;
+  ApplyParallelismToProperties(config.parallelism, &resolved);
+  absl::StatusOr<backends::storage::PosixBackendOptions> options =
+      backends::storage::PosixBackendOptions::FromProperties(
+          resolved.properties);
+  if (!options.ok()) {
+    LOG(FATAL) << "[Worker] invalid " << config.type
+               << " backend config (received topology: " << received
+               << "): " << options.status().message();
   }
   auto backend = std::make_shared<backends::storage::PosixKVBackend>(
       canonical_name, resolved.properties);
@@ -3673,8 +3680,10 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     backends_[canonical_name] = std::move(backend);
   }
   LOG(INFO) << "[Worker] Initialized secondary backend " << canonical_name
-            << " at tp_rank " << effective.tp_rank << " of tp_size "
-            << effective.tp_size;
+            << " with topology " << received << "; shard directory "
+            << options->root_dir << "/"
+            << backends::storage::SanitizeModelName(options->model_name) << "/"
+            << backends::storage::FormatTopologyDir(config.parallelism) << "/";
   return true;
 }
 

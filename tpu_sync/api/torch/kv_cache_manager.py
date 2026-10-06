@@ -129,11 +129,14 @@ class KVCacheManager:
         segments named by RAIDEN_SHM_KEY. The env var supplies the segment
         namespace; this flag supplies the per-manager decision. Managers whose
         host buffers are transient staging must leave it off.
-      backend_configs: Optional backend configurations (e.g persistent storage).
-        Pass the same BackendConfig objects given to the store's
-        secondary_backend_configs, with `parallelism.tp_rank` set to this
-        worker's rank (required) and `parallelism.tp_size` matching the store
-        (defaults to 1).
+      backend_configs: Optional backend configurations (e.g. persistent
+        storage). Pass the same BackendConfig objects given to the store's
+        secondary_backend_configs. The posix backend derives its storage
+        topology from `parallelism`: declare at least one axis (`tp`, `pcp`,
+        `pp`) with `<axis>_size`, using the same axes and sizes as the store,
+        and set `<axis>_rank` to this worker's rank in [0, size). Duplicate or
+        missing ranks cause wrong or missed recalls. An invalid config aborts
+        the process (LOG(FATAL)) at registration.
     """
     self._admission_summary = None
     impl = _torch_impl()

@@ -109,12 +109,46 @@ struct BackendConfig {
 };
 
 // Writes the storage topology in `parallelism` into config->properties as
-// "tp_size" / "tp_rank", the keys storage backends consume. Storage topology
-// comes only from BackendConfig::parallelism: caller-supplied tp_* properties
-// are overwritten. Callers resolve defaults first, so
-// `parallelism.tp_size` is expected to be >= 1 and `parallelism.tp_rank` >= 0.
+// "tp_size" / "tp_rank" / "pcp_size" / "pcp_rank" / "pp_size" / "pp_rank", the
+// keys storage backends consume. Storage topology comes only from
+// BackendConfig::parallelism: every field other than -1 overwrites the
+// caller-supplied property, and the property of every -1 field is erased. Does
+// not validate; the backend validates what it parses.
 void ApplyParallelismToProperties(
     const backends::ParallelismConfig& parallelism, BackendConfig* config);
+
+// Validates a worker's topology, one axis (tp, pcp, pp) at a time. An axis is
+// declared when its size is set: a declared axis needs size >= 1 and
+// 0 <= rank < size; an undeclared axis needs size == rank == -1. Returns
+// InvalidArgumentError naming the axis and the offending values otherwise.
+absl::Status ValidateWorkerParallelism(
+    const backends::ParallelismConfig& parallelism);
+
+// Returns true if at least one axis (tp, pcp, pp) has its size set, i.e. is
+// not kAxisUndeclared. A rank alone does not declare its axis.
+bool HasDeclaredAxis(const backends::ParallelismConfig& parallelism);
+
+// Formats `parallelism` for logs, outermost axis first, e.g.
+// "pp=2/r1 pcp=undeclared tp=4/r3". An unset (-1) size prints as
+// "undeclared", and "/r<rank>" is appended whenever the rank is set. Does not
+// validate, so an invalid config prints as given (e.g. "pcp=undeclared/r3").
+std::string FormatParallelism(const backends::ParallelismConfig& parallelism);
+
+// Returns InvalidArgumentError, naming the `received` topology, when
+// `coordinator` declares no parallelism axis: with no axis declared every
+// worker writes the same shard files. Returns OK otherwise.
+absl::Status RequireDeclaredAxis(
+    const backends::ParallelismConfig& received,
+    const backends::ParallelismConfig& coordinator);
+
+// Returns the coordinator's topology for `parallelism`: the same axis sizes,
+// with the rank of each declared axis pinned to 0 and of each undeclared axis
+// left at -1. The coordinator probes every rank explicitly, so the caller's
+// ranks (worker-only) of declared axes are ignored. Returns
+// InvalidArgumentError for an axis size that is neither -1 nor >= 1, or for a
+// rank given without its axis size.
+absl::StatusOr<backends::ParallelismConfig> ResolveCoordinatorParallelism(
+    const backends::ParallelismConfig& parallelism);
 
 // Factory registry for dynamic creation of KVCacheStoreBackend instances.
 class KVCacheStoreBackendFactory {

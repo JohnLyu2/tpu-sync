@@ -186,23 +186,28 @@ MakeRaidenController(const RaidenId& raiden_id, size_t capacity, int num_shards,
 
 // Resolves the storage topology of a secondary backend config from
 // BackendConfig::parallelism, the same config every KVCacheManager receives.
-// The coordinator always runs as a single rank, so it is pinned to rank 0;
-// parallelism.tp_rank is worker-only. An unset tp_size defaults to 1, as in
-// KVCacheManager. Backend knobs (root_dir, model_name, ...) are defaulted and
-// validated by the backend itself.
-BackendConfig ResolveSecondaryBackendTopology(BackendConfig sec_cfg) {
-  backends::ParallelismConfig effective = {
-      .tp_size = sec_cfg.parallelism.tp_size, .tp_rank = 0};
-  if (effective.tp_size <= 0) {
-    effective.tp_size = 1;
-    LOG(WARNING) << "Secondary backend '" << sec_cfg.type
-                 << "': parallelism.tp_size is unset; defaulting storage "
-                    "tp_size to 1, as KVCacheManager does. Pass the same "
-                    "BackendConfig (with parallelism set) to KVCacheStore "
-                    "and KVCacheManager.";
-  }
-  ApplyParallelismToProperties(effective, &sec_cfg);
-  sec_cfg.parallelism = effective;
+// The coordinator always runs as a single rank, so every declared axis (tp,
+// pcp, pp) is pinned to rank 0 and undeclared axes stay undeclared; the
+// per-axis ranks are worker-only. Backend knobs (root_dir, model_name, ...) are
+// defaulted and validated by the backend itself. Logs the received and the
+// resolved topology, in the format of the workers' "received topology" lines,
+// so an axis mismatch between the store and the workers is visible.
+absl::StatusOr<BackendConfig> ResolveSecondaryBackendTopology(
+    BackendConfig sec_cfg) {
+  const backends::ParallelismConfig received = sec_cfg.parallelism;
+  ABSL_ASSIGN_OR_RETURN(sec_cfg.parallelism,
+                        ResolveCoordinatorParallelism(received));
+  ApplyParallelismToProperties(sec_cfg.parallelism, &sec_cfg);
+  LOG(INFO) << "[Store] secondary backend " << sec_cfg.type
+            << " received topology: " << FormatParallelism(received)
+            << "; coordinator topology: "
+            << FormatParallelism(sec_cfg.parallelism)
+            << (HasDeclaredAxis(sec_cfg.parallelism)
+                    ? ""
+                    : "; no parallelism axis declared");
+  // Reject before Create builds the controller: with no axis declared every
+  // worker would write the same shard files.
+  ABSL_RETURN_IF_ERROR(RequireDeclaredAxis(received, sec_cfg.parallelism));
   return sec_cfg;
 }
 
@@ -274,8 +279,9 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
                                                backend_configs.end());
 
   for (size_t i = 1; i < effective_configs.size(); ++i) {
-    effective_configs[i] =
-        ResolveSecondaryBackendTopology(std::move(effective_configs[i]));
+    ABSL_ASSIGN_OR_RETURN(
+        effective_configs[i],
+        ResolveSecondaryBackendTopology(std::move(effective_configs[i])));
   }
 
   if (effective_configs.size() > 2) {
