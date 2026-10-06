@@ -226,13 +226,14 @@ NB_MODULE(_tpu_raiden_host, m) {
       .def(
           "map_shared_memory",
           [](HostKVCacheManager& self, uintptr_t mapped_address,
-             size_t pool_size_bytes) {
+             size_t pool_size_bytes, std::optional<size_t> page_nbytes) {
             ThrowIfError(self.base()->MapSharedMemory(
                              reinterpret_cast<void*>(mapped_address),
-                             pool_size_bytes),
+                             pool_size_bytes, page_nbytes),
                          "KVCacheManager map_shared_memory failed");
           },
-          nb::arg("mapped_address"), nb::arg("pool_size_bytes"))
+          nb::arg("mapped_address"), nb::arg("pool_size_bytes"),
+          nb::arg("page_nbytes") = nb::none())
       .def("unmap_shared_memory",
            [](HostKVCacheManager& self) {
              ThrowIfError(self.base()->UnmapSharedMemory(),

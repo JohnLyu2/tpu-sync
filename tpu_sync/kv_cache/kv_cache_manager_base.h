@@ -441,7 +441,17 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Registering several disjoint regions simultaneously is not supported;
   // PJRT's DmaMap/DmaUnmap are keyed by address and would allow it, but the
   // drain and validation bookkeeping here assumes a single pool.
-  absl::Status MapSharedMemory(void* mapped_address, size_t pool_size_bytes);
+  //
+  // `page_nbytes` fixes the per-layer transfer unit of every
+  // CopyExternalObjectBlocks call on this mapping: block ids count pages of
+  // this size.  It must be a positive multiple of slice_byte_size(), the
+  // device bytes of one index of the KV cache's leading dimension, and must
+  // divide every layer's device buffer.  A page of k slices serves a caller
+  // whose block spans k consecutive device blocks.  Defaults to
+  // slice_byte_size(); the default is checked the same way.
+  absl::Status MapSharedMemory(
+      void* mapped_address, size_t pool_size_bytes,
+      std::optional<size_t> page_nbytes = std::nullopt);
 
   // Drains in-flight copies and releases the shared-memory DMA registration.
   // Blocks until every submission that already holds a lease has registered
@@ -533,6 +543,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // `block_ids[i]` of that layer's device buffer, where `i` indexes
   // `host_block_bases`.
   //
+  // `page_nbytes` must equal the page size the pool was mapped with.  Block
+  // ids count pages of that size, so block `b` starts at byte
+  // `b * page_nbytes` of each layer's device buffer.
+  //
   // `keep_alive` is attached to every future issued, so the caller's host
   // storage outlives the transfer even when a later layer fails to submit.
   //
@@ -554,12 +568,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::Status TrackExternalCopy(raiden::PjRtCopyFuture future);
 
   // Test helpers to simulate shared memory mapping state in unit tests without
-  // requiring hardware DMA support.
-  void SetSharedMemoryMappedForTest(void* mapped_address,
-                                    size_t pool_size_bytes) {
+  // requiring hardware DMA support.  `page_nbytes` defaults to
+  // slice_byte_size() like MapSharedMemory, but is not validated.
+  void SetSharedMemoryMappedForTest(
+      void* mapped_address, size_t pool_size_bytes,
+      std::optional<size_t> page_nbytes = std::nullopt) {
     absl::MutexLock lock(external_mapping_mu_);
     external_mapped_address_ = mapped_address;
     external_mapped_size_ = pool_size_bytes;
+    external_page_nbytes_ = page_nbytes.value_or(slice_byte_size());
     external_mapping_phase_ = MappingPhase::kMapped;
   }
 
@@ -567,6 +584,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     absl::MutexLock lock(external_mapping_mu_);
     external_mapped_address_ = nullptr;
     external_mapped_size_ = 0;
+    external_page_nbytes_ = 0;
     in_flight_external_copies_.clear();
     external_copy_gc_watermark_ = kMinExternalCopyGcWatermark;
     deferred_external_copy_error_ = absl::OkStatus();
@@ -1098,6 +1116,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   void* external_mapped_address_
       ABSL_GUARDED_BY(external_mapping_mu_) = nullptr;
   size_t external_mapped_size_ ABSL_GUARDED_BY(external_mapping_mu_) = 0;
+  // Page size the pool was mapped with; 0 while unmapped.  Changes only when
+  // the mapping does, so an ExternalCopyLease pins it too.
+  size_t external_page_nbytes_ ABSL_GUARDED_BY(external_mapping_mu_) = 0;
   std::vector<raiden::PjRtCopyFuture> in_flight_external_copies_
       ABSL_GUARDED_BY(external_mapping_mu_);
   absl::Status deferred_external_copy_error_

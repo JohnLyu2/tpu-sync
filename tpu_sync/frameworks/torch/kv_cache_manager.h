@@ -354,10 +354,11 @@ class KVCacheManager {
         slot_idx, layer_idx, shard_idx);
   }
 
-  absl::Status MapSharedMemory(uintptr_t mapped_address,
-                               size_t pool_size_bytes) {
+  absl::Status MapSharedMemory(
+      uintptr_t mapped_address, size_t pool_size_bytes,
+      std::optional<size_t> page_nbytes = std::nullopt) {
     return torch_manager_->base()->MapSharedMemory(
-        reinterpret_cast<void*>(mapped_address), pool_size_bytes);
+        reinterpret_cast<void*>(mapped_address), pool_size_bytes, page_nbytes);
   }
 
   absl::Status UnmapSharedMemory() {
@@ -368,10 +369,11 @@ class KVCacheManager {
     return torch_manager_->base()->is_shared_memory_mapped();
   }
 
-  void SetSharedMemoryMappedForTest(uintptr_t mapped_address,
-                                    size_t pool_size_bytes) {
+  void SetSharedMemoryMappedForTest(
+      uintptr_t mapped_address, size_t pool_size_bytes,
+      std::optional<size_t> page_nbytes = std::nullopt) {
     torch_manager_->base()->SetSharedMemoryMappedForTest(
-        reinterpret_cast<void*>(mapped_address), pool_size_bytes);
+        reinterpret_cast<void*>(mapped_address), pool_size_bytes, page_nbytes);
   }
 
   void ResetSharedMemoryMappedForTest() {
