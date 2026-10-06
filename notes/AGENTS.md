@@ -1,40 +1,40 @@
-# Project: TPU Sync research & verification notes
+# TPU Sync research notes
 
-notes at: notes/
+Kept with the `better-than-fish` skill; its `SKILL.md` and `references/format.md`
+define the markers, tiers and triggers. Repo entry point, code map and commit
+conventions: `../AGENTS.md`.
 
-The `better-than-fish` skill governs how to add and maintain notes in this directory. Re-read its `SKILL.md` and `references/format.md` for conventions.
+## Project conventions
 
-## Marker & tier conventions
-
-- `[FACT]` — source-grounded (`path:line` + snippet) or Lean-proved claim; lives in `durable/`
-- `[EMP]` — reproducible empirical / test result with `Verified against:` commit header; lives in `empirical/`
-- `[OBS YYYY-MM-DD]` — dated observation from a specific run/trace; lives in `journal/YYYY-MM/`
-- `[HYP]` — untested or partial hypothesis; lives in `journal/YYYY-MM/`
-- `[OPEN]` — known unknown with a corresponding 5-field entry in `loose-ends/parked.md`
-- `[SUPERSEDED → filename.md]` — never delete wrong claims; mark in place and cross-link
-
-## Code locations to anchor citations
-
-- Tree = upstream `50b0774` merged as `8f03107` (2026-10-06; local tag `upstream-main-2026-10-06`). Every citation under `verification/` (Lean modules, `docs/`, `findings/`) is at `50b0774` (re-pin after a sync with `verification/tools/repin_citations.py OLD NEW --apply`, then hand-check wrapped lists); notes dated before 2026-10-06 are at `01ffa3d` unless they say otherwise (`journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md` has the line-shift table)
-- Transfer sessions: `tpu_sync/core/transfer_send_session.{h,cc}`, `tpu_sync/core/transfer_receive_session.{h,cc}`
-- Transfer manager and host-staging pool (`StagingBlockAllocator`): `tpu_sync/core/kv_cache_manager_with_transfer.{h,cc}`; staging memory `tpu_sync/core/host_memory_allocator.{h,cc}` (there is no `buffer_pool.{h,cc}`)
-- Network transport: `tpu_sync/transport/block_transport.{h,cc}` (+ `block_transport_delegate.h`, `lib/socket_transport_adapter.{h,cc}`)
-- KV cache store & offload: `tpu_sync/kv_cache/kv_cache_store.{h,cc}`, `tpu_sync/kv_cache/host_offload_backend.{h,cc}`, `tpu_sync/kv_cache/kv_cache_store_service.{h,cc}`
-- Raiden controller: `tpu_sync/core/controller/raiden_controller.{h,cc}`; control planes `tpu_sync/core/{tcp,grpc}_control_plane_backend.cc`
-- Lean 4 models: `verification/TpuSyncVerify/` (`Common/`, `Transfer/`, `Controller/`)
-- Bug-hunt reports: `verification/findings/`
+- Facts live in `verification/` (docs, findings, Lean docstrings). A `durable/`
+  or `empirical/` note is a thin pointer: a `Canonical:` line naming the
+  `verification/` document that owns the facts, then only what that document
+  does not say — interpretation, "do not re-investigate" guidance, the
+  correction trail. Never copy a fact table or a citation list into a note;
+  every copy made so far went stale within a week.
+- Upstream-sync facts (what changed in cited code, what was re-pinned) go in
+  `verification/docs/transfer/prefill_decode.md` §"Upstream re-checks" and
+  `verification/findings/README.md` §"History"; the journal records the delta
+  of understanding, corrections and tooling lessons, with a link.
+- `loose-ends/parked.md` is the only backlog. Items that mirror a row of
+  `prefill_decode.md` §"Future work" cite the row and hold only the
+  "To resume" steps.
+- Version stamps: every note names the tpu-sync commit its claims were read at.
+  Notes dated before 2026-10-06 are at `01ffa3d`; the line-shift table to
+  `50b0774` is in `journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md`.
+- Markers as in the skill: `[FACT]` source-grounded or Lean-proved (`durable/`);
+  `[EMP]` reproducible result with a "Verified against" stamp (`empirical/`);
+  `[OBS YYYY-MM-DD]` and `[HYP]` (`journal/YYYY-MM/`); `[OPEN]` with a parked
+  entry; `[SUPERSEDED → file]` marks a wrong claim in place, never deleted.
 
 ## Durable notes index
 
-- `prefill-decode-transfer-settle-and-layer-readiness-invariants.md` — 3-stage D2H/H2H/H2D pipeline, settle invariants, `ExecuteLayerH2d` lock window, `OnLayerReceived` ordering (A4), and `ReceivePoll` metrics skip
-- `lean-step-models-and-ghost-state-in-tpu-sync-verify.md` — `System S Ev` pattern, ghost state, mutant testing, and end-to-end `Pipeline` / `MultiRequest` theorems
-- `controller-read-remote-and-kv-store-pinning-concurrency-traps.md` — confirmed concurrency bugs (F1–F4) and 6 refuted look-alike traps (R-A..R-F)
-
-## Active investigations
-
-Tracked in `loose-ends/parked.md`:
-- `KVCacheStoreClient::Fetch` missing deadline + `LoadRemoteBlocks` staging free on transport error
-- Lean witness trace translation into C++ `transfer_session_test.cc`
-- Discharging `Receive` transport assumptions A1/A3/A4 via a Lean `BlockTransport` model
-- Propagate the real push-failure status instead of `InternalError("Incoming push failed")` (`4efb0dd`)
-- Citation drift check in CI (`repin_citations.py` dry run must report no `shift`/`CHECK`)
+- `prefill-decode-transfer-settle-and-layer-readiness-invariants.md` — why the
+  settle protocol and the `ExecuteLayerH2d` lock window matter; what to check
+  before touching them. Canonical: `verification/docs/transfer/prefill_decode.md`.
+- `lean-step-models-and-ghost-state-in-tpu-sync-verify.md` — how the models are
+  built (one executable `step`, ghost latches, replay + mutants) and how to
+  start a new one. Canonical: `verification/docs/conventions.md`.
+- `controller-read-remote-and-kv-store-pinning-concurrency-traps.md` — the four
+  confirmed defects and the look-alikes already refuted. Canonical:
+  `verification/findings/README.md`.

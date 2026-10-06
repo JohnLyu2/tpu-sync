@@ -4,11 +4,22 @@ Load this when the tree is at or past `50b0774`, when re-pinning citations after
 the next upstream sync, or when a note cites `01ffa3d` line numbers.
 
 [OBS 2026-10-06] Upstream `google/tpu-sync` `main` = `50b0774` (44 commits past
-`01ffa3d`) was merged into `experimental` as `8f03107` (no conflicts: our commits
+`01ffa3d`) was merged into `experimental` as `77eeec8` (no conflicts: our commits
 only touch `verification/`, upstream never does). Local tag
 `upstream-main-2026-10-06` = `50b0774`. The user's checkout had *not* been synced
 before this (merge-base was still `01ffa3d`, no fetch in the reflog) despite
 "I just synced" — check `git merge-base HEAD <upstream>` before trusting that.
+
+[SUPERSEDED → this entry, 2026-10-06 20:55] The paragraph above misread the
+situation. The user *had* synced — on GitHub ("Sync fork" produced `77eeec8`,
+a merge of `50b0774` into `experimental` with the same parents and an
+identical tree); the local clone simply had not fetched it. I merged again
+locally (`8f03107`) and only discovered the remote merge when the push was
+rejected. Resolution: our five commits were rebased onto `77eeec8` and the
+duplicate local merge dropped, so the pushed history has one sync merge.
+Why misled: I checked `git merge-base` without `git fetch` first, so I was
+testing the clone, not the fork. Rule: `git fetch origin` before judging
+whether anything is synced.
 
 [FACT] **One behavioural change in the modelled code since `01ffa3d`: `4efb0dd`
 (2026-10-02, "Immediately fail decode receive session when an incoming push
@@ -107,7 +118,7 @@ Use the README's labels when talking to anyone else.
 `BuildCoalescedCopySpec`; the function is `ValidateRequestedBlocksLocked`,
 `send.cc:97-114`) and `copy_spec_builder.h:42-92` for `BuildCoalescedSpec` (no
 such file in tpu-sync; `TransferSendSession::BuildCoalescedCopySpec`,
-`send.cc:203-232` at `50b0774`). Fixed in `0b3208b`. `BlockOrdering.lean`'s own
+`send.cc:203-232` at `50b0774`). Fixed in `2918b83`. `BlockOrdering.lean`'s own
 citations were right; the doc row was written from memory.
 
 ## Tooling
@@ -123,14 +134,14 @@ for lines starting with digits; (2) a bare backticked range after a comma
 switch file by table column (`Session.lean` field table: recv vs send header)
 or by row (`prefill_decode.md` mutant table); (4) lines naming another commit
 are skipped on purpose (`b68161a` audit lines in `Session.lean`). Found 4 wrapped
-lists and 1 column mix-up this time; all fixed in `0b3208b`.
+lists and 1 column mix-up this time; all fixed in `2918b83`.
 
 [HYP] `4efb0dd` collapses every push failure into `InternalError("Incoming push
 failed")`; the real cause (read timeout, size mismatch, `OnLayerReceived` error)
 survives only in the transport log, so `failed_recving` cannot distinguish them.
 Observability only; parked in `loose-ends/parked.md`.
 
-[FACT 2026-10-06, `c523e75`] Follow-up on user request: every reference
+[FACT 2026-10-06, `d566bd5`] Follow-up on user request: every reference
 statement under `verification/` now names only the current commit (`50b0774`);
 the re-pin history lives in `prefill_decode.md` §"Upstream re-checks" and
 `findings/README.md` §"History". `findings/` was re-pinned too (so the whole

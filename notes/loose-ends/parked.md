@@ -6,7 +6,7 @@ Each entry uses the 5-field `better-than-fish` format so any future session can 
 **Status:** parked 2026-10-05
 **Context:** `KVCacheStoreClient::Fetch` (`tpu_sync/kv_cache/kv_cache_store_client.cc:61-125`) sets no gRPC deadline on `ClientContext` (`grpc::ClientContext ctx;`), unlike `PrepareWrite` (`10s`) and `CompleteWrite` (`30s`). Furthermore, in `HostOffloadBackend::LoadRemoteBlocks` (`tpu_sync/kv_cache/host_offload_backend.cc:1184-1195`), if `TransferBuffers` returns an error (e.g., one worker fails or times out while another worker's D2H/H2H transfer is still in flight), `dst_host_block_ids` are immediately freed back to the host block allocator (`:1190-1193`).
 **Why parked:** Flagged as an unverified follow-up at the end of the `01ffa3d` concurrency bug-hunt (`verification/findings/README.md`) after confirming F1–F4.
-**To resume:** Inspect `RaidenController::TransferBuffers` (`tpu_sync/raiden_controller.cc:617, 786-790`) and `WorkerServiceImpl::TransferData` to check whether `TransferBuffers` can return early while any peer worker still writes into `dst_host_block_ids`, or whether `future.Get()` drains all dispatched workers before returning.
+**To resume:** Inspect `RaidenController::TransferBuffers` (`tpu_sync/core/controller/raiden_controller.cc:617, 786-790`) and `WorkerServiceImpl::TransferData` to check whether `TransferBuffers` can return early while any peer worker still writes into `dst_host_block_ids`, or whether `future.Get()` drains all dispatched workers before returning.
 **Effort estimate:** ~45 min.
 **References:** ../durable/controller-read-remote-and-kv-store-pinning-concurrency-traps.md, verification/findings/README.md
 
@@ -14,13 +14,13 @@ Each entry uses the 5-field `better-than-fish` format so any future session can 
 **Status:** parked 2026-10-05
 **Context:** `verification/TpuSyncVerify/Transfer/Receive.lean`, `ReceivePoll.lean`, and `MultiRequest.lean` contain 5 high-value executable witness traces (`trace_finish_between_locks`, `trace_poll_before_callbacks`, `trace_slow_consumer`, `trace_layers_out_of_order`, `trace_reseat_at_finish`) that exercise subtle lock windows and callback orderings in `TransferReceiveSession` and `KVCacheManagerWithTransfer`.
 **Why parked:** Lean proofs and trace witnesses are complete (`verification/docs/transfer/prefill_decode.md` Future Work F2); C++ unit test harness wiring in `tpu_sync/kv_cache/transfer_session_test.cc` was deferred.
-**To resume:** Open `tpu_sync/kv_cache/transfer_session_test.cc` and add deterministic multi-threaded or mock-PJRT callback tests corresponding to each of the 5 Lean `decide` traces.
+**To resume:** Add to `tpu_sync/core/transfer_send_session_test.cc` / `tpu_sync/core/kv_cache_manager_with_transfer_send_drain_test.cc` (receive side has no session-level test file) deterministic multi-threaded or mock-PJRT callback tests corresponding to each of the 5 Lean `decide` traces.
 **Effort estimate:** ~2 hours.
 **References:** ../durable/prefill-decode-transfer-settle-and-layer-readiness-invariants.md, verification/docs/transfer/prefill_decode.md
 
 ## Model BlockTransport multi-sender per-block completion in Lean to discharge Receive assumptions A1/A3/A4
 **Status:** parked 2026-10-05
-**Context:** `TransferReceiveSession` correctness (`Receive.sound_completion`) relies on four transport boundary assumptions (A1–A4), notably A4 (`OnLayerReceived` fires before `OnBlocksReceived` on the same reader thread in `block_transport.cc:528-530, 570-584`). Currently `BlockTransport` is treated as the environment of `Receive.lean`.
+**Context:** `TransferReceiveSession` correctness (`Receive` readiness soundness, `Receive.lean`) relies on four transport boundary assumptions (A1–A4), notably A4 (`OnLayerReceived` fires before `OnBlocksReceived` on the same reader thread in `block_transport.cc:528-530, 570-584`). Currently `BlockTransport` is treated as the environment of `Receive.lean`.
 **Why parked:** Scoped out of the initial session-layer formalization (`verification/docs/transfer/prefill_decode.md` Future Work F4).
 **To resume:** Create `verification/TpuSyncVerify/Transfer/Transport.lean` modeling `BlockTransport::ProcessPacket` per-block byte counters (`expected_Senders_per_block`, `layer_blocks_remaining_`, `total_blocks_remaining_`) across concurrent reader threads, and prove A1, A3, and A4 as theorems.
 **Effort estimate:** ~half-day.
