@@ -33,12 +33,14 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_sync {
@@ -223,9 +225,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // Returns the list of layer names associated with the weight synchronizer.
   const std::vector<std::string>& layer_names() const { return layer_names_; }
 
+  // Copies the host staging buffers of all layers to device, tiling each
+  // layer into the per-shard scratchpads unless skip_tiling is set for it
+  // under |uuid|.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
-  absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx,
-                                                  uint64_t uuid = 0);
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(
       size_t layer_idx, uint64_t uuid = 0,
@@ -350,8 +353,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   // Override parent AllocateBlocks as simple identity indices since we sync
   // entire buffers E2E!
-  absl::StatusOr<std::vector<int>> AllocateBlocks(
-      size_t num_blocks, uint64_t uuid = 0) override {
+  absl::StatusOr<std::vector<int>> AllocateBlocks(size_t num_blocks,
+                                                  uint64_t uuid = 0) override {
     std::vector<int> ids(num_blocks);
     for (size_t i = 0; i < num_blocks; ++i) ids[i] = static_cast<int>(i);
     return ids;
@@ -381,6 +384,18 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
         layer_futures;
   };
 
+  // Blocks until every expected layer of |uuid| has scheduled its future via
+  // OnLayerDataReceived, then removes and returns those futures.
+  absl::flat_hash_map<size_t,
+                      std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
+  TakeLayerFuturesWhenScheduled(uint64_t uuid)
+      ABSL_LOCKS_EXCLUDED(pending_h2d_mu_);
+
+  // Returns true if skip_tiling is set for |layer_idx| under |uuid|, falling
+  // back to the latest stored skip_tiling when |uuid| is unknown.
+  bool IsTilingSkipped(size_t layer_idx, uint64_t uuid)
+      ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
+
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
   std::unique_ptr<HostMemoryAllocator> host_allocator_;
@@ -406,13 +421,37 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // latest mask set via SetSkipTiling() and then to all-false.
   std::vector<bool> GetActiveSkipTiling(uint64_t uuid);
 
-  // Tiles (if needed) shard |shard_idx| of layer |layer_idx| into the shard's
-  // scratchpad and starts its host-to-device copy. |active_skip| is the
-  // per-layer skip-tiling mask. Tiling runs on the calling thread before this
-  // returns; the copy is asynchronous. Safe to call concurrently for distinct
-  // shards; calls for the same shard serialize on its scratchpad.
-  absl::StatusOr<xla::Future<raiden::BufferHolder>> H2dShard(
-      size_t layer_idx, size_t shard_idx, const std::vector<bool>& active_skip);
+  // Starts the host-to-device copy of shard |shard_idx| of layer |layer_idx|.
+  // If |tile| is true and the shard has a tiled layout, first tiles the host
+  // bytes into the shard's scratchpad and copies that; otherwise copies the
+  // host bytes as is. Tiling runs on the calling thread before this returns;
+  // the copy is asynchronous. Safe to call concurrently for distinct shards;
+  // calls for the same shard serialize on its scratchpad.
+  absl::StatusOr<xla::Future<raiden::BufferHolder>> H2dShard(size_t layer_idx,
+                                                             size_t shard_idx,
+                                                             bool tile);
+  // Copies all shards of |layer_idx| to device via H2dShard().
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx, bool tile);
+  // A local shard and its schedule in a StartTransferRequest.
+  struct ShardPushSchedule {
+    size_t shard_idx;
+    const tpu_sync::rpc::ShardPushScheduleProto& schedule;
+  };
+  // Returns the local shards that have an entry in |request|'s
+  // shard_push_schedules (keyed by global or local shard index, or by sorted
+  // key order for zero-based slicing), in ascending shard order. The
+  // references point into |request|.
+  absl::StatusOr<std::vector<ShardPushSchedule>> ResolveShardPushSchedules(
+      const tpu_sync::rpc::StartTransferRequest& request);
+  // Returns the scratchpad of shard |shard_idx|.
+  absl::StatusOr<ShardScratchpad*> GetTiledScratchpad(size_t shard_idx);
+  // Tiles the host bytes of shard |shard_idx| of layer |layer_idx| into |sp|
+  // and records tiling metrics. Returns the tiled bytes, valid while |sp.mu|
+  // is held.
+  absl::StatusOr<absl::Span<const uint8_t>> TileShardLocked(size_t layer_idx,
+                                                            size_t shard_idx,
+                                                            ShardScratchpad& sp)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(sp.mu);
 
   // Returns the pool that runs H2d()'s per-shard tasks, creating it on first
   // use. It is separate from |h2d_pool_| so that H2d() never waits on tasks

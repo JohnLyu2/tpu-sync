@@ -268,8 +268,7 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcast) {
   std::string dest_peer2 =
       "localhost:" + std::to_string(*ws_dest2->local_port());
 
-  uint8_t* src_host_ptr =
-      const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
   uint8_t* dest_host_ptr1 =
       const_cast<uint8_t*>(ws_dest1->GetHostPointer(0, 0));
   uint8_t* dest_host_ptr2 =
@@ -333,8 +332,7 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcastStrided) {
   std::string dest_peer2 =
       "localhost:" + std::to_string(*ws_dest2->local_port());
 
-  uint8_t* src_host_ptr =
-      const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
   uint8_t* dest_host_ptr1 =
       const_cast<uint8_t*>(ws_dest1->GetHostPointer(0, 0));
   uint8_t* dest_host_ptr2 =
@@ -1328,9 +1326,9 @@ TEST_F(WeightSynchronizerTest, UnbindWeightsFailsTransfersUntilRebound) {
   }
 
   std::vector<uint8_t> readback(slice_byte_size, 0);
-  ASSERT_OK(new_dest_pjrt_buffer
-                ->CopyRawToHost(readback.data(), 0, slice_byte_size)
-                .Await());
+  ASSERT_OK(
+      new_dest_pjrt_buffer->CopyRawToHost(readback.data(), 0, slice_byte_size)
+          .Await());
   for (size_t i = 0; i < slice_byte_size; ++i) {
     EXPECT_EQ(readback[i], 0x33) << "Mismatch at byte " << i;
   }
@@ -2036,8 +2034,7 @@ TEST_F(WeightSynchronizerTest,
   }
 }
 
-TEST_F(WeightSynchronizerTest,
-       PushWeightsReshardedLocalShardIndicesFallback) {
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedLocalShardIndicesFallback) {
   const size_t num_layers = 1;
   const size_t num_shards = 4;
   const size_t slice_byte_size = 256;
