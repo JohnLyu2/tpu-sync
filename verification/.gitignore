@@ -1,3 +1,5 @@
 # Lean / Lake build output
 /.lake/
 /build/
+# Slides are built from the tracked .typ sources
+/slides/*.pdf
