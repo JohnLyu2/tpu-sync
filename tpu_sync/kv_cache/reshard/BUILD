@@ -215,6 +215,27 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "reshard_control_pipe_test",
+    srcs = ["reshard_control_pipe_test.cc"],
+    copts = RESHARD_COPTS,
+    features = ["-use_header_modules"],
+    linkstatic = True,
+    deps = [
+        ":reshard_control_pipe",
+        "//tpu_sync/common/control_pipe:control_pipe_interfaces",
+        "//tpu_sync/common/control_pipe:control_pipe_types",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "//tpu_sync/rpc:controller_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "reshard_client",
     srcs = ["reshard_client.cc"],

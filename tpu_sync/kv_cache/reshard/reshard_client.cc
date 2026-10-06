@@ -14,8 +14,10 @@
 
 #include "tpu_sync/kv_cache/reshard/reshard_client.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -23,6 +25,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
@@ -39,6 +42,22 @@ namespace {
 
 // Facade parity: connect_socket(address, timeout=300.0) per call.
 constexpr absl::Duration kCallTimeout = absl::Seconds(300);
+// StartTransfer and cancellation target a producer that already served the
+// request. Define a retry budget for these calls.
+constexpr absl::Duration kDefaultDataPathConnectRetryBudget = absl::Seconds(10);
+
+absl::Duration DataPathConnectRetryBudget() {
+  static const absl::Duration budget = [] {
+    const char* env = std::getenv("TPU_RAIDEN_CONTROL_CONNECT_RETRY_S");
+    double seconds = 0;
+    if (env == nullptr || !absl::SimpleAtod(env, &seconds)) {
+      return kDefaultDataPathConnectRetryBudget;
+    }
+    if (seconds <= 0) return absl::ZeroDuration();
+    return std::min(absl::Seconds(seconds), kCallTimeout);
+  }();
+  return budget;
+}
 
 tpu_sync::rpc::RaidenIdProto RaidenIdProtoOf(const RaidenId& unit) {
   tpu_sync::rpc::RaidenIdProto proto;
@@ -277,11 +296,12 @@ tpu_sync::rpc::ControlRequest ReshardClient::BuildShutdown() {
 }
 
 absl::StatusOr<tpu_sync::rpc::ControllerResponse> ReshardClient::CallController(
-    const tpu_sync::rpc::ControllerRequest& request) {
+    const tpu_sync::rpc::ControllerRequest& request,
+    absl::Duration connect_retry_budget) {
   absl::StatusOr<tpu_sync::rpc::ControllerResponse> response =
       CallReshardControlPipe<tpu_sync::rpc::ControllerRequest,
                              tpu_sync::rpc::ControllerResponse>(
-          client_, address_, request, kCallTimeout);
+          client_, address_, request, kCallTimeout, connect_retry_budget);
   if (!response.ok()) return response.status();
   if (!response->success()) {
     // Verbatim facade text: the connector's bounded retry substring-matches
@@ -335,7 +355,8 @@ absl::Status ReshardClient::CompleteRequestBlocks(const std::string& req_id,
 absl::StatusOr<bool> ReshardClient::CancelRequestBlocksIfUnclaimed(
     const std::string& req_id, int64_t uuid) {
   absl::StatusOr<tpu_sync::rpc::ControllerResponse> response =
-      CallController(BuildCancelRequestBlocksIfUnclaimed(req_id, uuid));
+      CallController(BuildCancelRequestBlocksIfUnclaimed(req_id, uuid),
+                     DataPathConnectRetryBudget());
   if (!response.ok()) return response.status();
   if (response->response_data() == "true") return true;
   if (response->response_data() == "false") return false;
@@ -346,7 +367,9 @@ absl::StatusOr<bool> ReshardClient::CancelRequestBlocksIfUnclaimed(
 
 absl::StatusOr<bool> ReshardClient::StartTransfer(
     const StartTransferArgs& args) {
-  absl::Status status = CallController(BuildStartTransfer(args)).status();
+  absl::Status status =
+      CallController(BuildStartTransfer(args), DataPathConnectRetryBudget())
+          .status();
   if (!status.ok()) return status;
   return true;
 }
