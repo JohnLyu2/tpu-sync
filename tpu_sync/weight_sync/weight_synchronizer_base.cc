@@ -1112,6 +1112,14 @@ WeightSynchronizerBase::BuildLayerPushTasks(
     return fallback_layer_idx;
   };
 
+  // A relay of host buffers that are (or are being tiled) in device layout.
+  const bool pre_tiled =
+      request.host_tiling_mode() == tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED;
+  if (pre_tiled && !request.skip_d2h()) {
+    return absl::InvalidArgumentError(
+        "HOST_TILING_MODE_PRE_TILED pushes must skip D2H");
+  }
+
   std::vector<std::vector<transport::BufferPushTask>> tasks_by_layer(
       num_layers_);
   TF_ASSIGN_OR_RETURN(const std::vector<ShardPushSchedule> shard_schedules,
@@ -1153,6 +1161,18 @@ WeightSynchronizerBase::BuildLayerPushTasks(
       size_t dst_offset = entry.dst_offset_bytes();
       size_t src_offset = entry.src_offset_bytes();
       size_t size = entry.size_bytes();
+      if (pre_tiled) {
+        // The host buffer holds device-layout bytes and the receiver has the
+        // same sharding, so relay exactly what H2D copies: the whole shard,
+        // including any tiling padding past the logical span.
+        if (entry.outer_counts_size() != 0) {
+          return absl::InvalidArgumentError(
+              "HOST_TILING_MODE_PRE_TILED entries must not be strided");
+        }
+        count = 1;
+        src_offset = dst_offset = 0;
+        size = layers_[layer_idx_to_use].shards[i].device_size;
+      }
 
       const size_t effective_src_stride = src_stride > 0 ? src_stride : size;
       const size_t effective_dst_stride = dst_stride > 0 ? dst_stride : size;
@@ -1355,6 +1375,33 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 
   std::vector<std::future<absl::Status>> push_futures;
   push_futures.reserve((num_layers_ + group_size - 1) / group_size);
+  auto schedule_push = [&](std::vector<transport::BufferPushTask> tasks) {
+    if (tasks.empty()) return;
+    int push_parallelism =
+        request.parallelism() > 0 ? request.parallelism() : parallelism_;
+    absl::Time schedule_time =
+        (task_timing != nullptr) ? absl::Now() : absl::InfinitePast();
+    push_futures.push_back(push_pool_->Schedule(
+        assigned_numa_node_,
+        [this, tasks = std::move(tasks), push_parallelism,
+         uuid = request.uuid(), schedule_time, task_timing]() {
+          if (task_timing != nullptr) {
+            double wait_ms =
+                absl::ToDoubleMilliseconds(absl::Now() - schedule_time);
+            absl::MutexLock lock(task_timing->mu);
+            task_timing->queue_waits.push_back(wait_ms);
+          }
+          return PushWeightsChunks(tasks, push_parallelism, uuid);
+        }));
+  };
+
+  // A relay seed may still be tiling layers it received from the trainer.
+  std::vector<std::shared_ptr<LayerTileReady>> tile_ready;
+  if (request.host_tiling_mode() == tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED) {
+    absl::MutexLock lock(tile_ready_mu_);
+    tile_ready = layer_tile_ready_;
+  }
+  tile_ready.resize(num_layers_);
 
   for (size_t group_start = 0; group_start < num_layers_;
        group_start += group_size) {
@@ -1387,6 +1434,13 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         }
       }
       const auto& layer_tasks = tasks_by_layer[l];
+      if (!layer_tasks.empty() && tile_ready[l] != nullptr) {
+        if (!tile_ready[l]->IsSet()) {
+          // Start sending the layers that are ready while this one tiles.
+          schedule_push(std::exchange(group_tasks, {}));
+        }
+        TF_RETURN_IF_ERROR(tile_ready[l]->Wait());
+      }
       if (!layer_tasks.empty()) {
         for (const auto& t : layer_tasks) {
           total_h2h_bytes += (t.count > 0 ? t.count : 1) * t.size_bytes;
@@ -1427,24 +1481,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
     }
 
-    if (!group_tasks.empty()) {
-      int push_parallelism =
-          request.parallelism() > 0 ? request.parallelism() : parallelism_;
-      absl::Time schedule_time =
-          (task_timing != nullptr) ? absl::Now() : absl::InfinitePast();
-      push_futures.push_back(push_pool_->Schedule(
-          assigned_numa_node_,
-          [this, group_tasks = std::move(group_tasks), push_parallelism,
-           uuid = request.uuid(), schedule_time, task_timing]() {
-            if (task_timing != nullptr) {
-              double wait_ms =
-                  absl::ToDoubleMilliseconds(absl::Now() - schedule_time);
-              absl::MutexLock lock(task_timing->mu);
-              task_timing->queue_waits.push_back(wait_ms);
-            }
-            return PushWeightsChunks(group_tasks, push_parallelism, uuid);
-          }));
-    }
+    schedule_push(std::move(group_tasks));
   }
   if (!request.skip_d2h() && !already_completed && d2h_state != nullptr &&
       num_layers_ == 0) {

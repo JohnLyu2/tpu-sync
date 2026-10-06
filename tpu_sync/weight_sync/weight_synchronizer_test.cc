@@ -2270,6 +2270,70 @@ TEST_F(WeightSynchronizerTest, ReArmKeepsReceivedLayersReady) {
   ws->ForgetPushProgress(kUuid);
 }
 
+// A seed relays each received shard as is once it has been tiled in place:
+// the whole device-size shard, whatever span the schedule entry names, and
+// only after the layer's in-place tiling has finished.
+TEST_F(WeightSynchronizerTest, PreTiledPushSendsWholeShardAfterTiling) {
+  constexpr size_t kSliceBytes = 16384;
+  auto ws_seed = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_relay = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  ASSERT_TRUE(ws_relay->local_port().has_value());
+  const std::string relay_peer =
+      absl::StrCat("localhost:", *ws_relay->local_port());
+
+  uint8_t* seed_host = ws_seed->GetHostPointer(0, 0);
+  uint8_t* relay_host = ws_relay->GetHostPointer(0, 0);
+  ASSERT_NE(seed_host, nullptr);
+  ASSERT_NE(relay_host, nullptr);
+  std::memset(seed_host, 0xAB, kSliceBytes);
+  std::memset(relay_host, 0x00, kSliceBytes);
+
+  constexpr uint64_t kUuid = 884;
+  // The seed is still receiving (and tiling) layer 0 from the trainer.
+  tpu_sync::rpc::StartTransferRequest recv_req;
+  recv_req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  ws_seed->StoreSkipTiling(kUuid, recv_req);
+  ASSERT_OK(ws_seed->RegisterExpectedLayerChunks(kUuid, {{0, 1}}));
+
+  tpu_sync::rpc::StartTransferRequest push_req;
+  push_req.set_is_sender(true);
+  push_req.set_skip_d2h(true);
+  push_req.set_uuid(kUuid);
+  push_req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  auto* entry = (*push_req.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(relay_peer);
+  entry->set_dst_shard_idx(0);
+  // A logical span shorter than the shard.
+  entry->set_src_offset_bytes(64);
+  entry->set_dst_offset_bytes(64);
+  entry->set_size_bytes(128);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  ASSERT_OK(ws_relay->RegisterExpectedChunks(kUuid, 1));
+  absl::Notification push_done;
+  absl::Status push_status;
+  std::thread pusher([&] {
+    push_status = ws_seed->PushWeightsResharded(push_req);
+    push_done.Notify();
+  });
+  EXPECT_FALSE(push_done.WaitForNotificationWithTimeout(absl::Seconds(1)));
+
+  ASSERT_OK(ws_seed->OnLayerDataReceived(/*layer_idx=*/0, kUuid));
+  pusher.join();
+  ASSERT_OK(push_status);
+  ASSERT_OK(ws_relay->WaitForTransferCompletion(kUuid));
+  for (size_t i = 0; i < kSliceBytes; ++i) {
+    ASSERT_EQ(relay_host[i], 0xAB) << "Mismatch at byte " << i;
+  }
+  ws_seed->ForgetPushProgress(kUuid);
+  ws_relay->ForgetPushProgress(kUuid);
+}
+
 TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   const size_t num_layers = 2;
   const size_t num_shards = 4;

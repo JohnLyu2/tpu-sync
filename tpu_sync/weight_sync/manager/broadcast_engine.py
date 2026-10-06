@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 from absl import logging
 
 from tpu_sync.api.common import RaidenId
+from tpu_sync.rpc import raiden_service_pb2
 from tpu_sync.weight_sync.manager import controller_types
 
 _PIPELINE_TARGET_STAGES: int = 4
@@ -604,6 +605,11 @@ class BroadcastEngine:
         lambda: collections.defaultdict(lambda: collections.defaultdict(int))
     )
 
+    # Receivers fed directly by the trainer (seeds) and by another receiver
+    # (relay receivers); see raiden_service_pb2.HostTilingMode.
+    seed_receivers: set[RaidenId] = set()
+    relay_receivers: set[RaidenId] = set()
+
     for g in groups:
       dst_units = g.pending_dst_units
       n = len(dst_units)
@@ -787,11 +793,10 @@ class BroadcastEngine:
                 relay_shards = stage_group.canonical_relay_plans.get(
                     plan_id, {}
                 )
+                # Relays push each pre-tiled shard as a single chunk.
                 for local_dst_idx, blocks in relay_shards.items():
                   if blocks:
-                    relay_shard_layer_counts[local_dst_idx][layer_idx] += len(
-                        blocks
-                    )
+                    relay_shard_layer_counts[local_dst_idx][layer_idx] += 1
           seed_layer_totals: dict[int, int] = collections.defaultdict(int)
           seed_total_blocks = 0
           for layer_dict in seed_shard_layer_counts.values():
@@ -817,6 +822,7 @@ class BroadcastEngine:
         for hop in populated_hops:
           dst_unit = hop.receiver
           is_seed_hop = hop.sender == g.primary_src_unit
+          (seed_receivers if is_seed_hop else relay_receivers).add(dst_unit)
           shard_layer_counts = (
               seed_shard_layer_counts
               if is_seed_hop
@@ -981,6 +987,15 @@ class BroadcastEngine:
           )
           for r in sorted_rounds
       ]
+    # Seeds tile their host buffers in place and relays forward the tiled
+    # bytes. Every stage re-arms a receiver under the same uuid, so it must
+    # have the same role in all stages.
+    mixed_receivers = seed_receivers & relay_receivers
+    if mixed_receivers:
+      raise ValueError(
+          "Broadcast receivers are fed by both the trainer and relays: "
+          f"{sorted(str(u) for u in mixed_receivers)}"
+      )
 
     async def _run_single_transfer(
         s_node: RaidenId,
@@ -1037,6 +1052,7 @@ class BroadcastEngine:
                             d_unit, r_plan.expected_layer_chunk_counts
                         )
                     ),
+                    host_tiling_mode=r_plan.host_tiling_mode,
                 ),
             )
             if not success:
@@ -1072,6 +1088,7 @@ class BroadcastEngine:
                           d_node, plan.expected_layer_chunk_counts
                       )
                   ),
+                  host_tiling_mode=plan.host_tiling_mode,
               ),
           )
           if not success:
@@ -1266,6 +1283,7 @@ class BroadcastEngine:
                 endpoint_to_shards=getattr(
                     final_plan, "endpoint_to_shards", {}
                 ),
+                host_tiling_mode=raiden_service_pb2.HOST_TILING_MODE_ON_ARRIVAL,
             )
 
           s_u_plans = {}
@@ -1372,22 +1390,26 @@ class BroadcastEngine:
               relay_shards = stage_group.canonical_relay_plans.get(pid, {})
               for local_dst_idx, blocks in relay_shards.items():
                 if blocks:
-                  dst_peer = dst_addrs[local_dst_idx]
-                  relay_shard_plans_by_id.setdefault(local_dst_idx, {})[pid] = [
-                      (
-                          dst_peer,
+                  # The relay holds this shard in device layout, so it sends
+                  # the whole shard in one chunk; the sender resolves the
+                  # physical size (HOST_TILING_MODE_PRE_TILED), so the
+                  # logical span here is informational only.
+                  span = max(off + size for off, size, _ in blocks)
+                  dst_block_id = blocks[0][2]
+                  relay_shard_plans_by_id.setdefault(local_dst_idx, {})[pid] = (
+                      [(
+                          dst_addrs[local_dst_idx],
                           local_dst_idx,
-                          min_offset,
-                          min_offset,
-                          block_size,
+                          0,
+                          0,
+                          span,
                           dst_block_id,
                           dst_block_id,
-                          block_size,
-                          block_size,
+                          span,
+                          span,
                           1,
-                      )
-                      for min_offset, block_size, dst_block_id in blocks
-                  ]
+                      )]
+                  )
             relay_shard_sched = {
                 local_dst_idx: controller_types.PlanReferencedShardSchedule(
                     relay_shard_plans_by_id[local_dst_idx],
@@ -1439,6 +1461,7 @@ class BroadcastEngine:
               endpoint_to_shards=dict(
                   getattr(final_plan, "endpoint_to_shards", None) or {}
               ),
+              host_tiling_mode=raiden_service_pb2.HOST_TILING_MODE_PRE_TILED,
           )
           if diag_vlog:
             hop.plan_build_ms = (time.monotonic() - plan_build_start) * 1000.0
