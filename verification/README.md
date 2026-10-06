@@ -64,7 +64,10 @@ A clean build takes about half a minute; every `theorem` is checked and every
 
 ## Maintenance after an upstream sync
 
-Citations rot with every upstream commit. After merging a new `main`:
+Upstream is merged into `experimental`; the fork's `main` fast-forwards from it
+(`git push origin experimental:main`), never by squash or rebase, so commit
+hashes cited here and in the notes stay valid. Citations rot with every
+upstream commit. After merging a new upstream `main`:
 
 ```sh
 cd verification
