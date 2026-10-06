@@ -1,5 +1,9 @@
 # AI-assisted Formal Verification of Prefill-to-Decode Transfer Safety in TPU Sync
 
+*Status (2026-10-06): the prefill-to-decode case study is complete — results in
+[README.md](README.md) and [docs/transfer/prefill_decode.md](docs/transfer/prefill_decode.md);
+the defects found on the controller path are in [findings/](findings/README.md).*
+
 This project develops an AI-assisted verification workflow for TPU Sync,
 beginning with transfer safety in its **prefill-to-decode transfer path** for
 disaggregated serving: when transferred KV-cache data can safely be made available
@@ -48,69 +52,68 @@ signaling can lead to silent token corruption or engine crashes.
 
 ## 2. The verification problem
 
-Transfer safety in disaggregated serving requires that asynchronous completion
-signals (`done_sending` and `done_recving`) strictly reflect the physical state of
-memory operations across nodes. Because TPU Sync coordinates multi-layer DMA transfers
-and multi-stream network chunks concurrently across background threads, completion
-polling can race with ongoing memory operations. The central question is:
+At the system boundary, the prefill and decode serving engines treat TPU Sync as a transfer layer over a stream of requests $R_1, R_2, \dots$ that continuously recycle **TPU HBM blocks** (managed by the serving engines and reclaimed once `poll_stats()` reports a terminal outcome) and **host staging DRAM buffers** (managed by TPU Sync's `StagingBlockAllocator` and recycled as soon as a session settles). Because multi-layer D2H DMA, multi-stream network pushes, H2D DMA, cancellations, and `poll_stats()` run concurrently across background threads, the central question is:
 
-> Can pipelined DMA copying, multi-stream network streaming, buffer reuse, and
-> completion polling overlap in a way that causes corrupted KV data to be
-> consumed or source buffers to be prematurely overwritten?
+> Across a stream of requests that continuously recycle TPU HBM and host staging buffers, can out-of-order layer completion, mid-flight failures or cancellations, premature buffer reuse, or completion polling races ever corrupt a request's KV cache in decode HBM or leak buffers?
 
-The verification addresses three related properties:
+Ultimately, the serving engines rely on **two system-level properties**:
 
-| Property | Required behavior |
+| System property | Required behavior across requests $R_1, R_2, \dots$ |
 | --- | --- |
-| Publication correctness | When `done_recving` is signaled, all requested KV blocks are fully committed to decode HBM with their expected contents. Decode never executes attention kernels on uncommitted or stale HBM memory. |
-| Source buffer safety | When `done_sending` is signaled, all D2H DMA reads from prefill HBM have completed. Prefill never frees or overwrites source HBM buffers while a transfer is still reading from them. |
-| Staging integrity & termination | Under stated scheduling and network assumptions, operations eventually succeed or fail. Host staging DRAM blocks allocated for the pipeline are guaranteed to be released on completion, timeout, or cancellation, preventing memory leaks and cross-request memory pollution. |
+| **1. End-to-end KV data correctness** | Whenever `poll_stats()` signals `done_recving` for a request $R$, every transformer layer $0 \dots L-1$ of $R$'s decode HBM contains $R$'s exact KV cache `[kv 0, …, kv (L-1)]`, and nothing overwrites $R$'s decode HBM while decode attention is running — even when layers finish D2H, H2H, and H2D out of order, when the prefill engine immediately reclaims and overwrites $R$'s prefill HBM upon `done_sending`, and when $R$ reuses host staging and HBM buffers from earlier completed, failed, or cancelled requests. |
+| **2. Progress & no buffer leak** | Every started request $R$ (whether it succeeds, fails, or is cancelled) eventually drains all in-flight operations, settles both sessions so host staging DRAM buffers are returned to `StagingBlockAllocator`, and reports terminal outcomes via `poll_stats()` (`done_sending` / `failed_sending` and `done_recving` / `failed_recving`) so the serving engines can reclaim prefill and decode HBM and later requests never starve. |
+
+In this setting, per-buffer safety properties are the intermediate obligations required to establish the two system-level goals:
+- **Clean buffer handoff (no use-after-release across requests):**
+  - *Prefill HBM safety:* Once `poll_stats()` reports `done_sending` (or `failed_sending`), all D2H DMA reads from prefill HBM have retired, so the prefill engine immediately overwriting prefill HBM for a new request cannot corrupt an in-flight transfer.
+  - *Host staging safety:* Once a send or receive session settles and returns its staging buffer to `StagingBlockAllocator`, all D2H, H2H, and H2D operations touching that staging buffer have retired, so recycling the staging buffer can neither corrupt the finishing request nor overwrite the next request's staging data.
+  - *Decode HBM safety:* Once `poll_stats()` reports `done_recving` (or `failed_recving`), all H2D DMA writes to decode HBM have retired, so decode attention and subsequent requests reusing decode HBM are never overwritten by straggling writes.
+- **Single-request per-layer delivery:** Within an undisturbed transfer, every layer $l \in \{0 \dots L-1\}$ moves from `prefillHbm[l]` $\to$ `prefillStaging[l]` $\to$ `wire[l]` $\to$ `decodeStaging[l]` $\to$ `decodeHbm[l]` without premature reads, and `done_recving` is published only when all $L$ layers have finished H2D.
+- **Finite operation drain (no op leak):** Every accounted unit of `in_flight_` can complete or abort, and once `draining_` is set, remaining operations drain in finitely many steps so both sessions settle and publish.
 
 ## 3. Verification approach
 
 ### 3.1. Model the pipeline as states and steps
 
 Represent the prefill-to-decode transfer protocol as a formal state-machine model
-in Lean (`TpuSyncFormal/PrefillDecode/`): a precise description of states and
+in Lean (`TpuSyncVerify/Transfer/PrefillDecode/`): a precise description of states and
 allowed steps on which to base proofs. States record:
-- Prefill HBM buffer allocation, contents, and lifetime (active, ready to free, reused).
-- Producer and consumer host staging DRAM allocations from `StagingBlockAllocator`.
-- In-flight network chunks and out-of-order layer/shard arrivals.
-- Decode HBM buffer contents and publication status.
+- Prefill HBM buffer allocation, per-layer contents, and reclamation / reuse across requests.
+- Producer and consumer host staging DRAM allocations from `StagingBlockAllocator` and reuse across requests.
+- Per-layer completion state across D2H, H2H network streaming, landing, and H2D.
+- Decode HBM per-layer contents and publication status.
 - Session progress counters (`in_flight_`, `draining_`, `done_`, `status_`).
 
 Steps define allowed state transitions:
-- Producer D2H dispatch and layer completion.
-- Network chunk transmission, transport out-of-order delivery, and layer arrival.
-- Consumer H2D dispatch and completion.
-- `CompleteReadRaw` polling updates (`done_sending`, `done_recving`, `failed_recving`).
-- Producer buffer deallocation / reallocation and consumer attention kernel launch.
-- Deadlines, cancellation, and staging buffer release.
+- Producer D2H dispatch and per-layer completion (in arbitrary layer order).
+- Network push transmission, out-of-order layer landing, and push callbacks.
+- Consumer H2D dispatch (including the unlock/re-lock window) and per-layer completion.
+- `CompleteReadRaw` / `poll_stats()` publication (`done_sending` / `failed_sending`, `done_recving` / `failed_recving`).
+- Asynchronous buffer reclamation and reuse across requests (`reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging`, and multi-request transitions).
+- Deadlines, failures, cancellation, and staging buffer release.
 
-The model represents data symbolically, tracking whether copied contents match the
-original prompt KV blocks. Ground the abstraction in TPU Sync's C++ code: map model
-steps directly to `TransferSendSession`, `TransferReceiveSession`,
-`KVCacheManagerWithTransfer`, and `BlockTransport`.
+The model represents data symbolically per transformer layer (`Cell.kv l`, `Cell.junk`, `Cell.blank`), tracking whether copied contents in each layer slot match the original prompt KV blocks. Ground the abstraction in TPU Sync's C++ code: map model steps directly to `TransferSendSession`, `TransferReceiveSession`, `KVCacheManagerWithTransfer`, and `BlockTransport`.
 
-### 3.2. Check modeled executions and prove safety in Lean
+### 3.2. Check modeled executions and prove the system properties in Lean
 
 Lean is a programming language and proof assistant that supports executing the
-model and checking mathematical proofs about it. The objective is to establish
-whether the modeled pipeline satisfies publication correctness and source buffer
-safety under explicit assumptions.
+model and checking mathematical proofs about it. The objective is to prove the
+two system-level properties — **end-to-end KV data correctness** (at `done_recving`
+and throughout decode attention) and **progress / no buffer leak** across requests —
+under explicit assumptions.
 
 Use AI assistance to construct concrete executions covering normal multi-layer
-transfers, out-of-order network chunk arrivals, and worker timeout/cancellation
+transfers, out-of-order layer completions, slow-consumer buffer reclamation,
+multi-request buffer reuse after mid-stream failure, and worker timeout/cancellation
 scenarios. Lean checks whether a sequence of steps follows the transition rules and
-whether the resulting state satisfies the specification. An allowed execution that
-violates publication correctness or causes a premature buffer overwrite is a
-verified model counterexample.
+whether the resulting state satisfies the specification.
 
-To establish safety across all modeled executions, prove inductive invariants:
-conditions that hold initially, are preserved by every allowed step, and imply
-publication correctness and source buffer safety. Define the correctness
-properties and assumptions explicitly, then construct the proofs with AI
-assistance. Lean checks each proof step.
+To establish the two system-level properties across all modeled executions, prove
+inductive invariants from bottom to top: session settle invariants (`Session`),
+exact `in_flight_` counter conservation (`Send` and `Receive`), single-request
+per-layer delivery, post-handoff buffer quietness, and finite drain (`Pipeline`),
+and finally multi-request non-interference and progress (`multiSys`). Lean checks
+each proof step.
 
 ### 3.3. Replay executions between the model and TPU Sync
 
@@ -127,10 +130,11 @@ model before testing the code changes, and recheck proofs after any model change
 
 ## 4. Deliverables
 
-*   **A Lean model and proof suite** (in `TpuSyncFormal/PrefillDecode/`), with
-    explicit correctness properties (publication correctness, source buffer
-    safety, staging integrity), checked counterexamples where violations are
-    found, and validation against recorded TPU Sync executions.
+*   **A Lean model and proof suite** (in `TpuSyncVerify/Transfer/PrefillDecode/`), proving
+    the two system-level properties (**end-to-end KV data correctness** and **progress /
+    no buffer leak** across requests) from single-request publication correctness,
+    clean buffer handoff (prefill HBM, host staging, decode HBM), and finite drain,
+    together with checked concrete traces and mutant counterexamples when guards are removed.
 *   **Implementation tests and model validation**, covering replay in both
     directions, successful scenarios, and counterexample reproduction in TPU
     Sync's test suite. Retain regression traces and include validated repairs

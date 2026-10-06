@@ -157,12 +157,12 @@
     [As soon as prefill's `poll_stats()` reports `done_sending` or `failed_sending`, the prefill engine frees the HBM blocks and reuses them for a new request.],
 
     [*Prefill staging*],
-    [TPU Sync `BufferPool`],
-    [Inside `TransferSendSession::SettleLocked()`, the instant the send session settles (`done_ = true`) its host staging buffer is returned to `BufferPool` and reused.],
+    [TPU Sync `StagingBlockAllocator`],
+    [Inside `TransferSendSession::SettleLocked()`, the instant the send session settles (`done_ = true`) its host staging buffer is returned to `StagingBlockAllocator` and reused.],
 
     [*Decode staging*],
-    [TPU Sync `BufferPool`],
-    [Inside `TransferReceiveSession::SettleLocked()`, the instant the receive session settles (`done_ = true`) its host staging buffer is returned to `BufferPool` and reused.],
+    [TPU Sync `StagingBlockAllocator`],
+    [Inside `TransferReceiveSession::SettleLocked()`, the instant the receive session settles (`done_ = true`) its host staging buffer is returned to `StagingBlockAllocator` and reused.],
 
     [*Decode HBM*],
     [Decode serving engine],

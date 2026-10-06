@@ -410,7 +410,8 @@ def PrefillHbmSafe (s : Pipeline) : Prop :=
   s.send.published ≠ none → s.send.d2hPending = false ∧ s.send.d2hRetired = s.send.d2hIssued
 
 /-- Once a session settles and releases its host staging buffer back to TPU
-Sync's `BufferPool`, no copy or push is still reading or writing it. -/
+Sync's `StagingBlockAllocator`, no copy or push is still reading or writing
+it. -/
 def StagingSafe (s : Pipeline) : Prop :=
   (s.send.life.hasStaging = false →
     s.send.d2hPending = false ∧ s.send.d2hRetired = s.send.d2hIssued ∧
@@ -1756,10 +1757,11 @@ theorem not_isRecycleEv_and_wroteReleased_eq_false {r r' : Pipeline} {e : Ev}
     simp
 
 /-- The prefill side of a request has released both of its buffers: its host
-staging buffer has been returned to `BufferPool` (`send.life.hasStaging = false`)
-and `poll_stats()` has published `done_sending` or `failed_sending`
-(`send.published ≠ none`), so a later request may recycle prefill HBM and
-prefill staging even while this request's receive side is still running. -/
+staging buffer has been returned to `StagingBlockAllocator`
+(`send.life.hasStaging = false`) and `poll_stats()` has published
+`done_sending` or `failed_sending` (`send.published ≠ none`), so a later
+request may recycle prefill HBM and prefill staging even while this request's
+receive side is still running. -/
 def PrefillReleased (s : Pipeline) : Prop :=
   s.send.life.hasStaging = false ∧
   s.send.published ≠ none
@@ -1768,9 +1770,10 @@ instance (s : Pipeline) : Decidable (PrefillReleased s) :=
   inferInstanceAs (Decidable (_ ∧ _))
 
 /-- TPU Sync has finished with all four memories of this transfer:
-both host staging buffers have been released back to TPU Sync's `BufferPool`
-(`hasStaging = false`), and both HBM buffers have been handed back to the
-caller via `poll_stats()` (`send.published ≠ none`, `recv.published ≠ none`). -/
+both host staging buffers have been released back to TPU Sync's
+`StagingBlockAllocator` (`hasStaging = false`), and both HBM buffers have been
+handed back to the caller via `poll_stats()` (`send.published ≠ none`,
+`recv.published ≠ none`). -/
 def HandedOff (s : Pipeline) : Prop :=
   s.send.life.hasStaging = false ∧
   s.recv.life.hasStaging = false ∧
@@ -1846,8 +1849,8 @@ theorem handedOff_quiet {r r' : Pipeline} {e : Ev} (h : Inv r) (hp : HandedOff r
    decodeHbm_quiet h hp.2.2.2 hs⟩
 
 /-- From any pipeline state satisfying `Inv`, a finite trace settles both
-sessions, releases both host staging buffers to `BufferPool`, and publishes both
-HBM outcomes (`HandedOff`). -/
+sessions, releases both host staging buffers to `StagingBlockAllocator`, and
+publishes both HBM outcomes (`HandedOff`). -/
 theorem inv_can_handoff (n : Nat) {s : Pipeline} (hinv : Inv s) :
     ∃ evs s', (sys n).runFrom s evs = some s' ∧ HandedOff s' := by
   obtain ⟨evs, s', hr, _, hstS, _, hstR, hpubS, hpubR, _⟩ := inv_can_settle n hinv

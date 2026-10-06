@@ -7,8 +7,8 @@ Multiple requests $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run
 concurrently and recycle the four memories (`prefillHbm`, `prefillStaging`,
 `decodeStaging`, `decodeHbm`) across two ownership boundaries:
 - **Host staging (`prefillStaging`, `decodeStaging`)** is owned by TPU Sync's
-  `BufferPool` and is returned to the pool inside `SettleLocked()` as soon as
-  each session settles (`hasStaging = false`).
+  `StagingBlockAllocator` and is returned to the pool inside `SettleLocked()`
+  as soon as each session settles (`hasStaging = false`).
 - **TPU HBM (`prefillHbm`, `decodeHbm`)** is owned by the serving engines and
   is handed back to the caller when `poll_stats()` publishes the session
   outcome (`send.published ≠ none`, `recv.published ≠ none`).
@@ -39,8 +39,8 @@ request `idx`:
    `good n` and remains `good n` across all subsequent multi-request transitions.
 2. `system_progress`: from any reachable multi-request state and any request
    `idx`, a finite trace drains all in-flight operations of `idx`, returns both
-   staging buffers to `BufferPool`, and publishes both HBM outcomes via
-   `poll_stats()` (`HandedOff`), enabling both `.recyclePrefill idx` and
+   staging buffers to `StagingBlockAllocator`, and publishes both HBM outcomes
+   via `poll_stats()` (`HandedOff`), enabling both `.recyclePrefill idx` and
    `.nextRequest idx`.
 -/
 
@@ -331,9 +331,9 @@ theorem runFrom_reqSteps {n idx : Nat} :
 /-- **Progress and buffer release across requests:**
 From any reachable multi-request state and any request `idx`
 (`ms.reqs[idx]? = some r`), there exists a finite trace `evs` that drains all
-in-flight operations of `idx`, returns both host staging buffers to `BufferPool`,
-and publishes both HBM outcomes (`HandedOff r'`), enabling both
-`.recyclePrefill idx` and `.nextRequest idx`. -/
+in-flight operations of `idx`, returns both host staging buffers to
+`StagingBlockAllocator`, and publishes both HBM outcomes (`HandedOff r'`),
+enabling both `.recyclePrefill idx` and `.nextRequest idx`. -/
 theorem system_progress {n : Nat} {ms : MultiState} {idx : Nat} {r : Pipeline}
     (h : (multiSys n).Reachable ms)
     (hreq : ms.reqs[idx]? = some r) :
