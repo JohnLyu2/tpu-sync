@@ -87,6 +87,25 @@ absl::Status GrpcStatusToAbsl(const grpc::Status& status) {
   }
 }
 
+absl::Status WaitForChannelReady(grpc::Channel& channel,
+                                 absl::string_view endpoint,
+                                 absl::Time deadline) {
+  grpc_connectivity_state state = channel.GetState(/*try_to_connect=*/true);
+  while (state != GRPC_CHANNEL_READY) {
+    if (state == GRPC_CHANNEL_TRANSIENT_FAILURE ||
+        state == GRPC_CHANNEL_SHUTDOWN) {
+      return MarkControlPipeNotSent(absl::UnavailableError(
+          absl::StrCat("gRPC channel to ", endpoint, " failed to connect")));
+    }
+    if (!channel.WaitForStateChange(state, absl::ToChronoTime(deadline))) {
+      return MarkControlPipeNotSent(absl::DeadlineExceededError(absl::StrCat(
+          "gRPC channel to ", endpoint, " did not connect before deadline")));
+    }
+    state = channel.GetState(/*try_to_connect=*/true);
+  }
+  return absl::OkStatus();
+}
+
 std::string ExtractIpFromGrpcPeer(absl::string_view peer) {
   absl::string_view addr_port = peer;
   if (absl::StartsWithIgnoreCase(peer, "ipv4:") ||
@@ -345,13 +364,14 @@ bool GrpcControlPipeClient::TEST_HasCachedStub(
   return stubs_.contains(endpoint);
 }
 
-std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>
+std::pair<std::shared_ptr<grpc::Channel>,
+          std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>>
 GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   {
     absl::MutexLock lock(stub_mu_);
     if (auto it = stubs_.find(endpoint); it != stubs_.end()) {
       lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-      return it->second.stub;
+      return {it->second.channel, it->second.stub};
     }
   }
 
@@ -374,10 +394,10 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   absl::MutexLock lock(stub_mu_);
   if (auto it = stubs_.find(ep_str); it != stubs_.end()) {
     lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-    return it->second.stub;
+    return {it->second.channel, it->second.stub};
   }
   if (config_.max_cached_grpc_stubs == 0) {
-    return stub;
+    return {channel, stub};
   }
   while (stubs_.size() >= config_.max_cached_grpc_stubs &&
          !lru_order_.empty()) {
@@ -385,8 +405,9 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
     lru_order_.pop_back();
   }
   lru_order_.push_front(ep_str);
-  stubs_.emplace(std::move(ep_str), StubCacheEntry{stub, lru_order_.begin()});
-  return stub;
+  stubs_.emplace(std::move(ep_str),
+                 StubCacheEntry{channel, stub, lru_order_.begin()});
+  return {channel, stub};
 }
 
 absl::StatusOr<control_pipe::proto::ControlResponseEnvelope>
@@ -397,11 +418,16 @@ GrpcControlPipeClient::SendRaw(
   absl::Duration effective_timeout =
       timeout > absl::ZeroDuration() ? timeout : config_.default_timeout;
 
-  auto stub = GetOrCreateStub(endpoint);
+  auto [channel, stub] = GetOrCreateStub(endpoint);
+  const absl::Time deadline = effective_timeout > absl::ZeroDuration()
+                                  ? absl::Now() + effective_timeout
+                                  : absl::InfiniteFuture();
+  absl::Status ready = WaitForChannelReady(*channel, endpoint, deadline);
+  if (!ready.ok()) return ready;
   grpc::ClientContext ctx;
   if (effective_timeout > absl::ZeroDuration() &&
       effective_timeout < absl::InfiniteDuration()) {
-    ctx.set_deadline(absl::ToChronoTime(absl::Now() + effective_timeout));
+    ctx.set_deadline(absl::ToChronoTime(deadline));
   }
 
   control_pipe::proto::ControlResponseEnvelope resp_env;

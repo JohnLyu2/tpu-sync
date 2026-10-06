@@ -412,6 +412,67 @@ TEST(WeightSyncFourWayInteropTest, TcpFourWayClientServerMatrix) {
   old_server.Stop();
 }
 
+TEST(GrpcControlPipeClientTest, OnlyFailuresBeforeConnectingAreMarkedNotSent) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  GrpcControlPipeClient client(cfg);
+  PullStreamRequest req;
+
+  // Bound but not listening: the channel never connects, nothing was sent.
+  int bound_fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  ASSERT_EQ(bind(bound_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+            0);
+  socklen_t len = sizeof(addr);
+  getsockname(bound_fd, reinterpret_cast<sockaddr*>(&addr), &len);
+  auto refused = client.Call<PullStreamRequest, PullStreamResponse>(
+      absl::StrCat("127.0.0.1:", ntohs(addr.sin_port)), req, absl::Seconds(5));
+  close(bound_fd);
+  ASSERT_TRUE(absl::IsUnavailable(refused.status())) << refused.status();
+  EXPECT_TRUE(IsControlPipeNotSent(refused.status()));
+
+  std::atomic<bool> block{false};
+  std::unique_ptr<ControlPipeServer> server = CreateControlPipeServer(cfg);
+  server->dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
+      [&block](const ControlContext&,
+               const PullStreamRequest&) -> absl::StatusOr<PullStreamResponse> {
+        for (int i = 0; i < 1000 && block.load(); ++i) {
+          absl::SleepFor(absl::Milliseconds(10));
+        }
+        return PullStreamResponse();
+      });
+  TF_ASSERT_OK_AND_ASSIGN(int port, server->Start(0));
+  const std::string endpoint = absl::StrCat("127.0.0.1:", port);
+  ASSERT_TRUE((client.Call<PullStreamRequest, PullStreamResponse>(
+                   endpoint, req, absl::Seconds(5)))
+                  .ok());
+
+  // Delivered to a connected peer, then failed: never marked not sent.
+  block = true;
+  auto timed_out = client.Call<PullStreamRequest, PullStreamResponse>(
+      endpoint, req, absl::Milliseconds(300));
+  block = false;
+  ASSERT_TRUE(absl::IsDeadlineExceeded(timed_out.status()))
+      << timed_out.status();
+  EXPECT_FALSE(IsControlPipeNotSent(timed_out.status()));
+
+  // The peer goes away: the cached channel cannot reconnect, so later
+  // requests are not sent. One may race the disconnect and count as sent.
+  server->Stop();
+  bool saw_not_sent = false;
+  for (int i = 0; i < 50 && !saw_not_sent; ++i) {
+    auto after_stop = client.Call<PullStreamRequest, PullStreamResponse>(
+        endpoint, req, absl::Seconds(5));
+    ASSERT_FALSE(after_stop.ok());
+    saw_not_sent = absl::IsUnavailable(after_stop.status()) &&
+                   IsControlPipeNotSent(after_stop.status());
+    if (!saw_not_sent) absl::SleepFor(absl::Milliseconds(100));
+  }
+  EXPECT_TRUE(saw_not_sent);
+}
+
 TEST(GrpcControlPipeClientLruTest,
      EvictsLeastRecentlyUsedStubWhenCapacityExceeded) {
   ControlPipeConfig server_cfg;
