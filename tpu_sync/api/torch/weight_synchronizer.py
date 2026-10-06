@@ -37,7 +37,7 @@ common.register_telemetry_callbacks(
 )
 
 
-def configure_telemetry(exporter_types: list[str]) -> None:
+def configure_telemetry(exporter_types: Optional[list[str]] = None) -> None:
   """Configures the telemetry backend exporters in RaidenMetricStore."""
   _weight_synchronizer.configure_telemetry(exporter_types)
 
@@ -291,11 +291,13 @@ class WeightSynchronizer:
     m = self._impl.get_metrics()
     d2h_time_s = max(m.last_d2h_time_ms / 1000.0, 1e-9)
     h2h_time_s = max(m.last_h2h_time_ms / 1000.0, 1e-9)
+    total_h2h_time_s = max(m.total_h2h_time_ms / 1000.0, 1e-9)
     tiling_time_s = max(m.last_tiling_time_ms / 1000.0, 1e-9)
     detiling_time_s = max(m.last_detiling_time_ms / 1000.0, 1e-9)
 
     d2h_bytes_gb = m.last_d2h_bytes / 1e9
     h2h_bytes_gb = m.last_h2h_bytes / 1e9
+    total_h2h_bytes_gb = m.total_h2h_bytes / 1e9
     tiled_bytes_gb = m.last_tiled_bytes / 1e9
     detiled_bytes_gb = m.last_detiled_bytes / 1e9
 
@@ -330,6 +332,11 @@ class WeightSynchronizer:
         "h2h_bandwidth_gbps": (
             h2h_bytes_gb / h2h_time_s if m.last_h2h_bytes > 0 else 0.0
         ),
+        "total_h2h_bandwidth_gbps": (
+            total_h2h_bytes_gb / total_h2h_time_s
+            if m.total_h2h_bytes > 0
+            else 0.0
+        ),
         "tiling_bandwidth_gbps": (
             tiled_bytes_gb / tiling_time_s if m.last_tiled_bytes > 0 else 0.0
         ),
@@ -345,7 +352,9 @@ class WeightSynchronizer:
     self._impl.reset_metrics()
 
   @classmethod
-  def configure_telemetry(cls, exporter_types: list[str]) -> None:
+  def configure_telemetry(
+      cls, exporter_types: Optional[list[str]] = None
+  ) -> None:
     """Configures the telemetry backend exporters in RaidenMetricStore."""
     configure_telemetry(exporter_types)
 
