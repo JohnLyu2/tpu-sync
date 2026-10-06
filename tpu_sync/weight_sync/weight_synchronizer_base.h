@@ -443,6 +443,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // references point into |request|.
   absl::StatusOr<std::vector<ShardPushSchedule>> ResolveShardPushSchedules(
       const tpu_sync::rpc::StartTransferRequest& request);
+  // Expands |request|'s shard_push_schedules into per-layer push tasks.
+  absl::StatusOr<std::vector<std::vector<transport::BufferPushTask>>>
+  BuildLayerPushTasks(const tpu_sync::rpc::StartTransferRequest& request);
   // Returns the scratchpad of shard |shard_idx|.
   absl::StatusOr<ShardScratchpad*> GetTiledScratchpad(size_t shard_idx);
   // Tiles the host bytes of shard |shard_idx| of layer |layer_idx| into |sp|

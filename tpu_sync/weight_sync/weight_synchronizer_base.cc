@@ -1005,12 +1005,9 @@ WeightSynchronizerBase::ResolveShardPushSchedules(
   return shard_schedules;
 }
 
-absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
+absl::StatusOr<std::vector<std::vector<transport::BufferPushTask>>>
+WeightSynchronizerBase::BuildLayerPushTasks(
     const tpu_sync::rpc::StartTransferRequest& request) {
-  VLOG(1) << "Starting PushWeightsResharded for uuid=" << request.uuid()
-          << " across " << num_layers_
-          << " layers (skip_d2h=" << request.skip_d2h() << ")...";
-  StoreSkipTilingLocal(request.uuid(), request);
   int fallback_layer_idx = -1;
   bool checked_fallback = false;
   auto get_fallback_layer_idx = [&]() -> absl::StatusOr<int> {
@@ -1033,16 +1030,6 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     return fallback_layer_idx;
   };
 
-  std::vector<bool> skip_tiling(num_layers_, false);
-  for (const auto& [layer_idx, skip_val] : request.skip_tiling()) {
-    if (layer_idx >= 0 && static_cast<size_t>(layer_idx) < num_layers_) {
-      skip_tiling[layer_idx] = skip_val;
-    }
-  }
-
-  auto push_start = absl::Now();
-
-  auto staging_start = absl::Now();
   std::vector<std::vector<transport::BufferPushTask>> tasks_by_layer(
       num_layers_);
   TF_ASSIGN_OR_RETURN(const std::vector<ShardPushSchedule> shard_schedules,
@@ -1166,6 +1153,22 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
     }
   }
+  return tasks_by_layer;
+}
+
+absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
+    const tpu_sync::rpc::StartTransferRequest& request) {
+  VLOG(1) << "Starting PushWeightsResharded for uuid=" << request.uuid()
+          << " across " << num_layers_
+          << " layers (skip_d2h=" << request.skip_d2h() << ")...";
+  StoreSkipTilingLocal(request.uuid(), request);
+
+  auto push_start = absl::Now();
+
+  auto staging_start = absl::Now();
+  TF_ASSIGN_OR_RETURN(
+      const std::vector<std::vector<transport::BufferPushTask>> tasks_by_layer,
+      BuildLayerPushTasks(request));
   double staging_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - staging_start);
 
