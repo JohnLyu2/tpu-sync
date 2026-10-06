@@ -17,7 +17,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +31,8 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -63,6 +64,21 @@ class BlockTransport final {
   // Destructor closes all sockets and joins all threads.
   ~BlockTransport();
 
+  struct Config {
+    std::optional<absl::Duration> handshake_read_timeout = std::nullopt;
+    std::optional<absl::Duration> payload_read_timeout = std::nullopt;
+    size_t coalesce_window_bytes = 0;
+  };
+
+  const Config& config() const { return config_; }
+
+  std::optional<absl::Duration> handshake_read_timeout() const {
+    return config_.handshake_read_timeout;
+  }
+  std::optional<absl::Duration> payload_read_timeout() const {
+    return config_.payload_read_timeout;
+  }
+
   // Return the TCP listening socket port.
   int local_port() const { return raw_transport_.local_port(); }
 
@@ -76,25 +92,22 @@ class BlockTransport final {
     return peregrine_control_.get();
   }
 
-  // Asynchronous Scatter-Gather Push. `layer_idx` selects the local block
-  // array; `wire_layer_idx`, when set, is the index the receiver resolves the
-  // pushed blocks against (a sender whose pool table is a subset of the
-  // receiver's).
-  void AsyncPush(
-      const std::vector<std::string>& peers,
-      const std::vector<int>& src_block_ids,
-      const std::vector<int>& dst_block_ids, int parallelism,
-      MajorOrder major_order, uint64_t uuid, int layer_idx,
-      std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete,
-      std::optional<int> wire_layer_idx = std::nullopt);
-
-  // Synchronous Scatter-Gather Push (op = 1 / op = 6)
-  absl::StatusOr<std::vector<int>> SyncPush(
+  // Asynchronous Scatter-Gather Push (op = 1 / op = 6). `layer_idx` selects the
+  // local block array; `wire_layer_idx`, when set, is the index the receiver
+  // resolves the pushed blocks against (a sender whose pool table is a subset
+  // of the receiver's).
+  //
+  // Returns a future that resolves with the destination block ids once every
+  // peer has acknowledged, or with the first error. Callers that need a
+  // blocking push call `Await()` on the result; asynchronous callers attach a
+  // continuation with `OnReady()`, which runs on the transport thread that
+  // completes the push (or inline if the push already failed validation).
+  tsl::Future<std::vector<int>> AsyncPush(
       const std::vector<std::string>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, int parallelism = 1,
       MajorOrder major_order = MajorOrder::kLayerMajor, uint64_t uuid = 0,
-      int layer_idx = -1);
+      int layer_idx = -1, std::optional<int> wire_layer_idx = std::nullopt);
 
   // Synchronous Scatter-Gather Pull (op = 2)
   // When explicit_dst_ptrs is supplied it contains one base pointer per
@@ -228,6 +241,7 @@ class BlockTransport final {
  private:
   BlockTransportDelegate* const block_delegate_;
   const int parallelism_;
+  const Config config_;
 
   absl::Mutex active_sends_mu_;
   SendMap active_sends_ ABSL_GUARDED_BY(active_sends_mu_);

@@ -50,6 +50,7 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
@@ -183,20 +184,25 @@ MakeRaidenController(const RaidenId& raiden_id, size_t capacity, int num_shards,
       /*preprovision_worker_buffers=*/false, expected_worker_count);
 }
 
-// Ensures cluster dimensions (e.g. tp_size) are explicitly configured on the
-// secondary backend config. Properties come from the caller only.
-BackendConfig ResolveSecondaryBackendConfigDefaults(BackendConfig sec_cfg,
-                                                    int num_shards) {
-  if (!sec_cfg.HasProperty("tp_size")) {
-    sec_cfg.SetProperty("tp_size",
-                        std::to_string(num_shards > 0 ? num_shards : 1));
+// Resolves the storage topology of a secondary backend config from
+// BackendConfig::parallelism, the same config every KVCacheManager receives.
+// The coordinator always runs as a single rank, so it is pinned to rank 0;
+// parallelism.tp_rank is worker-only. An unset tp_size defaults to 1, as in
+// KVCacheManager. Backend knobs (root_dir, model_name, ...) are defaulted and
+// validated by the backend itself.
+BackendConfig ResolveSecondaryBackendTopology(BackendConfig sec_cfg) {
+  backends::ParallelismConfig effective = {
+      .tp_size = sec_cfg.parallelism.tp_size, .tp_rank = 0};
+  if (effective.tp_size <= 0) {
+    effective.tp_size = 1;
+    LOG(WARNING) << "Secondary backend '" << sec_cfg.type
+                 << "': parallelism.tp_size is unset; defaulting storage "
+                    "tp_size to 1, as KVCacheManager does. Pass the same "
+                    "BackendConfig (with parallelism set) to KVCacheStore "
+                    "and KVCacheManager.";
   }
-  if (!sec_cfg.HasProperty("model_name")) {
-    sec_cfg.SetProperty("model_name", "unknown");
-  }
-  if (!sec_cfg.HasProperty("root_dir")) {
-    sec_cfg.SetProperty("root_dir", "/tmp/raiden_storage");
-  }
+  ApplyParallelismToProperties(effective, &sec_cfg);
+  sec_cfg.parallelism = effective;
   return sec_cfg;
 }
 
@@ -268,8 +274,8 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
                                                backend_configs.end());
 
   for (size_t i = 1; i < effective_configs.size(); ++i) {
-    effective_configs[i] = ResolveSecondaryBackendConfigDefaults(
-        std::move(effective_configs[i]), num_shards);
+    effective_configs[i] =
+        ResolveSecondaryBackendTopology(std::move(effective_configs[i]));
   }
 
   if (effective_configs.size() > 2) {
@@ -1478,7 +1484,7 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // The store can be destroyed while this transfer is in flight, so every
   // touch of it goes through the lifetime fence below.
   future.OnReady(
-      [lifetime = lifetime_, host_ram_backend = backend(),
+      [lifetime = lifetime_, host_ram_backend = backend(), secondary_backend,
        raiden_id = raiden_id_,
        block_hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
@@ -1488,6 +1494,11 @@ void KVCacheStore::LoadFromSecondaryBackend(
            std::vector<int>(device_block_ids.begin(), device_block_ids.end())](
           absl::Status status) {
         if (!status.ok()) {
+          // The tier's Lookup may have answered from a stale existence cache
+          // (e.g. the files were evicted out of band). Drop those entries so
+          // the next Lookup re-probes storage. The worker's error code does
+          // not survive the RPC, so this is done for every recall failure.
+          secondary_backend->Delete(block_hashes, /*slices=*/{});
           // TODO: revisit returning every staging block and failing the whole
           // batch on a recall error. The transfer reports a single status, so
           // a partial storage failure (some blocks landed in HBM) is treated

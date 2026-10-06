@@ -242,6 +242,7 @@ class JobEntityTest(absltest.TestCase):
         use_block_chunks=True,
         is_sender=False,
         expected_block_count=10,
+        expected_layer_chunk_counts={0: 6, 1: 4},
     )
 
     payload = entity.encode_start_transfer(
@@ -254,7 +255,86 @@ class JobEntityTest(absltest.TestCase):
     req = raiden_service_pb2.ControlRequest()
     req.ParseFromString(payload)
     self.assertEqual(req.start_transfer_request.expected_block_count, 10)
+    self.assertEqual(
+        dict(req.start_transfer_request.expected_layer_chunk_counts),
+        {0: 6, 1: 4},
+    )
     self.assertEmpty(req.peers)
+    self.assertEqual(
+        req.start_transfer_request.host_tiling_mode,
+        raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED,
+    )
+
+  def test_encode_start_transfer_receiver_host_tiling_mode(self):
+    """Verifies host_tiling_mode is encoded for receivers."""
+    entity = job_entity.JobEntity(
+        unit=self.dst_unit,
+        shards=["10.11.0.3:8000"],
+        control_endpoints=["10.11.0.3:9000"],
+        control_pipe=self.pipe_stub,
+    )
+    self.addCleanup(entity.worker_rpc_client.close)
+
+    for mode in (
+        raiden_service_pb2.HOST_TILING_MODE_DEFERRED,
+        raiden_service_pb2.HOST_TILING_MODE_ON_ARRIVAL,
+        raiden_service_pb2.HOST_TILING_MODE_PRE_TILED,
+    ):
+      with self.subTest(mode=mode):
+        plan = controller_types.TransferPlan(
+            src_units=[self.src_unit],
+            dst_units=[self.dst_unit],
+            plan=None,
+            shard_push_schedules={},
+            worker_data_addresses={
+                self.src_unit: ["10.11.0.1:8000"],
+                self.dst_unit: ["10.11.0.3:8000"],
+            },
+            use_block_chunks=True,
+            is_sender=False,
+            expected_block_count=10,
+            expected_layer_chunk_counts={0: 6, 1: 4},
+            host_tiling_mode=mode,
+        )
+
+        payload = entity.encode_start_transfer(
+            plan, address="10.11.0.3:9000", unit=self.dst_unit
+        )
+        self.assertIsNotNone(payload)
+        req = raiden_service_pb2.ControlRequest()
+        req.ParseFromString(payload)
+        self.assertEqual(req.start_transfer_request.host_tiling_mode, mode)
+
+  def test_encode_start_transfer_receiver_requires_layer_chunk_counts(self):
+    """Verifies receivers fail fast without per-layer counts summing to total."""
+    entity = job_entity.JobEntity(
+        unit=self.dst_unit,
+        shards=["10.11.0.3:8000"],
+        control_endpoints=["10.11.0.3:9000"],
+        control_pipe=self.pipe_stub,
+    )
+    self.addCleanup(entity.worker_rpc_client.close)
+
+    for layer_counts in ({}, {0: 6, 1: 3}):
+      with self.subTest(layer_counts=layer_counts):
+        plan = controller_types.TransferPlan(
+            src_units=[self.src_unit],
+            dst_units=[self.dst_unit],
+            plan=None,
+            shard_push_schedules={},
+            worker_data_addresses={
+                self.src_unit: ["10.11.0.1:8000"],
+                self.dst_unit: ["10.11.0.3:8000"],
+            },
+            use_block_chunks=True,
+            is_sender=False,
+            expected_block_count=10,
+            expected_layer_chunk_counts=layer_counts,
+        )
+        with self.assertRaisesRegex(ValueError, "per-layer chunk counts"):
+          entity.encode_start_transfer(
+              plan, address="10.11.0.3:9000", unit=self.dst_unit
+          )
 
   def test_start_transfer_dispatches_only_to_active_hosts(self):
     """Verifies start_transfer only dispatches RPCs to hosts that own active push schedules."""

@@ -22,6 +22,8 @@ samplers with replicated dimensions, testing 1-hop and multi-hop relays.
 import asyncio
 import dataclasses
 import math
+import os
+import socket
 import threading
 import time
 from typing import Any, Sequence
@@ -1672,6 +1674,282 @@ class WeightSyncTreeRelayChecksumTest(absltest.TestCase):
           f"Contract 3b violation: Relayed host {res.unit} Host {res.host_idx}"
           " staging buffer did not match trainer after all stages completed!",
       )
+
+  def test_connection_storm_reproduces_timeout_and_recovers_with_retry(self):
+    """Proves that a Round-1 accept-queue overflow reproduces the exact connect timeout error without retry and succeeds with retry."""
+
+    old_env = {
+        k: os.environ.get(k)
+        for k in (
+            "TPU_RAIDEN_TCP_CONNECT_TIMEOUT_MS",
+            "TPU_RAIDEN_TCP_CONNECT_MAX_ATTEMPTS",
+            "TPU_RAIDEN_TCP_CONNECT_INITIAL_BACKOFF_MS",
+        )
+    }
+
+    def _restore_env():
+      for k, v in old_env.items():
+        if v is None:
+          os.environ.pop(k, None)
+        else:
+          os.environ[k] = v
+
+    self.addCleanup(_restore_env)
+
+    os.environ["TPU_RAIDEN_TCP_CONNECT_TIMEOUT_MS"] = "500"
+    os.environ["TPU_RAIDEN_TCP_CONNECT_INITIAL_BACKOFF_MS"] = "150"
+
+    req_id = "conn_storm"
+    specs = _make_scaled_35b_specs()[:4]
+    num_layers = len(specs)
+
+    trainer_mesh_shape = (1,)
+    trainer_mesh_axes = ["shard"]
+    trainer_mesh_dict = {"shard": 1}
+    trainer_host_shards = [[0]]
+
+    sampler_mesh_shape = (1,)
+    sampler_mesh_axes = ["shard"]
+    sampler_mesh_dict = {"shard": 1}
+    total_sampler_shards = 1
+
+    ctrl_specs = [
+        Scaled35BVarSpec(
+            name=s.name,
+            shape=s.shape,
+            trainer_sharding=["" for _ in s.shape],
+            sampler_sharding=["" for _ in s.shape],
+            item_size=s.item_size,
+        )
+        for s in specs
+    ]
+
+    src_slice_sizes = _calculate_shard_byte_sizes(
+        ctrl_specs, trainer_mesh_dict, is_trainer=True
+    )
+    dst_slice_sizes = _calculate_shard_byte_sizes(
+        ctrl_specs, sampler_mesh_dict, is_trainer=False
+    )
+
+    ws_src = (
+        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+            num_layers=num_layers,
+            num_shards=1,
+            slice_byte_size=src_slice_sizes,
+            local_port=0,
+            listener_port=0,
+            bind_ip="127.0.0.1",
+            global_shard_indices=[0],
+        )
+    )
+    ws_src.bind_ip = "127.0.0.1"
+    self.addCleanup(ws_src.shutdown)
+    ws_src_list = [ws_src]
+
+    num_samplers = 4
+    ws_dst_list = []
+    dst_units = []
+    dst_protos = _build_35b_variable_protos(
+        ctrl_specs, sampler_mesh_dict, is_trainer=False
+    )
+
+    # Create a gate socket with backlog=0 in front of sampler_0's data port so
+    # we can deterministically fill its kernel accept queue for the first 650ms
+    # (causing the kernel to drop incoming SYNs during Attempt 1) and then drain
+    # it and forward accepted connections to sampler_0.
+    seed_ip = "127.0.2.1"
+    gate_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    gate_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    gate_sock.bind((seed_ip, 0))
+    gate_sock.listen(0)
+    gate_port = gate_sock.getsockname()[1]
+    self.addCleanup(gate_sock.close)
+
+    for i in range(num_samplers):
+      host_ip = f"127.0.2.{i + 1}"
+      ws_dst = (
+          weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+              num_layers=num_layers,
+              num_shards=1,
+              slice_byte_size=dst_slice_sizes,
+              local_port=0,
+              listener_port=0,
+              bind_ip=host_ip,
+              auto_h2d=True,
+              global_shard_indices=[0],
+          )
+      )
+      ws_dst.bind_ip = host_ip
+      self.addCleanup(ws_dst.shutdown)
+      ws_dst_list.append(ws_dst)
+      d_u = RaidenId(f"sampler_{req_id}_{i}", "", "weights")
+      dst_units.append(d_u)
+      data_port = gate_port if i == 0 else ws_dst.local_port
+      self.ctrl_client.register_work_unit(
+          d_u,
+          [f"{host_ip}:{data_port}"],
+          control_plane_rpc_address=f"{host_ip}:{ws_dst.listener_port}",
+          mesh_shape=[1],
+          variables=dst_protos,
+          mesh_axes=sampler_mesh_axes,
+      )
+
+    src_unit = RaidenId(f"trainer_{req_id}", "", "weights")
+    src_protos = _build_35b_variable_protos(
+        ctrl_specs, trainer_mesh_dict, is_trainer=True
+    )
+    self.ctrl_client.register_work_unit(
+        src_unit,
+        [f"127.0.0.1:{ws_src.local_port}"],
+        control_plane_rpc_address=f"127.0.0.1:{ws_src.listener_port}",
+        mesh_shape=[1],
+        variables=src_protos,
+        mesh_axes=trainer_mesh_axes,
+    )
+
+    expected_by_layer = _fill_trainer_and_compute_expected_35b(
+        specs=ctrl_specs,
+        trainer_mesh_axes=trainer_mesh_axes,
+        trainer_mesh_shape=trainer_mesh_shape,
+        trainer_host_shards=trainer_host_shards,
+        ws_src_list=ws_src_list,
+        sampler_mesh_axes=sampler_mesh_axes,
+        sampler_mesh_shape=sampler_mesh_shape,
+    )
+
+    stop_proxy = threading.Event()
+    self.addCleanup(stop_proxy.set)
+
+    def _fill_gate_and_drain_after(congest_secs: float, forward_after: bool):
+      """Fills gate_sock's backlog=0 accept queue so the kernel drops SYNs for congest_secs, then drains and optionally proxies to ws_dst_list[0]."""
+      fillers = []
+      for _ in range(2):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setblocking(False)
+        s.connect_ex((seed_ip, gate_port))
+        fillers.append(s)
+      time.sleep(0.05)
+
+      def _worker():
+        time.sleep(congest_secs)
+        for s in fillers:
+          s.close()
+        gate_sock.setblocking(False)
+        while True:
+          try:
+            conn, _ = gate_sock.accept()
+            conn.close()
+          except BlockingIOError:
+            break
+        if not forward_after:
+          return
+        gate_sock.settimeout(0.05)
+        while not stop_proxy.is_set():
+          try:
+            client_conn, _ = gate_sock.accept()
+          except socket.timeout:
+            continue
+          except OSError:
+            break
+          backend_conn = socket.create_connection(
+              (seed_ip, ws_dst_list[0].local_port)
+          )
+
+          def _pump(src_s, dst_s):
+            try:
+              while True:
+                data = src_s.recv(65536)
+                if not data:
+                  break
+                dst_s.sendall(data)
+            except OSError:
+              pass
+            finally:
+              try:
+                dst_s.shutdown(socket.SHUT_WR)
+              except OSError:
+                pass
+              try:
+                src_s.close()
+              except OSError:
+                pass
+
+          threading.Thread(
+              target=_pump, args=(client_conn, backend_conn), daemon=True
+          ).start()
+          threading.Thread(
+              target=_pump, args=(backend_conn, client_conn), daemon=True
+          ).start()
+
+      t = threading.Thread(target=_worker, daemon=True)
+      t.start()
+      return t
+
+    # 1. With MAX_ATTEMPTS=1 (no retries), a 700ms accept-queue overflow on the
+    # Round-1 seed receiver reproduces the exact production error:
+    # RuntimeError: Raiden remote native execution failed: Failed to connect to
+    # peer 127.0.2.1:...: connect timed out after 500ms
+    os.environ["TPU_RAIDEN_TCP_CONNECT_MAX_ATTEMPTS"] = "1"
+    self.controller.broadcast_host_ratio = 2.0
+    self.controller.broadcast_pipeline_stages = 2
+    self.controller._plan_cache.clear()
+
+    congest_thread = _fill_gate_and_drain_after(0.7, forward_after=False)
+    future_fail = self.controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=dst_units,
+        dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+        use_block_chunks=True,
+        is_sender=True,
+        uuid=9001,
+        req_id=f"{req_id}_no_retry",
+        skip_d2h=True,
+        skip_tiling={l: False for l in range(num_layers)},
+    )
+    loop = asyncio.new_event_loop()
+    try:
+      with self.assertRaises(RuntimeError) as ctx:
+        loop.run_until_complete(
+            asyncio.wait_for(future_fail.wait(), timeout=self.timeout_secs)
+        )
+    finally:
+      loop.close()
+      congest_thread.join()
+
+    logging.info("Reproduced expected error without retry: %s", ctx.exception)
+    self.assertIn("Raiden remote native execution failed", str(ctx.exception))
+    self.assertIn(
+        f"Failed to connect to peer {seed_ip}:{gate_port}: connect timed out"
+        " after 500ms",
+        str(ctx.exception),
+    )
+
+    # 2. With MAX_ATTEMPTS=4 (retry with exponential backoff + jitter), the
+    # exact same 700ms accept-queue overflow on Round-1 seed receiver is
+    # absorbed by retry and passes byte-for-byte parity verification.
+    os.environ["TPU_RAIDEN_TCP_CONNECT_MAX_ATTEMPTS"] = "4"
+    for ws_dst in ws_dst_list:
+      for l in range(num_layers):
+        ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)[:] = 0x00
+
+    proxy_thread = _fill_gate_and_drain_after(0.7, forward_after=True)
+    try:
+      self._execute_tree_transfer_and_verify(
+          src_units=[src_unit],
+          dst_units=dst_units,
+          dst_ws_list=ws_dst_list,
+          specs=ctrl_specs,
+          expected_by_layer=expected_by_layer,
+          uuid=9002,
+          req_id=f"{req_id}_with_retry",
+          test_label="Connection Storm Recovery With Exponential Backoff Retry",
+          broadcast_host_ratio=2.0,
+          pipeline_stages=2,
+          num_sampler_shards=total_sampler_shards,
+      )
+    finally:
+      stop_proxy.set()
+      proxy_thread.join()
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api:socket_util",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -95,10 +96,14 @@ cc_test(
         "//tpu_sync/telemetry:metrics_3p_prometheus_exporter",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/transport/lib:chunk",
+        "//tpu_sync/transport/lib:chunk_serializer",
         "//tpu_sync/transport/lib/socket:psp_syscall_mock",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
+        "//tpu_sync/transport/lib/socket:util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/status",

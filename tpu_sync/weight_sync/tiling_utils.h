@@ -50,6 +50,14 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
                         const xla::Shape& shape, const xla::Layout& layout,
                         tpu_raiden::NumaThreadPool* pool = nullptr);
 
+// Tiles a buffer in place based on shape and layout without allocating an
+// intermediate full-size buffer. |buffer| must have a capacity of at least
+// GetTiledBufferElements(shape) * itemsize.
+absl::Status TileBufferInPlace(uint8_t* buffer, size_t buffer_capacity,
+                               const xla::Shape& shape,
+                               const xla::Layout& layout,
+                               tpu_raiden::NumaThreadPool* pool = nullptr);
+
 }  // namespace tpu_raiden::weight_sync
 
 #endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_WEIGHT_SYNC_TILING_UTILS_H_

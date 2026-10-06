@@ -222,11 +222,14 @@ struct MockTransferManager {
       const std::string canonical_name =
           std::string(kv_cache::backends::storage::kPosixBackendName);
       if (GetKVBackend(canonical_name) != nullptr) continue;
-      auto props = cfg.properties;
-      props["tp_rank"] = absl::StrCat(cfg.parallelism.tp_rank);
+      kv_cache::BackendConfig resolved = cfg;
+      kv_cache::ApplyParallelismToProperties(
+          {cfg.parallelism.tp_size > 0 ? cfg.parallelism.tp_size : 1,
+           cfg.parallelism.tp_rank},
+          &resolved);
       auto backend =
           std::make_shared<kv_cache::backends::storage::PosixKVBackend>(
-              canonical_name, props);
+              canonical_name, resolved.properties);
       backends[canonical_name] = std::move(backend);
     }
   }

@@ -92,6 +92,12 @@ class TransferReceiveSession
 
   absl::Status AwaitForDone() override;
 
+  // When Done() became true. Meaningless before then.
+  std::chrono::steady_clock::time_point CompletedAt() const {
+    absl::MutexLock lock(mu_);
+    return completed_at_;
+  }
+
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
     return draining_;
@@ -242,6 +248,7 @@ class TransferReceiveSession
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
+  std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
   std::vector<int> accumulated_host_block_ids_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point deadline_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point start_time_ ABSL_GUARDED_BY(mu_);

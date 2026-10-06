@@ -14,7 +14,10 @@
 
 #include "tpu_sync/weight_sync/tiling_utils.h"
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <thread>  // NOLINT
 #include <vector>
 
@@ -32,7 +35,45 @@
 namespace tpu_raiden::weight_sync {
 namespace {
 
-TEST(TilingUtilsTest, Standard2D) {
+enum class TilingMethod {
+  kAllocatedMemory,
+  kInPlace,
+};
+
+class TilingUtilsTest : public ::testing::TestWithParam<TilingMethod> {
+ protected:
+  absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
+                          const xla::Shape& shape, const xla::Layout& layout,
+                          tpu_raiden::NumaThreadPool* pool = nullptr) const {
+    if (GetParam() == TilingMethod::kAllocatedMemory) {
+      return ::tpu_raiden::weight_sync::TileBuffer(src_linear, dst_tiled, shape,
+                                                   layout, pool);
+    }
+    int64_t linear_bytes =
+        xla::ShapeUtil::ElementsIn(shape) *
+        xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+    int64_t tiled_bytes =
+        GetTiledBufferElements(shape) *
+        xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+    std::memcpy(dst_tiled, src_linear, linear_bytes);
+    return ::tpu_raiden::weight_sync::TileBufferInPlace(dst_tiled, tiled_bytes,
+                                                        shape, layout, pool);
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    Method, TilingUtilsTest,
+    ::testing::Values(TilingMethod::kAllocatedMemory, TilingMethod::kInPlace),
+    [](const ::testing::TestParamInfo<TilingMethod>& info) {
+      switch (info.param) {
+        case TilingMethod::kAllocatedMemory:
+          return "AllocatedMemory";
+        case TilingMethod::kInPlace:
+          return "InPlace";
+      }
+    });
+
+TEST_P(TilingUtilsTest, Standard2D) {
   // 2D matrix of shape 8x8, element type float (4 bytes).
   // Layout has minor_to_major={1, 0} (row-major), and tiling with tile
   // dimensions 4x4.
@@ -94,7 +135,7 @@ TEST(TilingUtilsTest, Standard2D) {
   }
 }
 
-TEST(TilingUtilsTest, Standard2DLarge) {
+TEST_P(TilingUtilsTest, Standard2DLarge) {
   // 2D matrix of shape 256x512, element type float (4 bytes).
   // Total size: 256 * 512 * 4 = 512KB, which is > 128KB (triggers parallel
   // path). Layout has minor_to_major={1, 0} (row-major), and tiling with tile
@@ -133,7 +174,7 @@ TEST(TilingUtilsTest, Standard2DLarge) {
   }
 }
 
-TEST(TilingUtilsTest, Padding2DLarge) {
+TEST_P(TilingUtilsTest, Padding2DLarge) {
   // 2D matrix of shape 250x500, element type float (4 bytes).
   // Total size: 250 * 500 * 4 = 500KB, which is > 128KB (triggers parallel
   // path). Dimensions do not divide the tile size (128x128). Number of tiles in
@@ -174,7 +215,7 @@ TEST(TilingUtilsTest, Padding2DLarge) {
   }
 }
 
-TEST(TilingUtilsTest, Padding2D) {
+TEST_P(TilingUtilsTest, Padding2D) {
   // 2D matrix of shape 6x6, element type float (4 bytes).
   // Layout has minor_to_major={1, 0} (row-major), and tiling with tile
   // dimensions 4x4. The dimensions do not divide the tile size. Number of tiles
@@ -224,7 +265,7 @@ TEST(TilingUtilsTest, Padding2D) {
   }
 }
 
-TEST(TilingUtilsTest, PermutedOuterLayout) {
+TEST_P(TilingUtilsTest, PermutedOuterLayout) {
   // Shape: F32[2, 3, 8, 8]
   // Outer dimensions: 0 (size 2), 1 (size 3)
   // Tiled dimensions: 2 (size 8), 3 (size 8)
@@ -271,7 +312,7 @@ TEST(TilingUtilsTest, PermutedOuterLayout) {
   }
 }
 
-TEST(TilingUtilsTest, Bf16SubTiling) {
+TEST_P(TilingUtilsTest, Bf16SubTiling) {
   // Shape: BF16[16, 256]
   // Tile 1: 8x128
   // Tile 2: 2x1
@@ -312,7 +353,7 @@ TEST(TilingUtilsTest, Bf16SubTiling) {
   }
 }
 
-TEST(TilingUtilsTest, Standard3D) {
+TEST_P(TilingUtilsTest, Standard3D) {
   // 3D matrix of shape 2x8x8, element type float (4 bytes).
   // Layout has minor_to_major={2, 1, 0} (standard row-major), and tiling with
   // tile dimensions 4x4.
@@ -363,7 +404,7 @@ TEST(TilingUtilsTest, Standard3D) {
   }
 }
 
-TEST(TilingUtilsTest, Standard4D) {
+TEST_P(TilingUtilsTest, Standard4D) {
   // 4D matrix of shape 2x3x8x8, element type float (4 bytes).
   // Layout has minor_to_major={3, 2, 1, 0} (standard row-major), and tiling
   // with tile dimensions 4x4.
@@ -421,12 +462,11 @@ TEST(TilingUtilsTest, Standard4D) {
   }
 }
 
-TEST(TilingUtilsTest, UntiledLayout) {
+TEST_P(TilingUtilsTest, UntiledLayout) {
   // Test that untiled buffers pass through directly via std::memcpy.
   const int64_t H = 16;
   const int64_t W = 32;
-  xla::Shape shape =
-      xla::ShapeUtil::MakeShape(xla::PrimitiveType::F32, {H, W});
+  xla::Shape shape = xla::ShapeUtil::MakeShape(xla::PrimitiveType::F32, {H, W});
   // Verify layout has no tiles
   ASSERT_TRUE(shape.layout().tiles().empty());
 
@@ -453,7 +493,7 @@ TEST(TilingUtilsTest, UntiledLayout) {
   }
 }
 
-TEST(TilingUtilsTest, Standard1DContiguous) {
+TEST_P(TilingUtilsTest, Standard1DContiguous) {
   // 1D tensor with tile (1, 128) where W % 128 == 0 (identical contiguous
   // layout).
   const int64_t W = 4096;
@@ -482,7 +522,7 @@ TEST(TilingUtilsTest, Standard1DContiguous) {
   }
 }
 
-TEST(TilingUtilsTest, IsStandardRowMajorTiled) {
+TEST(TilingUtilsPredicateTest, IsStandardRowMajorTiled) {
   // 1D shape with 1D tile.
   xla::Shape shape_1d_1d = xla::ShapeUtil::MakeShapeWithDenseLayout(
       xla::PrimitiveType::BF16, {4096}, {0}, {xla::Tile({128})});
@@ -530,7 +570,7 @@ TEST(TilingUtilsTest, IsStandardRowMajorTiled) {
   EXPECT_FALSE(IsStandardRowMajorTiled(shape_2d_col, shape_2d_col.layout()));
 }
 
-TEST(TilingUtilsTest, Standard1DSingleDimensionTile) {
+TEST_P(TilingUtilsTest, Standard1DSingleDimensionTile) {
   const int64_t W = 4096;
   xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
       xla::PrimitiveType::BF16, {W}, {0}, {xla::Tile({128})});
@@ -570,7 +610,7 @@ TEST(TilingUtilsTest, Standard1DSingleDimensionTile) {
   }
 }
 
-TEST(TilingUtilsTest, Standard1DSingleDimensionTileWithPadding) {
+TEST_P(TilingUtilsTest, Standard1DSingleDimensionTileWithPadding) {
   // 1D tensor shape 250 with 1D tile 128: Ceil(250 / 128) = 2 tiles -> 256
   // physical elements.
   const int64_t W = 250;
@@ -618,7 +658,7 @@ TEST(TilingUtilsTest, Standard1DSingleDimensionTileWithPadding) {
   }
 }
 
-TEST(TilingUtilsTest, Standard1DSingleDimensionTileSmall) {
+TEST_P(TilingUtilsTest, Standard1DSingleDimensionTileSmall) {
   // Shape 17 with tile 128: 1 tile -> 128 elements.
   const int64_t W = 17;
   xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
@@ -658,7 +698,7 @@ TEST(TilingUtilsTest, Standard1DSingleDimensionTileSmall) {
   }
 }
 
-TEST(TilingUtilsTest, Standard1DWithTilePadding) {
+TEST_P(TilingUtilsTest, Standard1DWithTilePadding) {
   // 1D tensor with tile (8, 128) where W = 300 (has horizontal and vertical
   // tile padding).
   const int64_t W = 300;
@@ -702,7 +742,7 @@ TEST(TilingUtilsTest, Standard1DWithTilePadding) {
   }
 }
 
-TEST(TilingUtilsTest, DegenerateTileDimensionsSafe) {
+TEST(TilingUtilsPredicateTest, DegenerateTileDimensionsSafe) {
   // Shape 128 with tile {0} (degenerate tile dimension)
   xla::Shape shape_zero = xla::ShapeUtil::MakeShapeWithDenseLayout(
       xla::PrimitiveType::BF16, {128}, {0});
@@ -714,7 +754,7 @@ TEST(TilingUtilsTest, DegenerateTileDimensionsSafe) {
   EXPECT_EQ(GetTiledBufferElements(shape_zero), 128);
 }
 
-TEST(TilingUtilsTest, SingleColumn2DContiguous) {
+TEST_P(TilingUtilsTest, SingleColumn2DContiguous) {
   // 2D tensor where W == tile_W (128) and H % tile_H == 0 (256 % 8 == 0).
   const int64_t H = 256;
   const int64_t W = 128;
@@ -744,7 +784,7 @@ TEST(TilingUtilsTest, SingleColumn2DContiguous) {
   }
 }
 
-TEST(TilingUtilsTest, SpecializedRowBytes_Int8_StandardTile) {
+TEST_P(TilingUtilsTest, SpecializedRowBytes_Int8_StandardTile) {
   // S8 dtype with tile (8, 128) => row_bytes = 128.
   const int64_t H = 64;
   const int64_t W = 256;
@@ -759,19 +799,21 @@ TEST(TilingUtilsTest, SpecializedRowBytes_Int8_StandardTile) {
 
   std::vector<uint8_t> dst_tiled(num_elements * sizeof(int8_t));
   ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                         dst_tiled.data(), shape, shape.layout()).ok());
+                         dst_tiled.data(), shape, shape.layout())
+                  .ok());
 
   std::vector<int8_t> dst_linear(num_elements, 0);
   ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
-                           reinterpret_cast<uint8_t*>(dst_linear.data()),
-                           shape, shape.layout()).ok());
+                           reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+                           shape.layout())
+                  .ok());
 
   for (int i = 0; i < num_elements; ++i) {
     EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
   }
 }
 
-TEST(TilingUtilsTest, SpecializedRowBytes_Int8_TransposedTile) {
+TEST_P(TilingUtilsTest, SpecializedRowBytes_Int8_TransposedTile) {
   // S8 dtype with tile (128, 8) => row_bytes = 8.
   const int64_t H = 256;
   const int64_t W = 64;
@@ -786,19 +828,21 @@ TEST(TilingUtilsTest, SpecializedRowBytes_Int8_TransposedTile) {
 
   std::vector<uint8_t> dst_tiled(num_elements * sizeof(int8_t));
   ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                         dst_tiled.data(), shape, shape.layout()).ok());
+                         dst_tiled.data(), shape, shape.layout())
+                  .ok());
 
   std::vector<int8_t> dst_linear(num_elements, 0);
   ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
-                           reinterpret_cast<uint8_t*>(dst_linear.data()),
-                           shape, shape.layout()).ok());
+                           reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+                           shape.layout())
+                  .ok());
 
   for (int i = 0; i < num_elements; ++i) {
     EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
   }
 }
 
-TEST(TilingUtilsTest, SpecializedRowBytes_BF16_StandardAndTransposed) {
+TEST_P(TilingUtilsTest, SpecializedRowBytes_BF16_StandardAndTransposed) {
   // BF16 dtype with tile (8, 128) => row_bytes = 256.
   // BF16 dtype with tile (128, 8) => row_bytes = 16.
   const int64_t H = 64;
@@ -815,11 +859,13 @@ TEST(TilingUtilsTest, SpecializedRowBytes_BF16_StandardAndTransposed) {
     }
     std::vector<uint8_t> dst_tiled(num_elements * sizeof(uint16_t));
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout()).ok());
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
     std::vector<uint16_t> dst_linear(num_elements, 0);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout()).ok());
+                             shape, shape.layout())
+                    .ok());
     for (int i = 0; i < num_elements; ++i) {
       EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
     }
@@ -836,18 +882,20 @@ TEST(TilingUtilsTest, SpecializedRowBytes_BF16_StandardAndTransposed) {
     }
     std::vector<uint8_t> dst_tiled(num_elements * sizeof(uint16_t));
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout()).ok());
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
     std::vector<uint16_t> dst_linear(num_elements, 0);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout()).ok());
+                             shape, shape.layout())
+                    .ok());
     for (int i = 0; i < num_elements; ++i) {
       EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
     }
   }
 }
 
-TEST(TilingUtilsTest, SpecializedRowBytes_FP32_StandardAndTransposed) {
+TEST_P(TilingUtilsTest, SpecializedRowBytes_FP32_StandardAndTransposed) {
   // F32 dtype with tile (8, 128) => row_bytes = 512.
   // F32 dtype with tile (128, 8) => row_bytes = 32.
   const int64_t H = 64;
@@ -864,11 +912,13 @@ TEST(TilingUtilsTest, SpecializedRowBytes_FP32_StandardAndTransposed) {
     }
     std::vector<uint8_t> dst_tiled(num_elements * sizeof(float));
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout()).ok());
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
     std::vector<float> dst_linear(num_elements, 0.0f);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout()).ok());
+                             shape, shape.layout())
+                    .ok());
     for (int i = 0; i < num_elements; ++i) {
       EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
     }
@@ -885,18 +935,20 @@ TEST(TilingUtilsTest, SpecializedRowBytes_FP32_StandardAndTransposed) {
     }
     std::vector<uint8_t> dst_tiled(num_elements * sizeof(float));
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout()).ok());
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
     std::vector<float> dst_linear(num_elements, 0.0f);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout()).ok());
+                             shape, shape.layout())
+                    .ok());
     for (int i = 0; i < num_elements; ++i) {
       EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
     }
   }
 }
 
-TEST(TilingUtilsTest, SpecializedRowBytes_64ByteRow) {
+TEST_P(TilingUtilsTest, SpecializedRowBytes_64ByteRow) {
   // S8 with tile (8, 64) -> row_bytes = 64
   const int64_t H = 32;
   const int64_t W = 128;
@@ -911,19 +963,21 @@ TEST(TilingUtilsTest, SpecializedRowBytes_64ByteRow) {
 
   std::vector<uint8_t> dst_tiled(num_elements * sizeof(int8_t));
   ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                         dst_tiled.data(), shape, shape.layout()).ok());
+                         dst_tiled.data(), shape, shape.layout())
+                  .ok());
 
   std::vector<int8_t> dst_linear(num_elements, 0);
   ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
-                           reinterpret_cast<uint8_t*>(dst_linear.data()),
-                           shape, shape.layout()).ok());
+                           reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+                           shape.layout())
+                  .ok());
 
   for (int i = 0; i < num_elements; ++i) {
     EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
   }
 }
 
-TEST(TilingUtilsTest, SpecializedRowBytes_MultiBatch_AllTypes) {
+TEST_P(TilingUtilsTest, SpecializedRowBytes_MultiBatch_AllTypes) {
   // Multi-batch 3D tensor: [4, 64, 256] with tile (8, 128)
   const int64_t B = 4;
   const int64_t H = 64;
@@ -940,11 +994,13 @@ TEST(TilingUtilsTest, SpecializedRowBytes_MultiBatch_AllTypes) {
     }
     std::vector<uint8_t> dst_tiled(total_elements * sizeof(int8_t));
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout()).ok());
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
     std::vector<int8_t> dst_linear(total_elements, 0);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout()).ok());
+                             shape, shape.layout())
+                    .ok());
     EXPECT_EQ(dst_linear, src_linear);
   }
 
@@ -958,11 +1014,13 @@ TEST(TilingUtilsTest, SpecializedRowBytes_MultiBatch_AllTypes) {
     }
     std::vector<uint8_t> dst_tiled(total_elements * sizeof(uint16_t));
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout()).ok());
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
     std::vector<uint16_t> dst_linear(total_elements, 0);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout()).ok());
+                             shape, shape.layout())
+                    .ok());
     EXPECT_EQ(dst_linear, src_linear);
   }
 
@@ -976,16 +1034,18 @@ TEST(TilingUtilsTest, SpecializedRowBytes_MultiBatch_AllTypes) {
     }
     std::vector<uint8_t> dst_tiled(total_elements * sizeof(float));
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout()).ok());
+                           dst_tiled.data(), shape, shape.layout())
+                    .ok());
     std::vector<float> dst_linear(total_elements, 0.0f);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout()).ok());
+                             shape, shape.layout())
+                    .ok());
     EXPECT_EQ(dst_linear, src_linear);
   }
 }
 
-TEST(TilingUtilsTest, NestedPacked_BF16_ExactTiles2D) {
+TEST_P(TilingUtilsTest, NestedPacked_BF16_ExactTiles2D) {
   // Shape [64, 256] with nested layout {1, 0 : T(8, 128)(2, 1)}
   const int64_t H = 64;
   const int64_t W = 256;
@@ -1031,7 +1091,7 @@ TEST(TilingUtilsTest, NestedPacked_BF16_ExactTiles2D) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, NestedPacked_BF16_WithPadding2D) {
+TEST_P(TilingUtilsTest, NestedPacked_BF16_WithPadding2D) {
   // Shape [53, 175] with nested layout {1, 0 : T(8, 128)(2, 1)} (has padding in
   // H and W)
   const int64_t H = 53;
@@ -1080,7 +1140,7 @@ TEST(TilingUtilsTest, NestedPacked_BF16_WithPadding2D) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, NestedPacked_BF16_1DTensor) {
+TEST_P(TilingUtilsTest, NestedPacked_BF16_1DTensor) {
   // Shape [2304] with nested layout {0 : T(8, 128)(2, 1)}
   const int64_t W = 2304;
   xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
@@ -1121,7 +1181,7 @@ TEST(TilingUtilsTest, NestedPacked_BF16_1DTensor) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, NestedPacked_BF16_MultiBatch3D) {
+TEST_P(TilingUtilsTest, NestedPacked_BF16_MultiBatch3D) {
   // Shape [3, 40, 300] with nested layout {2, 1, 0 : T(8, 128)(2, 1)}
   const int64_t B = 3;
   const int64_t H = 40;
@@ -1164,7 +1224,7 @@ TEST(TilingUtilsTest, NestedPacked_BF16_MultiBatch3D) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, NestedPacked_S8_PackingFactor4) {
+TEST_P(TilingUtilsTest, NestedPacked_S8_PackingFactor4) {
   // Shape [32, 256] with nested layout {1, 0 : T(8, 128)(4, 1)} (FP8/INT8 4-row
   // packing)
   const int64_t H = 32;
@@ -1206,7 +1266,7 @@ TEST(TilingUtilsTest, NestedPacked_S8_PackingFactor4) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, ThreadPool_ExecuteOneTask) {
+TEST(TilingUtilsThreadPoolTest, ThreadPool_ExecuteOneTask) {
   tpu_raiden::NumaThreadPool pool(2);
   // On empty pool, ExecuteOneTask returns false
   EXPECT_FALSE(pool.ExecuteOneTask());
@@ -1224,7 +1284,7 @@ TEST(TilingUtilsTest, ThreadPool_ExecuteOneTask) {
   EXPECT_TRUE(executed.load(std::memory_order_acquire));
 }
 
-TEST(TilingUtilsTest, ThresholdGatedTiling_SmallTensorInline) {
+TEST_P(TilingUtilsTest, ThresholdGatedTiling_SmallTensorInline) {
   // Tensor of size 1 MB (512 x 1024 bfloat16 = 1,048,576 bytes)
   // This is < 4 MB threshold, so it executes inline on calling thread.
   const int64_t H = 512;
@@ -1256,7 +1316,7 @@ TEST(TilingUtilsTest, ThresholdGatedTiling_SmallTensorInline) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, ThresholdGatedTiling_LargeTensorParallel) {
+TEST_P(TilingUtilsTest, ThresholdGatedTiling_LargeTensorParallel) {
   // Tensor of size 8 MB (2048 x 2048 bfloat16 = 8,388,608 bytes)
   // This is >= 4 MB threshold, so it exercises the parallel sub-tasking path.
   const int64_t H = 2048;
@@ -1300,7 +1360,8 @@ TEST(TilingUtilsTest, ThresholdGatedTiling_LargeTensorParallel) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, ThresholdGatedTiling_InvokedFromWorkerThread_NoDeadlock) {
+TEST_P(TilingUtilsTest,
+       ThresholdGatedTiling_InvokedFromWorkerThread_NoDeadlock) {
   // Test invoking TileBuffer on a large 8 MB tensor FROM WITHIN a worker thread
   // of the same thread pool. This specifically tests against thread starvation
   // deadlock.
@@ -1345,7 +1406,7 @@ TEST(TilingUtilsTest, ThresholdGatedTiling_InvokedFromWorkerThread_NoDeadlock) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, ThresholdGatedTiling_LargeTensorWithPadding) {
+TEST_P(TilingUtilsTest, ThresholdGatedTiling_LargeTensorWithPadding) {
   // Test large tensor with dimensions not aligned to tile size:
   // H = 2050, W = 2050 (tile is 8, 128)
   // Total size ~8.4 MB (triggers parallel path and exercises padding logic)
@@ -1378,7 +1439,7 @@ TEST(TilingUtilsTest, ThresholdGatedTiling_LargeTensorWithPadding) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
+TEST_P(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
   // 1. 4.59 MB tensor ([1792, 1280] BF16 -> 4,587,520 bytes, desired_chunks=1)
   {
     const int64_t H = 1792;
@@ -1437,11 +1498,10 @@ TEST(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
                      shard_tiled[s].data(), shape, shape.layout(),
                      /*pool=*/nullptr)
               .ok());
-      ASSERT_TRUE(
-          DetileBuffer(shard_tiled[s].data(),
-                       reinterpret_cast<uint8_t*>(shard_dsts[s].data()), shape,
-                       shape.layout(), /*pool=*/nullptr)
-              .ok());
+      ASSERT_TRUE(DetileBuffer(shard_tiled[s].data(),
+                               reinterpret_cast<uint8_t*>(shard_dsts[s].data()),
+                               shape, shape.layout(), /*pool=*/nullptr)
+                      .ok());
     });
   }
   for (auto& t : threads) {
@@ -1452,7 +1512,7 @@ TEST(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
   }
 }
 
-TEST(TilingUtilsTest, IsStandardColMajorTiledAnd1DPacked) {
+TEST(TilingUtilsPredicateTest, IsStandardColMajorTiledAnd1DPacked) {
   // 2D column-major unpacked {0,1:T(8,128)}
   xla::Shape col_unpacked = xla::ShapeUtil::MakeShapeWithDenseLayout(
       xla::PrimitiveType::BF16, {2560, 1216}, {0, 1}, {xla::Tile({8, 128})});
@@ -1514,7 +1574,7 @@ TEST(TilingUtilsTest, IsStandardColMajorTiledAnd1DPacked) {
                                       shape_1d_2level_unpacked.layout()));
 }
 
-TEST(TilingUtilsTest, ColMajor_Packed_BF16_ExactAndQwen3DownProj) {
+TEST_P(TilingUtilsTest, ColMajor_Packed_BF16_ExactAndQwen3DownProj) {
   // Test Qwen3-4B (TP=8 on TPU v6e) mlp.down_proj.weight shape:
   // BF16[2560, 1216] with {0, 1: T(8, 128)(2, 1)}
   const int64_t D0 = 2560;
@@ -1580,7 +1640,7 @@ TEST(TilingUtilsTest, ColMajor_Packed_BF16_ExactAndQwen3DownProj) {
   EXPECT_EQ(dst_linear, src_linear);
 }
 
-TEST(TilingUtilsTest, ColMajor_Packed_And_Unpacked_WithPadding2D) {
+TEST_P(TilingUtilsTest, ColMajor_Packed_And_Unpacked_WithPadding2D) {
   // Shape [175, 53] with {0, 1: T(8, 128)(2, 1)} (padding in both D0 and D1)
   const int64_t D0 = 175;
   const int64_t D1 = 53;
@@ -1644,7 +1704,7 @@ TEST(TilingUtilsTest, ColMajor_Packed_And_Unpacked_WithPadding2D) {
   }
 }
 
-TEST(TilingUtilsTest, ColMajor_Packed_S8_And_MultiBatch3D_And_Parallel) {
+TEST_P(TilingUtilsTest, ColMajor_Packed_S8_And_MultiBatch3D_And_Parallel) {
   // 1. S8 with {0, 1: T(8, 128)(4, 1)} and padding
   {
     const int64_t D0 = 175;
@@ -1762,7 +1822,7 @@ TEST(TilingUtilsTest, ColMajor_Packed_S8_And_MultiBatch3D_And_Parallel) {
   }
 }
 
-TEST(TilingUtilsTest, Packed1D_2Level_And_3Level_AllCases) {
+TEST_P(TilingUtilsTest, Packed1D_2Level_And_3Level_AllCases) {
   // Test {0:T(1024)(128)(2,1)} (Qwen3-4B 1D norm layout) and {0:T(128)(2,1)}
   // across exact (2048), outer-tile padded (2560), and arbitrary (300, 17)
   // lengths.
@@ -1889,6 +1949,96 @@ TEST(TilingUtilsTest, Packed1D_2Level_And_3Level_AllCases) {
                     .ok());
     EXPECT_EQ(dst_u16, src_u16);
   }
+}
+
+TEST(TilingUtilsStandaloneTest, InPlaceTilingMatchesTileBuffer) {
+  auto test_shape = [](const xla::Shape& shape) {
+    int64_t linear_elements = xla::ShapeUtil::ElementsIn(shape);
+    int64_t itemsize =
+        xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+    int64_t physical_elements = GetTiledBufferElements(shape);
+    int64_t linear_bytes = linear_elements * itemsize;
+    int64_t physical_bytes = physical_elements * itemsize;
+
+    std::vector<uint8_t> src_linear(linear_bytes);
+    for (size_t i = 0; i < src_linear.size(); ++i) {
+      src_linear[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
+    }
+
+    // 1. Run out-of-place TileBuffer
+    std::vector<uint8_t> expected_tiled(physical_bytes, 0);
+    ASSERT_TRUE(TileBuffer(src_linear.data(), expected_tiled.data(), shape,
+                           shape.layout())
+                    .ok());
+
+    // 2. Run TileBufferInPlace
+    std::vector<uint8_t> in_place_buf(physical_bytes, 0);
+    std::memcpy(in_place_buf.data(), src_linear.data(), linear_bytes);
+    ASSERT_TRUE(TileBufferInPlace(in_place_buf.data(), in_place_buf.size(),
+                                  shape, shape.layout())
+                    .ok());
+
+    // Verify byte-for-byte identity with TileBuffer
+    EXPECT_EQ(in_place_buf, expected_tiled);
+
+    // 3. Verify DetileBuffer restores original linear bytes
+    std::vector<uint8_t> detiled(linear_bytes, 0);
+    ASSERT_TRUE(
+        DetileBuffer(in_place_buf.data(), detiled.data(), shape, shape.layout())
+            .ok());
+    EXPECT_EQ(detiled, src_linear);
+
+    // 4. Verify insufficient capacity returns error
+    if (physical_bytes > 1) {
+      std::vector<uint8_t> small_buf(physical_bytes - 1, 0);
+      EXPECT_FALSE(TileBufferInPlace(small_buf.data(), small_buf.size(), shape,
+                                     shape.layout())
+                       .ok());
+    }
+  };
+
+  // Case 1: Standard 2D no padding (F32, tile 8x8)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::F32, {32, 64}, {1, 0}, {xla::Tile({8, 8})}));
+
+  // Case 2: Standard 2D with padding (BF16, tile 8x128, packing 2,1)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {65, 130}, {1, 0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})}));
+
+  // Case 3: Standard 2D no padding (BF16, tile 8x128, packing 2,1)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {64, 256}, {1, 0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})}));
+
+  // Case 4: Standard 3D batch with padding (BF16, tile 8x128, packing 2,1)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {2, 65, 130}, {2, 1, 0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})}));
+
+  // Case 5: Standard 3D batch no padding (BF16, tile 8x128, packing 2,1)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {3, 32, 128}, {2, 1, 0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})}));
+
+  // Case 6: FP8 / S8 packing factor 4 with padding (tile 8x128, packing 4,1)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::S8, {33, 135}, {1, 0},
+      {xla::Tile({8, 128}), xla::Tile({4, 1})}));
+
+  // Case 7: 1D unpacked tiling with padding (F32, tile 128)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::F32, {250}, {0}, {xla::Tile({128})}));
+
+  // Case 8: 1D packed tiling with padding (BF16, tile 128, packing 2,1)
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {250}, {0},
+      {xla::Tile({128}), xla::Tile({2, 1})}));
+
+  // Case 9: Column-major fallback (BF16, minor_to_major {0, 1})
+  test_shape(xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {65, 130}, {0, 1},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})}));
 }
 
 }  // namespace

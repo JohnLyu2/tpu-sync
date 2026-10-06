@@ -214,16 +214,18 @@ class _PlanReferencedShardSchedule(abc.Sequence):
 class _CachedTransferSchedule:
   """Cached pre-computed transfer schedules and metadata for resharding plans."""
 
-  computed_schedules: dict[Any, Any]
-  direct_schedules: dict[Any, Any]
-  broadcast_groups: dict[Any, Any]
-  local_skip_tiling: dict[int, bool]
-  expected_block_count: int
-  dst_unit_layer_counts: dict[Any, dict[int, int]]
-  data_address_to_unit: dict[str, Any]
-  direct_dsts: list[Any]
-  rpc_addresses: dict[Any, str]
-  data_addresses: dict[Any, list[str]]
+  computed_schedules: dict[Any, Any] = dataclasses.field(default_factory=dict)
+  direct_schedules: dict[Any, Any] = dataclasses.field(default_factory=dict)
+  broadcast_groups: dict[Any, Any] = dataclasses.field(default_factory=dict)
+  local_skip_tiling: dict[int, bool] = dataclasses.field(default_factory=dict)
+  expected_block_count: int = 0
+  dst_unit_layer_counts: dict[Any, dict[int, int]] = dataclasses.field(
+      default_factory=dict
+  )
+  data_address_to_unit: dict[str, Any] = dataclasses.field(default_factory=dict)
+  direct_dsts: list[Any] = dataclasses.field(default_factory=list)
+  rpc_addresses: dict[Any, str] = dataclasses.field(default_factory=dict)
+  data_addresses: dict[Any, list[str]] = dataclasses.field(default_factory=dict)
   dst_unit_counts: dict[Any, int] = dataclasses.field(default_factory=dict)
   dst_endpoint_counts: dict[str, int] = dataclasses.field(default_factory=dict)
   dst_endpoint_layer_counts: dict[str, dict[int, int]] = dataclasses.field(
@@ -282,6 +284,9 @@ class StageBroadcastGroup:
   canonical_variable_plans: dict[RaidenId, dict[int, dict[int, list[Any]]]]
   canonical_relay_plans: dict[int, dict[int, list[tuple[int, int, int]]]]
   data_addresses: dict[RaidenId, list[str]]
+  cached_hop_schedules: dict[Any, Any] = dataclasses.field(
+      default_factory=dict, repr=False, compare=False
+  )
 
 
 @dataclasses.dataclass
@@ -370,6 +375,9 @@ class TransferPlan:
   broadcast_round_destinations: list[Any] = dataclasses.field(
       default_factory=list
   )
+  has_explicit_shard_push_schedules: bool = False
+  # raiden_service_pb2.HostTilingMode of the host buffers moved by this plan.
+  host_tiling_mode: int = raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED
 
 
 class RaidenFuture:

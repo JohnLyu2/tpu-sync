@@ -876,13 +876,11 @@ TcpControlPipeClient::SendRaw(
 
   auto try_cpip =
       [&]() -> absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> {
-    int fd = -1;
-    if (probe_with_shut_wr) {
-      ABSL_ASSIGN_OR_RETURN(fd, ConnectSocket(endpoint, effective_timeout));
-    } else {
-      ABSL_ASSIGN_OR_RETURN(fd,
-                            conn_pool_->Acquire(endpoint, effective_timeout));
-    }
+    absl::StatusOr<int> fd_or =
+        probe_with_shut_wr ? ConnectSocket(endpoint, effective_timeout)
+                           : conn_pool_->Acquire(endpoint, effective_timeout);
+    if (!fd_or.ok()) return MarkControlPipeNotSent(fd_or.status());
+    int fd = *fd_or;
     connected = true;
     auto fd_closer = absl::MakeCleanup([fd]() { close(fd); });
 

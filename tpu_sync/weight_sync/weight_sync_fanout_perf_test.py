@@ -456,26 +456,29 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
       self.controller.broadcast_host_ratio = old_ratio
       self.controller._plan_cache.clear()
 
-    self.assertIsNotNone(sched)
-    self.assertIsNotNone(sched.direct_schedules)
-
     total_tasks = 0
     le_512_tasks = 0
 
-    for src_unit, sched_by_shard in sched.direct_schedules.items():
-      for shard_idx, entries in sched_by_shard.items():
-        for entry in entries:
-          size = entry[4]
-          src_stride = entry[7]
-          dst_stride = entry[8]
-          count = entry[9]
-          is_contiguous = (count == 1) or (
-              src_stride == size and dst_stride == size
+    for stage_group in sched.broadcast_groups.values():
+      s_u_schedules = (
+          broadcast_engine.BroadcastEngine.build_stage_trainer_push_schedules(
+              stage_group, self.dst_units
           )
-          num_tasks = 1 if is_contiguous else count
-          total_tasks += num_tasks
-          if size <= 512:
-            le_512_tasks += num_tasks
+      )
+      for src_unit, sched_by_shard in s_u_schedules.items():
+        for shard_idx, entries in sched_by_shard.items():
+          for entry in entries:
+            size = entry[4]
+            src_stride = entry[7]
+            dst_stride = entry[8]
+            count = entry[9]
+            is_contiguous = (count == 1) or (
+                src_stride == size and dst_stride == size
+            )
+            num_tasks = 1 if is_contiguous else count
+            total_tasks += num_tasks
+            if size <= 512:
+              le_512_tasks += num_tasks
 
     self._cached_task_counts = (total_tasks, le_512_tasks)
     return total_tasks, le_512_tasks
@@ -1180,13 +1183,19 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           )
       )
 
-      unshifted_schedules = {
-          u: {
-              s_idx: sorted(entries, key=lambda e: e[0])
-              for s_idx, entries in s_map.items()
-          }
-          for u, s_map in sched.direct_schedules.items()
-      }
+      unshifted_schedules = {u: {} for u in src_units}
+      for stage_group in sched.broadcast_groups.values():
+        s_u_schedules = (
+            broadcast_engine.BroadcastEngine.build_stage_trainer_push_schedules(
+                stage_group, dst_units
+            )
+        )
+        for u, s_map in s_u_schedules.items():
+          for s_idx, entries in s_map.items():
+            unshifted_schedules[u].setdefault(s_idx, []).extend(entries)
+      for u, s_map in unshifted_schedules.items():
+        for s_idx in s_map:
+          s_map[s_idx] = sorted(s_map[s_idx], key=lambda e: e[0])
 
       uuid_pre = 2002
       t0 = time.perf_counter()
@@ -1437,6 +1446,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           skip_tiling={l: False for l in range(self.num_layers)},
       )
       loop.run_until_complete(future_warmup.wait())
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=2100)
 
       # Run 1: broadcast_host_ratio = 0.125 (n_seed = 1, 3 rounds)
       for ws in ws_srcs:
@@ -1468,6 +1479,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           skip_tiling={l: False for l in range(self.num_layers)},
       )
       loop.run_until_complete(future_r0125.wait())
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=uuid_r0125)
       t_r0125 = time.perf_counter() - t0
 
       _verify_fsdp_destinations(0x5A, "Tree (ratio=0.125)")
@@ -1516,6 +1529,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           skip_tiling={l: False for l in range(self.num_layers)},
       )
       loop.run_until_complete(future_r025.wait())
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=uuid_r025)
       t_r025 = time.perf_counter() - t0
 
       _verify_fsdp_destinations(0xA5, "Tree (ratio=0.25)")
@@ -1933,6 +1948,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           skip_tiling={l: False for l in range(num_vars)},
       )
       loop.run_until_complete(future_cold.wait())
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=3100)
       t_cold = time.perf_counter() - t0
 
       _verify_fsdp_destinations(0x5A, "Cold transfer")
@@ -1972,6 +1989,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           skip_tiling={l: False for l in range(num_vars)},
       )
       loop.run_until_complete(future_warm.wait())
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=3101)
       t_warm = time.perf_counter() - t0
 
       _verify_fsdp_destinations(0xA5, "Warm transfer")

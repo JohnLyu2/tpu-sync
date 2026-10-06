@@ -70,7 +70,8 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   virtual absl::Status BeginIncomingPush(uint64_t uuid) {
     return absl::OkStatus();
   }
-  virtual absl::Status EndIncomingPush(uint64_t uuid) {
+  virtual absl::Status EndIncomingPush(
+      uint64_t uuid, const absl::Status& status = absl::OkStatus()) {
     return absl::OkStatus();
   }
 

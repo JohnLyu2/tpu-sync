@@ -14,13 +14,91 @@
 
 #include "tpu_sync/transport/lib/transport_metrics_exporter.h"
 
+#include <cstddef>
+#include <cstdint>
+
+#include "absl/strings/string_view.h"
 #include "peregrine/src/api/transport_metrics.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden::transport::lib {
+namespace {
 
-void TransportMetricsExporter::Export(
-    const ::peregrine::TransportMetrics& curr) {
-  // TODO(yyd): Implement metric delta calculation and telemetry export.
+namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
+namespace metric_names = ::tpu_raiden::telemetry::metric_names;
+using ::tpu_raiden::telemetry::LabelSpan;
+using ::tpu_raiden::telemetry::MetricLabel;
+using ::tpu_raiden::telemetry::RaidenMetricStore;
+
+constexpr MetricLabel kWriteLabels[] = {
+    {.key = metric_labels::kDirection, .value = metric_labels::kDirectionWrite},
+};
+constexpr MetricLabel kReadLabels[] = {
+    {.key = metric_labels::kDirection, .value = metric_labels::kDirectionRead},
+};
+
+constexpr int64_t ComputeDelta(uint64_t curr, uint64_t prev) {
+  return static_cast<int64_t>(curr - prev);
+}
+
+void ExportCounterDelta(RaidenMetricStore& store, absl::string_view name,
+                        LabelSpan labels, uint64_t curr, uint64_t prev) {
+  const int64_t delta = ComputeDelta(curr, prev);
+  if (delta > 0) {
+    store.IncrementCounter(name, labels, static_cast<uint64_t>(delta));
+  }
+}
+
+void ExportHistogramDelta(RaidenMetricStore& store, absl::string_view name,
+                          LabelSpan labels,
+                          const peregrine::Log2Histogram<32>& curr_hist,
+                          const peregrine::Log2Histogram<32>& prev_hist) {
+  for (size_t i = 0; i < curr_hist.buckets.size(); ++i) {
+    const int64_t delta =
+        ComputeDelta(curr_hist.buckets[i], prev_hist.buckets[i]);
+    if (delta <= 0) {
+      continue;
+    }
+    // Log2Histogram bucket 0 covers [0, 1) (lower bound 0.0), and bucket i
+    // (i >= 1) covers [2^(i-1), 2^i) (lower bound 2^(i-1)).
+    double bucket_val = 0.0;
+    if (i > 0) {
+      bucket_val = 1ULL << (i - 1);
+    }
+    for (int64_t sample = 0; sample < delta; ++sample) {
+      store.ObserveHistogram(name, labels, bucket_val);
+    }
+  }
+}
+
+void ExportOpMetricsDelta(RaidenMetricStore& store,
+                          const peregrine::OpMetrics& curr_op,
+                          const peregrine::OpMetrics& prev_op,
+                          LabelSpan labels) {
+  ExportHistogramDelta(store, metric_names::kPeregrineE2eLatencyUs, labels,
+                       curr_op.e2e_latency_us, prev_op.e2e_latency_us);
+  ExportHistogramDelta(store, metric_names::kPeregrineRequestSizeBytes, labels,
+                       curr_op.request_size_bytes, prev_op.request_size_bytes);
+  ExportCounterDelta(store, metric_names::kPeregrineBytesTotal, labels,
+                     curr_op.bytes, prev_op.bytes);
+  ExportCounterDelta(store, metric_names::kPeregrineErrorsTotal, labels,
+                     curr_op.errors, prev_op.errors);
+}
+
+}  // namespace
+
+void TransportMetricsExporter::Export(const peregrine::TransportMetrics& curr) {
+  RaidenMetricStore& store = RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    prev_metrics_ = curr;
+    return;
+  }
+
+  ExportOpMetricsDelta(store, curr.write, prev_metrics_.write, kWriteLabels);
+  ExportOpMetricsDelta(store, curr.read, prev_metrics_.read, kReadLabels);
+
+  prev_metrics_ = curr;
 }
 
 }  // namespace tpu_raiden::transport::lib

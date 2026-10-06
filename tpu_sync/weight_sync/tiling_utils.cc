@@ -27,6 +27,7 @@
 
 #include "absl/base/no_destructor.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "hwy/highway.h"
 #include "xla/index_util.h"
@@ -34,6 +35,7 @@
 #include "xla/layout_util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/platform/errors.h"
 #include "xla/util.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 
@@ -170,6 +172,91 @@ constexpr int64_t kMaxChunksPerTensor = 8;
 
 constexpr int64_t kMaxNumThreads = 16;
 
+// Geometry of a standard row-major tiled tensor (see IsStandardRowMajorTiled),
+// viewed as |batch_size| matrices of |H| x |W| elements tiled by
+// |tile_H| x |tile_W| with an optional minor packing factor. Shared by the
+// out-of-place and in-place row-major tilers so both agree on byte offsets.
+struct RowMajorTileGeometry {
+  int64_t H = 1;
+  int64_t W = 1;
+  int64_t itemsize = 1;
+  int64_t tile_H = 1;
+  int64_t tile_W = 1;
+  int64_t packing_factor = 1;
+  int64_t num_tiles_0 = 0;
+  int64_t num_tiles_1 = 0;
+  int64_t tile_size_bytes = 0;
+  int64_t batch_size = 1;
+  int64_t matrix_size_bytes = 0;
+  int64_t tiled_matrix_size_bytes = 0;
+  bool has_padding = false;
+
+  int64_t total_tiled_bytes() const {
+    return batch_size * tiled_matrix_size_bytes;
+  }
+};
+
+RowMajorTileGeometry ComputeRowMajorTileGeometry(const xla::Shape& shape,
+                                                 const xla::Layout& layout) {
+  RowMajorTileGeometry g;
+  const int R = shape.dimensions().size();
+  g.H = (R == 1) ? 1 : shape.dimensions(layout.minor_to_major(1));
+  g.W = shape.dimensions(layout.minor_to_major(0));
+  g.itemsize = xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+
+  const xla::Tile& tile = layout.tiles(0);
+  g.tile_H = (tile.dimensions().size() <= 1) ? 1 : tile.dimension(0);
+  g.tile_W = (tile.dimensions().size() == 1)   ? tile.dimension(0)
+             : (tile.dimensions().size() >= 2) ? tile.dimension(1)
+                                               : 1;
+  if (layout.tiles().size() >= 2) {
+    g.packing_factor = layout.tiles(1).dimension(0);
+  }
+
+  g.num_tiles_0 = xla::CeilOfRatio(g.H, g.tile_H);
+  g.num_tiles_1 = xla::CeilOfRatio(g.W, g.tile_W);
+  g.tile_size_bytes = g.tile_H * g.tile_W * g.itemsize;
+
+  for (int i = 2; i < R; ++i) {
+    g.batch_size *= shape.dimensions(layout.minor_to_major(i));
+  }
+
+  g.matrix_size_bytes = g.H * g.W * g.itemsize;
+  g.tiled_matrix_size_bytes = g.num_tiles_0 * g.num_tiles_1 * g.tile_size_bytes;
+  g.has_padding = (g.H % g.tile_H != 0) || (g.W % g.tile_W != 0);
+  return g;
+}
+
+// Geometry of a 1D tensor tiled as {0:T(tile_W)(P,1)} or
+// {0:T(outer_W)(tile_W)(P,1)}: |total_groups| packing groups of
+// |P| * |tile_W| elements each.
+struct Packed1DTileGeometry {
+  int64_t P = 1;
+  int64_t tile_W = 1;
+  int64_t total_groups = 0;
+  int64_t group_elems = 0;
+  int64_t group_bytes = 0;
+};
+
+Packed1DTileGeometry ComputePacked1DTileGeometry(int64_t W, int64_t itemsize,
+                                                 const xla::Layout& layout) {
+  Packed1DTileGeometry g;
+  const int num_tiles = layout.tiles().size();
+  g.P = layout.tiles(num_tiles - 1).dimension(0);
+  if (num_tiles == 2) {
+    g.tile_W = layout.tiles(0).dimension(0);
+    g.total_groups = xla::CeilOfRatio(xla::CeilOfRatio(W, g.tile_W), g.P);
+  } else {
+    const int64_t outer_W = layout.tiles(0).dimension(0);
+    g.tile_W = layout.tiles(1).dimension(0);
+    g.total_groups =
+        xla::CeilOfRatio(W, outer_W) * ((outer_W / g.tile_W) / g.P);
+  }
+  g.group_elems = g.P * g.tile_W;
+  g.group_bytes = g.group_elems * itemsize;
+  return g;
+}
+
 tpu_raiden::NumaThreadPool* GetThreadPool() {
   static absl::NoDestructor<tpu_raiden::NumaThreadPool> global_pool([]() {
     int64_t hw_threads =
@@ -187,10 +274,9 @@ void ExecuteParallelTasks(int64_t total_tasks, int64_t num_tiles_0,
                           tpu_raiden::NumaThreadPool* pool, TaskFn&& run_task) {
   tpu_raiden::NumaThreadPool* target_pool =
       (pool != nullptr) ? pool : GetThreadPool();
-  int64_t pool_threads =
-      (target_pool != nullptr)
-          ? static_cast<int64_t>(target_pool->num_threads())
-          : 0;
+  int64_t pool_threads = (target_pool != nullptr)
+                             ? static_cast<int64_t>(target_pool->num_threads())
+                             : 0;
   int64_t max_threads =
       std::min<int64_t>({kMaxChunksPerTensor, pool_threads, desired_chunks});
 
@@ -731,20 +817,13 @@ absl::Status TileBuffer1DOptimized(const uint8_t* src_linear,
   }
 
   // Packed 1D tiling: {0:T(tile_W)(P,1)} or {0:T(outer_W)(tile_W)(P,1)}.
-  const int64_t P = last_tile.dimension(0);
-  int64_t tile_W = 1;
-  int64_t total_groups = 0;
-  if (num_tiles == 2) {
-    tile_W = layout.tiles(0).dimension(0);
-    total_groups = xla::CeilOfRatio(xla::CeilOfRatio(W, tile_W), P);
-  } else {
-    const int64_t outer_W = layout.tiles(0).dimension(0);
-    tile_W = layout.tiles(1).dimension(0);
-    total_groups = xla::CeilOfRatio(W, outer_W) * ((outer_W / tile_W) / P);
-  }
-
-  const int64_t group_elems = P * tile_W;
-  const int64_t group_bytes = group_elems * itemsize;
+  const Packed1DTileGeometry geom =
+      ComputePacked1DTileGeometry(W, itemsize, layout);
+  const int64_t P = geom.P;
+  const int64_t tile_W = geom.tile_W;
+  const int64_t total_groups = geom.total_groups;
+  const int64_t group_elems = geom.group_elems;
+  const int64_t group_bytes = geom.group_bytes;
 
   DispatchByPackingFactor(P, [&](auto kPackingFactorTag) {
     constexpr int64_t kPackingFactor = decltype(kPackingFactorTag)::value;
@@ -796,20 +875,13 @@ absl::Status DetileBuffer1DOptimized(const uint8_t* src_tiled,
   }
 
   // Packed 1D tiling: {0:T(tile_W)(P,1)} or {0:T(outer_W)(tile_W)(P,1)}.
-  const int64_t P = last_tile.dimension(0);
-  int64_t tile_W = 1;
-  int64_t total_groups = 0;
-  if (num_tiles == 2) {
-    tile_W = layout.tiles(0).dimension(0);
-    total_groups = xla::CeilOfRatio(xla::CeilOfRatio(W, tile_W), P);
-  } else {
-    const int64_t outer_W = layout.tiles(0).dimension(0);
-    tile_W = layout.tiles(1).dimension(0);
-    total_groups = xla::CeilOfRatio(W, outer_W) * ((outer_W / tile_W) / P);
-  }
-
-  const int64_t group_elems = P * tile_W;
-  const int64_t group_bytes = group_elems * itemsize;
+  const Packed1DTileGeometry geom =
+      ComputePacked1DTileGeometry(W, itemsize, layout);
+  const int64_t P = geom.P;
+  const int64_t tile_W = geom.tile_W;
+  const int64_t total_groups = geom.total_groups;
+  const int64_t group_elems = geom.group_elems;
+  const int64_t group_bytes = geom.group_bytes;
 
   DispatchByPackingFactor(P, [&](auto kPackingFactorTag) {
     constexpr int64_t kPackingFactor = decltype(kPackingFactorTag)::value;
@@ -853,34 +925,21 @@ absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
     return TileBuffer1DOptimized(src_linear, dst_tiled, shape, layout);
   }
 
-  int64_t H = (R == 1) ? 1 : shape.dimensions(layout.minor_to_major(1));
-  int64_t W = shape.dimensions(layout.minor_to_major(0));
-  int64_t itemsize =
-      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+  const RowMajorTileGeometry geom = ComputeRowMajorTileGeometry(shape, layout);
+  const int64_t H = geom.H;
+  const int64_t W = geom.W;
+  const int64_t itemsize = geom.itemsize;
+  const int64_t tile_H = geom.tile_H;
+  const int64_t tile_W = geom.tile_W;
+  const int64_t packing_factor = geom.packing_factor;
+  const int64_t num_tiles_0 = geom.num_tiles_0;
+  const int64_t num_tiles_1 = geom.num_tiles_1;
+  const int64_t tile_size_bytes = geom.tile_size_bytes;
+  const int64_t batch_size = geom.batch_size;
+  const int64_t matrix_size_bytes = geom.matrix_size_bytes;
+  const int64_t tiled_matrix_size_bytes = geom.tiled_matrix_size_bytes;
 
-  const xla::Tile& tile = layout.tiles(0);
-  int64_t tile_H = (tile.dimensions().size() <= 1) ? 1 : tile.dimension(0);
-  int64_t tile_W = (tile.dimensions().size() == 1)   ? tile.dimension(0)
-                   : (tile.dimensions().size() >= 2) ? tile.dimension(1)
-                                                     : 1;
-  int64_t packing_factor = 1;
-  if (layout.tiles().size() >= 2) {
-    packing_factor = layout.tiles(1).dimension(0);
-  }
-
-  int64_t num_tiles_0 = xla::CeilOfRatio(H, tile_H);
-  int64_t num_tiles_1 = xla::CeilOfRatio(W, tile_W);
-  int64_t tile_size_bytes = tile_H * tile_W * itemsize;
-
-  int64_t batch_size = 1;
-  for (int i = 2; i < R; ++i) {
-    batch_size *= shape.dimensions(layout.minor_to_major(i));
-  }
-
-  int64_t matrix_size_bytes = H * W * itemsize;
-  int64_t tiled_matrix_size_bytes = num_tiles_0 * num_tiles_1 * tile_size_bytes;
-
-  bool has_padding = (H % tile_H != 0) || (W % tile_W != 0);
+  const bool has_padding = geom.has_padding;
 
   // Fast-path: When the tiled layout is byte-for-byte identical to the linear
   // layout (e.g. single column of tiles W == tile_W with no vertical padding
@@ -1025,34 +1084,21 @@ absl::Status DetileBufferNDOptimized(
     return DetileBuffer1DOptimized(src_tiled, dst_linear, shape, layout);
   }
 
-  int64_t H = (R == 1) ? 1 : shape.dimensions(layout.minor_to_major(1));
-  int64_t W = shape.dimensions(layout.minor_to_major(0));
-  int64_t itemsize =
-      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+  const RowMajorTileGeometry geom = ComputeRowMajorTileGeometry(shape, layout);
+  const int64_t H = geom.H;
+  const int64_t W = geom.W;
+  const int64_t itemsize = geom.itemsize;
+  const int64_t tile_H = geom.tile_H;
+  const int64_t tile_W = geom.tile_W;
+  const int64_t packing_factor = geom.packing_factor;
+  const int64_t num_tiles_0 = geom.num_tiles_0;
+  const int64_t num_tiles_1 = geom.num_tiles_1;
+  const int64_t tile_size_bytes = geom.tile_size_bytes;
+  const int64_t batch_size = geom.batch_size;
+  const int64_t matrix_size_bytes = geom.matrix_size_bytes;
+  const int64_t tiled_matrix_size_bytes = geom.tiled_matrix_size_bytes;
 
-  const xla::Tile& tile = layout.tiles(0);
-  int64_t tile_H = (tile.dimensions().size() <= 1) ? 1 : tile.dimension(0);
-  int64_t tile_W = (tile.dimensions().size() == 1)   ? tile.dimension(0)
-                   : (tile.dimensions().size() >= 2) ? tile.dimension(1)
-                                                     : 1;
-  int64_t packing_factor = 1;
-  if (layout.tiles().size() >= 2) {
-    packing_factor = layout.tiles(1).dimension(0);
-  }
-
-  int64_t num_tiles_0 = xla::CeilOfRatio(H, tile_H);
-  int64_t num_tiles_1 = xla::CeilOfRatio(W, tile_W);
-  int64_t tile_size_bytes = tile_H * tile_W * itemsize;
-
-  int64_t batch_size = 1;
-  for (int i = 2; i < R; ++i) {
-    batch_size *= shape.dimensions(layout.minor_to_major(i));
-  }
-
-  int64_t matrix_size_bytes = H * W * itemsize;
-  int64_t tiled_matrix_size_bytes = num_tiles_0 * num_tiles_1 * tile_size_bytes;
-
-  bool has_padding = (H % tile_H != 0) || (W % tile_W != 0);
+  const bool has_padding = geom.has_padding;
 
   // Fast-path: When the tiled layout is byte-for-byte identical to the linear
   // layout (e.g. single column of tiles W == tile_W with no vertical padding
@@ -1817,6 +1863,234 @@ absl::Status DetileBufferColMajorOptimized(
   return absl::OkStatus();
 }
 
+// In-place tiling of a 1D tensor with an unpacked 1D tile ({0:T(T0)} or
+// {0:T(T0)(T1)}). The tiled bytes are the linear bytes followed by zero
+// padding up to a multiple of the outer tile, so only the tail is written.
+absl::Status ZeroPadUnpacked1DInPlace(uint8_t* buffer, size_t buffer_capacity,
+                                      int64_t W, int64_t itemsize,
+                                      const xla::Layout& layout) {
+  const int64_t outer_W = layout.tiles(0).dimension(0);
+  const int64_t total_physical_elements =
+      xla::CeilOfRatio(W, outer_W) * outer_W;
+  if (buffer_capacity <
+      static_cast<size_t>(total_physical_elements * itemsize)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Buffer capacity ", buffer_capacity,
+                     " is smaller than required 1D tiled buffer size ",
+                     total_physical_elements * itemsize));
+  }
+  if (total_physical_elements > W) {
+    ZeroRowHighway(
+        buffer + W * itemsize,
+        static_cast<size_t>((total_physical_elements - W) * itemsize));
+  }
+  return absl::OkStatus();
+}
+
+// In-place tiling of a 1D tensor with a packed tile ({0:T(tile_W)(P,1)} or
+// {0:T(outer_W)(tile_W)(P,1)}). Each packing group holds P * tile_W
+// consecutive logical elements and is rewritten as tile_W lanes of P
+// interleaved elements. A group's tiled bytes occupy exactly the group's own
+// linear bytes, so each group is staged through a group-sized bounce buffer
+// and rewritten independently; the trailing partial group is zero padded.
+absl::Status TilePacked1DInPlace(uint8_t* buffer, size_t buffer_capacity,
+                                 int64_t W, int64_t itemsize,
+                                 const xla::Layout& layout) {
+  const Packed1DTileGeometry geom =
+      ComputePacked1DTileGeometry(W, itemsize, layout);
+  const int64_t P = geom.P;
+  const int64_t tile_W = geom.tile_W;
+  const int64_t total_groups = geom.total_groups;
+  const int64_t group_elems = geom.group_elems;
+  const int64_t group_bytes = geom.group_bytes;
+  if (buffer_capacity < static_cast<size_t>(total_groups * group_bytes)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Buffer capacity ", buffer_capacity,
+                     " is smaller than required 1D packed tiled buffer size ",
+                     total_groups * group_bytes));
+  }
+
+  std::vector<uint8_t> group_buf(group_bytes);
+  DispatchByPackingFactor(P, [&](auto kPackingFactorTag) {
+    constexpr int64_t kPackingFactor = decltype(kPackingFactorTag)::value;
+    for (int64_t g = total_groups - 1; g >= 0; --g) {
+      uint8_t* dst_group_ptr = buffer + g * group_bytes;
+      const int64_t group_start = g * group_elems;
+      if (group_start >= W) {
+        ZeroRowHighway(dst_group_ptr, static_cast<size_t>(group_bytes));
+        continue;
+      }
+      int64_t valid_elements = std::min(group_elems, W - group_start);
+      std::memcpy(group_buf.data(), dst_group_ptr, valid_elements * itemsize);
+      if (valid_elements < group_elems) {
+        std::memset(group_buf.data() + valid_elements * itemsize, 0,
+                    (group_elems - valid_elements) * itemsize);
+      }
+      if (group_start + group_elems <= W) {
+        CopyTilePackedNoPadding<kPackingFactor, 0>(
+            group_buf.data(), dst_group_ptr, /*tile_row=*/0, /*tile_col=*/0,
+            /*tile_H=*/kPackingFactor, tile_W, /*W=*/tile_W, itemsize);
+      } else {
+        ZeroRowHighway(dst_group_ptr, static_cast<size_t>(group_bytes));
+        for (int64_t p = 0; p < kPackingFactor; ++p) {
+          const int64_t row_start = p * tile_W;
+          for (int64_t c = 0; c < tile_W; ++c) {
+            const int64_t idx = row_start + c;
+            if (idx < valid_elements) {
+              std::memcpy(dst_group_ptr + (c * kPackingFactor + p) * itemsize,
+                          group_buf.data() + idx * itemsize, itemsize);
+            }
+          }
+        }
+      }
+    }
+  });
+  return absl::OkStatus();
+}
+
+// In-place tiling of a single logical row (H == 1) under a 2D tile with no
+// packing. Each tile_W-element column slice becomes the first row of its tile,
+// followed by (tile_H - 1) zero rows. Tiles are moved from last to first:
+// tile_col's destination offset (tile_col * tile_size_bytes) is never less than
+// its source offset (tile_col * tile_W * itemsize), so a reverse sweep never
+// overwrites a slice that has not been moved yet.
+void TileSingleRowInPlace(uint8_t* buffer, const RowMajorTileGeometry& geom) {
+  const int64_t W = geom.W;
+  const int64_t itemsize = geom.itemsize;
+  const int64_t tile_H = geom.tile_H;
+  const int64_t tile_W = geom.tile_W;
+  for (int64_t b = geom.batch_size - 1; b >= 0; --b) {
+    uint8_t* src_batch_ptr = buffer + b * geom.matrix_size_bytes;
+    uint8_t* dst_batch_ptr = buffer + b * geom.tiled_matrix_size_bytes;
+    for (int64_t tile_col = geom.num_tiles_1 - 1; tile_col >= 0; --tile_col) {
+      int64_t logical_col_start = tile_col * tile_W;
+      int64_t valid_elements = std::min(tile_W, W - logical_col_start);
+      uint8_t* dst_tile_ptr = dst_batch_ptr + tile_col * geom.tile_size_bytes;
+      const uint8_t* src_tile_ptr =
+          src_batch_ptr + logical_col_start * itemsize;
+      if (valid_elements > 0) {
+        std::memmove(dst_tile_ptr, src_tile_ptr, valid_elements * itemsize);
+        if (valid_elements < tile_W) {
+          std::memset(dst_tile_ptr + valid_elements * itemsize, 0,
+                      (tile_W - valid_elements) * itemsize);
+        }
+      } else {
+        std::memset(dst_tile_ptr, 0, tile_W * itemsize);
+      }
+      if (tile_H > 1) {
+        std::memset(dst_tile_ptr + tile_W * itemsize, 0,
+                    (tile_H - 1) * tile_W * itemsize);
+      }
+    }
+  }
+}
+
+// General in-place tiling of a row-major 2D/ND tensor. A band is tile_H
+// consecutive logical rows; its tiles are exactly the tiles in one tile row.
+// Each band is copied to an L2-resident bounce buffer and scattered back as
+// tiles. Bands run from last to first (and batches likewise): the tiled offset
+// of a band is >= its linear offset, so writing band k only touches bytes of
+// bands >= k, which have already been consumed.
+void TileRowMajorBandsInPlace(uint8_t* buffer,
+                              const RowMajorTileGeometry& geom) {
+  const int64_t H = geom.H;
+  const int64_t W = geom.W;
+  const int64_t itemsize = geom.itemsize;
+  const int64_t tile_H = geom.tile_H;
+  const int64_t tile_W = geom.tile_W;
+  const int64_t num_tiles_1 = geom.num_tiles_1;
+  const int64_t tile_size_bytes = geom.tile_size_bytes;
+  const int64_t row_bytes =
+      (geom.packing_factor == 1) ? (tile_W * itemsize) : 0;
+  std::vector<uint8_t> band_buf(tile_H * W * itemsize);
+
+  DispatchByPackingFactor(geom.packing_factor, [&](auto kPackingFactorTag) {
+    constexpr int64_t kPackingFactor = decltype(kPackingFactorTag)::value;
+    DispatchByRowBytes(row_bytes, [&](auto kRowBytesTag) {
+      constexpr size_t kRowBytes = decltype(kRowBytesTag)::value;
+      for (int64_t b = geom.batch_size - 1; b >= 0; --b) {
+        uint8_t* src_batch_ptr = buffer + b * geom.matrix_size_bytes;
+        uint8_t* dst_batch_ptr = buffer + b * geom.tiled_matrix_size_bytes;
+
+        for (int64_t tile_row = geom.num_tiles_0 - 1; tile_row >= 0;
+             --tile_row) {
+          int64_t logical_row_start = tile_row * tile_H;
+          int64_t valid_band_H = std::min(H - logical_row_start, tile_H);
+          if (valid_band_H <= 0) continue;
+
+          size_t linear_bytes_to_copy =
+              static_cast<size_t>(valid_band_H * W * itemsize);
+          const uint8_t* linear_band_src =
+              src_batch_ptr + logical_row_start * W * itemsize;
+          std::memcpy(band_buf.data(), linear_band_src, linear_bytes_to_copy);
+          if (valid_band_H < tile_H) {
+            std::memset(band_buf.data() + linear_bytes_to_copy, 0,
+                        (tile_H - valid_band_H) * W * itemsize);
+          }
+
+          bool is_row_interior = (valid_band_H == tile_H);
+          for (int64_t tile_col = 0; tile_col < num_tiles_1; ++tile_col) {
+            int64_t tile_index = tile_row * num_tiles_1 + tile_col;
+            uint8_t* dst_tile_ptr =
+                dst_batch_ptr + tile_index * tile_size_bytes;
+            bool is_col_interior = (tile_col * tile_W + tile_W <= W);
+            if (is_row_interior && is_col_interior) {
+              CopyTilePackedNoPadding<kPackingFactor, kRowBytes>(
+                  band_buf.data(), dst_tile_ptr, /*tile_row=*/0, tile_col,
+                  tile_H, tile_W, W, itemsize);
+            } else {
+              CopyTilePackedWithPadding<kPackingFactor>(
+                  band_buf.data(), dst_tile_ptr, /*tile_row=*/0, tile_col,
+                  tile_H, tile_W, valid_band_H, W, itemsize, tile_size_bytes);
+            }
+          }
+        }
+      }
+    });
+  });
+}
+
+// Dispatches a standard row-major tiled tensor to the matching in-place tiler.
+absl::Status TileBufferInPlaceRowMajor(
+    uint8_t* buffer, size_t buffer_capacity, const xla::Shape& shape,
+    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
+  const int R = shape.dimensions().size();
+  if (R == 1 && layout.tiles(0).dimensions().size() == 1) {
+    const int64_t W = shape.dimensions(0);
+    const int64_t itemsize =
+        xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+    const xla::Tile& last_tile = layout.tiles(layout.tiles().size() - 1);
+    if (last_tile.dimensions().size() == 1) {
+      return ZeroPadUnpacked1DInPlace(buffer, buffer_capacity, W, itemsize,
+                                      layout);
+    }
+    return TilePacked1DInPlace(buffer, buffer_capacity, W, itemsize, layout);
+  }
+
+  const RowMajorTileGeometry geom = ComputeRowMajorTileGeometry(shape, layout);
+  const int64_t total_tiled_bytes = geom.total_tiled_bytes();
+  if (buffer_capacity < static_cast<size_t>(total_tiled_bytes)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Buffer capacity ", buffer_capacity,
+        " is smaller than required tiled buffer size ", total_tiled_bytes));
+  }
+
+  // The tiled layout is byte-for-byte identical to the linear layout: a single
+  // column of tiles with no padding, or a 1D tensor with tile_H == 1.
+  if (geom.packing_factor == 1 && !geom.has_padding &&
+      (geom.W == geom.tile_W || (geom.H == 1 && geom.tile_H == 1))) {
+    return absl::OkStatus();
+  }
+
+  if (geom.packing_factor == 1 && geom.H == 1) {
+    TileSingleRowInPlace(buffer, geom);
+    return absl::OkStatus();
+  }
+
+  TileRowMajorBandsInPlace(buffer, geom);
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 int64_t GetTiledBufferElements(const xla::Shape& shape) {
@@ -1924,6 +2198,16 @@ absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
 absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
                         const xla::Shape& shape, const xla::Layout& layout,
                         tpu_raiden::NumaThreadPool* pool) {
+  if (src_linear == dst_tiled) {
+    xla::Shape tiled_shape = shape;
+    *tiled_shape.mutable_layout() = layout;
+    int64_t itemsize =
+        xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+    int64_t total_physical_elements = GetTiledBufferElements(tiled_shape);
+    return TileBufferInPlace(dst_tiled, total_physical_elements * itemsize,
+                             shape, layout, pool);
+  }
+
   if (layout.tiles().empty()) {
     const int64_t bytes = xla::ShapeUtil::ByteSizeOf(shape);
     if (bytes > 0) {
@@ -1972,6 +2256,39 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
         return true;
       });
 
+  return absl::OkStatus();
+}
+
+absl::Status TileBufferInPlace(uint8_t* buffer, size_t buffer_capacity,
+                               const xla::Shape& shape,
+                               const xla::Layout& layout,
+                               tpu_raiden::NumaThreadPool* pool) {
+  if (layout.tiles().empty()) {
+    return absl::OkStatus();
+  }
+
+  if (IsStandardRowMajorTiled(shape, layout)) {
+    return TileBufferInPlaceRowMajor(buffer, buffer_capacity, shape, layout,
+                                     pool);
+  }
+
+  xla::Shape tiled_shape = shape;
+  *tiled_shape.mutable_layout() = layout;
+  int64_t itemsize =
+      xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
+  int64_t total_physical_elements = GetTiledBufferElements(tiled_shape);
+  if (buffer_capacity <
+      static_cast<size_t>(total_physical_elements * itemsize)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Buffer capacity ", buffer_capacity,
+                     " is smaller than required tiled buffer size ",
+                     total_physical_elements * itemsize));
+  }
+
+  // Fallback for non-row-major layouts: allocate scratchpad, tile, and copy.
+  std::vector<uint8_t> tmp(total_physical_elements * itemsize);
+  TF_RETURN_IF_ERROR(TileBuffer(buffer, tmp.data(), shape, layout, pool));
+  std::memcpy(buffer, tmp.data(), tmp.size());
   return absl::OkStatus();
 }
 

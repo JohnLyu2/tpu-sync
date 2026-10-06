@@ -426,10 +426,43 @@ def generate_local_shard(
     return np.zeros(tuple(local_dims), dtype=dtype)
 
 
+def compute_global_shard_index(
+    spec_axes: list[str],
+    mesh_shape_dict: dict[str, int],
+    rank: int,
+) -> int:
+  """Computes the global shard index for a single-device tensor on `rank`."""
+  mesh_axes = ["fsdp", "tp"]
+  mesh_dims = [mesh_shape_dict.get(ax, 1) for ax in mesh_axes]
+
+  coords = {}
+  rem = rank
+  for ax, dim in zip(reversed(mesh_axes), reversed(mesh_dims)):
+    coords[ax] = rem % dim
+    rem //= dim
+
+  sharding_shape = [mesh_shape_dict.get(ax, 1) for ax in spec_axes]
+  shard_coords = []
+  for ax in spec_axes:
+    if ax and ax in coords:
+      shard_coords.append(coords[ax])
+    else:
+      shard_coords.append(0)
+
+  global_shard_idx = 0
+  stride = 1
+  for c, s_dim in zip(reversed(shard_coords), reversed(sharding_shape)):
+    global_shard_idx += c * stride
+    stride *= s_dim
+
+  return global_shard_idx
+
+
 def _build_variable_protos(
     specs: list[tuple[tuple[int, ...], list[str], str]],
     mesh_shape_dict: dict[str, int],
     item_size: int,
+    rank: int = 0,
 ) -> tuple[list[raiden_service_pb2.VariableMetadataProto], int]:
   """Builds controller metadata protos and computes total payload bytes."""
   variable_protos = []
@@ -441,6 +474,11 @@ def _build_variable_protos(
     total_bytes += num_elements * item_size
 
     layout = list(range(len(global_shape) - 1, -1, -1))
+    global_shard_idx = compute_global_shard_index(
+        spec_axes=spec_axes,
+        mesh_shape_dict=mesh_shape_dict,
+        rank=rank,
+    )
     variable_protos.append(
         raiden_service_pb2.VariableMetadataProto(
             name=name,
@@ -449,7 +487,7 @@ def _build_variable_protos(
             layout=layout,
             item_size=item_size,
             layer_idx=idx,
-            sharding_spec=spec_axes,
+            global_shard_indices=[global_shard_idx],
         )
     )
 
@@ -561,7 +599,10 @@ def _run_distributed_worker(
       num_layers=num_layers, role=role, tp_size=dst_mesh_dict["tp"]
   )
   protos, total_bytes = _build_variable_protos(
-      specs, mesh_shape_dict=active_mesh_dict, item_size=item_size
+      specs,
+      mesh_shape_dict=active_mesh_dict,
+      item_size=item_size,
+      rank=local_rank,
   )
 
   # Start in-process controller on rank 0
@@ -592,7 +633,7 @@ def _run_distributed_worker(
         device=device,
         dtype=torch_dtype,
     )
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     # Wrap in PyTorch WeightSynchronizer (each rank manages 1 local shard)
     device_tensors = [[t] for t in local_tensors]
@@ -603,6 +644,7 @@ def _run_distributed_worker(
         parallelism=parallelism,
         bind_ip="127.0.0.1",
         auto_h2d=False,
+        global_shard_indices=[local_rank],
     )
 
     skip_tiling_map = _compute_skip_tiling_map(specs)
@@ -623,10 +665,7 @@ def _run_distributed_worker(
         unit=unit_id,
         shards=[f"127.0.0.1:{ws.local_port}"],
         control_plane_rpc_address=f"127.0.0.1:{ws.listener_port}",
-        mesh_shape=[active_mesh_dict.get(ax, 1) for ax in ["fsdp", "tp"]],
         variables=protos,
-        mesh_axes=["fsdp", "tp"],
-        host_subgrid=[1, 1],
     )
 
     # Rank 0 verifies all 8 work units have self-registered
@@ -693,7 +732,7 @@ def _run_distributed_worker(
     if not is_source:
       ws.wait_for_transfer_completion(uuid_warmup)
       ws.h2d()
-      torch.tpu.synchronize()
+      torch.accelerator.synchronize()
 
     dist.barrier()
 
@@ -776,7 +815,7 @@ def _run_distributed_worker(
       t2 = time.perf_counter()
       if not is_source:
         ws.h2d()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       dist.barrier()
       h2d_ms = (time.perf_counter() - t2) * 1000.0
 

@@ -60,6 +60,44 @@ int ConnectLocalhost(int port) {
   return fd;
 }
 
+TEST(TcpControlPipeTest, OnlyConnectFailuresAreMarkedNotSent) {
+  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  ASSERT_EQ(bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+            0);
+  socklen_t len = sizeof(addr);
+  getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
+  const std::string endpoint = absl::StrCat("127.0.0.1:", ntohs(addr.sin_port));
+  ControlPipeConfig cfg;
+  cfg.allow_legacy_framing = false;
+  TcpControlPipeClient client(cfg);
+  PullStreamRequest req;
+
+  // Bound but not listening: connect is refused, nothing was sent.
+  auto refused = client.Call<PullStreamRequest, PullStreamResponse>(
+      endpoint, req, absl::Seconds(5));
+  ASSERT_TRUE(absl::IsUnavailable(refused.status())) << refused.status();
+  EXPECT_TRUE(IsControlPipeNotSent(refused.status()));
+
+  // A peer that reads the request, then dies without replying.
+  ASSERT_EQ(listen(listen_fd, 4), 0);
+  std::thread peer([listen_fd]() {
+    int fd = accept(listen_fd, nullptr, nullptr);
+    char buf[4096];
+    absl::SleepFor(absl::Milliseconds(100));
+    (void)recv(fd, buf, sizeof(buf), 0);
+    close(fd);
+  });
+  auto lost = client.Call<PullStreamRequest, PullStreamResponse>(
+      endpoint, req, absl::Seconds(5));
+  peer.join();
+  close(listen_fd);
+  ASSERT_FALSE(lost.ok());
+  EXPECT_FALSE(IsControlPipeNotSent(lost.status())) << lost.status();
+}
+
 TEST(TcpControlPipeTest, CpipEnvelopeRoundtripAndConnectionPooling) {
   ControlPipeConfig cfg;
   cfg.enable_tcp_connection_pooling = true;

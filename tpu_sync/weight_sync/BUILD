@@ -30,10 +30,12 @@ cc_library(
         "//tpu_sync/core:numa_thread_pool",
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
         "@highway//:hwy",
         "@xla//xla:shape_util",
         "@xla//xla:util",
+        "@xla//xla/tsl/platform:errors",
     ],
 )
 
@@ -55,7 +57,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":tiling_utils",
-        "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/common:trace",
         "//tpu_sync/common/control_pipe",
         "//tpu_sync/core:host_memory_allocator",
@@ -71,6 +72,7 @@ cc_library(
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib:test_only_rate_limiter",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -109,6 +111,7 @@ cc_test(
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport/lib:test_only_rate_limiter",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
@@ -120,6 +123,7 @@ cc_test(
         "@xla//xla:shape_util",
         "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )
 
@@ -201,6 +205,31 @@ py_test(
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
+    ],
+)
+
+py_test(
+    name = "weight_sync_tp_mismatch_torch_test",
+    size = "medium",
+    srcs = ["weight_sync_tp_mismatch_test.py"],
+    args = ["--framework=torch"],
+    main = "weight_sync_tp_mismatch_test.py",
+    tags = [
+        "cpu:4",
+        "no_oss",
+        "requires-mem:16g",
+    ],
+    deps = [
+        "//tpu_sync/api:common",
+        "//tpu_sync/api/torch:weight_synchronizer_torch_py",
+        "//tpu_sync/rpc:raiden_controller",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/logging",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@com_google_absl_py//absl/testing:parameterized",
+        "@pypi//numpy",
+        "@torch_tpu//shims/torch:pytorch",
     ],
 )
 

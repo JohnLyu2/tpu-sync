@@ -113,6 +113,12 @@ double DurationMs(std::chrono::steady_clock::time_point start,
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+int64_t SteadyNs(std::chrono::steady_clock::time_point t) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             t.time_since_epoch())
+      .count();
+}
+
 }  // namespace
 
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
@@ -213,7 +219,8 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                    : absl::CancelledError(absl::StrCat(
                          "Receive session for uuid=", uuid, " is draining"));
   };
-  hooks.end_incoming_push = [this](uint64_t uuid) -> absl::Status {
+  hooks.end_incoming_push = [this](uint64_t uuid,
+                                   const absl::Status& status) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;
     std::shared_ptr<ReshardReceiveSession> reshard_session;
     {
@@ -229,6 +236,10 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       }
     }
     if (recv_session != nullptr) {
+      if (!status.ok()) {
+        recv_session->DeferUnregisterOnSettle();
+        recv_session->Finish(status);
+      }
       recv_session->EndRecvOp();
       MaybeUnregisterSettledRecv(uuid, *recv_session);
       return !recv_session->GetStatus().ok()
@@ -894,14 +905,10 @@ void KVCacheManagerWithTransfer::StartRead(
   session->ExecutePullRequest(*this, remote_endpoint);
 }
 
-std::tuple<std::vector<std::string>, std::vector<std::string>,
-           std::vector<std::string>>
-KVCacheManagerWithTransfer::CompleteReadRaw() {
-  RAIDEN_TRACE("KVTransfer::CompleteReadRaw");
+CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
+  RAIDEN_TRACE("KVTransfer::CompleteReadWithDetails");
   FaultInjectThrow(hooks::kKvCacheManagerApiCompleteRead);
-  std::vector<std::string> done_sending;
-  std::vector<std::string> done_recving;
-  std::vector<std::string> failed_recving;
+  CompleteReadResult completions;
   std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
   {
     absl::MutexLock lock(mu_);
@@ -919,9 +926,12 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
       if (session->Done()) {
         const bool failed = !session->GetStatus().ok();
         (failed ? failed_recving_ : done_sending_).insert(session->req_id());
+        transfer_details_[session->req_id()].completed_ns =
+            SteadyNs(session->CompletedAt());
         if (failed) {
           settled_plans.emplace_back(uuid, 0);
         }
+        base_->ClearRemoteLayerAddrs(uuid);
         send_sessions_.erase(it++);
       } else {
         ++it;
@@ -971,6 +981,8 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
       if (session->Done()) {
         (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(session->req_id());
+        transfer_details_[session->req_id()].completed_ns =
+            SteadyNs(session->CompletedAt());
         uint64_t generation = 0;
         if (session->TakePendingUnregister(&generation)) {
           settled_plans.emplace_back(uuid, generation);
@@ -1007,9 +1019,10 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
         ++it;
       }
     }
-    done_sending.assign(done_sending_.begin(), done_sending_.end());
-    done_recving.assign(done_recving_.begin(), done_recving_.end());
-    failed_recving.assign(failed_recving_.begin(), failed_recving_.end());
+    completions.sent.assign(done_sending_.begin(), done_sending_.end());
+    completions.received.assign(done_recving_.begin(), done_recving_.end());
+    completions.failed.assign(failed_recving_.begin(), failed_recving_.end());
+    completions.details.swap(transfer_details_);
     done_sending_.clear();
     done_recving_.clear();
     failed_recving_.clear();
@@ -1022,7 +1035,15 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     // still hold bounded-staging arena slots.
     base_->ReleasePoolStagingLeases(uuid);
   }
-  return {done_sending, done_recving, failed_recving};
+  return completions;
+}
+
+std::tuple<std::vector<std::string>, std::vector<std::string>,
+           std::vector<std::string>>
+KVCacheManagerWithTransfer::CompleteReadRaw() {
+  CompleteReadResult completions = CompleteReadWithDetails();
+  return {std::move(completions.sent), std::move(completions.received),
+          std::move(completions.failed)};
 }
 
 StagingBlockAllocator::Allocation::Allocation(StagingBlockAllocator* allocator,
@@ -1451,6 +1472,7 @@ KVCacheManagerWithTransfer::HandlePullStream(
       // grace.
       session->ValidateAndBeginPull(req.src_block_ids,
                                     std::chrono::steady_clock::now());
+      base_->SetRemoteLayerAddrs(req.uuid, req.layer_host_addrs);
     }
 
     std::vector<std::string> peer_ips = req.consumer_ips;

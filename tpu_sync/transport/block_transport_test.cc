@@ -23,7 +23,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -35,6 +34,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
 #include "absl/status/status.h"
@@ -59,8 +59,11 @@
 #include "tpu_sync/telemetry/prometheus_exporter.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/chunk.h"
+#include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -257,6 +260,19 @@ class MockDelegate : public BlockTransportDelegate {
     return wait_events_;
   }
 
+  absl::Status EndIncomingPush(
+      uint64_t uuid, const absl::Status& status = absl::OkStatus()) override {
+    (void)uuid;
+    absl::MutexLock lock(end_status_mu_);
+    last_end_incoming_push_status_ = status;
+    return absl::OkStatus();
+  }
+
+  absl::Status last_end_incoming_push_status() const {
+    absl::MutexLock lock(end_status_mu_);
+    return last_end_incoming_push_status_;
+  }
+
  private:
   size_t BufferIndex(size_t layer_idx, size_t shard_idx) const {
     return layer_idx * num_shards_ + shard_idx;
@@ -278,6 +294,8 @@ class MockDelegate : public BlockTransportDelegate {
   std::atomic<int> pool_completion_count_{0};
   absl::Mutex wait_events_mu_;
   std::vector<std::tuple<size_t, size_t, int>> wait_events_;
+  mutable absl::Mutex end_status_mu_;
+  absl::Status last_end_incoming_push_status_ ABSL_GUARDED_BY(end_status_mu_);
   mutable absl::Mutex peer_channels_mu_;
   std::shared_ptr<grpc::Channel> default_channel_
       ABSL_GUARDED_BY(peer_channels_mu_);
@@ -416,20 +434,24 @@ TEST_P(BlockTransportTest, PoolModeReceiverRejectsPlanlessExplicitPush) {
   // Explicit destination (op=6) without a registered plan: the pool-mode
   // receiver drops the push before any payload byte lands in its mirror.
   auto rejected =
-      sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
-                      /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
-                      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/77,
-                      /*layer_idx=*/-1);
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/77,
+                     /*layer_idx=*/-1)
+          .Await();
   EXPECT_FALSE(rejected.ok());
   EXPECT_EQ(receiver_delegate.data()[0], 0x00);
 
   // The plan-less legacy contract (receiver-allocated destinations) is
   // untouched.
   auto legacy =
-      sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
-                      /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
-                      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
-                      /*layer_idx=*/-1);
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await();
   ASSERT_TRUE(legacy.ok()) << legacy.status().message();
   EXPECT_EQ(receiver_delegate.data()[0], 0xAB);
 }
@@ -450,10 +472,13 @@ TEST_P(BlockTransportTest, PushAndPullCorrectness) {
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
   // Push block 0 from transport1 to transport2
-  auto push_res = transport1.SyncPush(
-      {absl::StrCat("localhost:", transport2.local_port())},
-      /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
-      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+  auto push_res =
+      transport1
+          .AsyncPush({absl::StrCat("localhost:", transport2.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await();
   ASSERT_TRUE(push_res.ok()) << push_res.status().message();
 
   // Verify push parity
@@ -525,17 +550,13 @@ TEST_P(BlockTransportTest, PushNamesTheReceiversArrayByWireLayerIndex) {
 
   // Chunks come from the sender's array 0; the wire names the receiver's
   // array 1.
-  std::promise<absl::StatusOr<std::vector<int>>> promise;
-  auto future = promise.get_future();
-  sender.AsyncPush(
-      {absl::StrCat("localhost:", receiver.local_port())},
-      /*src_block_ids=*/{0}, /*dst_block_ids=*/{0}, /*parallelism=*/1,
-      MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/0,
-      [&promise](absl::StatusOr<std::vector<int>> res) {
-        promise.set_value(std::move(res));
-      },
-      /*wire_layer_idx=*/1);
-  auto pushed = future.get();
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/0, /*wire_layer_idx=*/1)
+          .Await();
   ASSERT_TRUE(pushed.ok()) << pushed.status().message();
 
   EXPECT_EQ(receiver_delegate.data(1)[0], 0xAB);
@@ -702,11 +723,14 @@ TEST_P(BlockTransportTest, SamePeerFanoutFiltersEachDestinationStream) {
   BindControlChannels(&sender_transport, &sender, &receiver_transport,
                       &receiver);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  auto result = sender_transport.SyncPush(
-      {absl::StrCat("localhost:", receiver_transport.local_port())},
-      /*src_block_ids=*/{0, 0, 0, 0},
-      /*dst_block_ids=*/{0, 1, 2, 3}, /*parallelism=*/4,
-      MajorOrder::kLayerMajor, /*uuid=*/901, /*layer_idx=*/0);
+  auto result =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0, 0, 0, 0},
+              /*dst_block_ids=*/{0, 1, 2, 3}, /*parallelism=*/4,
+              MajorOrder::kLayerMajor, /*uuid=*/901, /*layer_idx=*/0)
+          .Await();
 
   ASSERT_TRUE(result.ok()) << result.status();
   ASSERT_EQ(*result, std::vector<int>({0, 1, 2, 3}));
@@ -739,9 +763,11 @@ TEST_P(BlockTransportTest, LayerCompletesOnlyAfterEveryDeclaredSender) {
   sender_b.SetPeerChannel(peer, ch_recv);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   auto push_layer = [&](BlockTransport& transport, int layer_idx) {
-    return transport.SyncPush({peer}, /*src_block_ids=*/{0},
-                              /*dst_block_ids=*/{0}, /*parallelism=*/1,
-                              MajorOrder::kLayerMajor, kUuid, layer_idx);
+    return transport
+        .AsyncPush({peer}, /*src_block_ids=*/{0},
+                   /*dst_block_ids=*/{0}, /*parallelism=*/1,
+                   MajorOrder::kLayerMajor, kUuid, layer_idx)
+        .Await();
   };
 
   // One sender's full push of a layer must not complete it.
@@ -786,15 +812,17 @@ TEST_P(BlockTransportTest, DeclaredSendersEachCompleteTheirOwnParallelism) {
 
   // Sender A splits its two blocks over two streams; sender B uses one.
   ASSERT_TRUE(a_transport
-                  .SyncPush({peer}, /*src_block_ids=*/{0, 1},
-                            /*dst_block_ids=*/{0, 1}, /*parallelism=*/2,
-                            MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                  .AsyncPush({peer}, /*src_block_ids=*/{0, 1},
+                             /*dst_block_ids=*/{0, 1}, /*parallelism=*/2,
+                             MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                  .Await()
                   .ok());
   EXPECT_EQ(receiver.layer_completion_count(), 0);
   ASSERT_TRUE(b_transport
-                  .SyncPush({peer}, /*src_block_ids=*/{0, 1},
-                            /*dst_block_ids=*/{0, 1}, /*parallelism=*/1,
-                            MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                  .AsyncPush({peer}, /*src_block_ids=*/{0, 1},
+                             /*dst_block_ids=*/{0, 1}, /*parallelism=*/1,
+                             MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                  .Await()
                   .ok());
   EXPECT_EQ(receiver.layer_completion_count(), 1);
 }
@@ -821,9 +849,11 @@ TEST_P(BlockTransportTest, SenderOverDeliveryIsRejected) {
   sender_b.SetPeerChannel(peer, ch_recv);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   auto push_layer = [&](BlockTransport& transport, int layer_idx) {
-    return transport.SyncPush({peer}, /*src_block_ids=*/{0},
-                              /*dst_block_ids=*/{0}, /*parallelism=*/1,
-                              MajorOrder::kLayerMajor, kUuid, layer_idx);
+    return transport
+        .AsyncPush({peer}, /*src_block_ids=*/{0},
+                   /*dst_block_ids=*/{0}, /*parallelism=*/1,
+                   MajorOrder::kLayerMajor, kUuid, layer_idx)
+        .Await();
   };
 
   ASSERT_TRUE(push_layer(a_transport, 0).ok());
@@ -855,16 +885,18 @@ TEST_P(BlockTransportTest, SenderChangingDeclaredStreamCountIsRejected) {
 
   // Sender A declares one stream for the array ...
   ASSERT_TRUE(a_transport
-                  .SyncPush({peer}, /*src_block_ids=*/{0},
-                            /*dst_block_ids=*/{0}, /*parallelism=*/1,
-                            MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                  .AsyncPush({peer}, /*src_block_ids=*/{0},
+                             /*dst_block_ids=*/{0}, /*parallelism=*/1,
+                             MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                  .Await()
                   .ok());
   EXPECT_EQ(receiver.layer_completion_count(), 0);
   // ... and then pushes the same array again declaring two.
   EXPECT_FALSE(a_transport
-                   .SyncPush({peer}, /*src_block_ids=*/{0, 1},
-                             /*dst_block_ids=*/{0, 1}, /*parallelism=*/2,
-                             MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                   .AsyncPush({peer}, /*src_block_ids=*/{0, 1},
+                              /*dst_block_ids=*/{0, 1}, /*parallelism=*/2,
+                              MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                   .Await()
                    .ok());
   EXPECT_EQ(receiver.layer_completion_count(), 0);
 }
@@ -890,10 +922,12 @@ TEST_P(BlockTransportTest, UndeclaredUuidKeepsHeaderDeclaredCompletion) {
   sender_b.SetPeerChannel(peer, ch_recv);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   auto push = [&](BlockTransport& transport) {
-    return transport.SyncPush({peer}, /*src_block_ids=*/{0},
-                              /*dst_block_ids=*/{0}, /*parallelism=*/1,
-                              MajorOrder::kLayerMajor, kUuid,
-                              /*layer_idx=*/0);
+    return transport
+        .AsyncPush({peer}, /*src_block_ids=*/{0},
+                   /*dst_block_ids=*/{0}, /*parallelism=*/1,
+                   MajorOrder::kLayerMajor, kUuid,
+                   /*layer_idx=*/0)
+        .Await();
   };
 
   // Without a declared sender count each push completes the layer by itself.
@@ -915,10 +949,12 @@ TEST_P(BlockTransportTest, ForgetPushProgressAllowsUuidReuse) {
                       &receiver);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   auto push_layer = [&](int layer_idx) {
-    return sender_transport.SyncPush(
-        {absl::StrCat("localhost:", receiver_transport.local_port())},
-        /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
-        /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid, layer_idx);
+    return sender_transport
+        .AsyncPush(
+            {absl::StrCat("localhost:", receiver_transport.local_port())},
+            /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+            /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid, layer_idx)
+        .Await();
   };
 
   ASSERT_TRUE(push_layer(0).ok());
@@ -950,10 +986,12 @@ TEST_P(BlockTransportTest,
                       &receiver);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   auto push_pool = [&](int pool_idx) {
-    return sender_transport.SyncPush(
-        {absl::StrCat("localhost:", receiver_transport.local_port())},
-        /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
-        /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid, pool_idx);
+    return sender_transport
+        .AsyncPush(
+            {absl::StrCat("localhost:", receiver_transport.local_port())},
+            /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+            /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid, pool_idx)
+        .Await();
   };
 
   ASSERT_TRUE(push_pool(0).ok());
@@ -986,10 +1024,12 @@ TEST_P(BlockTransportTest, ForgetPushProgressResetsPartialPoolGeneration) {
                       &receiver);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   auto push_once = [&]() {
-    return sender_transport.SyncPush(
-        {absl::StrCat("localhost:", receiver_transport.local_port())},
-        /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
-        /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0);
+    return sender_transport
+        .AsyncPush(
+            {absl::StrCat("localhost:", receiver_transport.local_port())},
+            /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+            /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+        .Await();
   };
 
   ASSERT_TRUE(push_once().ok());
@@ -1042,9 +1082,9 @@ TEST_P(BlockTransportTest, RoundRobinDistribution) {
   MockBlockTransport transport(&delegate, 0, local_ips);
 
   std::vector<int> src_blocks = {0, 1, 2, 3, 4, 5};
-  auto res = transport.SyncPush(peers, src_blocks, /*dst_block_ids=*/{},
+  auto res = transport.AsyncPush(peers, src_blocks, /*dst_block_ids=*/{},
                                 /*parallelism=*/6, MajorOrder::kLayerMajor,
-                                /*uuid=*/0, /*layer_idx=*/-1);
+                                /*uuid=*/0, /*layer_idx=*/-1).Await();
 
   EXPECT_FALSE(res.ok());
   EXPECT_EQ(res.status().message(), "mock_connection_halt");
@@ -1087,10 +1127,13 @@ TEST_P(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
   BlockTransport transport2(&delegate2, 0);
   BindControlChannels(&transport1, &delegate1, &transport2, &delegate2);
 
-  auto push_res = transport1.SyncPush(
-      {absl::StrCat("localhost:", transport2.local_port())},
-      /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
-      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+  auto push_res =
+      transport1
+          .AsyncPush({absl::StrCat("localhost:", transport2.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await();
   ABSL_ASSERT_OK(push_res);
 
   constexpr absl::string_view kExpectedPushMetric =
@@ -1133,10 +1176,13 @@ TEST_P(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
   BlockTransport transport2(&delegate2, 0);
   BindControlChannels(&transport1, &delegate1, &transport2, &delegate2);
 
-  auto push_res = transport1.SyncPush(
-      {absl::StrCat("localhost:", transport2.local_port())},
-      /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
-      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+  auto push_res =
+      transport1
+          .AsyncPush({absl::StrCat("localhost:", transport2.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await();
   ABSL_ASSERT_OK(push_res);
 
   constexpr absl::string_view kExpectedPushMetric =
@@ -1171,9 +1217,13 @@ TEST_P(BlockTransportTest, TransferFailuresTelemetryPushValidationFailures) {
   BlockTransport transport(&delegate, 0);
 
   // 1. Empty block list (memory error)
-  absl::StatusOr<std::vector<int>> res1 = transport.SyncPush(
-      {"localhost:1234"}, /*src_block_ids=*/{}, /*dst_block_ids=*/{},
-      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+  absl::StatusOr<std::vector<int>> res1 =
+      transport
+          .AsyncPush({"localhost:1234"}, /*src_block_ids=*/{},
+                     /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await();
   EXPECT_THAT(res1, StatusIs(absl::StatusCode::kInvalidArgument));
 
   constexpr absl::string_view kExpectedError1 =
@@ -1183,9 +1233,13 @@ TEST_P(BlockTransportTest, TransferFailuresTelemetryPushValidationFailures) {
               HasSubstr(kExpectedError1));
 
   // 2. Empty peers list (memory error)
-  absl::StatusOr<std::vector<int>> res2 = transport.SyncPush(
-      /*peers=*/{}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
-      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+  absl::StatusOr<std::vector<int>> res2 =
+      transport
+          .AsyncPush(
+              /*peers=*/{}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+              /*layer_idx=*/-1)
+          .Await();
   EXPECT_THAT(res2, StatusIs(absl::StatusCode::kInvalidArgument));
 
   constexpr absl::string_view kExpectedError2 =
@@ -1195,9 +1249,13 @@ TEST_P(BlockTransportTest, TransferFailuresTelemetryPushValidationFailures) {
               HasSubstr(kExpectedError2));
 
   // 3. Invalid parallelism (P <= 0)
-  absl::StatusOr<std::vector<int>> res3 = transport.SyncPush(
-      {"localhost:1234"}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
-      /*parallelism=*/0, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+  absl::StatusOr<std::vector<int>> res3 =
+      transport
+          .AsyncPush({"localhost:1234"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{},
+                     /*parallelism=*/0, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await();
   EXPECT_THAT(res3, StatusIs(absl::StatusCode::kInvalidArgument));
 
   constexpr absl::string_view kExpectedError3 =
@@ -1217,9 +1275,13 @@ TEST_P(BlockTransportTest, TransferFailuresTelemetryPushTransferFailure) {
       grpc::CreateChannel("localhost:1", grpc::InsecureChannelCredentials()));
   BlockTransport transport(&delegate, 0);
 
-  absl::StatusOr<std::vector<int>> res = transport.SyncPush(
-      {"localhost:1"}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
-      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+  absl::StatusOr<std::vector<int>> res =
+      transport
+          .AsyncPush({"localhost:1"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await();
   EXPECT_THAT(res, StatusIs(absl::StatusCode::kUnavailable));
 
   constexpr absl::string_view kExpectedError =
@@ -1388,11 +1450,13 @@ TEST_P(BlockTransportTest, NoTransferFailuresTelemetryOnSuccess) {
   BindControlChannels(&transport1, &delegate1, &transport2, &delegate2);
 
   ABSL_ASSERT_OK(
-      transport1.SyncPush({absl::StrCat("localhost:", transport2.local_port())},
-                          /*src_block_ids=*/{0},
-                          /*dst_block_ids=*/{},
-                          /*parallelism=*/1, MajorOrder::kLayerMajor,
-                          /*uuid=*/0, /*layer_idx=*/-1));
+      transport1
+          .AsyncPush({absl::StrCat("localhost:", transport2.local_port())},
+                     /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor,
+                     /*uuid=*/0, /*layer_idx=*/-1)
+          .Await());
 
   ABSL_ASSERT_OK(
       transport2.SyncPull({absl::StrCat("localhost:", transport1.local_port())},
@@ -1435,10 +1499,12 @@ TEST_P(BlockTransportTest, MultiShardPushBlockMajor) {
                       &receiver_delegate);
 
   ABSL_ASSERT_OK(
-      sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
-                      /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
-                      /*parallelism=*/1, MajorOrder::kBlockMajor, /*uuid=*/0,
-                      /*layer_idx=*/-1));
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
+                     /*parallelism=*/1, MajorOrder::kBlockMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await());
 
   for (size_t l = 0; l < kNumLayers; ++l) {
     for (size_t sh = 0; sh < kNumShards; ++sh) {
@@ -1479,10 +1545,12 @@ TEST_P(BlockTransportTest, MultiShardPushLayerMajor) {
                       &receiver_delegate);
 
   ABSL_ASSERT_OK(
-      sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
-                      /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
-                      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
-                      /*layer_idx=*/-1));
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await());
 
   for (size_t l = 0; l < kNumLayers; ++l) {
     for (size_t sh = 0; sh < kNumShards; ++sh) {
@@ -1644,6 +1712,128 @@ TEST_P(BlockTransportTest, PollEINTRIsBenign) {
       /*dst_offset_bytes=*/kDstOffset, push_payload.data(), push_payload.size(),
       /*uuid=*/0);
   ABSL_EXPECT_OK(push_res) << push_res.message();
+}
+
+TEST(DecodeReadTimeoutTest, TimeoutConfigFromEnv) {
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  });
+  MockDelegate delegate(/*slice_size=*/64);
+
+  unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+  }
+
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "1.5", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "12.5", 1);
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.handshake_read_timeout(), absl::Milliseconds(1500));
+    EXPECT_EQ(transport.payload_read_timeout(), absl::Milliseconds(12500));
+  }
+
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "-3", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "invalid", 1);
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+  }
+}
+
+TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "0.1", 1);
+
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/2);
+  BlockTransport receiver(&delegate, /*local_port=*/0);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      int fd,
+      lib::ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
+  auto close_fd = absl::MakeCleanup([fd] { close(fd); });
+
+  // Send an Op 6 header for 2 blocks, then stall before sending block IDs.
+  lib::ChunkHeader header = {};
+  header.version = 1;
+  header.op = 6;
+  header.flags = static_cast<uint8_t>(MajorOrder::kLayerMajor);
+  header.reserved = 1;
+  header.local_id = 0;
+  header.count_or_size = 2;
+  header.uuid = 77;
+  const auto s_header = lib::SerializeChunkHeader(header);
+  ASSERT_EQ(::send(fd, s_header.data(), s_header.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_header.size()));
+
+  uint8_t ack = 0;
+  EXPECT_THAT(lib::ReadExactWithTimeout(fd, &ack, 1, absl::Seconds(2)),
+              StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
+  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
+}
+
+TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  });
+  setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "1.0", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "0.1", 1);
+
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/2);
+  BlockTransport receiver(&delegate, /*local_port=*/0);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      int fd,
+      lib::ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
+  auto close_fd = absl::MakeCleanup([fd] { close(fd); });
+
+  // Complete the Op 6 handshake for 1 block, then stall mid-payload.
+  lib::ChunkHeader header = {};
+  header.version = 1;
+  header.op = 6;
+  header.flags = static_cast<uint8_t>(MajorOrder::kLayerMajor);
+  header.reserved = 1;
+  header.local_id = 0;
+  header.count_or_size = 1;
+  header.uuid = 88;
+  const auto s_header = lib::SerializeChunkHeader(header);
+  ASSERT_EQ(::send(fd, s_header.data(), s_header.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_header.size()));
+
+  const int bid = 0;
+  const auto s_ids = lib::SerializeBlockIds(absl::MakeConstSpan(&bid, 1));
+  ASSERT_EQ(::send(fd, s_ids.data(), s_ids.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_ids.size()));
+  ASSERT_EQ(::send(fd, s_ids.data(), s_ids.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_ids.size()));
+
+  uint8_t handshake_ack = 0;
+  ABSL_ASSERT_OK(
+      lib::ReadExactWithTimeout(fd, &handshake_ack, 1, absl::Seconds(2)));
+  EXPECT_EQ(handshake_ack, 1);
+
+  // Send the 4-byte chunk size (64 bytes) and only 16 bytes of payload, then
+  // stall.
+  const auto s_size = lib::SerializeChunkSize(64);
+  ASSERT_EQ(::send(fd, s_size.data(), s_size.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_size.size()));
+  const std::vector<uint8_t> partial_payload(16, 0x5A);
+  ASSERT_EQ(
+      ::send(fd, partial_payload.data(), partial_payload.size(), MSG_NOSIGNAL),
+      16);
+
+  uint8_t final_ack = 0;
+  EXPECT_THAT(lib::ReadExactWithTimeout(fd, &final_ack, 1, absl::Seconds(2)),
+              StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
 
 INSTANTIATE_TEST_SUITE_P(

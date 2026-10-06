@@ -93,7 +93,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip,
           raiden::DetectNumaNodes(layer_buffers)),
-      auto_h2d_(auto_h2d) {
+      auto_h2d_(auto_h2d),
+      push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max(parallelism_, 4))) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
     for (size_t i = 0; i < num_layers_; ++i) {
@@ -226,11 +228,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
         std::make_unique<WeightSynchronizerListener>(this, *listener_port);
   }
   if (auto_h2d_) {
-    h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
+    h2d_pool_ =
+        std::make_unique<tpu_raiden::NumaThreadPool>(std::max(parallelism_, 4));
   }
-  push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-      std::max(parallelism_, 4));
 
   tiled_scratchpads_.reserve(num_shards_);
   for (size_t i = 0; i < num_shards_; ++i) {
@@ -270,7 +270,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           num_layers, num_shards,
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
           parallelism, bind_ip),
-      auto_h2d_(auto_h2d) {
+      auto_h2d_(auto_h2d),
+      push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max(parallelism_, 4))) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
     for (size_t i = 0; i < num_layers_; ++i) {
@@ -323,11 +325,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
         std::make_unique<WeightSynchronizerListener>(this, *listener_port);
   }
   if (auto_h2d_) {
-    h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
+    h2d_pool_ =
+        std::make_unique<tpu_raiden::NumaThreadPool>(std::max(parallelism_, 4));
   }
-  push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-      std::max(parallelism_, 4));
 
   tiled_scratchpads_.reserve(num_shards_);
   for (size_t i = 0; i < num_shards_; ++i) {
@@ -466,132 +466,293 @@ void WeightSynchronizerBase::UpdateAllocatedOccupancyMetric(size_t delta) {
       static_cast<double>(total));
 }
 
+std::vector<bool> WeightSynchronizerBase::GetActiveSkipTiling(uint64_t uuid) {
+  absl::MutexLock lock(skip_tiling_mu_);
+  if (uuid != 0) {
+    auto it = uuid_to_skip_tiling_.find(uuid);
+    if (it != uuid_to_skip_tiling_.end() && !it->second.empty()) {
+      return it->second;
+    }
+  }
+  if (!latest_skip_tiling_.empty()) {
+    return latest_skip_tiling_;
+  }
+  return std::vector<bool>(num_layers_, false);
+}
+
+namespace {
+
+bool HasTiledLayout(const xla::Shape& shape) {
+  return shape.has_layout() && !shape.layout().tiles().empty();
+}
+
+}  // namespace
+
+absl::StatusOr<WeightSynchronizerBase::ShardScratchpad*>
+WeightSynchronizerBase::GetTiledScratchpad(size_t shard_idx) {
+  if (shard_idx >= tiled_scratchpads_.size() ||
+      !tiled_scratchpads_[shard_idx]) {
+    return absl::InternalError("Shard index out of range for scratchpad");
+  }
+  return tiled_scratchpads_[shard_idx].get();
+}
+
+absl::StatusOr<absl::Span<const uint8_t>>
+WeightSynchronizerBase::TileShardLocked(size_t layer_idx, size_t shard_idx,
+                                        ShardScratchpad& sp) {
+  const auto& shard_info = layers_[layer_idx].shards[shard_idx];
+  const auto& shard_hold = buffer_holds_[layer_idx][shard_idx];
+  const size_t physical_bytes =
+      tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
+      xla::ShapeUtil::ByteSizeOfPrimitiveType(shard_hold.shape.element_type());
+  TF_ASSIGN_OR_RETURN(
+      uint8_t* tiled_buffer_ptr,
+      AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
+  if (tiled_buffer_ptr == nullptr) {
+    return absl::InternalError("Tiled buffer pointer is null for tiled shape");
+  }
+  const absl::Time tile_start = absl::Now();
+  TF_RETURN_IF_ERROR(tpu_raiden::weight_sync::TileBuffer(
+      shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape,
+      shard_hold.shape.layout(), /*pool=*/nullptr));
+  const double tile_time_ms =
+      absl::ToDoubleMilliseconds(absl::Now() - tile_start);
+  {
+    absl::MutexLock metrics_lock(metrics_mu_);
+    metrics_.last_tiling_time_ms =
+        std::max(metrics_.last_tiling_time_ms, tile_time_ms);
+    metrics_.total_tiling_time_ms += tile_time_ms;
+    metrics_.last_tiled_bytes += physical_bytes;
+    metrics_.total_tiled_bytes += physical_bytes;
+  }
+  return absl::Span<const uint8_t>(tiled_buffer_ptr, physical_bytes);
+}
+
+absl::StatusOr<xla::Future<raiden::BufferHolder>>
+WeightSynchronizerBase::H2dShard(size_t layer_idx, size_t shard_idx,
+                                 bool tile) {
+  const auto& shard_info = layers_[layer_idx].shards[shard_idx];
+  const auto& shard_hold = buffer_holds_[layer_idx][shard_idx];
+  const bool is_tiled = tile && HasTiledLayout(shard_hold.shape);
+  VLOG(1) << "[WeightSynchronizerBase] H2dLayer " << layer_idx << " shard "
+          << shard_idx << " (layer: "
+          << (layer_idx < layer_names_.size() ? layer_names_[layer_idx]
+                                              : "unknown")
+          << ", is_tiled=" << is_tiled << ", tile=" << tile
+          << ", shape=" << shard_hold.shape.ToString()
+          << ", size=" << shard_info.device_size << " bytes)";
+
+  std::vector<xla::Future<>> shard_futures;
+  if (is_tiled) {
+    TF_ASSIGN_OR_RETURN(ShardScratchpad * sp, GetTiledScratchpad(shard_idx));
+    absl::MutexLock lock(sp->mu);
+    TF_ASSIGN_OR_RETURN(absl::Span<const uint8_t> tiled,
+                        TileShardLocked(layer_idx, shard_idx, *sp));
+    // The scratchpad is reused once this copy completes; see
+    // AcquireTiledScratchpadLocked().
+    xla::Future<> future =
+        shard_hold.CopyRawHostToDevice(tiled.data(), 0, tiled.size());
+    sp->in_flight_future = future;
+    shard_futures.push_back(std::move(future));
+  } else {
+    shard_futures.push_back(shard_hold.CopyRawHostToDevice(
+        shard_info.host_ptr, 0, shard_info.device_size));
+  }
+  return raiden::CreateBufferFuture(std::move(shard_futures), shard_hold.c_hold,
+                                    shard_hold.common_hold);
+}
+
+bool WeightSynchronizerBase::IsTilingSkipped(size_t layer_idx, uint64_t uuid) {
+  const std::vector<bool> skip = GetActiveSkipTiling(uuid);
+  return layer_idx < skip.size() && skip[layer_idx];
+}
+
+tpu_sync::rpc::HostTilingMode WeightSynchronizerBase::GetReceiverTiling(
+    uint64_t uuid) {
+  absl::MutexLock lock(skip_tiling_mu_);
+  auto it = receiver_tiling_.find(uuid);
+  return it == receiver_tiling_.end() ? tpu_sync::rpc::HOST_TILING_MODE_DEFERRED
+                                      : it->second;
+}
+
+absl::Status WeightSynchronizerBase::TileLayer(size_t layer_idx,
+                                               uint64_t uuid) {
+  if (buffer_holds_.empty() || layer_idx >= num_layers_ ||
+      IsTilingSkipped(layer_idx, uuid)) {
+    return absl::OkStatus();
+  }
+  for (size_t i = 0; i < num_shards_; ++i) {
+    const auto& shard_hold = buffer_holds_[layer_idx][i];
+    if (!HasTiledLayout(shard_hold.shape)) continue;
+    TF_ASSIGN_OR_RETURN(ShardScratchpad * sp, GetTiledScratchpad(i));
+    absl::MutexLock lock(sp->mu);
+    TF_ASSIGN_OR_RETURN(absl::Span<const uint8_t> tiled,
+                        TileShardLocked(layer_idx, i, *sp));
+    std::memcpy(const_cast<uint8_t*>(layers_[layer_idx].shards[i].host_ptr),
+                tiled.data(), tiled.size());
+  }
+  return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::LayerTileReady::Set(absl::Status status) {
+  absl::MutexLock lock(mu_);
+  if (done_) return;
+  status_ = std::move(status);
+  done_ = true;
+}
+
+absl::Status WeightSynchronizerBase::LayerTileReady::Wait() {
+  absl::MutexLock lock(mu_);
+  while (!mu_.AwaitWithTimeout(absl::Condition(&done_), absl::Seconds(60))) {
+    LOG(WARNING) << "Still waiting for a received layer to be ready on host";
+  }
+  return status_;
+}
+
+bool WeightSynchronizerBase::LayerTileReady::IsSet() {
+  absl::MutexLock lock(mu_);
+  return done_;
+}
+
+void WeightSynchronizerBase::SetLayerTileReady(
+    size_t layer_idx, std::shared_ptr<LayerTileReady> ready) {
+  if (layer_idx >= num_layers_) return;
+  absl::MutexLock lock(tile_ready_mu_);
+  layer_tile_ready_.resize(num_layers_);
+  layer_tile_ready_[layer_idx] = std::move(ready);
+}
+
+void WeightSynchronizerBase::MarkHostBufferUntiled() {
+  absl::MutexLock lock(tile_ready_mu_);
+  layer_tile_ready_.assign(num_layers_, nullptr);
+}
+
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
-    size_t layer_idx, uint64_t uuid) {
+    size_t layer_idx, bool tile) {
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before H2d.");
+  }
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
-  std::vector<bool> active_skip;
-  {
-    absl::MutexLock lock(skip_tiling_mu_);
-    if (uuid != 0) {
-      auto it = uuid_to_skip_tiling_.find(uuid);
-      if (it != uuid_to_skip_tiling_.end()) {
-        active_skip = it->second;
-      }
-    }
-    if (active_skip.empty()) {
-      if (!latest_skip_tiling_.empty()) {
-        active_skip = latest_skip_tiling_;
-      } else {
-        active_skip = std::vector<bool>(num_layers_, false);
-      }
-    }
-  }
-
-  auto& layer_info = layers_[layer_idx];
-  const auto& layer_holds = buffer_holds_[layer_idx];
   std::vector<xla::Future<raiden::BufferHolder>> shard_futures_to_join;
-
+  shard_futures_to_join.reserve(num_shards_);
   for (size_t i = 0; i < num_shards_; ++i) {
-    auto& shard_info = layer_info.shards[i];
-    const auto& shard_hold = layer_holds[i];
-
-    const xla::Layout* xla_layout = nullptr;
-    if (shard_hold.shape.has_layout()) {
-      xla_layout = &shard_hold.shape.layout();
-    }
-    bool is_tiled = xla_layout && !xla_layout->tiles().empty();
-    bool skip_flag = layer_idx < active_skip.size() && active_skip[layer_idx];
-    if (skip_flag) {
-      is_tiled = false;
-    }
-    VLOG(1) << "[WeightSynchronizerBase] H2dLayer " << layer_idx << " shard "
-            << i << " (layer: "
-            << (layer_idx < layer_names_.size() ? layer_names_[layer_idx]
-                                                : "unknown")
-            << ", is_tiled=" << is_tiled << ", skip_flag=" << skip_flag
-            << ", shape=" << shard_hold.shape.ToString()
-            << ", size=" << shard_info.device_size << " bytes)";
-
-    std::vector<xla::Future<>> shard_futures;
-    if (is_tiled) {
-      int64_t itemsize = xla::ShapeUtil::ByteSizeOfPrimitiveType(
-          shard_hold.shape.element_type());
-      size_t physical_bytes =
-          tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
-          itemsize;
-
-      if (i >= tiled_scratchpads_.size() || !tiled_scratchpads_[i]) {
-        return absl::InternalError("Shard index out of range for scratchpad");
-      }
-      auto& sp = *tiled_scratchpads_[i];
-      absl::MutexLock lock(sp.mu);
-      TF_ASSIGN_OR_RETURN(
-          uint8_t* tiled_buffer_ptr,
-          AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
-      if (tiled_buffer_ptr == nullptr) {
-        return absl::InternalError(
-            "Tiled buffer pointer is null for tiled shape");
-      }
-      auto tile_start = absl::Now();
-      auto status = tpu_raiden::weight_sync::TileBuffer(
-          shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout,
-          /*pool=*/nullptr);
-      if (!status.ok()) {
-        return status;
-      }
-      double tile_time_ms =
-          absl::ToDoubleMilliseconds(absl::Now() - tile_start);
-      {
-        absl::MutexLock metrics_lock(metrics_mu_);
-        metrics_.last_tiling_time_ms =
-            std::max(metrics_.last_tiling_time_ms, tile_time_ms);
-        metrics_.total_tiling_time_ms += tile_time_ms;
-        metrics_.last_tiled_bytes += physical_bytes;
-        metrics_.total_tiled_bytes += physical_bytes;
-      }
-
-      xla::Future<> future =
-          shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, physical_bytes);
-      sp.in_flight_future = future;
-      shard_futures.push_back(future);
-    } else {
-      xla::Future<> future = shard_hold.CopyRawHostToDevice(
-          shard_info.host_ptr, 0, shard_info.device_size);
-      shard_futures.push_back(std::move(future));
-    }
-    shard_futures_to_join.push_back(raiden::CreateBufferFuture(
-        std::move(shard_futures), shard_hold.c_hold, shard_hold.common_hold));
+    TF_ASSIGN_OR_RETURN(xla::Future<raiden::BufferHolder> shard_future,
+                        H2dShard(layer_idx, i, tile));
+    shard_futures_to_join.push_back(std::move(shard_future));
   }
   return raiden::PjRtCopyFuture::FromFuture(
       xla::JoinFutures(absl::MakeSpan(shard_futures_to_join)));
 }
 
+tpu_raiden::NumaThreadPool* WeightSynchronizerBase::GetH2dShardPool() {
+  absl::MutexLock lock(h2d_shard_pool_mu_);
+  if (h2d_shard_pool_ == nullptr) {
+    h2d_shard_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
+        std::max<size_t>(num_shards_, 1));
+  }
+  return h2d_shard_pool_.get();
+}
+
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
     uint64_t uuid) {
   RAIDEN_TRACE("WeightSynchronizerBase::H2d");
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before H2d.");
+  }
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
   const auto start_time = absl::Now();
-  VLOG(1) << "Starting H2d across " << num_layers_ << " layers (uuid=" << uuid
-          << ")...";
+  std::vector<std::shared_ptr<LayerTileReady>> tile_ready;
   {
+    absl::MutexLock lock(tile_ready_mu_);
+    tile_ready = layer_tile_ready_;
+  }
+  tile_ready.resize(num_layers_);
+  bool any_in_place = false;
+  for (const std::shared_ptr<LayerTileReady>& ready : tile_ready) {
+    any_in_place = any_in_place || ready != nullptr;
+  }
+  VLOG(1) << "Starting H2d across " << num_layers_ << " layers (uuid=" << uuid
+          << ", any_in_place=" << any_in_place << ")...";
+  if (!any_in_place) {
+    // All layers are tiled below; otherwise keep the metrics recorded while
+    // tiling in place on receive.
     absl::MutexLock lock(metrics_mu_);
     metrics_.last_tiling_time_ms = 0.0;
     metrics_.last_tiled_bytes = 0;
   }
-  std::vector<raiden::PjRtCopyFuture> layer_futures;
-  layer_futures.reserve(num_layers_);
+  // Layers whose host buffers are (or are about to be) in device layout are
+  // copied as is; the rest are tiled into the scratchpads unless skipped.
+  const std::vector<bool> active_skip = GetActiveSkipTiling(uuid);
+  std::vector<bool> tile_layer(num_layers_);
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                        H2dLayer(layer_idx, uuid));
-    layer_futures.push_back(std::move(layer_future));
+    tile_layer[layer_idx] =
+        tile_ready[layer_idx] == nullptr &&
+        !(layer_idx < active_skip.size() && active_skip[layer_idx]);
   }
-  VLOG(1) << "Done with scheduling H2d across " << num_layers_
-          << " layers (uuid=" << uuid << ").";
-  raiden::PjRtCopyFuture joined = raiden::JoinPjRtCopyFutures(layer_futures);
+  using ShardFutures = std::vector<xla::Future<raiden::BufferHolder>>;
+  // Each shard has its own device and tiling scratchpad, so shards are tiled
+  // and copied concurrently. Layers of a shard stay in order because they
+  // share the scratchpad.
+  auto h2d_shard_layers =
+      [this, &tile_layer,
+       &tile_ready](size_t shard_idx) -> absl::StatusOr<ShardFutures> {
+    ShardFutures futures;
+    futures.reserve(num_layers_);
+    for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+      if (tile_ready[layer_idx] != nullptr) {
+        // The transport acks before OnLayerDataReceived runs, so this layer's
+        // receive callback (and in-place tiling) may still be in flight.
+        TF_RETURN_IF_ERROR(tile_ready[layer_idx]->Wait());
+      }
+      TF_ASSIGN_OR_RETURN(
+          xla::Future<raiden::BufferHolder> future,
+          H2dShard(layer_idx, shard_idx, tile_layer[layer_idx]));
+      futures.push_back(std::move(future));
+    }
+    return futures;
+  };
+  std::vector<std::future<absl::StatusOr<ShardFutures>>> shard_tasks;
+  if (num_shards_ > 1) {
+    tpu_raiden::NumaThreadPool* pool = GetH2dShardPool();
+    shard_tasks.reserve(num_shards_ - 1);
+    for (size_t shard_idx = 1; shard_idx < num_shards_; ++shard_idx) {
+      shard_tasks.push_back(
+          pool->Schedule(assigned_numa_node_, [&h2d_shard_layers, shard_idx]() {
+            return h2d_shard_layers(shard_idx);
+          }));
+    }
+  }
+  std::vector<absl::StatusOr<ShardFutures>> shard_results;
+  shard_results.reserve(num_shards_);
+  if (num_shards_ > 0) {
+    shard_results.push_back(h2d_shard_layers(0));
+  }
+  // Wait for every task before returning: they reference |tile_layer|,
+  // |tile_ready| and |h2d_shard_layers|.
+  for (auto& task : shard_tasks) {
+    shard_results.push_back(task.get());
+  }
+  ShardFutures all_futures;
+  all_futures.reserve(num_layers_ * num_shards_);
+  for (auto& result : shard_results) {
+    TF_RETURN_IF_ERROR(result.status());
+    for (auto& future : *result) {
+      all_futures.push_back(std::move(future));
+    }
+  }
+  VLOG(1) << "Done with scheduling H2d across " << num_layers_ << " layers x "
+          << num_shards_ << " shards (uuid=" << uuid << ") in "
+          << absl::ToDoubleMilliseconds(absl::Now() - start_time) << " ms.";
+  raiden::PjRtCopyFuture joined = raiden::PjRtCopyFuture::FromFuture(
+      xla::JoinFutures(absl::MakeSpan(all_futures)));
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
     double tiling_time_ms = 0.0;
@@ -620,6 +781,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
     size_t layer_idx, uint64_t uuid,
     std::shared_ptr<std::atomic<double>> max_detile_ms) {
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before D2h.");
+  }
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -737,12 +903,19 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
     uint64_t uuid) {
   RAIDEN_TRACE("WeightSynchronizerBase::D2h");
+  if (weights_unbound_) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before D2h.");
+  }
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
   const auto start_time = absl::Now();
   VLOG(1) << "Starting D2h across " << num_layers_ << " layers (uuid=" << uuid
           << ")...";
+  // D2h writes logical-layout bytes into the host staging buffers.
+  MarkHostBufferUntiled();
   {
     absl::MutexLock lock(metrics_mu_);
     metrics_.last_detiling_time_ms = 0.0;
@@ -815,46 +988,9 @@ absl::Status WeightSynchronizerBase::PushWeightsResharded(
   return PushWeightsReshardedLocal(request);
 }
 
-absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
+absl::StatusOr<std::vector<WeightSynchronizerBase::ShardPushSchedule>>
+WeightSynchronizerBase::ResolveShardPushSchedules(
     const tpu_sync::rpc::StartTransferRequest& request) {
-  VLOG(1) << "Starting PushWeightsResharded for uuid=" << request.uuid()
-          << " across " << num_layers_
-          << " layers (skip_d2h=" << request.skip_d2h() << ")...";
-  StoreSkipTilingLocal(request.uuid(), request);
-  int fallback_layer_idx = -1;
-  bool checked_fallback = false;
-  auto get_fallback_layer_idx = [&]() -> absl::StatusOr<int> {
-    if (checked_fallback) return fallback_layer_idx;
-    checked_fallback = true;
-    if (request.src_units().empty()) {
-      return absl::InvalidArgumentError("src_units list cannot be empty");
-    }
-    std::string data_name = request.src_units(0).data_name();
-    for (size_t l = 0; l < layer_names_.size(); ++l) {
-      if (layer_names_[l] == data_name) {
-        fallback_layer_idx = static_cast<int>(l);
-        break;
-      }
-    }
-    if (fallback_layer_idx == -1) {
-      return absl::NotFoundError(absl::StrCat(
-          "Layer name not found in WeightSynchronizer: ", data_name));
-    }
-    return fallback_layer_idx;
-  };
-
-  std::vector<bool> skip_tiling(num_layers_, false);
-  for (const auto& [layer_idx, skip_val] : request.skip_tiling()) {
-    if (layer_idx >= 0 && static_cast<size_t>(layer_idx) < num_layers_) {
-      skip_tiling[layer_idx] = skip_val;
-    }
-  }
-
-  auto push_start = absl::Now();
-
-  auto staging_start = absl::Now();
-  std::vector<std::vector<transport::BufferPushTask>> tasks_by_layer(
-      num_layers_);
   const auto& schedules = request.shard_push_schedules();
   bool use_global_keys = false;
   if (!global_shard_indices_.empty()) {
@@ -923,6 +1059,8 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
           absl::StrJoin(offending_keys, ", "), "], num_shards_=", num_shards_));
     }
   }
+  std::vector<ShardPushSchedule> shard_schedules;
+  shard_schedules.reserve(num_shards_);
   for (size_t i = 0; i < num_shards_; ++i) {
     int64_t global_shard = global_shard_index(i);
     int64_t local_shard = local_shard_index(i);
@@ -942,10 +1080,46 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     if (it == schedules.end() && i < sorted_sliced_keys.size()) {
       it = schedules.find(sorted_sliced_keys[i]);
     }
-    if (it == schedules.end()) {
-      continue;
+    if (it != schedules.end()) {
+      shard_schedules.push_back({i, it->second});
     }
-    const auto& schedule = it->second;
+  }
+  return shard_schedules;
+}
+
+absl::StatusOr<std::vector<std::vector<transport::BufferPushTask>>>
+WeightSynchronizerBase::BuildLayerPushTasks(
+    const tpu_sync::rpc::StartTransferRequest& request) {
+  int fallback_layer_idx = -1;
+  bool checked_fallback = false;
+  auto get_fallback_layer_idx = [&]() -> absl::StatusOr<int> {
+    if (checked_fallback) return fallback_layer_idx;
+    checked_fallback = true;
+    if (request.src_units().empty()) {
+      return absl::InvalidArgumentError("src_units list cannot be empty");
+    }
+    std::string data_name = request.src_units(0).data_name();
+    for (size_t l = 0; l < layer_names_.size(); ++l) {
+      if (layer_names_[l] == data_name) {
+        fallback_layer_idx = static_cast<int>(l);
+        break;
+      }
+    }
+    if (fallback_layer_idx == -1) {
+      return absl::NotFoundError(absl::StrCat(
+          "Layer name not found in WeightSynchronizer: ", data_name));
+    }
+    return fallback_layer_idx;
+  };
+
+  std::vector<std::vector<transport::BufferPushTask>> tasks_by_layer(
+      num_layers_);
+  TF_ASSIGN_OR_RETURN(const std::vector<ShardPushSchedule> shard_schedules,
+                      ResolveShardPushSchedules(request));
+  for (const ShardPushSchedule& shard_schedule : shard_schedules) {
+    const size_t i = shard_schedule.shard_idx;
+    const tpu_sync::rpc::ShardPushScheduleProto& schedule =
+        shard_schedule.schedule;
 
     for (const auto& entry : schedule.entries()) {
       int layer_idx_to_use = -1;
@@ -1061,11 +1235,28 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
     }
   }
+  return tasks_by_layer;
+}
+
+absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
+    const tpu_sync::rpc::StartTransferRequest& request) {
+  VLOG(1) << "Starting PushWeightsResharded for uuid=" << request.uuid()
+          << " across " << num_layers_
+          << " layers (skip_d2h=" << request.skip_d2h() << ")...";
+  StoreSkipTilingLocal(request.uuid(), request);
+
+  auto push_start = absl::Now();
+
+  auto staging_start = absl::Now();
+  TF_ASSIGN_OR_RETURN(
+      const std::vector<std::vector<transport::BufferPushTask>> tasks_by_layer,
+      BuildLayerPushTasks(request));
   double staging_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - staging_start);
 
   bool already_completed = false;
   uint64_t uuid = request.uuid();
+  std::shared_ptr<UuidD2hState> d2h_state;
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures;
   d2h_layer_futures.reserve(num_layers_);
   auto d2h_start = absl::Now();
@@ -1073,14 +1264,27 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     if (uuid != 0) {
       absl::MutexLock lock(d2h_mu_);
       already_completed = !completed_d2h_uuids_.insert(uuid).second;
+      auto& state_ref = d2h_states_[uuid];
+      if (!state_ref) {
+        state_ref = std::make_shared<UuidD2hState>(num_layers_);
+      }
+      d2h_state = state_ref;
     }
     if (!already_completed) {
       VLOG(1)
           << "PushWeightsResharded: Executing pipelined D2H copies for uuid "
           << uuid;
       for (size_t l = 0; l < num_layers_; ++l) {
-        TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f, D2hLayer(l, uuid));
-        d2h_layer_futures.push_back(std::move(f));
+        auto f_or = D2hLayer(l, uuid);
+        if (!f_or.ok()) {
+          if (d2h_state != nullptr) {
+            absl::MutexLock lock(d2h_state->mu);
+            d2h_state->status = f_or.status();
+            d2h_state->all_ready = true;
+          }
+          return f_or.status();
+        }
+        d2h_layer_futures.push_back(*std::move(f_or));
       }
     } else {
       VLOG(1) << "RAIDEN_DIAG push PushWeightsResharded: Coalescing D2H copy"
@@ -1091,10 +1295,19 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     VLOG(1) << "PushWeightsResharded: Skipping D2H copy.";
   }
 
-  if (!push_pool_) {
-    push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
-  }
+  auto d2h_state_cleanup = absl::MakeCleanup(
+      [&d2h_state, already_completed, skip_d2h = request.skip_d2h()]() {
+        if (!skip_d2h && !already_completed && d2h_state != nullptr) {
+          absl::MutexLock lock(d2h_state->mu);
+          if (!d2h_state->all_ready) {
+            if (d2h_state->status.ok()) {
+              d2h_state->status = absl::InternalError(
+                  "D2H leader exited before completing all layers");
+            }
+            d2h_state->all_ready = true;
+          }
+        }
+      });
 
   auto h2h_start = absl::Now();
   {
@@ -1155,7 +1368,15 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       if (!request.skip_d2h() && !already_completed) {
         absl::Time d2h_wait_start =
             ABSL_PREDICT_FALSE(diag_vlog) ? absl::Now() : absl::InfinitePast();
-        TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
+        absl::Status await_status = d2h_layer_futures[l].Await();
+        if (!await_status.ok()) {
+          if (d2h_state != nullptr) {
+            absl::MutexLock lock(d2h_state->mu);
+            d2h_state->status = await_status;
+            d2h_state->all_ready = true;
+          }
+          return await_status;
+        }
         if (ABSL_PREDICT_FALSE(diag_vlog)) {
           d2h_wait_duration += (absl::Now() - d2h_wait_start);
         }
@@ -1172,6 +1393,37 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         }
         group_tasks.insert(group_tasks.end(), layer_tasks.begin(),
                            layer_tasks.end());
+      }
+    }
+
+    if (!request.skip_d2h() && d2h_state != nullptr && group_end > 0) {
+      if (!already_completed) {
+        absl::MutexLock lock(d2h_state->mu);
+        for (size_t l = group_start; l < group_end; ++l) {
+          d2h_state->layer_ready[l] = true;
+        }
+        if (group_end >= num_layers_) {
+          d2h_state->all_ready = true;
+        }
+      } else {
+        absl::Time d2h_wait_start =
+            ABSL_PREDICT_FALSE(diag_vlog) ? absl::Now() : absl::InfinitePast();
+        {
+          absl::MutexLock lock(d2h_state->mu);
+          struct WaitCtx {
+            const UuidD2hState* state;
+            size_t target_layer;
+          } wait_ctx{d2h_state.get(), group_end - 1};
+          auto cond_fn = +[](WaitCtx* c) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+            return c->state->all_ready ||
+                   c->state->layer_ready[c->target_layer];
+          };
+          d2h_state->mu.Await(absl::Condition(cond_fn, &wait_ctx));
+          TF_RETURN_IF_ERROR(d2h_state->status);
+        }
+        if (ABSL_PREDICT_FALSE(diag_vlog)) {
+          d2h_wait_duration += (absl::Now() - d2h_wait_start);
+        }
       }
     }
 
@@ -1193,6 +1445,11 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
             return PushWeightsChunks(group_tasks, push_parallelism, uuid);
           }));
     }
+  }
+  if (!request.skip_d2h() && !already_completed && d2h_state != nullptr &&
+      num_layers_ == 0) {
+    absl::MutexLock lock(d2h_state->mu);
+    d2h_state->all_ready = true;
   }
 
   for (auto& fut : push_futures) {
@@ -1284,6 +1541,10 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 absl::Status WeightSynchronizerBase::BindWeights(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers) {
   RAIDEN_TRACE("WeightSynchronizerBase::BindWeights");
+  if (layer_buffers.empty()) {
+    UnbindWeights();
+    return absl::OkStatus();
+  }
   if (layer_buffers.size() != num_layers_) {
     return absl::InvalidArgumentError("Number of layers mismatch");
   }
@@ -1348,7 +1609,14 @@ absl::Status WeightSynchronizerBase::BindWeights(
     }
     buffer_holds_.push_back(std::move(hold_info));
   }
+  weights_unbound_ = false;
   return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::UnbindWeights() {
+  RAIDEN_TRACE("WeightSynchronizerBase::UnbindWeights");
+  buffer_holds_.clear();
+  weights_unbound_ = true;
 }
 
 absl::Status WeightSynchronizerBase::RegisterExpectedChunks(
@@ -1361,12 +1629,6 @@ absl::Status WeightSynchronizerBase::RegisterExpectedChunks(
 
 absl::Status WeightSynchronizerBase::RegisterExpectedChunksLocal(
     uint64_t uuid, uint32_t expected_chunks) {
-  {
-    absl::MutexLock lock(pending_h2d_mu_);
-    if (pending_h2d_states_[uuid].expected_layers == 0) {
-      pending_h2d_states_[uuid].expected_layers = num_layers_;
-    }
-  }
   return RaidenManagerBase::RegisterExpectedChunks(uuid, expected_chunks);
 }
 
@@ -1383,9 +1645,45 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunks(
 absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
+  // The transport fires OnLayerDataReceived only for layers with a non-zero
+  // expected count.
+  //
+  // The transport acks the final chunk to the sender before it runs the
+  // receive callbacks, so H2d() may be called before OnLayerDataReceived has
+  // run. Create the per-layer readiness signals here, before any data can
+  // arrive, so that H2d() waits for them.
+  //
+  // A tree broadcast re-arms each receiver with the same uuid and the full
+  // counts before every pipeline stage, so layers that already have a signal
+  // or have been received under |uuid| are left alone.
+  const bool signal_layers =
+      GetReceiverTiling(uuid) != tpu_sync::rpc::HOST_TILING_MODE_DEFERRED;
   {
     absl::MutexLock lock(pending_h2d_mu_);
-    pending_h2d_states_[uuid].expected_layers = expected_layer_chunks.size();
+    bool is_new_uuid = !pending_h2d_states_.contains(uuid);
+    auto& state = pending_h2d_states_[uuid];
+    if (is_new_uuid) {
+      absl::MutexLock metrics_lock(metrics_mu_);
+      metrics_.last_tiling_time_ms = 0.0;
+      metrics_.last_tiled_bytes = 0;
+    }
+    size_t expected_layers = 0;
+    for (const auto& [layer_idx, count] : expected_layer_chunks) {
+      if (count == 0) continue;
+      ++expected_layers;
+      if (state.tile_ready.contains(layer_idx) ||
+          state.layer_futures.contains(layer_idx)) {
+        continue;
+      }
+      std::shared_ptr<LayerTileReady> ready;
+      if (signal_layers && layer_idx < num_layers_) {
+        ready = std::make_shared<LayerTileReady>();
+        state.tile_ready[layer_idx] = ready;
+      }
+      // Without a signal, H2d() treats the layer as logical layout.
+      SetLayerTileReady(layer_idx, std::move(ready));
+    }
+    state.expected_layers = expected_layers;
   }
   return RaidenManagerBase::RegisterExpectedLayerChunks(uuid,
                                                         expected_layer_chunks);
@@ -1393,25 +1691,78 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
 
 absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
                                                          uint64_t uuid) {
-  if (!auto_h2d_) {
-    return absl::OkStatus();
-  }
+  const tpu_sync::rpc::HostTilingMode tiling = GetReceiverTiling(uuid);
+  absl::MutexLock lock(pending_h2d_mu_);
   if (!h2d_pool_) {
-    h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
+    h2d_pool_ =
+        std::make_unique<tpu_raiden::NumaThreadPool>(std::max(parallelism_, 4));
   }
-  {
-    absl::MutexLock lock(pending_h2d_mu_);
+  if (auto_h2d_) {
     active_h2d_uuids_.insert(uuid);
-    auto& state = pending_h2d_states_[uuid];
-    if (state.expected_layers == 0) {
-      state.expected_layers = num_layers_;
-    }
-    state.layer_futures[layer_idx] = h2d_pool_->Schedule(
-        assigned_numa_node_,
-        [this, layer_idx, uuid]() { return H2dLayer(layer_idx, uuid); });
   }
+  auto& state = pending_h2d_states_[uuid];
+  std::shared_ptr<LayerTileReady> ready;
+  if (auto it = state.tile_ready.find(layer_idx);
+      it != state.tile_ready.end()) {
+    ready = std::move(it->second);
+    state.tile_ready.erase(it);
+  } else {
+    // Not armed via RegisterExpectedLayerChunksLocal().
+    if (tiling != tpu_sync::rpc::HOST_TILING_MODE_DEFERRED) {
+      ready = std::make_shared<LayerTileReady>();
+    }
+    SetLayerTileReady(layer_idx, ready);
+  }
+  const bool tile_in_place =
+      tiling == tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL;
+  state.layer_futures[layer_idx] = h2d_pool_->Schedule(
+      assigned_numa_node_,
+      [this, layer_idx, uuid, ready,
+       tile_in_place]() -> absl::StatusOr<raiden::PjRtCopyFuture> {
+        if (ready == nullptr) {
+          // Logical-layout host buffers; tile into a scratchpad.
+          if (!auto_h2d_) {
+            return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
+          }
+          return H2dLayer(layer_idx,
+                          /*tile=*/!IsTilingSkipped(layer_idx, uuid));
+        }
+        // Pre-tiled data arrived in device layout and is used as is.
+        absl::Status tile_status =
+            tile_in_place ? TileLayer(layer_idx, uuid) : absl::OkStatus();
+        ready->Set(tile_status);
+        TF_RETURN_IF_ERROR(tile_status);
+        if (!auto_h2d_) {
+          return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
+        }
+        return H2dLayer(layer_idx, /*tile=*/false);
+      });
   return absl::OkStatus();
+}
+
+absl::flat_hash_map<size_t, std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
+WeightSynchronizerBase::TakeLayerFuturesWhenScheduled(uint64_t uuid) {
+  absl::MutexLock lock(pending_h2d_mu_);
+  // The transport releases its progress lock before invoking callbacks, so
+  // another thread's OnLayerDataReceived may still be in flight when the
+  // final chunk triggers OnDataReceived. Wait until every expected layer has
+  // scheduled its future.
+  auto all_layers_scheduled =
+      [this, uuid]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pending_h2d_mu_) {
+        auto it = pending_h2d_states_.find(uuid);
+        return it == pending_h2d_states_.end() ||
+               it->second.layer_futures.size() >= it->second.expected_layers;
+      };
+  pending_h2d_mu_.Await(absl::Condition(&all_layers_scheduled));
+  absl::flat_hash_map<size_t,
+                      std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
+      layer_futures;
+  auto it = pending_h2d_states_.find(uuid);
+  if (it != pending_h2d_states_.end()) {
+    layer_futures = std::move(it->second.layer_futures);
+    pending_h2d_states_.erase(it);
+  }
+  return layer_futures;
 }
 
 absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
@@ -1421,8 +1772,17 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
       completed_transfers_.insert(uuid);
     }
   };
+  absl::flat_hash_map<size_t,
+                      std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
+      layer_futures_map = TakeLayerFuturesWhenScheduled(uuid);
 
   if (!auto_h2d_) {
+    // Wait for the per-layer tasks scheduled by OnLayerDataReceived. For
+    // in-place uuids these tile the host buffers so that a later H2d() can
+    // perform a raw copy.
+    for (auto& [layer_idx, tile_future] : layer_futures_map) {
+      TF_RETURN_IF_ERROR(tile_future.get().status());
+    }
     auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
     if (store.IsCloudLoggingEnabled()) {
       store.FlushToCloudLogging("destination_receive", uuid);
@@ -1446,31 +1806,12 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
   }
   VLOG(1) << "Starting OnDataReceived (auto_h2d for uuid=" << uuid << ")...";
   auto h2d_start = absl::Now();
-  absl::flat_hash_map<size_t,
-                      std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
-      layer_futures_map;
-  {
-    absl::MutexLock lock(pending_h2d_mu_);
-    auto it = pending_h2d_states_.find(uuid);
-    if (it != pending_h2d_states_.end()) {
-      layer_futures_map = std::move(it->second.layer_futures);
-      pending_h2d_states_.erase(it);
-    }
-  }
 
   std::vector<raiden::PjRtCopyFuture> futures_to_await;
-  futures_to_await.reserve(num_layers_);
-  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    auto it = layer_futures_map.find(layer_idx);
-    if (it != layer_futures_map.end() && it->second.valid()) {
-      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                          it->second.get());
-      futures_to_await.push_back(std::move(layer_future));
-    } else {
-      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                          H2dLayer(layer_idx, uuid));
-      futures_to_await.push_back(std::move(layer_future));
-    }
+  futures_to_await.reserve(layer_futures_map.size());
+  for (auto& [layer_idx, layer_future] : layer_futures_map) {
+    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture copy_future, layer_future.get());
+    futures_to_await.push_back(std::move(copy_future));
   }
   if (!futures_to_await.empty()) {
     raiden::PjRtCopyFuture joined_future =
@@ -1530,6 +1871,12 @@ void WeightSynchronizerBase::DrainPendingH2d() {
     pending_h2d_states_.clear();
     active_h2d_uuids_.clear();
   }
+  // Layers whose data never arrived will not be tiled.
+  for (auto& [uuid, state] : pending_states) {
+    for (auto& [layer_idx, ready] : state.tile_ready) {
+      ready->Set(absl::CancelledError("Pending H2D was drained"));
+    }
+  }
 
   if (pending_states.empty()) {
     bool needs_h2d = false;
@@ -1550,19 +1897,11 @@ void WeightSynchronizerBase::DrainPendingH2d() {
 
   for (auto& [uuid, state] : pending_states) {
     std::vector<raiden::PjRtCopyFuture> futures_to_await;
-    futures_to_await.reserve(num_layers_);
-    for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-      auto it = state.layer_futures.find(layer_idx);
-      if (it != state.layer_futures.end() && it->second.valid()) {
-        auto status_or_future = it->second.get();
-        if (status_or_future.ok()) {
-          futures_to_await.push_back(std::move(*status_or_future));
-        }
-      } else {
-        auto status_or_future = H2dLayer(layer_idx, uuid);
-        if (status_or_future.ok()) {
-          futures_to_await.push_back(std::move(*status_or_future));
-        }
+    futures_to_await.reserve(state.layer_futures.size());
+    for (auto& [layer_idx, layer_future] : state.layer_futures) {
+      absl::StatusOr<raiden::PjRtCopyFuture> copy_future = layer_future.get();
+      if (copy_future.ok()) {
+        futures_to_await.push_back(*std::move(copy_future));
       }
     }
     if (!futures_to_await.empty()) {
@@ -1614,6 +1953,15 @@ void WeightSynchronizerBase::StoreSkipTilingLocal(
   absl::MutexLock lock(skip_tiling_mu_);
   latest_skip_tiling_ = skip;
   uuid_to_skip_tiling_[uuid] = std::move(skip);
+  if (!request.is_sender()) {
+    const tpu_sync::rpc::HostTilingMode mode = request.host_tiling_mode();
+    if (mode == tpu_sync::rpc::HOST_TILING_MODE_UNSPECIFIED ||
+        mode == tpu_sync::rpc::HOST_TILING_MODE_DEFERRED) {
+      receiver_tiling_.erase(uuid);
+    } else {
+      receiver_tiling_[uuid] = mode;
+    }
+  }
   if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
     if (!request.req_id().empty()) {
       uuid_to_req_id_[uuid] = request.req_id();
@@ -1639,15 +1987,26 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   {
     absl::MutexLock lock(skip_tiling_mu_);
     uuid_to_skip_tiling_.erase(uuid);
+    receiver_tiling_.erase(uuid);
     uuid_to_req_id_.erase(uuid);
   }
   {
     absl::MutexLock lock(d2h_mu_);
     completed_d2h_uuids_.erase(uuid);
+    d2h_states_.erase(uuid);
   }
+  absl::flat_hash_map<size_t, std::shared_ptr<LayerTileReady>> tile_ready;
   {
     absl::MutexLock lock(pending_h2d_mu_);
-    pending_h2d_states_.erase(uuid);
+    auto it = pending_h2d_states_.find(uuid);
+    if (it != pending_h2d_states_.end()) {
+      tile_ready = std::move(it->second.tile_ready);
+      pending_h2d_states_.erase(it);
+    }
+  }
+  // Layers whose data never arrived will not be tiled.
+  for (auto& [layer_idx, ready] : tile_ready) {
+    ready->Set(absl::CancelledError("Receive was forgotten"));
   }
 }
 

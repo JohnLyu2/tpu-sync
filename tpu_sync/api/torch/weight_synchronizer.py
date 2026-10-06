@@ -14,7 +14,7 @@
 
 """High-performance PyTorch Weight Synchronizer for Trainer-Inference Pipelines."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -37,7 +37,7 @@ common.register_telemetry_callbacks(
 )
 
 
-def configure_telemetry(exporter_types: list[str]) -> None:
+def configure_telemetry(exporter_types: Optional[list[str]] = None) -> None:
   """Configures the telemetry backend exporters in RaidenMetricStore."""
   _weight_synchronizer.configure_telemetry(exporter_types)
 
@@ -73,6 +73,7 @@ class WeightSynchronizer:
       bind_ip: Optional[str] = None,
       unsafe_skip_buffer_lock: bool = True,
       auto_h2d: bool = False,
+      global_shard_indices: Optional[List[int]] = None,
   ):
     """Instantiates the PyTorch Weight Synchronizer shims.
 
@@ -86,7 +87,26 @@ class WeightSynchronizer:
       bind_ip: Sockets server bind IP address.
       unsafe_skip_buffer_lock: Whether to bypass buffer lock safety.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
+      global_shard_indices: Optional list of global shard indices corresponding
+        to each local shard on this process. If None, defaults to [rank *
+        num_shards + i for i in range(num_shards)] when torch.distributed is
+        initialized, or [0, ..., num_shards - 1] otherwise.
     """
+    self._has_explicit_global_shard_indices = global_shard_indices is not None
+    if global_shard_indices is None:
+      num_shards = len(device_tensors[0]) if device_tensors else 0
+      offset = 0
+      if (
+          torch.distributed.is_available()
+          and torch.distributed.is_initialized()
+      ):
+        offset = torch.distributed.get_rank() * num_shards
+      global_shard_indices = [offset + i for i in range(num_shards)]
+
+    self._global_shard_indices = (
+        list(global_shard_indices) if global_shard_indices is not None else []
+    )
+
     self._impl = _weight_synchronizer.WeightSynchronizer(
         device_tensors,
         local_port,
@@ -95,6 +115,56 @@ class WeightSynchronizer:
         bind_ip,
         unsafe_skip_buffer_lock,
         auto_h2d,
+        global_shard_indices,
+    )
+
+  @classmethod
+  def test_only_create_cpu_instance(
+      cls,
+      num_layers: int,
+      num_shards: int,
+      slice_byte_size: Union[int, List[int]],
+      local_port: Optional[int] = None,
+      parallelism: int = 1,
+      listener_port: Optional[int] = None,
+      bind_ip: Optional[str] = "127.0.0.1",
+      auto_h2d: bool = False,
+      global_shard_indices: Optional[List[int]] = None,
+      test_only_simulated_egress_gbps: float = 0.0,
+      test_only_simulated_ingress_gbps: float = 0.0,
+  ) -> "WeightSynchronizer":
+    """Instantiates a CPU-only WeightSynchronizer allocating host DRAM without TPU devices."""
+    instance = cls.__new__(cls)
+    instance._impl = (
+        _weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+            num_layers,
+            num_shards,
+            slice_byte_size,
+            local_port,
+            parallelism,
+            listener_port,
+            bind_ip,
+            auto_h2d,
+            global_shard_indices,
+            test_only_simulated_egress_gbps,
+            test_only_simulated_ingress_gbps,
+        )
+    )
+    instance._global_shard_indices = list(global_shard_indices or [])
+    instance._has_explicit_global_shard_indices = (
+        global_shard_indices is not None
+    )
+    return instance
+
+  def test_only_set_bandwidth_limit(
+      self,
+      test_only_simulated_egress_gbps: float = 0.0,
+      test_only_simulated_ingress_gbps: float = 0.0,
+  ) -> None:
+    """Sets the simulated transport bandwidth limit in Gbps (for testing only)."""
+    self._impl.test_only_set_bandwidth_limit(
+        test_only_simulated_egress_gbps,
+        test_only_simulated_ingress_gbps,
     )
 
   def push_weights(self, peers: List[str]) -> None:
@@ -109,8 +179,33 @@ class WeightSynchronizer:
       self._impl.set_skip_tiling(list(skip))
 
   def bind_weights(self, device_tensors: List[List[torch.Tensor]]) -> None:
-    """Dynamically re-binds new device weights in-place without daemon restart."""
+    """Dynamically re-binds new device weights in-place without daemon restart.
+
+    Args:
+      device_tensors: New per-layer, per-shard device tensors to bind. Must
+        match the layer/shard/size configuration from construction. An empty
+        list is equivalent to calling `unbind_weights()`.
+    """
+    if not device_tensors:
+      self.unbind_weights()
+      return
     self._impl.bind_weights(device_tensors)
+
+  def unbind_weights(self) -> None:
+    """Releases all bound device tensors and their TPU HBM holds immediately.
+
+    The synchronizer itself (pinned host staging buffers, listeners, controller
+    registration) stays alive, so a later `bind_weights()` is cheap and does not
+    require re-creating or re-registering the WeightSynchronizer. Use this right
+    after a transfer completes so temporary send tensors do not stay pinned in
+    HBM during the next training step.
+
+    After unbinding, `d2h()`, `h2d()`, and any controller-driven push that
+    performs D2H raise until `bind_weights()` is called again.
+
+    Must not be called while a D2H/H2D/push on this synchronizer is in flight.
+    """
+    self._impl.unbind_weights()
 
   def d2h(self) -> None:
     """Triggers asynchronous D2H copy of current weights to Host buffer."""
@@ -137,21 +232,43 @@ class WeightSynchronizer:
 
   def get_local_endpoints(self) -> List[Dict[str, Any]]:
     """Returns the list of transfer endpoints advertised by this instance."""
-    return self._impl.get_local_endpoints()
+    eps = self._impl.get_local_endpoints()
+    if (
+        not self._has_explicit_global_shard_indices
+        and self._global_shard_indices
+    ):
+      g_to_l = {g: i for i, g in enumerate(self._global_shard_indices)}
+      normalized = []
+      for ep in eps:
+        raw_shards = ep["shards"]
+        local_shards = [g_to_l.get(s, s) for s in raw_shards]
+        normalized.append({
+            "endpoint": ep["endpoint"],
+            "shards": local_shards,
+            "global_shards": list(raw_shards),
+        })
+      return normalized
+    return eps
 
   @property
   def local_port(self) -> Optional[int]:
     """Returns assigned ephemeral listener port coordinates."""
+    if self._impl is None:
+      return None
     return self._impl.local_port
 
   @property
   def listener_port(self) -> Optional[int]:
     """Returns assigned RPC listener port coordinate."""
+    if self._impl is None:
+      return None
     return self._impl.listener_port
 
   @property
   def is_listener_active(self) -> bool:
     """Returns whether the native C++ listener thread is actively running."""
+    if self._impl is None:
+      return False
     return self._impl.is_listener_active
 
   @property
@@ -174,11 +291,13 @@ class WeightSynchronizer:
     m = self._impl.get_metrics()
     d2h_time_s = max(m.last_d2h_time_ms / 1000.0, 1e-9)
     h2h_time_s = max(m.last_h2h_time_ms / 1000.0, 1e-9)
+    total_h2h_time_s = max(m.total_h2h_time_ms / 1000.0, 1e-9)
     tiling_time_s = max(m.last_tiling_time_ms / 1000.0, 1e-9)
     detiling_time_s = max(m.last_detiling_time_ms / 1000.0, 1e-9)
 
     d2h_bytes_gb = m.last_d2h_bytes / 1e9
     h2h_bytes_gb = m.last_h2h_bytes / 1e9
+    total_h2h_bytes_gb = m.total_h2h_bytes / 1e9
     tiled_bytes_gb = m.last_tiled_bytes / 1e9
     detiled_bytes_gb = m.last_detiled_bytes / 1e9
 
@@ -213,6 +332,11 @@ class WeightSynchronizer:
         "h2h_bandwidth_gbps": (
             h2h_bytes_gb / h2h_time_s if m.last_h2h_bytes > 0 else 0.0
         ),
+        "total_h2h_bandwidth_gbps": (
+            total_h2h_bytes_gb / total_h2h_time_s
+            if m.total_h2h_bytes > 0
+            else 0.0
+        ),
         "tiling_bandwidth_gbps": (
             tiled_bytes_gb / tiling_time_s if m.last_tiled_bytes > 0 else 0.0
         ),
@@ -228,7 +352,9 @@ class WeightSynchronizer:
     self._impl.reset_metrics()
 
   @classmethod
-  def configure_telemetry(cls, exporter_types: list[str]) -> None:
+  def configure_telemetry(
+      cls, exporter_types: Optional[list[str]] = None
+  ) -> None:
     """Configures the telemetry backend exporters in RaidenMetricStore."""
     configure_telemetry(exporter_types)
 
@@ -248,3 +374,7 @@ class WeightSynchronizer:
   ) -> str:
     """Flushes buffered telemetry metrics to Cloud Logging (stdout JSON) if enabled."""
     return flush_cloud_logging(phase, uuid, req_id)
+
+  def shutdown(self) -> None:
+    """Releases and shuts down the underlying C++ synchronizer instance."""
+    self._impl = None

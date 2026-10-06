@@ -27,7 +27,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <future>  // NOLINT
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -52,6 +51,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -73,19 +73,42 @@ namespace {
 
 constexpr absl::Duration kTransportMetricsPollInterval = absl::Seconds(1);
 
-size_t GetCoalesceWindowBytes() {
-  const char* env = std::getenv("RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES");
-  if (env != nullptr && *env != '\0') {
-    size_t val = 0;
-    if (absl::SimpleAtoi(env, &val)) {
-      return val;
+BlockTransport::Config ReadConfigFromEnv() {
+  BlockTransport::Config config;
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.handshake_read_timeout = absl::Seconds(parsed);
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
     }
   }
-  return 0;
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.payload_read_timeout = absl::Seconds(parsed);
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val = std::getenv("RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES");
+      val != nullptr && val[0] != '\0') {
+    size_t parsed = 0;
+    if (absl::SimpleAtoi(val, &parsed)) {
+      config.coalesce_window_bytes = parsed;
+    }
+  }
+  return config;
 }
 
-using ::peregrine::ReadExact;
-using ::peregrine::ReadVExact;
 using ::peregrine::WriteExact;
 using ::peregrine::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
@@ -230,12 +253,13 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
                                int parallelism)
     : block_delegate_(delegate),
       parallelism_(parallelism),
+      config_(ReadConfigFromEnv()),
       raw_transport_(
           delegate, local_port, local_ips,
           [this](int client_fd, const lib::ChunkHeader& header) {
             return HandleCustomRequest(client_fd, header);
           },
-          GetCoalesceWindowBytes()),
+          config_.coalesce_window_bytes),
       peregrine_control_(
           std::make_unique<lib::PeregrineControlServiceImpl>(&raw_transport_)),
       transport_adapter_(std::make_unique<lib::SocketTransportAdapter>(
@@ -351,7 +375,10 @@ absl::Status BlockTransport::HandleIncomingPush(
   bool incoming_push_lease_held = true;
   absl::Cleanup end_incoming_push = [&]() {
     if (incoming_push_lease_held) {
-      block_delegate_->EndIncomingPush(header.uuid).IgnoreError();
+      block_delegate_
+          ->EndIncomingPush(header.uuid,
+                            absl::InternalError("Incoming push failed"))
+          .IgnoreError();
     }
   };
 
@@ -364,10 +391,12 @@ absl::Status BlockTransport::HandleIncomingPush(
   } else {
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
     FaultInjectSocket(hooks::kBlockTransportRecvBlockIds, client_fd);
-    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
+        client_fd, ids_buf.data(), ids_buf.size(), handshake_read_timeout()));
     allocated_ids = lib::DeserializeBlockIds(ids_buf);
 
-    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
+        client_fd, ids_buf.data(), ids_buf.size(), handshake_read_timeout()));
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
     uint8_t ack = 1;
     FaultInjectSocket(hooks::kBlockTransportRecvSendHandshakeAck, client_fd);
@@ -392,7 +421,8 @@ absl::Status BlockTransport::HandleIncomingPush(
           FaultInjectSocket(hooks::kBlockTransportRecvPayload, client_fd);
         }
         uint8_t size_buf[lib::kChunkSizeFieldSize];
-        ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
+        ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
+            client_fd, size_buf, sizeof(size_buf), payload_read_timeout()));
         const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
 
         const int64_t block_id_val = dst_id;
@@ -431,7 +461,8 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
 
         if (expected_size > 0) {
-          ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks)));
+          ABSL_RETURN_IF_ERROR(lib::ReadVExactWithTimeout(
+              client_fd, ToIovec(chunks), payload_read_timeout()));
           total_received_bytes += expected_size;
         }
         return absl::OkStatus();
@@ -750,48 +781,37 @@ uint32_t BlockTransport::GetChunksTotalSize(
   return total;
 }
 
-absl::StatusOr<std::vector<int>> BlockTransport::SyncPush(
-    const std::vector<std::string>& peers,
-    const std::vector<int>& src_block_ids,
-    const std::vector<int>& dst_block_ids, int parallelism,
-    MajorOrder major_order, uint64_t uuid, int layer_idx) {
-  auto promise =
-      std::make_shared<std::promise<absl::StatusOr<std::vector<int>>>>();
-  auto future = promise->get_future();
-  AsyncPush(peers, src_block_ids, dst_block_ids, parallelism, major_order, uuid,
-            layer_idx, [promise](absl::StatusOr<std::vector<int>> res) {
-              promise->set_value(std::move(res));
-            });
-  return future.get();
-}
-
-void BlockTransport::AsyncPush(
+tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<std::string>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
-    std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete,
     std::optional<int> wire_layer_idx) {
-  auto on_complete = [raw_on_complete](absl::StatusOr<std::vector<int>> res) {
+  auto [promise, future] = tsl::MakePromise<std::vector<int>>();
+  // The adapter's completion callback must be copyable, while tsl::Promise is
+  // move-only.
+  auto shared_promise =
+      std::make_shared<tsl::Promise<std::vector<int>>>(std::move(promise));
+  auto on_complete = [shared_promise](absl::StatusOr<std::vector<int>> res) {
     if (!res.ok()) {
       RecordTransferFailure(res.status(), metric_labels::kDirectionPush);
     }
-    raw_on_complete(std::move(res));
+    shared_promise->Set(std::move(res));
   };
   size_t num_blocks = src_block_ids.size();
   if (num_blocks == 0) {
     on_complete(absl::InvalidArgumentError("Block list cannot be empty"));
-    return;
+    return std::move(future);
   }
   if (peers.empty()) {
     on_complete(absl::InvalidArgumentError("Peer list cannot be empty"));
-    return;
+    return std::move(future);
   }
 
   int P = parallelism;
   if (P <= 0) {
     on_complete(absl::InvalidArgumentError("parallelism must be positive"));
-    return;
+    return std::move(future);
   }
   if (static_cast<int>(num_blocks) < P) P = num_blocks;
 
@@ -803,14 +823,17 @@ void BlockTransport::AsyncPush(
                          uuid, layer_idx, P, wire_layer_idx);
   if (!requests.ok()) {
     on_complete(requests.status());
-    return;
+    return std::move(future);
   }
 
+  // Post reports its own errors through `on_complete`, so the returned status
+  // carries no additional information.
   transport_adapter_
       ->Post(peers, *requests, src_block_ids, dst_block_ids,
              std::move(on_complete))
       .status()
       .IgnoreError();
+  return std::move(future);
 }
 
 absl::StatusOr<std::vector<int>> BlockTransport::SyncPull(

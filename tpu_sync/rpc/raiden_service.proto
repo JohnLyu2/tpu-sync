@@ -226,6 +226,29 @@ message StartTransferRequest {
   // endpoint (ControlRequest.peers), used by the sender to compute
   // remote addresses (raddr).
   map<string, ReceiverAddrsProto> receiver_addrs = 25;
+  // Layout of the weight-sync host buffers moved by this transfer; see
+  // HostTilingMode.
+  HostTilingMode host_tiling_mode = 26;
+}
+
+// How a weight-sync transfer treats the device (tiled) layout of the host
+// staging buffers.
+enum HostTilingMode {
+  // Default when unset; behaves like HOST_TILING_MODE_DEFERRED.
+  HOST_TILING_MODE_UNSPECIFIED = 0;
+  // The receiver's host buffers hold logical-layout bytes; they are tiled
+  // into a scratchpad at H2D time.
+  HOST_TILING_MODE_DEFERRED = 1;
+  // Receiver-only: logical-layout data from the source; the receiver tiles
+  // each layer's host buffers into device layout in place as soon as the
+  // layer has arrived, so H2D is a raw copy. Used for tree-broadcast seeds.
+  HOST_TILING_MODE_ON_ARRIVAL = 2;
+  // The transfer carries host buffers that are already in device layout,
+  // i.e. a relay between receivers with identical sharding. The sender
+  // pushes each whole shard ([0, device size)) once its in-place tiling is
+  // done, and the receiver neither tiles nor alters the bytes, so H2D is a
+  // raw copy.
+  HOST_TILING_MODE_PRE_TILED = 3;
 }
 
 // Round-grouped destination targets for tree-based broadcast logging and audit.
@@ -281,6 +304,7 @@ message PoolHostAddrsProto {
   int64 block_stride_bytes = 2;
   int64 num_blocks = 3;
   // Bounded staging: device block id -> host slot leased to this transfer.
+  // Demand staging: device block id -> host block allocated for this transfer.
   // Empty means each block lands at its own id.
   map<int64, int64> host_slot_by_block = 4;
 }

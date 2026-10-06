@@ -67,6 +67,22 @@ cc_library(
     srcs = ["transport_metrics_exporter.cc"],
     hdrs = ["transport_metrics_exporter.h"],
     deps = [
+        "//tpu_sync/telemetry:metrics_api",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/strings:string_view",
+        "@peregrine//peregrine/src/api:transport_metrics",
+    ],
+)
+
+cc_test(
+    name = "transport_metrics_exporter_test",
+    srcs = ["transport_metrics_exporter_test.cc"],
+    deps = [
+        ":transport_metrics_exporter",
+        "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/telemetry:mock_metrics_backend",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api:transport_metrics",
     ],
 )
@@ -89,6 +105,7 @@ cc_library(
         "//tpu_sync/telemetry:label_util",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/transport/lib/socket:util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
