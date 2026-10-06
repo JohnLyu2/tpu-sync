@@ -272,6 +272,15 @@ absl::StatusOr<int> GrpcControlPipeServer::Start(int requested_port) {
   int max_msg_bytes = static_cast<int>(config_.max_frame_bytes);
   builder.SetMaxReceiveMessageSize(max_msg_bytes);
   builder.SetMaxSendMessageSize(max_msg_bytes);
+  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS,
+                             config_.grpc_keepalive_time_ms);
+  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS,
+                             config_.grpc_keepalive_timeout_ms);
+  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+  builder.AddChannelArgument(
+      GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS,
+      config_.grpc_min_recv_ping_interval_without_data_ms);
+  builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PING_STRIKES, 0);
 
   int selected_port = 0;
   std::string server_address = absl::StrCat("[::]:", requested_port);
@@ -349,11 +358,13 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   std::string ep_str(endpoint);
   grpc::ChannelArguments args;
   int max_msg_bytes = static_cast<int>(config_.max_frame_bytes);
+  args.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
   args.SetMaxReceiveMessageSize(max_msg_bytes);
   args.SetMaxSendMessageSize(max_msg_bytes);
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 20000);
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 10000);
+  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, config_.grpc_keepalive_time_ms);
+  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, config_.grpc_keepalive_timeout_ms);
   args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+  args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
   std::shared_ptr<grpc::Channel> channel = grpc::CreateCustomChannel(
       ep_str, grpc::InsecureChannelCredentials(), args);

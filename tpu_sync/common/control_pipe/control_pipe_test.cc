@@ -29,6 +29,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -494,6 +496,61 @@ TEST(GrpcControlPipeClientLruTest, ZeroCapacityBypassesCache) {
   ASSERT_TRUE(client.SendOneWay(ep, ack_req).ok());
   EXPECT_EQ(client.TEST_CachedStubCount(), 0u);
   EXPECT_FALSE(client.TEST_HasCachedStub(ep));
+
+  server->Stop();
+}
+
+TEST(GrpcControlPipeKeepaliveTest,
+     IdleKeepalivePingsDoNotTriggerTooManyPingsGoaway) {
+  ControlPipeConfig server_cfg;
+  server_cfg.backend_type = ControlPipeBackendType::kGrpc;
+  server_cfg.grpc_keepalive_time_ms = 20;
+  server_cfg.grpc_keepalive_timeout_ms = 5000;
+  server_cfg.grpc_min_recv_ping_interval_without_data_ms = 10;
+
+  std::unique_ptr<ControlPipeServer> server =
+      CreateControlPipeServer(server_cfg);
+  server->dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
+      [](const ControlContext& ctx,
+         const PullStreamRequest& req) -> absl::StatusOr<PullStreamResponse> {
+        if (req.uuid() == 2) {
+          // Hold the RPC in flight across several 20 ms keepalive intervals so
+          // any GOAWAY ENHANCE_YOUR_CALM ("too_many_pings") aborts this call
+          // with UNAVAILABLE.
+          absl::SleepFor(absl::Milliseconds(100));
+        }
+        PullStreamResponse resp;
+        resp.set_status(0);
+        resp.set_num_layers(static_cast<int32_t>(req.uuid()));
+        return resp;
+      });
+  TF_ASSERT_OK_AND_ASSIGN(int port, server->Start(0));
+  std::string ep = absl::StrCat("127.0.0.1:", port);
+
+  ControlPipeConfig client_cfg;
+  client_cfg.backend_type = ControlPipeBackendType::kGrpc;
+  client_cfg.grpc_keepalive_time_ms = 20;
+  client_cfg.grpc_keepalive_timeout_ms = 5000;
+  GrpcControlPipeClient client(client_cfg);
+
+  // Establish the HTTP/2 connection and warm the cached stub.
+  PullStreamRequest req1;
+  req1.set_uuid(1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      PullStreamResponse resp1,
+      (client.Call<PullStreamRequest, PullStreamResponse>(ep, req1)));
+  EXPECT_EQ(resp1.num_layers(), 1);
+
+  // Remain idle for >6 ping intervals (>2 default ping strikes) without active
+  // calls, then issue an in-flight RPC that spans multiple additional pings.
+  absl::SleepFor(absl::Milliseconds(150));
+
+  PullStreamRequest req2;
+  req2.set_uuid(2);
+  TF_ASSERT_OK_AND_ASSIGN(
+      PullStreamResponse resp2,
+      (client.Call<PullStreamRequest, PullStreamResponse>(ep, req2)));
+  EXPECT_EQ(resp2.num_layers(), 2);
 
   server->Stop();
 }
