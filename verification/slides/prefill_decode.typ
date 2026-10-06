@@ -43,8 +43,66 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[The prefill → decode transfer][
-  A *prefill* worker holds the prompt's KV cache in its TPU memory (HBM). A *decode* worker needs a copy in its own HBM. TPU Sync moves it in three steps, through host memory on each side:
+#slide[Why formally verify TPU Sync?][
+  TPU Sync moves KV caches and weights asynchronously across TPU memory, host DRAM, and the network while continuously recycling memory buffers across requests.
+
+  #v(0.55em)
+  #cols(columns: (1fr, 1fr))[
+    #set list(spacing: 1.15em)
+    *Why concurrency bugs are hard to catch*
+    #v(0.2em)
+    - *Asynchronous, multi-stage pipeline:* DMA copies, network pushes, callbacks, and cancellations interleave in arbitrary order.
+    - *Aggressive buffer reuse:* TPU HBM and host staging DRAM are immediately recycled to new requests as soon as a transfer finishes or aborts.
+    - *High-stakes failure modes:* Releasing a buffer one step too early causes *silent KV corruption*; missing a cleanup step on abort *leaks memory forever*.
+  ][
+    #set list(spacing: 1.15em)
+    *Benefits of formal verification*
+    #v(0.2em)
+    - *Trust beyond unit tests:* Whereas a unit test checks one schedule at a time, a mechanized proof guarantees correctness across *every* thread, DMA, lock-drop, and abort interleaving.
+    - *Clearer developer understanding:* Turns implicit C++ assumptions about locks, callbacks, and reference counts into explicit *invariants* that explain *why* the protocol is safe.
+    - *Safer maintenance & refactoring:* Serves as a machine-checked guardrail when evolving or simplifying the code — catching broken invariants immediately at compile time.
+  ]
+]
+
+// ---------------------------------------------------------------------------
+#slide[Verification workflow in Lean 4][
+  *Lean 4* is a functional programming language and interactive theorem prover that lets us both *execute* a system model on concrete test cases and *mathematically prove* properties across all possible executions:
+
+  #v(1.8em)
+  #let step-card(num, title, body) = block(
+    fill: luma(248),
+    stroke: 0.6pt + luma(220),
+    radius: 4pt,
+    inset: (x: 14pt, y: 16pt),
+    width: 100%,
+  )[
+    #text(fill: accent, weight: "medium", size: 16pt)[#num · #title]
+    #v(0.6em)
+    #set text(size: 13.5pt)
+    #set par(leading: 0.65em)
+    #body
+  ]
+
+  #grid(
+    columns: (1fr, auto, 1fr, auto, 1fr),
+    column-gutter: 0.7em,
+    step-card[1][Model the system][
+      Choose the right *abstraction level* to capture the C++ concurrency and buffer-ownership logic as a state machine in Lean 4.
+    ],
+    align(center + horizon)[#text(size: 22pt, fill: accent.lighten(30%))[#sym.arrow.r]],
+    step-card[2][Validate the model][
+      Check that the model behaves like the real system: valid executions succeed, and injected bugs are caught.
+    ],
+    align(center + horizon)[#text(size: 22pt, fill: accent.lighten(30%))[#sym.arrow.r]],
+    step-card[3][Prove correctness][
+      Mathematically prove that core safety and progress guarantees hold across every possible execution schedule.
+    ],
+  )
+]
+
+// ---------------------------------------------------------------------------
+#slide[prefill → decode transfer (single request)][
+  For each request, the *prefill engine* computes the prompt's KV cache in *prefill HBM*, and the *decode engine* needs a copy in *decode HBM* to generate tokens. TPU Sync moves it in three steps, through a host staging buffer on each machine:
 
   #v(0.5em)
   #align(center, text(size: 14pt, diagram(
@@ -77,34 +135,129 @@
 
     Steps start in layer order but finish in any order.
   ][
-    *Sessions.* Each side has a session that keeps count of the copies and pushes still running (`in_flight_`). Once it is told to finish — the last layer completes, an error, or a cancel — it starts no new ones (`draining_`), and when the count reaches zero it _settles_ (`done_`).
+    *One session pair per request.* For each request, TPU Sync creates a session on each side (`TransferSendSession` and `TransferReceiveSession`) that counts the copies and pushes still running (`in_flight_`). Once told to finish — the last layer completes, an error, or a cancel — it starts no new ones (`draining_`), and when the count reaches zero it _settles_ (`done_`).
 
-    The engines learn the outcome from `poll_stats()`:
-    - `done_sending` — prefill may free its HBM
-    - `done_recving` — decode may run attention
+    The serving engines poll `poll_stats()` for the outcome:
+    - `done_sending` — prefill engine may free its HBM
+    - `done_recving` — decode engine may run attention
   ]
 ]
 
 // ---------------------------------------------------------------------------
-#slide[What the transfer must guarantee][
-  Copies, pushes, callbacks and cancels can interleave in any order. Across every interleaving, the sessions must never report completion early or hand a buffer on while it is still in use:
+#slide[Buffer recycling across requests][
+  In production, prefill and decode serve a continuous stream of requests $R_1, R_2, …$ that share four memory pools across two ownership boundaries:
 
-  #v(0.5em)
-  #grid(
-    columns: (13.5em, 1fr),
-    row-gutter: 0.9em,
-    column-gutter: 1.2em,
-    [*Publication correctness*], [When `done_recving` is reported, every layer's cache has arrived in decode HBM, in the right layer position.],
-    [*Attention safety*], [Once `done_recving` is reported, nothing that happens later in the pipeline overwrites decode HBM.],
-    [*Prefill HBM safety*], [When `done_sending` lets prefill free its HBM, no D2H copy is still reading from it.],
-    [*Staging integrity*], [Each host staging buffer is held until its session settles; when it is returned to the pool, no copy or push is still using it.],
-    [*Progress*], [Every started transfer eventually settles on both sides and returns its staging buffers.],
+  #v(0.3em)
+  #table(
+    columns: (auto, auto, 1fr),
+    fill: (_, y) => if calc.odd(y) { accent.lighten(93%) } else { none },
+    table.header[Buffer][Pool owner][When a request's buffer is recycled to a later request],
+    [*Prefill HBM*],
+    [Prefill serving engine],
+    [As soon as prefill's `poll_stats()` reports `done_sending` or `failed_sending`, the prefill engine frees the HBM blocks and reuses them for a new request.],
+
+    [*Prefill staging*],
+    [TPU Sync `BufferPool`],
+    [Inside `TransferSendSession::SettleLocked()`, the instant the send session settles (`done_ = true`) its host staging buffer is returned to `BufferPool` and reused.],
+
+    [*Decode staging*],
+    [TPU Sync `BufferPool`],
+    [Inside `TransferReceiveSession::SettleLocked()`, the instant the receive session settles (`done_ = true`) its host staging buffer is returned to `BufferPool` and reused.],
+
+    [*Decode HBM*],
+    [Decode serving engine],
+    [When decode's `poll_stats()` reports `done_recving`, the decode engine reads `decode HBM` for attention and then reallocates those HBM blocks to a later request (or immediately on `failed_recving`).],
   )
+
+  #v(0.25em)
+  Once a request releases a staging buffer or hands back an HBM buffer, a later request may immediately start reading and writing that same memory — so any straggling operation from the earlier request would corrupt the transfer.
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Abstraction levels in TPU Sync — and what we model in Lean][
-  TPU Sync's transfer stack has four levels, from whole requests down to TCP chunks. The highlighted rows are what the Lean model covers:
+#slide[What we want to prove — main theorems across requests][
+  Across the entire stream of requests $R_1, R_2, …$ as TPU HBM and host staging buffers are continuously recycled, we prove three system-level theorems:
+
+  #v(0.7em)
+  - *Theorem 1 (Publication correctness):* When TPU Sync signals to the decode engine that $R_k$'s KV transfer succeeded, $R_k$'s decode HBM holds the correct KV cache from prefill across all transformer layers.
+
+  #v(0.5em)
+  - *Theorem 2 (Decoding safety):* Once TPU Sync signals that $R_k$'s KV transfer succeeded, nothing overwrites $R_k$'s decode HBM while the decode engine is decoding.
+
+  #v(0.5em)
+  - *Theorem 3 (Progress & no buffer leak):* Every started request $R_k$ (whether it succeeds, fails, or is cancelled) eventually settles both sessions and releases all four HBM and staging buffers for reuse.
+]
+
+// ---------------------------------------------------------------------------
+#slide[Proof sketch — reducing multiple requests to a single request][
+  Concurrent requests $R_1, R_2, …$ do not share session state — they interact _only_ when a buffer released by an earlier request is reused by a later request.
+
+  #v(0.45em)
+  This reduces *Theorems 1–3* across *all* requests to *three lemmas on a single request*:
+
+  #v(0.55em)
+  - *Lemma 1 (No buffer access after release):* Once a request releases _any_ of its four buffers, it never reads or writes that buffer again — so later requests can safely reuse released buffers, and decode HBM is never overwritten during decoding (*proves Theorem 2* and isolates requests).
+
+  #v(0.45em)
+  - *Lemma 2 (Single-request KV correctness):* If a request's active buffers are not overwritten by other requests, signaling transfer success guarantees its decode HBM holds the correct KV cache across all layers (*with Lemma 1, proves Theorem 1*).
+
+  #v(0.45em)
+  - *Lemma 3 (Single-request eventual drain):* Every request eventually finishes all in-flight operations, settles both sessions, and releases all four buffers (*proves Theorem 3*).
+]
+
+// ---------------------------------------------------------------------------
+#slide[Proof sketch — Lemma 1: No buffer access after release][
+  *Lemma 1:* Once a request releases any of its four buffers (prefill HBM, prefill staging, decode staging, or decode HBM), no copy or network push from that request ever reads or writes that buffer again.
+
+  #v(0.45em)
+  We prove *Lemma 1* from two invariants on each session's settle protocol (`in_flight_`, `draining_`, `done_`):
+
+  #v(0.35em)
+  - *Invariant 1a (Settle gate):* Buffers are released only when the session settles (`done_ = true`), which implies `draining_ == true` (no *future* operations can start) and `in_flight_ == 0`.
+
+  #v(0.35em)
+  - *Invariant 1b (`in_flight_` conservation):* `in_flight_` equals the exact sum of non-negative counters for active copies, callbacks, pool tasks, and network pushes (each stage claims the next `in_flight_` count before releasing its own).
+
+  #v(0.45em)
+  #sym.arrow.r.double *Together, Invariants 1a + 1b prove Lemma 1:* when any buffer is released, `in_flight_ == 0` forces every active operation counter to be `0`, and `draining_ == true` prevents any new operation from starting.
+]
+
+// ---------------------------------------------------------------------------
+#slide[Proof sketch — Lemma 2: Single-request KV correctness][
+  *Lemma 2:* Within a single request (assuming its active buffers are not overwritten by other requests), when transfer success is signaled, decode HBM holds the correct KV cache from prefill across all $L$ transformer layers — even when layers finish out of order.
+
+  #v(0.45em)
+  We prove *Lemma 2* from two invariants across the $L$ layers:
+
+  #v(0.35em)
+  - *Invariant 2a (Per-layer stage ordering):* For each layer, each stage along `prefill HBM` #sym.arrow.r `prefill staging` #sym.arrow.r `network` #sym.arrow.r `decode staging` #sym.arrow.r `decode HBM` starts only after that layer's previous stage finishes, while `in_flight_ > 0` keeps its source buffer from being released mid-operation.
+
+  #v(0.35em)
+  - *Invariant 2b (At-most-once layer counting):* The receive session increments a completed-layer counter on each H2D completion and signals success only when the counter reaches $L$; each of the $L$ layers increments this counter at most once.
+
+  #v(0.45em)
+  #sym.arrow.r.double *Together, Invariants 2a + 2b prove Lemma 2:* because each of the $L$ layers increments the counter at most once, reaching $L$ guarantees *every one of the $L$ layers* has finished H2D — and Invariant 2a ensures each layer in decode HBM holds the right KV cache from prefill.
+]
+
+// ---------------------------------------------------------------------------
+#slide[Proof sketch — Lemma 3: Single-request eventual drain][
+  *Lemma 3:* From any state of a request (normal completion, error, or mid-stream cancellation), all in-flight operations finish in finitely many steps (`in_flight_ == 0`), settling both sessions (`done_ = true`) and releasing all four buffers.
+
+  #v(0.45em)
+  We prove *Lemma 3* by combining an invariant with a well-founded ranking measure:
+
+  #v(0.35em)
+  - *Invariant 3 (No stuck operations):* Whenever `in_flight_ > 0`, at least one active operation counter is positive (by Invariant 1b) and its completion or abort step is enabled.
+
+  #v(0.35em)
+  - *Ranking measure (Bounded remaining work):* Once `draining_ = true` blocks new operations, every enabled step strictly decreases a `Nat` ranking function measuring remaining work across all $L$ layers.
+
+  #v(0.45em)
+  #sym.arrow.r.double *Together, Invariant 3 + the ranking measure prove Lemma 3:* from any state, setting `draining_ = true` guarantees `in_flight_` reaches `0` in finitely many steps, settling both sessions (`done_ = true`) and releasing all four buffers.
+]
+
+// ---------------------------------------------------------------------------
+#slide[Modeling TPU Sync in Lean: abstraction levels][
+  To mechanize this top-to-bottom proof in Lean, we model the top three levels of TPU Sync's transfer stack and abstract byte chunks into whole transformer layers:
 
   #v(0.2em)
   #table(
@@ -137,363 +290,255 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[How the Lean model is structured][
-  The Lean model mirrors the C++ in four modules at three levels:
+#slide[Modeling state: module hierarchy & layer-indexed memories][
+  The Lean formalization builds the system state in four modular layers from top-level requests down to primitive session locks:
 
   #v(0.3em)
   #cols(columns: (0.85fr, 1.45fr))[
-    #v(0.5em)
-    #align(center, text(size: 13.5pt, diagram(
-      spacing: (1.8em, 1.6em),
+    #v(0.4em)
+    #align(center, text(size: 13pt, diagram(
+      spacing: (1.5em, 1.25em),
       node-stroke: 0.7pt + accent,
       node-shape: rect,
-      node-inset: 8pt,
+      node-inset: 6pt,
       node-corner-radius: 3pt,
-      node((0.5, 0), [`Pipeline`\ #small[memories per layer]]),
-      node((0, 1), [`Send`\ #small[prefill counters]]),
-      node((1, 1), [`Receive`\ #small[decode counters]]),
-      node((0.5, 2), [`Session`\ #small[shared `Lifecycle`]]),
-      edge((0.5, 0), (0, 1), "->"),
-      edge((0.5, 0), (1, 1), "->"),
-      edge((0, 1), (0.5, 2), "->"),
-      edge((1, 1), (0.5, 2), "->"),
+      node((0.5, 0), [*`MultiRequest`*\ #small[`reqs : List Pipeline`]]),
+      node((0.5, 1), [*`Pipeline`*\ #small[5 `List Cell` memories]]),
+      node((0, 2), [*`Send`*\ #small[prefill counters]]),
+      node((1, 2), [*`Receive`*\ #small[decode counters]]),
+      node((0.5, 3), [*`Session`*\ #small[shared `Lifecycle`]]),
+      edge((0.5, 0), (0.5, 1), "->"),
+      edge((0.5, 1), (0, 2), "->"),
+      edge((0.5, 1), (1, 2), "->"),
+      edge((0, 2), (0.5, 3), "->"),
+      edge((1, 2), (0.5, 3), "->"),
     )))
   ][
     #table(
       columns: (auto, 1fr),
-      table.header[Lean module][What it models],
-      [`Session`], [The settle protocol shared by both sides: `inFlight`, `draining`, `done`, and releasing the staging buffer.],
-      [`Send`], [`TransferSendSession`: the D2H copy loop and the H2H push chain, at the counter level.],
-      [`Receive`], [`TransferReceiveSession`: incoming pushes, H2D copies, the readiness check, at the counter level.],
-      [`Pipeline`], [One `Send`, one `Receive`, and the five memories (prefill HBM, prefill staging, network, decode staging, decode HBM), tracking which transformer layer's data is in each.],
+      inset: (x: 8pt, y: 7pt),
+      table.header[Layer][State represented in the model],
+      [*`MultiRequest`*], [
+        #set list(spacing: 0.55em)
+        - `reqs : List Pipeline` (stream of concurrent requests)
+        - Cross-request buffer recycling & write-release detection
+      ],
+      [*`Pipeline`*], [
+        #set list(spacing: 0.55em)
+        - 5 memories of length $L$ (`List Cell` per layer)
+        - `Cell` is `.kv l` (valid layer $l$), `.blank`, or `.junk`
+      ],
+      [*`Send`* /\ *`Receive`*], [
+        #set list(spacing: 0.55em)
+        - Counters for active DMA copies, pushes, and pool tasks
+        - Tracks mutex-drop windows and completion callbacks
+      ],
+      [*`Session`*], [
+        #set list(spacing: 0.55em)
+        - `inFlight` counter, `draining`, `done`, `statusOk`
+        - Settle gate: releases staging iff `inFlight == 0`
+      ],
     )
   ]
+]
+
+// ---------------------------------------------------------------------------
+#slide[Modeling actions: non-deterministic events & async steps][
+  We model concurrent C++ threads, DMA streams, and network callbacks as a non-deterministic transition system `step(state, event)` where any enabled event can fire next:
 
   #v(0.4em)
-  `Session`, `Send` and `Receive` only *count* operations. `Pipeline` adds *what each operation moves*; only there can publication correctness be stated.
+  #table(
+    columns: (1fr, 1fr),
+    inset: (x: 10pt, y: 8.5pt),
+    table.header[*Concurrency in the C++ implementation*][*How the Lean state machine models it*],
+    [
+      *Out-of-order async DMA & network:*\
+      D2H and H2D device futures resolve in arbitrary layer order; parallel TCP pushes arrive out of order.
+    ],
+    [
+      *Split `Issue` vs. `Ready` events:*\
+      Decouples dispatch from completion so transformer layers $0 dots L-1$ advance and complete independently.
+    ],
+    [
+      *Fine-grained locking & thread handoffs:*\
+      Mutexes are dropped during blocking dispatches and re-acquired before updating session state.
+    ],
+    [
+      *Explicit lock-gap states:*\
+      Models unlock/re-lock windows with intermediate ghost states (e.g., `ExecuteLayerH2d` lock gap).
+    ],
+    [
+      *Cancellations, polls & buffer recycling:*\
+      Deadlines, peer disconnects, `poll_stats()`, and buffer reuse fire asynchronously across requests.
+    ],
+    [
+      *Non-deterministic transitions:*\
+      Any active DMA, callback, cancellation, poll, or buffer-recycle step (`reclaim`, `reseat`, `recycle`) can fire next.
+    ],
+  )
 ]
 
 // ---------------------------------------------------------------------------
-#slide[`Session` — the shared settle protocol][
-  Both sessions use the same protocol to track running work and decide when to settle. Every event in `Send` and `Receive` calls these functions:
+#slide[Example: how steps update memories & catch bugs][
+  #let cell-kv = box(fill: rgb("#e6f4ea"), stroke: 0.7pt + rgb("#137333"), inset: (x: 6pt, y: 2.5pt), radius: 3pt)[#text(fill: rgb("#137333"), weight: "bold", size: 10.5pt)[`kv l`]]
+  #let cell-blank = box(fill: rgb("#f1f3f4"), stroke: 0.7pt + rgb("#5f6368"), inset: (x: 6pt, y: 2.5pt), radius: 3pt)[#text(fill: rgb("#5f6368"), size: 10.5pt)[`blank`]]
+  #let cell-junk = box(fill: rgb("#fce8e6"), stroke: 0.7pt + rgb("#c5221f"), inset: (x: 6pt, y: 2.5pt), radius: 3pt)[#text(fill: rgb("#c5221f"), weight: "bold", size: 10.5pt)[`junk`]]
 
-  #cols(columns: (1fr, 1fr))[
-    ```lean
-    def settleLocked (l : Lifecycle) :=
-      if l.draining ∧ l.inFlight = 0 ∧ ¬l.done then
-        { l with done := true, hasStaging := false }
-      else l
-
-    def beginOp (l : Lifecycle) : Option Lifecycle :=
-      if l.done ∨ l.draining then none
-      else some { l with inFlight := l.inFlight + 1 }
-
-    def endOpLocked (l : Lifecycle) :=
-      if l.inFlight = 0 then l
-      else settleLocked
-        { l with inFlight := l.inFlight - 1 }
-
-    def finish (ok : Bool) (l : Lifecycle) :=
-      if l.draining ∨ l.done then l
-      else settleLocked
-        { l with draining := true, statusOk := ok }
-    ```
-  ][
-    ```lean
-    structure Lifecycle where
-      inFlight   : Nat  := 0
-      draining   : Bool := false
-      done       : Bool := false
-      statusOk   : Bool := true
-      hasStaging : Bool := true
-
-    structure Consistent (l : Lifecycle) : Prop where
-      done_draining : l.done → l.draining
-      done_idle     : l.done → l.inFlight = 0
-      prompt        : l.draining →
-                      l.inFlight = 0 → l.done
-      staging       : l.hasStaging = !l.done
-    ```
-    `Consistent` holds initially and is preserved by all four functions — so any session built from them holds its staging buffer until `done`, and reaches `done` only when `inFlight = 0`.
-  ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[`Send` — counting operations on the prefill side][
-  `Send` models the prefill session (`TransferSendSession`): it starts all $L$ D2H copies up front, then pushes layers one after another from a thread pool, all sharing a single `inFlight` counter.
+  *Normal execution (`0 → 1 → 2 → 3 → 4 → 5`):* #h(0.3em) #cell-kv valid layer-$l$ KV #h(0.4em) #cell-junk stale / recycled DRAM #h(0.4em) #cell-blank unwritten wire
 
   #v(0.3em)
-  #cols(columns: (1.05fr, 0.95fr))[
-    ```lean
-    def Accounted (s : Send) : Prop :=
-      s.life.inFlight =
-        (if s.d2hPending then 1 else 0)
-        + (s.d2hIssued - s.d2hRetired) -- D2H copies
-        + (s.queued - s.woken)         -- waiting on D2H
-        + s.pooled + s.chaining        -- pool tasks
-        + (s.h2hIssued - s.h2hRetired) -- H2H pushes
-    ```
-    Every unit of `inFlight` is accounted for by a running D2H copy, a `SendNextLayer` callback waiting on its D2H future, a thread-pool task, or a running H2H push.
-  ][
-    *Why the D2H → H2H handoff is safe*
-    - When layer $l$'s D2H copy finishes, the pool task increments `inFlight` for the H2H push _before_ releasing the count held while waiting on D2H (`chaining`) — so `inFlight` cannot hit `0` in the gap between the two steps.
-
-    *Proved for `Send`*
-    - At `done`, `inFlight = 0`, so every term in `Accounted` is `0`: no D2H copy, pool task or H2H push is running.
-    - `inFlight` never underflows.
-    - `done_sending` (`published = some true`) implies all $L$ pushes succeeded (`h2hOk = numLayers`).
-  ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[`Receive` — counting operations on the decode side][
-  `Receive` models the decode session (`TransferReceiveSession`): it accepts incoming H2H pushes from the network and dispatches one H2D copy per layer as each layer arrives.
-
-  #v(0.3em)
-  #cols(columns: (1.05fr, 0.95fr))[
-    ```lean
-    def Accounted (s : Recv) : Prop :=
-      s.life.inFlight =
-        (if s.pullPending then 1 else 0)
-        + s.pushes                -- open H2H pushes
-        + s.pending               -- H2D lock gap
-        + (s.issued - s.retired)  -- H2D copies
-
-    def isReadyToComplete (s : Recv) : Prop :=
-      (s.layersAccounted = s.numLayers ∨
-       s.completed = s.numLayers) ∧
-      s.ready = s.issued
-    ```
-    Every unit of `inFlight` is the initial pull handshake, an open H2H push, an H2D dispatch between its two locks, or an H2D copy whose callback has not yet run.
-  ][
-    *Why H2D dispatch is two steps (`pending`)*
-    - `ExecuteLayerH2d` drops the session lock while issuing the TPU copy. It claims an `inFlight` count _before_ dropping the lock and re-checks `draining` after re-acquiring it — so a concurrent cancel cannot settle the session mid-dispatch.
-
-    *Proved for `Receive`*
-    - At `done`, `inFlight = 0`, so no push, pull request, H2D dispatch or H2D callback is still outstanding.
-    - `isReadyToComplete` implies all $L$ H2D copies have finished (`ready = numLayers`).
-    - `done_recving` (`published = some true`) implies all $L$ H2D callbacks succeeded (`completed = numLayers`).
-  ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[`Pipeline` — per-layer memories and events][
-  `Send` and `Receive` only count operations. `Pipeline` pairs one `Send` and one `Receive` with the five memories, and tags every copy and push with its layer index $l$ so completions can interleave in any order.
-
-  #v(0.2em)
-  #cols(columns: (0.95fr, 1.05fr))[
-    ```lean
-    inductive Cell where
-      | blank            -- nothing sent yet
-      | kv (layer : Nat) -- layer l's KV data
-      | junk             -- another request's bytes
-
-    structure Pipeline where
-      numLayers      : Nat
-      send           : Send
-      recv           : Recv
-      prefillHbm     : List Cell
-      prefillStaging : List Cell
-      wire           : List Cell
-      decodeStaging  : List Cell
-      decodeHbm      : List Cell
-    ```
-  ][
-    *Initial state ($L$ cells per memory)*
-    - `prefillHbm`: `[kv 0, …, kv (L-1)]`
-    - `wire`: `[blank, …, blank]`
-    - `prefillStaging`, `decodeStaging`, `decodeHbm`: `[junk, …, junk]` (from earlier requests)
-
-    *Data-moving events (in any layer order)*
-    - `d2hReady l`: copies `prefillHbm[l]` → `prefillStaging[l]`.
-    - `h2hDone l true`: copies `prefillStaging[l]` → `wire[l]`.
-    - `land l`: copies `wire[l]` → `decodeStaging[l]` inside an open push.
-    - `h2dReady l`: copies `decodeStaging[l]` → `decodeHbm[l]`.
-
-    *Reuse events*
-    - Freeing prefill HBM (`reclaim`) or reusing a released staging buffer (`reseat*`) overwrites all $L$ of its slots with `junk`.
-  ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[`Pipeline` — why each layer arrives intact][
-  Each layer $l$'s data (`kv l`) moves step by step across the five memories: `prefillHbm` → `prefillStaging` → `wire` → `decodeStaging` → `decodeHbm`. At each step, two properties connect the local C++ guards in `step` to the proved invariant `Pipeline.Inv`:
-
-  #v(0.3em)
-  #cols(columns: (1fr, 1fr))[
-    *1. Don't read before the previous step finishes*
-
-    - *Guards in `step` (from C++):*
-      - Layer $l$'s H2H push wakes only after layer $l$'s _own_ D2H copy finishes (`d2hReadyL[l] = true`).
-      - Layer $l$'s H2D copy starts only after layer $l$'s push lands (`landedL[l] = true`).
-    - *Proved in `Pipeline.Inv`:*
-      - Any active push or H2D copy for layer $l$ reads a slot that the previous step has already written (`woken_d2hReady`, `issued_landed`).
-  ][
-    *2. Don't overwrite while a step is in flight*
-
-    - *Guards in `step` (from C++):*
-      - A session settles (`done := true`, `hasStaging := false`) only when `inFlight = 0`; freeing HBM (`reclaim`) requires `done`, and reusing staging (`reseat*`) requires `hasStaging = false`.
-    - *Proved in `Pipeline.Inv`:*
-      - Any running copy or push keeps `inFlight > 0` (`Accounted`), so `done = false` and its source memory cannot be overwritten with `junk` before it finishes.
-  ]
-
-  #v(0.25em)
-  Applying (1) and (2) at each step proves one invariant per memory in `Pipeline.Inv`, each feeding the next:
   #align(center)[
-    `phbm_good` #sym.arrow.r `pstaging_good` #sym.arrow.r `wire_good` #sym.arrow.r `dstaging_good` #sym.arrow.r `dhbm_good`
+    #text(size: 11pt)[
+      #table(
+        columns: (auto, auto, 1.05fr, 1.35fr, 0.65fr, 1.3fr, 1fr),
+        align: (left + horizon, left + horizon, center + horizon, center + horizon, center + horizon, center + horizon, center + horizon),
+        inset: (x: 6pt, y: 5.5pt),
+        table.header[Step (layer $l$)][Memory update][`prefillHbm`][`prefillStaging`][`wire`][`decodeStaging`][`decodeHbm`],
+        [*0. Initial state*], [Staging & decode start as `junk`], [#cell-kv], [#cell-junk], [#cell-blank], [#cell-junk], [#cell-junk],
+        [*1. `d2hReady l`*], [`prefillStaging[l] := prefillHbm[l]`], [#cell-kv], [#cell-kv], [#cell-blank], [#cell-junk], [#cell-junk],
+        [*2. `h2hDone l`*], [`wire[l] := prefillStaging[l]`], [#cell-kv], [#cell-kv], [#cell-kv], [#cell-junk], [#cell-junk],
+        [*3. `land l`*], [`decodeStaging[l] := wire[l]`], [#cell-kv], [#cell-kv], [#cell-kv], [#cell-kv], [#cell-junk],
+        [*4. `h2dReady l`*], [`decodeHbm[l] := decodeStaging[l]`], [#cell-kv], [#cell-kv], [#cell-kv], [#cell-kv], [#cell-kv],
+        [*5. `reclaim` / `reseat`*], [Released buffers reset to `junk`], [#cell-junk], [#cell-junk], [#cell-kv], [#cell-junk], [#cell-kv],
+      )
+    ]
   ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[Main theorems — decode HBM correctness][
-  The first two properties guarantee that decode HBM holds `[kv 0, …, kv (n - 1)]` when `done_recving` is reported, and keeps holding it for the rest of the run:
-
-  #v(0.3em)
-  #cols(columns: (1.1fr, 0.9fr))[
-    ```lean
-    def good (n : Nat) : List Cell :=
-      (List.range n).map Cell.kv
-
-    def PublicationCorrect (s : Pipeline) : Prop :=
-      s.recv.published = some true →
-        s.decodeHbm = good s.numLayers
-
-    theorem attention_safe {n : Nat} {s s' : Pipeline}
-        (h  : (sys n).Reachable s)
-        (hp : s.recv.published = some true)
-        (evs : List Ev)
-        (hr : (sys n).runFrom s evs = some s') :
-        s'.decodeHbm = good n
-    ```
-  ][
-    *Publication correctness (`PublicationCorrect`)*
-    - `good n` is `[kv 0, kv 1, …, kv (n - 1)]` — every layer slot holds its own KV data.
-    - Whenever `poll_stats()` reports `done_recving` (`s.recv.published = some true`), `decodeHbm` already equals `good n`.
-
-    *Attention safety (`attention_safe`)*
-    - Once `done_recving` has been reported in a reachable state `s`, _any_ later sequence of events `evs` leading to `s'` leaves `s'.decodeHbm = good n`.
-    - Freeing prefill HBM, reusing either staging buffer, or a late cancel cannot corrupt decode HBM while attention runs.
-  ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[Main theorems — prefill HBM and staging safety][
-  The remaining properties guarantee that no copy or push is still touching prefill HBM or either host staging buffer once it is freed or released:
-
-  #v(0.3em)
-  #cols(columns: (1.1fr, 0.9fr))[
-    ```lean
-    def PrefillHbmSafe (s : Pipeline) : Prop :=
-      s.reclaimed = true →
-        s.send.d2hPending = false ∧
-        s.send.d2hRetired = s.send.d2hIssued
-
-    def StagingSafe (s : Pipeline) : Prop :=
-      (s.send.life.hasStaging = false →
-        s.send.d2hPending = false ∧
-        s.send.d2hRetired = s.send.d2hIssued ∧
-        s.send.h2hRetired = s.send.h2hIssued) ∧
-      (s.recv.life.hasStaging = false →
-        s.recv.pushes = 0 ∧ s.recv.pending = 0 ∧
-        s.recv.retired = s.recv.issued)
-
-    theorem reachable_safe {n : Nat} {s : Pipeline}
-        (h : (sys n).Reachable s) :
-        PublicationCorrect s ∧
-        PrefillHbmSafe s ∧ StagingSafe s
-    ```
-  ][
-    *Prefill HBM safety (`PrefillHbmSafe`)*
-    - Once the prefill engine frees `prefillHbm` (`s.reclaimed = true`), no D2H copy is mid-dispatch (`d2hPending = false`) and every issued D2H copy has retired — and because the send session has settled, no new D2H copy can start.
-
-    *Staging integrity (`StagingSafe`)*
-    - When prefill staging is released (`hasStaging = false`), no D2H copy is mid-dispatch and every D2H copy and H2H push has retired.
-    - When decode staging is released, no H2H push is open (`pushes = 0`), no H2D dispatch is pending (`pending = 0`), and every H2D copy has retired.
-
-    *All layer counts (`reachable_safe`)*
-    - Holds for every number of transformer layers $n$ and every interleaving the Lean model admits.
-  ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[Main theorems — progress and no op leak][
-  In both `Send` and `Receive`, `Accounted` also proves that `inFlight` never gets stuck above zero — every reachable session can drain to `done = true` and release its staging buffer:
-
-  #v(0.3em)
-  #cols(columns: (1.1fr, 0.9fr))[
-    ```lean
-    def NoOpLeak (s : Send) : Prop :=
-      0 < s.life.inFlight →
-        ∃ e ∈ drainEvents, (step s e).isSome = true
-
-    theorem reachable_can_settle {n : Nat} {s : Send}
-        (h : (sys n).Reachable s) :
-        ∃ evs s',
-          (sys n).runFrom s evs = some s' ∧
-          s'.life.done = true ∧
-          s'.life.hasStaging = false
-
-    -- Likewise proved in Receive.lean:
-    -- Recv.NoOpLeak, Recv.reachable_can_settle
-    ```
-  ][
-    *No operation leak (`NoOpLeak`)*
-    - Whenever `inFlight > 0`, `Accounted` guarantees at least one active operation, which enables a completion step in `drainEvents`.
-    - Rules out bugs where an early return forgets to decrement `inFlight` (which would leave `done` unreachable and `SettleSafe` vacuously true).
-
-    *Eventual settlement (`reachable_can_settle`)*
-    - Once `draining = true`, no new operation can start (`beginOp` returns `none`) and each `drainEvents` step strictly decreases a finite `drainRank`.
-    - So from every reachable state, a finite event sequence `evs` settles the session (`done = true`, `hasStaging = false`).
-  ]
-]
-
-// ---------------------------------------------------------------------------
-#slide[How the proofs work][
-  All theorems are proved by induction on `Reachable` in Lean 4. Three ideas keep the proofs simple:
 
   #v(0.35em)
-  #cols(columns: (1fr, 1fr))[
-    *1. How `inFlight = 0` proves every step has finished*\
-    _(`PrefillHbmSafe`, `StagingSafe`, `NoOpLeak`)_
-    - In C++, `in_flight_` is just one number — `in_flight_ = 0` alone does not say which copies or pushes are still running.
-    - `Accounted` equates `inFlight` to the sum of `Nat` counters for each kind of active work.
-    - Because `Nat`s cannot be negative, their sum is `0` _iff every counter is `0`_ — and when `inFlight > 0`, at least one counter is `> 0` (`NoOpLeak`).
+  *Why any concurrency bug produces `decodeHbm[l] =` #cell-junk (steps firing in the wrong order):*
+  #set list(spacing: 0.45em)
+  - *Out-of-order copy (e.g. Step `4` before `3`):* `h2dReady l` runs before `land l`, reading initial #cell-junk from `decodeStaging[l]` into `decodeHbm[l]`.
+  - *Read-after-release (Step `5` before `4`):* Early `reseat` resets `decodeStaging[l]` to #cell-junk while H2D is in flight; `h2dReady l` then copies #cell-junk into `decodeHbm[l]`.
+  - *Write-after-release (Step `5` before `3`):* `land l` writes to `decodeStaging` after `reseat` released it; the model's `wroteReleased` check catches the late write and sets `decodeHbm[l]` to #cell-junk.
+]
 
-    #v(0.3em)
-    *2. How `Pipeline` reuses the `Send` and `Receive` proofs*
-    - `Pipeline.Inv` includes `s.send.Inv` and `s.recv.Inv` directly; events that only change session counters reuse those proofs as-is, so `Pipeline` only has to prove the memory-touching events.
+
+
+// ---------------------------------------------------------------------------
+#slide[Validating the model: translating unit tests to Lean][
+  To check that the Lean model faithfully captures the production C++ behavior (without over-constraining valid runs), we replay all 52 `tpu-sync` unit and E2E tests inside the model before proving general theorems:
+
+  #v(0.25em)
+  #let pill(title, sub) = block(
+    fill: luma(246), stroke: 0.6pt + luma(220), radius: 4pt,
+    inset: (x: 12pt, y: 9pt), width: 100%,
+  )[
+    #text(fill: accent, weight: "medium", size: 15pt, title)\
+    #v(0.15em)
+    #text(size: 13pt, sub)
+  ]
+  #grid(
+    columns: (1fr, auto, 1fr, auto, 1fr),
+    column-gutter: 0.6em,
+    pill[1 · Production test][Tests *one* fixed schedule in C++ or Python (`52` tests total)],
+    align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
+    pill[2 · Lean trace (`by decide`)][Executes that exact scenario step-by-step inside the Lean model],
+    align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
+    pill[3 · Lean theorem][Proves the property holds across *every* thread & DMA schedule],
+  )
+
+  #v(0.35em)
+  *Example: mid-H2D failure on a 2-layer receive (`FailedLayerWaitsForOtherH2dCopies`)*
+  #v(0.2em)
+  #cols(columns: (0.94fr, 1.06fr))[
+    #block(fill: luma(247), stroke: 0.5pt + luma(222), radius: 4pt, inset: 11pt, width: 100%)[
+      #text(fill: accent, weight: "medium", size: 14pt)[C++ unit test (`..._send_drain_test.cc`)]
+      #v(0.3em)
+      #set text(size: 13pt)
+      #set list(spacing: 0.55em)
+      - Issues H2D copies for *Layer 0* and *Layer 1*.
+      - *Layer 0 fails* while *Layer 1* is still copying.
+      - Asserts that staging stays pinned (`!done()`) and failure is not published until *Layer 1* finishes.
+      - #text(fill: muted)[Covers $L = 2$ and 1 failure order.]
+    ]
   ][
-    *3. How a counter (`ready = L`) proves every slot $0 … L-1$ is ready*\
-    _(`PublicationCorrect`)_
-    - C++ checks a counter (`ready == num_layers`), whereas `PublicationCorrect` requires every slot $0 … L-1$ to be filled — so the proof must rule out one layer being counted twice while another is missing.
-    - `Pipeline` keeps a list of $L$ booleans (`h2dReadyL : List Bool`, one entry `h2dReadyL[l]` per layer $l$). Layer $l$'s H2D copy flips `h2dReadyL[l]` from `false` to `true` at most once, so:
-      ```lean
-      countTrue s.h2dReadyL = s.recv.ready
-      ```
-    - When `ready = L`, a list of $L$ booleans has $L$ `true`s — so _every_ entry `h2dReadyL[l]` must be `true`, and `dhbm_good` gives `decodeHbm[l] = kv l`.
+    #set text(size: 11.5pt)
+    ```lean
+    -- 1. Executable trace (replays C++ test)
+    theorem trace_failed_h2d_waits_for_other_layer :
+      ∃ s1 s2,
+        run 2 init2 [..., h2dCallback false] = some s1 ∧
+        !s1.life.done ∧ s1.life.hasStaging ∧
+        run 2 s1 [h2dReady, h2dCallback true,
+                  pollPublish] = some s2 ∧
+        s2.life.done ∧ s2.published = some false := by decide
+    -- 2. General theorem (all L & all schedules)
+    theorem reachable_safe : Reachable n s →
+      SettleSafe s ∧ StagingIntegrity s
+    ```
   ]
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Sanity checks on the Lean model][
-  Two checks run automatically at every `lake build` to verify that the Lean model neither forbids valid runs nor misses bugs when a guard is dropped:
-
-  #v(0.3em)
-  #cols(columns: (1fr, 1fr))[
-    *1. Concrete traces (`decide`)*\
-    _Checks that key scenarios run to completion:_
-
-    - *Normal multi-layer run:* completes all copies and pushes and publishes `done_recving` with `[kv 0, …, kv (L-1)]`.
-    - *Out-of-order layers:* Layer 1 finishes D2H, H2H, and H2D before Layer 0 at every step, and `decodeHbm` still ends with `[kv 0, kv 1]`.
-    - *Fast prefill, slow decode:* prefill finishes, frees `prefillHbm`, and reuses `prefillStaging` before decode lands anything — decode still gets `[kv 0, kv 1]`.
-    - *Cancel in the H2D lock gap:* a cancel arrives while the session mutex is unlocked during H2D dispatch; the re-check aborts the copy and drains cleanly.
-  ][
-    *2. Mutants (bounded model checking)*\
-    _Checks that removing a C++ guard exposes a bug:_
-
-    - *Settle without waiting for `inFlight = 0`:* session settles and releases its staging buffer while a copy is still running.
-    - *Start H2D before layer $l$ lands:* H2D copies stale `[junk]` from `decodeStaging` into `decodeHbm`.
-    - *Release staging at `Finish` instead of settle:* staging is reused while in-flight operations are still draining, corrupting the transfer.
-    - *Skip `--inFlight` on early abort:* `inFlight` never reaches `0`, so the session is stuck `draining` forever and leaks its staging buffer.
+#slide[Validating the model: 52 production tests covered in Lean][
+  #v(0.15em)
+  #let cat(title, count, mod, bullets) = block(
+    fill: luma(247), stroke: 0.5pt + luma(222), radius: 4pt,
+    inset: (x: 12pt, y: 9pt), width: 100%,
+  )[
+    #grid(
+      columns: (1fr, auto),
+      text(fill: accent, weight: "medium", size: 14pt, title),
+      text(size: 11.5pt, fill: muted)[#count · #mod],
+    )
+    #v(0.25em)
+    #set text(size: 12.5pt)
+    #set par(leading: 0.45em)
+    #set list(spacing: 0.4em)
+    #bullets
   ]
+
+  #grid(
+    columns: (1fr, 1fr),
+    column-gutter: 0.9em,
+    row-gutter: 0.65em,
+    cat[1 · Session drain & leases][21 C++][`Send` / `Receive`][
+      - Mid-copy failures & deadlines wait for all in-flight DMA copies
+      - Incoming TCP push leases pin host staging; first `Finish` wins
+    ],
+    cat[2 · Control handshake][6 C++][`Send` / `Pipeline`][
+      - Pulls arriving ahead of `NotifyForRead` wait and succeed once registered
+      - Rejects duplicate or unregistered pulls; shutdown unblocks waiters
+    ],
+    cat[3 · Block gather & reordering][7 C++ · 3 E2E][`BlockOrdering`][
+      - Rejects empty, duplicate, or unregistered block IDs on pull
+      - Proves DMA coalescing & dual-permutation `BuildLoadCopyPlan`
+    ],
+    cat[4 · UUID drain-before-reuse][4 C++][`UuidTable`][
+      - Expired receive (`draining && !done`) blocks UUID reuse until drained
+      - Protects live send offers; idempotent on repeated same-request reads
+    ],
+    cat[5 · Multi-peer fault isolation][5 C++][`PeerIsolation`][
+      - Models TCP worker-pool blocking (Issue \#888) vs. async gRPC
+      - Per-peer staging quota stops a wedged peer from starving others
+    ],
+    cat[6 · Multi-layer & multi-request][3 E2E][`MultiRequest`][
+      - Out-of-order layer completion across D2H, H2H, and H2D stages
+      - Continuous HBM & host staging recycling across concurrent requests
+    ],
+  )
 ]
+
+// ---------------------------------------------------------------------------
+#slide[Validating the model: mutant checks][
+  #let cell-junk = box(fill: rgb("#fce8e6"), stroke: 0.7pt + rgb("#c5221f"), inset: (x: 6pt, y: 2.5pt), radius: 3pt)[#text(fill: rgb("#c5221f"), weight: "bold", size: 10.5pt)[`junk`]]
+
+  We also test *mutant models*—removing one C++ guard at a time—to check that Lean catches the resulting bug:
+
+  #v(0.5em)
+  #table(
+    columns: (0.78fr, 1.22fr),
+    inset: (x: 10pt, y: 11pt),
+    align: (left + horizon, left + horizon),
+    table.header[*Dropped C++ guard (mutant)*][*Bug caught automatically by Lean*],
+    [*Settle without waiting for `inFlight == 0`*],
+    [Session settles and frees staging while a DMA copy or push is running.],
+    [*Release staging at `Finish()` instead of settle*],
+    [In-flight push reads released staging and delivers #cell-junk to `decodeHbm`.],
+    [*Start H2D before layer $l$ lands*],
+    [H2D reads `decodeStaging[l]` early and copies #cell-junk into `decodeHbm[l]`.],
+    [*Skip `--inFlight` on early abort*],
+    [`inFlight` never reaches `0`, leaving the session stuck `draining` forever.],
+  )
+]
+
