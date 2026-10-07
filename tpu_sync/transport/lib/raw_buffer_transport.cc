@@ -721,9 +721,9 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
   close(client_fd);
 }
 
-absl::StatusOr<PspPeerKey>
-RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
-                                    absl::string_view client_key) {
+absl::StatusOr<PspPeerKey> RawBufferTransport::RegisterPspPeer(
+    uint32_t client_spi, absl::string_view client_key,
+    absl::string_view peer_target) {
   if (!require_psp_tcp_) {
     return absl::InvalidArgumentError(
         "PSP is not enabled in transport");
@@ -734,7 +734,7 @@ RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
         "Transport is stopping or listening socket is not initialized.");
   }
 
-  return RegisterPspPeerKey(server_fd_, client_spi, client_key);
+  return RegisterPspPeerKey(server_fd_, client_spi, client_key, peer_target);
 }
 
 void RawBufferTransport::ListenerLoop() {

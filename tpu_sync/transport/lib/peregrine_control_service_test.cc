@@ -91,7 +91,7 @@ TEST(PeregrineControlServiceTest, ProcessUnary) {
     EXPECT_TRUE(resp_psp.has_gen());
     EXPECT_EQ(resp_psp.key().size(), 16);
   } else {
-    EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::UNIMPLEMENTED);
   }
 
   EXPECT_EQ(call(ReqMsg{}, &resp).error_code(),
@@ -118,6 +118,12 @@ TEST(PeregrineControlServiceTest, ProcessUnary) {
   {
     ReqMsg req = MakeValidReq();
     req.mutable_psp_tcp_req()->clear_peer_target();
+    EXPECT_EQ(call(req, &resp).error_code(),
+              grpc::StatusCode::INVALID_ARGUMENT);
+  }
+  if (IsPspSupported()) {
+    ReqMsg req = MakeValidReq();
+    req.mutable_psp_tcp_req()->mutable_peer_target()->set_ip_port("invalid");
     EXPECT_EQ(call(req, &resp).error_code(),
               grpc::StatusCode::INVALID_ARGUMENT);
   }

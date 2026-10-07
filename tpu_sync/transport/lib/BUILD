@@ -337,9 +337,9 @@ cc_library(
         ":raw_buffer_transport",
         ":service_cc_grpc",
         ":service_cc_proto",
+        "//tpu_sync/common:grpc_util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
     ],
 )
 

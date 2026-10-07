@@ -48,8 +48,10 @@ bool IsPspSupported();
 
 // Registers a client's PSP key on server_fd and returns the allocated server
 // RX key.
-absl::StatusOr<PspPeerKey> RegisterPspPeerKey(
-    int server_fd, uint32_t client_spi, absl::string_view client_key);
+absl::StatusOr<PspPeerKey> RegisterPspPeerKey(int server_fd,
+                                              uint32_t client_spi,
+                                              absl::string_view client_key,
+                                              absl::string_view peer_target);
 
 // Returns true if the accepted socket has valid PSP encryption active
 // according to GetInitialRxSpi.

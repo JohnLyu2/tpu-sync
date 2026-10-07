@@ -153,7 +153,8 @@ class RawBufferTransport final {
   // Registers incoming client PSP key and returns server's allocated RX key.
   // Triggered by ProcessUnary() in PeregrineControlServiceImpl.
   absl::StatusOr<PspPeerKey> RegisterPspPeer(uint32_t client_spi,
-                                             absl::string_view client_key);
+                                             absl::string_view client_key,
+                                             absl::string_view peer_target);
 
   void SetTestOnlyRateLimiters(std::shared_ptr<TestOnlyRateLimiter> egress,
                                std::shared_ptr<TestOnlyRateLimiter> ingress);

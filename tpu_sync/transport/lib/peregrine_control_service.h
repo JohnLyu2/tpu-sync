@@ -16,9 +16,9 @@
 #define TPU_SYNC_TRANSPORT_LIB_PEREGRINE_CONTROL_SERVICE_H_
 
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/common/grpc_util.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/service.pb.h"
@@ -68,12 +68,10 @@ class PeregrineControlServiceImpl final
                           "peer_target.ip_port must be non-empty");
     }
 
-    auto server_rx_key = transport_->RegisterPspPeer(psp.spi(), psp.key());
+    auto server_rx_key = transport_->RegisterPspPeer(
+        psp.spi(), psp.key(), psp_req.peer_target().ip_port());
     if (!server_rx_key.ok()) {
-      return grpc::Status(
-          grpc::StatusCode::INTERNAL,
-          absl::StrCat("Failed to register PSP peer: ",
-                       server_rx_key.status().message()));
+      return ToGrpcStatus(server_rx_key.status());
     }
 
     auto* resp_psp = response->mutable_psp_tcp_resp()->mutable_psp();
