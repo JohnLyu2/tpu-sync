@@ -151,7 +151,7 @@ class RawBufferTransport final {
   void ForgetPushProgress(uint64_t uuid);
 
   // Registers incoming client PSP key and returns server's allocated RX key.
-  // Triggered by ExchangePspKey() in PeregrineControlServiceImpl.
+  // Triggered by ProcessUnary() in PeregrineControlServiceImpl.
   absl::StatusOr<PspPeerKey> RegisterPspPeer(uint32_t client_spi,
                                              absl::string_view client_key);
 

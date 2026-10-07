@@ -39,6 +39,7 @@ void SetPspTcpSyscallsForTesting(void* psp_sys);
 // Structure representing an exchanged PSP key.
 struct PspPeerKey {
   uint32_t spi = 0;
+  uint32_t gen = 0;
   std::string key;
 };
 
