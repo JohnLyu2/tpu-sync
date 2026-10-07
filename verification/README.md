@@ -43,10 +43,13 @@ All citations (models, `docs/`, `findings/`) are to tpu-sync `50b0774`
 | `Transfer/PrefillDecode/BlockOrdering` | within-layer block refinement of `Pipeline` (discharges its A1): block-index gather and dual-permutation `BuildLoadCopyPlan`, coalesced DMA runs equal element-wise copies on every memory (`execCoalesced_buildCoalescedSpec`), subset/uniqueness validation, custom host staging; `BlockPipeline.step_pipe` couples each block step to `Pipeline.step`, `BlockPipeline.reachable_safe` | proved; `decide` traces + mutants | same |
 | `Controller/ReadRemote` | `NoWriteAfterRelease` | shipping code: counterexamples (shapes A, B); deferred-settle fix: safe by exhaustive search | [read_remote.md](docs/controller/read_remote.md) |
 
-Outcome so far: no bugs in the prefill-to-decode transfer path at `50b0774`
-(observations in the doc); four confirmed defects in the controller /
-KV-cache-store path, written up in [findings/](findings/README.md), none fixed
-upstream as of `50b0774`.
+Outcome so far: no data-correctness or safety bugs in the prefill-to-decode
+transfer path at `50b0774` (observations in the doc); one owner-acknowledged
+availability gap on that path (F5, no per-peer staging admission at
+`StartRead`) confirmed with the owners' own parked test and fixed by
+`findings/per_peer_staging_admission.patch`; four confirmed defects in the
+controller / KV-cache-store path, written up in
+[findings/](findings/README.md). None fixed upstream as of `50b0774`.
 
 ## Building
 
@@ -80,5 +83,5 @@ hand), then grep for citation lists that wrap onto a second line and for bare
 backticked ranges after a comma (the script does not follow either). Update the
 commit sentence in each module preamble, in this file, in `docs/*/*.md` and in
 `findings/README.md` / `findings/filed_bugs.md`; re-run `git apply --check` on
-the two patches in `findings/`; run `lake build`; add a row to
+the three patches in `findings/`; run `lake build`; add a row to
 [prefill_decode.md](docs/transfer/prefill_decode.md) §"Upstream re-checks".

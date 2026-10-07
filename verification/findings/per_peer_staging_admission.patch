@@ -1,0 +1,709 @@
+diff --git a/tpu_sync/core/kv_cache_manager_with_transfer.cc b/tpu_sync/core/kv_cache_manager_with_transfer.cc
+index e5cd2af..fdf7350 100644
+--- a/tpu_sync/core/kv_cache_manager_with_transfer.cc
++++ b/tpu_sync/core/kv_cache_manager_with_transfer.cc
+@@ -42,6 +42,7 @@
+ #include "absl/status/status_macros.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/match.h"
++#include "absl/strings/numbers.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/synchronization/mutex.h"
+ #include "absl/time/clock.h"
+@@ -864,7 +865,8 @@ void KVCacheManagerWithTransfer::StartRead(
+         TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
+                                        uuid, req_id, remote_block_ids,
+                                        local_block_ids, local_host_block_ids,
+-                                       effective_deadline);
++                                       effective_deadline,
++                                       /*peer_key=*/remote_endpoint);
+     if (!created.ok()) {
+       failed_recving_.insert(req_id);
+       return;
+@@ -1048,22 +1050,29 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
+ 
+ StagingBlockAllocator::Allocation::Allocation(StagingBlockAllocator* allocator,
+                                               int64_t slot_idx,
+-                                              std::vector<int> block_ids)
++                                              std::vector<int> block_ids,
++                                              std::string peer_key)
+     : allocator_(allocator),
+       slot_idx_(slot_idx),
+-      block_ids_(std::move(block_ids)) {}
++      block_ids_(std::move(block_ids)),
++      peer_key_(std::move(peer_key)) {}
+ 
+ StagingBlockAllocator::Allocation::Allocation(StagingBlockAllocator* allocator,
+-                                              std::vector<int> dynamic_blocks)
+-    : allocator_(allocator), block_ids_(std::move(dynamic_blocks)) {}
++                                              std::vector<int> dynamic_blocks,
++                                              std::string peer_key)
++    : allocator_(allocator),
++      block_ids_(std::move(dynamic_blocks)),
++      peer_key_(std::move(peer_key)) {}
+ 
+ StagingBlockAllocator::Allocation::Allocation(Allocation&& other) noexcept
+     : allocator_(other.allocator_),
+       slot_idx_(other.slot_idx_),
+-      block_ids_(std::move(other.block_ids_)) {
++      block_ids_(std::move(other.block_ids_)),
++      peer_key_(std::move(other.peer_key_)) {
+   other.allocator_ = nullptr;
+   other.slot_idx_ = -1;
+   other.block_ids_.clear();
++  other.peer_key_.clear();
+ }
+ 
+ StagingBlockAllocator::Allocation& StagingBlockAllocator::Allocation::operator=(
+@@ -1073,9 +1082,11 @@ StagingBlockAllocator::Allocation& StagingBlockAllocator::Allocation::operator=(
+     allocator_ = other.allocator_;
+     slot_idx_ = other.slot_idx_;
+     block_ids_ = std::move(other.block_ids_);
++    peer_key_ = std::move(other.peer_key_);
+     other.allocator_ = nullptr;
+     other.slot_idx_ = -1;
+     other.block_ids_.clear();
++    other.peer_key_.clear();
+   }
+   return *this;
+ }
+@@ -1085,24 +1096,42 @@ StagingBlockAllocator::Allocation::~Allocation() { Reset(); }
+ void StagingBlockAllocator::Allocation::Reset() {
+   if (allocator_ != nullptr) {
+     if (slot_idx_ >= 0) {
+-      allocator_->ReleaseSlot(slot_idx_);
++      allocator_->ReleaseSlot(slot_idx_, peer_key_);
+     } else if (!block_ids_.empty()) {
+-      allocator_->ReleaseDynamicBlocks(block_ids_);
++      allocator_->ReleaseDynamicBlocks(block_ids_, peer_key_);
+     }
+   }
+   allocator_ = nullptr;
+   slot_idx_ = -1;
+   block_ids_.clear();
++  peer_key_.clear();
+ }
+ 
+ std::unique_ptr<StagingBlockAllocator> StagingBlockAllocator::Create(
+     kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
+-    std::optional<bool> dynamic_host_staging) {
++    std::optional<bool> dynamic_host_staging,
++    std::optional<int64_t> max_staged_reads_per_peer) {
+   const char* raw_env = std::getenv("TPU_RAIDEN_DYNAMIC_HOST_STAGING");
+   const bool use_dynamic_staging = dynamic_host_staging.value_or(
+       raw_env != nullptr && std::string(raw_env) == "1");
++  int64_t max_per_peer = max_staged_reads_per_peer.value_or(0);
++  if (!max_staged_reads_per_peer.has_value()) {
++    if (const char* cap_env =
++            std::getenv("TPU_RAIDEN_MAX_STAGED_READS_PER_PEER");
++        cap_env != nullptr && !absl::SimpleAtoi(cap_env, &max_per_peer)) {
++      LOG(WARNING)
++          << "Ignoring unparsable TPU_RAIDEN_MAX_STAGED_READS_PER_PEER="
++          << cap_env;
++      max_per_peer = 0;
++    }
++  }
++  if (max_per_peer < 0) max_per_peer = 0;
++  if (max_per_peer > 0) {
++    LOG(INFO) << "StagingBlockAllocator: capping staged reads per peer at "
++              << max_per_peer << " (num_slots=" << num_slots << ")";
++  }
+   std::unique_ptr<StagingBlockAllocator> allocator(new StagingBlockAllocator(
+-      base, num_slots, max_blocks, use_dynamic_staging));
++      base, num_slots, max_blocks, use_dynamic_staging, max_per_peer));
+   absl::Status status = allocator->Initialize();
+   if (!status.ok()) {
+     throw std::runtime_error(std::string(status.message()));
+@@ -1113,11 +1142,13 @@ std::unique_ptr<StagingBlockAllocator> StagingBlockAllocator::Create(
+ StagingBlockAllocator::StagingBlockAllocator(kv_cache::KVCacheManagerBase* base,
+                                              int64_t num_slots,
+                                              int64_t max_blocks,
+-                                             bool dynamic_host_staging)
++                                             bool dynamic_host_staging,
++                                             int64_t max_per_peer)
+     : base_(base),
+       num_slots_(num_slots),
+       max_blocks_(max_blocks),
+-      dynamic_host_staging_(dynamic_host_staging) {}
++      dynamic_host_staging_(dynamic_host_staging),
++      max_per_peer_(max_per_peer) {}
+ 
+ StagingBlockAllocator::~StagingBlockAllocator() {
+   {
+@@ -1180,8 +1211,27 @@ void StagingBlockAllocator::Shutdown() {
+   shutting_down_ = true;
+ }
+ 
++bool StagingBlockAllocator::PeerAtCapLocked(absl::string_view peer_key) const {
++  if (max_per_peer_ <= 0 || peer_key.empty()) return false;
++  auto it = held_by_peer_.find(peer_key);
++  return it != held_by_peer_.end() && it->second >= max_per_peer_;
++}
++
++void StagingBlockAllocator::ChargePeerLocked(absl::string_view peer_key) {
++  if (peer_key.empty()) return;
++  ++held_by_peer_[std::string(peer_key)];
++}
++
++void StagingBlockAllocator::ReleasePeerLocked(absl::string_view peer_key) {
++  if (peer_key.empty()) return;
++  auto it = held_by_peer_.find(peer_key);
++  if (it == held_by_peer_.end()) return;
++  if (--it->second <= 0) held_by_peer_.erase(it);
++}
++
+ absl::StatusOr<StagingBlockAllocator::Allocation>
+-StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
++StagingBlockAllocator::AcquireLocked(int64_t num_blocks,
++                                     absl::string_view peer_key) {
+   if (num_blocks <= 0) {
+     return Allocation();
+   }
+@@ -1196,13 +1246,22 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
+                                            : "a staging slot capacity (",
+                      cap, ")"));
+   }
++  // Per-peer admission comes before the capacity check so that a refusal is
++  // attributable: this peer is at its cap, not the pool exhausted.
++  if (PeerAtCapLocked(peer_key)) {
++    return absl::ResourceExhaustedError(absl::StrCat(
++        "Peer ", peer_key, " already holds ", held_by_peer_.at(peer_key),
++        " staged reads (cap ", max_per_peer_, "); refusing to stage more"));
++  }
+   if (!dynamic_host_staging_) {
+     if (free_slots_.empty()) {
+       return absl::ResourceExhaustedError("No free staging slots available");
+     }
+     int64_t slot_idx = free_slots_.front();
+     free_slots_.pop_front();
+-    return Allocation(this, slot_idx, slot_blocks_[slot_idx]);
++    ChargePeerLocked(peer_key);
++    return Allocation(this, slot_idx, slot_blocks_[slot_idx],
++                      std::string(peer_key));
+   }
+   if (base_ == nullptr || base_->host_block_manager() == nullptr) {
+     return absl::FailedPreconditionError("Host block manager is null");
+@@ -1214,23 +1273,25 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
+   ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated,
+                         base_->host_block_manager()->Allocate(
+                             static_cast<int>(num_blocks), /*lock=*/true));
+-  return Allocation(this, std::move(allocated));
++  ChargePeerLocked(peer_key);
++  return Allocation(this, std::move(allocated), std::string(peer_key));
+ }
+ 
+ absl::StatusOr<StagingBlockAllocator::Allocation>
+-StagingBlockAllocator::Acquire(int64_t num_blocks) {
++StagingBlockAllocator::Acquire(int64_t num_blocks, absl::string_view peer_key) {
+   absl::MutexLock lock(mu_);
+-  return AcquireLocked(num_blocks);
++  return AcquireLocked(num_blocks, peer_key);
+ }
+ 
+ absl::StatusOr<StagingBlockAllocator::Allocation>
+ StagingBlockAllocator::AcquireWithTimeout(
+-    int64_t num_blocks, std::chrono::steady_clock::time_point deadline) {
++    int64_t num_blocks, std::chrono::steady_clock::time_point deadline,
++    absl::string_view peer_key) {
+   absl::MutexLock lock(mu_);
+   if (shutting_down_) {
+     return absl::CancelledError("StagingBlockAllocator is shutting down");
+   }
+-  absl::StatusOr<Allocation> acquired = AcquireLocked(num_blocks);
++  absl::StatusOr<Allocation> acquired = AcquireLocked(num_blocks, peer_key);
+   if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
+     return acquired;
+   }
+@@ -1240,6 +1301,7 @@ StagingBlockAllocator::AcquireWithTimeout(
+   }
+   auto can_proceed = [&]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+     if (shutting_down_) return true;
++    if (PeerAtCapLocked(peer_key)) return false;
+     if (!dynamic_host_staging_) return !free_slots_.empty();
+     return base_ != nullptr && base_->host_block_manager() != nullptr &&
+            base_->host_block_manager()->num_free_blocks() >=
+@@ -1253,7 +1315,7 @@ StagingBlockAllocator::AcquireWithTimeout(
+   if (shutting_down_) {
+     return absl::CancelledError("StagingBlockAllocator is shutting down");
+   }
+-  return AcquireLocked(num_blocks);
++  return AcquireLocked(num_blocks, peer_key);
+ }
+ 
+ absl::Status StagingBlockAllocator::AcquirePoolStagingLease(
+@@ -1277,6 +1339,13 @@ size_t StagingBlockAllocator::num_free_slots() const {
+   return free_slots_.size();
+ }
+ 
++int64_t StagingBlockAllocator::num_held_by_peer(
++    absl::string_view peer_key) const {
++  absl::MutexLock lock(mu_);
++  auto it = held_by_peer_.find(peer_key);
++  return it == held_by_peer_.end() ? 0 : it->second;
++}
++
+ absl::Span<const int> StagingBlockAllocator::slot_blocks(
+     int64_t slot_idx) const {
+   return slot_blocks_[slot_idx];
+@@ -1291,20 +1360,24 @@ int64_t StagingBlockAllocator::capacity() const {
+   return max_blocks_;
+ }
+ 
+-void StagingBlockAllocator::ReleaseSlot(int64_t slot_idx) {
++void StagingBlockAllocator::ReleaseSlot(int64_t slot_idx,
++                                        absl::string_view peer_key) {
+   absl::MutexLock lock(mu_);
++  ReleasePeerLocked(peer_key);
+   if (slot_idx < 0 || slot_idx >= num_slots_) {
+     return;
+   }
+   free_slots_.push_back(slot_idx);
+ }
+ 
+-void StagingBlockAllocator::ReleaseDynamicBlocks(absl::Span<const int> blocks) {
++void StagingBlockAllocator::ReleaseDynamicBlocks(absl::Span<const int> blocks,
++                                                 absl::string_view peer_key) {
++  absl::MutexLock lock(mu_);
++  ReleasePeerLocked(peer_key);
+   if (blocks.empty() || base_ == nullptr ||
+       base_->host_block_manager() == nullptr) {
+     return;
+   }
+-  absl::MutexLock lock(mu_);
+   std::vector<int> block_vec(blocks.begin(), blocks.end());
+   (void)base_->host_block_manager()->Unlock(block_vec);
+   (void)base_->host_block_manager()->Deallocate(block_vec);
+diff --git a/tpu_sync/core/kv_cache_manager_with_transfer.h b/tpu_sync/core/kv_cache_manager_with_transfer.h
+index 0b1635a..852a122 100644
+--- a/tpu_sync/core/kv_cache_manager_with_transfer.h
++++ b/tpu_sync/core/kv_cache_manager_with_transfer.h
+@@ -32,6 +32,7 @@
+ #include "absl/container/flat_hash_set.h"
+ #include "absl/status/status.h"
+ #include "absl/status/statusor.h"
++#include "absl/strings/string_view.h"
+ #include "absl/synchronization/mutex.h"
+ #include "absl/types/span.h"
+ #include "tpu_sync/core/control_plane_backend.h"
+@@ -98,6 +99,14 @@ struct CopyPlan {
+ // Encapsulates host staging block allocation and release (both fixed slots
+ // and on-demand dynamic host blocks) behind an RAII |Allocation| handle that
+ // can be transferred into session classes.
++//
++// Per-peer admission: an acquisition may name the remote peer it stages for.
++// When a cap is configured (TPU_RAIDEN_MAX_STAGED_READS_PER_PEER, or the
++// |max_staged_reads_per_peer| argument to Create()), a peer that already holds
++// that many live allocations is refused with kResourceExhausted even while
++// staging is free, so one unresponsive peer cannot pin the whole pool and
++// starve reads to healthy peers. Keyless acquisitions are never capped. With
++// no cap configured (the default) behaviour is unchanged.
+ class StagingBlockAllocator {
+  public:
+   // RAII handle owning either a fixed staging slot or a set of dynamically
+@@ -108,9 +117,9 @@ class StagingBlockAllocator {
+     Allocation() = default;
+     Allocation(std::nullptr_t) {}  // NOLINT(runtime/explicit)
+     Allocation(StagingBlockAllocator* allocator, int64_t slot_idx,
+-               std::vector<int> block_ids);
++               std::vector<int> block_ids, std::string peer_key = {});
+     Allocation(StagingBlockAllocator* allocator,
+-               std::vector<int> dynamic_blocks);
++               std::vector<int> dynamic_blocks, std::string peer_key = {});
+     Allocation(Allocation&& other) noexcept;
+     Allocation& operator=(Allocation&& other) noexcept;
+     Allocation(const Allocation&) = delete;
+@@ -126,16 +135,22 @@ class StagingBlockAllocator {
+     bool is_dynamic() const { return slot_idx_ < 0 && !block_ids_.empty(); }
+     int64_t slot_idx() const { return slot_idx_; }
+     absl::Span<const int> block_ids() const { return block_ids_; }
++    // The peer this allocation is charged to; empty for keyless acquisitions.
++    const std::string& peer_key() const { return peer_key_; }
+ 
+    private:
+     StagingBlockAllocator* allocator_ = nullptr;
+     int64_t slot_idx_ = -1;
+     std::vector<int> block_ids_;
++    std::string peer_key_;
+   };
+ 
++  // |max_staged_reads_per_peer| overrides TPU_RAIDEN_MAX_STAGED_READS_PER_PEER;
++  // values <= 0 (and an unset variable) mean no per-peer cap.
+   static std::unique_ptr<StagingBlockAllocator> Create(
+       kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
+-      std::optional<bool> dynamic_host_staging = std::nullopt);
++      std::optional<bool> dynamic_host_staging = std::nullopt,
++      std::optional<int64_t> max_staged_reads_per_peer = std::nullopt);
+   ~StagingBlockAllocator();
+   StagingBlockAllocator(const StagingBlockAllocator&) = delete;
+   StagingBlockAllocator& operator=(const StagingBlockAllocator&) = delete;
+@@ -143,14 +158,18 @@ class StagingBlockAllocator {
+   // Acquires staging for |num_blocks| blocks: a fixed slot when
+   // !dynamic_host_staging_, or |num_blocks| locked dynamic host blocks when
+   // dynamic_host_staging_ is enabled. Returns an error if staging capacity is
+-  // currently unavailable.
+-  absl::StatusOr<Allocation> Acquire(int64_t num_blocks);
++  // currently unavailable, or if |peer_key| is non-empty and that peer is at
++  // its cap.
++  absl::StatusOr<Allocation> Acquire(int64_t num_blocks,
++                                     absl::string_view peer_key = "");
+ 
+   // Waits until |deadline| to acquire staging for |num_blocks| blocks. Returns
+   // an error if |num_blocks| exceeds capacity(), if Shutdown() is called, or if
+-  // |deadline| expires before staging capacity becomes available.
++  // |deadline| expires before staging capacity (and, for a non-empty
++  // |peer_key|, headroom under that peer's cap) becomes available.
+   absl::StatusOr<Allocation> AcquireWithTimeout(
+-      int64_t num_blocks, std::chrono::steady_clock::time_point deadline);
++      int64_t num_blocks, std::chrono::steady_clock::time_point deadline,
++      absl::string_view peer_key = "");
+ 
+   // Signals shutdown to wake any threads waiting in AcquireWithTimeout().
+   void Shutdown();
+@@ -165,21 +184,34 @@ class StagingBlockAllocator {
+   void ReleasePoolStagingLeases(uint64_t uuid);
+ 
+   size_t num_free_slots() const;
++  // Live allocations currently charged to |peer_key|.
++  int64_t num_held_by_peer(absl::string_view peer_key) const;
+   absl::Span<const int> slot_blocks(int64_t slot_idx) const;
+   int64_t num_slots() const { return num_slots_; }
+   int64_t max_blocks() const { return max_blocks_; }
++  // The per-peer cap; 0 when none is configured.
++  int64_t max_staged_reads_per_peer() const { return max_per_peer_; }
+   int64_t capacity() const;
+   bool dynamic_host_staging() const { return dynamic_host_staging_; }
+ 
+  private:
+   StagingBlockAllocator(kv_cache::KVCacheManagerBase* base, int64_t num_slots,
+-                        int64_t max_blocks, bool dynamic_host_staging);
++                        int64_t max_blocks, bool dynamic_host_staging,
++                        int64_t max_per_peer);
+   absl::Status Initialize();
+   absl::Status InitializeSlotPool();
+-  absl::StatusOr<Allocation> AcquireLocked(int64_t num_blocks)
++  absl::StatusOr<Allocation> AcquireLocked(int64_t num_blocks,
++                                           absl::string_view peer_key)
++      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
++  bool PeerAtCapLocked(absl::string_view peer_key) const
++      ABSL_SHARED_LOCKS_REQUIRED(mu_);
++  void ChargePeerLocked(absl::string_view peer_key)
++      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
++  void ReleasePeerLocked(absl::string_view peer_key)
+       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+-  void ReleaseSlot(int64_t slot_idx);
+-  void ReleaseDynamicBlocks(absl::Span<const int> blocks);
++  void ReleaseSlot(int64_t slot_idx, absl::string_view peer_key);
++  void ReleaseDynamicBlocks(absl::Span<const int> blocks,
++                            absl::string_view peer_key);
+ 
+   mutable absl::Mutex mu_;
+   kv_cache::KVCacheManagerBase* const base_ = nullptr;
+@@ -187,8 +219,11 @@ class StagingBlockAllocator {
+   const int64_t num_slots_ = 0;
+   const int64_t max_blocks_ = 0;
+   const bool dynamic_host_staging_ = false;
++  const int64_t max_per_peer_ = 0;  // 0 = no per-peer cap
+   std::deque<int64_t> free_slots_ ABSL_GUARDED_BY(mu_);
+   std::vector<std::vector<int>> slot_blocks_;
++  // Live allocations per peer key; entries are erased when they reach zero.
++  absl::flat_hash_map<std::string, int64_t> held_by_peer_ ABSL_GUARDED_BY(mu_);
+ };
+ using StagingAllocation = StagingBlockAllocator::Allocation;
+ 
+diff --git a/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc b/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc
+index a29fdc4..1b0b213 100644
+--- a/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc
++++ b/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc
+@@ -94,6 +94,26 @@ class ScopedControlPlaneBackend {
+   std::optional<std::string> old_;
+ };
+ 
++// Caps staged reads per peer for managers built while it is in scope.
++class ScopedStagedReadsPerPeerCap {
++ public:
++  explicit ScopedStagedReadsPerPeerCap(int cap) {
++    if (const char* old = std::getenv(kVar)) old_ = old;
++    setenv(kVar, absl::StrCat(cap).c_str(), /*overwrite=*/1);
++  }
++  ~ScopedStagedReadsPerPeerCap() {
++    if (old_.has_value()) {
++      setenv(kVar, old_->c_str(), /*overwrite=*/1);
++    } else {
++      unsetenv(kVar);
++    }
++  }
++
++ private:
++  static constexpr char kVar[] = "TPU_RAIDEN_MAX_STAGED_READS_PER_PEER";
++  std::optional<std::string> old_;
++};
++
+ class TestManager : private ScopedControlPlaneBackend,
+                     public KVCacheManagerWithTransfer {
+  public:
+@@ -1035,16 +1055,21 @@ TEST(ControlHandshakeTest,
+ // outright -- a read to a healthy peer is not merely delayed, it is rejected
+ // and never attempted.
+ //
+-// Still DISABLED_ on both backends: not holding a worker does not stop one
+-// peer from holding every staging slot. That needs per-peer admission at
+-// StartRead, which is a separate change.
+-TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
++// Not holding a worker does not stop one peer from holding every staging
++// slot; that takes per-peer admission at StartRead. With
++// TPU_RAIDEN_MAX_STAGED_READS_PER_PEER set below the pool size, the
++// StagingBlockAllocator refuses the sick peer's excess reads up front and the
++// healthy peer is admitted from the slots the cap kept free. Backend-agnostic:
++// the staging pool is shared by both control-plane backends.
++TEST(ControlHandshakeTest, SickPeerStarvesStagingSlotsForHealthyPeer) {
++  // TestManager is built with num_slots = 2 * kPoolSize.
++  constexpr int kSlots = 2 * kPoolSize;
++  // One peer may hold all but one slot; the last slot is for everyone else.
++  ScopedStagedReadsPerPeerCap cap(kSlots - 1);
+   SilentProducer sick;
+   SilentProducer healthy;
+   TestManager consumer(/*timeout_s=*/kStarvationTimeoutS);
+ 
+-  // TestManager is built with num_slots = 2 * kPoolSize.
+-  constexpr int kSlots = 2 * kPoolSize;
+   const size_t free_before = consumer.free_slots();
+   ASSERT_GE(free_before, static_cast<size_t>(kSlots));
+ 
+@@ -1054,8 +1079,12 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+                        /*local_block_ids=*/{0});
+   }
+   ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)));
+-  ASSERT_EQ(consumer.free_slots(), 0u)
+-      << "precondition: the sick peer is holding every staging slot";
++  ASSERT_EQ(consumer.free_slots(), 1u)
++      << "precondition: the sick peer holds every slot its cap allows and "
++         "exactly one slot is left for other peers";
++  EXPECT_FALSE(consumer.has_recv(800 + kSlots - 1))
++      << "the sick peer's read past its cap must be refused at StartRead, "
++         "not admitted";
+ 
+   // A read to a peer that is answering normally.
+   consumer.StartRead("healthy0", /*uuid=*/900, healthy.endpoint(),
+@@ -1067,6 +1096,8 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+       << kSlots
+       << " staging slots; no request to a healthy producer can even be "
+          "attempted while another producer is wedged";
++  EXPECT_EQ(consumer.free_slots(), 0u)
++      << "the healthy read took the slot the cap kept free";
+ 
+   auto [done_sending, done_recving, failed_recving] =
+       consumer.CompleteReadRaw();
+@@ -1074,6 +1105,9 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+   (void)done_recving;
+   EXPECT_THAT(failed_recving, ::testing::Not(Contains("healthy0")))
+       << "the healthy read failed immediately rather than being served";
++  EXPECT_THAT(failed_recving, Contains(absl::StrCat("sick", kSlots - 1)))
++      << "the refused sick read is reported as failed at once, not after "
++         "holding a slot until the deadline";
+ 
+   sick.DropClients();
+   healthy.DropClients();
+@@ -1086,6 +1120,8 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+     settled += received.size() + failed.size();
+     absl::SleepFor(absl::Milliseconds(20));
+   }
++  EXPECT_EQ(consumer.free_slots(), free_before)
++      << "every slot, and so every per-peer charge, is returned on settle";
+ }
+ 
+ }  // namespace
+diff --git a/tpu_sync/core/transfer_receive_session.cc b/tpu_sync/core/transfer_receive_session.cc
+index 38a9a8d..382cfbf 100644
+--- a/tpu_sync/core/transfer_receive_session.cc
++++ b/tpu_sync/core/transfer_receive_session.cc
+@@ -88,7 +88,8 @@ TransferReceiveSession::Create(
+     const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
+     const std::vector<int64_t>& local_block_ids,
+     const std::optional<std::vector<int64_t>>& local_host_block_ids,
+-    std::chrono::steady_clock::time_point deadline) {
++    std::chrono::steady_clock::time_point deadline,
++    absl::string_view peer_key) {
+   if (staging_allocator == nullptr) {
+     return absl::InvalidArgumentError("staging_allocator must not be null");
+   }
+@@ -96,7 +97,8 @@ TransferReceiveSession::Create(
+       new TransferReceiveSession(base, staging_allocator, uuid));
+   std::vector<int64_t> host_block_ids;
+   if (!session->AllocateStagingForLoad(req_id, local_block_ids,
+-                                       local_host_block_ids, &host_block_ids)) {
++                                       local_host_block_ids, &host_block_ids,
++                                       peer_key)) {
+     return absl::ResourceExhaustedError(
+         absl::StrCat("Failed to allocate staging for load req_id=", req_id,
+                      ", uuid=", uuid));
+@@ -214,7 +216,7 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
+ bool TransferReceiveSession::AllocateStagingForLoad(
+     const std::string& req_id, const std::vector<int64_t>& local_block_ids,
+     const std::optional<std::vector<int64_t>>& local_host_block_ids,
+-    std::vector<int64_t>* host_block_ids) {
++    std::vector<int64_t>* host_block_ids, absl::string_view peer_key) {
+   absl::MutexLock lock(mu_);
+   if (local_host_block_ids.has_value()) {
+     *host_block_ids = *local_host_block_ids;
+@@ -227,14 +229,17 @@ bool TransferReceiveSession::AllocateStagingForLoad(
+   absl::flat_hash_set<int64_t> unique_local_bids(local_block_ids.begin(),
+                                                  local_block_ids.end());
+   absl::StatusOr<StagingAllocation> acquired = staging_allocator_->Acquire(
+-      static_cast<int64_t>(unique_local_bids.size()));
++      static_cast<int64_t>(unique_local_bids.size()), peer_key);
+   if (!acquired.ok()) {
+     LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
+-               << " blocks for req_id=" << req_id
++               << " blocks for req_id=" << req_id << " from peer=" << peer_key
++               << ": " << acquired.status().message()
+                << " (dynamic=" << staging_allocator_->dynamic_host_staging()
+                << ", free_host_blocks="
+                << base_->host_block_manager()->num_free_blocks()
+                << ", free_slots=" << staging_allocator_->num_free_slots()
++               << ", held_by_peer="
++               << staging_allocator_->num_held_by_peer(peer_key)
+                << ", max_blocks=" << staging_allocator_->max_blocks() << ")";
+     return false;
+   }
+diff --git a/tpu_sync/core/transfer_receive_session.h b/tpu_sync/core/transfer_receive_session.h
+index d7948ee..8392891 100644
+--- a/tpu_sync/core/transfer_receive_session.h
++++ b/tpu_sync/core/transfer_receive_session.h
+@@ -28,6 +28,7 @@
+ #include "absl/container/flat_hash_map.h"
+ #include "absl/status/status.h"
+ #include "absl/status/statusor.h"
++#include "absl/strings/string_view.h"
+ #include "absl/synchronization/mutex.h"
+ #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+ #include "tpu_sync/core/raw_transfer_core.h"
+@@ -52,13 +53,17 @@ class TransferReceiveSession
+     : public TransferSession,
+       public std::enable_shared_from_this<TransferReceiveSession> {
+  public:
++  // |peer_key| names the producer this read pulls from; the staging slot
++  // borrowed for it is charged to that peer for per-peer admission (see
++  // StagingBlockAllocator). Empty means uncharged.
+   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
+       kv_cache::KVCacheManagerBase* base,
+       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+       const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
+       const std::vector<int64_t>& local_block_ids,
+       const std::optional<std::vector<int64_t>>& local_host_block_ids,
+-      std::chrono::steady_clock::time_point deadline);
++      std::chrono::steady_clock::time_point deadline,
++      absl::string_view peer_key = "");
+ 
+   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
+       kv_cache::KVCacheManagerBase* base,
+@@ -198,11 +203,11 @@ class TransferReceiveSession
+   // Allocates host staging for a consumer StartRead load plan via
+   // |staging_allocator_| (unless |local_host_block_ids| is explicitly provided)
+   // and populates |*host_block_ids|. Returns false if staging capacity is
+-  // unavailable.
++  // unavailable or |peer_key| is at its per-peer cap.
+   bool AllocateStagingForLoad(
+       const std::string& req_id, const std::vector<int64_t>& local_block_ids,
+       const std::optional<std::vector<int64_t>>& local_host_block_ids,
+-      std::vector<int64_t>* host_block_ids);
++      std::vector<int64_t>* host_block_ids, absl::string_view peer_key);
+ 
+   // Builds the transport and H2D copy plan for a consumer StartRead request.
+   static CopyPlan BuildLoadCopyPlan(
+diff --git a/tpu_sync/core/transfer_send_session_test.cc b/tpu_sync/core/transfer_send_session_test.cc
+index 820b226..afbc608 100644
+--- a/tpu_sync/core/transfer_send_session_test.cc
++++ b/tpu_sync/core/transfer_send_session_test.cc
+@@ -488,5 +488,92 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
+       session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+ }
+ 
++// Per-peer admission on the shared staging pool: a peer at its cap is refused
++// while slots are still free, other peers are unaffected, and a release
++// restores headroom. This is the staging-slot half of cross-peer isolation
++// (see DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer in
++// kv_cache_manager_with_transfer_control_test.cc).
++TEST(StagingBlockAllocatorTest, PerPeerCapRefusesOnlyThePeerAtCap) {
++  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      StagingBlockAllocator::Create(&base, /*num_slots=*/4, /*max_blocks=*/1,
++                                    /*dynamic_host_staging=*/false,
++                                    /*max_staged_reads_per_peer=*/2);
++  ASSERT_EQ(allocator->max_staged_reads_per_peer(), 2);
++
++  absl::StatusOr<StagingAllocation> sick0 = allocator->Acquire(1, "sick");
++  absl::StatusOr<StagingAllocation> sick1 = allocator->Acquire(1, "sick");
++  ABSL_ASSERT_OK(sick0);
++  ABSL_ASSERT_OK(sick1);
++  EXPECT_EQ(allocator->num_held_by_peer("sick"), 2);
++  EXPECT_EQ(allocator->num_free_slots(), 2u);
++
++  // Third read from the same peer: refused although two slots are free.
++  EXPECT_THAT(allocator->Acquire(1, "sick"),
++              StatusIs(absl::StatusCode::kResourceExhausted));
++  EXPECT_EQ(allocator->num_free_slots(), 2u)
++      << "a refused acquisition must not consume a slot";
++  EXPECT_EQ(allocator->num_held_by_peer("sick"), 2)
++      << "a refused acquisition must not be charged";
++
++  // Another peer is admitted from the slots the capped peer could not take.
++  absl::StatusOr<StagingAllocation> healthy0 = allocator->Acquire(1, "healthy");
++  ABSL_ASSERT_OK(healthy0);
++  EXPECT_EQ(allocator->num_held_by_peer("healthy"), 1);
++  EXPECT_EQ(allocator->num_free_slots(), 1u);
++
++  // Keyless acquisitions (the send side) are never capped.
++  absl::StatusOr<StagingAllocation> keyless = allocator->Acquire(1);
++  ABSL_ASSERT_OK(keyless);
++  EXPECT_EQ(allocator->num_free_slots(), 0u);
++  keyless->Reset();
++  EXPECT_EQ(allocator->num_free_slots(), 1u);
++
++  // Releasing one of the capped peer's allocations restores its headroom; the
++  // charge is dropped in the same step as the slot.
++  sick0->Reset();
++  EXPECT_EQ(allocator->num_held_by_peer("sick"), 1);
++  EXPECT_EQ(allocator->num_free_slots(), 2u);
++  absl::StatusOr<StagingAllocation> sick2 = allocator->Acquire(1, "sick");
++  ABSL_ASSERT_OK(sick2);
++  EXPECT_EQ(allocator->num_held_by_peer("sick"), 2);
++
++  // Moving the handle moves the charge with it; destroying the moved-to
++  // handle releases it exactly once.
++  {
++    StagingAllocation moved = *std::move(sick1);
++    EXPECT_EQ(moved.peer_key(), "sick");
++    EXPECT_EQ(allocator->num_held_by_peer("sick"), 2);
++  }
++  EXPECT_EQ(allocator->num_held_by_peer("sick"), 1);
++  EXPECT_EQ(allocator->num_free_slots(), 2u);
++
++  // Everything released: no peer is charged, every slot is back.
++  sick2->Reset();
++  healthy0->Reset();
++  EXPECT_EQ(allocator->num_held_by_peer("sick"), 0);
++  EXPECT_EQ(allocator->num_held_by_peer("healthy"), 0);
++  EXPECT_EQ(allocator->num_free_slots(), 4u);
++}
++
++TEST(StagingBlockAllocatorTest, NoCapConfiguredLeavesAdmissionUnchanged) {
++  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1,
++                                    /*dynamic_host_staging=*/false,
++                                    /*max_staged_reads_per_peer=*/0);
++  EXPECT_EQ(allocator->max_staged_reads_per_peer(), 0);
++
++  // One peer may take the whole pool, exactly as before.
++  absl::StatusOr<StagingAllocation> a = allocator->Acquire(1, "sick");
++  absl::StatusOr<StagingAllocation> b = allocator->Acquire(1, "sick");
++  ABSL_ASSERT_OK(a);
++  ABSL_ASSERT_OK(b);
++  EXPECT_EQ(allocator->num_held_by_peer("sick"), 2);
++  EXPECT_EQ(allocator->num_free_slots(), 0u);
++  EXPECT_THAT(allocator->Acquire(1, "healthy"),
++              StatusIs(absl::StatusCode::kResourceExhausted));
++}
++
+ }  // namespace
+ }  // namespace tpu_raiden

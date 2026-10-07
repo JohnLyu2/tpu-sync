@@ -2,7 +2,8 @@
 
 Defects found while modelling tpu-sync, with the evidence for each. Line
 numbers are for tpu-sync `50b0774` unless a block of test output says
-otherwise; the tests were run on `b68161a` and re-run on `d16701e`.
+otherwise; the F1–F4 tests were run on `b68161a` and re-run on `d16701e`, the
+F5 tests on `50b0774`.
 
 Caller checked: `vllm-torchtpu` @ `6a9132a84`.
 
@@ -38,14 +39,19 @@ here.
 | `kv_cache_store_pin_race_test.cc` | F1 |
 | `build_targets.patch` | `cc_test` targets for the two files above |
 | `candidate_fixes.patch` | fixes for F1, F2 (naive, shape A only) and F4; see "Fix validation" |
+| `per_peer_staging_admission.patch` | fix for F5 (per-peer staging admission at `StartRead`), the owners' parked acceptance test re-enabled, two allocator unit tests; see "F5" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 
-To run: copy the two `.cc` files next to the code they test
+To run F1–F4: copy the two `.cc` files next to the code they test
 (`tpu_sync/core/controller/`, `tpu_sync/kv_cache/`), `git apply
 verification/findings/build_targets.patch`, then
 `bazel test //tpu_sync/core/controller:raiden_controller_bughunt_test
-//tpu_sync/kv_cache:kv_cache_store_pin_race_test`. Both patches apply
-cleanly at `50b0774`.
+//tpu_sync/kv_cache:kv_cache_store_pin_race_test`. F5 needs no repro file:
+its test is already in the tree as `DISABLED_`; `git apply
+verification/findings/per_peer_staging_admission.patch` re-enables it, then
+`bazel test --config=oss //tpu_sync/core:kv_cache_manager_with_transfer_control_test
+//tpu_sync/core:transfer_send_session_test`. All three patches apply cleanly
+at `50b0774`.
 
 ## Summary
 
@@ -55,6 +61,7 @@ cleanly at `50b0774`.
 | F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shape A; proved in Lean for shapes A and B | same |
 | F3 | Data race on `RemoteReadState::lease_id` | CONFIRMED (read) | same |
 | F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test), both halves | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
+| F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix: `per_peer_staging_admission.patch`) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
 
 ---
 
@@ -234,6 +241,118 @@ cleanly at `50b0774`.
 
 ---
 
+## F5. One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer
+
+- **Status:** **CONFIRMED (test)**, owner-acknowledged. The test is the
+  owners' own, parked as `DISABLED_` in `63da027` ("the written-down
+  acceptance criteria for the per-peer admission work"). Run on unmodified
+  `50b0774` with `--gtest_also_run_disabled_tests`, verbatim:
+  ```
+  [ RUN      ] ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer
+  E0000 00:00:1791391218.831497      12 transfer_receive_session.cc:232] StartRead: cannot stage 1 blocks for req_id=healthy0 (dynamic=false, free_host_blocks=0, free_slots=0, max_blocks=8)
+  tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc:1064: Failure
+  Value of: consumer.has_recv(900)
+    Actual: false
+  Expected: true
+  the read to the healthy peer was rejected outright because an unresponsive peer holds all 8 staging slots; no request to a healthy producer can even be attempted while another producer is wedged
+  tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc:1075: Failure
+  Value of: failed_recving
+  Expected: doesn't contain any element that is equal to "healthy0"
+    Actual: { "healthy0" }, whose element #0 matches
+  the healthy read failed immediately rather than being served
+  [  FAILED  ] ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer (48 ms)
+  ```
+- **Where:** `KVCacheManagerWithTransfer::StartRead` →
+  `TransferReceiveSession::Create` → `AllocateStagingForLoad` →
+  `StagingBlockAllocator::Acquire`, non-blocking and first-come-first-served
+  (`kv_cache_manager_with_transfer.cc:863-871`,
+  `transfer_receive_session.cc:214-241`,
+  `kv_cache_manager_with_transfer.cc:1200-1201`).
+  - The slot is taken *before* the handshake because the pull request
+    carries the allocated host block ids (`transfer_receive_session.cc:468`);
+    lazy allocation after the peer answers is not an option.
+  - It is released only in `SettleLocked()` once no copy or push is in flight
+    (the `inFlight = 0` rule of the Lean model), so cancelling a read to a
+    dead peer does not return its slot before the deadline.
+  - On `ResourceExhausted`, `StartRead` puts the request in `failed_recving_`
+    and returns (`:868-870`). No queueing: the read is rejected, not delayed.
+  - Nothing bounds how many slots one peer may hold. The September changes
+    bound how *long*: control-plane deadline (`430089c`, PR #1010, the
+    thread-pool half of issue #888), per-read socket timeouts (`e7c933f`,
+    `61b6c76`), release on a broken push stream (`4efb0dd`).
+- **Reachability:** production path, every consumer `StartRead`. Trigger:
+  one producer that accepts connections and never answers (crash without
+  RST, partition, hung device) while the scheduler keeps routing reads to
+  it; its reads then hold every slot for a deadline at a time and the decode
+  host refuses KV transfers from the whole prefill fleet. Availability only,
+  no memory-safety component.
+- **Lean:** `PeerIsolation.trace_sick_peer_starves_staging_slots` is this
+  test as a `decide` trace under `unboundedPerPeer` (`freeSlots = 0` even
+  after `.cancel`, next healthy `StartRead` refused).
+  `PeerIsolation.reachable_sick_staging_le_quota` and
+  `PeerIsolation.reachable_quota_admits_healthy` state what the fix below
+  guarantees over all reachable states: under `perPeerQuota c` the sick peer
+  holds at most `c` slots, and a healthy peer holding fewer than `c` is
+  admitted whenever `c + (slots healthy peers hold) < numSlots`. In words,
+  cap `c` reserves `numSlots − c` slots for everyone else. It does not share
+  fairly among many peers, it does not queue, and `c = numSlots` guarantees
+  nothing (which is why the default is a no-op).
+- **Fix in `per_peer_staging_admission.patch`:** `StagingBlockAllocator`
+  keeps a count of live allocations per peer key.
+  `Acquire(num_blocks, peer_key)` refuses with `kResourceExhausted` once the
+  peer already holds `max_staged_reads_per_peer` allocations, even while
+  slots are free; the charge is taken only on a successful allocation and
+  dropped in `Allocation`'s RAII release under the same lock acquisition that
+  returns the slot or the dynamic blocks, so count and pool cannot disagree.
+  Keyless acquisitions (send side, incoming-push leases) are never capped.
+  `StartRead` passes `remote_endpoint` as the key through
+  `TransferReceiveSession::Create` / `AllocateStagingForLoad`; its failure
+  path is unchanged and the log now names the peer and the reason. Knob:
+  `TPU_RAIDEN_MAX_STAGED_READS_PER_PEER` (same pattern as
+  `TPU_RAIDEN_DYNAMIC_HOST_STAGING`) plus an explicit `Create()` argument;
+  unset or `0` leaves admission exactly as it is. The parked test is
+  re-enabled under cap `kSlots − 1` with the owners' two healthy-peer
+  assertions verbatim, plus assertions that the excess sick read is refused
+  up front and that every per-peer charge is returned on settle; two
+  `StagingBlockAllocatorTest` unit tests cover the allocator alone (cap
+  refuses only the peer at cap, and only while it is at cap; no cap leaves
+  admission unchanged).
+- **Validation (2026-10-07, on `50b0774`, OSS build):** patch applied,
+  tests run, upstream files restored. The re-enabled test alone, verbatim
+  (log lines not about admission omitted):
+  ```
+  [ RUN      ] ControlHandshakeTest.SickPeerStarvesStagingSlotsForHealthyPeer
+  I0000 00:00:1791391420.582191      12 kv_cache_manager_with_transfer.cc:1130] StagingBlockAllocator: capping staged reads per peer at 7 (num_slots=8)
+  E0000 00:00:1791391420.583945      12 transfer_receive_session.cc:234] StartRead: cannot stage 1 blocks for req_id=sick7 from peer=127.0.0.1:46081: Peer 127.0.0.1:46081 already holds 7 staged reads (cap 7); refusing to stage more (dynamic=false, free_host_blocks=0, free_slots=1, held_by_peer=7, max_blocks=8)
+  I0000 00:00:1791391420.584110      12 kv_cache_manager_with_transfer.cc:824] StartRead (initiate): req_id=healthy0, uuid=900, numa=-1
+  I0000 00:00:1791391420.584206      12 transfer_receive_session.cc:481] StartRead (connecting): req_id=healthy0, uuid=900, numa=-1
+  [       OK ] ControlHandshakeTest.SickPeerStarvesStagingSlotsForHealthyPeer (48 ms)
+  ```
+  The full targets (the two that carry the new tests plus every other
+  hardware-free test that links the allocator), verbatim:
+  ```
+  //tpu_sync/core:kv_cache_manager_with_transfer_ip_test          (cached) PASSED in 0.1s
+  //tpu_sync/core:kv_cache_manager_with_transfer_control_test              PASSED in 47.8s
+  //tpu_sync/core:kv_cache_manager_with_transfer_pool_reshard_test         PASSED in 22.6s
+  //tpu_sync/core:kv_cache_manager_with_transfer_send_drain_test           PASSED in 43.6s
+  //tpu_sync/core:transfer_send_session_test                               PASSED in 22.4s
+
+  Executed 4 out of 5 tests: 5 tests pass.
+  ```
+  (23 tests in the control target, the 22 existing plus the re-enabled one;
+  12 in `transfer_send_session_test`, 10 plus the two new
+  `StagingBlockAllocatorTest` cases.) `kv_cache_manager_with_transfer_test`
+  is `no_oss` / `requires-jellyfish` (TPU hardware) and was not run. The OSS
+  build needs a compiler the `.bazelrc` `oss` config can find; here
+  `--action_env=CC=clang-21 --action_env=CXX=clang++-21 --repo_env=CC=clang-21`.
+- **Open design choices for the owners:** refuse at the cap (as patched,
+  matching today's `StartRead` contract and the proof) vs. wait; env knob vs.
+  a constructor / Python parameter. A self-sizing share (cap derived from the
+  number of peers currently holding staging) is a natural follow-up and would
+  need its own proof.
+
+---
+
 ## Refuted or closed
 
 ### R-A. Premature completion in `TransferReceiveSession::IsReadyToComplete()`: REFUTED
@@ -338,3 +457,10 @@ clone reset. Results, verbatim:
   +11 (`:1655-1683` → `:1666-1694`); F4 fix PR #1105 still open, not merged.
   No finding fixed. Line numbers in this file and in `filed_bugs.md`
   re-pinned to `50b0774`; both patches still apply cleanly.
+- 2026-10-07: F5 added. Confirmed on `50b0774` by running the owners' parked
+  `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`; fix written, tested
+  and shipped as `per_peer_staging_admission.patch` (output above). Upstream
+  `main` checked at `ebcc7af` (three commits past `50b0774`: `93e09ee`,
+  `a29649c`, `ebcc7af`): none touches `StartRead` admission or the
+  allocator, the test is still `DISABLED_`, and no issue or PR proposes a
+  per-peer cap.

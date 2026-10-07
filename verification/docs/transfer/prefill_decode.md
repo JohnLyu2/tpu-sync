@@ -215,7 +215,16 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 | Issue #888 TCP blocking handshake pool | `kv_cache_manager_with_transfer_control_test.cc:841-846` | `PeerIsolation.trace_tcp_sick_peer_blocks_healthy` | `PeerIsolation.tcp_healthy_blocked_when_pool_full` |
 | `GrpcSickPeerDoesNotDelayHandshakeToHealthyPeer` | `kv_cache_manager_with_transfer_control_test.cc:924-964` | `PeerIsolation.trace_grpc_sick_peer_does_not_delay_healthy` | `PeerIsolation.grpc_freeWorkers_eq_poolSize`, `PeerIsolation.grpc_healthy_can_complete` |
 | `GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains` | `kv_cache_manager_with_transfer_control_test.cc:971-1028` | `PeerIsolation.trace_grpc_healthy_progresses_under_backlog` | `PeerIsolation.grpc_freeWorkers_eq_poolSize`, `PeerIsolation.grpc_healthy_can_complete` |
-| `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` | `kv_cache_manager_with_transfer_control_test.cc:1030-1089` | `PeerIsolation.trace_sick_peer_starves_staging_slots` (`unboundedPerPeer` counterexample), `PeerIsolation.trace_per_peer_quota_admits_healthy` (`perPeerQuota` fix) | `PeerIsolation.reachable_sick_staging_le_quota`, `PeerIsolation.reachable_quota_admits_healthy` |
+| `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` (re-enabled as `SickPeerStarvesStagingSlotsForHealthyPeer` by `findings/per_peer_staging_admission.patch`, finding F5) | `kv_cache_manager_with_transfer_control_test.cc:1030-1089` | `PeerIsolation.trace_sick_peer_starves_staging_slots` (`unboundedPerPeer` counterexample), `PeerIsolation.trace_per_peer_quota_admits_healthy` (`perPeerQuota` fix) | `PeerIsolation.reachable_sick_staging_le_quota`, `PeerIsolation.reachable_quota_admits_healthy` |
+
+Knob ↔ policy, for the F5 patch: `TPU_RAIDEN_MAX_STAGED_READS_PER_PEER` unset
+or `0` is `unboundedPerPeer` (the shipping behaviour, and the patch's
+default); `=k` is `perPeerQuota k`, keyed by `remote_endpoint`. The
+re-enabled test runs under `perPeerQuota (numSlots − 1)` with `numSlots = 8`,
+which meets the precondition of `reachable_quota_admits_healthy`
+(`peerStaging healthy = 0 < 7` and `7 + 0 < 8`); the Lean trace uses
+`perPeerQuota 1`. Keyless acquisitions (send-side staging, incoming-push
+leases) are outside the model's `canAdmit` and are never capped.
 
 ### 4. Manager UUID registration table, drain-before-reuse & control handshake tests (`RecvDrainTest`, `SendLifecycleTest`, `ControlHandshakeTest` → `UuidTable.lean`, `Send.lean`, `Pipeline.lean`, `BlockOrdering.lean`)
 
@@ -249,8 +258,13 @@ safety theorems (`reachable_safe`, `reachable_can_settle`, `system_data_correct`
 
 ## Outcome at `50b0774`
 
-No bugs in the transfer path. All proposal properties are proved under the
-cited assumptions. Observations (not bugs) worth passing on:
+No data-correctness or safety bugs in the transfer path. All proposal
+properties are proved under the cited assumptions. One availability gap on
+this path, already known to the owners, is confirmed and fixed in
+[findings/](../../findings/README.md#f5-one-unresponsive-producer-pins-every-host-staging-slot-startread-then-rejects-reads-from-every-other-producer)
+(F5: no per-peer staging admission at `StartRead`; `PeerIsolation.lean`
+gives the counterexample and the guarantee of the fix). Observations (not
+bugs) worth passing on:
 
 | Observation | Where | Note |
 |---|---|---|
