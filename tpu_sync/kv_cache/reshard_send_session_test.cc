@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/reshard_send_session.h"
+#include "tpu_sync/kv_cache/reshard_send_session.h"
 
 #include <cstdint>
 #include <limits>

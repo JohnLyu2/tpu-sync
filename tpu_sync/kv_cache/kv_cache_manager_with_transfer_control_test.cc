@@ -54,10 +54,11 @@
 #include "absl/time/time.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
-#include "tpu_sync/core/transfer_receive_session.h"
-#include "tpu_sync/core/transfer_send_session.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_receive_session.h"
+// Needed for the complete type behind send_sessions_.at(uuid)->... below.
+#include "tpu_sync/kv_cache/transfer_send_session.h"  // IWYU pragma: keep
 
 namespace tpu_raiden {
 namespace {

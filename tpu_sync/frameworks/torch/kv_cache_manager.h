@@ -29,7 +29,7 @@
 #include "absl/types/span.h"
 #include "csrc/api/tensor_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 namespace tpu_raiden {
 namespace controller {

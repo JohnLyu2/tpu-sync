@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -53,13 +53,13 @@
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/reshard_receive_session.h"
-#include "tpu_sync/core/reshard_send_session.h"
-#include "tpu_sync/core/transfer_receive_session.h"
-#include "tpu_sync/core/transfer_send_session.h"
-#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/reshard_receive_session.h"
+#include "tpu_sync/kv_cache/reshard_send_session.h"
+#include "tpu_sync/kv_cache/transfer_receive_session.h"
+#include "tpu_sync/kv_cache/transfer_send_session.h"
+#include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {

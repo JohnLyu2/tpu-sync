@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/transfer_receive_session.h"
+#include "tpu_sync/kv_cache/transfer_receive_session.h"
 
 #include <algorithm>
 #include <chrono>  // NOLINT(build/c++11)
@@ -41,12 +41,12 @@
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/control_plane_backend.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/transfer_send_session.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_send_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"

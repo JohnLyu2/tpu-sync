@@ -42,10 +42,10 @@
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/host_memory_allocator.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 ABSL_FLAG(int, num_tpus, 1, "Number of TPUs to use");
 ABSL_FLAG(int, num_layers, 64, "Number of layers to use for the benchmark.");

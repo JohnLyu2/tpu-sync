@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 #include <algorithm>
 #include <chrono>

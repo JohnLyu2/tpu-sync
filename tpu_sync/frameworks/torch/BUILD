@@ -188,7 +188,7 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:buffer_utils",
-        "//tpu_sync/core:kv_cache_manager_with_transfer",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
@@ -254,9 +254,9 @@ nanobind_extension(
     visibility = ["//visibility:public"],
     deps = [
         ":pool_layout_nanobind",
-        "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:block_transport",
         "@com_google_absl//absl/status",
@@ -432,7 +432,7 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:buffer_utils",
-        "//tpu_sync/core:kv_cache_manager_with_transfer",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
