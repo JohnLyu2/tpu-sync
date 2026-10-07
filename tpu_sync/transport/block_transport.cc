@@ -1001,10 +1001,16 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
           }
           ABSL_RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
 
-          // What the receiver needs to handle these chunks. Uses the iterated
-          // layer `l`, not `layer_idx` (which is -1 for all-layer pushes).
-          const uint64_t buffer_id = (static_cast<uint64_t>(l) << 32) |
-                                     static_cast<uint32_t>(sh);
+          // What the receiver needs to handle these chunks. Uses
+          // `wire_layer_idx` when set (the receiver's array index), otherwise
+          // the iterated layer `l` (not `layer_idx`, which is -1 for all-layer
+          // pushes).
+          const size_t wire_layer =
+              wire_layer_idx.has_value() ? static_cast<size_t>(*wire_layer_idx)
+                                         : l;
+          const uint64_t buffer_id =
+              (static_cast<uint64_t>(wire_layer) << 32) |
+              static_cast<uint32_t>(sh);
           for (const auto& chunk : chunks) {
             requests.push_back(BuildBlockRequest(
                 socket_opcode, chunk.ptr, chunk.raddr, chunk.size,
