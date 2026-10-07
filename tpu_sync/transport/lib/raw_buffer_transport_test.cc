@@ -1697,5 +1697,25 @@ TEST(RawBufferTransportEnvTest, NonPositiveOrInvalidEnvUsesDefault) {
   }
 }
 
+TEST(RawBufferTransportEnvTest, PinRecvThreadToNicNumaDoesNotAffectTransfer) {
+  // Loopback connections resolve to no host NIC, so the worker takes the
+  // "unresolved, not pinned" branch. This covers the switch parsing and the
+  // per-connection lookup without depending on the host's NUMA topology.
+  ScopedEnvVar env_pin("TPU_RAIDEN_PIN_RECV_THREAD_TO_NIC_NUMA", "1");
+
+  constexpr size_t kSize = 4096;
+  RawMockDelegate src(kSize);
+  RawMockDelegate dst(kSize);
+  RandomNonZero(src.DataSpan());
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+
+  ASSERT_OK(src_transport.ProcessSocketBufferPush(
+      GetIpPort(dst_transport),
+      *BuildBufferRequest(kBufferId, kDstShardIdx, /*offset_bytes=*/0,
+                          src.data(), kSize, /*uuid=*/0, kOpBufferPush)));
+  EXPECT_THAT(dst.DataSpan(), Pointwise(Eq(), src.DataSpan()));
+}
+
 }  // namespace
 }  // namespace tpu_raiden::transport::lib

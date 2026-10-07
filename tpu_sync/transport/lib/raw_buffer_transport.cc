@@ -34,6 +34,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>  // NOLINT
@@ -48,6 +49,7 @@
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -57,6 +59,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -149,6 +152,17 @@ int GetPositiveIntFromEnvOrDefault(const char* name, int default_val) {
     return default_val;
   }
   return parsed;
+}
+
+// Whether inbound connection workers pin themselves to the NUMA node of the
+// NIC their connection arrived on. Opt-in while the end-to-end NUMA-affine
+// path (sender-side shard-to-NIC steering) is still being rolled out.
+bool PinRecvThreadsToNicNumaEnabled() {
+  const char* v = std::getenv("TPU_RAIDEN_PIN_RECV_THREAD_TO_NIC_NUMA");
+  if (v == nullptr) return false;
+  const absl::string_view sv(v);
+  return sv == "1" || absl::EqualsIgnoreCase(sv, "true") ||
+         absl::EqualsIgnoreCase(sv, "yes") || absl::EqualsIgnoreCase(sv, "on");
 }
 
 absl::Status InternalError(absl::string_view msg, int _errno) {
@@ -254,6 +268,7 @@ RawBufferTransport::RawBufferTransport(
       local_ips_(local_ips),
       local_port_(local_port),
       require_psp_tcp_(absl::GetFlag(FLAGS_require_psp_tcp)),
+      pin_recv_threads_to_nic_numa_(PinRecvThreadsToNicNumaEnabled()),
       server_fd_(-1),
       stopping_(false),
       store_(RaidenMetricStore::GetGlobalMetricStore().HasBackends()
@@ -282,7 +297,9 @@ RawBufferTransport::RawBufferTransport(
             << ", local_ips_: " << absl::StrJoin(local_ips_, ",")
             << ", local_port_: " << local_port_ << ", listening tcp socket "
             << server_fd_ << ": " << GetAddrPortPair(server_fd_)
-            << ", listen_backlog: " << listen_backlog;
+            << ", listen_backlog: " << listen_backlog
+            << ", pin_recv_threads_to_nic_numa: "
+            << pin_recv_threads_to_nic_numa_;
 
   // 2. Start listener
   listener_thread_ = std::thread(&RawBufferTransport::ListenerLoop, this);
@@ -652,8 +669,30 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
 void RawBufferTransport::ConnectionWorker(int client_fd) {
   DCHECK_GE(client_fd, 0);
+  // One connection is served by exactly this thread for its whole life, and
+  // the kernel's copy into the delegate's host buffers runs on whichever CPU
+  // this thread occupies. Pinning to the NUMA node of the NIC the connection
+  // arrived on keeps that copy node-local when the sender steers each shard's
+  // stream to the NIC adjacent to the shard's host memory. The lookup is a
+  // getsockname() plus a cached table scan, paid once per connection.
+  std::string numa_note;
+  if (pin_recv_threads_to_nic_numa_) {
+    std::optional<HostNicAddress> nic = GetSocketLocalNic(client_fd);
+    if (nic.has_value() && nic->numa_node >= 0) {
+      const int rc = PinCurrentThreadToNumaNode(nic->numa_node);
+      numa_note = absl::StrCat(", nic=", nic->interface_name,
+                               ", numa=", nic->numa_node);
+      if (rc == 0) {
+        absl::StrAppend(&numa_note, ", pinned");
+      } else {
+        absl::StrAppend(&numa_note, ", pin failed rc=", rc);
+      }
+    } else {
+      numa_note = ", nic=unresolved, not pinned";
+    }
+  }
   LOG(INFO) << absl::StrCat("accepted tcp socket ", client_fd, ": ",
-                            GetAddrPortPair(client_fd));
+                            GetAddrPortPair(client_fd), numa_note);
   while (!stopping_) {
     struct pollfd pfd;
     pfd.fd = client_fd;

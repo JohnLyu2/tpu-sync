@@ -258,6 +258,7 @@ cc_library(
         ":transport_adapter",
         "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/core:numa_thread_pool",
+        "//tpu_sync/core:tpu_utils",
         "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/telemetry:label_util",
         "//tpu_sync/telemetry:metrics_api",

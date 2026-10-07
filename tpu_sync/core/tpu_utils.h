@@ -106,9 +106,11 @@ std::vector<std::string> GetLocalHostIpAddresses();
 int GetInterfaceNumaNode(const char* ifname,
                          absl::string_view sysfs_root = "/sys");
 
-// Uses getsockname to look up the local IPv4 address and returns its
-// corresponding interface's host NIC address. Returns std::nullopt on failure
-// or if not found.
+// Uses getsockname to look up the local address of `fd` and returns the host
+// NIC that owns it. Accepts AF_INET and AF_INET6 sockets; v4-mapped IPv6
+// addresses (as reported by dual-stack listeners) are unmapped before the
+// lookup. Returns std::nullopt on failure or if no NIC matches (e.g.
+// loopback).
 std::optional<HostNicAddress> GetSocketLocalNic(int fd);
 
 // Pins the thread to the local NUMA node if pin_thread is true.

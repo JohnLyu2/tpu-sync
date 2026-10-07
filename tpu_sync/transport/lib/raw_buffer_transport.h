@@ -186,6 +186,10 @@ class RawBufferTransport final {
   const std::vector<std::string> local_ips_;
   int local_port_;
   const bool require_psp_tcp_;
+  // When true (TPU_RAIDEN_PIN_RECV_THREAD_TO_NIC_NUMA), each accepted
+  // connection's worker thread pins itself to the NUMA node of the local NIC
+  // the connection arrived on. See ConnectionWorker().
+  const bool pin_recv_threads_to_nic_numa_;
   std::atomic<int> server_fd_;  // owned by listener_thread_
   std::atomic<bool> stopping_;
 
