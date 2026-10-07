@@ -11,6 +11,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation
 import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering
 import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
+import TpuSyncVerify.Transfer.Reshard.Receive
+import TpuSyncVerify.Transfer.Reshard.Send
 import TpuSyncVerify.Controller.ReadRemote
 
 /-!
@@ -22,10 +24,11 @@ subsystem of `tpu_sync/` they describe:
 * `Common` — the transition-system core, list/pigeonhole lemmas, and a bounded
   model checker shared by every model.
 * `Transfer` — the session-based KV transfer path (`tpu_sync/core/transfer_*`,
-  `tpu_sync/transport`). `Transfer.PrefillDecode` is the prefill-to-decode
-  model of `proposal.md`, built up in stages through single-request (`Pipeline`)
-  and multi-request (`MultiRequest`) proofs plus executable checks
-  (`PipelineChecks`).
+  `tpu_sync/core/reshard_*`, `tpu_sync/transport`). `Transfer.PrefillDecode` is
+  the prefill-to-decode model of `proposal.md`, built up in stages through
+  single-request (`Pipeline`) and multi-request (`MultiRequest`) proofs plus
+  executable checks (`PipelineChecks`). `Transfer.Reshard` models the
+  pool-addressed resharding path of `docs/transfer/reshard.md`.
 * `Controller` — `RaidenController` (`tpu_sync/core/controller`).
   `Controller.ReadRemote` is the exhaustive check behind finding F2 in
   `findings/`.

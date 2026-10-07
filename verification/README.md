@@ -15,8 +15,9 @@ verification/
 │   ├── Common/                              # System, ListAux, bounded model checker
 │   ├── Transfer/
 │   │   ├── Session.lean                     # settle protocol shared by the session classes
-│   │   └── PrefillDecode/                   # Receive, ReceivePoll, Send, Pipeline, MultiRequest,
-│   │                                        # PipelineChecks, PeerIsolation, UuidTable, BlockOrdering
+│   │   ├── PrefillDecode/                   # Receive, ReceivePoll, Send, Pipeline, MultiRequest,
+│   │   │                                    # PipelineChecks, PeerIsolation, UuidTable, BlockOrdering
+│   │   └── Reshard/                         # Receive, Send (Stage 1 of docs/transfer/reshard.md)
 │   └── Controller/ReadRemote.lean           # exhaustive check behind finding F2
 ├── docs/                                    # correspondence tables, results, upstream re-checks, future work
 ├── findings/                                # bug-hunt write-up, repro tests, patches
@@ -41,6 +42,8 @@ All citations (models, `docs/`, `findings/`) are to tpu-sync `50b0774`
 | `Transfer/PrefillDecode/PeerIsolation` | cross-peer fault isolation: a decode consumer pulling from a `sick` and a `healthy` prefill peer that share `StagingBlockAllocator` slots and the `push_pool_`. Under the shipping unbounded-per-peer admission the sick peer pins every slot and healthy reads are *rejected* (`trace_sick_peer_starves_staging_slots`); on the TCP control plane a full pool blocks the healthy handshake (`tcp_healthy_blocked_when_pool_full`), on gRPC it completes (`grpc_healthy_can_complete`); a per-peer quota admits the healthy peer (`reachable_quota_admits_healthy`) | proved; `decide` traces, bounded search | same |
 | `Transfer/PrefillDecode/UuidTable` | manager UUID tables (`active_recv_sessions_`, `send_sessions_`) and the drain-before-reuse discipline: a live session is never displaced by a same-uuid retry (`active_recv_preserved`, `active_send_preserved`), per-table safety (`reachable_recv_safe`, `reachable_send_safe`) | proved; bounded search + mutants | same |
 | `Transfer/PrefillDecode/BlockOrdering` | within-layer block refinement of `Pipeline` (discharges its A1): block-index gather and dual-permutation `BuildLoadCopyPlan`, coalesced DMA runs equal element-wise copies on every memory (`execCoalesced_buildCoalescedSpec`), subset/uniqueness validation, custom host staging; `BlockPipeline.step_pipe` couples each block step to `Pipeline.step`, `BlockPipeline.reachable_safe` | proved; `decide` traces + mutants | same |
+| `Transfer/Reshard/Receive` | `ReshardReceiveSession` on `Session.Lifecycle`: settle safety, no retired callback, `PoolStagingLease` integrity, deferred plan unregistration (`PlanIntegrity`), prompt settle, **rank-ordered pool H2D waves** (`RankWaveOrder`, `rankWaveOrder_iff`), readiness soundness, publication, no op leak / termination (`reachable_can_settle`), `IsReadyToComplete` poll-finish redundancy (`reachable_pollReady_disabled`), shipping vs. `finishOnError` `end_incoming_push` policy (`trace_r1_failed_incoming_push`) | proved; `decide` traces, bounded search + mutants | [reshard.md](docs/transfer/reshard.md) |
+| `Transfer/Reshard/Send` | `ReshardSendSession` + `CountPoolReshardSendSlots` on `Session.Lifecycle`: settle safety, no retired callback, `PoolStagingLease` integrity, prompt settle, active-or-draining (`ActiveOrDraining`), plan unregistration (`UnregisterPolicy.shipping` vs. `onSettle`, `reachable_onSettle_plan_iff_done`), multi-pool multi-peer publication, no op leak / termination (`reachable_can_settle`) | proved; `decide` traces, bounded search + mutants | same |
 | `Controller/ReadRemote` | `NoWriteAfterRelease` | shipping code: counterexamples (shapes A, B); deferred-settle fix: safe by exhaustive search | [read_remote.md](docs/controller/read_remote.md) |
 
 Outcome so far: no data-correctness or safety bugs in the prefill-to-decode
