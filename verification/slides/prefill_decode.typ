@@ -542,3 +542,104 @@
   )
 ]
 
+// ---------------------------------------------------------------------------
+#slide[Plan & discussion][
+  #v(0.3em)
+  #let title-card(num, title) = block(
+    fill: luma(247),
+    stroke: 0.6pt + luma(220),
+    radius: 4pt,
+    inset: (x: 14pt, y: 12pt),
+    width: 100%,
+  )[
+    #text(fill: accent, weight: "medium", size: 15.5pt)[#num · #title]
+  ]
+
+  #let disc-card(num, title, body) = block(
+    fill: luma(247),
+    stroke: 0.6pt + luma(220),
+    radius: 4pt,
+    inset: (x: 14pt, y: 13pt),
+    width: 100%,
+  )[
+    #text(fill: accent, weight: "medium", size: 15.5pt)[#num · #title]
+    #v(0.5em)
+    #set text(size: 13.5pt)
+    #set par(leading: 0.55em)
+    #set list(spacing: 0.75em)
+    #body
+  ]
+
+  #stack(
+    spacing: 0.85em,
+    title-card[1][Extend the formalization to reshard & KV cache storage],
+    title-card[2][Bug hunting & fixes],
+    disc-card[3][Discussion with the team: how can the Lean model help day-to-day?][
+      - *Developer understanding:* Does the state-machine view and explicit invariants help engineers build a clearer mental model of the C++ protocol?
+      - *Code changes & new features:* Can the model help the team reason about subtle refactors and design new transfer features safely?
+      - *AI-assisted coding workflows:* As we work with AI coding agents, can the Lean model serve as an executable spec and guardrail in that workflow?
+    ],
+  )
+]
+
+// ---------------------------------------------------------------------------
+#slide[Case study: per-peer staging admission at `StartRead`][
+  #v(0.3em)
+  #set text(size: 14pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 0.8em)
+
+  *1. The problem: one unresponsive peer starves all staging buffers*
+  - To start a KV read, the decode worker must reserve a host staging buffer *up front* and hold it until the transfer finishes draining.
+  - With first-come-first-served allocation, a single hung prefill peer ties up *all* staging buffers—causing new reads from *healthy peers* to be rejected immediately.
+
+  #v(0.4em)
+  *2. Why it matters: fleet-wide availability*
+  - Even with async gRPC handshakes and timeouts, one unresponsive prefill worker can exhaust staging memory on the decode host and block transfers from the entire prefill fleet.
+
+  #v(0.4em)
+  *3. The solution: per-peer staging limit*
+  - Cap how many staging buffers any single remote peer can hold at once, reserving the remaining buffers in the pool for healthy peers.
+  - Re-enables and passes the team's parked `SickPeerStarvesStagingSlotsForHealthyPeer` acceptance test.
+]
+
+// ---------------------------------------------------------------------------
+#slide[Why the fix is subtle — and how the Lean model helped][
+  Even a simple "per-peer limit" has subtle interactions with memory safety, thread pools, and cancellation paths:
+
+  #v(0.6em)
+  #table(
+    columns: (0.95fr, 1.05fr),
+    inset: (x: 10pt, y: 11pt),
+    align: (left + horizon, left + horizon),
+    table.header[*Why the fix is tricky*][*How the Lean model helped*],
+    [
+      *1. Timeouts cannot free buffers immediately*\
+      A timed-out or cancelled read cannot free its staging buffer right away—if the peer is still sending, freeing early would corrupt memory.
+    ],
+    [
+      *Ruled out unsafe shortcuts*\
+      Showed that buffers must stay pinned until a session fully drains, proving that an *up-front per-peer limit* is the only safe fix.
+    ],
+    [
+      *2. Two shared pools must work together*\
+      Every read needs both a *handshake thread* and a *staging buffer*; fixing only one still lets a wedged peer block healthy peers.
+    ],
+    [
+      *Proved end-to-end progress*\
+      Modeled both resource pools together and proved that combining async gRPC with a per-peer buffer limit guarantees healthy reads complete.
+    ],
+    [
+      *3. Counter bugs on cancel & error paths*\
+      Reads can end via normal completion, timeout, cancel, or network error; a single missed decrement permanently locks out a peer.
+    ],
+    [
+      *Guided a leak-free C++ design*\
+      Tied the per-peer count directly to buffer ownership in the allocator (rather than session callbacks) so the count can never drift.
+    ],
+  )
+]
+
+
+
+
