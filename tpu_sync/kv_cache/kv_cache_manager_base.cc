@@ -425,7 +425,13 @@ KVCacheManagerBase::KVCacheManagerBase(
           local_port, parallelism, bind_ip,
           assigned_numa_node_override.has_value()
               ? std::vector<int>{*assigned_numa_node_override}
-              : raiden::DetectNumaNodes(layer_buffers)),
+              : raiden::DetectNumaNodes(layer_buffers),
+          GetLocalHostNicAddresses(),
+          // An explicit NUMA override pins every shard to that node, so no
+          // per-shard map is derived from the buffers.
+          assigned_numa_node_override.has_value()
+              ? std::vector<int>{}
+              : raiden::DetectShardNumaNodes(layer_buffers)),
       host_allocator_(host_allocator) {
   if (num_layers_ == 0 || num_shards_ == 0) {
     return;

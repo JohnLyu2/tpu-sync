@@ -43,10 +43,12 @@ class TestRaidenManager : public RaidenManagerBase {
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::vector<int> numa_nodes = {},
-      std::vector<HostNicAddress> mock_nics = GetLocalHostNicAddresses())
+      std::vector<HostNicAddress> mock_nics = GetLocalHostNicAddresses(),
+      std::vector<int> shard_numa_nodes = {})
       : RaidenManagerBase(num_layers, num_shards, slice_byte_size, local_port,
                           parallelism, /*bind_ip=*/std::nullopt,
-                          std::move(numa_nodes), std::move(mock_nics)) {
+                          std::move(numa_nodes), std::move(mock_nics),
+                          std::move(shard_numa_nodes)) {
     std::vector<LayerInfoBase> layers(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       layers[l].shards.resize(num_shards);
@@ -270,6 +272,127 @@ TEST(RaidenManagerBaseTest, IpCollectionPrioritizeControlOverLoopback) {
 
   ASSERT_EQ(ips.size(), 1);
   EXPECT_EQ(ips[0], "10.0.0.1");
+}
+
+TEST(RaidenManagerBaseTest, IpCollectionSpansEveryShardNumaNode) {
+  std::vector<HostNicAddress> mock_nics = {
+      {"eth0", "10.0.0.1", 0, NicClassification::kControlPlane},
+      {"eth1", "10.0.0.2", 0, NicClassification::kDataPlane},
+      {"eth2", "10.0.0.3", 1, NicClassification::kControlPlane},
+      {"eth3", "10.0.0.4", 1, NicClassification::kDataPlane},
+      {"eth4", "10.0.0.5", 1, NicClassification::kDataPlane},
+  };
+  // Shards 0-1 live on NUMA 1, shards 2-3 on NUMA 0: NUMA 1 NICs come first.
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/4,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{}, mock_nics,
+                            /*shard_numa_nodes=*/{1, 1, 0, 0});
+
+  EXPECT_THAT(manager.local_ips(),
+              ::testing::ElementsAre("10.0.0.4", "10.0.0.5", "10.0.0.2"));
+  // assigned_numa_node derives from the shard map when numa_nodes is empty.
+  EXPECT_THAT(manager.assigned_numa_node(), ::testing::Optional(1));
+
+  EXPECT_THAT(manager.shard_numa_node(0), ::testing::Optional(1));
+  EXPECT_THAT(manager.shard_numa_node(3), ::testing::Optional(0));
+  EXPECT_THAT(manager.numa_node_for_ip("10.0.0.2"), ::testing::Optional(0));
+  EXPECT_THAT(manager.numa_node_for_ip("10.0.0.3"), ::testing::Optional(1));
+  EXPECT_EQ(manager.numa_node_for_ip("192.168.0.1"), std::nullopt);
+
+  EXPECT_THAT(manager.local_ips_for_shard(1),
+              ::testing::ElementsAre("10.0.0.4", "10.0.0.5"));
+  EXPECT_THAT(manager.local_ips_for_shard(2),
+              ::testing::ElementsAre("10.0.0.2"));
+  EXPECT_THAT(manager.shards_for_local_ip("10.0.0.2"),
+              ::testing::ElementsAre(2, 3));
+  EXPECT_THAT(manager.shards_for_local_ip("10.0.0.5"),
+              ::testing::ElementsAre(0, 1));
+  // Unknown IP: every shard, so the endpoint is never advertised as empty.
+  EXPECT_THAT(manager.shards_for_local_ip("192.168.0.1"),
+              ::testing::ElementsAre(0, 1, 2, 3));
+}
+
+TEST(RaidenManagerBaseTest, UniformShardNumaMapMatchesLegacySelection) {
+  std::vector<HostNicAddress> mock_nics = {
+      {"eth1", "10.0.0.2", 0, NicClassification::kDataPlane},
+      {"eth3", "10.0.0.4", 1, NicClassification::kDataPlane},
+  };
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/2,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{1}, mock_nics,
+                            /*shard_numa_nodes=*/{1, 1});
+
+  EXPECT_THAT(manager.local_ips(), ::testing::ElementsAre("10.0.0.4"));
+  EXPECT_THAT(manager.shards_for_local_ip("10.0.0.4"),
+              ::testing::ElementsAre(0, 1));
+  EXPECT_THAT(manager.local_ips_for_shard(0),
+              ::testing::ElementsAre("10.0.0.4"));
+}
+
+TEST(RaidenManagerBaseTest, UnknownShardNumaFallsBackToAllLocalIps) {
+  std::vector<HostNicAddress> mock_nics = {
+      {"eth1", "10.0.0.2", 0, NicClassification::kDataPlane},
+      {"eth3", "10.0.0.4", 1, NicClassification::kDataPlane},
+  };
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/2,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{}, mock_nics,
+                            /*shard_numa_nodes=*/{0, -1});
+
+  EXPECT_THAT(manager.local_ips(), ::testing::ElementsAre("10.0.0.2"));
+  EXPECT_EQ(manager.shard_numa_node(1), std::nullopt);
+  EXPECT_THAT(manager.local_ips_for_shard(1),
+              ::testing::ElementsAre("10.0.0.2"));
+  // NUMA 1 NIC is not a local IP, but its shard query still degrades to all.
+  EXPECT_THAT(manager.shards_for_local_ip("10.0.0.4"),
+              ::testing::ElementsAre(0, 1));
+}
+
+TEST(RaidenManagerBaseTest, SingleNicAdvertisesShardsOfEveryNumaNode) {
+  // One data NIC on NUMA 0 while shards span NUMA 0 and 1: shards 0-1 have no
+  // NUMA-local NIC, so the only endpoint must still advertise them.
+  std::vector<HostNicAddress> mock_nics = {
+      {"eth1", "10.0.0.2", 0, NicClassification::kDataPlane},
+  };
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/4,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{}, mock_nics,
+                            /*shard_numa_nodes=*/{1, 1, 0, 0});
+
+  EXPECT_THAT(manager.local_ips(), ::testing::ElementsAre("10.0.0.2"));
+  EXPECT_THAT(manager.shards_for_local_ip("10.0.0.2"),
+              ::testing::ElementsAre(0, 1, 2, 3));
+  EXPECT_THAT(manager.local_ips_for_shard(0),
+              ::testing::ElementsAre("10.0.0.2"));
+  EXPECT_THAT(manager.local_ips_for_shard(2),
+              ::testing::ElementsAre("10.0.0.2"));
+}
+
+TEST(RaidenManagerBaseTest, OrphanShardsAreAdvertisedByEveryLocalIp) {
+  // NICs on NUMA 0 and 1, shards on NUMA 0, 1 and 2: shard 3 (NUMA 2) has no
+  // local NIC and is claimed by both endpoints; the others stay partitioned.
+  std::vector<HostNicAddress> mock_nics = {
+      {"eth1", "10.0.0.2", 0, NicClassification::kDataPlane},
+      {"eth3", "10.0.0.4", 1, NicClassification::kDataPlane},
+  };
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/4,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{}, mock_nics,
+                            /*shard_numa_nodes=*/{0, 0, 1, 2});
+
+  EXPECT_THAT(manager.local_ips(),
+              ::testing::ElementsAre("10.0.0.2", "10.0.0.4"));
+  EXPECT_THAT(manager.shards_for_local_ip("10.0.0.2"),
+              ::testing::ElementsAre(0, 1, 3));
+  EXPECT_THAT(manager.shards_for_local_ip("10.0.0.4"),
+              ::testing::ElementsAre(2, 3));
+  EXPECT_THAT(manager.local_ips_for_shard(3),
+              ::testing::ElementsAre("10.0.0.2", "10.0.0.4"));
 }
 
 }  // namespace

@@ -21,16 +21,19 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/future.h"
@@ -49,29 +52,51 @@ xla::Future<> ReturnFuture(const absl::Status& status) {
   return xla::Future<>(status);
 }
 
-RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
-                                     size_t slice_byte_size,
-                                     std::optional<int> local_port,
-                                     int parallelism,
-                                     std::optional<std::string> bind_ip,
-                                     std::vector<int> numa_nodes,
-                                     std::vector<HostNicAddress> host_nics)
+RaidenManagerBase::RaidenManagerBase(
+    size_t num_layers, size_t num_shards, size_t slice_byte_size,
+    std::optional<int> local_port, int parallelism,
+    std::optional<std::string> bind_ip, std::vector<int> numa_nodes,
+    std::vector<HostNicAddress> host_nics, std::vector<int> shard_numa_nodes)
     : num_layers_(num_layers),
       num_shards_(num_shards),
       slice_byte_size_(slice_byte_size),
       parallelism_(parallelism),
+      shard_numa_nodes_(std::move(shard_numa_nodes)),
       local_port_cfg_(local_port.value_or(0)),
       bind_ip_cfg_(std::move(bind_ip)) {
   shard_factor_ = 1;
   (void)telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!shard_numa_nodes_.empty() && shard_numa_nodes_.size() != num_shards_) {
+    LOG(WARNING) << "shard_numa_nodes has " << shard_numa_nodes_.size()
+                 << " entries but num_shards=" << num_shards_
+                 << "; ignoring per-shard NUMA map";
+    shard_numa_nodes_.clear();
+  }
+  if (numa_nodes.empty()) {
+    // Derive the distinct node list from the per-shard map so the two inputs
+    // stay interchangeable.
+    for (int node : shard_numa_nodes_) {
+      if (node >= 0 && !absl::c_linear_search(numa_nodes, node)) {
+        numa_nodes.push_back(node);
+      }
+    }
+  }
   if (!numa_nodes.empty()) {
     assigned_numa_node_ = numa_nodes[0];
     if (numa_nodes.size() > 1) {
-      LOG(WARNING) << "Incoming PJRT buffers are associated with more than one "
-                      "NUMA node ("
-                   << numa_nodes[0] << " vs " << numa_nodes[1]
-                   << "). Picking the first detected NUMA node: "
-                   << numa_nodes[0];
+      if (shard_numa_nodes_.empty()) {
+        LOG(WARNING) << "Incoming PJRT buffers are associated with more than "
+                        "one NUMA node ("
+                     << numa_nodes[0] << " vs " << numa_nodes[1]
+                     << ") and no per-shard NUMA map was supplied. Picking "
+                        "the first detected NUMA node: "
+                     << numa_nodes[0];
+      } else {
+        LOG(INFO) << "Incoming PJRT buffers span NUMA nodes ["
+                  << absl::StrJoin(numa_nodes, ",")
+                  << "]; per-shard NUMA map: ["
+                  << absl::StrJoin(shard_numa_nodes_, ",") << "]";
+      }
     }
   }
   InitTransportServer(std::move(host_nics));
@@ -99,6 +124,13 @@ tpu_raiden::transport::BlockTransport* RaidenManagerBase::InitTransportServer(
   absl::MutexLock lock(server_init_mu_);
   if (server_) return server_.get();
 
+  ip_numa_nodes_.clear();
+  for (const auto& nic : host_nics) {
+    if (nic.numa_node >= 0) {
+      ip_numa_nodes_.emplace(nic.ip_address, nic.numa_node);
+    }
+  }
+
   std::vector<std::string> collected_ips;
   if (bind_ip_cfg_.has_value() && !bind_ip_cfg_->empty()) {
     collected_ips = {*bind_ip_cfg_};
@@ -119,27 +151,42 @@ tpu_raiden::transport::BlockTransport* RaidenManagerBase::InitTransportServer(
     }
 
     if (!host_nics.empty()) {
-      int target_numa = assigned_numa_node_.value_or(-1);
-      std::cerr << "InitTransportServer: target_numa=" << target_numa
-                << std::endl;
-
-      // 1. Collect all NUMA-local Data NICs
-      if (target_numa >= 0) {
-        for (const auto& nic : host_nics) {
-          if (nic.numa_node == target_numa &&
-              nic.classification == NicClassification::kDataPlane) {
-            collected_ips.push_back(nic.ip_address);
-          }
+      // NUMA nodes to serve, in first-seen shard order. Without a per-shard
+      // map this degenerates to the single assigned node.
+      std::vector<int> target_numas;
+      for (int node : shard_numa_nodes_) {
+        if (node >= 0 && !absl::c_linear_search(target_numas, node)) {
+          target_numas.push_back(node);
         }
       }
+      if (target_numas.empty() && assigned_numa_node_.has_value() &&
+          *assigned_numa_node_ >= 0) {
+        target_numas.push_back(*assigned_numa_node_);
+      }
+      std::cerr << "InitTransportServer: target_numa=["
+                << absl::StrJoin(target_numas, ",") << "]" << std::endl;
 
-      // 2. Fallback: Collect all NUMA-local NICs
-      if (collected_ips.empty() && target_numa >= 0) {
-        for (const auto& nic : host_nics) {
-          if (nic.numa_node == target_numa) {
-            collected_ips.push_back(nic.ip_address);
+      auto collect = [&](bool data_plane_only) {
+        for (int target_numa : target_numas) {
+          for (const auto& nic : host_nics) {
+            if (nic.numa_node != target_numa) continue;
+            if (data_plane_only &&
+                nic.classification != NicClassification::kDataPlane) {
+              continue;
+            }
+            if (!absl::c_linear_search(collected_ips, nic.ip_address)) {
+              collected_ips.push_back(nic.ip_address);
+            }
           }
         }
+      };
+
+      // 1. Collect the Data NICs local to every shard NUMA node.
+      collect(/*data_plane_only=*/true);
+
+      // 2. Fallback: Collect all NUMA-local NICs.
+      if (collected_ips.empty()) {
+        collect(/*data_plane_only=*/false);
       }
 
       // 3. Ultimate Fallback: Use the first NIC on the host
@@ -156,7 +203,8 @@ tpu_raiden::transport::BlockTransport* RaidenManagerBase::InitTransportServer(
   local_ips_ = std::move(collected_ips);
 
   for (const auto& ip : local_ips_) {
-    std::cerr << "InitTransportServer: Local IP: " << ip << std::endl;
+    std::cerr << "InitTransportServer: Local IP: " << ip
+              << " numa=" << numa_node_for_ip(ip).value_or(-1) << std::endl;
   }
 
   server_ = std::make_unique<tpu_raiden::transport::BlockTransport>(
@@ -175,6 +223,62 @@ std::vector<std::string> RaidenManagerBase::local_ips() const {
     return {server_->bound_ip()};
   }
   return local_ips_;
+}
+
+std::optional<int> RaidenManagerBase::shard_numa_node(size_t shard_idx) const {
+  if (shard_idx < shard_numa_nodes_.size()) {
+    const int node = shard_numa_nodes_[shard_idx];
+    if (node >= 0) return node;
+    return std::nullopt;
+  }
+  return assigned_numa_node_;
+}
+
+std::optional<int> RaidenManagerBase::numa_node_for_ip(
+    absl::string_view ip) const {
+  auto it = ip_numa_nodes_.find(ip);
+  if (it == ip_numa_nodes_.end()) return std::nullopt;
+  return it->second;
+}
+
+std::vector<std::string> RaidenManagerBase::local_ips_for_shard(
+    size_t shard_idx) const {
+  const std::vector<std::string> all_ips = local_ips();
+  const std::optional<int> numa = shard_numa_node(shard_idx);
+  if (!numa.has_value()) return all_ips;
+  std::vector<std::string> ips;
+  for (const std::string& ip : all_ips) {
+    if (numa_node_for_ip(ip) == numa) ips.push_back(ip);
+  }
+  return ips.empty() ? all_ips : ips;
+}
+
+std::vector<int64_t> RaidenManagerBase::shards_for_local_ip(
+    absl::string_view ip) const {
+  std::vector<int64_t> all_shards(num_shards_);
+  std::iota(all_shards.begin(), all_shards.end(), 0);
+  const std::optional<int> numa = numa_node_for_ip(ip);
+  if (!numa.has_value() || shard_numa_nodes_.empty()) return all_shards;
+  // A shard belongs to |ip| when it is NUMA-local to it, or when no local IP
+  // is NUMA-local to the shard at all (e.g. one NIC serving shards on two
+  // nodes): every shard must be advertised by at least one endpoint, so such
+  // shards are claimed by every local IP (mirroring local_ips_for_shard).
+  const std::vector<std::string> all_ips = local_ips();
+  if (!absl::c_linear_search(all_ips, ip)) return all_shards;
+  auto has_local_ip = [&](std::optional<int> shard_numa) {
+    return absl::c_any_of(all_ips, [&](const std::string& local_ip) {
+      return numa_node_for_ip(local_ip) == shard_numa;
+    });
+  };
+  std::vector<int64_t> shards;
+  for (size_t sh = 0; sh < num_shards_; ++sh) {
+    const std::optional<int> shard_numa = shard_numa_node(sh);
+    if (shard_numa == numa || !shard_numa.has_value() ||
+        !has_local_ip(shard_numa)) {
+      shards.push_back(static_cast<int64_t>(sh));
+    }
+  }
+  return shards.empty() ? all_shards : shards;
 }
 
 // Resolves host memory pointer for a specific layer and shard.

@@ -291,7 +291,16 @@ struct RaidenBufferHandle {
 
 using BufferHoldAndAlias = RaidenBufferHandle;
 
+// Distinct NUMA nodes (in first-seen order) of the devices backing
+// |layer_buffers|. Devices whose NUMA node cannot be resolved are skipped.
 std::vector<int> DetectNumaNodes(
+    const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers);
+
+// NUMA node of the device backing each shard of |layer_buffers|, indexed by
+// shard (one entry per `layer_buffers[0]` element). A shard whose device NUMA
+// node cannot be resolved maps to -1. Returns an empty vector when
+// |layer_buffers| is empty.
+std::vector<int> DetectShardNumaNodes(
     const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers);
 
 struct BufferHolder {

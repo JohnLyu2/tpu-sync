@@ -92,7 +92,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           layer_buffers.empty() ? 0
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip,
-          raiden::DetectNumaNodes(layer_buffers)),
+          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses(),
+          raiden::DetectShardNumaNodes(layer_buffers)),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))) {

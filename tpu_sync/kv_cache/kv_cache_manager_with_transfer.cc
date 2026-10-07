@@ -768,10 +768,6 @@ KVCacheManagerWithTransfer::get_local_data_endpoints() const {
 
 std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
     int64_t port) const {
-  std::vector<int64_t> all_shards(base_->num_shards());
-  for (size_t i = 0; i < base_->num_shards(); ++i) {
-    all_shards[i] = static_cast<int64_t>(i);
-  }
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
       base_->LayerHostAddrs(/*uuid=*/0);
   std::vector<RaidenTransferEndpoint> eps;
@@ -779,7 +775,9 @@ std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
     std::string endpoint = absl::StrContains(ip, ':')
                                ? absl::StrCat("[", ip, "]:", port)
                                : absl::StrCat(ip, ":", port);
-    eps.push_back({endpoint, all_shards, layer_host_addrs});
+    // Shards whose device is NUMA-local to this NIC; every shard when the
+    // host has no usable NUMA topology.
+    eps.push_back({endpoint, base_->shards_for_local_ip(ip), layer_host_addrs});
   }
   return eps;
 }

@@ -45,12 +45,20 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   using LayerInfoBase = ::tpu_raiden::LayerInfoBase;
   using StagingArena = ::tpu_raiden::StagingArena;
 
+  // |numa_nodes| lists the distinct NUMA nodes of the incoming buffers (the
+  // first one becomes `assigned_numa_node()`). |shard_numa_nodes|, when
+  // non-empty, maps each shard index to the NUMA node of the device backing
+  // it (-1 = unknown); it drives per-shard NIC selection (`local_ips()` then
+  // spans the data NICs of every shard's NUMA node, see
+  // `local_ips_for_shard()` / `shards_for_local_ip()`). When empty, every
+  // shard is attributed to `assigned_numa_node()`.
   RaidenManagerBase(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<std::string> bind_ip = std::nullopt,
       std::vector<int> numa_nodes = {},
-      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses());
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
+      std::vector<int> shard_numa_nodes = {});
 
   ~RaidenManagerBase() override;
 
@@ -123,6 +131,24 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   virtual std::vector<std::string> local_ips() const;
   std::optional<int> assigned_numa_node() const { return assigned_numa_node_; }
 
+  // NUMA node of the device backing |shard_idx|, or nullopt when unknown.
+  // Falls back to `assigned_numa_node()` when no per-shard map was supplied.
+  std::optional<int> shard_numa_node(size_t shard_idx) const;
+  // NUMA node of the NIC that owns local address |ip|, or nullopt when |ip| is
+  // not one of the host NICs handed to the constructor.
+  std::optional<int> numa_node_for_ip(absl::string_view ip) const;
+  // Subset of `local_ips()` whose NIC sits on the NUMA node of |shard_idx|.
+  // Returns all of `local_ips()` when the shard or the NICs have no NUMA
+  // information, so callers can always use the result as a peer list.
+  std::vector<std::string> local_ips_for_shard(size_t shard_idx) const;
+  // Shards to advertise on local address |ip|: those whose device sits on the
+  // NIC's NUMA node, plus every shard that no local IP is NUMA-local to (or
+  // whose NUMA node is unknown), so that the union over `local_ips()` always
+  // covers every shard. Returns every shard when |ip| is not a local address,
+  // when |ip| or the shards carry no NUMA information, or when nothing else
+  // would be selected.
+  std::vector<int64_t> shards_for_local_ip(absl::string_view ip) const;
+
   uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) override;
 
@@ -153,6 +179,11 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   size_t shard_factor_ = 1;
   int64_t major_dim_size_ = 0;
   std::optional<int> assigned_numa_node_ = std::nullopt;
+  // Per-shard NUMA node (-1 = unknown); empty when not supplied.
+  std::vector<int> shard_numa_nodes_;
+  // Local IP address -> NUMA node of the owning NIC, for every NIC handed to
+  // the constructor (not only the ones selected into `local_ips_`).
+  absl::flat_hash_map<std::string, int> ip_numa_nodes_;
   int local_port_cfg_ = 0;
   std::optional<std::string> bind_ip_cfg_ = std::nullopt;
   std::vector<std::string> local_ips_;
