@@ -27,16 +27,29 @@
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
 namespace {
 
 // Test subclass to populate protected layers_ and implement AllocateBlocks
+// One ShardInfo per entry of |numa_nodes|, shard `i` on `numa_nodes[i]`.
+std::vector<transport::ShardInfo> ShardsOnNuma(std::vector<int> numa_nodes) {
+  std::vector<transport::ShardInfo> shards;
+  shards.reserve(numa_nodes.size());
+  for (size_t sh = 0; sh < numa_nodes.size(); ++sh) {
+    shards.push_back(
+        {.local_index = static_cast<int>(sh), .numa_node = numa_nodes[sh]});
+  }
+  return shards;
+}
+
 class TestRaidenManager : public RaidenManagerBase {
  public:
   TestRaidenManager(
@@ -44,11 +57,11 @@ class TestRaidenManager : public RaidenManagerBase {
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::vector<int> numa_nodes = {},
       std::vector<HostNicAddress> mock_nics = GetLocalHostNicAddresses(),
-      std::vector<int> shard_numa_nodes = {})
+      std::vector<transport::ShardInfo> shards = {})
       : RaidenManagerBase(num_layers, num_shards, slice_byte_size, local_port,
                           parallelism, /*bind_ip=*/std::nullopt,
                           std::move(numa_nodes), std::move(mock_nics),
-                          std::move(shard_numa_nodes)) {
+                          std::move(shards)) {
     std::vector<LayerInfoBase> layers(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       layers[l].shards.resize(num_shards);
@@ -287,7 +300,7 @@ TEST(RaidenManagerBaseTest, IpCollectionSpansEveryShardNumaNode) {
                             /*slice_byte_size=*/1024,
                             /*local_port=*/std::nullopt, /*parallelism=*/1,
                             /*numa_nodes=*/{}, mock_nics,
-                            /*shard_numa_nodes=*/{1, 1, 0, 0});
+                            ShardsOnNuma({1, 1, 0, 0}));
 
   EXPECT_THAT(manager.local_ips(),
               ::testing::ElementsAre("10.0.0.4", "10.0.0.5", "10.0.0.2"));
@@ -322,7 +335,7 @@ TEST(RaidenManagerBaseTest, UniformShardNumaMapMatchesLegacySelection) {
                             /*slice_byte_size=*/1024,
                             /*local_port=*/std::nullopt, /*parallelism=*/1,
                             /*numa_nodes=*/{1}, mock_nics,
-                            /*shard_numa_nodes=*/{1, 1});
+                            ShardsOnNuma({1, 1}));
 
   EXPECT_THAT(manager.local_ips(), ::testing::ElementsAre("10.0.0.4"));
   EXPECT_THAT(manager.shards_for_local_ip("10.0.0.4"),
@@ -340,7 +353,7 @@ TEST(RaidenManagerBaseTest, UnknownShardNumaFallsBackToAllLocalIps) {
                             /*slice_byte_size=*/1024,
                             /*local_port=*/std::nullopt, /*parallelism=*/1,
                             /*numa_nodes=*/{}, mock_nics,
-                            /*shard_numa_nodes=*/{0, -1});
+                            ShardsOnNuma({0, -1}));
 
   EXPECT_THAT(manager.local_ips(), ::testing::ElementsAre("10.0.0.2"));
   EXPECT_EQ(manager.shard_numa_node(1), std::nullopt);
@@ -361,7 +374,7 @@ TEST(RaidenManagerBaseTest, SingleNicAdvertisesShardsOfEveryNumaNode) {
                             /*slice_byte_size=*/1024,
                             /*local_port=*/std::nullopt, /*parallelism=*/1,
                             /*numa_nodes=*/{}, mock_nics,
-                            /*shard_numa_nodes=*/{1, 1, 0, 0});
+                            ShardsOnNuma({1, 1, 0, 0}));
 
   EXPECT_THAT(manager.local_ips(), ::testing::ElementsAre("10.0.0.2"));
   EXPECT_THAT(manager.shards_for_local_ip("10.0.0.2"),
@@ -383,7 +396,7 @@ TEST(RaidenManagerBaseTest, OrphanShardsAreAdvertisedByEveryLocalIp) {
                             /*slice_byte_size=*/1024,
                             /*local_port=*/std::nullopt, /*parallelism=*/1,
                             /*numa_nodes=*/{}, mock_nics,
-                            /*shard_numa_nodes=*/{0, 0, 1, 2});
+                            ShardsOnNuma({0, 0, 1, 2}));
 
   EXPECT_THAT(manager.local_ips(),
               ::testing::ElementsAre("10.0.0.2", "10.0.0.4"));
@@ -393,6 +406,72 @@ TEST(RaidenManagerBaseTest, OrphanShardsAreAdvertisedByEveryLocalIp) {
               ::testing::ElementsAre(2, 3));
   EXPECT_THAT(manager.local_ips_for_shard(3),
               ::testing::ElementsAre("10.0.0.2", "10.0.0.4"));
+}
+
+TEST(RaidenManagerBaseTest, ShardsDefaultToAssignedNumaAndUnknownGlobal) {
+  std::vector<HostNicAddress> mock_nics = {
+      {"eth1", "10.0.0.2", 1, NicClassification::kDataPlane},
+  };
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/3,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{1}, mock_nics);
+
+  const absl::Span<const transport::ShardInfo> shards = manager.shards();
+  ASSERT_EQ(shards.size(), 3);
+  for (size_t sh = 0; sh < shards.size(); ++sh) {
+    EXPECT_EQ(shards[sh].local_index, static_cast<int>(sh));
+    EXPECT_EQ(shards[sh].global_index, -1);
+    EXPECT_EQ(shards[sh].numa_node, 1);
+  }
+  EXPECT_EQ(manager.shard_numa_node(2), 1);
+}
+
+TEST(RaidenManagerBaseTest, ShardsWithoutAnyNumaInfoAreUnknown) {
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/2,
+                            /*slice_byte_size=*/1024);
+
+  ASSERT_EQ(manager.shards().size(), 2);
+  EXPECT_EQ(manager.shards()[0].numa_node, -1);
+  EXPECT_EQ(manager.shards()[1].numa_node, -1);
+  EXPECT_EQ(manager.shard_numa_node(0), std::nullopt);
+}
+
+TEST(RaidenManagerBaseTest, ShardsCarryPerShardPlacement) {
+  std::vector<HostNicAddress> mock_nics = {
+      {"eth1", "10.0.0.2", 0, NicClassification::kDataPlane},
+      {"eth3", "10.0.0.4", 1, NicClassification::kDataPlane},
+  };
+  std::vector<transport::ShardInfo> placement = ShardsOnNuma({0, 0, 1, -1});
+  placement[0].global_index = 8;
+  placement[2].global_index = 10;
+  // local_index is normalised to the position regardless of the input.
+  placement[3].local_index = 99;
+  TestRaidenManager manager(/*num_layers=*/1, /*num_shards=*/4,
+                            /*slice_byte_size=*/1024,
+                            /*local_port=*/std::nullopt, /*parallelism=*/1,
+                            /*numa_nodes=*/{}, mock_nics, placement);
+
+  const absl::Span<const transport::ShardInfo> shards = manager.shards();
+  ASSERT_EQ(shards.size(), 4);
+  EXPECT_EQ(shards[0].numa_node, 0);
+  EXPECT_EQ(shards[1].numa_node, 0);
+  EXPECT_EQ(shards[2].numa_node, 1);
+  EXPECT_EQ(shards[3].numa_node, -1);
+  EXPECT_EQ(shards[0].global_index, 8);
+  EXPECT_EQ(shards[2].global_index, 10);
+  EXPECT_EQ(shards[1].global_index, -1);
+  EXPECT_EQ(shards[3].global_index, -1);
+  EXPECT_EQ(shards[3].local_index, 3);
+  // A mismatched per-shard placement is ignored, not partially applied.
+  TestRaidenManager mismatched(/*num_layers=*/1, /*num_shards=*/4,
+                               /*slice_byte_size=*/1024,
+                               /*local_port=*/std::nullopt, /*parallelism=*/1,
+                               /*numa_nodes=*/{0}, mock_nics,
+                               ShardsOnNuma({0, 1}));
+  ASSERT_EQ(mismatched.shards().size(), 4);
+  EXPECT_EQ(mismatched.shards()[1].numa_node, 0);
+  EXPECT_THAT(mismatched.local_ips(), ::testing::ElementsAre("10.0.0.2"));
 }
 
 }  // namespace

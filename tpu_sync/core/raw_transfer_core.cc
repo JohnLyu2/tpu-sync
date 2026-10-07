@@ -43,23 +43,25 @@ std::vector<int> DetectNumaNodes(
   return unique_numa_nodes;
 }
 
-std::vector<int> DetectShardNumaNodes(
+std::vector<tpu_raiden::transport::ShardInfo> DetectShards(
     const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers) {
-  std::vector<int> shard_numa_nodes;
+  std::vector<tpu_raiden::transport::ShardInfo> shards;
   if (layer_buffers.empty()) {
-    return shard_numa_nodes;
+    return shards;
   }
   // Every layer places shard `i` on the same device, so layer 0 is
   // representative.
-  shard_numa_nodes.reserve(layer_buffers[0].size());
-  for (const auto& buf : layer_buffers[0]) {
+  shards.reserve(layer_buffers[0].size());
+  for (size_t sh = 0; sh < layer_buffers[0].size(); ++sh) {
+    const RaidenBufferHandle& buf = layer_buffers[0][sh];
     int node = -1;
     if (buf.device) {
       node = tpu_raiden::GetPjRtDeviceNumaNode(buf.device);
     }
-    shard_numa_nodes.push_back(node >= 0 ? node : -1);
+    shards.push_back({.local_index = static_cast<int>(sh),
+                      .numa_node = node >= 0 ? node : -1});
   }
-  return shard_numa_nodes;
+  return shards;
 }
 
 }  // namespace raiden

@@ -52,52 +52,74 @@ xla::Future<> ReturnFuture(const absl::Status& status) {
   return xla::Future<>(status);
 }
 
-RaidenManagerBase::RaidenManagerBase(
-    size_t num_layers, size_t num_shards, size_t slice_byte_size,
-    std::optional<int> local_port, int parallelism,
-    std::optional<std::string> bind_ip, std::vector<int> numa_nodes,
-    std::vector<HostNicAddress> host_nics, std::vector<int> shard_numa_nodes)
+RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
+                                     size_t slice_byte_size,
+                                     std::optional<int> local_port,
+                                     int parallelism,
+                                     std::optional<std::string> bind_ip,
+                                     std::vector<int> numa_nodes,
+                                     std::vector<HostNicAddress> host_nics,
+                                     std::vector<transport::ShardInfo> shards)
     : num_layers_(num_layers),
       num_shards_(num_shards),
       slice_byte_size_(slice_byte_size),
       parallelism_(parallelism),
-      shard_numa_nodes_(std::move(shard_numa_nodes)),
+      shards_(std::move(shards)),
       local_port_cfg_(local_port.value_or(0)),
       bind_ip_cfg_(std::move(bind_ip)) {
   shard_factor_ = 1;
   (void)telemetry::RaidenMetricStore::GetGlobalMetricStore();
-  if (!shard_numa_nodes_.empty() && shard_numa_nodes_.size() != num_shards_) {
-    LOG(WARNING) << "shard_numa_nodes has " << shard_numa_nodes_.size()
+  if (!shards_.empty() && shards_.size() != num_shards_) {
+    LOG(WARNING) << "shards has " << shards_.size()
                  << " entries but num_shards=" << num_shards_
-                 << "; ignoring per-shard NUMA map";
-    shard_numa_nodes_.clear();
+                 << "; ignoring per-shard placement";
+    shards_.clear();
   }
+  const bool has_shard_placement = !shards_.empty();
   if (numa_nodes.empty()) {
-    // Derive the distinct node list from the per-shard map so the two inputs
-    // stay interchangeable.
-    for (int node : shard_numa_nodes_) {
-      if (node >= 0 && !absl::c_linear_search(numa_nodes, node)) {
-        numa_nodes.push_back(node);
+    // Derive the distinct node list from the per-shard placement so the two
+    // inputs stay interchangeable.
+    for (const transport::ShardInfo& shard : shards_) {
+      if (shard.numa_node >= 0 &&
+          !absl::c_linear_search(numa_nodes, shard.numa_node)) {
+        numa_nodes.push_back(shard.numa_node);
       }
     }
   }
   if (!numa_nodes.empty()) {
     assigned_numa_node_ = numa_nodes[0];
     if (numa_nodes.size() > 1) {
-      if (shard_numa_nodes_.empty()) {
+      if (!has_shard_placement) {
         LOG(WARNING) << "Incoming PJRT buffers are associated with more than "
                         "one NUMA node ("
                      << numa_nodes[0] << " vs " << numa_nodes[1]
-                     << ") and no per-shard NUMA map was supplied. Picking "
+                     << ") and no per-shard placement was supplied. Picking "
                         "the first detected NUMA node: "
                      << numa_nodes[0];
       } else {
+        std::vector<int> shard_numa_nodes;
+        shard_numa_nodes.reserve(shards_.size());
+        for (const transport::ShardInfo& shard : shards_) {
+          shard_numa_nodes.push_back(shard.numa_node);
+        }
         LOG(INFO) << "Incoming PJRT buffers span NUMA nodes ["
                   << absl::StrJoin(numa_nodes, ",")
                   << "]; per-shard NUMA map: ["
-                  << absl::StrJoin(shard_numa_nodes_, ",") << "]";
+                  << absl::StrJoin(shard_numa_nodes, ",") << "]";
       }
     }
+  }
+  if (!has_shard_placement) {
+    // No placement supplied: every shard sits on the assigned node (or is
+    // unknown) with an unknown global index.
+    shards_.resize(num_shards_);
+    for (size_t sh = 0; sh < num_shards_; ++sh) {
+      shards_[sh].numa_node = assigned_numa_node_.value_or(-1);
+    }
+  }
+  // `local_index` is the position in `shards_` by definition.
+  for (size_t sh = 0; sh < shards_.size(); ++sh) {
+    shards_[sh].local_index = static_cast<int>(sh);
   }
   InitTransportServer(std::move(host_nics));
 }
@@ -154,9 +176,10 @@ tpu_raiden::transport::BlockTransport* RaidenManagerBase::InitTransportServer(
       // NUMA nodes to serve, in first-seen shard order. Without a per-shard
       // map this degenerates to the single assigned node.
       std::vector<int> target_numas;
-      for (int node : shard_numa_nodes_) {
-        if (node >= 0 && !absl::c_linear_search(target_numas, node)) {
-          target_numas.push_back(node);
+      for (const transport::ShardInfo& shard : shards_) {
+        if (shard.numa_node >= 0 &&
+            !absl::c_linear_search(target_numas, shard.numa_node)) {
+          target_numas.push_back(shard.numa_node);
         }
       }
       if (target_numas.empty() && assigned_numa_node_.has_value() &&
@@ -226,8 +249,8 @@ std::vector<std::string> RaidenManagerBase::local_ips() const {
 }
 
 std::optional<int> RaidenManagerBase::shard_numa_node(size_t shard_idx) const {
-  if (shard_idx < shard_numa_nodes_.size()) {
-    const int node = shard_numa_nodes_[shard_idx];
+  if (shard_idx < shards_.size()) {
+    const int node = shards_[shard_idx].numa_node;
     if (node >= 0) return node;
     return std::nullopt;
   }
@@ -258,7 +281,7 @@ std::vector<int64_t> RaidenManagerBase::shards_for_local_ip(
   std::vector<int64_t> all_shards(num_shards_);
   std::iota(all_shards.begin(), all_shards.end(), 0);
   const std::optional<int> numa = numa_node_for_ip(ip);
-  if (!numa.has_value() || shard_numa_nodes_.empty()) return all_shards;
+  if (!numa.has_value()) return all_shards;
   // A shard belongs to |ip| when it is NUMA-local to it, or when no local IP
   // is NUMA-local to the shard at all (e.g. one NIC serving shards on two
   // nodes): every shard must be advertised by at least one endpoint, so such

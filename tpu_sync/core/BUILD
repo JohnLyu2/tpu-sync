@@ -186,6 +186,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
     ],
     alwayslink = 1,
 )
@@ -365,6 +366,7 @@ cc_library(
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
         "@xla//xla/tsl/concurrency:async_value",
         "//tpu_sync/common:trace",
+        "//tpu_sync/transport:block_transport_delegate",
     ],
 )
 
@@ -834,9 +836,11 @@ cc_test(
         ":raiden_manager_base",
         ":tpu_pjrt_manager",
         ":tpu_utils",
+        "//tpu_sync/transport:block_transport_delegate",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",  # build_cleaner: keep
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
