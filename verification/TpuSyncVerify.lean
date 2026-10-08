@@ -13,6 +13,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering
 import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
 import TpuSyncVerify.Transfer.Reshard.Receive
 import TpuSyncVerify.Transfer.Reshard.Send
+import TpuSyncVerify.Transfer.Reshard.Pipeline
 import TpuSyncVerify.Controller.ReadRemote
 
 /-!
