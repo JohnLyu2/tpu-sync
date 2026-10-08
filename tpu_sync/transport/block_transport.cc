@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -36,6 +37,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/log.h"
@@ -222,13 +224,14 @@ absl::StatusOr<MajorOrder> ParseMajorOrder(uint8_t value) {
 template <typename Fn>
 absl::Status ForEachPayload(MajorOrder major_order,
                             const std::vector<int>& layer_ids,
-                            size_t num_shards, size_t num_blocks, Fn fn) {
+                            absl::Span<const int> shard_ids, size_t num_blocks,
+                            Fn fn) {
   switch (static_cast<int>(major_order)) {
     case static_cast<int>(MajorOrder::kLayerMajor):
       for (int l : layer_ids) {
-        for (size_t sh = 0; sh < num_shards; ++sh) {
+        for (int sh : shard_ids) {
           for (size_t k = 0; k < num_blocks; ++k) {
-            ABSL_RETURN_IF_ERROR(fn(l, sh, k));
+            ABSL_RETURN_IF_ERROR(fn(l, static_cast<size_t>(sh), k));
           }
         }
       }
@@ -236,14 +239,79 @@ absl::Status ForEachPayload(MajorOrder major_order,
     case static_cast<int>(MajorOrder::kBlockMajor):
       for (size_t k = 0; k < num_blocks; ++k) {
         for (int l : layer_ids) {
-          for (size_t sh = 0; sh < num_shards; ++sh) {
-            ABSL_RETURN_IF_ERROR(fn(l, sh, k));
+          for (int sh : shard_ids) {
+            ABSL_RETURN_IF_ERROR(fn(l, static_cast<size_t>(sh), k));
           }
         }
       }
       return absl::OkStatus();
   }
   return absl::InvalidArgumentError("Unknown block transport major order");
+}
+
+std::vector<int> AllShards(size_t num_shards) {
+  std::vector<int> shards(num_shards);
+  std::iota(shards.begin(), shards.end(), 0);
+  return shards;
+}
+
+// Shard subset addressed by a push stream's `ChunkHeader::buffer_id`; 0 is
+// the legacy "every shard" encoding.
+absl::StatusOr<std::vector<int>> ShardsFromMask(uint16_t mask,
+                                                size_t num_shards) {
+  if (mask == 0) return AllShards(num_shards);
+  std::vector<int> shards;
+  for (int sh = 0; sh < kMaxShardMaskBits; ++sh) {
+    if ((mask >> sh) & 1u) {
+      if (static_cast<size_t>(sh) >= num_shards) {
+        return absl::OutOfRangeError(
+            absl::StrCat("push stream shard mask ", mask, " addresses shard ",
+                         sh, " but the receiver has ", num_shards));
+      }
+      shards.push_back(sh);
+    }
+  }
+  return shards;
+}
+
+// Shards of one push that share a NUMA node and therefore one set of streams.
+struct ShardGroup {
+  int numa_node;            // -1 = unknown / legacy.
+  std::vector<int> shards;  // Ascending local shard indices.
+  uint16_t shard_mask;      // 0 for the single legacy group.
+};
+
+// Groups `shards` by NUMA node, ordered by first appearance. Returns a single
+// legacy group (every shard, mask 0, node -1) whenever a split is not possible
+// or not useful: no placement info, every shard on one node, any shard on an
+// unknown node, or more shards than fit in the wire mask.
+std::vector<ShardGroup> ShardGroupsByNuma(absl::Span<const ShardInfo> shards,
+                                          size_t num_shards) {
+  std::vector<ShardGroup> groups;
+  if (shards.size() == num_shards &&
+      num_shards <= static_cast<size_t>(kMaxShardMaskBits)) {
+    for (const ShardInfo& info : shards) {
+      if (info.numa_node < 0 || info.local_index < 0 ||
+          static_cast<size_t>(info.local_index) >= num_shards) {
+        groups.clear();
+        break;
+      }
+      auto it = std::find_if(
+          groups.begin(), groups.end(),
+          [&](const ShardGroup& g) { return g.numa_node == info.numa_node; });
+      if (it == groups.end()) {
+        groups.push_back(ShardGroup{info.numa_node, {}, 0});
+        it = std::prev(groups.end());
+      }
+      it->shards.push_back(info.local_index);
+      it->shard_mask |= static_cast<uint16_t>(1u << info.local_index);
+    }
+  }
+  if (groups.size() <= 1) {
+    return {ShardGroup{-1, AllShards(num_shards), 0}};
+  }
+  for (ShardGroup& g : groups) std::sort(g.shards.begin(), g.shards.end());
+  return groups;
 }
 
 }  // namespace
@@ -264,9 +332,26 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
           std::make_unique<lib::PeregrineControlServiceImpl>(&raw_transport_)),
       transport_adapter_(std::make_unique<lib::SocketTransportAdapter>(
           &raw_transport_, parallelism_)) {
+  // Pin a send adapter to each NUMA node the local shards span, but only when
+  // they span more than one: that is the only case where pushes are split by
+  // source node. Single-node managers keep the legacy send path untouched.
+  std::vector<int> send_numa_nodes;
+  for (const ShardInfo& shard : block_delegate_->shards()) {
+    if (shard.numa_node >= 0 &&
+        !absl::c_linear_search(send_numa_nodes, shard.numa_node)) {
+      send_numa_nodes.push_back(shard.numa_node);
+    }
+  }
+  if (send_numa_nodes.size() > 1) {
+    for (const int node : send_numa_nodes) {
+      numa_adapters_[node] = std::make_unique<lib::SocketTransportAdapter>(
+          &raw_transport_, parallelism_, node);
+    }
+  }
   LOG(INFO) << "local_port=" << local_port
             << ", local_ips=" << absl::StrJoin(local_ips, ",")
-            << ", parallelism=" << parallelism_;
+            << ", parallelism=" << parallelism_
+            << ", numa_send_adapters=" << numa_adapters_.size();
   metrics_thread_ = std::thread([this]() {
     while (!stop_metrics_thread_.WaitForNotificationWithTimeout(
         kTransportMetricsPollInterval)) {
@@ -404,17 +489,21 @@ absl::Status BlockTransport::HandleIncomingPush(
   }
 
   uint64_t total_received_bytes = 0;
+  // Shards this stream carries: every shard for a legacy push, one NUMA
+  // group's subset for a push split by source NUMA node.
+  ABSL_ASSIGN_OR_RETURN(
+      const std::vector<int> stream_shards,
+      ShardsFromMask(header.buffer_id, block_delegate_->num_shards()));
   // The payload arrives as one chunk per (layer, shard, block). The payload
   // fault injection hook fires once per push, right before the middle chunk,
   // so an injected failure or latency hits mid-transfer: half of the payload
   // has already been received and the rest is still in flight.
-  const size_t fault_injection_payload_index = target_layers.size() *
-                                               block_delegate_->num_shards() *
-                                               header.count_or_size / 2;
+  const size_t fault_injection_payload_index =
+      target_layers.size() * stream_shards.size() * header.count_or_size / 2;
   size_t payload_index = 0;
   ABSL_RETURN_IF_ERROR(ForEachPayload(
-      major_order, target_layers, block_delegate_->num_shards(),
-      header.count_or_size, [&](size_t l, size_t sh, size_t k) -> absl::Status {
+      major_order, target_layers, stream_shards, header.count_or_size,
+      [&](size_t l, size_t sh, size_t k) -> absl::Status {
         ABSL_DCHECK_LT(k, allocated_ids.size());
         const int dst_id = allocated_ids[k];
         if (payload_index++ == fault_injection_payload_index) {
@@ -611,11 +700,11 @@ absl::Status BlockTransport::HandleIncomingPush(
   LOG(INFO) << "HandleCustomRequest (H2H read complete): client_fd="
             << client_fd << ", uuid=" << header.uuid
             << ", numa=" << block_delegate_->node_id();
-  // Every stream of an unrouted push carries all shards of its block range.
-  std::vector<int> all_shards(block_delegate_->num_shards());
-  std::iota(all_shards.begin(), all_shards.end(), 0);
+  // Report exactly the shards this stream carried: every shard for a legacy
+  // stream, one route's subset for a routed stream. The delegate owns
+  // per-block shard accounting across streams.
   ABSL_RETURN_IF_ERROR(block_delegate_->OnBlockShardsReceived(
-      allocated_ids, all_shards, header.uuid));
+      allocated_ids, stream_shards, header.uuid));
   incoming_push_lease_held = false;
   ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
   uint8_t ack = 1;
@@ -790,6 +879,41 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx) {
+  // Split the push by source NUMA node: every group of shards sharing a node
+  // is pushed by the adapter pinned to that node. The receiver pairs the
+  // per-group shard subsets of one block range by destination id, so a
+  // multi-group push requires explicit destinations (op 6); otherwise fall
+  // back to one legacy group.
+  const size_t num_shards = block_delegate_->num_shards();
+  std::vector<ShardGroup> groups =
+      ShardGroupsByNuma(block_delegate_->shards(), num_shards);
+  if (groups.size() > 1 && dst_block_ids.empty()) {
+    LOG_FIRST_N(WARNING, 1)
+        << "Push without explicit destination block ids cannot be split by "
+           "NUMA node; sending every shard on each stream.";
+    groups = ShardGroupsByNuma({}, num_shards);
+  }
+  std::vector<tsl::Future<std::vector<int>>> futures;
+  futures.reserve(groups.size());
+  for (const ShardGroup& group : groups) {
+    futures.push_back(AsyncPushShards(
+        peers, src_block_ids, dst_block_ids, parallelism, major_order, uuid,
+        layer_idx, wire_layer_idx, group.shards, groups.size(),
+        AdapterFor(group.numa_node)));
+  }
+  // Every group returns the same destination ids; keep the first.
+  return tsl::JoinFutures(absl::MakeSpan(futures))
+      .Map<std::vector<int>>(
+          [](const std::vector<std::vector<int>>& ids) { return ids.front(); });
+}
+
+tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
+    const std::vector<std::string>& peers,
+    const std::vector<int>& src_block_ids,
+    const std::vector<int>& dst_block_ids, int parallelism,
+    MajorOrder major_order, uint64_t uuid, int layer_idx,
+    std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
+    size_t num_groups, lib::TransportAdapter* adapter) {
   auto [promise, future] = tsl::MakePromise<std::vector<int>>();
   // The adapter's completion callback must be copyable, while tsl::Promise is
   // move-only.
@@ -818,12 +942,22 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
   }
   if (static_cast<int>(num_blocks) < P) P = num_blocks;
 
+  // The receiver completes a block array once it has seen the stream count
+  // declared in the header, i.e. the streams of every shard group.
+  const size_t total_streams = static_cast<size_t>(P) * num_groups;
+  if (total_streams > std::numeric_limits<uint16_t>::max()) {
+    on_complete(absl::InvalidArgumentError(
+        absl::StrCat("push declares ", total_streams,
+                     " streams, exceeding the header limit")));
+    return std::move(future);
+  }
+
   // In multi-NIC setups, `peers` contains all NIC rail endpoints for the
   // destination host. Request chunk resolution is identical across NICs, so
   // we pass `peers[0]` as the destination peer to build requests.
-  auto requests =
-      BuildBlockRequests(peers[0], src_block_ids, dst_block_ids, major_order,
-                         uuid, layer_idx, P, wire_layer_idx);
+  auto requests = BuildBlockRequests(
+      peers[0], src_block_ids, dst_block_ids, major_order, uuid, layer_idx, P,
+      wire_layer_idx, shard_ids, static_cast<int>(total_streams));
   if (!requests.ok()) {
     on_complete(requests.status());
     return std::move(future);
@@ -831,7 +965,7 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
 
   // Post reports its own errors through `on_complete`, so the returned status
   // carries no additional information.
-  transport_adapter_
+  adapter
       ->Post(peers, *requests, src_block_ids, dst_block_ids,
              std::move(on_complete))
       .status()
@@ -918,7 +1052,8 @@ lib::Request BlockTransport::BuildBlockRequest(
     uint32_t count_or_size, uint32_t request_id, uint64_t uuid,
     uint64_t buffer_id, int parallelism, MajorOrder major_order,
     uint32_t remote_id, uint32_t local_id, int stream_idx,
-    BlockReceivedCallback on_block_received) {
+    BlockReceivedCallback on_block_received, uint16_t shard_mask,
+    int total_streams) {
   return lib::Request{
       .socket_opcode = socket_opcode,
       .laddr = laddr,
@@ -933,6 +1068,8 @@ lib::Request BlockTransport::BuildBlockRequest(
       .uuid = uuid,
       .request_id = request_id,
       .stream_idx = stream_idx,
+      .shard_mask = shard_mask,
+      .total_streams = total_streams,
       .on_block_received = std::move(on_block_received),
   };
 }
@@ -941,7 +1078,8 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
     absl::string_view peer, const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, MajorOrder major_order,
     uint64_t uuid, int layer_idx, int parallelism,
-    std::optional<int> wire_layer_idx) {
+    std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
+    int total_streams) {
   const size_t num_blocks = src_block_ids.size();
   const uint8_t socket_opcode =
       static_cast<uint8_t>(dst_block_ids.empty() ? 1 : 6);
@@ -956,7 +1094,30 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
     return std::vector<lib::Request>{BuildBlockRequest(
         socket_opcode, /*laddr=*/nullptr, /*raddr=*/nullptr, /*len=*/0,
         /*count_or_size=*/0, /*request_id=*/0, uuid, /*buffer_id=*/0,
-        parallelism, major_order, remote_id, local_id, /*stream_idx=*/0)};
+        parallelism, major_order, remote_id, local_id)};
+  }
+  if (parallelism <= 0 || static_cast<size_t>(parallelism) > num_blocks) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "parallelism ", parallelism, " must be in [1, ", num_blocks, "]"));
+  }
+
+  // The wire shard mask stays 0 (legacy "every shard") unless this call
+  // covers a strict subset, which the receiver must be able to decode.
+  const size_t num_shards = block_delegate_->num_shards();
+  uint16_t shard_mask = 0;
+  if (shard_ids.size() != num_shards) {
+    if (shard_ids.empty()) {
+      return absl::InvalidArgumentError("shard_ids cannot be empty");
+    }
+    for (int sh : shard_ids) {
+      if (sh < 0 || static_cast<size_t>(sh) >= num_shards ||
+          sh >= kMaxShardMaskBits) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "shard ", sh, " cannot be addressed by a push shard mask (",
+            num_shards, " shards, mask limit ", kMaxShardMaskBits, ")"));
+      }
+      shard_mask |= static_cast<uint16_t>(1u << sh);
+    }
   }
 
   std::vector<int> target_layers;
@@ -967,31 +1128,31 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
     target_layers = {layer_idx};
   }
 
+  std::vector<lib::Request> requests;
+  requests.reserve(target_layers.size() * shard_ids.size() * num_blocks);
+
+  // One stream per `stream_idx`, over an even block partition; the adapter
+  // derives the same partition from `stream_idx` and `parallelism`.
   const size_t base_blocks_per_stream = num_blocks / parallelism;
   const size_t remainder = num_blocks % parallelism;
-
-  std::vector<lib::Request> requests;
-  requests.reserve(target_layers.size() * block_delegate_->num_shards() *
-                   num_blocks);
-
-  for (int i = 0; i < parallelism; ++i) {
-    const size_t stream_block_count =
-        base_blocks_per_stream + (static_cast<size_t>(i) < remainder ? 1 : 0);
-    const size_t stream_block_offset =
-        i * base_blocks_per_stream + std::min<size_t>(i, remainder);
-    const uint32_t count_or_size = static_cast<uint32_t>(stream_block_count);
+  for (int stream_idx = 0; stream_idx < parallelism; ++stream_idx) {
+    const size_t block_count =
+        base_blocks_per_stream +
+        (static_cast<size_t>(stream_idx) < remainder ? 1 : 0);
+    const size_t block_offset = stream_idx * base_blocks_per_stream +
+                                std::min<size_t>(stream_idx, remainder);
+    const uint32_t count_or_size = static_cast<uint32_t>(block_count);
     uint32_t request_id = 0;
-
-    absl::Status s = ForEachPayload(
-        major_order, target_layers, block_delegate_->num_shards(),
-        stream_block_count, [&](size_t l, size_t sh, size_t k) -> absl::Status {
-          ABSL_DCHECK_LT(stream_block_offset + k, src_block_ids.size());
-          const int src_id = src_block_ids[stream_block_offset + k];
+    ABSL_RETURN_IF_ERROR(ForEachPayload(
+        major_order, target_layers, shard_ids, block_count,
+        [&](size_t l, size_t sh, size_t k) -> absl::Status {
+          ABSL_DCHECK_LT(block_offset + k, src_block_ids.size());
+          const int src_id = src_block_ids[block_offset + k];
 
           const int64_t block_id_val = src_id;
           const int64_t dst_id_val =
-              stream_block_offset + k < dst_block_ids.size()
-                  ? static_cast<int64_t>(dst_block_ids[stream_block_offset + k])
+              block_offset + k < dst_block_ids.size()
+                  ? static_cast<int64_t>(dst_block_ids[block_offset + k])
                   : -1;
           std::vector<BlockChunk> chunks = block_delegate_->GetBlockChunks(
               l, sh, absl::MakeConstSpan(&block_id_val, 1),
@@ -1018,17 +1179,20 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
             requests.push_back(BuildBlockRequest(
                 socket_opcode, chunk.ptr, chunk.raddr, chunk.size,
                 count_or_size, request_id, uuid, buffer_id, parallelism,
-                major_order, remote_id, local_id, /*stream_idx=*/i));
+                major_order, remote_id, local_id, stream_idx,
+                /*on_block_received=*/nullptr, shard_mask, total_streams));
           }
           ++request_id;
           return absl::OkStatus();
-        });
-
-    if (!s.ok()) {
-      return s;
-    }
+        }));
   }
   return requests;
+}
+
+lib::TransportAdapter* BlockTransport::AdapterFor(int numa_node) {
+  auto it = numa_adapters_.find(numa_node);
+  return it != numa_adapters_.end() ? it->second.get()
+                                    : transport_adapter_.get();
 }
 
 absl::StatusOr<std::vector<lib::Request>>
@@ -1118,9 +1282,11 @@ BlockTransport::BuildBlockPullRequests(
 
     std::vector<int> target_layers(block_delegate_->num_block_arrays());
     std::iota(target_layers.begin(), target_layers.end(), 0);
+    const std::vector<int> all_shards =
+        AllShards(block_delegate_->num_shards());
     ABSL_RETURN_IF_ERROR(ForEachPayload(
-        major_order, target_layers, block_delegate_->num_shards(),
-        chunk.local_count, [&](size_t l, size_t sh, size_t k) -> absl::Status {
+        major_order, target_layers, all_shards, chunk.local_count,
+        [&](size_t l, size_t sh, size_t k) -> absl::Status {
           ABSL_DCHECK_LT(local_block_offset + chunk.local_start_idx + k,
                          allocated_ids.size());
           const int dst_id =

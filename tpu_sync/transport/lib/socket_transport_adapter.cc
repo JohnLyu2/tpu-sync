@@ -34,6 +34,7 @@
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/absl_check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -45,6 +46,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -178,9 +180,10 @@ std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i) {
 }
 
 SocketTransportAdapter::SocketTransportAdapter(
-    RawBufferTransport* raw_transport, int parallelism)
+    RawBufferTransport* raw_transport, int parallelism, int numa_node)
     : raw_transport_(raw_transport),
       parallelism_(parallelism),
+      numa_node_(numa_node),
       config_(ReadConfigFromEnv()),
       rr_index_(0),
       scheduler_stopping_(false) {
@@ -204,6 +207,12 @@ SocketTransportAdapter::~SocketTransportAdapter() {
 }
 
 void SocketTransportAdapter::SocketWorkerLoop() {
+  if (numa_node_ >= 0) {
+    const int rc = PinCurrentThreadToNumaNode(numa_node_);
+    LOG_IF(WARNING, rc != 0)
+        << "Failed to pin send worker to NUMA node " << numa_node_
+        << " (rc=" << rc << "); continuing unpinned";
+  }
   while (!scheduler_stopping_) {
     std::unique_ptr<WriteTask> task;
     {
@@ -418,8 +427,11 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   header.version = 1;
   header.op = socket_opcode;
   header.flags = major_order;
-  header.buffer_id = 0;
-  header.reserved = static_cast<uint16_t>(parallelism);
+  // Shard subset of these streams (0 = every shard) and the total stream
+  // count the receiver completes the push on.
+  header.buffer_id = first.shard_mask;
+  header.reserved = static_cast<uint16_t>(
+      first.total_streams > 0 ? first.total_streams : parallelism);
   header.remote_id = remote_id;
   header.local_id = local_id;
   header.count_or_size = count_or_size;

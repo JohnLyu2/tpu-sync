@@ -51,9 +51,14 @@ std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i);
 // TCP Socket implementation of TransportAdapter.
 class SocketTransportAdapter : public TransportAdapter {
  public:
+  // |numa_node| >= 0 pins the send workers to that node; -1 (default) leaves
+  // them unpinned.
   explicit SocketTransportAdapter(RawBufferTransport* raw_transport,
-                                  int parallelism = 1);
+                                  int parallelism = 1, int numa_node = -1);
   ~SocketTransportAdapter() override;
+
+  // NUMA node the send workers are pinned to, or -1.
+  int numa_node() const { return numa_node_; }
 
   absl::StatusOr<Handle> Post(
       absl::Span<const std::string> peers, absl::Span<const Request> requests,
@@ -119,6 +124,7 @@ class SocketTransportAdapter : public TransportAdapter {
  private:
   RawBufferTransport* const raw_transport_;
   const int parallelism_;
+  const int numa_node_;
   const Config config_;
 
   absl::Mutex scheduler_mu_;

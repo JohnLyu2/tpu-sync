@@ -64,6 +64,7 @@ cc_library(
         "//tpu_sync/transport/lib:transport_adapter",
         "//tpu_sync/transport/lib:transport_metrics_exporter",
         "//tpu_sync/transport/lib/socket:util",
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",

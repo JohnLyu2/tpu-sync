@@ -622,6 +622,111 @@ TEST_P(BlockTransportTest, PushReportsEveryShardPerStream) {
                                   ::testing::ElementsAre(0, 1, 2, 3))));
 }
 
+// Sender delegate whose shards are spread over NUMA nodes {0, 0, 1, 1}, so a
+// push is split into two shard groups with their own streams.
+class TwoNumaSenderDelegate : public MockDelegate {
+ public:
+  using MockDelegate::MockDelegate;
+
+  absl::Span<const ShardInfo> shards() const override { return shards_; }
+
+ private:
+  const std::vector<ShardInfo> shards_ = {
+      {.local_index = 0, .numa_node = 0},
+      {.local_index = 1, .numa_node = 0},
+      {.local_index = 2, .numa_node = 1},
+      {.local_index = 3, .numa_node = 1},
+  };
+};
+
+TEST_P(BlockTransportTest, PushSplitBySourceNumaDeliversEachShardGroup) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1,
+                                        kShards);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(
+      kSlice, kBlocks, /*num_layers=*/1, kShards);
+  for (size_t sh = 0; sh < kShards; ++sh) {
+    for (int b = 0; b < kBlocks; ++b) {
+      std::memset(sender_delegate.block_data(b, 0, sh),
+                  static_cast<int>(0x10 * sh + b), kSlice);
+    }
+  }
+
+  // The sender's shards span NUMA nodes 0 and 1, so the transport creates a
+  // pinned send adapter per node and splits the push into two shard groups.
+  BlockTransport sender(&sender_delegate, 0, /*local_ips=*/{"127.0.0.1"},
+                        /*parallelism=*/2);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // 2 shard groups x parallelism 2 = 4 streams, each reporting its block
+  // slice with only its group's shards.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{2, 3},
+                     /*parallelism=*/2, MajorOrder::kLayerMajor, /*uuid=*/8,
+                     /*layer_idx=*/-1)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+  EXPECT_THAT(*pushed, ::testing::ElementsAre(2, 3));
+
+  EXPECT_THAT(receiver_delegate.reports(),
+              ::testing::UnorderedElementsAre(
+                  ::testing::Pair(::testing::ElementsAre(2),
+                                  ::testing::ElementsAre(0, 1)),
+                  ::testing::Pair(::testing::ElementsAre(3),
+                                  ::testing::ElementsAre(0, 1)),
+                  ::testing::Pair(::testing::ElementsAre(2),
+                                  ::testing::ElementsAre(2, 3)),
+                  ::testing::Pair(::testing::ElementsAre(3),
+                                  ::testing::ElementsAre(2, 3))));
+
+  for (size_t sh = 0; sh < kShards; ++sh) {
+    for (int b = 0; b < 2; ++b) {
+      const uint8_t* dst = receiver_delegate.block_data(b + 2, 0, sh);
+      EXPECT_EQ(dst[0], static_cast<uint8_t>(0x10 * sh + b)) << sh << "/" << b;
+      EXPECT_EQ(dst[kSlice - 1], static_cast<uint8_t>(0x10 * sh + b))
+          << sh << "/" << b;
+    }
+  }
+}
+
+TEST_P(BlockTransportTest, PushWithoutDestinationIdsIsNotSplitByNuma) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1,
+                                        kShards);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(
+      kSlice, kBlocks, /*num_layers=*/1, kShards);
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Op 1 (receiver allocates): the receiver cannot pair shard subsets across
+  // streams, so the push falls back to the legacy every-shard layout.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/9,
+                     /*layer_idx=*/-1)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+  ASSERT_EQ(pushed->size(), 2);
+
+  EXPECT_THAT(receiver_delegate.reports(),
+              ::testing::ElementsAre(
+                  ::testing::Pair(::testing::ElementsAreArray(*pushed),
+                                  ::testing::ElementsAre(0, 1, 2, 3))));
+}
+
 TEST_P(BlockTransportTest, PullNonContiguous) {
   size_t size = 1024;
   // Delegate 1 has 3 blocks capacity
