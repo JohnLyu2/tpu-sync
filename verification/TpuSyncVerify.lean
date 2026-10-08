@@ -16,6 +16,8 @@ import TpuSyncVerify.Transfer.Reshard.Send
 import TpuSyncVerify.Transfer.Reshard.Pipeline
 import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
+import TpuSyncVerify.Transfer.Reshard.Registry
+import TpuSyncVerify.Transfer.Reshard.Coordinator
 import TpuSyncVerify.Controller.ReadRemote
 
 /-!
