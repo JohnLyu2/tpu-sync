@@ -27,7 +27,7 @@ are directly comparable. Per-stage metrics mirror the JAX runner too:
 D2H on the source, Net transfer and H2D on the destination.
 
 Start the SOURCE first; with --parallelism_list it hosts an in-process
-`RaidenControllerServer` on port (50050 + p) for each rung and waits for the
+`RaidenControllerServer` on port (29550 + p) for each rung and waits for the
 destination to drive and then shut each rung down:
 
   cd <tpu-raiden>
@@ -43,7 +43,7 @@ Then, for each rung P, the DESTINATION pointed at the source host:
   PYTHONUNBUFFERED=1 PYTHONPATH=$PWD python3 \
     examples/microbenchmarks/torch_weight_sync_benchmark_runner.py \
       --role=destination \
-      --controller_address=10.128.0.241:$((50050 + P)) \
+      --controller_address=10.128.0.241:$((29550 + P)) \
       --parallelism=$P
 
 The payload flags must match on both sides.
@@ -83,9 +83,9 @@ flags.DEFINE_enum(
 )
 flags.DEFINE_string(
     "controller_address",
-    "localhost:50051",
+    "localhost:29551",
     "Host:port of the RaidenController (destination only). The source hosts"
-    " the controller itself on port (50050 + parallelism).",
+    " the controller itself on port (29550 + parallelism).",
 )
 flags.DEFINE_integer(
     "num_processes",
@@ -122,7 +122,7 @@ flags.DEFINE_list(
     "parallelism_list",
     [],
     "Source only: comma-separated parallelism values to sweep. For each"
-    " value p the source hosts a RaidenControllerServer on port (50050 + p).",
+    " value p the source hosts a RaidenControllerServer on port (29550 + p).",
 )
 flags.DEFINE_integer(
     "group_size",
@@ -144,7 +144,9 @@ flags.DEFINE_string(
 _UNIT_NAME = "benchmark_weights"
 _SRC_JOB = "torch_trainer"
 _DST_JOB = "torch_sampler"
-_CONTROLLER_BASE_PORT = 50050
+# Keep below Linux ip_local_port_range (32768..60999) so outbound connect()
+# sockets in TIME_WAIT cannot collide with even controller ports.
+_CONTROLLER_BASE_PORT = 29550
 _REGISTRATION_TIMEOUT_S = 1800.0
 
 _GOOGLE_PCI_VENDOR_ID = "0x1ae0"
