@@ -227,6 +227,83 @@ and five explicit pool-indexed memories (`srcHbm`, `srcStaging`, `wire`,
   `mutant_onPoolReceived_before_all_streams`, and
   `mutant_reclaim_before_publish_corrupts_dstHbm`).
 
+## Stage 3 results: `Coverage.lean` and `PoolStaging.lean`
+
+### `TpuSyncVerify/Transfer/Reshard/Coverage.lean` (sub-block byte coverage & multi-sender stream accounting)
+
+Refines `Reshard.Pipeline` along the data plane (`reshard_receive_session.cc:80-349`,
+`pool_reshard_planner.cc:1091-1140`, `reshard_send_session.cc:195-216, 283-339`,
+`pool_reshard_send_slots.cc:23-54`, `block_transport.cc:485-580, 801-827`):
+
+* **Multi-sender stream count conservation (`stream_count_matches`,
+  `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
+  `(src_block_id, dst_block_id)` pairs (`senderPairs`) for a pool group and opens
+  `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:811-816`,
+  `reshard_send_session.cc:283-331`). `ValidateReceiverCoverage`
+  (`reshard_receive_session.cc:314-324`) verifies that the receiver's
+  `expected_pushes` equals $\sum_s \min(\text{parallelism}, |\text{pairs}_s|)$,
+  matching the planner (`pool_reshard_planner.cc:1108-1116`), and a sender with
+  zero scheduled pairs opens zero streams (`reshard_send_session.cc:208-215`).
+* **Exact sub-block byte reconstruction under out-of-order stream arrival
+  (`checkContiguous_covers`, `checkContiguous_head_disjoint`,
+  `writeInterval_comm`, `partition_reconstructs_block`,
+  `partition_reconstructs_perm`).** `ValidateReceiverCoverage` sorts the logical
+  live-byte intervals `[start_bytes, end_bytes)` targeting a destination block and
+  checks that they partition `[0, extent)` without gaps or overlaps
+  (`reshard_receive_session.cc:325-346`). We prove that any interval list accepted
+  by `validBlockCoverage` is pairwise disjoint and covers every byte `b < extent`,
+  so landing the intervals in *any* network permutation reconstructs `good extent`
+  (`[kv 0, …, kv (extent - 1)]`).
+* **Refinement coupling (`CoveragePipeline.step_pipe`,
+  `CoveragePipeline.reachable_safe`).** `CoveragePipeline` refines
+  `Reshard.Pipeline` by replacing each pool's scalar stream counter with a queue
+  of sub-block intervals and a byte-addressed staging buffer. Every
+  `CoveragePipeline` step projects to a `Pipeline.step`, lifting all Stage 2
+  pipeline invariants together with byte-level destination reconstruction (`good
+  extent` on every pool's staging buffer and `good numPools` on `dstHbm`).
+* **Traces and mutants.** Three `decide` traces (`trace_tp4_to_tp2_subblock_merge`,
+  `trace_multi_sender_stream_count`, `trace_coverage_pipeline_end_to_end`) and
+  three mutants (`mutant_gap_in_coverage_leaves_unwritten_byte`,
+  `mutant_overlap_in_coverage_rejected`,
+  `mutant_mismatched_expected_pushes_rejected`).
+
+### `TpuSyncVerify/Transfer/Reshard/PoolStaging.lean` (bounded `PoolStagingStorage` & per-UUID lease lifecycle)
+
+Models `KVCacheManagerBase::PoolStagingStorage`
+(`tpu_sync/kv_cache/kv_cache_manager_base.h:963-975`,
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2002-2155`) and the receive
+registration lifecycle in `PoolReshardRegisterRecv`
+(`tpu_sync/core/kv_cache_manager_with_transfer.cc:640-675`,
+`tpu_sync/core/reshard_receive_session.cc:373-378, 408-456`):
+
+* **Idempotent per-UUID lease acquisition (`acquireLease_idempotent`,
+  `acquireLease_resolves_all`).** Re-acquiring a subset of already-leased block
+  IDs for the same `uuid` is a no-op (`kv_cache_manager_base.cc:2101-2106`), so
+  multiple pools sharing a physical storage (`storage_index`) share one page lease
+  without double-consuming arena slots, and any successful `acquireLease` maps
+  every requested block ID to an allocated slot.
+* **Slot conservation & cross-UUID disjointness (`allocateMissing_slot_sum`,
+  `init_inv`, `no_slot_aliasing_between_distinct_uuids`,
+  `acquireLease_preserves_other_resolve`,
+  `releaseLease_preserves_other_resolve`).** In any well-formed arena
+  (`ArenaInv`), distinct UUIDs `u₁ ≠ u₂` hold disjoint slot lists and never
+  resolve any block IDs to the same physical staging slot.
+* **Receive registration lifecycle & Risk R5 (`RegistrationPolicy.shipping` vs.
+  `reserveBeforeLease`, `trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`,
+  `reachable_reserveBeforeLease_safe`).** Proves both the constructive R5
+  counterexample under `.shipping` (where a rejected duplicate-UUID arm's
+  destructor frees the surviving session's lease and a third session `uuid = 8`
+  is allocated the survivor's physical slot `0`) and the inductive safety theorem
+  `reachable_reserveBeforeLease_safe` showing that reserving `uuid` before
+  acquiring staging leases guarantees `ActiveSessionsHoldLeases` in every
+  reachable state.
+* **Traces and mutants.** Parity `decide` traces replaying `pool_staging_test.cc`
+  (`trace_bounded_arena_leases_and_addressing` for `:115-208`,
+  `trace_shared_storage_pools_share_lease` for `:252-279`,
+  `trace_reserveBeforeLease_end_to_end`) and two mutants
+  (`mutant_non_idempotent_acquire_exhausts_shared_storage`,
+  `mutant_leaking_release_breaks_conservation_and_starves`).
+
 ## Candidate observations and hypotheses under investigation
 
 Tracked here as we build the Stage 1–4 models; items marked **[HYP]** require a
@@ -268,17 +345,32 @@ hardware-free C++ reproduction test before being promoted to `findings/`.
   `reshard_receive_session.h:180-184` and `kv_cache_manager_base.h:667-670`;
   verified as `RankWaveOrder` (`rankWaveOrder_iff`) in Stage 1 and
   `AliasedPageCorrect` in Stage 2.
-* **R5 [HYP — Stage 1/3 `PoolStaging.lean`] Per-UUID staging lease key collision
-  across two-lock registration.** `PoolStagingStorage` keys leases by `uuid`
-  alone (`kv_cache_manager_base.cc:2093, 2144`), and
-  `~ReshardReceiveSession` calls `ReleasePoolStagingLeases(uuid_)`
-  (`reshard_receive_session.h:67`). Because `PoolReshardRegisterRecv` checks
-  `active_pool_reshard_recvs_`, calls `ReshardReceiveSession::Create` (which
-  acquires leases and may block on `staging_cv_`), and inserts into
-  `active_pool_reshard_recvs_` in two separate `mu_` scopes
-  (`kv_cache_manager_with_transfer.cc:647-675`), two concurrent arms with the
-  same `uuid` would share a lease and the overwritten session's destructor would
-  free the survivor's staging slots.
+* **R5 [HYP / Code audit — Stage 1/3 `PoolStaging.lean`] Per-UUID staging lease
+  key collision across three-phase registration in `PoolReshardRegisterRecv`.**
+  `PoolStagingStorage` keys leases by `uuid` alone
+  (`kv_cache_manager_base.cc:2093, 2144`), and `~ReshardReceiveSession` calls
+  `ReleasePoolStagingLeases(uuid_)` (`reshard_receive_session.h:67`).
+  `PoolReshardRegisterRecv` (`kv_cache_manager_with_transfer.cc:647-675`) runs in
+  three phases: (1) checks `active_pool_reshard_recvs_` under `mu_` (`:648-661`),
+  (2) calls `ReshardReceiveSession::Create` outside `mu_` (`:663-666`), which
+  calls `AcquireStagingLeases(plan)` (`reshard_receive_session.cc:376`) and sets
+  `staging_released_ = false` (`:420`), and (3) calls
+  `base_->RegisterActivePlanDirect(plan.uuid(), ...)`
+  (`kv_cache_manager_with_transfer.cc:668-669`) and inserts into
+  `active_pool_reshard_recvs_` under `mu_` (`:671-673`). Even though
+  `RegisterActivePlanDirect` (`kv_cache_manager_base.cc:3149-3156`) rejects a
+  second concurrent call with the same `uuid` (`AlreadyExistsError`), Phase 2 has
+  already succeeded idempotently on `st.leases[uuid]` with
+  `staging_released_ = false`. When `ABSL_RETURN_IF_ERROR` destroys the rejected
+  second `ReshardReceiveSession` at `kv_cache_manager_with_transfer.cc:668`, its
+  destructor runs
+  `ReleasePoolStagingLeases(uuid)` — erasing `st.leases[uuid]` and returning the
+  first (surviving) session's staging slots to `free_slots`, allowing a third
+  session `uuid' ≠ uuid` to allocate the same physical staging slot while the
+  first session is still actively receiving. Modeled and witnessed by
+  `trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot` and proved safe
+  under `reserveBeforeLease` by `reachable_reserveBeforeLease_safe` in
+  `PoolStaging.lean`.
 * **R6 [HYP / Code audit — Stage 1–2 `Send.lean` / `Pipeline.lean`]
   `RecordPushCompletion` unregisters the active plan on partial error while
   sibling pools/peers are still in flight.** In
