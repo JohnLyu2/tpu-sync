@@ -323,8 +323,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
   size_t GetPipelineGroupSize() const;
 
-  absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
-                                uint64_t uuid = 0) override;
+  // Block-push completion. Counts the shards reported for |uuid| and runs the
+  // auto H2D (which copies every layer and shard) only once the count reaches
+  // num_shards(); see block_push_shards_.
+  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
+                                     absl::Span<const int> shard_ids,
+                                     uint64_t uuid = 0) override;
 
   absl::Status RegisterExpectedChunks(uint64_t uuid,
                                       uint32_t expected_chunks) override;
@@ -563,6 +567,14 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   mutable absl::Mutex completed_transfers_mu_;
   absl::flat_hash_set<uint64_t> completed_transfers_
       ABSL_GUARDED_BY(completed_transfers_mu_);
+
+  // Number of shards reported by OnBlockShardsReceived per block-push uuid. A
+  // routed push delivers a block range over several streams that each carry a
+  // shard subset; H2d(uuid) copies all shards, so it waits until the count
+  // reaches num_shards(). Cleared by ForgetPushProgress.
+  mutable absl::Mutex block_push_shards_mu_;
+  absl::flat_hash_map<uint64_t, size_t> block_push_shards_
+      ABSL_GUARDED_BY(block_push_shards_mu_);
 
   std::optional<size_t> pipeline_group_size_override_;
   void UpdateAllocatedOccupancyMetric(size_t delta = 0);

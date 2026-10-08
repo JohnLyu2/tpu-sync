@@ -564,6 +564,64 @@ TEST_P(BlockTransportTest, PushNamesTheReceiversArrayByWireLayerIndex) {
   EXPECT_EQ(receiver_delegate.data(0)[0], 0x00);
 }
 
+// Receiver delegate recording every OnBlockShardsReceived report as
+// (block_ids, shard_ids).
+class BlockShardsReceivedRecordingDelegate : public MockDelegate {
+ public:
+  using Report = std::pair<std::vector<int>, std::vector<int>>;
+  using MockDelegate::MockDelegate;
+
+  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
+                                     absl::Span<const int> shard_ids,
+                                     uint64_t uuid) override {
+    absl::MutexLock lock(mu_);
+    reports_.emplace_back(block_ids,
+                          std::vector<int>(shard_ids.begin(), shard_ids.end()));
+    return absl::OkStatus();
+  }
+
+  std::vector<Report> reports() const {
+    absl::MutexLock lock(mu_);
+    return reports_;
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  std::vector<Report> reports_ ABSL_GUARDED_BY(mu_);
+};
+
+TEST_P(BlockTransportTest, PushReportsEveryShardPerStream) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  MockDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1, kShards);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(
+      kSlice, kBlocks, /*num_layers=*/1, kShards);
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Two streams, each owning half of the block range; each reports its blocks
+  // with every shard.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{2, 3},
+                     /*parallelism=*/2, MajorOrder::kLayerMajor, /*uuid=*/7,
+                     /*layer_idx=*/-1)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+
+  EXPECT_THAT(receiver_delegate.reports(),
+              ::testing::UnorderedElementsAre(
+                  ::testing::Pair(::testing::ElementsAre(2),
+                                  ::testing::ElementsAre(0, 1, 2, 3)),
+                  ::testing::Pair(::testing::ElementsAre(3),
+                                  ::testing::ElementsAre(0, 1, 2, 3))));
+}
+
 TEST_P(BlockTransportTest, PullNonContiguous) {
   size_t size = 1024;
   // Delegate 1 has 3 blocks capacity

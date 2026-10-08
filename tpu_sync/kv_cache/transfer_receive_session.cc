@@ -36,6 +36,7 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
@@ -200,7 +201,7 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
     h2d_host_block_ids.push_back(hb == host_block_of->end() ? dst : hb->second);
   }
   total_blocks_ = expected_blocks;
-  num_completed_blocks_ = 0;
+  ResetShardProgressLocked();
   deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
   h2d_copy_ = TransferSendSession::BuildCoalescedCopySpec(h2d_host_block_ids,
@@ -338,7 +339,7 @@ void TransferReceiveSession::InitFromLoadPlan(
   start_time_ = std::chrono::steady_clock::now();
   chip_block_ids_ = load_plan.h2d_local_block_ids;
   total_blocks_ = load_plan.num_blocks;
-  num_completed_blocks_ = 0;
+  ResetShardProgressLocked();
   num_completed_layers_ = 0;
   in_flight_ = load_plan.num_blocks > 0 ? 1 : 0;
   h2d_copy_ = load_plan.h2d_copy;
@@ -435,20 +436,35 @@ bool TransferReceiveSession::IsReadyToComplete() const {
          AllH2dDoneLocked();
 }
 
-bool TransferReceiveSession::RecordBlocksReceivedLocked(
-    const std::vector<int>& block_ids, bool* first_packet,
-    bool* network_just_completed) {
-  *first_packet = false;
+void TransferReceiveSession::ResetShardProgressLocked() {
+  blocks_received_per_shard_.assign(base_ != nullptr ? base_->num_shards() : 0,
+                                    0);
+  num_completed_shards_ = 0;
+  any_blocks_received_ = false;
+}
+
+bool TransferReceiveSession::RecordBlockShardsReceivedLocked(
+    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
+    bool* first_packet, bool* network_just_completed) {
+  *first_packet = !any_blocks_received_;
+  any_blocks_received_ = true;
   *network_just_completed = false;
-  num_completed_blocks_ += block_ids.size();
-  if (num_completed_blocks_ == static_cast<int32_t>(block_ids.size())) {
-    *first_packet = true;
-  }
   accumulated_host_block_ids_.insert(accumulated_host_block_ids_.end(),
                                      block_ids.begin(), block_ids.end());
   const size_t total_layers = base_ != nullptr ? base_->num_layers() : 0;
-  if (num_completed_blocks_ >=
-      total_blocks_ * static_cast<int32_t>(total_layers)) {
+  const int64_t per_shard_target =
+      static_cast<int64_t>(total_blocks_) * static_cast<int64_t>(total_layers);
+  for (const int sh : shard_ids) {
+    int64_t& received = blocks_received_per_shard_[sh];
+    const bool was_complete = received >= per_shard_target;
+    received += static_cast<int64_t>(block_ids.size());
+    if (!was_complete && received >= per_shard_target) {
+      ++num_completed_shards_;
+    }
+  }
+  if (!network_completed_ &&
+      num_completed_shards_ ==
+          static_cast<int32_t>(blocks_received_per_shard_.size())) {
     network_completed_ = true;
     *network_just_completed = true;
     return num_completed_layers_ == static_cast<int32_t>(total_layers);
@@ -526,8 +542,9 @@ void TransferReceiveSession::ExecutePullRequest(
       });
 }
 
-absl::Status TransferReceiveSession::OnBlocksReceived(
-    KVCacheManagerWithTransfer& manager, const std::vector<int>& block_ids) {
+absl::Status TransferReceiveSession::OnBlockShardsReceived(
+    KVCacheManagerWithTransfer& manager, const std::vector<int>& block_ids,
+    absl::Span<const int> shard_ids) {
   const uint64_t uuid = uuid_;
   const int numa_node = base_->assigned_numa_node().value_or(-1);
   std::chrono::steady_clock::time_point session_start_time;
@@ -541,15 +558,24 @@ absl::Status TransferReceiveSession::OnBlocksReceived(
     if (done_ || draining_) {
       return absl::OkStatus();
     }
-    all_complete = RecordBlocksReceivedLocked(block_ids, &first_packet,
-                                              &network_just_completed);
+    for (const int sh : shard_ids) {
+      if (sh < 0 || sh >= static_cast<int>(blocks_received_per_shard_.size())) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "shard ", sh, " out of range for uuid ", uuid_,
+            " (num_shards=", blocks_received_per_shard_.size(), ")"));
+      }
+    }
+    all_complete = RecordBlockShardsReceivedLocked(
+        block_ids, shard_ids, &first_packet, &network_just_completed);
     MetricsCollector* const metrics = manager.metrics_collector_.get();
     if (first_packet && metrics != nullptr) {
       metrics->RecordFirstPacket(uuid_);
     }
     if (!network_just_completed) {
-      VLOG(1) << "OnBlocksReceived: Partial blocks received for uuid " << uuid_
-              << ", completed: " << num_completed_blocks_ << " / "
+      VLOG(1) << "OnBlockShardsReceived: partial for uuid " << uuid_
+              << ", shards complete: " << num_completed_shards_ << " / "
+              << blocks_received_per_shard_.size() << ", per-shard blocks: ["
+              << absl::StrJoin(blocks_received_per_shard_, ",") << "] / "
               << total_blocks_ * base_->num_layers();
       return absl::OkStatus();
     }
@@ -570,7 +596,7 @@ absl::Status TransferReceiveSession::OnBlocksReceived(
   if (should_record_duration) {
     RecordTransferDuration(
         DurationMs(session_start_time, std::chrono::steady_clock::now()));
-    LOG(INFO) << "OnBlocksReceived (Network + H2D complete): req_id="
+    LOG(INFO) << "OnBlockShardsReceived (Network + H2D complete): req_id="
               << session_req_id << ", uuid=" << uuid << ", numa=" << numa_node;
   }
   return absl::OkStatus();
