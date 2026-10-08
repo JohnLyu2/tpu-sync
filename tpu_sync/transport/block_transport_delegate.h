@@ -182,16 +182,8 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return absl::OkStatus();
   }
 
-  // Fired once per incoming push stream after its payload for |block_ids| has
-  // landed in host memory. |shard_ids| is the set of shards that stream
-  // carried: every shard for an unrouted push, or one route's subset for a
-  // shard-routed push, in which case the same |block_ids| are reported again
-  // by the streams carrying the remaining shards. A delegate that needs
-  // "all shards of a block are present" must accumulate |shard_ids| across
-  // calls; the transport does not merge streams.
-  virtual absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
-                                             absl::Span<const int> shard_ids,
-                                             uint64_t uuid = 0) {
+  virtual absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
+                                        uint64_t uuid = 0) {
     return OnDataReceived();
   }
 

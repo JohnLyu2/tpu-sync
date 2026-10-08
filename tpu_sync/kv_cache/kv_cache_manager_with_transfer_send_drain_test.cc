@@ -23,7 +23,6 @@
 #include <cstring>
 #include <future>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -189,9 +188,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   }
 
   absl::Status ReceiveBlocks(const std::vector<int>& blocks, uint64_t uuid) {
-    std::vector<int> all_shards(base()->num_shards());
-    std::iota(all_shards.begin(), all_shards.end(), 0);
-    return OnBlockShardsReceived(blocks, all_shards, uuid);
+    return OnBlocksReceived(blocks, uuid);
   }
 
   void FinishCopy(size_t index, absl::Status status) {
@@ -835,15 +832,14 @@ TEST(RecvLifecycleTest,
   ASSERT_EQ(consumer.free_slots(), kSlots - 1);
 
   // Simulate BlockTransport::HandleIncomingPush holding the incoming push lease
-  // across OnLayerReceived, synchronous H2D completion, and
-  // OnBlockShardsReceived.
+  // across OnLayerReceived, synchronous H2D completion, and OnBlocksReceived.
   ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/92),
               ::absl_testing::IsOk());
   ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/92),
               ::absl_testing::IsOk());
   consumer.FinishCopy(0, absl::OkStatus());
   // Even though the H2D copy finished, staging must remain pinned until
-  // OnBlockShardsReceived and EndIncomingPush complete.
+  // OnBlocksReceived and EndIncomingPush complete.
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
   ASSERT_THAT(consumer.ReceiveBlocks({0}, /*uuid=*/92), ::absl_testing::IsOk());

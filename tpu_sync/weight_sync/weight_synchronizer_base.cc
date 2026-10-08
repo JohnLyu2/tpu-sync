@@ -2007,25 +2007,10 @@ void WeightSynchronizerBase::StoreSkipTilingLocal(
   }
 }
 
-absl::Status WeightSynchronizerBase::OnBlockShardsReceived(
-    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
-    uint64_t uuid) {
+absl::Status WeightSynchronizerBase::OnBlocksReceived(
+    const std::vector<int>& block_ids, uint64_t uuid) {
   if (!auto_h2d_) {
     return absl::OkStatus();
-  }
-  // Count the shards delivered for |uuid| and continue only once all of them
-  // are in; H2d(uuid) copies all layers and shards and would otherwise upload
-  // host buffers whose other shards are still in flight. An unrouted stream
-  // carries every shard, so it proceeds at once (one H2D per stream, as
-  // before).
-  {
-    absl::MutexLock lock(block_push_shards_mu_);
-    const size_t finished = block_push_shards_[uuid] += shard_ids.size();
-    if (finished < num_shards_) {
-      VLOG(1) << "OnBlockShardsReceived: uuid " << uuid << " has " << finished
-              << " / " << num_shards_ << " shards; deferring H2D";
-      return absl::OkStatus();
-    }
   }
   TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture h2d_future, H2d(uuid));
   return h2d_future.Await();
@@ -2036,10 +2021,6 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   {
     absl::MutexLock lock(completed_transfers_mu_);
     completed_transfers_.erase(uuid);
-  }
-  {
-    absl::MutexLock lock(block_push_shards_mu_);
-    block_push_shards_.erase(uuid);
   }
   {
     absl::MutexLock lock(skip_tiling_mu_);

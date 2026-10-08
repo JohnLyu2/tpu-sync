@@ -167,8 +167,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
         transport::BlockTransportDelegate::HostBlockReadyCallback cb)>
         register_block_readiness_callback;
     std::function<absl::Status(const std::vector<int>& block_ids,
-                               absl::Span<const int> shard_ids, uint64_t uuid)>
-        on_block_shards_received;
+                               uint64_t uuid)>
+        on_blocks_received;
     std::function<absl::Status(size_t layer_idx, uint64_t uuid)>
         on_layer_received;
     std::function<absl::Status(size_t pool_idx, uint64_t uuid)>
@@ -198,9 +198,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
-  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
-                                     absl::Span<const int> shard_ids,
-                                     uint64_t uuid = 0) override;
+  absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
+                                uint64_t uuid = 0) override;
   absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid = 0) override;
   absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid = 0) override;
   void ScheduleAsyncTask(std::function<void()> task) override;
