@@ -239,6 +239,11 @@ class TransferReceiveSession
                                        bool* network_just_completed)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ResetShardProgressLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  bool RecordNetworkCompleteLocked(
+      MetricsCollector* absl_nullable metrics, bool all_complete,
+      std::string* session_req_id,
+      std::chrono::steady_clock::time_point* session_start_time)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* base_ = nullptr;

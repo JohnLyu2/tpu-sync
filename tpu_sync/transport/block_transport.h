@@ -245,6 +245,10 @@ class BlockTransport final {
                                   const lib::ChunkHeader& header);
   absl::Status HandleIncomingPull(int client_fd,
                                   const lib::ChunkHeader& header);
+  absl::Status CompleteIncomingPush(
+      uint64_t uuid, uint32_t local_id, uint32_t remote_id, size_t num_streams,
+      size_t landed_shards,
+      const std::optional<PoolPushProgressSpec>& pool_progress_spec);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
       const std::vector<std::string>& peers,

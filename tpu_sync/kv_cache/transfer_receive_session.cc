@@ -472,6 +472,26 @@ bool TransferReceiveSession::RecordBlockShardsReceivedLocked(
   return false;
 }
 
+bool TransferReceiveSession::RecordNetworkCompleteLocked(
+    MetricsCollector* absl_nullable metrics, bool all_complete,
+    std::string* session_req_id,
+    std::chrono::steady_clock::time_point* session_start_time) {
+  network_completed_ = true;
+  *session_req_id = req_id_;
+  if (metrics != nullptr) {
+    metrics->RecordLastPacket(uuid_);
+  }
+  if (!all_complete) {
+    return false;
+  }
+  *session_start_time = start_time_;
+  if (metrics != nullptr) {
+    metrics->RecordEnd(uuid_);
+  }
+  FinishLocked();
+  return true;
+}
+
 void TransferReceiveSession::ExecutePullRequest(
     KVCacheManagerWithTransfer& manager, const std::string& remote_endpoint) {
   std::optional<int> target_node = base_->assigned_numa_node();
@@ -579,18 +599,8 @@ absl::Status TransferReceiveSession::OnBlockShardsReceived(
               << total_blocks_ * base_->num_layers();
       return absl::OkStatus();
     }
-    session_req_id = req_id_;
-    if (metrics != nullptr) {
-      metrics->RecordLastPacket(uuid_);
-    }
-    if (all_complete) {
-      session_start_time = start_time_;
-      should_record_duration = true;
-      if (metrics != nullptr) {
-        metrics->RecordEnd(uuid_);
-      }
-      FinishLocked();
-    }
+    should_record_duration = RecordNetworkCompleteLocked(
+        metrics, all_complete, &session_req_id, &session_start_time);
   }
 
   if (should_record_duration) {
