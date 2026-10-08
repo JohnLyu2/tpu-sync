@@ -611,8 +611,11 @@ absl::Status BlockTransport::HandleIncomingPush(
   LOG(INFO) << "HandleCustomRequest (H2H read complete): client_fd="
             << client_fd << ", uuid=" << header.uuid
             << ", numa=" << block_delegate_->node_id();
-  ABSL_RETURN_IF_ERROR(
-      block_delegate_->OnBlocksReceived(allocated_ids, header.uuid));
+  // Every stream of an unrouted push carries all shards of its block range.
+  std::vector<int> all_shards(block_delegate_->num_shards());
+  std::iota(all_shards.begin(), all_shards.end(), 0);
+  ABSL_RETURN_IF_ERROR(block_delegate_->OnBlockShardsReceived(
+      allocated_ids, all_shards, header.uuid));
   incoming_push_lease_held = false;
   ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
   uint8_t ack = 1;

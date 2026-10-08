@@ -129,9 +129,10 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
         RegisterBlockReadinessCallback(layer_idx, shard_idx, block_id, uuid,
                                        std::move(cb));
       };
-  hooks.on_blocks_received = [this](const std::vector<int>& block_ids,
-                                    uint64_t uuid) {
-    return OnBlocksReceived(block_ids, uuid);
+  hooks.on_block_shards_received = [this](const std::vector<int>& block_ids,
+                                          absl::Span<const int> shard_ids,
+                                          uint64_t uuid) {
+    return OnBlockShardsReceived(block_ids, shard_ids, uuid);
   };
   hooks.on_layer_received = [this](size_t layer_idx, uint64_t uuid) {
     RAIDEN_TRACE_FN("KVTransfer::OnLayerReceived", [&]() {
@@ -592,7 +593,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
                                      uuid, req_id, expected_block_count,
                                      deadline.value_or(DeadlineFromNow())));
   // host_to_chip is left empty -> defaults to 1-to-1 mapping in
-  // OnBlocksReceived
+  // OnBlockShardsReceived
   absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
   if (!inserted.ok()) {
     return inserted;
@@ -1658,13 +1659,16 @@ void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
   local_data_port_ = *data_port;
 }
 
-absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
-    const std::vector<int>& block_ids, uint64_t uuid) {
-  RAIDEN_TRACE_FN("KVTransfer::OnBlocksReceived", [&]() {
-    return absl::StrCat("blocks=", block_ids.size(), " uuid=", uuid);
+absl::Status KVCacheManagerWithTransfer::OnBlockShardsReceived(
+    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
+    uint64_t uuid) {
+  RAIDEN_TRACE_FN("KVTransfer::OnBlockShardsReceived", [&]() {
+    return absl::StrCat("blocks=", block_ids.size(),
+                        " shards=", shard_ids.size(), " uuid=", uuid);
   });
-  VLOG(1) << "KVCacheManagerWithTransfer::OnBlocksReceived called. uuid: "
-          << uuid << ", received blocks count: " << block_ids.size();
+  VLOG(1) << "KVCacheManagerWithTransfer::OnBlockShardsReceived called. uuid: "
+          << uuid << ", received blocks count: " << block_ids.size()
+          << ", shards: " << shard_ids.size();
 
   std::shared_ptr<TransferReceiveSession> session;
   {
@@ -1675,7 +1679,8 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
     }
     session = it->second;
   }
-  absl::Status status = session->OnBlocksReceived(*this, block_ids);
+  absl::Status status =
+      session->OnBlockShardsReceived(*this, block_ids, shard_ids);
   MaybeUnregisterSettledRecv(uuid, *session);
   return status;
 }

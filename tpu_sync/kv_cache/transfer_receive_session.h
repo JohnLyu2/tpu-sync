@@ -29,6 +29,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
@@ -138,9 +139,14 @@ class TransferReceiveSession
   void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
                           const std::string& remote_endpoint);
 
-  // Handles block completion notifications for this receive session.
-  absl::Status OnBlocksReceived(KVCacheManagerWithTransfer& manager,
-                                const std::vector<int>& block_ids);
+  // Handles a transport report that |shard_ids| of |block_ids| landed. Each
+  // shard's progress is tracked separately; a shard completes once it has
+  // received every (layer, block) of the session, and the network phase
+  // completes once every shard has. Routed pushes report a block range once
+  // per shard subset, so a shard's count only advances on streams carrying it.
+  absl::Status OnBlockShardsReceived(KVCacheManagerWithTransfer& manager,
+                                     const std::vector<int>& block_ids,
+                                     absl::Span<const int> shard_ids);
 
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
   // callback.
@@ -164,7 +170,11 @@ class TransferReceiveSession
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
                          uint64_t uuid = 0)
-      : base_(base), staging_allocator_(staging_allocator), uuid_(uuid) {}
+      : base_(base),
+        staging_allocator_(staging_allocator),
+        uuid_(uuid),
+        blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0,
+                                   0) {}
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
                          uint64_t uuid, std::string req_id,
@@ -176,6 +186,7 @@ class TransferReceiveSession
         uuid_(uuid),
         req_id_(std::move(req_id)),
         total_blocks_(total_blocks),
+        blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
         deadline_(deadline),
         start_time_(std::chrono::steady_clock::now()) {
     if (acquire_staging) {
@@ -222,10 +233,12 @@ class TransferReceiveSession
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  bool RecordBlocksReceivedLocked(const std::vector<int>& block_ids,
-                                  bool* first_packet,
-                                  bool* network_just_completed)
+  bool RecordBlockShardsReceivedLocked(const std::vector<int>& block_ids,
+                                       absl::Span<const int> shard_ids,
+                                       bool* first_packet,
+                                       bool* network_just_completed)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ResetShardProgressLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* base_ = nullptr;
@@ -240,7 +253,12 @@ class TransferReceiveSession
       host_to_chip_ ABSL_GUARDED_BY(mu_);
   std::vector<H2dIssueFuture> h2d_dispatch_futures_ ABSL_GUARDED_BY(mu_);
   int32_t total_blocks_ ABSL_GUARDED_BY(mu_) = 0;
-  int32_t num_completed_blocks_ ABSL_GUARDED_BY(mu_) = 0;
+  // Per-shard count of (layer, block) units reported so far, indexed by shard;
+  // shard `s` is complete at total_blocks_ * num_layers.
+  std::vector<int64_t> blocks_received_per_shard_ ABSL_GUARDED_BY(mu_);
+  // Shards whose count reached completion; network done at num_shards.
+  int32_t num_completed_shards_ ABSL_GUARDED_BY(mu_) = 0;
+  bool any_blocks_received_ ABSL_GUARDED_BY(mu_) = false;
   int32_t num_completed_layers_ ABSL_GUARDED_BY(mu_) = 0;
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;

@@ -2912,10 +2912,11 @@ void KVCacheManagerBase::RegisterBlockReadinessCallback(
   cb(absl::OkStatus());
 }
 
-absl::Status KVCacheManagerBase::OnBlocksReceived(
-    const std::vector<int>& block_ids, uint64_t uuid) {
-  if (transfer_hooks_.on_blocks_received) {
-    return transfer_hooks_.on_blocks_received(block_ids, uuid);
+absl::Status KVCacheManagerBase::OnBlockShardsReceived(
+    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
+    uint64_t uuid) {
+  if (transfer_hooks_.on_block_shards_received) {
+    return transfer_hooks_.on_block_shards_received(block_ids, shard_ids, uuid);
   }
   return absl::OkStatus();
 }
