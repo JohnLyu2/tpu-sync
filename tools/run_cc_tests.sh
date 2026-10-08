@@ -127,9 +127,15 @@ for arg in "$@"; do
   fi
 done
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  TARGETS=("//...")
+  TARGETS=("//..." "-//tpu_sync/frameworks/torch/..." "-//tpu_sync/api/torch/...")
   ARGS+=("--build_tests_only")
 fi
+for target in "${TARGETS[@]}"; do
+  if [[ "${target}" == *torch* && "${target}" != -* ]]; then
+    ARGS+=("--nocheck_visibility")
+    break
+  fi
+done
 
 mkdir -p "${BAZEL_CACHE_BASE}/disk_cache" "${BAZEL_CACHE_BASE}/repo_cache"
 
