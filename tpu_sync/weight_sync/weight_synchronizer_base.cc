@@ -1887,8 +1887,12 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
 }
 
 void WeightSynchronizerBase::DrainPendingH2d() {
-  if (!auto_h2d_) return;
-
+  // Runs in both auto_h2d modes: a receiver armed with an in-place tiling mode
+  // holds LayerTileReady signals that H2d() (and a PRE_TILED relay push) wait
+  // on, and WaitForTransferCompletion() waits on completed_transfers_. Neither
+  // is released by anything else once the transport stops delivering data, so
+  // the drain must cancel the signals and record the pending uuids regardless
+  // of who issues the H2D.
   absl::flat_hash_map<uint64_t, PendingH2dState> pending_states;
   {
     absl::MutexLock lock(pending_h2d_mu_);
@@ -1904,6 +1908,10 @@ void WeightSynchronizerBase::DrainPendingH2d() {
   }
 
   if (pending_states.empty()) {
+    // Legacy auto-H2D behavior: if no transfer ever completed, copy the host
+    // buffers once so the device is not left stale. Without auto_h2d the
+    // caller issues H2d() itself.
+    if (!auto_h2d_) return;
     bool needs_h2d = false;
     {
       absl::MutexLock lock(completed_transfers_mu_);

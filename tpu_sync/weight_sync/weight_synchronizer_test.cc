@@ -39,6 +39,7 @@
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/plugin/xla_cpu/cpu_client_options.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -2242,6 +2243,103 @@ TEST_F(WeightSynchronizerTest, H2dWaitsForArmedInPlaceTiling) {
   absl::StatusOr<raiden::PjRtCopyFuture> h2d_fut = ws->H2d(kSecondUuid);
   EXPECT_EQ(h2d_fut.status().code(), absl::StatusCode::kCancelled);
   ws->ForgetPushProgress(kFirstUuid);
+}
+
+// SHUTDOWN runs DrainPendingH2d() on every receiver. A receiver that was armed
+// with an in-place tiling mode but whose data never arrived (sender died,
+// partial transfer) must be released by the drain: H2d() fails instead of
+// blocking on the layer's readiness signal and WaitForTransferCompletion(uuid)
+// returns. Synthetic reproduction; no transport or controller involved.
+TEST_F(WeightSynchronizerTest, DrainPendingH2dReleasesArmedLayers) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
+  std::unique_ptr<xla::PjRtClient> client = *std::move(client_status_or);
+  absl::StatusOr<xla::PjRtMemorySpace*> memory_space =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_TRUE(memory_space.ok()) << memory_space.status().message();
+
+  for (bool auto_h2d : {true, false}) {
+    SCOPED_TRACE(absl::StrCat("auto_h2d=", auto_h2d));
+    std::vector<float> placeholder(64, 0.0f);
+    absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffer =
+        client->BufferFromHostBuffer(
+            placeholder.data(), xla::PrimitiveType::F32, {8, 8},
+            /*byte_strides=*/std::nullopt,
+            xla::PjRtClient::HostBufferSemantics::
+                kImmutableUntilTransferCompletes,
+            /*on_done_with_host_buffer=*/nullptr, *memory_space,
+            /*device_layout=*/nullptr);
+    ASSERT_TRUE(pjrt_buffer.ok()) << pjrt_buffer.status().message();
+    absl::StatusOr<raiden::RaidenBufferHandle> handle =
+        raiden::RaidenBufferHandle::Acquire(pjrt_buffer->get());
+    ASSERT_TRUE(handle.ok()) << handle.status().message();
+    handle->shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
+    std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
+
+    auto ws = std::make_unique<WeightSynchronizerBase>(
+        buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+        /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+        /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+
+    // The controller arms the receiver (START_TRANSFER with is_sender=false),
+    // but no chunk ever lands, so OnLayerDataReceived/OnDataReceived never run.
+    constexpr uint64_t kUuid = 883;
+    tpu_sync::rpc::StartTransferRequest req;
+    req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+    ws->StoreSkipTiling(kUuid, req);
+    ASSERT_OK(ws->RegisterExpectedLayerChunks(kUuid, {{0, 1}}));
+
+    // SHUTDOWN.
+    ws->DrainPendingH2d();
+
+    // What the benchmark client does next, each on its own thread so that a
+    // hang shows up as a failure instead of wedging the test.
+    absl::Notification wait_done;
+    absl::Status wait_status;
+    std::thread wait_caller([&] {
+      wait_status = ws->WaitForTransferCompletion(kUuid);
+      wait_done.Notify();
+    });
+    absl::Notification h2d_done;
+    absl::Status h2d_status;
+    std::thread h2d_caller([&] {
+      absl::StatusOr<raiden::PjRtCopyFuture> h2d_fut = ws->H2d(kUuid);
+      h2d_status = h2d_fut.ok() ? h2d_fut->Await() : h2d_fut.status();
+      h2d_done.Notify();
+    });
+
+    const bool wait_returned =
+        wait_done.WaitForNotificationWithTimeout(absl::Seconds(3));
+    const bool h2d_returned =
+        h2d_done.WaitForNotificationWithTimeout(absl::Seconds(3));
+    EXPECT_TRUE(wait_returned)
+        << "WaitForTransferCompletion(uuid) is still blocked 3s after "
+           "DrainPendingH2d()";
+    EXPECT_TRUE(h2d_returned)
+        << "H2d() is still blocked on the armed layer 3s after "
+           "DrainPendingH2d()";
+    if (wait_returned) {
+      EXPECT_OK(wait_status);
+    }
+    if (h2d_returned) {
+      EXPECT_EQ(h2d_status.code(), absl::StatusCode::kCancelled) << h2d_status;
+    }
+
+    // Unblock whatever the drain left behind so the threads can be joined.
+    if (!h2d_returned) {
+      ws->ForgetPushProgress(kUuid);  // Cancels the armed signal.
+    }
+    h2d_caller.join();
+    if (!wait_returned) {
+      // Pretend the missing layer arrived after all.
+      EXPECT_OK(ws->OnLayerDataReceived(/*layer_idx=*/0, kUuid));
+      EXPECT_OK(ws->OnDataReceived(kUuid));
+    }
+    wait_caller.join();
+    ws->ForgetPushProgress(kUuid);
+  }
 }
 
 // A relay receiver gets bytes that the seed already tiled: it must neither
