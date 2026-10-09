@@ -61,6 +61,7 @@ cc_library(
         "//tpu_sync/transport/lib:raw_buffer_transport",
         "//tpu_sync/transport/lib:service_cc_grpc",
         "//tpu_sync/transport/lib:socket_transport_adapter",
+        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/transport/lib:transport_adapter",
         "//tpu_sync/transport/lib:transport_metrics_exporter",
         "//tpu_sync/transport/lib/socket:util",
@@ -117,6 +118,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api:socket_util",
         "@xla//xla/tsl/platform:statusor",
     ],
 )

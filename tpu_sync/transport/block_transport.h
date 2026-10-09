@@ -31,7 +31,6 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
-#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -41,6 +40,7 @@
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/socket_transport_adapter.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/lib/transport_metrics_exporter.h"
 
@@ -77,18 +77,24 @@ class BlockTransport final {
   ~BlockTransport();
 
   struct Config {
-    std::optional<absl::Duration> handshake_read_timeout = std::nullopt;
-    std::optional<absl::Duration> payload_read_timeout = std::nullopt;
+    int handshake_read_timeout_ms = -1;
+    int payload_read_timeout_ms = -1;
+    int ack_write_timeout_ms = -1;
+    int payload_write_timeout_ms = -1;
     size_t coalesce_window_bytes = 0;
   };
 
   const Config& config() const { return config_; }
 
-  std::optional<absl::Duration> handshake_read_timeout() const {
-    return config_.handshake_read_timeout;
+  int handshake_read_timeout_ms() const {
+    return config_.handshake_read_timeout_ms;
   }
-  std::optional<absl::Duration> payload_read_timeout() const {
-    return config_.payload_read_timeout;
+  int payload_read_timeout_ms() const {
+    return config_.payload_read_timeout_ms;
+  }
+  int ack_write_timeout_ms() const { return config_.ack_write_timeout_ms; }
+  int payload_write_timeout_ms() const {
+    return config_.payload_write_timeout_ms;
   }
 
   // Return the TCP listening socket port.

@@ -21,7 +21,6 @@
 #include <deque>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <string>
 #include <thread>  // NOLINT
 #include <vector>
@@ -32,7 +31,6 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
-#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -71,18 +69,30 @@ class SocketTransportAdapter : public TransportAdapter {
   static constexpr int kDefaultMaxSocketWorkers = 64;
 
   struct Config {
-    std::optional<absl::Duration> handshake_ack_read_timeout = std::nullopt;
-    std::optional<absl::Duration> final_ack_read_timeout = std::nullopt;
+    int handshake_ack_read_timeout_ms = -1;
+    int final_ack_read_timeout_ms = -1;
+    int payload_read_timeout_ms = -1;
+    int handshake_write_timeout_ms = -1;
+    int payload_write_timeout_ms = -1;
     int max_socket_workers = kDefaultMaxSocketWorkers;
   };
 
   const Config& config() const { return config_; }
 
-  std::optional<absl::Duration> handshake_ack_read_timeout() const {
-    return config_.handshake_ack_read_timeout;
+  int handshake_ack_read_timeout_ms() const {
+    return config_.handshake_ack_read_timeout_ms;
   }
-  std::optional<absl::Duration> final_ack_read_timeout() const {
-    return config_.final_ack_read_timeout;
+  int final_ack_read_timeout_ms() const {
+    return config_.final_ack_read_timeout_ms;
+  }
+  int payload_read_timeout_ms() const {
+    return config_.payload_read_timeout_ms;
+  }
+  int handshake_write_timeout_ms() const {
+    return config_.handshake_write_timeout_ms;
+  }
+  int payload_write_timeout_ms() const {
+    return config_.payload_write_timeout_ms;
   }
   int max_socket_workers() const { return config_.max_socket_workers; }
 

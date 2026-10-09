@@ -82,7 +82,8 @@ BlockTransport::Config ReadConfigFromEnv() {
       val != nullptr && val[0] != '\0') {
     double parsed = 0.0;
     if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
-      config.handshake_read_timeout = absl::Seconds(parsed);
+      config.handshake_read_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
     } else {
       LOG(WARNING) << "TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S=\"" << val
                    << "\" must be a positive number; using default (no "
@@ -94,9 +95,35 @@ BlockTransport::Config ReadConfigFromEnv() {
       val != nullptr && val[0] != '\0') {
     double parsed = 0.0;
     if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
-      config.payload_read_timeout = absl::Seconds(parsed);
+      config.payload_read_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
     } else {
       LOG(WARNING) << "TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val = std::getenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.ack_write_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.payload_write_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S=\"" << val
                    << "\" must be a positive number; using default (no "
                       "timeout)";
     }
@@ -111,6 +138,8 @@ BlockTransport::Config ReadConfigFromEnv() {
   return config;
 }
 
+using ::peregrine::ReadExact;
+using ::peregrine::ReadVExact;
 using ::peregrine::WriteExact;
 using ::peregrine::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
@@ -491,20 +520,22 @@ absl::Status BlockTransport::HandleIncomingPush(
         allocated_ids,
         block_delegate_->AllocateBlocks(header.count_or_size, header.uuid));
     const std::vector<uint8_t> s_ids = lib::SerializeBlockIds(allocated_ids);
-    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size(),
+                                    config_.ack_write_timeout_ms));
   } else {
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
     FaultInjectSocket(hooks::kBlockTransportRecvBlockIds, client_fd);
-    ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
-        client_fd, ids_buf.data(), ids_buf.size(), handshake_read_timeout()));
+    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size(),
+                                   config_.handshake_read_timeout_ms));
     allocated_ids = lib::DeserializeBlockIds(ids_buf);
 
-    ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
-        client_fd, ids_buf.data(), ids_buf.size(), handshake_read_timeout()));
+    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size(),
+                                   config_.handshake_read_timeout_ms));
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
     uint8_t ack = 1;
     FaultInjectSocket(hooks::kBlockTransportRecvSendHandshakeAck, client_fd);
-    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+    ABSL_RETURN_IF_ERROR(
+        WriteExact(client_fd, &ack, 1, config_.ack_write_timeout_ms));
   }
 
   uint64_t total_received_bytes = 0;
@@ -530,8 +561,8 @@ absl::Status BlockTransport::HandleIncomingPush(
           FaultInjectSocket(hooks::kBlockTransportRecvPayload, client_fd);
         }
         uint8_t size_buf[lib::kChunkSizeFieldSize];
-        ABSL_RETURN_IF_ERROR(lib::ReadExactWithTimeout(
-            client_fd, size_buf, sizeof(size_buf), payload_read_timeout()));
+        ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf),
+                                       config_.payload_read_timeout_ms));
         const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
 
         const int64_t block_id_val = dst_id;
@@ -570,8 +601,8 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
 
         if (expected_size > 0) {
-          ABSL_RETURN_IF_ERROR(lib::ReadVExactWithTimeout(
-              client_fd, ToIovec(chunks), payload_read_timeout()));
+          ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks),
+                                          config_.payload_read_timeout_ms));
           total_received_bytes += expected_size;
         }
         return absl::OkStatus();
@@ -601,7 +632,8 @@ absl::Status BlockTransport::HandleIncomingPush(
   ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
   uint8_t ack = 1;
   FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);
-  ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+  ABSL_RETURN_IF_ERROR(
+      WriteExact(client_fd, &ack, 1, config_.ack_write_timeout_ms));
   return absl::OkStatus();
 }
 
@@ -778,7 +810,8 @@ absl::Status BlockTransport::HandleIncomingPull(
   resp_header.local_id = 0;
   resp_header.count_or_size = header.count_or_size;
   const auto s = lib::SerializeChunkHeader(resp_header);
-  ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s.data(), s.size()));
+  ABSL_RETURN_IF_ERROR(
+      WriteExact(client_fd, s.data(), s.size(), config_.ack_write_timeout_ms));
 
   size_t local_blocks = header.count_or_size / block_delegate_->shard_factor();
   if (header.remote_id >
@@ -860,7 +893,8 @@ void BlockTransport::TriggerNextSendStep(
           uint32_t total_size = GetChunksTotalSize(chunks);
           const std::array<uint8_t, lib::kChunkSizeFieldSize> s_size =
               lib::SerializeChunkSize(total_size);
-          s = WriteExact(state->client_fd, s_size.data(), s_size.size());
+          s = WriteExact(state->client_fd, s_size.data(), s_size.size(),
+                         config_.payload_write_timeout_ms);
           if (!s.ok()) {
             LOG(ERROR) << "Write size failed: " << s.ToString();
             shutdown(state->client_fd, SHUT_RDWR);
@@ -869,7 +903,8 @@ void BlockTransport::TriggerNextSendStep(
             return;
           }
           if (total_size > 0) {
-            s = WriteVExact(state->client_fd, ToIovec(chunks));
+            s = WriteVExact(state->client_fd, ToIovec(chunks),
+                            config_.payload_write_timeout_ms);
           }
           if (!s.ok()) {
             LOG(ERROR) << "Write payload failed: " << s.ToString();

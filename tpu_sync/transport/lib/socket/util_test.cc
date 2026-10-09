@@ -19,11 +19,9 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 #include <unistd.h>
 
 #include <cstdlib>
-#include <optional>
 #include <string>
 #include <thread>  // NOLINT
 #include <vector>
@@ -37,7 +35,6 @@
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "absl/types/span.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
@@ -222,75 +219,5 @@ TEST(ConnectToPeerTest, DoesNotRetryOnConnectionRefused) {
   EXPECT_LT(absl::Now() - start, absl::Seconds(1));
 }
 
-TEST(ReadWithTimeoutTest, ReadExactTimesOutWhenPeerStalls) {
-  int sv[2];
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-  const char partial[] = "ab";
-  ASSERT_EQ(write(sv[0], partial, 2), 2);
-
-  char buf[4] = {};
-  const absl::Time start = absl::Now();
-  EXPECT_THAT(ReadExactWithTimeout(sv[1], buf, sizeof(buf),
-                                   absl::Milliseconds(100)),
-              StatusIs(absl::StatusCode::kDeadlineExceeded,
-                       HasSubstr("timed out")));
-  EXPECT_GE(absl::Now() - start, absl::Milliseconds(80));
-
-  close(sv[0]);
-  close(sv[1]);
-}
-
-TEST(ReadWithTimeoutTest, ReadVExactTimesOutAndReadsAcrossIovecs) {
-  int sv[2];
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-  const char full[] = "abcdef";
-  ASSERT_EQ(write(sv[0], full, 6), 6);
-
-  char buf1[2] = {};
-  char buf2[4] = {};
-  struct iovec iovs[2] = {
-      {.iov_base = buf1, .iov_len = sizeof(buf1)},
-      {.iov_base = buf2, .iov_len = sizeof(buf2)},
-  };
-  ABSL_EXPECT_OK(ReadVExactWithTimeout(sv[1], absl::MakeConstSpan(iovs),
-                                       absl::Seconds(1)));
-  EXPECT_EQ(std::string(buf1, 2), "ab");
-  EXPECT_EQ(std::string(buf2, 4), "cdef");
-
-  // Write partial data for next scatter read and let it time out.
-  ASSERT_EQ(write(sv[0], full, 3), 3);
-  EXPECT_THAT(ReadVExactWithTimeout(sv[1], absl::MakeConstSpan(iovs),
-                                    absl::Milliseconds(100)),
-              StatusIs(absl::StatusCode::kDeadlineExceeded,
-                       HasSubstr("timed out")));
-
-  close(sv[0]);
-  close(sv[1]);
-}
-
-TEST(ReadWithTimeoutTest, NulloptTimeoutUsesPeregrineRead) {
-  int sv[2];
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
-  const char payload[] = "abcdefgh";
-  ASSERT_EQ(write(sv[0], payload, 8), 8);
-
-  char buf[4] = {};
-  ABSL_EXPECT_OK(ReadExactWithTimeout(sv[1], buf, sizeof(buf), std::nullopt));
-  EXPECT_EQ(std::string(buf, 4), "abcd");
-
-  char vbuf1[2] = {};
-  char vbuf2[2] = {};
-  struct iovec iovs[2] = {
-      {.iov_base = vbuf1, .iov_len = sizeof(vbuf1)},
-      {.iov_base = vbuf2, .iov_len = sizeof(vbuf2)},
-  };
-  ABSL_EXPECT_OK(
-      ReadVExactWithTimeout(sv[1], absl::MakeConstSpan(iovs), std::nullopt));
-  EXPECT_EQ(std::string(vbuf1, 2), "ef");
-  EXPECT_EQ(std::string(vbuf2, 2), "gh");
-
-  close(sv[0]);
-  close(sv[1]);
-}
 }  // namespace
 }  // namespace tpu_raiden::transport::lib
