@@ -519,29 +519,6 @@ cc_library(
 )
 
 cc_test(
-    name = "weight_synchronizer_wrapper_test",
-    srcs = ["weight_synchronizer_wrapper_test.cc"],
-    copts = [
-        "-std=c++20",
-        "-DWITHOUT_PYTHON",
-        "-fexceptions",
-    ],
-    features = ["-use_header_modules"],
-    tags = ["nobuilder"],
-    deps = [
-        ":weight_synchronizer_torch_core_lib",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/rpc:raiden_service_cc_proto",
-        "//tpu_sync/weight_sync:weight_synchronizer_base",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@xla//xla/tsl/platform:test",
-        "@xla//xla/tsl/platform:test_main",
-    ],
-)
-
-cc_test(
     name = "kv_cache_manager_test",
     srcs = ["kv_cache_manager_test.cc"],
     copts = [

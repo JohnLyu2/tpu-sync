@@ -265,11 +265,7 @@ void WeightSynchronizerListener::ExecuteControlRequest(
     LOG(INFO) << "C++ Listener received SHUTDOWN command. Draining pending H2D "
                  "and initiating clean exit.";
     if (engine != nullptr) {
-      if (engine->control_delegate() != nullptr) {
-        engine->control_delegate()->DrainPendingH2d();
-      } else {
-        engine->DrainPendingH2d();
-      }
+      engine->DrainPendingH2d();
     }
     if (shutdown_callback) {
       shutdown_callback();

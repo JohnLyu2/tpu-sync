@@ -91,24 +91,6 @@ struct WeightSyncMetrics {
 
 class WeightSynchronizerListener;
 
-class WeightSynchronizerControlDelegate {
- public:
-  virtual ~WeightSynchronizerControlDelegate() = default;
-  virtual absl::Status PushWeights(const std::vector<std::string>& peers) = 0;
-  virtual absl::Status PushWeightsResharded(
-      const tpu_sync::rpc::StartTransferRequest& request) = 0;
-  virtual void StoreSkipTiling(
-      uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request) = 0;
-  virtual absl::Status RegisterExpectedChunks(uint64_t uuid,
-                                              uint32_t expected_chunks) = 0;
-  virtual absl::Status RegisterExpectedLayerChunks(
-      uint64_t uuid,
-      const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) = 0;
-  virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0) = 0;
-  virtual void ForgetPushProgress(uint64_t uuid) = 0;
-  virtual void DrainPendingH2d() = 0;
-};
-
 class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
  public:
   // Symmetrical core constructor wrapping raw PJRT buffers directly E2E
@@ -148,12 +130,6 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   ~WeightSynchronizerBase() override;
 
-  void SetControlDelegate(WeightSynchronizerControlDelegate* delegate) {
-    control_delegate_ = delegate;
-  }
-  WeightSynchronizerControlDelegate* control_delegate() const {
-    return control_delegate_;
-  }
   void SetGlobalShardIndices(std::vector<int64_t> indices) {
     global_shard_indices_ = std::move(indices);
   }
@@ -392,7 +368,6 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  private:
-  WeightSynchronizerControlDelegate* control_delegate_ = nullptr;
   std::vector<int64_t> global_shard_indices_;
   std::vector<int> local_shard_indices_;
 

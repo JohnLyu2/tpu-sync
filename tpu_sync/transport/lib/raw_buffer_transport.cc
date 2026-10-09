@@ -430,11 +430,9 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
               << (prog.expected_chunks.has_value()
                       ? std::to_string(*prog.expected_chunks)
                       : "unknown");
-      // In NUMA-aware multi-NIC configurations (`NumaAwareWeightSynchronizer`),
-      // the total expected chunk count is partitioned across sub-synchronizers.
-      // Integer division remainder distributions across NUMA nodes can result
-      // in an individual sub-synchronizer receiving slightly more chunks than
-      // its partitioned quota. Using '>=' ensures completion triggers reliably.
+      // Tolerate receiving more chunks than registered (e.g. when the
+      // expected count is a lower-bound estimate) so completion triggers
+      // reliably: use '>=' rather than '=='.
       if (prog.expected_chunks.has_value() &&
           prog.completed_chunks >= *prog.expected_chunks) {
         if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {

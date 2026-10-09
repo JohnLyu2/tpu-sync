@@ -2742,6 +2742,59 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedLocalShardIndicesFallback) {
 }
 
 TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedLocalKeysWithoutExplicitLocalShardIndices) {
+  // One shard per process with a non-zero global index and no explicit local
+  // indices (empty local_shard_indices_ == identity). A schedule keyed by the
+  // local index 0 must still be resolved rather than looked up by global key.
+  const size_t num_layers = 1;
+  const size_t num_shards = 1;
+  const size_t slice_byte_size = 256;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  ws_source->SetGlobalShardIndices({3});
+  ws_dest->SetGlobalShardIndices({3});
+
+  uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
+  ASSERT_NE(src_ptr, nullptr);
+  ASSERT_NE(dst_ptr, nullptr);
+  std::memset(src_ptr, 0x5A, slice_byte_size);
+  std::memset(dst_ptr, 0x00, slice_byte_size);
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(54324);
+  auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(slice_byte_size);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(request));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  const uint8_t* out = ws_dest->GetHostBufferPtr(0, 0);
+  ASSERT_NE(out, nullptr);
+  for (size_t b = 0; b < slice_byte_size; ++b) {
+    EXPECT_EQ(out[b], 0x5A) << "Mismatch at byte " << b;
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
        PushWeightsReshardedLocalShardIndicesNotShadowedByGlobalIndices) {
   const size_t num_layers = 1;
   const size_t num_shards = 4;

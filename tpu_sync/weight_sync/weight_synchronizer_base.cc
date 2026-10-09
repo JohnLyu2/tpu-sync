@@ -943,9 +943,6 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
 absl::Status WeightSynchronizerBase::PushWeights(
     const std::vector<std::string>& peers) {
   RAIDEN_TRACE("WeightSynchronizerBase::PushWeights");
-  if (control_delegate_ != nullptr) {
-    return control_delegate_->PushWeights(peers);
-  }
   return PushWeightsLocal(peers);
 }
 
@@ -969,9 +966,6 @@ absl::Status WeightSynchronizerBase::PushWeightsLocal(
 absl::Status WeightSynchronizerBase::PushWeightsResharded(
     const tpu_sync::rpc::StartTransferRequest& request) {
   RAIDEN_TRACE("WeightSynchronizerBase::PushWeightsResharded");
-  if (control_delegate_ != nullptr) {
-    return control_delegate_->PushWeightsResharded(request);
-  }
   return PushWeightsReshardedLocal(request);
 }
 
@@ -979,20 +973,25 @@ absl::StatusOr<std::vector<WeightSynchronizerBase::ShardPushSchedule>>
 WeightSynchronizerBase::ResolveShardPushSchedules(
     const tpu_sync::rpc::StartTransferRequest& request) {
   const auto& schedules = request.shard_push_schedules();
+  // Schedules are keyed by local shard index unless some key falls outside
+  // the local index space, in which case they are keyed by global index. An
+  // empty |local_shard_indices_| denotes the identity mapping [0, num_shards_).
   bool use_global_keys = false;
   if (!global_shard_indices_.empty()) {
-    if (local_shard_indices_.empty()) {
-      use_global_keys = true;
-    } else {
-      for (const auto& [sched_key, _] : schedules) {
-        bool in_local =
+    for (const auto& [sched_key, _] : schedules) {
+      bool in_local;
+      if (local_shard_indices_.empty()) {
+        in_local =
+            sched_key >= 0 && static_cast<size_t>(sched_key) < num_shards_;
+      } else {
+        in_local =
             std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
                       static_cast<int>(sched_key)) !=
             local_shard_indices_.end();
-        if (!in_local) {
-          use_global_keys = true;
-          break;
-        }
+      }
+      if (!in_local) {
+        use_global_keys = true;
+        break;
       }
     }
   }
@@ -1646,9 +1645,6 @@ void WeightSynchronizerBase::UnbindWeights() {
 
 absl::Status WeightSynchronizerBase::RegisterExpectedChunks(
     uint64_t uuid, uint32_t expected_chunks) {
-  if (control_delegate_ != nullptr) {
-    return control_delegate_->RegisterExpectedChunks(uuid, expected_chunks);
-  }
   return RegisterExpectedChunksLocal(uuid, expected_chunks);
 }
 
@@ -1660,10 +1656,6 @@ absl::Status WeightSynchronizerBase::RegisterExpectedChunksLocal(
 absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunks(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
-  if (control_delegate_ != nullptr) {
-    return control_delegate_->RegisterExpectedLayerChunks(
-        uuid, expected_layer_chunks);
-  }
   return RegisterExpectedLayerChunksLocal(uuid, expected_layer_chunks);
 }
 
@@ -1965,10 +1957,6 @@ absl::Status WeightSynchronizerBase::WaitForTransferCompletion(uint64_t uuid) {
 
 void WeightSynchronizerBase::StoreSkipTiling(
     uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request) {
-  if (control_delegate_ != nullptr) {
-    control_delegate_->StoreSkipTiling(uuid, request);
-    return;
-  }
   StoreSkipTilingLocal(uuid, request);
 }
 
