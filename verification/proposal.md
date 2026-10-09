@@ -61,11 +61,11 @@ Ultimately, the serving engines rely on **two system-level properties**:
 | System property | Required behavior across requests $R_1, R_2, \dots$ |
 | --- | --- |
 | **1. End-to-end KV data correctness** | Whenever `poll_stats()` signals `done_recving` for a request $R$, every transformer layer $0 \dots L-1$ of $R$'s decode HBM contains $R$'s exact KV cache `[kv 0, …, kv (L-1)]`, and nothing overwrites $R$'s decode HBM while decode attention is running — even when layers finish D2H, H2H, and H2D out of order, when the prefill engine immediately reclaims and overwrites $R$'s prefill HBM upon `done_sending`, and when $R$ reuses host staging and HBM buffers from earlier completed, failed, or cancelled requests. |
-| **2. Progress & no buffer leak** | Every started request $R$ (whether it succeeds, fails, or is cancelled) eventually drains all in-flight operations, settles both sessions so host staging DRAM buffers are returned to `StagingBlockAllocator`, and reports terminal outcomes via `poll_stats()` (`done_sending` / `failed_sending` and `done_recving` / `failed_recving`) so the serving engines can reclaim prefill and decode HBM and later requests never starve. |
+| **2. Progress & no buffer leak** | Every started request $R$ (whether it succeeds, fails, or is cancelled) eventually drains all in-flight operations, settles both sessions so host staging DRAM buffers are returned to `StagingBlockAllocator`, and reports terminal outcomes via `poll_stats()` (`done_sending` / `failed_recving` and `done_recving` / `failed_recving`) so the serving engines can reclaim prefill and decode HBM and later requests never starve. |
 
 In this setting, per-buffer safety properties are the intermediate obligations required to establish the two system-level goals:
 - **Clean buffer handoff (no use-after-release across requests):**
-  - *Prefill HBM safety:* Once `poll_stats()` reports `done_sending` (or `failed_sending`), all D2H DMA reads from prefill HBM have retired, so the prefill engine immediately overwriting prefill HBM for a new request cannot corrupt an in-flight transfer.
+  - *Prefill HBM safety:* Once `poll_stats()` reports `done_sending` (or `failed_recving` on the producer), all D2H DMA reads from prefill HBM have retired, so the prefill engine immediately overwriting prefill HBM for a new request cannot corrupt an in-flight transfer.
   - *Host staging safety:* Once a send or receive session settles and returns its staging buffer to `StagingBlockAllocator`, all D2H, H2H, and H2D operations touching that staging buffer have retired, so recycling the staging buffer can neither corrupt the finishing request nor overwrite the next request's staging data.
   - *Decode HBM safety:* Once `poll_stats()` reports `done_recving` (or `failed_recving`), all H2D DMA writes to decode HBM have retired, so decode attention and subsequent requests reusing decode HBM are never overwritten by straggling writes.
 - **Single-request per-layer delivery:** Within an undisturbed transfer, every layer $l \in \{0 \dots L-1\}$ moves from `prefillHbm[l]` $\to$ `prefillStaging[l]` $\to$ `wire[l]` $\to$ `decodeStaging[l]` $\to$ `decodeHbm[l]` without premature reads, and `done_recving` is published only when all $L$ layers have finished H2D.
@@ -88,7 +88,7 @@ Steps define allowed state transitions:
 - Producer D2H dispatch and per-layer completion (in arbitrary layer order).
 - Network push transmission, out-of-order layer landing, and push callbacks.
 - Consumer H2D dispatch (including the unlock/re-lock window) and per-layer completion.
-- `CompleteReadRaw` / `poll_stats()` publication (`done_sending` / `failed_sending`, `done_recving` / `failed_recving`).
+- `CompleteReadWithDetails` / `CompleteReadRaw` (`poll_stats()`) publication (`done_sending` / `done_recving` / `failed_recving`).
 - Asynchronous buffer reclamation and reuse across requests (`reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging`, and multi-request transitions).
 - Deadlines, failures, cancellation, and staging buffer release.
 

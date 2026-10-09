@@ -1,13 +1,13 @@
 // Repro for a check-then-act window in KVCacheStore::ValidateAndPinHostBlocks.
 //
-// ValidateAndPinHostBlocks (kv_cache_store.cc:1670-1697) does
+// ValidateAndPinHostBlocks (kv_cache_store.cc:1666-1694) does
 //     slices = backend()->Lookup(hashes)      // default options: pin_found=false
 //     ids    = slices[i].host_block_id
 //     backend()->Pin(hashes)
 // under KVCacheStore::mutex_ only. The backend's own mutex is released between
-// Lookup and Pin, and neither KVCacheStore::Evict (kv_cache_store.cc:1744-1761,
-// "We do not hold store mutex_") nor KVCacheStore::Insert
-// (kv_cache_store.cc:1055-1088) takes KVCacheStore::mutex_. So another thread
+// Lookup and Pin, and neither KVCacheStore::Evict (kv_cache_store.cc:1851-1882,
+// "We do not hold store mutex_" at :1855-1857) nor KVCacheStore::Insert
+// (kv_cache_store.cc:1059-1092) takes KVCacheStore::mutex_. So another thread
 // can evict the hash and re-insert it at a different host block inside the
 // window. Pin then succeeds (keyed by hash) and the function returns the OLD
 // host block id, which no longer holds that hash.

@@ -33,7 +33,7 @@ or `.blank` (never written). Layer `l` of a memory is correct iff it is
 | `prefillHbm`     | the request's KV cache in prefill HBM | `reclaim` (the engine frees prefill HBM) |
 | `prefillStaging` | the send's host staging (`send.cc:288-293`) | `d2hReady l` (D2H copy, `send.cc:334-343`), `reseatPrefillStaging` |
 | `wire`           | data delivered by a direct H2H write (`send.cc:426-447`) | `h2hDone l true` |
-| `decodeStaging`  | the receive's host staging | `land l` (transport, `bt.cc:467-501`), `reseatDecodeStaging` |
+| `decodeStaging`  | the receive's host staging | `land l` (transport, `bt.cc:415-469`), `reseatDecodeStaging` |
 | `decodeHbm`      | the decode request's KV cache in decode HBM | `h2dReady l` (H2D copy, `recv.cc:579-700`) |
 
 ## Layers complete in any order
@@ -49,11 +49,11 @@ and per-layer ghost sets record which layers have passed each stage:
 | Ghost         | Layers that … | Agrees with |
 |---------------|---------------|-------------|
 | `d2hReadyL`   | have finished their D2H copy (`prefillStaging[l]` written) | `send.d2hReady` (`cnt_d2hReady`) |
-| `h2hRetiredL` | have run their push callback | — |
+| `h2hRetiredL` | have run their push callback | `send.h2hRetired` (`cnt_h2hRetired`) |
 | `landedL`     | the transport has landed in `decodeStaging` | — |
 | `claimedL`    | `OnLayerReceived` has entered `ExecuteLayerH2d` for | — |
-| `h2dPendingL` | are between the first and second lock of `ExecuteLayerH2d` | — |
-| `h2dIssuedL`  | `ExecuteLayerH2d` has dispatched to the device | — |
+| `h2dPendingL` | are between the first and second lock of `ExecuteLayerH2d` | `recv.pending` (`cnt_h2dPending`) |
+| `h2dIssuedL`  | `ExecuteLayerH2d` has dispatched to the device | `recv.issued` (`cnt_h2dIssued`) |
 | `h2dReadyL`   | have finished their H2D copy (`decodeHbm[l]` written) | `recv.ready` (`cnt_h2dReady`) |
 
 `reclaimed` records that the engine has freed prefill HBM.
@@ -72,7 +72,7 @@ and per-layer ghost sets record which layers have passed each stage:
 | `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:605-636`): dispatches layer `l`'s H2D copy unless draining or failed |
 | `h2dReady l`            | the H2D copy of layer `l` finishes: `decodeHbm[l] := decodeStaging[l]` |
 | `land l`                | the transport writes layer `l` from the wire into `decodeStaging[l]`, inside an accepted push (`bt.cc:374` … `bt.cc:617`) |
-| `reclaim`               | the engine frees prefill HBM once `poll_stats()` has reported the send (`mgr.cc:925-935`) |
+| `reclaim`               | the engine frees prefill HBM once `poll_stats()` has reported the send (`mgr.cc:926-936`) |
 | `reseatPrefillStaging`  | the host staging pool hands the send's released staging to someone else, who writes to it |
 | `reseatDecodeStaging`   | likewise for the receive's staging |
 
@@ -403,7 +403,7 @@ dispatching or writing to decode HBM. -/
 def DecodeHbmSafe (s : Pipeline) : Prop :=
   s.recv.published ≠ none → s.recv.pending = 0 ∧ s.recv.retired = s.recv.issued
 
-/-- Once `poll_stats()` reports `done_sending` or `failed_sending` to the
+/-- Once `poll_stats()` reports `done_sending` or `failed_recving` to the
 caller (handing prefill HBM back to the engine so it may be reclaimed), no D2H
 copy is still dispatching or reading from prefill HBM. -/
 def PrefillHbmSafe (s : Pipeline) : Prop :=
@@ -1592,7 +1592,7 @@ theorem numLayers_eq {n : Nat} {s : Pipeline} (h : (sys n).Reachable s) : s.numL
   (sys n).reachable_induction (P := fun s => s.numLayers = n) rfl
     (fun _ _ _ hi hs => (step_numLayers hs).trans hi) h
 
-/-- Once `poll_stats()` reports `done_sending` or `failed_sending`
+/-- Once `poll_stats()` reports `done_sending` or `failed_recving`
 (`s.send.published ≠ none`), `d2hReady` is permanently disabled (`PrefillHbmSafe`
 gives `d2hRetired = d2hIssued`, which with `d2hRetired ≤ d2hReady ≤ d2hIssued`
 forces `d2hReady = d2hIssued`). -/
@@ -1759,7 +1759,7 @@ theorem not_isRecycleEv_and_wroteReleased_eq_false {r r' : Pipeline} {e : Ev}
 /-- The prefill side of a request has released both of its buffers: its host
 staging buffer has been returned to `StagingBlockAllocator`
 (`send.life.hasStaging = false`) and `poll_stats()` has published
-`done_sending` or `failed_sending` (`send.published ≠ none`), so a later
+`done_sending` or `failed_recving` (`send.published ≠ none`), so a later
 request may recycle prefill HBM and prefill staging even while this request's
 receive side is still running. -/
 def PrefillReleased (s : Pipeline) : Prop :=

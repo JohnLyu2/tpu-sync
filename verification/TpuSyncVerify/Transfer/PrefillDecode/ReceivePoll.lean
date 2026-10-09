@@ -56,10 +56,11 @@ and `RecordEnd`. `RecvM` adds a ghost bit `metrics` for those calls and
 
 The one case where the poll is load-bearing is `num_layers() == 0`: nothing
 else ever calls `FinishLocked()` (`noPoll_zero_layers_never_succeeds`),
-whereas with the poll the session is complete at once
-(`trace_zero_layers_poll`). A change that drops the poll has to finish a
-zero-layer receive at creation, as `TransferSendSession::StartPush` does for
-a zero-layer send (`send.cc:302-305`).
+whereas with the poll `IsReadyToComplete()` holds at once (in C++, via its
+`num_completed_layers_ == total_layers` disjunct while `network_completed_`
+remains `false`, `trace_zero_layers_poll`). A change that drops the poll has to
+finish a zero-layer receive at creation, as `TransferSendSession::StartPush`
+does for a zero-layer send (`send.cc:302-305`).
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.Recv

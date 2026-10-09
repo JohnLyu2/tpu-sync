@@ -24,7 +24,8 @@ def producer : List Ev :=
    .send (.wake true), .send .h2hIssue, .send .sendNext, .h2hDone 0 true, .send .publish]
 
 /-- A one-layer consumer, pull handshake to `done_recving`. Within the accepted
-push, `HandleCustomRequest` (`bt.cc:374-617`) lands the chunk, dispatches
+push, `HandleIncomingPush` (`bt.cc:374-617`, dispatched from
+`HandleCustomRequest` at `bt.cc:303`) lands the chunk, dispatches
 `OnLayerReceived` (`h2dBegin` / `h2dIssue`) and accounts for the chunk
 (`netAccount`) before returning (`pushEnd`). -/
 def consumer : List Ev :=
@@ -33,9 +34,12 @@ def consumer : List Ev :=
    .recv (.h2dDone true), .recv .publish]
 
 /-- Producer then consumer: both sides published as done, the data in decode
-HBM (`KVCacheManagerTransferTest.SingleDeviceTransfer` / `MultiDeviceTransfer`
-in `kv_cache_manager_with_transfer_test.cc`, and `test_e2e_transfer_polling` /
-`test_parallel_pull` in `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py`). -/
+HBM (`KVCacheManagerWithTransferTest.LocalOrchestratedTransfer` /
+`TreeBroadcastCorrectness8Nodes` / `MultiIpOrchestratedTransfer` in
+`kv_cache_manager_with_transfer_test.cc:111-290, 440-594, 596-676`, and
+`test_e2e_transfer_polling` / `test_parallel_pull` in
+`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:102-185, 451-531` and
+`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:147-174, 285-311`). -/
 theorem trace_normal :
     ((sys 1).run (producer ++ consumer)).map
       (fun s => (s.send.published, s.recv.published, s.decodeHbm)) =
@@ -119,7 +123,7 @@ theorem trace_aborted_issue_cannot_ready :
 
 /-- `ControlHandshakeTest.RegisteredPullIsAcknowledged` and
 `DuplicatePullIsRejectedBeforeAcknowledgement`
-(`kv_cache_manager_with_transfer_control_test.cc:353-379`):
+(`kv_cache_manager_with_transfer_control_test.cc:281-291, 367-379`):
 a registered offer is claimed by `.send .beginPull` and acknowledged by
 `.recv (.pullReply true)`, whereas a duplicate `.send .beginPull` is rejected
 even before the pull acknowledgement is delivered. -/
@@ -130,9 +134,11 @@ theorem trace_registered_and_duplicate_pull :
     (sys 1).run [.send .beginPull, .send .beginPull] = none := by
   decide
 
-/-- `ControlHandshakeTest.PullWithoutRegistrationIsRejected` and
-`PullAfterRegistrationDeadlineIsRejected`
-(`kv_cache_manager_with_transfer_control_test.cc:381-393`):
+/-- `ControlHandshakeTest.PullWithoutRegistrationIsRejected`
+(`kv_cache_manager_with_transfer_control_test.cc:293-306`; compare
+`PullAfterRegistrationDeadlineIsRejected` at `:308-330`, where a registered
+offer's `deadline_ <= now` is rejected inside `ValidateAndBeginPull`, modelled
+by `Send.trace_never_pulled`):
 when `NotifyForRead` never registers the offer (`sysUnregistered 1`), neither
 `ValidateAndBeginPull` (`.send .beginPull`) nor a positive pull reply
 (`.recv (.pullReply true)`) nor `StartPush` (`.send .start`) can run;
@@ -149,11 +155,12 @@ theorem trace_unregistered_pull_rejected :
   decide
 
 /-- `ControlHandshakeTest.PullAheadOfRegistrationIsAcknowledgedOnceRegistered`
-(`kv_cache_manager_with_transfer_control_test.cc:395-413`):
+(`kv_cache_manager_with_transfer_control_test.cc:332-351`):
 `HandlePullStream` arrives before `NotifyForRead` and waits in
 `cv_.WaitWithTimeout` (`.pullWait`); once `NotifyForRead` registers the offer
-(`.notifyForRead`), `ValidateAndBeginPull` claims the session and the full
-1-layer transfer completes to `done_sending` and `done_recving`. -/
+(`.notifyForRead`), `ValidateAndBeginPull` claims the session (as in the C++
+handshake test) and the Lean trace extends this through the full 1-layer
+transfer to `done_sending` and `done_recving`. -/
 theorem trace_pull_ahead_of_registration :
     ((sysUnregistered 1).run [.pullWait]).map
       (fun s => (s.registered, s.pullWaiting, s.send.pullStarted, s.recv.pullPending)) =
@@ -164,10 +171,11 @@ theorem trace_pull_ahead_of_registration :
   decide
 
 /-- `ControlHandshakeTest.ShutdownUnblocksPendingPull`
-(`kv_cache_manager_with_transfer_control_test.cc:415-441`):
+(`kv_cache_manager_with_transfer_control_test.cc:555-573`):
 while `HandlePullStream` is waiting in `cv_.WaitWithTimeout` for an unregistered
-offer (`.pullWait`), shutdown cancels the sessions and fails the pending pull
-(`.recv (.pullReply false)`), unblocking the consumer and settling both sides. -/
+offer (`.pullWait`), producer shutdown wakes the wait and fails the pending pull
+(`.recv (.pullReply false)`); the Lean trace also cancels and publishes both
+sessions to show full two-sided settlement. -/
 theorem trace_shutdown_unblocks_pending_pull :
     ((sysUnregistered 1).run
       [.pullWait, .send .cancel, .recv .cancel, .recv (.pullReply false),

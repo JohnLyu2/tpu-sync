@@ -7,8 +7,10 @@ Multiple requests $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run
 concurrently and recycle the four memories (`prefillHbm`, `prefillStaging`,
 `decodeStaging`, `decodeHbm`) across two ownership boundaries:
 - **Host staging (`prefillStaging`, `decodeStaging`)** is owned by TPU Sync's
-  `StagingBlockAllocator` and is returned to the pool inside `SettleLocked()`
-  as soon as each session settles (`hasStaging = false`).
+  `StagingBlockAllocator` and is returned to the pool by `Lifecycle.settleLocked`
+  (`ReleaseStagingBlocksLocked` / `ReleaseStagingLocked` in `FinishLocked` and
+  `EndSendOpLocked` / `EndRecvOpLocked`) as soon as each session settles
+  (`hasStaging = false`).
 - **TPU HBM (`prefillHbm`, `decodeHbm`)** is owned by the serving engines and
   is handed back to the caller when `poll_stats()` publishes the session
   outcome (`send.published ≠ none`, `recv.published ≠ none`).

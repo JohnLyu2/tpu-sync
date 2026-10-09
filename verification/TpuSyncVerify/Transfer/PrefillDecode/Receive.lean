@@ -29,7 +29,7 @@ The settle protocol itself is `Transfer.Lifecycle`. On top of it:
 | `issued`          | `h2d_futures_.size()` (`.h:255`)           | H2D copies handed to the device |
 | `ready`           | futures in `h2d_futures_` with `IsReady()` | copies finished on the device |
 | `completed`       | `num_completed_layers_` (`.h:244`)         | callbacks that ran with an OK status |
-| `layersAccounted` | `num_completed_blocks_ / total_blocks_` (`.h:243`) | layers whose blocks the transport has reported |
+| `layersAccounted` | `num_completed_blocks_ / total_blocks_` (`.h:242-243`) | layers whose blocks the transport has reported |
 | `published`       | membership in `done_recving_` / `failed_recving_` (`mgr.cc:981-983`) | what `poll_stats()` shows the engine |
 | `pushes`          | ghost                                      | incoming pushes between `TryBeginRecvOp` and `EndRecvOp` |
 | `pullPending`     | ghost                                      | the StartRead pull handshake still holds its op |
@@ -54,10 +54,10 @@ Ghost fields have no single C++ variable. They record where each unit of
 | `h2dIssue ok`  | `ExecuteLayerH2d` from the re-check on (`.cc:605-636`) |
 | `h2dReady`     | the device finishes a copy: its future becomes `IsReady()` |
 | `h2dDone ok`   | H2D completion callback (`.cc:639-697`) |
-| `netAccount`   | `OnBlocksReceived` (`.cc:529-577`) via `bt.cc:614-615` / `mgr.cc:1660-1681`: accounts a layer's blocks, may set `network_completed_`, and finishes the session if every layer is also complete (`.cc:560-567`) |
-| `pollReady`    | `CompleteReadRaw` sees `IsReadyToComplete()` and calls `Finish()` (`mgr.cc:966-970`) |
-| `cancel`       | any `Finish(error)` from outside the session: deadline (`mgr.cc:971-978`), shutdown (`mgr.cc:346-361`), plan unregister (`mgr.cc:703`) |
-| `publish`      | `CompleteReadRaw` moves a settled session into `done_recving_` or `failed_recving_` by its status and drops it (`mgr.cc:981-990`) |
+| `netAccount`   | `OnBlocksReceived` (`.cc:529-577`) via `bt.cc:614-615` / `mgr.cc:1660-1680`: accounts a layer's blocks, may set `network_completed_`, and finishes the session if every layer is also complete (`.cc:560-567`) |
+| `pollReady`    | `CompleteReadWithDetails` / `CompleteReadRaw` sees `IsReadyToComplete()` and calls `Finish()` (`mgr.cc:966-970`) |
+| `cancel`       | any `Finish(error)` from outside the session: deadline (`mgr.cc:971-978`), shutdown (`mgr.cc:349-353`), plan unregister (`mgr.cc:703`) |
+| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session into `done_recving_` or `failed_recving_` by its status and drops it (`mgr.cc:981-990`) |
 
 ## Assumptions
 
@@ -66,22 +66,27 @@ Ghost fields have no single C++ variable. They record where each unit of
   `ExecuteLayerH2d` is entered at most `numLayers` times. Encoded as the
   `h2dBegin` guard `issued + pending < numLayers`.
 * **A2 (registration).** The session has blocks to receive and is registered.
-  `ReleaseStaging()` is only called from outside on registration failure
-  (`mgr.cc:530,576,876`), before the session is visible, so it is not an
-  event here.
+  `ReleaseStaging()` is only called from outside on registration failure:
+  `mgr.cc:530` and `:876` run before the session is seated, and if
+  `base_->RegisterActivePlan` (`:569-571`, called under `plan_lifecycle_mu_`
+  after the session was seated in `active_recv_sessions_` under an earlier `mu_`
+  lock at `:520-539`) fails, the cleanup `mu_` critical section (`:572-578`)
+  releases (`:576`) and erases (`:577`) the session together before the plan is
+  published, so it is not an event here.
 * **A3 (no double end).** Every op ends at most once, so `in_flight_` never
   underflows: `h2dDone` is only enabled while a callback is outstanding,
   `pushEnd` only while a push is open.
 * **A4 (transport ordering).** For the request that completes a layer,
-  `HandleCustomRequest` calls `OnLayerReceived` (`bt.cc:601-608`) before
-  `OnBlocksReceived` (`bt.cc:614-615`), on the same thread, and
-  `ExecuteLayerH2d` pushes the future into `h2d_futures_` before returning
-  (`.cc:633-636`). A layer's blocks are accounted as one event once its copy is
-  issued: guard `layersAccounted < issued`. With several senders per layer the
-  real counter can grow before `OnLayerReceived`, but it can only *reach* the
-  threshold `total_blocks_ * num_layers` (`.cc:450-451`) after the last layer's
-  final request, which is the ordered one; lumping each layer's accounting into
-  that event is sound for everything proved here.
+  `HandleIncomingPush` (dispatched from `HandleCustomRequest`, `bt.cc:303`)
+  calls `OnLayerReceived` (`bt.cc:601-608`) before `OnBlocksReceived`
+  (`bt.cc:614-615`), on the same thread, and `ExecuteLayerH2d` pushes the future
+  into `h2d_futures_` before returning (`.cc:633-636`). A layer's blocks are
+  accounted as one event once its copy is issued: guard
+  `layersAccounted < issued`. With several senders per layer the real counter
+  can grow before `OnLayerReceived`, but it can only *reach* the threshold
+  `total_blocks_ * num_layers` (`.cc:450-451`) after the last layer's final
+  request, which is the ordered one; lumping each layer's accounting into that
+  event is sound for everything proved here.
 
 ## Properties
 
@@ -150,7 +155,10 @@ def initPush (numLayers : Nat) : Recv := { numLayers }
 def initLoad (numLayers : Nat) : Recv :=
   { numLayers, life := { inFlight := 1 }, pullPending := true }
 
-/-- `network_completed_` (`.cc:450-452`): every layer's blocks accounted. -/
+/-- `network_completed_` (`.cc:450-452`): every layer's blocks accounted
+(agrees with `.h:245` for `numLayers > 0`; at `numLayers = 0`, C++'s
+`IsReadyToComplete` at `.cc:433-434` holds via its `num_completed_layers_ ==
+total_layers` disjunct while `network_completed_` stays `false`). -/
 def networkCompleted (s : Recv) : Prop := s.layersAccounted = s.numLayers
 
 /-- `AllH2dDoneLocked` (`.cc:423-428`): every future in `h2d_futures_` is ready. -/
@@ -260,8 +268,8 @@ def netAccount (s : Recv) : Option Recv :=
     else some s
   else none
 
-/-- `CompleteReadRaw` polls a session that is not draining and finds it ready
-(`mgr.cc:966-970`). -/
+/-- `CompleteReadWithDetails` / `CompleteReadRaw` polls a session that is not
+draining and finds it ready (`mgr.cc:966-970`). -/
 def pollReady (s : Recv) : Option Recv :=
   if s.life.draining = false ∧ isReadyToComplete s then
     some { s with life := s.life.finishLocked true }
@@ -271,7 +279,8 @@ def pollReady (s : Recv) : Option Recv :=
 def cancel (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false }
 
-/-- `CompleteReadRaw` publishes a settled session (`mgr.cc:981-990`). -/
+/-- `CompleteReadWithDetails` / `CompleteReadRaw` publishes a settled session
+(`mgr.cc:981-990`). -/
 def publish (s : Recv) : Option Recv :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }
@@ -805,8 +814,8 @@ within a few events of either initial state. The inductive proof above is the
 actual guarantee; the search guards against a modelling slip making the proof
 vacuous. -/
 
-/-- A two-layer push receive that completes through the poll and is published
-as done. -/
+/-- A two-layer push receive that completes through the last H2D callback and
+is published as done. -/
 theorem trace_normal :
     ((sysPush 2).run
       [.pushBegin, .h2dBegin, .h2dIssue true, .netAccount, .pushEnd,
@@ -830,9 +839,14 @@ theorem trace_poll_before_callbacks :
       (fun s => (s.published, s.completed)) = some (some true, 1) := by
   decide
 
-/-- The deadline fires while a copy is in flight: the session drains but does
-not settle until the copy's callback ends the op, and is then published as
-failed. -/
+/-- `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds`
+(`kv_cache_manager_with_transfer_send_drain_test.cc:604-631`) and
+`RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging` (`:712-748`): the deadline
+fires while an H2D copy is in flight (or while the thread is inside
+`H2dSyncDispatch` at `.cc:619-624`, after the `.cc:611-616` re-check has passed
+— since `.cc:617-636` never re-reads `draining_`/`done_`, that deadline
+linearises after `h2dIssue`). The session drains but does not settle until the
+copy's callback ends the op, and is then published as failed. -/
 theorem trace_deadline_during_copy :
     ((sysLoad 1).run [.pullReply true, .h2dBegin, .h2dIssue true, .cancel]).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
@@ -892,7 +906,7 @@ theorem trace_failed_h2d_waits_for_other_layer :
   decide
 
 /-- `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`
-(`kv_cache_manager_with_transfer_control_test.cc:503-529`) and
+(`kv_cache_manager_with_transfer_send_drain_test.cc:801-824`) and
 `DemandStagingTest.UnregisteringInFlightReceiverDefersUntilItSettles`
 (`kv_cache_manager_with_transfer_pool_reshard_test.cc:436-476`):
 an open incoming push lease (`pushBegin`) keeps staging pinned across `cancel`
@@ -910,7 +924,8 @@ theorem trace_push_lease_pins_staging_on_cancel :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
-/-- `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`:
+/-- `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`
+(`kv_cache_manager_with_transfer_send_drain_test.cc:826-852`):
 even if the H2D copy and its callback finish inside `HandleIncomingPush` before
 `EndIncomingPush` runs, the open push lease (`pushes = 1`) keeps `done = false`
 and `hasStaging = true` until `pushEnd`. -/
@@ -924,9 +939,10 @@ theorem trace_push_lease_outlives_h2d :
   decide
 
 /-- `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds`
-(`kv_cache_manager_with_transfer_control_test.cc:394-431`), plus the idle
+(`kv_cache_manager_with_transfer_control_test.cc:792-832`), plus the idle
 push-plan cases `RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline`
-(`:462-477`), `DemandStagingTest.UnregisteringIdleReceiverReleasesPlanAtOnce`
+(`kv_cache_manager_with_transfer_send_drain_test.cc:591-602`),
+`DemandStagingTest.UnregisteringIdleReceiverReleasesPlanAtOnce`
 (`kv_cache_manager_with_transfer_pool_reshard_test.cc:409-434`), and
 `DemandStagingTest.DemandStagedReceiverPlanUnregistersWhenItSettles`
 (`:538-561`): on `sysLoad 1`, a deadline while the pull handshake is still
@@ -989,9 +1005,10 @@ def netAccountUnordered (s : Recv) : Option Recv :=
         | _ => false)
 
 /-- Mutant for `NoOpLeak`: `ExecuteLayerH2d` returns early on `done_ || draining_`
-(`.cc:611`) without calling `EndRecvOpLocked()`. A cancel between the two locks
-leaks the op: `inFlight` stays positive with no enabled drain event, so the
-session never settles (`SettleSafe` holds vacuously, `NoOpLeak` catches it). -/
+(`.cc:612-615`) without calling `EndRecvOpLocked()`. A cancel between the two
+locks leaks the op: `inFlight` stays positive with no enabled drain event, so
+the session never settles (`SettleSafe` holds vacuously, `NoOpLeak` catches
+it). -/
 def h2dIssueLeak (ok : Bool) (s : Recv) : Option Recv :=
   if s.pending = 0 then none
   else

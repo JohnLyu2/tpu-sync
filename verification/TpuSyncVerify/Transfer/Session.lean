@@ -3,9 +3,10 @@
 
 The settle protocol shared by TPU Sync's session classes
 (`TransferReceiveSession`, `TransferSendSession`, `ReshardReceiveSession`,
-`ReshardSendSession`): a count of in-flight operations, a `draining_` flag that
-stops new ones, and a `done_` flag set by whichever of `Finish` or the last
-`EndOp` comes second. The session owns its host staging until it settles.
+`ReshardSendSession`): a count of in-flight operations, a `draining_` flag
+(`finalizing_` in `ReshardSendSession`) that stops new ones, and a `done_` flag
+set by whichever of `Finish` or the last `EndRecvOp`/`EndSendOp`/`EndOp` comes
+second. The session owns its host staging until it settles.
 
 Citations are to tpu-sync `50b0774`; `recv` is
 `tpu_sync/core/transfer_receive_session.{h,cc}`, `send` is
@@ -17,7 +18,7 @@ Citations are to tpu-sync `50b0774`; `recv` is
 | `draining`   | `draining_` (`.h:249`)   | `draining_` (`.h:190`)   |
 | `done`       | `done_` (`.h:250`)       | `done_` (`.h:191`)       |
 | `statusOk`   | `status_.ok()` (`.h:248`) | `status_.ok()` (`.h:183`) |
-| `hasStaging` | `!staging_.empty()` (`.h:235`, `HasStaging` `.h:108-111`) | `!staging_.empty()` (`.h:176`, `HasStaging` `.h:89-92`); see below |
+| `hasStaging` | `!staging_.empty()` (`.h:235`, `HasStaging` `.h:108-111`); see below | `!staging_.empty()` (`.h:176`, `HasStaging` `.h:89-92`); see below |
 
 The two classes settle the same way but decide their status differently:
 
@@ -33,13 +34,15 @@ underflow branch is a no-op. The sender's `EndSendOpLocked` (`send.cc:189-196`)
 decrements unconditionally; the send model records an underflow instead of
 reusing the no-op so that its absence can be proved. `beginOp` transcribes
 `TryBeginRecvOp` (`recv.h:115-120`) and the sender's `if (draining_) return;
-++in_flight_` pattern (`send.cc:331-332, 379-383, 415-422`), which refuses on
+++in_flight_` pattern (`send.cc:331-332, 379-383, 415-421`), which refuses on
 `draining_` alone; the two agree under `Consistent`.
 
-The sender acquires its staging inside `StartPush` rather than at creation. Its
-model starts `Lifecycle` with `hasStaging = true` all the same and reads the
-flag as "not yet released": the slot is actually held iff the flag is set and
-the acquisition happened.
+The sender acquires its staging inside `StartPush` rather than at creation (and
+on the receiver, `RegisterRecv`, fixed-slot `InitFromActivePlan`, and
+caller-supplied `local_host_block_ids` in `AllocateStagingForLoad` leave
+`staging_` empty at creation). Both models start `Lifecycle` with
+`hasStaging = true` and read the flag as "not yet released": the slot is
+actually held iff the flag is set and the acquisition happened.
 
 `Consistent` is the invariant of the protocol on its own: a settled session has
 nothing in flight and no staging, and a draining session settles as soon as its
@@ -402,8 +405,9 @@ Audit of the `done_` mentions in the receiver's lifecycle guards (`recv` at
   (`.cc:541`) and `ExecuteLayerH2d` (`.cc:586`, `.cc:612`) is `draining_` —
   `Consistent.done_or_draining`.
 
-The sender has the same two: `send.cc:168` (`draining_ || done_`) and
-`send.cc:191` (`!done_`).
+The sender has `FinishLocked` (`send.cc:168`, `draining_ || done_`) and
+`EndSendOpLocked` (`send.cc:191`, `!done_`), plus `draining_ || done_` in
+`AcquireStagingWithRetry` (`send.cc:238, 252`) and `StartPush` (`send.cc:299`).
 
 The primed functions below are the transcriptions with those guards removed.
 They agree with the originals on every `Consistent` lifecycle, and every

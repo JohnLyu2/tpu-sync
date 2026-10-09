@@ -153,8 +153,9 @@ at `50b0774`.
     after the caller has been told the read failed (shape A).
   - If the deadline fires during the pull, the caller is told the read
     failed while the DMA continues (shape B).
-  - The header says the host staging blocks are returned to the pool "once
-    the read settles, success or failure" (`:1134-1138`). A late pull
+  - The comment in `PullAndRelease` says the host staging blocks are returned
+    to the pool "once the read settles, success or failure" (`:1134-1138`; see
+    also `raiden_controller.h:180-182`). A late pull
     therefore writes into staging blocks that were freed and reallocated,
     and into device blocks the caller may already be refilling.
 - **Lean results:**
@@ -223,7 +224,8 @@ at `50b0774`.
     vllm-torchtpu code calls `TransferBuffers` directly.
   - **Orphaned-copy half: reachable from production.** Fetch and WriteRemote
     pass remote worker endpoints, so they go through the node_id matching
-    loop. If some workers match and a later one does not, `:722` / `:737`
+    loop. If some workers match and a later one does not,
+    `raiden_controller.cc:722` / `:737`
     return after the earlier workers were dispatched. Fetch then awaits the
     error, unpins its source blocks (`unpin_cleanup`,
     `kv_cache_store_service.cc:475`) and fails the RPC; the client's
@@ -271,11 +273,14 @@ at `50b0774`.
   - The slot is taken *before* the handshake because the pull request
     carries the allocated host block ids (`transfer_receive_session.cc:468`);
     lazy allocation after the peer answers is not an option.
-  - It is released only in `SettleLocked()` once no copy or push is in flight
-    (the `inFlight = 0` rule of the Lean model), so cancelling a read to a
-    dead peer does not return its slot before the deadline.
+  - It is released only in `FinishLocked()` / `EndRecvOpLocked()` via
+    `ReleaseStagingLocked()` once no copy or push is in flight
+    (`Lifecycle.settleLocked` / the `inFlight = 0` rule of the Lean model), so
+    cancelling a read to a dead peer does not return its slot before the
+    deadline.
   - On `ResourceExhausted`, `StartRead` puts the request in `failed_recving_`
-    and returns (`:868-870`). No queueing: the read is rejected, not delayed.
+    and returns (`kv_cache_manager_with_transfer.cc:868-870`). No queueing: the
+    read is rejected, not delayed.
   - Nothing bounds how many slots one peer may hold. The September changes
     bound how *long*: control-plane deadline (`430089c`, PR #1010, the
     thread-pool half of issue #888), per-read socket timeouts (`e7c933f`,
@@ -360,7 +365,7 @@ at `50b0774`.
 The transport dispatches a layer before counting its blocks
 (`block_transport.cc:607` then `:615`); `total_blocks_` is summed across
 senders; the `network_completed_` disjunct is an intentional fast path. The
-stage-2 model proves readiness sound under this ordering
+receive-session model proves readiness sound under this ordering
 (`Transfer/PrefillDecode/Receive.lean`, assumption A4, `ReadinessSound`).
 
 ### R-B. Stale push after a same-uuid retry: not reachable from vLLM
@@ -396,7 +401,8 @@ rather than a design choice.
 ### R-E. Local `KVCacheStore::Load` reads host blocks that could be evicted mid-copy: REFUTED (read)
 
 Both `Load` overloads require that the caller already holds a pin on every
-hash; eviction skips pinned entries (`host_offload_backend.cc:815`).
+hash; eviction skips pinned entries (`host_offload_backend.cc:667, 815`,
+`lru_cache.h:258-294`).
 
 ### R-F. Fetch-source (production remote load) unpins before the pull finishes: REFUTED (read)
 
@@ -454,7 +460,7 @@ clone reset. Results, verbatim:
   Re-checked by diff: `raiden_controller.cc` byte-identical to `01ffa3d`
   (F2, F3, F4 numbers hold); the F1 regions of `kv_cache_store.cc`
   (`ValidateAndPinHostBlocks`, `Evict`/`Insert`) unchanged, lines moved by
-  +11 (`:1655-1683` → `:1666-1694`); F4 fix PR #1105 still open, not merged.
+  +11 (1655–1683 at `01ffa3d` → `kv_cache_store.cc:1666-1694`); F4 fix PR #1105 still open, not merged.
   No finding fixed. Line numbers in this file and in `filed_bugs.md`
   re-pinned to `50b0774`; both patches still apply cleanly.
 - 2026-10-07: F5 added. Confirmed on `50b0774` by running the owners' parked

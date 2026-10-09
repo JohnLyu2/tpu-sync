@@ -154,15 +154,15 @@
     table.header[Buffer][Pool owner][When a request's buffer is recycled to a later request],
     [*Prefill HBM*],
     [Prefill serving engine],
-    [As soon as prefill's `poll_stats()` reports `done_sending` or `failed_sending`, the prefill engine frees the HBM blocks and reuses them for a new request.],
+    [As soon as prefill's `poll_stats()` reports `done_sending` or `failed_recving`, the prefill engine frees the HBM blocks and reuses them for a new request.],
 
     [*Prefill staging*],
     [TPU Sync `StagingBlockAllocator`],
-    [Inside `TransferSendSession::SettleLocked()`, the instant the send session settles (`done_ = true`) its host staging buffer is returned to `StagingBlockAllocator` and reused.],
+    [Inside `TransferSendSession::FinishLocked()` / `EndSendOpLocked()` (`Lifecycle.settleLocked`), the instant the send session settles (`done_ = true`) its host staging buffer is returned to `StagingBlockAllocator` and reused.],
 
     [*Decode staging*],
     [TPU Sync `StagingBlockAllocator`],
-    [Inside `TransferReceiveSession::SettleLocked()`, the instant the receive session settles (`done_ = true`) its host staging buffer is returned to `StagingBlockAllocator` and reused.],
+    [Inside `TransferReceiveSession::FinishLocked()` / `EndRecvOpLocked()` (`Lifecycle.settleLocked`), the instant the receive session settles (`done_ = true`) its host staging buffer is returned to `StagingBlockAllocator` and reused.],
 
     [*Decode HBM*],
     [Decode serving engine],
@@ -277,7 +277,7 @@
     [*Block Transport*\ `BlockTransport`],
     [KV block →\ layer],
     [Counts arrived KV blocks for each transformer layer and notifies the receive session (`begin/end_incoming_push`, `OnLayerReceived(l)` when all blocks of layer $l$ land, `OnBlocksReceived`).],
-    [*Callbacks modeled;*\ blocks abstracted],
+    [*Callbacks &*\ `BlockOrdering`],
 
     [*Raw Buffer Transport*\ `RawBufferTransport`],
     [Byte chunk /\ TCP socket],
@@ -286,12 +286,12 @@
   )
 
   #v(0.2em)
-  Because every session decision (`StartPush`, `SendNextLayer(l)`, `OnLayerReceived(l)`, `ExecuteLayerH2d(l)`) acts on a complete *transformer layer*, the Lean model tracks one slot per transformer layer rather than individual KV blocks or TCP chunks.
+  Because every session decision (`StartPush`, `SendNextLayer(l)`, `OnLayerReceived(l)`, `ExecuteLayerH2d(l)`) acts on a complete *transformer layer*, `Pipeline` tracks one slot per layer while `BlockOrdering` refines each layer into blocks.
 ]
 
 // ---------------------------------------------------------------------------
 #slide[Modeling state: module hierarchy & layer-indexed memories][
-  The Lean formalization builds the system state in four modular layers from top-level requests down to primitive session locks:
+  The Lean formalization builds the system state in four core layers from top-level requests down to primitive session locks (plus companion modules `BlockOrdering`, `UuidTable`, `PeerIsolation`, `ReceivePoll`, and `PipelineChecks`):
 
   #v(0.3em)
   #cols(columns: (0.85fr, 1.45fr))[
@@ -416,7 +416,7 @@
 
 // ---------------------------------------------------------------------------
 #slide[Validating the model: translating unit tests to Lean][
-  To check that the Lean model faithfully captures the production C++ behavior (without over-constraining valid runs), we replay all 52 `tpu-sync` unit and E2E tests inside the model before proving general theorems:
+  To check that the Lean model faithfully captures the production C++ behavior (without over-constraining valid runs), we replay all 56 `tpu-sync` unit and E2E tests inside the model before proving general theorems:
 
   #v(0.25em)
   #let pill(title, sub) = block(
@@ -430,17 +430,17 @@
   #grid(
     columns: (1fr, auto, 1fr, auto, 1fr),
     column-gutter: 0.6em,
-    pill[1 · Production test][Tests *one* fixed schedule in C++ or Python (`52` tests total)],
+    pill[1 · Production test][Tests *one* fixed schedule in C++ or Python (`56` tests total)],
     align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
     pill[2 · Lean trace (`by decide`)][Executes that exact scenario step-by-step inside the Lean model],
     align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
     pill[3 · Lean theorem][Proves the property holds across *every* thread & DMA schedule],
   )
 
-  #v(0.35em)
+  #v(0.3em)
   *Example: mid-H2D failure on a 2-layer receive (`FailedLayerWaitsForOtherH2dCopies`)*
   #v(0.2em)
-  #cols(columns: (0.94fr, 1.06fr))[
+  #cols(columns: (0.80fr, 1.20fr))[
     #block(fill: luma(247), stroke: 0.5pt + luma(222), radius: 4pt, inset: 11pt, width: 100%)[
       #text(fill: accent, weight: "medium", size: 14pt)[C++ unit test (`..._send_drain_test.cc`)]
       #v(0.3em)
@@ -448,29 +448,28 @@
       #set list(spacing: 0.55em)
       - Issues H2D copies for *Layer 0* and *Layer 1*.
       - *Layer 0 fails* while *Layer 1* is still copying.
-      - Asserts that staging stays pinned (`!done()`) and failure is not published until *Layer 1* finishes.
+      - Asserts that staging stays pinned (`!Done()`) and failure is not published until *Layer 1* finishes.
       - #text(fill: muted)[Covers $L = 2$ and 1 failure order.]
     ]
   ][
-    #set text(size: 11.5pt)
     ```lean
     -- 1. Executable trace (replays C++ test)
     theorem trace_failed_h2d_waits_for_other_layer :
-      ∃ s1 s2,
-        run 2 init2 [..., h2dCallback false] = some s1 ∧
-        !s1.life.done ∧ s1.life.hasStaging ∧
-        run 2 s1 [h2dReady, h2dCallback true,
-                  pollPublish] = some s2 ∧
-        s2.life.done ∧ s2.published = some false := by decide
+      let pre := [..., .h2dReady, .h2dDone false]
+      ((sysPush 2).run pre).map (fun s =>
+        (!s.life.done, s.life.hasStaging)) = some (true,true) ∧
+      ((sysPush 2).run (pre ++ [.h2dReady, .h2dDone true,
+                                .publish])).map (fun s =>
+        (s.life.done, s.published)) = some (true, some false)
+        := by decide
     -- 2. General theorem (all L & all schedules)
-    theorem reachable_safe : Reachable n s →
-      SettleSafe s ∧ StagingIntegrity s
+    theorem reachable_safe : (sysPush n).Reachable s → Safe s
     ```
   ]
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Validating the model: 52 production tests covered in Lean][
+#slide[Validating the model: 56 production tests covered in Lean][
   #v(0.15em)
   #let cat(title, count, mod, bullets) = block(
     fill: luma(247), stroke: 0.5pt + luma(222), radius: 4pt,
@@ -492,7 +491,7 @@
     columns: (1fr, 1fr),
     column-gutter: 0.9em,
     row-gutter: 0.65em,
-    cat[1 · Session drain & leases][21 C++][`Send` / `Receive`][
+    cat[1 · Session drain & leases][27 C++][`Send` / `Receive`][
       - Mid-copy failures & deadlines wait for all in-flight DMA copies
       - Incoming TCP push leases pin host staging; first `Finish` wins
     ],
@@ -508,11 +507,11 @@
       - Expired receive (`draining && !done`) blocks UUID reuse until drained
       - Protects live send offers; idempotent on repeated same-request reads
     ],
-    cat[5 · Multi-peer fault isolation][5 C++][`PeerIsolation`][
+    cat[5 · Multi-peer fault isolation][4 C++][`PeerIsolation`][
       - Models TCP worker-pool blocking (Issue \#888) vs. async gRPC
       - Per-peer staging quota stops a wedged peer from starving others
     ],
-    cat[6 · Multi-layer & multi-request][3 E2E][`MultiRequest`][
+    cat[6 · Multi-layer & multi-request][2 C++ · 3 E2E][`Pipeline` / `MultiRequest`][
       - Out-of-order layer completion across D2H, H2H, and H2D stages
       - Continuous HBM & host staging recycling across concurrent requests
     ],
@@ -572,7 +571,7 @@
 
   #stack(
     spacing: 0.85em,
-    title-card[1][Extend the formalization to reshard & KV cache storage],
+    title-card[1][Extend the formalization: reshard, KV cache storage & lower-level transport (`RawBufferTransport`)],
     title-card[2][Bug hunting & fixes],
     disc-card[3][Discussion with the team: how can the Lean model help day-to-day?][
       - *Developer understanding:* Does the state-machine view and explicit invariants help engineers build a clearer mental model of the C++ protocol?

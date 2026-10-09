@@ -7,7 +7,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 Models a decode consumer (`KVCacheManagerWithTransfer`) pulling KV caches from
 multiple prefill producers concurrently (`Peer.sick` vs. `Peer.healthy`) across
 the two finite consumer resources shared by `StartRead`
-(`tpu_sync/core/kv_cache_manager_with_transfer.cc:811-906`,
+(`tpu_sync/core/kv_cache_manager_with_transfer.cc:810-906`,
 `tpu_sync/core/transfer_receive_session.cc:214-260, 459-527`,
 `tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc:684-1089`,
 tpu-sync `50b0774`):
@@ -18,8 +18,11 @@ tpu-sync `50b0774`):
    because `PullStreamRequestSpec` sends the allocated host block IDs
    (`dst_block_ids`) to the producer (`recv.cc:468`). The session starts at
    `Recv.initLoad numLayers` (`inFlight = 1, pullPending = true, hasStaging = true`)
-   and holds its staging slot until `SettleLocked()` sets `hasStaging = false`
-   when `draining = true ∧ inFlight = 0` (`mgr.cc:1294`). If no staging slot can
+   and holds its staging slot until `Lifecycle.settleLocked`
+   (`FinishLocked` / `EndRecvOpLocked` → `ReleaseStagingLocked` →
+   `StagingBlockAllocator::ReleaseSlot`, `recv.cc:353-355, 368-372, 392-396`,
+   `mgr.cc:1294-1300`) sets `hasStaging = false` when
+   `draining = true ∧ inFlight = 0`. If no staging slot can
    be acquired, `StartRead` immediately records the request in
    `failed_recving_` (`mgr.cc:869`).
 
@@ -58,14 +61,16 @@ tpu-sync `50b0774`):
      `trace_grpc_healthy_progresses_under_backlog`).
 
 3. **Staging-slot starvation counterexample & per-peer quota fix
-   (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`, `:1034-1093`):**
+   (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`,
+   `kv_cache_manager_with_transfer_control_test.cc:1030-1089`):**
    - Under the shipping `SlotPolicy.unboundedPerPeer`, `numSlots` wedged reads
      to `Peer.sick` exhaust `freeSlots = 0` (even if their session deadlines
      expire via `.cancel`, since `inFlight = 1` keeps their staging pinned until
      `pullReply false`). A subsequent `StartRead` to `Peer.healthy` fails slot
      allocation immediately (`trace_sick_peer_starves_staging_slots`, plus the
      bounded model check counterexample).
-   - Under `SlotPolicy.perPeerQuota maxPerPeer` (`:1042-1044`), `Peer.sick` can
+   - Under `SlotPolicy.perPeerQuota maxPerPeer`
+     (`kv_cache_manager_with_transfer_control_test.cc:1038-1040`), `Peer.sick` can
      hold at most `maxPerPeer` slots (`reachable_sick_staging_le_quota`). Thus
      whenever `maxPerPeer < numSlots` and `Peer.healthy` has fewer than
      `min maxPerPeer (numSlots - maxPerPeer)` active sessions (in particular,
@@ -179,7 +184,7 @@ def allowedForPeer (p : Peer) (e : Recv.Ev) : Bool :=
     | _ => true
 
 inductive Ev where
-  /-- `StartRead` for target `peer` (`mgr.cc:811-906`). -/
+  /-- `StartRead` for target `peer` (`mgr.cc:810-906`). -/
   | startRead (peer : Peer)
   /-- `push_pool_` worker dispatches `SendPullRequest` for session `idx`
   (`recv.cc:513-526`). -/
@@ -806,7 +811,8 @@ theorem trace_sick_peer_starves_staging_slots :
   decide
 
 /-- Under `SlotPolicy.perPeerQuota 1` (`maxPerPeer = 1 < numSlots = 2`,
-`:1038-1040`), the second `StartRead` to `Peer.sick` is refused by the per-peer
+`kv_cache_manager_with_transfer_control_test.cc:1038-1040`), the second
+`StartRead` to `Peer.sick` is refused by the per-peer
 quota, leaving a staging slot free so `Peer.healthy` is admitted and completes
 its transfer to `published = some true` with `rejectedHealthy = false`. -/
 theorem trace_per_peer_quota_admits_healthy :
@@ -838,8 +844,8 @@ def checkEvents : List Ev :=
    .sessStep 1 .h2dReady, .sessStep 1 (.h2dDone true), .sessStep 1 .publish]
 
 /-- Violation predicate for `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`:
-the first `StartRead` to `Peer.healthy` (`peerStaging .healthy ≤ 1` and no prior
-healthy session) is rejected at admission (`rejectedHealthy = true`). -/
+the first `StartRead` to `Peer.healthy` (`peerStaging .healthy s.sessions = 0` and
+no prior healthy session) is rejected at admission (`rejectedHealthy = true`). -/
 def starvesFirstHealthy (s : State) : Bool :=
   s.rejectedHealthy &&
   (s.sessions.filter (fun e => e.peer == .healthy)).isEmpty

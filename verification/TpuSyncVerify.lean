@@ -22,10 +22,13 @@ subsystem of `tpu_sync/` they describe:
 * `Common` — the transition-system core, list/pigeonhole lemmas, and a bounded
   model checker shared by every model.
 * `Transfer` — the session-based KV transfer path (`tpu_sync/core/transfer_*`,
-  `tpu_sync/transport`). `Transfer.PrefillDecode` is the prefill-to-decode
-  model of `proposal.md`, built up in stages through single-request (`Pipeline`)
-  and multi-request (`MultiRequest`) proofs plus executable checks
-  (`PipelineChecks`).
+  `tpu_sync/core/kv_cache_manager_with_transfer.*`, `tpu_sync/transport`):
+  shared session lifecycle (`Transfer.Session`), and under
+  `Transfer.PrefillDecode` the consumer and producer sessions (`Receive`,
+  `ReceivePoll`, `Send`), single- and multi-request pipelines (`Pipeline`,
+  `MultiRequest`, `PipelineChecks`), multi-peer fault isolation (`PeerIsolation`),
+  UUID registration table (`UuidTable`), and block-level gather/reordering/coalescing
+  (`BlockOrdering`).
 * `Controller` — `RaidenController` (`tpu_sync/core/controller`).
   `Controller.ReadRemote` is the exhaustive check behind finding F2 in
   `findings/`.
