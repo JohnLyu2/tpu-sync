@@ -514,65 +514,57 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     ]
 
   def test_multi_numa_endpoints_and_metrics(self):
-    os.environ["ENABLE_MULTI_NUMA"] = "1"
-    try:
-      tensors = self._make_tensors(num_layers=2, num_shards=2)
-      ws = WeightSynchronizer(
-          tensors,
-          local_port=0,
-          parallelism=2,
-          auto_h2d=True,
-      )
-      self.assertEqual(ws.num_layers, 2)
-      self.assertEqual(ws.num_shards, 2)
-      self.assertIsNotNone(ws.local_port)
+    tensors = self._make_tensors(num_layers=2, num_shards=2)
+    ws = WeightSynchronizer(
+        tensors,
+        local_port=0,
+        parallelism=2,
+        auto_h2d=True,
+    )
+    self.assertEqual(ws.num_layers, 2)
+    self.assertEqual(ws.num_shards, 2)
+    self.assertIsNotNone(ws.local_port)
 
-      eps = ws.get_local_endpoints()
-      self.assertNotEmpty(eps)
-      all_shards = []
-      for ep in eps:
-        self.assertIn("endpoint", ep)
-        self.assertIn("shards", ep)
-        all_shards.extend(ep["shards"])
-      self.assertEqual(sorted(all_shards), [0, 1])
+    eps = ws.get_local_endpoints()
+    self.assertNotEmpty(eps)
+    all_shards = []
+    for ep in eps:
+      self.assertIn("endpoint", ep)
+      self.assertIn("shards", ep)
+      all_shards.extend(ep["shards"])
+    self.assertEqual(sorted(all_shards), [0, 1])
 
-      ws.test_only_set_skip_tiling(True)
-      ws.test_only_set_skip_tiling([True, False])
+    ws.test_only_set_skip_tiling(True)
+    ws.test_only_set_skip_tiling([True, False])
 
-      metrics = ws.get_metrics()
-      self.assertIn("last_d2h_time_ms", metrics)
-      self.assertIn("total_d2h_time_ms", metrics)
-      self.assertIn("total_h2h_bandwidth_gbps", metrics)
-      ws.reset_metrics()
-    finally:
-      os.environ["ENABLE_MULTI_NUMA"] = "0"
+    metrics = ws.get_metrics()
+    self.assertIn("last_d2h_time_ms", metrics)
+    self.assertIn("total_d2h_time_ms", metrics)
+    self.assertIn("total_h2h_bandwidth_gbps", metrics)
+    ws.reset_metrics()
 
   def test_multi_numa_push_weights_e2e(self):
-    os.environ["ENABLE_MULTI_NUMA"] = "1"
-    try:
-      dst_tensors = self._make_tensors(num_layers=1, num_shards=2)
-      src_tensors = self._make_tensors(num_layers=1, num_shards=2)
-      ws_dst = WeightSynchronizer(
-          dst_tensors,
-          local_port=0,
-          parallelism=4,
-          auto_h2d=True,
-      )
-      ws_src = WeightSynchronizer(
-          src_tensors,
-          local_port=0,
-          parallelism=4,
-      )
-      eps = ws_dst.get_local_endpoints()
-      peers = (
-          [ep["endpoint"] for ep in eps]
-          if eps
-          else [f"127.0.0.1:{ws_dst.local_port}"]
-      )
-      ws_src.push_weights(peers)
-      ws_dst.h2d()
-    finally:
-      os.environ["ENABLE_MULTI_NUMA"] = "0"
+    dst_tensors = self._make_tensors(num_layers=1, num_shards=2)
+    src_tensors = self._make_tensors(num_layers=1, num_shards=2)
+    ws_dst = WeightSynchronizer(
+        dst_tensors,
+        local_port=0,
+        parallelism=4,
+        auto_h2d=True,
+    )
+    ws_src = WeightSynchronizer(
+        src_tensors,
+        local_port=0,
+        parallelism=4,
+    )
+    eps = ws_dst.get_local_endpoints()
+    peers = (
+        [ep["endpoint"] for ep in eps]
+        if eps
+        else [f"127.0.0.1:{ws_dst.local_port}"]
+    )
+    ws_src.push_weights(peers)
+    ws_dst.h2d()
 
   def test_explicit_global_shard_indices(self):
     tensors = self._make_tensors(num_layers=2, num_shards=2)
