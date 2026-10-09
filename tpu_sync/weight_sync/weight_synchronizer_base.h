@@ -185,9 +185,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                 size_t shard_idx) const override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
 
+  // Returns the tiling scratchpad of `shard_idx`, shared by all layers. The
+  // pointer may be reallocated by a later H2D/D2H that needs more space.
   uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) {
     if (shard_idx < tiled_scratchpads_.size() &&
         tiled_scratchpads_[shard_idx]) {
+      absl::MutexLock lock(tiled_scratchpads_[shard_idx]->mu);
       return tiled_scratchpads_[shard_idx]->ptr;
     }
     return nullptr;
@@ -195,6 +198,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   const uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) const {
     if (shard_idx < tiled_scratchpads_.size() &&
         tiled_scratchpads_[shard_idx]) {
+      absl::MutexLock lock(tiled_scratchpads_[shard_idx]->mu);
       return tiled_scratchpads_[shard_idx]->ptr;
     }
     return nullptr;
@@ -449,18 +453,20 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // allocating redundant tiled staging buffers across all layers.
   struct ShardScratchpad {
     absl::Mutex mu;
-    uint8_t* ptr = nullptr;
-    size_t capacity = 0;
-    std::shared_ptr<void> owner;
-    std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer = {nullptr,
-                                                                [](void*) {}};
-    xla::Future<> in_flight_future;
+    uint8_t* ptr ABSL_GUARDED_BY(mu) = nullptr;
+    size_t capacity ABSL_GUARDED_BY(mu) = 0;
+    std::shared_ptr<void> owner ABSL_GUARDED_BY(mu);
+    std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer ABSL_GUARDED_BY(
+        mu) = {nullptr, [](void*) {}};
+    // Copy that still reads (H2D) or writes (D2H) |ptr|. Awaited before the
+    // buffer is reused or reallocated.
+    xla::Future<> in_flight_future ABSL_GUARDED_BY(mu);
   };
   std::vector<std::unique_ptr<ShardScratchpad>> tiled_scratchpads_;
 
   absl::StatusOr<uint8_t*> AcquireTiledScratchpadLocked(
       ShardScratchpad& sp, size_t required_bytes,
-      const xla::PjRtDevice* device);
+      const xla::PjRtDevice* device) ABSL_EXCLUSIVE_LOCKS_REQUIRED(sp.mu);
 
   // Returns the per-layer skip-tiling mask for |uuid|, falling back to the
   // latest mask set via SetSkipTiling() and then to all-false.
