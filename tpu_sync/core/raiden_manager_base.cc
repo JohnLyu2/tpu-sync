@@ -29,6 +29,7 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -36,8 +37,10 @@
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "xla/future.h"
 #include "tpu_sync/common/trace.h"
+#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
@@ -133,6 +136,33 @@ void RaidenManagerBase::StopTransportServer() {
   if (server_) {
     server_.reset();
   }
+}
+
+xla::Future<> RaidenManagerBase::ForEachShardNumaLocal(
+    tpu_raiden::NumaThreadPool& pool,
+    absl::AnyInvocable<xla::Future<>(size_t shard_idx) const> fn) {
+  std::shared_ptr<const absl::AnyInvocable<xla::Future<>(size_t) const>>
+      shared_fn = std::make_shared<
+          const absl::AnyInvocable<xla::Future<>(size_t) const>>(std::move(fn));
+  std::vector<xla::Future<>> shard_futures;
+  shard_futures.reserve(num_shards_);
+  for (size_t i = 0; i < num_shards_; ++i) {
+    auto [promise, future] = xla::MakePromise<>();
+    shard_futures.push_back(std::move(future));
+    pool.Schedule(
+        shard_numa_node(i),
+        [shared_fn, i, promise = std::move(promise).ToShared()]() {
+          xla::Future<> result = (*shared_fn)(i);
+          if (!result.IsValid()) {
+            promise->Set(absl::InternalError(
+                "ForEachShardNumaLocal: shard task returned no future"));
+            return;
+          }
+          std::move(result).OnReady(
+              [promise](const absl::Status& status) { promise->Set(status); });
+        });
+  }
+  return xla::JoinFutures(absl::MakeSpan(shard_futures));
 }
 
 void RaidenManagerBase::SetTestOnlyRateLimiters(

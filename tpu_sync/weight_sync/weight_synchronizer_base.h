@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"
@@ -34,6 +35,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -460,6 +462,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
+  // Runs ForEachShardNumaLocal()'s per-shard tasks (tiling, H2D/D2H issue).
+  // Separate from |h2d_pool_| so that H2d() never waits on tasks queued behind
+  // its own caller. It has one thread per shard, so a task on it must never
+  // block on another task of this pool (e.g. H2d() waiting for in-place tiling
+  // done by TileLayer()).
+  absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> shard_pool_;
   std::unique_ptr<HostMemoryAllocator> host_allocator_;
 
   // Shared reusable scratchpad per shard (one per local device/chip) to avoid
@@ -494,6 +502,14 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                                              bool tile);
   // Copies all shards of |layer_idx| to device via H2dShard().
   absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx, bool tile);
+  // Starts the device-to-host copy of shard |shard_idx| of layer |layer_idx|
+  // into its host staging buffer. If the shard has a tiled layout and
+  // |skip_tiling| is false, copies into the shard's scratchpad and detiles into
+  // the staging buffer once the copy completes, recording the detile time in
+  // |max_detile_ms| when non-null. Errors are returned as a failed future.
+  xla::Future<raiden::BufferHolder> D2hShard(
+      size_t layer_idx, size_t shard_idx, bool skip_tiling,
+      std::shared_ptr<std::atomic<double>> max_detile_ms);
   // A local shard and its schedule in a StartTransferRequest.
   struct ShardPushSchedule {
     size_t shard_idx;
@@ -517,15 +533,6 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                                             size_t shard_idx,
                                                             ShardScratchpad& sp)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(sp.mu);
-
-  // Returns the pool that runs H2d()'s per-shard tasks, creating it on first
-  // use. It is separate from |h2d_pool_| so that H2d() never waits on tasks
-  // queued behind its own caller.
-  tpu_raiden::NumaThreadPool* GetH2dShardPool();
-
-  absl::Mutex h2d_shard_pool_mu_;
-  std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_shard_pool_
-      ABSL_GUARDED_BY(h2d_shard_pool_mu_);
 
   // Per-layer in-place tiling state of the host staging buffers, indexed by
   // layer. A non-null entry means the layer's host buffers hold device-layout

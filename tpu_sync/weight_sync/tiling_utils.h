@@ -16,14 +16,11 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_WEIGHT_SYNC_TILING_UTILS_H_
 
 #include <cstdint>
+#include <optional>
 
 #include "absl/status/status.h"
 #include "xla/layout.h"
 #include "xla/shape.h"
-
-namespace tpu_raiden {
-class NumaThreadPool;
-}  // namespace tpu_raiden
 
 namespace tpu_raiden::weight_sync {
 
@@ -40,15 +37,20 @@ bool IsStandardColMajorTiled(const xla::Shape& shape,
 // Calculates the total number of physical elements required for a tiled buffer.
 int64_t GetTiledBufferElements(const xla::Shape& shape);
 
+// Large tensors are tiled in parallel: one chunk on the calling thread and
+// the rest as helper tasks on a shared pool. When |numa_node| is set, the
+// helper tasks are pinned to that node; callers should pass the node of the
+// buffers so the copies stay NUMA-local.
+
 // Reconstructs a linear buffer from a tiled buffer based on shape and layout.
 absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
                           const xla::Shape& shape, const xla::Layout& layout,
-                          tpu_raiden::NumaThreadPool* pool = nullptr);
+                          std::optional<int> numa_node = std::nullopt);
 
 // Tiles a linear buffer based on shape and layout.
 absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
                         const xla::Shape& shape, const xla::Layout& layout,
-                        tpu_raiden::NumaThreadPool* pool = nullptr);
+                        std::optional<int> numa_node = std::nullopt);
 
 // Tiles a buffer in place based on shape and layout without allocating an
 // intermediate full-size buffer. |buffer| must have a capacity of at least
@@ -56,7 +58,7 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
 absl::Status TileBufferInPlace(uint8_t* buffer, size_t buffer_capacity,
                                const xla::Shape& shape,
                                const xla::Layout& layout,
-                               tpu_raiden::NumaThreadPool* pool = nullptr);
+                               std::optional<int> numa_node = std::nullopt);
 
 }  // namespace tpu_raiden::weight_sync
 

@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <thread>  // NOLINT
 #include <vector>
 
@@ -44,10 +45,10 @@ class TilingUtilsTest : public ::testing::TestWithParam<TilingMethod> {
  protected:
   absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
                           const xla::Shape& shape, const xla::Layout& layout,
-                          tpu_raiden::NumaThreadPool* pool = nullptr) const {
+                          std::optional<int> numa_node = std::nullopt) const {
     if (GetParam() == TilingMethod::kAllocatedMemory) {
       return ::tpu_raiden::weight_sync::TileBuffer(src_linear, dst_tiled, shape,
-                                                   layout, pool);
+                                                   layout, numa_node);
     }
     int64_t linear_bytes =
         xla::ShapeUtil::ElementsIn(shape) *
@@ -56,8 +57,8 @@ class TilingUtilsTest : public ::testing::TestWithParam<TilingMethod> {
         GetTiledBufferElements(shape) *
         xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
     std::memcpy(dst_tiled, src_linear, linear_bytes);
-    return ::tpu_raiden::weight_sync::TileBufferInPlace(dst_tiled, tiled_bytes,
-                                                        shape, layout, pool);
+    return ::tpu_raiden::weight_sync::TileBufferInPlace(
+        dst_tiled, tiled_bytes, shape, layout, numa_node);
   }
 };
 
@@ -1299,18 +1300,17 @@ TEST_P(TilingUtilsTest, ThresholdGatedTiling_SmallTensorInline) {
     src_linear[i] = static_cast<uint16_t>(i & 0x7FFF);
   }
 
-  tpu_raiden::NumaThreadPool pool(4);
   int64_t total_physical_elements = GetTiledBufferElements(shape);
   std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t), 0);
 
   EXPECT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                         dst_tiled.data(), shape, shape.layout(), &pool)
+                         dst_tiled.data(), shape, shape.layout())
                   .ok());
 
   std::vector<uint16_t> dst_linear(num_elements, 0);
   EXPECT_TRUE(DetileBuffer(dst_tiled.data(),
                            reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
-                           shape.layout(), &pool)
+                           shape.layout())
                   .ok());
 
   EXPECT_EQ(dst_linear, src_linear);
@@ -1337,25 +1337,58 @@ TEST_P(TilingUtilsTest, ThresholdGatedTiling_LargeTensorParallel) {
   std::vector<uint8_t> dst_tiled_par(total_physical_elements * sizeof(uint16_t),
                                      0);
 
-  // 1. Sequential baseline (pool = nullptr)
+  // Two independent parallel runs must agree bit for bit: the dynamic
+  // work-stealing split is non-deterministic across runs.
   EXPECT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                         dst_tiled_seq.data(), shape, shape.layout(), nullptr)
+                         dst_tiled_seq.data(), shape, shape.layout())
                   .ok());
-
-  // 2. Parallel path with injected 4-thread pool
-  tpu_raiden::NumaThreadPool pool(4);
   EXPECT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                         dst_tiled_par.data(), shape, shape.layout(), &pool)
+                         dst_tiled_par.data(), shape, shape.layout())
                   .ok());
-
-  // Bit-for-bit parity between sequential and parallel tiling
   EXPECT_EQ(dst_tiled_par, dst_tiled_seq);
 
   // Detile in parallel and verify full round-trip accuracy
   std::vector<uint16_t> dst_linear(num_elements, 0);
   EXPECT_TRUE(DetileBuffer(dst_tiled_par.data(),
                            reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
-                           shape.layout(), &pool)
+                           shape.layout())
+                  .ok());
+  EXPECT_EQ(dst_linear, src_linear);
+}
+
+TEST_P(TilingUtilsTest, ThresholdGatedTiling_ParallelPathPinnedToNumaNode) {
+  // Same parallel path with helper tasks pinned to NUMA node 0, which exists
+  // on every host. Output must match the sequential path bit for bit.
+  const int64_t H = 2048;
+  const int64_t W = 2048;
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {H, W}, {1, 0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})});
+
+  const int64_t num_elements = H * W;
+  std::vector<uint16_t> src_linear(num_elements);
+  for (int i = 0; i < num_elements; ++i) {
+    src_linear[i] = static_cast<uint16_t>(i % 32749);
+  }
+  int64_t total_physical_elements = GetTiledBufferElements(shape);
+  std::vector<uint8_t> dst_tiled_seq(total_physical_elements * sizeof(uint16_t),
+                                     0);
+  std::vector<uint8_t> dst_tiled_par(total_physical_elements * sizeof(uint16_t),
+                                     0);
+  ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                         dst_tiled_seq.data(), shape, shape.layout())
+                  .ok());
+
+  ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                         dst_tiled_par.data(), shape, shape.layout(),
+                         /*numa_node=*/0)
+                  .ok());
+  EXPECT_EQ(dst_tiled_par, dst_tiled_seq);
+
+  std::vector<uint16_t> dst_linear(num_elements, 0);
+  ASSERT_TRUE(DetileBuffer(dst_tiled_par.data(),
+                           reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+                           shape.layout(), /*numa_node=*/0)
                   .ok());
   EXPECT_EQ(dst_linear, src_linear);
 }
@@ -1363,8 +1396,9 @@ TEST_P(TilingUtilsTest, ThresholdGatedTiling_LargeTensorParallel) {
 TEST_P(TilingUtilsTest,
        ThresholdGatedTiling_InvokedFromWorkerThread_NoDeadlock) {
   // Test invoking TileBuffer on a large 8 MB tensor FROM WITHIN a worker thread
-  // of the same thread pool. This specifically tests against thread starvation
-  // deadlock.
+  // of another NumaThreadPool, as the per-shard tiling tasks do in production.
+  // The caller must not be mistaken for a shared-pool worker and must not
+  // starve while draining helper tasks.
   const int64_t H = 2048;
   const int64_t W = 2048;
   xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
@@ -1386,7 +1420,7 @@ TEST_P(TilingUtilsTest,
   auto future = pool.Schedule([&]() -> absl::Status {
     EXPECT_TRUE(tpu_raiden::NumaThreadPool::IsCurrentThreadWorker());
     return TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                      dst_tiled.data(), shape, shape.layout(), &pool);
+                      dst_tiled.data(), shape, shape.layout());
   });
 
   absl::Status status = future.get();
@@ -1398,7 +1432,7 @@ TEST_P(TilingUtilsTest,
     EXPECT_TRUE(tpu_raiden::NumaThreadPool::IsCurrentThreadWorker());
     return DetileBuffer(dst_tiled.data(),
                         reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
-                        shape.layout(), &pool);
+                        shape.layout());
   });
 
   absl::Status detile_status = detile_future.get();
@@ -1425,15 +1459,14 @@ TEST_P(TilingUtilsTest, ThresholdGatedTiling_LargeTensorWithPadding) {
   int64_t total_physical_elements = GetTiledBufferElements(shape);
   std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t), 0);
 
-  tpu_raiden::NumaThreadPool pool(4);
   EXPECT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                         dst_tiled.data(), shape, shape.layout(), &pool)
+                         dst_tiled.data(), shape, shape.layout())
                   .ok());
 
   std::vector<uint16_t> dst_linear(num_elements, 0);
   EXPECT_TRUE(DetileBuffer(dst_tiled.data(),
                            reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
-                           shape.layout(), &pool)
+                           shape.layout())
                   .ok());
 
   EXPECT_EQ(dst_linear, src_linear);
@@ -1456,11 +1489,11 @@ TEST_P(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
                                0);
     std::vector<uint16_t> dst(num_elements, 0);
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src.data()),
-                           tiled.data(), shape, shape.layout(), nullptr)
+                           tiled.data(), shape, shape.layout())
                     .ok());
     ASSERT_TRUE(DetileBuffer(tiled.data(),
                              reinterpret_cast<uint8_t*>(dst.data()), shape,
-                             shape.layout(), nullptr)
+                             shape.layout())
                     .ok());
     EXPECT_EQ(dst, src);
   }
@@ -1495,12 +1528,11 @@ TEST_P(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
     threads.emplace_back([&, s]() {
       ASSERT_TRUE(
           TileBuffer(reinterpret_cast<const uint8_t*>(shard_srcs[s].data()),
-                     shard_tiled[s].data(), shape, shape.layout(),
-                     /*pool=*/nullptr)
+                     shard_tiled[s].data(), shape, shape.layout())
               .ok());
       ASSERT_TRUE(DetileBuffer(shard_tiled[s].data(),
                                reinterpret_cast<uint8_t*>(shard_dsts[s].data()),
-                               shape, shape.layout(), /*pool=*/nullptr)
+                               shape, shape.layout())
                       .ok());
     });
   }
@@ -1809,14 +1841,13 @@ TEST_P(TilingUtilsTest, ColMajor_Packed_S8_And_MultiBatch3D_And_Parallel) {
     int64_t total_physical_elements = GetTiledBufferElements(shape);
     std::vector<uint8_t> dst_tiled(total_physical_elements * sizeof(uint16_t),
                                    0);
-    tpu_raiden::NumaThreadPool pool(4);
     ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
-                           dst_tiled.data(), shape, shape.layout(), &pool)
+                           dst_tiled.data(), shape, shape.layout())
                     .ok());
     std::vector<uint16_t> dst_linear(num_elements, 0);
     ASSERT_TRUE(DetileBuffer(dst_tiled.data(),
                              reinterpret_cast<uint8_t*>(dst_linear.data()),
-                             shape, shape.layout(), &pool)
+                             shape, shape.layout())
                     .ok());
     EXPECT_EQ(dst_linear, src_linear);
   }

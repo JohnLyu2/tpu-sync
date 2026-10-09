@@ -21,15 +21,19 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "xla/future.h"
+#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tpu_utils.h"
@@ -222,7 +226,55 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   absl::Status OnDataReceived(uint64_t uuid = 0) override {
     return absl::OkStatus();
   }
+
+  // Runs |fn| once per shard, concurrently, each as a task on |pool| pinned to
+  // that shard's NUMA node so host-side work on the shard's buffers touches
+  // local memory. Returns as soon as the tasks are scheduled; the returned
+  // future is the join of the futures returned by |fn|, indexed by shard, and
+  // fails with the first error. Shard tasks never block on those futures. |fn|
+  // outlives this call and is invoked concurrently, so it must own its state
+  // and be const-callable. |pool| must outlive the scheduled tasks.
+  template <typename T>
+  xla::Future<std::vector<T>> ForEachShardNumaLocal(
+      tpu_raiden::NumaThreadPool& pool,
+      absl::AnyInvocable<xla::Future<T>(size_t shard_idx) const> fn);
+  // Same, for |fn| without a result.
+  xla::Future<> ForEachShardNumaLocal(
+      tpu_raiden::NumaThreadPool& pool,
+      absl::AnyInvocable<xla::Future<>(size_t shard_idx) const> fn);
 };
+
+template <typename T>
+xla::Future<std::vector<T>> RaidenManagerBase::ForEachShardNumaLocal(
+    tpu_raiden::NumaThreadPool& pool,
+    absl::AnyInvocable<xla::Future<T>(size_t shard_idx) const> fn) {
+  std::shared_ptr<const absl::AnyInvocable<xla::Future<T>(size_t) const>>
+      shared_fn = std::make_shared<
+          const absl::AnyInvocable<xla::Future<T>(size_t) const>>(
+          std::move(fn));
+  std::vector<xla::Future<T>> shard_futures;
+  shard_futures.reserve(num_shards_);
+  // One task per shard, pinned to that shard's NUMA node. The task forwards
+  // the future returned by |fn| into the shard's promise without blocking on
+  // it.
+  for (size_t i = 0; i < num_shards_; ++i) {
+    auto [promise, future] = xla::MakePromise<T>();
+    shard_futures.push_back(std::move(future));
+    pool.Schedule(
+        shard_numa_node(i),
+        [shared_fn, i, promise = std::move(promise).ToShared()]() {
+          xla::Future<T> result = (*shared_fn)(i);
+          if (!result.IsValid()) {
+            promise->Set(absl::InternalError(
+                "ForEachShardNumaLocal: shard task returned no future"));
+            return;
+          }
+          std::move(result).OnReady(
+              [promise](const auto& value) { promise->Set(value); });
+        });
+  }
+  return xla::JoinFutures(absl::MakeSpan(shard_futures));
+}
 
 }  // namespace tpu_raiden
 
