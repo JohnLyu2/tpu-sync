@@ -5,12 +5,12 @@ import TpuSyncVerify.Transfer.Session
 /-!
 # Send session
 
-Stage 3 of the prefill-to-decode model: one `TransferSendSession` on the
+Producer side of the prefill-to-decode model: one `TransferSendSession` on the
 prefill (producer) side and the slice of `KVCacheManagerWithTransfer` that
 drives it. The sender stages each layer's device blocks into host staging
 (D2H), pushes the staging to the consumer (H2H) layer by layer, and must not
 let the engine reuse the device blocks, or the allocator reseat the staging,
-while any copy or push is still running. Memory contents come in stage 4.
+while any copy or push is still running. Memory contents are in `Pipeline.lean`.
 
 Citations are to tpu-sync `50b0774`.
 Unqualified `.h`/`.cc` are
@@ -127,7 +127,7 @@ All proved on every reachable state (`reachable_safe`):
 * **No underflow.** `EndSendOpLocked` never runs on an idle session.
 * **Publication.** `published = some true → h2hOk = numLayers`: when the
   engine is told `done_sending`, every layer's push completed OK. Counter-level
-  form of the proposal's *publication correctness* for the producer.
+  form of *publication correctness* for the producer.
 * **Counters.** The two chains are ordered:
   `d2hRetired ≤ d2hReady ≤ d2hIssued ≤ numLayers`,
   `woken ≤ queued ≤ d2hIssued`, `woken ≤ d2hReady`,

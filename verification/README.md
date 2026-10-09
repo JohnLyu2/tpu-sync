@@ -18,9 +18,10 @@ verification/
 │   │   └── PrefillDecode/                   # Receive, ReceivePoll, Send, Pipeline, MultiRequest,
 │   │                                        # PipelineChecks, PeerIsolation, UuidTable, BlockOrdering
 │   └── Controller/ReadRemote.lean           # exhaustive check behind finding F2
-├── docs/                                    # correspondence tables, results, upstream re-checks, future work
+├── agents/tpu-sync-lean-helper/             # Lean-backed Q&A and code-reasoning subagent
+├── docs/                                    # correspondence tables, results, upstream re-checks
 ├── findings/                                # bug-hunt write-up, repro tests, patches
-├── tools/repin_citations.py                 # moves file:line citations to a new upstream commit
+├── tools/                                   # repin_citations.py, run_lean.sh (stdin counterfactual runner)
 └── slides/                                  # Typst deck (prefill_decode.typ)
 ```
 

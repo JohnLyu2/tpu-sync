@@ -15,7 +15,7 @@ Citations and abbreviations are as there (tpu-sync `50b0774`).
   `(network_completed_ || num_completed_layers_ == total_layers) &&
   AllH2dDoneLocked()`.
 
-`TransferSendSession` has only the first. The proposal under review removes
+`TransferSendSession` has only the first. A design alternative removes
 the second (and with it `h2d_futures_`, `network_completed_` and the dead
 `if (all_complete)` finish in `OnBlocksReceived`, `.cc:560-575`). This module
 asks what the second way does today, and what changes without it.
@@ -44,7 +44,7 @@ What the earlier draining changes is the last callback's bookkeeping: it
 finds `draining_` set and skips `RecordTransferDuration`, `RecordH2dComplete`
 and `RecordEnd`. `RecvM` adds a ghost bit `metrics` for those calls and
 `stepM poll` runs the model with (`poll = true`, the shipping code) or without
-(`poll = false`, the proposal) the poll:
+(`poll = false`, the design alternative) the poll:
 
 * with the poll, `published = some true ∧ metrics = false` is reachable
   (`trace_poll_skips_metrics`; the bounded search finds it too);

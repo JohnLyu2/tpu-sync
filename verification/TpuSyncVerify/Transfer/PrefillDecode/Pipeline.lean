@@ -5,14 +5,14 @@ import TpuSyncVerify.Transfer.PrefillDecode.Send
 /-!
 # Prefill-to-decode pipeline
 
-Stage 4 of the prefill-to-decode model: one `Send` session, one `Recv` session
-and the five memories the KV data moves through between them. The sessions
-are the stage 1-3 models, used as-is; this file adds what they abstract away —
-*which bytes* each copy moves, and *which layer* each copy is for — and proves
-the proposal's publication correctness: when the decode engine is told
-`done_recving`, its HBM holds the prefill's KV cache. The buffer-safety
-properties of the proposal (prefill HBM reclaimed, staging released) turn
-out to be corollaries of the sessions' settle protocol and are stated here too.
+End-to-end single-request prefill-to-decode model: one `Send` session, one
+`Recv` session and the five memories the KV data moves through between them.
+The sessions are the `Send.lean` and `Receive.lean` models, used as-is; this
+file adds what they abstract away — *which bytes* each copy moves, and *which
+layer* each copy is for — and proves publication correctness: when the decode
+engine is told `done_recving`, its HBM holds the prefill's KV cache. Buffer
+safety properties (prefill HBM reclaimed, staging released) follow as
+corollaries of the sessions' settle protocol and are stated here too.
 
 Citations are to tpu-sync `50b0774`:
 `send.cc` is
@@ -117,7 +117,7 @@ All proved on every reachable state (`reachable_safe` and
 
 * **Publication correctness.** `recv.published = some true → decodeHbm = good n`:
   when the engine is told `done_recving`, decode HBM holds every layer of the
-  prefill's KV cache. First half of `proposal.md` §2 *Publication correctness*.
+  prefill's KV cache (`PublicationCorrect`).
 * **Decode HBM safety** (`DecodeHbmSafe`, `attention_safe`). Once the engine is
   told `done_recving` or `failed_recving` (`recv.published ≠ none`), no H2D copy
   is dispatching or writing to decode HBM (`pending = 0 ∧ retired = issued`);
@@ -125,12 +125,12 @@ All proved on every reachable state (`reachable_safe` and
   state reachable afterwards (`attention_safe`).
 * **Prefill HBM safety.** `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`:
   when the engine frees prefill HBM no D2H copy is dispatching or reading it,
-  and (since the send has settled) none will be issued. `proposal.md` §2
-  *Source buffer safety*.
+  and (since the send has settled) none will be issued (`PrefillHbmSafe`,
+  source buffer safety).
 * **Staging safety.** A send whose staging was released has no copy writing
   it and no push reading it; a receive whose staging was released has no push
-  writing it and no copy reading it. Safety half of `proposal.md` §2 *Staging
-  integrity & termination*. Both follow from `done → inFlight = 0` and the
+  writing it and no copy reading it (`StagingSafe`, staging
+  integrity & quietness). Both follow from `done → inFlight = 0` and the
   sessions' accounting of `in_flight_`.
 * **Handshake rendezvous safety** (`HandshakeSafe`). `StartPush`
   (`send.started = true`) and all D2H/H2H activity require the offer to have

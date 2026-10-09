@@ -5,14 +5,14 @@ import TpuSyncVerify.Transfer.Session
 /-!
 # Receive session
 
-Stages 1-2 of the prefill-to-decode model: one `TransferReceiveSession` on the
-decode (consumer) side and the slice of `KVCacheManagerWithTransfer` that
-drives it. Stage 1 is the session lifecycle — how in-flight work is counted,
-how the session drains and settles, when its host staging is released. Stage 2
-adds the transport's block accounting, the readiness predicate
+Consumer side of the prefill-to-decode model: one `TransferReceiveSession` on
+the decode (consumer) side and the slice of `KVCacheManagerWithTransfer` that
+drives it. Models the session lifecycle — how in-flight work is counted,
+how the session drains and settles, when its host staging is released — along
+with the transport's block accounting, the readiness predicate
 `IsReadyToComplete`, and the manager's poll that publishes `done_recving` /
-`failed_recving`. Layer data, memory contents and the producer come in later
-stages.
+`failed_recving`. Layer data, memory contents and the producer are modelled in
+`Send.lean` and `Pipeline.lean`.
 
 Citations are to tpu-sync `50b0774`. Unqualified `.h`/`.cc` are
 `tpu_sync/core/transfer_receive_session.{h,cc}`; `mgr.cc` is
@@ -103,8 +103,8 @@ All proved on every reachable state (`reachable_safe`):
   breaks without it).
 * **Publication.** `published = some true → completed = numLayers`: when the
   engine is told `done_recving`, every layer's H2D callback has run with an
-  OK status. Counter-level form of the proposal's *publication correctness*;
-  stage 4 adds the memory contents.
+  OK status. Counter-level form of *publication correctness*;
+  `Pipeline.lean` adds the memory contents.
 * **Counters.** `completed ≤ retired ≤ ready ≤ issued ≤ numLayers` and
   `layersAccounted ≤ issued`.
 * **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:

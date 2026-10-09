@@ -63,7 +63,7 @@ def consumer2 : List Ev :=
 /-- Layers complete out of order at every stage; publication still finds the
 right data in the right slots (`test_e2e_transfer_polling` / `test_parallel_pull`
 with `num_layers = 2` in `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py`).
-This is the proposal's out-of-order question answered inside the model. -/
+Verifies out-of-order layer completion end-to-end inside the model. -/
 theorem trace_layers_out_of_order :
     ((sys 2).run (producer2 ++ consumer2)).map
       (fun s => (s.send.published, s.recv.published, s.decodeHbm)) =
