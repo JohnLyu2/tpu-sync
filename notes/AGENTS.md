@@ -16,9 +16,7 @@ conventions: `../AGENTS.md`.
   `verification/docs/transfer/prefill_decode.md` §"Upstream re-checks" and
   `verification/findings/README.md` §"History"; the journal records the delta
   of understanding, corrections and tooling lessons, with a link.
-- `loose-ends/parked.md` is the only backlog. Items that mirror a row of
-  `prefill_decode.md` §"Future work" cite the row and hold only the
-  "To resume" steps.
+- `loose-ends/parked.md` is the only backlog.
 - Version stamps: every note names the tpu-sync commit its claims were read at.
   Notes dated before 2026-10-06 are at `01ffa3d`; the line-shift table to
   `50b0774` is in `journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md`.

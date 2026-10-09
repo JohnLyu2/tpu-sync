@@ -33,27 +33,27 @@ reachable only through the public API (`KVCacheStore::ReadRemote`, bound as
 `read_remote` in the torch/jax modules) — no in-tree production caller — so
 F1/F2/F3 are latent until a client calls it. F4's orphaned-copy half is
 reachable from production `Fetch`/`WriteRemote`
-(`findings/README.md` §F4 Reachability).
+(`verification/findings/README.md` §F4 Reachability).
 
 ## Do not re-investigate
 
-Settled, with evidence, in `findings/README.md` §"Refuted or closed" — use its
+Settled, with evidence, in `verification/findings/README.md` §"Refuted or closed" — use its
 labels: R-A premature `IsReadyToComplete` (transport ordering A4); R-B stale
 same-uuid push (not reachable from vLLM); R-C `RequestBlockRegistry` lifecycle;
 R-D `WriteRemote` landing blocks at the deadline (`DeadlineLoop` defers them);
 R-E local `Load` eviction mid-copy (pinned before `Load`); R-F Fetch-source
 unpin before the pull ends.
 
-Settled in the transfer-path model (`prefill_decode.md` §Outcome): an
+Settled in the transfer-path model (`prefill_decode.md` §"C++ observations (non-bugs at `50b0774`)" and §"Executable trace witnesses"): an
 `ExecuteLayerH2d` early return leaking an op (`EndRecvOpLocked` runs on that
-path; `Receive.trace_finish_between_locks`); a second `FinishLocked` from `Poll`
-(no-op once `draining_`; only metrics skipped); a `StartD2hTransfer` callback
-after staging is freed (the op is counted before `mu_` is released; `Send`
-staging-integrity property).
+path; `Recv.trace_finish_between_locks`); a second `FinishLocked` from
+`CompleteReadWithDetails` / `.pollReady`
+(no-op once `draining_`; only metrics skipped); a `StartPush` (`D2hSyncDispatch` / `SendNextLayer`) `OnReady` callback
+after staging is freed (the op is counted before `mu_` is released; `Send.StagingIntegrity` / `Send.Drained`).
 
 ## Correction trail
 
-[SUPERSEDED → journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md]
+[SUPERSEDED → ../journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md]
 (2026-10-06) The 2026-10-05 version named `KVCacheStore::Store` as the
 unsynchronised evictor (it does not exist; the writers are `Evict` and
 `Insert`), linked four `findings/F1-…md` … `F4-…md` files that never existed,

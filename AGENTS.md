@@ -21,7 +21,7 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 - TCP block transport: `tpu_sync/transport/block_transport.{h,cc}`
 - KV-cache store, host offload, store RPC service/client: `tpu_sync/kv_cache/{kv_cache_store,host_offload_backend,kv_cache_store_service,kv_cache_store_client}.{h,cc}`
 - Raiden controller and remote leases: `tpu_sync/core/controller/raiden_controller.{h,cc}`
-- Lean models `verification/TpuSyncVerify/` (`Common/`, `Transfer/`, `Controller/`); docs `verification/docs/`; bug-hunt reports, reproducers and patches `verification/findings/`; citation tool `verification/tools/repin_citations.py`
+- Lean models `verification/TpuSyncVerify/` (`Common/`, `Transfer/`, `Controller/`); docs `verification/docs/`; bug-hunt reports, reproducers and patches `verification/findings/`; tools `verification/tools/{repin_citations.py,run_lean.sh}`; Lean-backed Q&A and code-reasoning subagent `verification/agents/tpu-sync-lean-helper/`
 
 ## Conventions
 

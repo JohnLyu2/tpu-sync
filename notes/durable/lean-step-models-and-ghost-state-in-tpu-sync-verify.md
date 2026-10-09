@@ -33,7 +33,7 @@ C++ unit tests and E2E tests are replayed as `decide` traces (positive — the
 model is not over-constrained; `prefill_decode.md` §"Test suite
 correspondence"), and critical guards are removed one at a time in mutant
 configurations to confirm a property breaks (negative — the proofs are not
-vacuous; §"Evidence the proofs are not vacuous").
+vacuous; `prefill_decode.md` §"Counterfactual mutants").
 
 ## Why this matters
 
@@ -44,7 +44,7 @@ without replayed traces is a drawing; a proof without mutants may be vacuous.
 
 ## Correction trail
 
-[SUPERSEDED → journal/2026-10/2026-10-06-notes-reorganization-one-home-per-fact.md]
+[SUPERSEDED → ../journal/2026-10/2026-10-06-notes-reorganization-one-home-per-fact.md]
 The 2026-10-05 version described a 3-step proof template via
 `Common/Tactics.lean` (`unpack_step`, `reachable_invariant`, `StepPreserves`)
 and a `docs/test_suite_correspondence.md`; none of these exist. The real
