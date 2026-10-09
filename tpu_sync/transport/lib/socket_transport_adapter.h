@@ -68,9 +68,12 @@ class SocketTransportAdapter : public TransportAdapter {
 
   absl::StatusOr<Status> Poll(Handle handle) override;
 
+  static constexpr int kDefaultMaxSocketWorkers = 64;
+
   struct Config {
     std::optional<absl::Duration> handshake_ack_read_timeout = std::nullopt;
     std::optional<absl::Duration> final_ack_read_timeout = std::nullopt;
+    int max_socket_workers = kDefaultMaxSocketWorkers;
   };
 
   const Config& config() const { return config_; }
@@ -80,6 +83,12 @@ class SocketTransportAdapter : public TransportAdapter {
   }
   std::optional<absl::Duration> final_ack_read_timeout() const {
     return config_.final_ack_read_timeout;
+  }
+  int max_socket_workers() const { return config_.max_socket_workers; }
+
+  size_t worker_count() const {
+    absl::MutexLock lock(scheduler_mu_);
+    return socket_workers_.size();
   }
 
  private:
@@ -127,12 +136,17 @@ class SocketTransportAdapter : public TransportAdapter {
   const int numa_node_;
   const Config config_;
 
-  absl::Mutex scheduler_mu_;
+  mutable absl::Mutex scheduler_mu_;
   absl::CondVar scheduler_cv_;
   absl::flat_hash_map<std::string, PeerQueue> peer_queues_
       ABSL_GUARDED_BY(scheduler_mu_);
   std::vector<std::string> active_peers_ ABSL_GUARDED_BY(scheduler_mu_);
   size_t rr_index_ ABSL_GUARDED_BY(scheduler_mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<std::atomic<bool>>>
+      session_failed_by_uuid_ ABSL_GUARDED_BY(scheduler_mu_);
+  std::deque<uint64_t> uuid_lru_order_ ABSL_GUARDED_BY(scheduler_mu_);
+  static constexpr size_t kMaxTrackedUuids = 1024;
+
   // TODO(swasthi): Guard scheduler_stopping_ with scheduler_mu_ instead of
   // atomic.
   std::atomic<bool> scheduler_stopping_;

@@ -89,6 +89,12 @@ SocketTransportAdapter::Config ReadConfigFromEnv() {
       config.final_ack_read_timeout = absl::Seconds(s);
     }
   }
+  if (const char* val = std::getenv("TPU_RAIDEN_MAX_SOCKET_WORKERS")) {
+    int w = 0;
+    if (absl::SimpleAtoi(val, &w) && w > 0) {
+      config.max_socket_workers = w;
+    }
+  }
   return config;
 }
 
@@ -188,11 +194,6 @@ SocketTransportAdapter::SocketTransportAdapter(
       rr_index_(0),
       scheduler_stopping_(false) {
   ABSL_DCHECK(raw_transport_ != nullptr);
-  socket_workers_.reserve(parallelism_);
-  for (int i = 0; i < parallelism_; ++i) {
-    socket_workers_.push_back(
-        std::thread(&SocketTransportAdapter::SocketWorkerLoop, this));
-  }
 }
 
 SocketTransportAdapter::~SocketTransportAdapter() {
@@ -297,6 +298,31 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
                                         "parallelism must be positive"));
   }
 
+  std::shared_ptr<std::atomic<bool>> session_failed = nullptr;
+  if (uuid != 0) {
+    absl::MutexLock lock(scheduler_mu_);
+    auto it = session_failed_by_uuid_.find(uuid);
+    if (it != session_failed_by_uuid_.end()) {
+      session_failed = it->second;
+    } else {
+      if (uuid_lru_order_.size() >= kMaxTrackedUuids) {
+        uint64_t oldest = uuid_lru_order_.front();
+        uuid_lru_order_.pop_front();
+        session_failed_by_uuid_.erase(oldest);
+      }
+      session_failed = std::make_shared<std::atomic<bool>>(false);
+      session_failed_by_uuid_[uuid] = session_failed;
+      uuid_lru_order_.push_back(uuid);
+    }
+  }
+
+  if (session_failed != nullptr &&
+      session_failed->load(std::memory_order_relaxed)) {
+    return ReportError(
+        on_complete, absl::CancelledError("Request cancelled due to previous "
+                                          "failure on same transfer session"));
+  }
+
   auto shared_requests =
       std::make_shared<std::vector<Request>>(requests.begin(), requests.end());
   auto shared_src_block_ids = std::make_shared<std::vector<int>>(
@@ -317,6 +343,38 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
   const size_t base_blocks_per_stream = num_blocks / P;
   const size_t remainder = num_blocks % P;
   size_t req_offset = 0;
+
+  std::vector<std::unique_ptr<WriteTask>> new_tasks;
+  new_tasks.reserve(P);
+
+  auto finish_stream = [statuses, remaining_workers, shared_on_complete,
+                        allocated_ids, push_start_ts, local_ips,
+                        dst_ip](int stream_idx, absl::Status status) {
+    (*statuses)[stream_idx] = std::move(status);
+    if (remaining_workers->fetch_sub(1) == 1) {
+      absl::Status final_status = absl::OkStatus();
+      for (const auto& s : *statuses) {
+        if (!s.ok()) {
+          final_status = s;
+          break;
+        }
+      }
+      if (final_status.ok()) {
+        const std::chrono::steady_clock::time_point push_end_ts =
+            std::chrono::steady_clock::now();
+        RecordP2pTransferTime(push_start_ts, push_end_ts,
+                              ExtractFirstEndpointIp(local_ips), dst_ip);
+      }
+      if (*shared_on_complete) {
+        if (!final_status.ok()) {
+          (*shared_on_complete)(final_status);
+        } else {
+          (*shared_on_complete)(*allocated_ids);
+        }
+      }
+    }
+  };
+
   for (int i = 0; i < P; ++i) {
     const size_t block_offset =
         i * base_blocks_per_stream + std::min<size_t>(i, remainder);
@@ -335,37 +393,28 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
             .subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    auto task_run = [this, i, remote_peer, local_ip, local_ips, dst_ip,
-                     block_offset, shared_requests, stream_requests,
-                     shared_src_block_ids, shared_dst_block_ids, allocated_ids,
-                     statuses, remaining_workers, shared_on_complete,
-                     push_start_ts]() {
-      (*statuses)[i] = PostSocketPushInternal(
+    auto task_run = [this, i, remote_peer, local_ip, dst_ip, block_offset,
+                     shared_requests, stream_requests, shared_src_block_ids,
+                     shared_dst_block_ids, allocated_ids, session_failed,
+                     finish_stream]() {
+      if (session_failed != nullptr &&
+          session_failed->load(std::memory_order_relaxed)) {
+        finish_stream(
+            i,
+            absl::CancelledError(
+                "Request cancelled due to failure on another stream or layer"));
+        return;
+      }
+
+      absl::Status status = PostSocketPushInternal(
           remote_peer, local_ip, dst_ip, stream_requests, *shared_src_block_ids,
           *shared_dst_block_ids, block_offset, *allocated_ids);
 
-      if (remaining_workers->fetch_sub(1) == 1) {
-        absl::Status final_status = absl::OkStatus();
-        for (const auto& s : *statuses) {
-          if (!s.ok()) {
-            final_status = s;
-            break;
-          }
-        }
-        if (final_status.ok()) {
-          const std::chrono::steady_clock::time_point push_end_ts =
-              std::chrono::steady_clock::now();
-          RecordP2pTransferTime(push_start_ts, push_end_ts,
-                                ExtractFirstEndpointIp(local_ips), dst_ip);
-        }
-        if (*shared_on_complete) {
-          if (!final_status.ok()) {
-            (*shared_on_complete)(final_status);
-          } else {
-            (*shared_on_complete)(*allocated_ids);
-          }
-        }
+      if (!status.ok() && session_failed != nullptr) {
+        session_failed->store(true, std::memory_order_relaxed);
       }
+
+      finish_stream(i, std::move(status));
     };
 
     auto task = std::make_unique<WriteTask>();
@@ -373,18 +422,28 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
     task->stream_idx = i;
     task->peer = remote_peer;
     task->run = std::move(task_run);
-
-    {
-      absl::MutexLock lock(scheduler_mu_);
-      auto& pq = peer_queues_[task->peer];
-      pq.tasks.push_back(std::move(task));
-      if (std::find(active_peers_.begin(), active_peers_.end(), remote_peer) ==
-          active_peers_.end()) {
-        active_peers_.push_back(remote_peer);
-      }
-    }
-    scheduler_cv_.SignalAll();
+    new_tasks.push_back(std::move(task));
   }
+
+  {
+    absl::MutexLock lock(scheduler_mu_);
+    for (auto& task : new_tasks) {
+      const std::string& remote_peer = task->peer;
+      auto [it, inserted] = peer_queues_.try_emplace(remote_peer);
+      if (inserted) {
+        active_peers_.push_back(remote_peer);
+        const size_t target_workers = active_peers_.size() * parallelism_;
+        while (socket_workers_.size() < target_workers &&
+               socket_workers_.size() <
+                   static_cast<size_t>(config_.max_socket_workers)) {
+          socket_workers_.push_back(
+              std::thread(&SocketTransportAdapter::SocketWorkerLoop, this));
+        }
+      }
+      it->second.tasks.push_back(std::move(task));
+    }
+  }
+  scheduler_cv_.SignalAll();
   return 0;
 }
 
