@@ -276,7 +276,7 @@
 
     [*Block Transport*\ `BlockTransport`],
     [KV block →\ layer],
-    [Counts arrived KV blocks for each transformer layer and notifies the receive session (`begin/end_incoming_push`, `OnLayerReceived(l)` when all blocks of layer $l$ land, `OnBlocksReceived`).],
+    [Counts arrived KV blocks for each transformer layer and notifies the receive session (`begin/end_incoming_push`, `OnLayerReceived(l)` when all blocks of layer $l$ land, `OnBlockShardsReceived`).],
     [*Callbacks &*\ `BlockOrdering`],
 
     [*Raw Buffer Transport*\ `RawBufferTransport`],

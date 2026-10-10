@@ -27,8 +27,9 @@ verification/
 
 ## Status
 
-All citations (models, `docs/`, `findings/`) are to tpu-sync `50b0774`
-(upstream `main` as merged into this fork on 2026-10-06).
+All citations (models, `docs/`, `findings/`) are to tpu-sync `1fa06d1`
+(upstream `main` as merged into this fork on 2026-10-10); `findings/filed_bugs.md`
+and `proposal.md` are frozen at the commit they name.
 
 | Model | Proved | Doc |
 |---|---|---|
@@ -42,12 +43,12 @@ All citations (models, `docs/`, `findings/`) are to tpu-sync `50b0774`
 | `Controller/ReadRemote` | `NoWriteAfterRelease`: counterexamples on shipping code, deferred-settle fix safe by exhaustive search | [read_remote.md](docs/controller/read_remote.md) |
 
 Outcome so far: no data-correctness or safety bugs in the prefill-to-decode
-transfer path at `50b0774` (non-bug observations in [findings/](findings/README.md) §Observations); one owner-acknowledged
+transfer path at `1fa06d1` (non-bug observations in [findings/](findings/README.md) §Observations); one owner-acknowledged
 availability gap on that path (F5, no per-peer staging admission at
 `StartRead`) confirmed with the owners' own parked test and fixed by
 `findings/per_peer_staging_admission.patch`; four confirmed defects in the
 controller / KV-cache-store path, written up in
-[findings/](findings/README.md). None fixed upstream as of `50b0774`.
+[findings/](findings/README.md). F4 was fixed upstream in `72255dd`; the others are open as of `1fa06d1`.
 
 ## Building
 

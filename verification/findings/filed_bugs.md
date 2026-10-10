@@ -2,6 +2,10 @@
 
 Code references below are against [`google/tpu-sync` @ `50b0774`](https://github.com/google/tpu-sync/tree/50b0774a62dd96b9aab580546fbf70a9443ce16c).
 
+These are the write-ups as filed; the permalinks and line numbers are frozen at
+`50b0774` and are not re-pinned on upstream syncs. Status updates go in
+[README.md](README.md) (§Summary, §History).
+
 ---
 
 ## 1. `RaidenController::TransferBuffers` error-path defects (F4)
@@ -37,4 +41,4 @@ Both problems are confirmed by unit tests, which will be added in the CL (they f
 
 All of the function's early returns happen before the first job is sent. After that, the returned future completes only when every sent job's RPC has finished.
 
-**Fix:** [google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105) — still open, not merged as of upstream `50b0774` (2026-10-06).
+**Fix:** [google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105) — still open, not merged as of upstream `50b0774` (2026-10-06). *Update 2026-10-10: landed upstream as `72255dd` (2026-10-07), see README.md §F4.*

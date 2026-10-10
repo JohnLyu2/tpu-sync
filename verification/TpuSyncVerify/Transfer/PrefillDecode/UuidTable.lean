@@ -9,49 +9,51 @@ Models `KVCacheManagerWithTransfer`'s UUID-keyed session tables
 (`active_recv_sessions_[uuid]` on the decode consumer and `send_sessions_[uuid]`
 on the prefill producer) and its terminal report sets (`done_sending_`,
 `done_recving_`, `failed_recving_`) across duplicate announcements, conflicting
-UUIDs, and session retries (`tpu_sync/core/kv_cache_manager_with_transfer.cc:443-492,
-842-882, 908-994`, `tpu_sync/core/kv_cache_manager_with_transfer_send_drain_test.cc:363-380,
-633-682`, `tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc:718-790`,
-tpu-sync `50b0774`).
+UUIDs, and session retries (`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:445-494,
+844-884, 910-996`, `tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc:368-385,
+638-687`, `tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc:719-791`,
+tpu-sync `1fa06d1`).
 
 ## Protocol rules encoded
 
-1. **Consumer `StartRead(req_id, uuid, ...)` (`mgr.cc:845-881`):**
+1. **Consumer `StartRead(req_id, uuid, ...)` (`mgr.cc:847-883`):**
    - If `active_recv_sessions_[uuid]` holds an incumbent with `!Done()`
      (`done = false`, including when `draining = true` with in-flight H2D/push/pull
      work):
-     - **Same `req_id` (`incumbent->req_id() == req_id`, `:856`):** idempotent
+     - **Same `req_id` (`incumbent->second->req_id() == req_id`, `:858`):** idempotent
        re-announcement — returns immediately without allocating staging,
        replacing the incumbent, or recording a failure
        (`RepeatedReceiveAnnouncementIsIdempotent`,
-       `kv_cache_manager_with_transfer_control_test.cc:754-790`).
-     - **Different `req_id` (`incumbent->req_id() != req_id`, `mgr.cc:856-858`):**
+       `kv_cache_manager_with_transfer_control_test.cc:755-791`).
+     - **Different `req_id` (`incumbent->second->req_id() != req_id`, `mgr.cc:858-860`):**
        rejects the duplicate — leaves the incumbent untouched, allocates no
        staging slot, and records the duplicate `req_id` in `failed_recving_`
        (`DuplicateReceiveDoesNotReplaceOrLeakFirstRead`,
-       `kv_cache_manager_with_transfer_control_test.cc:718-752`).
+       `kv_cache_manager_with_transfer_control_test.cc:719-753`).
    - If `active_recv_sessions_[uuid]` holds an already-settled incumbent
-     (`incumbent->Done()`, `mgr.cc:847-851`), `StartRead` retires it inline into
+     (`incumbent->Done()`, `mgr.cc:849-852`), `StartRead` retires it inline into
      `done_recving_` / `failed_recving_` and erases it before creating the new
      session.
 
 2. **Consumer `EmplaceRecvSessionLocked(uuid, session)` / `RegisterActivePlan` /
-   `RegisterRecv` (`mgr.cc:477-492, 528-532, 584-603`):**
-   - Retires an existing entry only if `existing->second->Done()` (`:480-484`).
+   `RegisterRecv` (`mgr.cc:479-494, 530-534, 586-605`):**
+   - Retires an existing entry only if `existing->second->Done()` (`:482-486`).
    - If an incumbent is still draining (`done = false`), `try_emplace` fails
-     with `AlreadyExistsError` (`:487-490`) and the caller releases the
-     candidate's staging (`:529-531`, and `StartRead` at `:875-877`), keeping the draining
+     with `AlreadyExistsError` (`:489-492`) and the candidate's staging is
+     released — explicitly by `RegisterActivePlan` (`:531-533`) and `StartRead`
+     (`:877-879`), by the session destructor (`recv.h:80`) for `RegisterRecv`
+     (`:597-600`) — keeping the draining
      incumbent authoritative until all in-flight operations finish
      (`DuplicateUuidIsRejectedUntilExpiredReceiveDrains`,
-     `kv_cache_manager_with_transfer_send_drain_test.cc:633-682`).
+     `kv_cache_manager_with_transfer_send_drain_test.cc:638-687`).
 
-3. **Producer `NotifyForRead(req_id, uuid, ...)` (`mgr.cc:459-463`):**
+3. **Producer `NotifyForRead(req_id, uuid, ...)` (`mgr.cc:461-465`):**
    - `send_sessions_.try_emplace(uuid, session)` rejects any duplicate `uuid`
      while a live offer is present (`DuplicateRegistrationCannotReplaceLiveOffer`,
-     `kv_cache_manager_with_transfer_send_drain_test.cc:363-380`).
+     `kv_cache_manager_with_transfer_send_drain_test.cc:368-385`).
 
 4. **Sweep in `CompleteReadWithDetails()` / `CompleteReadRaw()`
-   (`mgr.cc:916-994, 1041-1047`):**
+   (`mgr.cc:918-996, 1043-1049`):**
    - Only sessions with `Done()` (`done = true`) are reported into
      `done_sending_` / `done_recving_` / `failed_recving_` and erased from
      `send_sessions_` / `active_recv_sessions_`.
@@ -112,7 +114,7 @@ def insertReq (rs : List ReqId) (r : ReqId) : List ReqId :=
   if r ∈ rs then rs else rs ++ [r]
 
 /-- Record a settled receive session's outcome in `doneRecving` or `failedRecving`
-(`mgr.cc:848-849, 982-983`). -/
+(`mgr.cc:850-851, 984-985`). -/
 def recordRecvReport (doneRecving failedRecving : List ReqId)
     (reqId : ReqId) (statusOk : Bool) : List ReqId × List ReqId :=
   if statusOk then
@@ -121,7 +123,7 @@ def recordRecvReport (doneRecving failedRecving : List ReqId)
     (doneRecving, insertReq failedRecving reqId)
 
 /-- Record a settled send session's outcome in `doneSending` or `failedRecving`
-(`mgr.cc:927-928`). -/
+(`mgr.cc:929-930`). -/
 def recordSendReport (doneSending failedRecving : List ReqId)
     (reqId : ReqId) (statusOk : Bool) : List ReqId × List ReqId :=
   if statusOk then
@@ -153,27 +155,32 @@ def init (cfg : Config) : State :=
     sendTable := List.replicate cfg.numUuids none }
 
 inductive Ev where
-  /-- `StartRead(req_id, uuid, ...)` (`mgr.cc:845-881`): creates a load-plan
+  /-- `StartRead(req_id, uuid, ...)` (`mgr.cc:847-883`): creates a load-plan
   receive session (`Recv.initLoad`), with idempotent same-`reqId` handling and
   immediate `failed_recving_` reporting on a conflicting duplicate `reqId`. -/
   | startRead (reqId : ReqId) (uuid : Uuid)
   /-- `RegisterRecv` / `RegisterActivePlan` /
-  `EmplaceRecvSessionLocked(uuid, session)` (`mgr.cc:477-492, 528-532, 584-603`):
+  `EmplaceRecvSessionLocked(uuid, session)` (`mgr.cc:479-494, 530-534, 586-605`):
   creates a push-plan receive session (`Recv.initPush`); rejects any duplicate
-  `uuid` whose incumbent has `!Done()` without leaking staging. -/
+  `uuid` whose incumbent has `!Done()` without leaking staging. The slot taken
+  here models `RegisterActivePlan` under dynamic staging (`mgr.cc:521-534`) and
+  the white-box test fixture `RecvTestManager::AddRecv`
+  (`kv_cache_manager_with_transfer_send_drain_test.cc:177-185`, `acquire_staging
+  = true`); production `RegisterRecv` (`mgr.cc:590-594`) uses the `Create`
+  overload whose `acquire_staging` defaults to `false` and takes no slot. -/
   | registerRecv (reqId : ReqId) (uuid : Uuid)
   /-- Step the active receive session at `uuid` (`Receive.lean`). -/
   | recvStep (uuid : Uuid) (e : Recv.Ev)
   /-- `CompleteReadWithDetails` / `CompleteReadRaw` sweeps a settled (`Done()`)
-  receive at `uuid` (`mgr.cc:981-991, 1041-1047`). -/
+  receive at `uuid` (`mgr.cc:983-992, 1043-1049`). -/
   | sweepRecv (uuid : Uuid)
-  /-- `NotifyForRead(req_id, uuid, ...)` (`mgr.cc:443-464`): registers a send
+  /-- `NotifyForRead(req_id, uuid, ...)` (`mgr.cc:445-466`): registers a send
   offer in `send_sessions_[uuid]`; rejects any duplicate `uuid`. -/
   | notifyForRead (reqId : ReqId) (uuid : Uuid)
   /-- Step the active send session at `uuid` (`Send.lean`). -/
   | sendStep (uuid : Uuid) (e : Send.Ev)
   /-- `CompleteReadWithDetails` / `CompleteReadRaw` sweeps a settled (`Done()`)
-  send at `uuid` (`mgr.cc:926-935, 1041-1047`). -/
+  send at `uuid` (`mgr.cc:928-937, 1043-1049`). -/
   | sweepSend (uuid : Uuid)
   deriving Repr, DecidableEq
 
@@ -183,13 +190,13 @@ def step (s : State) : Ev → Option State
     | none => none
     | some (some inc) =>
       if !inc.recv.life.done then
-        -- Incumbent is still active or draining (`mgr.cc:851-860`).
+        -- Incumbent is still active or draining (`mgr.cc:853-862`).
         if inc.reqId == reqId then
           some s
         else
           some { s with failedRecving := insertReq s.failedRecving reqId }
       else
-        -- Incumbent is already `Done()`: retire inline (`mgr.cc:847-851`).
+        -- Incumbent is already `Done()`: retire inline (`mgr.cc:849-852`).
         let (doneR, failR) :=
           recordRecvReport s.doneRecving s.failedRecving inc.reqId inc.recv.life.statusOk
         if 0 < s.freeSlots then
@@ -221,8 +228,9 @@ def step (s : State) : Ev → Option State
     | none => none
     | some (some inc) =>
       if !inc.recv.life.done then
-        -- `EmplaceRecvSessionLocked` returns `AlreadyExistsError` and caller
-        -- releases the candidate's staging (`mgr.cc:487-490, 529-531`).
+        -- `EmplaceRecvSessionLocked` returns `AlreadyExistsError` and the
+        -- candidate's staging is released (`mgr.cc:489-492, 531-533`; RAII for
+        -- `RegisterRecv`, `recv.h:80`).
         none
       else if 0 < s.freeSlots then
         let (doneR, failR) :=
@@ -281,7 +289,7 @@ def step (s : State) : Ev → Option State
     match s.sendTable[uuid]? with
     | none => none
     | some (some _) =>
-      -- `send_sessions_.try_emplace(uuid, session)` fails (`mgr.cc:459-462`).
+      -- `send_sessions_.try_emplace(uuid, session)` fails (`mgr.cc:461-464`).
       none
     | some none =>
       let entry : SendEntry :=
@@ -787,7 +795,7 @@ def recvSummary (s : State) (uuid : Uuid) : Option RecvSummary :=
   | _ => none
 
 /-- `RecvDrainTest.DuplicateUuidIsRejectedUntilExpiredReceiveDrains`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:633-682`):
+(`kv_cache_manager_with_transfer_send_drain_test.cc:638-687`):
 1. Register `"old"` (`reqId = 0`) at `uuid = 0`, issue layer 0 H2D copy
    (`h2dBegin`, `h2dIssue true`), and expire its deadline (`.cancel`).
 2. While `"old"` is draining (`draining = true, done = false`), `.sweepRecv 0`
@@ -820,7 +828,7 @@ theorem trace_duplicate_uuid_rejected_until_drained :
   decide
 
 /-- `ControlHandshakeTest.DuplicateReceiveDoesNotReplaceOrLeakFirstRead`
-(`kv_cache_manager_with_transfer_control_test.cc:718-752`):
+(`kv_cache_manager_with_transfer_control_test.cc:719-753`):
 1. `startRead` for `"first"` (`reqId = 0, uuid = 0`) allocates 1 slot
    (`freeSlots = 3`).
 2. `startRead` for `"duplicate"` (`reqId = 1, uuid = 0`) sees the live incumbent
@@ -843,7 +851,7 @@ theorem trace_duplicate_receive_different_req_id :
   decide
 
 /-- `ControlHandshakeTest.RepeatedReceiveAnnouncementIsIdempotent`
-(`kv_cache_manager_with_transfer_control_test.cc:754-790`):
+(`kv_cache_manager_with_transfer_control_test.cc:755-791`):
 re-delivering `startRead 0 0` with the **same** `(reqId = 0, uuid = 0)` while
 the first is still in flight is a no-op (`failedRecving = []`, `freeSlots = 3`),
 and when the handshake eventually fails and is swept, `reqId = 0` is reported
@@ -860,12 +868,13 @@ theorem trace_repeated_receive_same_req_id_idempotent :
   decide
 
 /-- `SendLifecycleTest.DuplicateRegistrationCannotReplaceLiveOffer`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:363-380`):
+(`kv_cache_manager_with_transfer_send_drain_test.cc:368-385`):
 `notifyForRead 0 0` (`"first"`, `reqId = 0, uuid = 0`) registers a live send
 offer. A duplicate `notifyForRead 1 0` (`"replacement"`, `reqId = 1, uuid = 0`)
 is rejected (`none`). When `"first"` times out (`.cancel`) and is swept
 (`.sweepSend 0`), `"first"` (`reqId = 0`) is reported in `failedRecving = [0]`
-and `uuid = 0` becomes free for a subsequent `notifyForRead 1 0`. -/
+and `uuid = 0` becomes free for a subsequent `notifyForRead 1 0` (the
+re-registration step is model-only; the C++ test stops after the sweep). -/
 theorem trace_duplicate_send_cannot_replace_live_offer :
     let cfg : Config := { numLayers := 1, numSlots := 4, numUuids := 1 }
     ((sys cfg).run [.notifyForRead 0 0]).map
@@ -879,7 +888,7 @@ theorem trace_duplicate_send_cannot_replace_live_offer :
       some ([0], some (1, 1)) := by
   decide
 
-/-- Inline retirement on `StartRead` (`mgr.cc:847-851`): when an incumbent at
+/-- Inline retirement on `StartRead` (`mgr.cc:849-852`): when an incumbent at
 `uuid = 0` has already settled (`done = true`), a new `startRead 1 0` retires
 the settled incumbent into `doneRecving` / `failedRecving` inline without
 needing an intervening `sweepRecv 0`, and seats the new session (`gen = 1`)

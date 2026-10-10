@@ -21,8 +21,8 @@ subsystem of `tpu_sync/` they describe:
 
 * `Common` — the transition-system core, list/pigeonhole lemmas, and a bounded
   model checker shared by every model.
-* `Transfer` — the session-based KV transfer path (`tpu_sync/core/transfer_*`,
-  `tpu_sync/core/kv_cache_manager_with_transfer.*`, `tpu_sync/transport`):
+* `Transfer` — the session-based KV transfer path (`tpu_sync/kv_cache/transfer_*`,
+  `tpu_sync/kv_cache/kv_cache_manager_with_transfer.*`, `tpu_sync/transport`):
   shared session lifecycle (`Transfer.Session`), and under
   `Transfer.PrefillDecode` the consumer and producer sessions (`Receive`,
   `ReceivePoll`, `Send`), single- and multi-request pipelines (`Pipeline`,

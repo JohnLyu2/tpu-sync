@@ -1,7 +1,7 @@
-diff --git a/tpu_sync/core/kv_cache_manager_with_transfer.cc b/tpu_sync/core/kv_cache_manager_with_transfer.cc
-index e5cd2af..fdf7350 100644
---- a/tpu_sync/core/kv_cache_manager_with_transfer.cc
-+++ b/tpu_sync/core/kv_cache_manager_with_transfer.cc
+diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc b/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc
+index 54e9470..14ba34e 100644
+--- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc
++++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc
 @@ -42,6 +42,7 @@
  #include "absl/status/status_macros.h"
  #include "absl/status/statusor.h"
@@ -10,7 +10,7 @@ index e5cd2af..fdf7350 100644
  #include "absl/strings/str_cat.h"
  #include "absl/synchronization/mutex.h"
  #include "absl/time/clock.h"
-@@ -864,7 +865,8 @@ void KVCacheManagerWithTransfer::StartRead(
+@@ -866,7 +867,8 @@ void KVCacheManagerWithTransfer::StartRead(
          TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
                                         uuid, req_id, remote_block_ids,
                                         local_block_ids, local_host_block_ids,
@@ -20,7 +20,7 @@ index e5cd2af..fdf7350 100644
      if (!created.ok()) {
        failed_recving_.insert(req_id);
        return;
-@@ -1048,22 +1050,29 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
+@@ -1050,22 +1052,29 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
  
  StagingBlockAllocator::Allocation::Allocation(StagingBlockAllocator* allocator,
                                                int64_t slot_idx,
@@ -55,7 +55,7 @@ index e5cd2af..fdf7350 100644
  }
  
  StagingBlockAllocator::Allocation& StagingBlockAllocator::Allocation::operator=(
-@@ -1073,9 +1082,11 @@ StagingBlockAllocator::Allocation& StagingBlockAllocator::Allocation::operator=(
+@@ -1075,9 +1084,11 @@ StagingBlockAllocator::Allocation& StagingBlockAllocator::Allocation::operator=(
      allocator_ = other.allocator_;
      slot_idx_ = other.slot_idx_;
      block_ids_ = std::move(other.block_ids_);
@@ -67,7 +67,7 @@ index e5cd2af..fdf7350 100644
    }
    return *this;
  }
-@@ -1085,24 +1096,42 @@ StagingBlockAllocator::Allocation::~Allocation() { Reset(); }
+@@ -1087,24 +1098,42 @@ StagingBlockAllocator::Allocation::~Allocation() { Reset(); }
  void StagingBlockAllocator::Allocation::Reset() {
    if (allocator_ != nullptr) {
      if (slot_idx_ >= 0) {
@@ -114,7 +114,7 @@ index e5cd2af..fdf7350 100644
    absl::Status status = allocator->Initialize();
    if (!status.ok()) {
      throw std::runtime_error(std::string(status.message()));
-@@ -1113,11 +1142,13 @@ std::unique_ptr<StagingBlockAllocator> StagingBlockAllocator::Create(
+@@ -1115,11 +1144,13 @@ std::unique_ptr<StagingBlockAllocator> StagingBlockAllocator::Create(
  StagingBlockAllocator::StagingBlockAllocator(kv_cache::KVCacheManagerBase* base,
                                               int64_t num_slots,
                                               int64_t max_blocks,
@@ -130,7 +130,7 @@ index e5cd2af..fdf7350 100644
  
  StagingBlockAllocator::~StagingBlockAllocator() {
    {
-@@ -1180,8 +1211,27 @@ void StagingBlockAllocator::Shutdown() {
+@@ -1182,8 +1213,27 @@ void StagingBlockAllocator::Shutdown() {
    shutting_down_ = true;
  }
  
@@ -159,7 +159,7 @@ index e5cd2af..fdf7350 100644
    if (num_blocks <= 0) {
      return Allocation();
    }
-@@ -1196,13 +1246,22 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
+@@ -1198,13 +1248,22 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
                                             : "a staging slot capacity (",
                       cap, ")"));
    }
@@ -183,7 +183,7 @@ index e5cd2af..fdf7350 100644
    }
    if (base_ == nullptr || base_->host_block_manager() == nullptr) {
      return absl::FailedPreconditionError("Host block manager is null");
-@@ -1214,23 +1273,25 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
+@@ -1216,23 +1275,25 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
    ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated,
                          base_->host_block_manager()->Allocate(
                              static_cast<int>(num_blocks), /*lock=*/true));
@@ -214,7 +214,7 @@ index e5cd2af..fdf7350 100644
    if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
      return acquired;
    }
-@@ -1240,6 +1301,7 @@ StagingBlockAllocator::AcquireWithTimeout(
+@@ -1242,6 +1303,7 @@ StagingBlockAllocator::AcquireWithTimeout(
    }
    auto can_proceed = [&]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
      if (shutting_down_) return true;
@@ -222,7 +222,7 @@ index e5cd2af..fdf7350 100644
      if (!dynamic_host_staging_) return !free_slots_.empty();
      return base_ != nullptr && base_->host_block_manager() != nullptr &&
             base_->host_block_manager()->num_free_blocks() >=
-@@ -1253,7 +1315,7 @@ StagingBlockAllocator::AcquireWithTimeout(
+@@ -1255,7 +1317,7 @@ StagingBlockAllocator::AcquireWithTimeout(
    if (shutting_down_) {
      return absl::CancelledError("StagingBlockAllocator is shutting down");
    }
@@ -231,7 +231,7 @@ index e5cd2af..fdf7350 100644
  }
  
  absl::Status StagingBlockAllocator::AcquirePoolStagingLease(
-@@ -1277,6 +1339,13 @@ size_t StagingBlockAllocator::num_free_slots() const {
+@@ -1279,6 +1341,13 @@ size_t StagingBlockAllocator::num_free_slots() const {
    return free_slots_.size();
  }
  
@@ -245,7 +245,7 @@ index e5cd2af..fdf7350 100644
  absl::Span<const int> StagingBlockAllocator::slot_blocks(
      int64_t slot_idx) const {
    return slot_blocks_[slot_idx];
-@@ -1291,20 +1360,24 @@ int64_t StagingBlockAllocator::capacity() const {
+@@ -1293,20 +1362,24 @@ int64_t StagingBlockAllocator::capacity() const {
    return max_blocks_;
  }
  
@@ -273,10 +273,10 @@ index e5cd2af..fdf7350 100644
    std::vector<int> block_vec(blocks.begin(), blocks.end());
    (void)base_->host_block_manager()->Unlock(block_vec);
    (void)base_->host_block_manager()->Deallocate(block_vec);
-diff --git a/tpu_sync/core/kv_cache_manager_with_transfer.h b/tpu_sync/core/kv_cache_manager_with_transfer.h
-index 0b1635a..852a122 100644
---- a/tpu_sync/core/kv_cache_manager_with_transfer.h
-+++ b/tpu_sync/core/kv_cache_manager_with_transfer.h
+diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer.h b/tpu_sync/kv_cache/kv_cache_manager_with_transfer.h
+index 1e53666..0a439ef 100644
+--- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer.h
++++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer.h
 @@ -32,6 +32,7 @@
  #include "absl/container/flat_hash_set.h"
  #include "absl/status/status.h"
@@ -410,11 +410,11 @@ index 0b1635a..852a122 100644
  };
  using StagingAllocation = StagingBlockAllocator::Allocation;
  
-diff --git a/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc b/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc
-index a29fdc4..1b0b213 100644
---- a/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc
-+++ b/tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc
-@@ -94,6 +94,26 @@ class ScopedControlPlaneBackend {
+diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc
+index ab8cfc7..ed3f412 100644
+--- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc
++++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc
+@@ -95,6 +95,26 @@ class ScopedControlPlaneBackend {
    std::optional<std::string> old_;
  };
  
@@ -441,7 +441,7 @@ index a29fdc4..1b0b213 100644
  class TestManager : private ScopedControlPlaneBackend,
                      public KVCacheManagerWithTransfer {
   public:
-@@ -1035,16 +1055,21 @@ TEST(ControlHandshakeTest,
+@@ -1036,16 +1056,21 @@ TEST(ControlHandshakeTest,
  // outright -- a read to a healthy peer is not merely delayed, it is rejected
  // and never attempted.
  //
@@ -469,7 +469,7 @@ index a29fdc4..1b0b213 100644
    const size_t free_before = consumer.free_slots();
    ASSERT_GE(free_before, static_cast<size_t>(kSlots));
  
-@@ -1054,8 +1079,12 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+@@ -1055,8 +1080,12 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
                         /*local_block_ids=*/{0});
    }
    ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)));
@@ -484,7 +484,7 @@ index a29fdc4..1b0b213 100644
  
    // A read to a peer that is answering normally.
    consumer.StartRead("healthy0", /*uuid=*/900, healthy.endpoint(),
-@@ -1067,6 +1096,8 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+@@ -1068,6 +1097,8 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
        << kSlots
        << " staging slots; no request to a healthy producer can even be "
           "attempted while another producer is wedged";
@@ -493,7 +493,7 @@ index a29fdc4..1b0b213 100644
  
    auto [done_sending, done_recving, failed_recving] =
        consumer.CompleteReadRaw();
-@@ -1074,6 +1105,9 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+@@ -1075,6 +1106,9 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
    (void)done_recving;
    EXPECT_THAT(failed_recving, ::testing::Not(Contains("healthy0")))
        << "the healthy read failed immediately rather than being served";
@@ -503,7 +503,7 @@ index a29fdc4..1b0b213 100644
  
    sick.DropClients();
    healthy.DropClients();
-@@ -1086,6 +1120,8 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+@@ -1087,6 +1121,8 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
      settled += received.size() + failed.size();
      absl::SleepFor(absl::Milliseconds(20));
    }
@@ -512,11 +512,11 @@ index a29fdc4..1b0b213 100644
  }
  
  }  // namespace
-diff --git a/tpu_sync/core/transfer_receive_session.cc b/tpu_sync/core/transfer_receive_session.cc
-index 38a9a8d..382cfbf 100644
---- a/tpu_sync/core/transfer_receive_session.cc
-+++ b/tpu_sync/core/transfer_receive_session.cc
-@@ -88,7 +88,8 @@ TransferReceiveSession::Create(
+diff --git a/tpu_sync/kv_cache/transfer_receive_session.cc b/tpu_sync/kv_cache/transfer_receive_session.cc
+index c5bf805..bb2db19 100644
+--- a/tpu_sync/kv_cache/transfer_receive_session.cc
++++ b/tpu_sync/kv_cache/transfer_receive_session.cc
+@@ -89,7 +89,8 @@ TransferReceiveSession::Create(
      const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
      const std::vector<int64_t>& local_block_ids,
      const std::optional<std::vector<int64_t>>& local_host_block_ids,
@@ -526,7 +526,7 @@ index 38a9a8d..382cfbf 100644
    if (staging_allocator == nullptr) {
      return absl::InvalidArgumentError("staging_allocator must not be null");
    }
-@@ -96,7 +97,8 @@ TransferReceiveSession::Create(
+@@ -97,7 +98,8 @@ TransferReceiveSession::Create(
        new TransferReceiveSession(base, staging_allocator, uuid));
    std::vector<int64_t> host_block_ids;
    if (!session->AllocateStagingForLoad(req_id, local_block_ids,
@@ -536,7 +536,7 @@ index 38a9a8d..382cfbf 100644
      return absl::ResourceExhaustedError(
          absl::StrCat("Failed to allocate staging for load req_id=", req_id,
                       ", uuid=", uuid));
-@@ -214,7 +216,7 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
+@@ -215,7 +217,7 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
  bool TransferReceiveSession::AllocateStagingForLoad(
      const std::string& req_id, const std::vector<int64_t>& local_block_ids,
      const std::optional<std::vector<int64_t>>& local_host_block_ids,
@@ -545,7 +545,7 @@ index 38a9a8d..382cfbf 100644
    absl::MutexLock lock(mu_);
    if (local_host_block_ids.has_value()) {
      *host_block_ids = *local_host_block_ids;
-@@ -227,14 +229,17 @@ bool TransferReceiveSession::AllocateStagingForLoad(
+@@ -228,14 +230,17 @@ bool TransferReceiveSession::AllocateStagingForLoad(
    absl::flat_hash_set<int64_t> unique_local_bids(local_block_ids.begin(),
                                                   local_block_ids.end());
    absl::StatusOr<StagingAllocation> acquired = staging_allocator_->Acquire(
@@ -565,19 +565,19 @@ index 38a9a8d..382cfbf 100644
                 << ", max_blocks=" << staging_allocator_->max_blocks() << ")";
      return false;
    }
-diff --git a/tpu_sync/core/transfer_receive_session.h b/tpu_sync/core/transfer_receive_session.h
-index d7948ee..8392891 100644
---- a/tpu_sync/core/transfer_receive_session.h
-+++ b/tpu_sync/core/transfer_receive_session.h
+diff --git a/tpu_sync/kv_cache/transfer_receive_session.h b/tpu_sync/kv_cache/transfer_receive_session.h
+index 0c0f311..9c45284 100644
+--- a/tpu_sync/kv_cache/transfer_receive_session.h
++++ b/tpu_sync/kv_cache/transfer_receive_session.h
 @@ -28,6 +28,7 @@
  #include "absl/container/flat_hash_map.h"
  #include "absl/status/status.h"
  #include "absl/status/statusor.h"
 +#include "absl/strings/string_view.h"
  #include "absl/synchronization/mutex.h"
- #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+ #include "absl/types/span.h"
  #include "tpu_sync/core/raw_transfer_core.h"
-@@ -52,13 +53,17 @@ class TransferReceiveSession
+@@ -53,13 +54,17 @@ class TransferReceiveSession
      : public TransferSession,
        public std::enable_shared_from_this<TransferReceiveSession> {
   public:
@@ -596,7 +596,7 @@ index d7948ee..8392891 100644
  
    static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
        kv_cache::KVCacheManagerBase* base,
-@@ -198,11 +203,11 @@ class TransferReceiveSession
+@@ -209,11 +214,11 @@ class TransferReceiveSession
    // Allocates host staging for a consumer StartRead load plan via
    // |staging_allocator_| (unless |local_host_block_ids| is explicitly provided)
    // and populates |*host_block_ids|. Returns false if staging capacity is
@@ -610,11 +610,11 @@ index d7948ee..8392891 100644
  
    // Builds the transport and H2D copy plan for a consumer StartRead request.
    static CopyPlan BuildLoadCopyPlan(
-diff --git a/tpu_sync/core/transfer_send_session_test.cc b/tpu_sync/core/transfer_send_session_test.cc
-index 820b226..afbc608 100644
---- a/tpu_sync/core/transfer_send_session_test.cc
-+++ b/tpu_sync/core/transfer_send_session_test.cc
-@@ -488,5 +488,92 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
+diff --git a/tpu_sync/kv_cache/transfer_send_session_test.cc b/tpu_sync/kv_cache/transfer_send_session_test.cc
+index 9dd8af3..fa9114b 100644
+--- a/tpu_sync/kv_cache/transfer_send_session_test.cc
++++ b/tpu_sync/kv_cache/transfer_send_session_test.cc
+@@ -480,5 +480,92 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
        session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
  }
  

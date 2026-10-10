@@ -5,7 +5,7 @@ import TpuSyncVerify.Common.ModelCheck
 # `ReadRemote`: destination-side settle protocol
 
 The destination half of `RaidenController::ReadRemote`
-(`tpu_sync/core/controller/raiden_controller.cc`, tpu-sync `50b0774`) as a
+(`tpu_sync/core/controller/raiden_controller.cc`, tpu-sync `1fa06d1`) as a
 finite transition system, checked exhaustively. Seven booleans, every event
 fires at most once, so `ModelCheck.check` visits the *whole* reachable state
 space: `.safe` here is a verification result, not a bounded one.
@@ -16,18 +16,18 @@ has been told the read failed.
 
 ## How a read runs
 
-`ReadRemote` (`:912-1107`) acquires a lease at the source (`AcquireReadLease`,
-`:1016`). The reply callback (`:1018-1077`) settles on an RPC error
-(`:1020-1033`), settles with `Cancelled` if the controller was torn down
-meanwhile (`:1059-1075`), and otherwise calls `PullAndRelease` (`:1076`),
+`ReadRemote` (`:947-1142`) acquires a lease at the source (`AcquireReadLease`,
+`:1051`). The reply callback (`:1053-1112`) settles on an RPC error
+(`:1055-1068`), settles with `Cancelled` if the controller was torn down
+meanwhile (`:1094-1110`), and otherwise calls `PullAndRelease` (`:1111`),
 which issues the pull — `TransferBuffers` into the caller's destination
-blocks (`:1161-1162`) — and, when it completes, releases the lease and
-settles with the verdict (`:1169-1210`). A detached deadline thread
-(`:1084-1104`) settles with `DeadlineExceeded` unless already settled.
-`Settle` is idempotent (`:902-909`): the first call sets the promise.
+blocks (`:1196-1197`) — and, when it completes, releases the lease and
+settles with the verdict (`:1204-1245`). A detached deadline thread
+(`:1119-1139`) settles with `DeadlineExceeded` unless already settled.
+`Settle` is idempotent (`:937-944`): the first call sets the promise.
 
 The caller treats a settled promise as "no copy touches my blocks any more":
-the comment at `:1134-1138` says the staging blocks go back to the pool once
+the comment at `:1169-1173` says the staging blocks go back to the pool once
 the read settles, success or failure, and the device blocks are the caller's
 to refill.
 
@@ -36,24 +36,24 @@ to refill.
 | Field           | C++ |
 |-----------------|-----|
 | `acquired`      | the acquire callback has run |
-| `pullIssued`    | `TransferBuffers` was called (`:1162`) |
-| `pullDone`      | the transfer future resolved (`:1169`) |
-| `settled`       | `RemoteReadState::settled` (`:899`) |
-| `deadlineFired` | the deadline thread woke (`:1085`) |
-| `shutdown`      | `lifetime->ctrl == nullptr` (`:1060`) |
+| `pullIssued`    | `TransferBuffers` was called (`:1197`) |
+| `pullDone`      | the transfer future resolved (`:1204`) |
+| `settled`       | `RemoteReadState::settled` (`:934`) |
+| `deadlineFired` | the deadline thread woke (`:1120`) |
+| `shutdown`      | `lifetime->ctrl == nullptr` (`:1095`) |
 | `reused`        | ghost: the caller has reused the destination blocks |
 
 | Event              | C++ |
 |--------------------|-----|
 | `acquireReply ok`  | the acquire callback, with an OK or failed RPC status |
 | `shutdown`         | controller teardown detaches in-flight reads (`:318`) |
-| `deadline`         | the deadline thread (`:1084-1104`) |
-| `pullDone`         | `transfer.OnReady` → release → `Settle(verdict)` (`:1169-1210`) |
+| `deadline`         | the deadline thread (`:1119-1139`) |
+| `pullDone`         | `transfer.OnReady` → release → `Settle(verdict)` (`:1204-1245`) |
 | `callerReuse`      | the caller reuses the destination blocks after the future settled |
 
 `Impl` selects the implementation of the acquire callback and the deadline:
 
-* `shipping` — the code at `50b0774`: nothing checks `settled` before
+* `shipping` — the code at `1fa06d1`: nothing checks `settled` before
   `TransferBuffers`, and the deadline settles regardless of an in-flight pull;
 * `checkSettledBeforePull` — the naive fix: skip the pull if already settled
   (`findings/candidate_fixes.patch` does this);
@@ -112,11 +112,11 @@ inductive Impl where
 /-- A pull was issued and its future has not resolved. -/
 def S.pullInFlight (s : S) : Bool := s.pullIssued && !s.pullDone
 
-/-- The acquire callback (`:1018-1077`). -/
+/-- The acquire callback (`:1053-1112`). -/
 def acquireReply (impl : Impl) (ok : Bool) (s : S) : Option S :=
   if s.acquired then none
   else if !ok || s.shutdown then
-    -- `:1028` / `:1072`: settle, no pull.
+    -- `:1063` / `:1107`: settle, no pull.
     some { s with acquired := true, settled := true }
   else
     let issue := match impl with
@@ -128,7 +128,7 @@ def acquireReply (impl : Impl) (ok : Bool) (s : S) : Option S :=
 def shutdownCtrl (s : S) : Option S :=
   if s.shutdown then none else some { s with shutdown := true }
 
-/-- The deadline thread (`:1084-1104`). -/
+/-- The deadline thread (`:1119-1139`). -/
 def deadline (impl : Impl) (s : S) : Option S :=
   if s.deadlineFired then none
   else
@@ -137,7 +137,7 @@ def deadline (impl : Impl) (s : S) : Option S :=
       | _ => true
     some { s with deadlineFired := true, settled := s.settled || settleNow }
 
-/-- `transfer.OnReady` → `ReleaseReadLease` → `Settle(verdict)` (`:1169-1210`). -/
+/-- `transfer.OnReady` → `ReleaseReadLease` → `Settle(verdict)` (`:1204-1245`). -/
 def completePull (s : S) : Option S :=
   if s.pullInFlight then some { s with pullDone := true, settled := true } else none
 

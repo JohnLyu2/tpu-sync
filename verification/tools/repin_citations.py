@@ -5,11 +5,13 @@ commit to another.
     tools/repin_citations.py OLD NEW [--apply] [--skip SRC:LINE ...] [SOURCE ...]
 
 Run from `verification/`. Default sources: `TpuSyncVerify/**/*.lean`,
-`docs/**/*.md` and `findings/*.md`. OLD and NEW are any two tpu-sync revisions
+`docs/**/*.md` and `findings/*.md` except FROZEN (`filed_bugs.md`, verbatim
+bug write-ups pinned to the commit they name). OLD and NEW are any two tpu-sync revisions
 known to the enclosing git repository (e.g. `01ffa3d upstream-main-2026-10-06`).
 
 For every citation, the cited OLD line range is mapped through
-`git diff -U0 OLD NEW -- <file>` and one report line is printed:
+`git diff -U0 OLD NEW -- <file>` (across a rename detected with `git diff -M`
+when the file moved) and one report line is printed:
 
     SRC:LINE  path  old -> new  STATUS
 
@@ -20,9 +22,12 @@ For every citation, the cited OLD line range is mapped through
             range is a guess — re-read the code and fix by hand
     skip    left alone: unknown or external file, ambiguous basename, a line
             that names another commit (e.g. `b68161a`), or --skip
+    moved   suffix: the file was renamed between OLD and NEW; a citation that
+            spells the full OLD path is rewritten to the NEW path
 
-With --apply, `same`/`shift`/`grown` citations are rewritten in place; a
-citation with any CHECK element is left untouched as a whole. The preamble
+With --apply, `same`/`shift`/`grown` citations are rewritten in place (and a
+full OLD path is replaced by the NEW path when the file moved); a citation with
+any CHECK element is left untouched as a whole, path included. The preamble
 sentence that names the commit is *not* rewritten — change it by hand once the
 report is clean, and record the re-check in `docs/upstream_rechecks.md`
 (see `docs/conventions.md`).
@@ -31,7 +36,7 @@ Recognised forms (the number must follow a colon):
 
     `alias:N`  `alias:N-M`  `alias:N, M, P-Q`   alias = short name in ALIASES,
                                                 or a basename / path in the
-                                                tpu-sync tree at OLD
+                                                tpu-sync tree at OLD or NEW
     `.cc:N`  `.h:N`                              the source module's default
                                                 pair (DEFAULTS)
     `:N`  (backtick, colon, digits)              the file of the previous
@@ -52,27 +57,33 @@ import re
 import subprocess
 import sys
 
+# Paths here and in DEFAULTS may be spelled in either the OLD or the NEW tree
+# naming; Mapper.old_path() follows renames in both directions.
 ALIASES = {
-    "recv.cc": "tpu_sync/core/transfer_receive_session.cc",
-    "recv.h": "tpu_sync/core/transfer_receive_session.h",
-    "send.cc": "tpu_sync/core/transfer_send_session.cc",
-    "send.h": "tpu_sync/core/transfer_send_session.h",
-    "mgr.cc": "tpu_sync/core/kv_cache_manager_with_transfer.cc",
-    "mgr.h": "tpu_sync/core/kv_cache_manager_with_transfer.h",
+    "recv.cc": "tpu_sync/kv_cache/transfer_receive_session.cc",
+    "recv.h": "tpu_sync/kv_cache/transfer_receive_session.h",
+    "send.cc": "tpu_sync/kv_cache/transfer_send_session.cc",
+    "send.h": "tpu_sync/kv_cache/transfer_send_session.h",
+    "mgr.cc": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc",
+    "mgr.h": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h",
     "bt.cc": "tpu_sync/transport/block_transport.cc",
     "bt.h": "tpu_sync/transport/block_transport.h",
     "send_drain_test.cc":
-        "tpu_sync/core/kv_cache_manager_with_transfer_send_drain_test.cc",
+        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc",
     "control_test.cc":
-        "tpu_sync/core/kv_cache_manager_with_transfer_control_test.cc",
+        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc",
 }
 
 # Files cited by basename that are not part of the tpu-sync tree.
 EXTERNAL = {"tpu_connector.py"}
 
+# Sources whose citations are deliberately frozen at the commit they name
+# (verbatim bug write-ups with GitHub permalinks) and never re-pinned.
+FROZEN = {"filed_bugs.md"}
+
 # Unqualified `.cc` / `.h` per source module: the stem of the default pair.
-RECV = "tpu_sync/core/transfer_receive_session"
-SEND = "tpu_sync/core/transfer_send_session"
+RECV = "tpu_sync/kv_cache/transfer_receive_session"
+SEND = "tpu_sync/kv_cache/transfer_send_session"
 DEFAULTS = {
     "TpuSyncVerify/Transfer/PrefillDecode/Receive.lean": RECV,
     "TpuSyncVerify/Transfer/PrefillDecode/ReceivePoll.lean": RECV,
@@ -128,11 +139,34 @@ class Mapper:
             if p.startswith("tpu_sync/"):
                 self.paths.add(p)
                 self.by_base[os.path.basename(p)].append(p)
+        # Renames between OLD and NEW (old path -> new path), so that a moved
+        # file is diffed against itself rather than reported as deleted.
+        self.renamed = {}
+        for line in git(repo, "diff", "-M", "--name-status", "--diff-filter=R",
+                        old, new).splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                self.renamed[parts[1]] = parts[2]
+        self.renamed_back = {v: k for k, v in self.renamed.items()}
         self._hunks = {}
+
+    def old_path(self, path):
+        """The OLD-tree path for `path` spelled in OLD or NEW naming, or None."""
+        if path in self.paths:
+            return path
+        return self.renamed_back.get(path)
+
+    def new_path(self, path):
+        """Where the OLD-tree `path` lives at NEW."""
+        return self.renamed.get(path, path)
 
     def hunks(self, path):
         if path not in self._hunks:
-            out = git(self.repo, "diff", "-U0", self.old, self.new, "--", path)
+            if path in self.renamed:
+                out = git(self.repo, "diff", "-U0", f"{self.old}:{path}",
+                          f"{self.new}:{self.renamed[path]}")
+            else:
+                out = git(self.repo, "diff", "-U0", self.old, self.new, "--", path)
             hs = []
             for m in re.finditer(
                     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", out, re.M):
@@ -145,13 +179,18 @@ class Mapper:
         return self._hunks[path]
 
     def resolve(self, tok):
-        """Return (path | None, reason)."""
+        """Return (OLD-tree path | None, reason)."""
         if tok in ALIASES:
-            return ALIASES[tok], ""
+            return self.old_path(ALIASES[tok]), ""
         if tok in EXTERNAL:
             return None, "external"
         if "/" in tok:
-            cands = [p for p in self.paths if p == tok or p.endswith("/" + tok)]
+            direct = self.old_path(tok)
+            if direct:
+                return direct, ""
+            cands = [p for p in self.paths if p.endswith("/" + tok)]
+            cands += [o for n, o in self.renamed_back.items()
+                      if n.endswith("/" + tok) and o not in cands]
             if len(cands) == 1:
                 return cands[0], ""
             return None, "unknown-path" if not cands else "ambiguous"
@@ -215,7 +254,7 @@ def process(src, rel, mapper, skips, apply):
                 label = tok
             elif unq:
                 ext = unq[2:]  # "cc" or "h"
-                path = f"{default}.{ext}" if default else None
+                path = mapper.old_path(f"{default}.{ext}") if default else None
                 why = "no-default"
                 label = f".{ext}"
             else:
@@ -245,10 +284,21 @@ def process(src, rel, mapper, skips, apply):
             old_s = ", ".join(fmt(lo, hi) for _, _, lo, hi, _, _ in elems)
             new_s = ", ".join(fmt(nlo, nhi) for _, _, _, _, nlo, nhi in elems)
             tag = f"  via {label}" if not tok else ""
+            # A full OLD path spelled in the citation follows the rename:
+            # the citation keeps its own depth (last k components).
+            moved = bool(tok and "/" in tok and path in mapper.renamed
+                         and path.endswith(tok))
+            if moved:
+                tag += "  moved"
+                counts["moved"] += 1
             if worst == "same":
                 print(f"{rel}:{lineno}  {path}:{old_s}  same{tag}")
             else:
                 print(f"{rel}:{lineno}  {path}:{old_s} -> {new_s}  {worst}{tag}")
+            if moved and worst != "CHECK":
+                k = tok.count("/") + 1
+                new_tok = "/".join(mapper.new_path(path).split("/")[-k:])
+                edits.append((m.start("tok"), m.end("tok"), new_tok))
             if worst in ("shift", "grown"):
                 # Rebuild the nums group with new numbers, keeping separators.
                 pieces, last = [], 0
@@ -300,7 +350,7 @@ def main():
                            ("findings", (".md",))):
             for dp, _, fns in os.walk(root):
                 sources += [os.path.join(dp, f) for f in sorted(fns)
-                            if f.endswith(exts)]
+                            if f.endswith(exts) and f not in FROZEN]
     total = collections.Counter()
     for src in sorted(sources):
         rel = os.path.relpath(src, here)

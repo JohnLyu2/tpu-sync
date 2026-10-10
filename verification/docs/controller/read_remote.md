@@ -2,7 +2,7 @@
 
 `TpuSyncVerify/Controller/ReadRemote.lean` models the destination half of
 `RaidenController::ReadRemote` (`tpu_sync/core/controller/raiden_controller.cc`,
-tpu-sync `50b0774`). It is the model behind finding **F2** in
+tpu-sync `1fa06d1`). It is the model behind finding **F2** in
 `findings/README.md`: a remote read can keep DMA-ing into the caller's
 destination blocks after the caller has been told the read failed.
 
@@ -20,7 +20,7 @@ exhausts it: `.safe` here is a proof, not a bound.
 
 | `Impl` | Acquire callback | Deadline |
 |---|---|---|
-| `shipping` | issues the pull unconditionally (`:1161-1162`) | settles (`:1084-1104`) |
+| `shipping` | issues the pull unconditionally (`:1196-1197`) | settles (`:1119-1139`) |
 | `checkSettledBeforePull` | skips the pull if already settled (`findings/candidate_fixes.patch`) | settles |
 | `deferSettleWhilePullInFlight` | as above | does not settle while a pull is in flight; the pull's completion settles — what the sibling `WriteRemote` path already does (`kv_cache_store_service.cc` `DeadlineLoop`) |
 
@@ -28,7 +28,7 @@ exhausts it: `.safe` here is a proof, not a bound.
 
 `NoWriteAfterRelease`: the caller never reuses the destination blocks while a
 pull into them is in flight (issued and not done). The caller is entitled to
-this by the comment at `:1134-1138`.
+this by the comment at `:1169-1173`.
 
 ## Results
 
@@ -53,8 +53,7 @@ cancellation, or settle-with-error while the blocks stay quarantined.
 ## Test suite correspondence (`tpu-raiden` C++ unit tests → Lean)
 
 The `ReadRemote` C++ unit tests in `tpu_sync/core/controller/raiden_controller_test.cc`
-(run by `tools/run_cc_tests.sh` and the `tpu-raiden` Blaze suite
-`//third_party/tpu_raiden/tpu_sync/core/controller:raiden_controller_test`) and
+(`bazel test //tpu_sync/core/controller:raiden_controller_test`) and
 the bug-hunt repro in `findings/raiden_controller_bughunt_test.cc` map to
 `ReadRemote.lean` as follows:
 
@@ -74,8 +73,8 @@ the bug-hunt repro in `findings/raiden_controller_bughunt_test.cc` map to
 
 | | |
 |---|---|
-| Citations | `50b0774` |
-| Tests in `findings/` | last run on `d16701e`; not re-run at `50b0774` |
-| Patches in `findings/` | `git apply --check` clean at `50b0774` |
-| Upstream fix | none as of `50b0774` (2026-10-06) |
+| Citations | `1fa06d1` (the `ReadRemote` region of `raiden_controller.cc` moved +35 lines since `50b0774`, otherwise byte-identical) |
+| Tests in `findings/` | last run on `d16701e`; not re-run at `1fa06d1` |
+| Patches in `findings/` | apply clean at `1fa06d1` |
+| Upstream fix | none for F2 as of `1fa06d1` (2026-10-10); F4 fixed in `72255dd` |
 

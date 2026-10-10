@@ -4,7 +4,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 /-!
 # Within-Layer Block-Index Gather, Reordering, Subset Validation & Custom Host Staging
 
-Citations are to tpu-sync `50b0774`;
+Citations are to tpu-sync `1fa06d1`;
 `send.cc`, `recv.cc`, `bt.cc` and `mgr.cc` abbreviate as in `Pipeline.lean`.
 
 Stage 4 (spatial block refinement) of the prefill-to-decode model: refines
@@ -26,19 +26,19 @@ per-block arrays `Layer → BlockId → BlockCell`, modelling:
      is extensionally identical on every memory state to executing elementwise
      block-by-block copies (`execElementwise`).
 3. **Consumer staging allocation & custom host staging blocks**
-   (`AllocateStagingForLoad`, `recv.cc:214-260`):
+   (`AllocateStagingForLoad`, `recv.cc:215-261`):
    - Supports both caller-supplied custom host block IDs
-     (`local_host_block_ids.has_value()`, `recv.cc:219-222`, tested in
+     (`local_host_block_ids.has_value()`, `recv.cc:220-223`, tested in
      `LocalOrchestratedTransferToCustomHostBlock`) and allocator-backed host
      staging (`staging_allocator_->Acquire(unique_local_bids.size())`,
-     `recv.cc:227-259`).
-4. **Dual-permutation `BuildLoadCopyPlan`** (`recv.cc:262-330`, `send.cc:270-320`):
-   - **Transport order (`remote_order`, `recv.cc:280-296`):** stable-sorts
+     `recv.cc:228-260`).
+4. **Dual-permutation `BuildLoadCopyPlan`** (`recv.cc:263-331`, `send.cc:270-320`):
+   - **Transport order (`remote_order`, `recv.cc:281-297`):** stable-sorts
      request indices by `remote_block_ids` so both `producer_remote_block_ids`
      (staged into producer host slots `0 … k-1` by `StartPush`) and
      `transport_host_block_ids` (where `BlockTransport` lands incoming blocks on
      the consumer host) are permuted by the same permutation $\pi_{\text{remote}}$.
-   - **H2D order (`local_order`, `recv.cc:298-327`):** stable-sorts request
+   - **H2D order (`local_order`, `recv.cc:299-328`):** stable-sorts request
      indices by `local_block_ids`, deduplicates identical `(local_bid, host_bid)`
      pairs, and coalesces contiguous `(h2d_host_block_ids, h2d_local_block_ids)`
      runs via `BuildCoalescedCopySpec`.
@@ -252,21 +252,21 @@ theorem getElem?_execElementwise_of_mem (default : α) (src dst : List α)
           exact hrest hq
       · exact (hrest hmem').elim
 
-/-! ## 3. Consumer Staging Allocation & Dual-Permutation `CopyPlan` (`recv.cc:214-330`) -/
+/-! ## 3. Consumer Staging Allocation & Dual-Permutation `CopyPlan` (`recv.cc:215-331`) -/
 
 /-- How consumer host staging blocks are chosen in `AllocateStagingForLoad`
-(`recv.cc:214-260`):
+(`recv.cc:215-261`):
 - `allocator stagedBlocks`: deduplicates `local_block_ids` and assigns blocks
-  drawn from `staging_allocator_->Acquire` (`recv.cc:227-259`).
+  drawn from `staging_allocator_->Acquire` (`recv.cc:228-260`).
 - `customHost hostBlocks`: uses caller-specified `local_host_block_ids` directly
-  without touching `staging_allocator_` (`recv.cc:219-222`). -/
+  without touching `staging_allocator_` (`recv.cc:220-223`). -/
 inductive StagingMode where
   | allocator (stagedBlocks : List Nat)
   | customHost (hostBlocks : List Nat)
   deriving Repr, DecidableEq
 
 /-- Look up or assign a host block for each local block ID, matching the
-`local_to_host` loop in `AllocateStagingForLoad` (`recv.cc:243-258`). -/
+`local_to_host` loop in `AllocateStagingForLoad` (`recv.cc:244-259`). -/
 def assignHostBlocksAux (stagedBlocks : List Nat) :
     List Nat → List (Nat × Nat) → Nat → Option (List Nat)
   | [], _, _ => some []
@@ -281,7 +281,7 @@ def assignHostBlocksAux (stagedBlocks : List Nat) :
           (hostBid :: ·)
       | none => none
 
-/-- `TransferReceiveSession::AllocateStagingForLoad` (`recv.cc:214-260`). -/
+/-- `TransferReceiveSession::AllocateStagingForLoad` (`recv.cc:215-261`). -/
 def allocateStagingForLoad (localBlocks : List Nat) : StagingMode → Option (List Nat)
   | .customHost hostBlocks =>
     if hostBlocks.length = localBlocks.length then some hostBlocks else none
@@ -297,7 +297,7 @@ structure BlockTriple where
   deriving Repr, DecidableEq
 
 /-- Stable insertion sort helper (`std::stable_sort` in `BuildLoadCopyPlan`,
-`recv.cc:285-288, 303-306`). -/
+`recv.cc:286-289, 304-307`). -/
 def insertBy (le : α → α → Bool) (x : α) : List α → List α
   | [] => [x]
   | y :: ys => if le x y then x :: y :: ys else y :: insertBy le x ys
@@ -450,7 +450,7 @@ theorem enumFrom_fst_inj [DecidableEq α] {x : α} {j₁ j₂ idx : Nat} {xs : L
       exact (hnd.1 (fst_mem_of_mem_enumFrom htail₁)).elim
     · exact ih hnd.2 htail₁ htail₂
 
-/-- Deduplicate adjacent equal pairs (`recv.cc:314-323` in `BuildLoadCopyPlan`). -/
+/-- Deduplicate adjacent equal pairs (`recv.cc:315-324` in `BuildLoadCopyPlan`). -/
 def dedupAdj [DecidableEq α] : List α → List α
   | [] => []
   | [x] => [x]
@@ -477,27 +477,27 @@ def zipTriples : List Nat → List Nat → List Nat → List BlockTriple
   | r :: rs, d :: ds, h :: hs => ⟨r, d, h⟩ :: zipTriples rs ds hs
   | _, _, _ => []
 
-/-- The compiled dual-permutation copy plan (`CopyPlan` in `recv.cc:262-330`
+/-- The compiled dual-permutation copy plan (`CopyPlan` in `recv.cc:263-331`
 coupled with producer `StartPush` staging in `send.cc:306-320`). -/
 structure CopyPlan where
   triples : List BlockTriple
-  /-- `remote_order` (`recv.cc:280-296`): `triples` sorted by `remote_block_ids`. -/
+  /-- `remote_order` (`recv.cc:281-297`): `triples` sorted by `remote_block_ids`. -/
   remoteSorted : List BlockTriple
-  /-- `local_order` (`recv.cc:298-307`): `triples` sorted by `local_block_ids`. -/
+  /-- `local_order` (`recv.cc:299-307`): `triples` sorted by `local_block_ids`. -/
   localSorted : List BlockTriple
-  /-- `producer_remote_block_ids` sent in `PullStream` (`recv.cc:294`). -/
+  /-- `producer_remote_block_ids` sent in `PullStream` (`recv.cc:295`). -/
   producerRemoteBlocks : List Nat
-  /-- `transport_host_block_ids` where `BlockTransport` lands blocks (`recv.cc:295`). -/
+  /-- `transport_host_block_ids` where `BlockTransport` lands blocks (`recv.cc:296`). -/
   transportHostBlocks : List Nat
   /-- Producer D2H pairs `(producer_remote_block_ids[j], j)` (`send.cc:306-320`). -/
   d2hPairs : List (Nat × Nat)
   /-- Network H2H pairs `(j, transport_host_block_ids[j])` (`send.cc:311-312`). -/
   h2hPairs : List (Nat × Nat)
-  /-- Consumer H2D pairs `(h2d_host_block_ids[j], h2d_local_block_ids[j])` (`recv.cc:310-324`). -/
+  /-- Consumer H2D pairs `(h2d_host_block_ids[j], h2d_local_block_ids[j])` (`recv.cc:311-325`). -/
   h2dPairs : List (Nat × Nat)
   /-- Coalesced producer D2H `CopySpec` (`send.cc:320`). -/
   d2hSpec : List CopyRun
-  /-- Coalesced consumer H2D `CopySpec` (`recv.cc:326-327`). -/
+  /-- Coalesced consumer H2D `CopySpec` (`recv.cc:327-328`). -/
   h2dSpec : List CopyRun
   deriving Repr, DecidableEq
 
@@ -509,7 +509,7 @@ end CopyPlan
 
 /-- Build a `CopyPlan` from `triples`, executing the exact dual-permutation
 sorting and run-coalescing of `TransferReceiveSession::BuildLoadCopyPlan`
-(`recv.cc:262-330`) and `TransferSendSession::StartPush` (`send.cc:306-320`). -/
+(`recv.cc:263-331`) and `TransferSendSession::StartPush` (`send.cc:306-320`). -/
 def buildCopyPlanFromTriples (triples : List BlockTriple) : CopyPlan :=
   let remoteSorted := sortBy (fun a b => a.remote ≤ b.remote) triples
   let localSorted := sortBy (fun a b => a.local_ ≤ b.local_) triples
@@ -529,7 +529,7 @@ def buildCopyPlanFromTriples (triples : List BlockTriple) : CopyPlan :=
     d2hSpec := buildCoalescedSpec d2hPairs,
     h2dSpec := buildCoalescedSpec h2dPairs }
 
-/-- `TransferReceiveSession::BuildLoadCopyPlan` (`recv.cc:262-330`). -/
+/-- `TransferReceiveSession::BuildLoadCopyPlan` (`recv.cc:263-331`). -/
 def buildLoadCopyPlan (remoteBlocks localBlocks hostBlocks : List Nat) : CopyPlan :=
   buildCopyPlanFromTriples (zipTriples remoteBlocks localBlocks hostBlocks)
 
@@ -570,12 +570,12 @@ def d2hStage (l numBlocks : Nat) (plan : CopyPlan) : List BlockCell :=
   execCoalesced .junk (goodBlockLayer numBlocks l) (junkBlockLayer plan.numBlocks) plan.d2hSpec
 
 /-- Stage 2 (Network H2H landing): `BlockTransport` lands producer host blocks
-`0 … k-1` into consumer `transport_host_block_ids` (`bt.cc:415-469`). -/
+`0 … k-1` into consumer `transport_host_block_ids` (`bt.cc:555-609`). -/
 def landStage (l numBlocks numHostBlocks : Nat) (plan : CopyPlan) : List BlockCell :=
   execElementwise .junk (d2hStage l numBlocks plan) (blankBlockLayer numHostBlocks) plan.h2hPairs
 
 /-- Stage 3 (Consumer H2D): coalesced scatter from consumer `h2d_host_block_ids`
-into consumer device `h2d_local_block_ids` (`recv.cc:326-327, 618-629`). -/
+into consumer device `h2d_local_block_ids` (`recv.cc:327-328, 655-660`). -/
 def h2dStage (l numBlocks numHostBlocks : Nat) (plan : CopyPlan) : List BlockCell :=
   execCoalesced .junk (landStage l numBlocks numHostBlocks plan) (blankBlockLayer numBlocks) plan.h2dSpec
 
@@ -587,7 +587,7 @@ def h2dStage (l numBlocks numHostBlocks : Nat) (plan : CopyPlan) : List BlockCel
 3. Host block assignment is injective on distinct triples (`AllocateStagingForLoad`
    assigns distinct staged blocks to distinct local blocks, and requested pairs
    are distinct).
-4. Duplicate local block IDs map to the same host block ID (`recv.cc:319-322`). -/
+4. Duplicate local block IDs map to the same host block ID (`recv.cc:320-323`). -/
 structure ValidTriples (numBlocks numHostBlocks : Nat) (triples : List BlockTriple) : Prop where
   remote_lt : ∀ t ∈ triples, t.remote < numBlocks
   local_lt : ∀ t ∈ triples, t.local_ < numBlocks
@@ -1412,7 +1412,7 @@ def trace2LayersOutOfOrder : List Ev :=
    .h2dReady 1, .h2dReady 0, .recv (.h2dDone true), .recv (.h2dDone true), .recv .publish]
 
 /-- **Trace 1 (`DuplicateBlocksAreRejectedAtRegistration`,
-`kv_cache_manager_with_transfer_send_drain_test.cc:382-391`):**
+`kv_cache_manager_with_transfer_send_drain_test.cc:387-396`):**
 `PopulateRegisteredBlocks` rejects `{0, 0}` at `NotifyForRead` while accepting
 `{0, 1, 2}`. -/
 theorem trace_duplicate_registration_rejected :
@@ -1420,10 +1420,11 @@ theorem trace_duplicate_registration_rejected :
     validateRegistration [0, 1, 2] = true := by decide
 
 /-- **Trace 2 (`UniqueRegisteredSubsetIsAcknowledged`,
-`kv_cache_manager_with_transfer_control_test.cc:353-365`):**
+`kv_cache_manager_with_transfer_control_test.cc:354-366`):**
 `NotifyForRead` registers `{0, 1, 2}`; `PullStream` requests the reordered
 subset `source_blocks = {2, 0}` into `destination_blocks = {6, 7}`.
-`ValidateAndBeginPull` accepts the subset and the transfer delivers
+`ValidateAndBeginPull` accepts the subset (the test asserts the handshake
+`status == 0`); model-only beyond the test, the transfer delivers
 `decodeHbm[0][6] = .kv 0 2` and `decodeHbm[0][7] = .kv 0 0`. -/
 theorem trace_subset_pull_acknowledged :
     ((BlockPipeline.sys 1 8 2 [0, 1, 2] [⟨2, 6, 0⟩, ⟨0, 7, 1⟩]).run trace1Layer).map
@@ -1435,10 +1436,11 @@ theorem trace_subset_pull_acknowledged :
   decide
 
 /-- **Trace 3 (`PullOfUnregisteredBlockIsRejected`,
-`kv_cache_manager_with_transfer_control_test.cc:381-394`):**
+`kv_cache_manager_with_transfer_control_test.cc:382-395`):**
 `NotifyForRead` registers `{0, 1}`; `PullStream` requests `{0, 2}`.
-`ValidateAndBeginPull` (`.send .beginPull`) is rejected (`none`), and the
-consumer's pull fails (`.recv (.pullReply false)`) with `pullStarted = false`. -/
+`ValidateAndBeginPull` (`.send .beginPull`) is rejected (`none`) — the test
+checks the producer's response — and, model-only, the consumer's pull fails
+(`.recv (.pullReply false)`) with `pullStarted = false`. -/
 theorem trace_unregistered_block_rejected :
     let sys := BlockPipeline.sys 1 4 2 [0, 1] [⟨0, 0, 0⟩, ⟨2, 1, 1⟩]
     sys.run [.send .beginPull] = none ∧
@@ -1448,7 +1450,7 @@ theorem trace_unregistered_block_rejected :
   decide
 
 /-- **Trace 4 (`PullWithDuplicateSourceBlockIsRejected`,
-`kv_cache_manager_with_transfer_control_test.cc:396-409`):**
+`kv_cache_manager_with_transfer_control_test.cc:397-410`):**
 `NotifyForRead` registers `{0, 1}`; `PullStream` requests duplicate source
 blocks `{0, 0}`. `ValidateAndBeginPull` (`.send .beginPull`) is rejected. -/
 theorem trace_duplicate_source_block_rejected :
@@ -1456,7 +1458,7 @@ theorem trace_duplicate_source_block_rejected :
   decide
 
 /-- **Trace 5 (`EmptyPullIsRejected`,
-`kv_cache_manager_with_transfer_control_test.cc:411-423`):**
+`kv_cache_manager_with_transfer_control_test.cc:412-424`):**
 `NotifyForRead` registers `{0}`; `PullStream` requests `{}`.
 `ValidateAndBeginPull` (`.send .beginPull`) is rejected. -/
 theorem trace_empty_pull_rejected :
@@ -1491,8 +1493,8 @@ theorem trace_custom_host_block_transfer :
   decide
 
 /-- **Trace 8 (`test_non_contiguous_blocks`,
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:187-272`,
-`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:176-207`):**
+`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:187-271`,
+`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:176-206`):**
 2 layers completing out of order; `registered = [0, 2]`, `remote = [0, 2]`,
 `local = [0, 1]` out of `3` blocks. For both layers `l ∈ {0, 1}`,
 `decodeHbmB[l] = [.kv l 0, .kv l 2, .blank]` (local block `2` stays untouched). -/
@@ -1504,8 +1506,8 @@ theorem trace_non_contiguous_blocks :
   decide
 
 /-- **Trace 9 (`test_host_reordering`,
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:274-357`,
-`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:209-238`):**
+`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:274-356`,
+`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:209-237`):**
 2 layers completing out of order; `registered = [0, 1]`, `remote = [1, 0]`
 (reversed), `local = [0, 1]`. Both layers deliver `[.kv l 1, .kv l 0]` in
 `decodeHbmB[l]` (`local[0] ← remote[1]`, `local[1] ← remote[0]`). -/
@@ -1518,16 +1520,16 @@ theorem trace_host_reordering :
 
 /-- The 10-block non-contiguous reversed transfer configuration from
 `test_large_complex_non_contiguous_and_reorder`
-(`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:359-449`,
-`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:240-283`). -/
+(`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:359-448`,
+`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:240-282`). -/
 def largeComplexRegistered : List Nat := [0, 2, 3, 5, 6, 7, 9, 11, 12, 14]
 def largeComplexRemote : List Nat := largeComplexRegistered.reverse
 def largeComplexLocal : List Nat := List.range 10
 def largeComplexHost : List Nat := List.range 10
 
 /-- **Trace 10 (`test_large_complex_non_contiguous_and_reorder`,
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:359-449`,
-`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:240-283`):**
+`tpu_sync/api/jax/kv_cache_manager_transfer_test.py:359-448`,
+`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:240-282`):**
 16 blocks per layer, 2 layers completing out of order; `registered = [0, 2, 3, 5, 6, 7, 9, 11, 12, 14]`,
 `remote = reversed(registered)`, `local = [0..9]`.
 - `BuildCoalescedCopySpec` compresses the 10 sorted producer D2H blocks into 6
@@ -1545,11 +1547,11 @@ theorem trace_large_complex_non_contiguous_and_reorder :
            (largeComplexRemote.map (BlockCell.kv 1)) ++ List.replicate 6 BlockCell.blank]) := by
   decide
 
-/-! ### Mutant: Mismatched Transport Order (`recv.cc:295`)
+/-! ### Mutant: Mismatched Transport Order (`recv.cc:296`)
 
 If `BuildLoadCopyPlan` sorted `producer_remote_block_ids` by `remote_order`
-(`recv.cc:294`) without applying the same `remote_order` permutation to
-`transport_host_block_ids` (`recv.cc:295`), then on `test_host_reordering`
+(`recv.cc:295`) without applying the same `remote_order` permutation to
+`transport_host_block_ids` (`recv.cc:296`), then on `test_host_reordering`
 (`remote = [1, 0], local = [0, 1]`), `decodeHbm` silently receives the
 un-permuted blocks `[.kv 0 0, .kv 0 1]` instead of `[.kv 0 1, .kv 0 0]`. -/
 
