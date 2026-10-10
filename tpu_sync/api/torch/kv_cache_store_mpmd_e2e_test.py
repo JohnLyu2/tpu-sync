@@ -815,6 +815,34 @@ def _worker_write_remote_main(argv):
     dist.destroy_process_group()
 
 
+def _expected_shard_path(root, model_name, key, axes):
+  """Returns the file PosixPathMapper::MapKey picks for `key`.
+
+  Args:
+    root: The backend's root_dir.
+    model_name: The backend's model_name (already path-safe).
+    key: The raw block key bytes.
+    axes: (name, size, rank) for each declared axis, outermost first (pp, pcp,
+      tp). An empty list means no topology directory.
+  """
+  topology = "_".join(f"{name}{size}_r{rank}" for name, size, rank in axes)
+  key_hex = key.hex()
+  padded = key_hex + "0" * 5  # l1/l2 are fixed width; short keys are padded.
+  parts = [root, model_name] + ([topology] if topology else [])
+  parts += [padded[:3], padded[3:5], f"{key_hex}.bin"]
+  return os.path.join(*parts)
+
+
+def _assert_exact_shard_files(root, expected_paths, who):
+  """Asserts the .bin files under `root` are exactly `expected_paths`."""
+  expected = set(expected_paths)
+  actual = set(glob.glob(os.path.join(root, "**", "*.bin"), recursive=True))
+  assert actual == expected, (
+      f"{who}: missing {sorted(expected - actual)},"
+      f" unexpected {sorted(actual - expected)}"
+  )
+
+
 def _worker_secondary_storage_main(argv):
   rank = FLAGS.rank
   world_size = FLAGS.world_size
@@ -1007,19 +1035,23 @@ def _worker_secondary_storage_main(argv):
 
       dist.barrier()
 
-      # Expected per-rank shard path:
-      #   {storage_root}/test_model_mpmd/tp{world_size}_r{rank}/{hash[:3]}/{hash[3:5]}/{hash}.bin
-      # Each rank discovers only its rank-local shard file matching its TP rank.
-      bin_files = glob.glob(
-          os.path.join(
-              storage_root,
-              "test_model_mpmd",
-              f"tp{world_size}_r{rank}",
-              "**",
-              "*.bin",
-          ),
-          recursive=True,
-      )
+      # Each rank writes one file per hash, at exactly
+      #   {storage_root}/test_model_mpmd/tp{world_size}_r{rank}/{l1}/{l2}/{hash}.bin
+      # and nothing else may exist under storage_root.
+      paths_by_rank = {
+          r: [
+              _expected_shard_path(
+                  storage_root, "test_model_mpmd", h, [("tp", world_size, r)]
+              )
+              for h in hashes
+          ]
+          for r in range(world_size)
+      }
+      all_paths = []
+      for paths in paths_by_rank.values():
+        all_paths.extend(paths)
+      _assert_exact_shard_files(storage_root, all_paths, f"Rank {rank}")
+      bin_files = paths_by_rank[rank]
       print(
           f"[MPMD Storage][Step 6/11][Write Phase][Rank {rank}] Discovered"
           f" {len(bin_files)} on-disk shard files:"
@@ -1372,26 +1404,26 @@ def _wait_for_lookup(store, hashes, expected_statuses,
     time.sleep(0.1)
 
 
-def _verify_and_print_shard_files(tag, phase, storage_root, model_name,
-                                  world_size, rank, expected_count):
-  bin_files = sorted(
-      glob.glob(
-          os.path.join(
-              storage_root,
-              model_name,
-              f"tp{world_size}_r{rank}",
-              "**",
-              "*.bin",
-          ),
-          recursive=True,
-      )
+def _verify_and_print_shard_files(
+    tag, phase, storage_root, model_name, world_size, rank, keys
+):
+  """Asserts every TP rank wrote exactly one file per key, and nothing else."""
+  expected = []
+  for r in range(world_size):
+    expected.extend(
+        _expected_shard_path(
+            storage_root, model_name, k, [("tp", world_size, r)]
+        )
+        for k in keys
+    )
+  _assert_exact_shard_files(storage_root, expected, f"Rank {rank}")
+  bin_files = sorted(p for p in expected if f"/tp{world_size}_r{rank}/" in p)
+  _log(
+      tag,
+      phase,
+      rank,
+      f"{len(bin_files)} on-disk shard files (exact paths verified):",
   )
-  assert len(bin_files) == expected_count, (
-      f"Rank {rank}: expected {expected_count} shard files, got"
-      f" {len(bin_files)}: {bin_files}"
-  )
-  _log(tag, phase, rank,
-       f"{len(bin_files)} on-disk shard files (exact count verified):")
   for f in bin_files:
     print(f"  [Shard File][Rank {rank}] {f}"
           f" ({os.path.getsize(f)} bytes)", flush=True)
@@ -1545,8 +1577,9 @@ def _worker_three_source_main(argv):
         secs = _wait_for_all(store_s.poll_save_status, [s0], "storage save")
         _log(tag, "1/6", rank, f"{s0!r} saved in {secs:.3f}s.")
       dist.barrier()
-      _verify_and_print_shard_files(tag, "1/6", storage_root, model_name,
-                                    world_size, rank, 1)
+      _verify_and_print_shard_files(
+          tag, "1/6", storage_root, model_name, world_size, rank, [s0]
+      )
       del manager_s, store_s, tpu_cache_s
       dist.barrier()
       if phase == "write":
@@ -2114,27 +2147,30 @@ def _worker_gdn_hybrid_mock_main(argv):
       # W4. After the barrier every replica has saved, so tp1_r0 holds
       #     exactly world_size x 10 files, one per key of every replica, and
       #     nothing else.
-      shard_dir = os.path.join(root, "test_model_mpmd", "tp1_r0")
-      paths = glob.glob(os.path.join(shard_dir, "**", "*.bin"), recursive=True)
-      files = {os.path.basename(p): p for p in paths}
-      want_names = {
-          f"{k.hex()}.bin"
-          for r in range(world_size)
-          for k in _gdn_keys(r, _GDN_SRC_PAGES)
-      }
-      assert len(paths) == len(files) and set(files) == want_names, (
-          f"replica {rank}: {len(paths)} files,"
-          f" missing {sorted(want_names - set(files))},"
-          f" unexpected {sorted(set(files) - want_names)}"
-      )
+      def shard_path(k):
+        return _expected_shard_path(root, "test_model_mpmd", k, [("tp", 1, 0)])
+
+      want = []
+      for r in range(world_size):
+        want.extend(shard_path(k) for k in _gdn_keys(r, _GDN_SRC_PAGES))
+      _assert_exact_shard_files(root, want, f"replica {rank}")
       # W5. Each of this replica's 10 files is 15 x 32 KiB = 480 KiB: block
       #     b of buffer 0, then buffer 1, ..., buffer 14
       #     (ResolveBlockSlices(b)).
       for key, b in zip(keys, src_ids):
-        _check_file(files[f"{key.hex()}.bin"], blocks, b, f"replica {rank}",
-                    block_bytes=_GDN_BLOCK_BYTES)
-      _log(tag, phase, rank,
-           f"PASS: {len(files)} files in tp1_r0; own {len(keys)} byte-exact.")
+        _check_file(
+            shard_path(key),
+            blocks,
+            b,
+            f"replica {rank}",
+            block_bytes=_GDN_BLOCK_BYTES,
+        )
+      _log(
+          tag,
+          phase,
+          rank,
+          f"PASS: {len(want)} files in tp1_r0; own {len(keys)} byte-exact.",
+      )
     else:
       # R1. Cold replica: 15 buffers with every byte 0xA5; nothing of the
       #     source is on this replica's host or device.

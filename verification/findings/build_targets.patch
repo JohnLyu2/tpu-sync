@@ -1,8 +1,8 @@
 diff --git a/tpu_sync/core/controller/BUILD b/tpu_sync/core/controller/BUILD
-index 7077922..59afc60 100644
+index f809093..3bfdc6b 100644
 --- a/tpu_sync/core/controller/BUILD
 +++ b/tpu_sync/core/controller/BUILD
-@@ -359,3 +359,25 @@ py_library(
+@@ -362,3 +362,25 @@ py_library(
          "//tpu_sync/store_node:kv_cache_host_store_node_main",
      ],
  )
@@ -29,10 +29,10 @@ index 7077922..59afc60 100644
 +    ],
 +)
 diff --git a/tpu_sync/kv_cache/BUILD b/tpu_sync/kv_cache/BUILD
-index e3c1a9e..ec5dadf 100644
+index eab5ecf..3b0729c 100644
 --- a/tpu_sync/kv_cache/BUILD
 +++ b/tpu_sync/kv_cache/BUILD
-@@ -869,3 +869,25 @@ cc_library(
+@@ -1202,3 +1202,25 @@ cc_library(
          "@com_google_absl//absl/types:span",
      ],
  )

@@ -19,6 +19,7 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
@@ -26,6 +27,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "grpcpp/channel.h"
 #include "grpcpp/server.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
@@ -89,11 +91,13 @@ class GrpcControlPipeClient : public ControlPipeClient {
 
  private:
   struct StubCacheEntry {
+    std::shared_ptr<grpc::Channel> channel;
     std::shared_ptr<control_pipe::proto::ControlPipeService::Stub> stub;
     std::list<std::string>::iterator lru_it;
   };
 
-  std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>
+  std::pair<std::shared_ptr<grpc::Channel>,
+            std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>>
   GetOrCreateStub(absl::string_view endpoint);
 
   ControlPipeConfig config_;

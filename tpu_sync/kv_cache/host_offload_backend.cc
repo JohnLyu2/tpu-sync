@@ -75,9 +75,7 @@ BuildLocalWorkerEndpoints(controller::RaidenController* ctrl) {
     group.set_worker_id(reg.worker_id);
     group.mutable_endpoints()->Reserve(reg.raiden_transfer_endpoints.size());
     for (const auto& ep : reg.raiden_transfer_endpoints) {
-      auto* ep_proto = group.add_endpoints();
-      ep_proto->set_endpoint(ep.endpoint);
-      ep_proto->mutable_shards()->Add(ep.shards.begin(), ep.shards.end());
+      *group.add_endpoints() = ep.ToProto();
     }
     result.push_back(std::move(group));
   }

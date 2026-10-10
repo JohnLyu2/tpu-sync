@@ -23,6 +23,7 @@ py_library(
     deps = [
         ":controller_types",
         "//tpu_sync/api:common",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
         "@com_google_absl_py//absl/logging",
     ],
 )

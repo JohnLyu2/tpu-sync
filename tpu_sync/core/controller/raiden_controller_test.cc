@@ -1056,9 +1056,6 @@ TEST_F(RaidenControllerTest, TransferBuffersMatchesSrcEndpointGroupsByNodeId) {
 
 // Strict matching on the src side too: a local worker whose node_id has no
 // source group is a hard error, never a broadcast to some other node's shards.
-// (Asserted with a SINGLE registered worker: the per-worker loop dispatches
-// each RPC before validating the next, so with >1 worker an earlier RPC would
-// already be in flight when the mismatch is detected.)
 TEST_F(RaidenControllerTest, TransferBuffersUnmatchedSrcNodeIdFails) {
   ShardAwareMockTransferManager mock;
   test_server_->service->SetTransferManager(KVManagerHolder(&mock));
@@ -1086,6 +1083,102 @@ TEST_F(RaidenControllerTest, TransferBuffersUnmatchedSrcNodeIdFails) {
   // Never broadcast: no worker RPC was issued at all.
   EXPECT_EQ(mock.vector_h2h_read_calls, 0);
   EXPECT_EQ(mock.h2h_read_calls, 0);
+}
+
+// With >1 worker, a node_id mismatch on a later worker must still fail before
+// any worker RPC is issued; otherwise the earlier worker's copy is left running
+// after the caller has seen the error. worker_0 sorts before worker_1, and only
+// node 0 has a destination group.
+TEST_F(RaidenControllerTest, TransferBuffersUnmatchedNodeIdDispatchesNoWorker) {
+  auto test_server2 = CreateTestWorkerServer();
+  ShardAwareMockTransferManager mock0;  // node_id 0
+  ShardAwareMockTransferManager mock1;  // node_id 1
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock0));
+  test_server2->service->SetTransferManager(KVManagerHolder(&mock1));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/2,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address,
+                        /*node_id=*/0);
+  RegisterAndInitWorker(*controller, "worker_1", test_server2->server_address,
+                        /*node_id=*/1);
+
+  std::vector<Buffer> src_buffers;
+  src_buffers.emplace_back(/*index=*/1, std::vector<BufferShard>{},
+                           std::nullopt, ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  Buffer dst_buf(/*index=*/2, std::vector<BufferShard>{}, std::nullopt,
+                 ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buf.set_remote_worker_endpoints(
+      {::tpu_raiden::RaidenWorkerEndpoints{0, "peer_0", {{"ep:1", {0, 1}}}}});
+  std::vector<Buffer> dst_buffers;
+  dst_buffers.push_back(std::move(dst_buf));
+
+  EXPECT_THAT(
+      controller->TransferBuffers(src_buffers, dst_buffers).Await(),
+      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("node_id 1")));
+  // Worker RPCs are asynchronous: give a wrongly issued one time to arrive.
+  absl::SleepFor(absl::Milliseconds(100));
+  EXPECT_EQ(mock0.vector_h2h_write_calls, 0);
+  EXPECT_EQ(mock1.vector_h2h_write_calls, 0);
+}
+
+// Local HBM -> remote with no staging supplied auto-allocates local staging
+// blocks; a node_id mismatch must not leave them allocated.
+TEST_F(RaidenControllerTest,
+       TransferBuffersUnmatchedNodeIdDoesNotLeakAutoStaging) {
+  ShardAwareMockTransferManager mock;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/2,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address,
+                        /*node_id=*/0);
+
+  std::vector<Buffer> src_buffers;
+  src_buffers.emplace_back(/*index=*/1, std::vector<BufferShard>{},
+                           std::nullopt, ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  Buffer dst_buf(/*index=*/2, std::vector<BufferShard>{}, std::nullopt,
+                 ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buf.set_remote_worker_endpoints(
+      {::tpu_raiden::RaidenWorkerEndpoints{7, "peer_7", {{"ep:1", {0, 1}}}}});
+  std::vector<Buffer> dst_buffers;
+  dst_buffers.push_back(std::move(dst_buf));
+
+  EXPECT_THAT(controller->TransferBuffers(src_buffers, dst_buffers).Await(),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_EQ(controller->block_manager()->num_locked_blocks(), 0);
+}
+
+// Same as above, but the failure comes from building the worker request
+// (negative buffer index), which happens after staging is auto-allocated.
+TEST_F(RaidenControllerTest,
+       TransferBuffersRequestBuildFailureReleasesAutoStaging) {
+  ShardAwareMockTransferManager mock;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/2,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address,
+                        /*node_id=*/0);
+
+  std::vector<Buffer> src_buffers;
+  src_buffers.emplace_back(/*index=*/-1, std::vector<BufferShard>{},
+                           std::nullopt, ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  Buffer dst_buf(/*index=*/2, std::vector<BufferShard>{}, std::nullopt,
+                 ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buf.set_remote_worker_endpoints(
+      {::tpu_raiden::RaidenWorkerEndpoints{0, "peer_0", {{"ep:1", {0, 1}}}}});
+  std::vector<Buffer> dst_buffers;
+  dst_buffers.push_back(std::move(dst_buf));
+
+  EXPECT_THAT(controller->TransferBuffers(src_buffers, dst_buffers).Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("negative index")));
+  EXPECT_EQ(controller->block_manager()->num_locked_blocks(), 0);
 }
 
 // The controller rejects a second worker that registers a duplicate non-zero
@@ -1416,8 +1509,8 @@ TEST_F(RaidenControllerTest, TransferBuffersRemoteDramToLocalHbmSuccess) {
   EXPECT_THAT(mock_mgr.last_dst_offsets, ElementsAre(1));
 }
 
-// Builds a minimal valid secondary-backend config. tp_rank is always explicit:
-// the worker rejects a config without one.
+// Builds a minimal valid secondary-backend config with the tp axis declared:
+// the worker rejects a tp_rank without a tp_size.
 kv_cache::BackendConfig PosixTestConfig(int tp_rank = 0, int tp_size = 1) {
   kv_cache::BackendConfig cfg;
   cfg.type = "posix";
@@ -1443,13 +1536,39 @@ TEST_F(RaidenControllerTest, WorkerBackendLookup) {
   EXPECT_EQ(holder.GetKVBackend("nonexistent"), nullptr);
 }
 
-TEST_F(RaidenControllerTest, WorkerBackendRejectsConfigWithoutTpRank) {
+// The worker aborts on an invalid storage config; MockTransferManager mirrors
+// that contract. These tests need no fixture: they never start a server.
+TEST(RaidenControllerDeathTest, WorkerBackendDiesOnTpRankWithoutTpSize) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   MockTransferManager mgr;
   KVManagerHolder holder(&mgr);
-  kv_cache::BackendConfig cfg;
-  cfg.type = "posix";  // tp_rank left at -1
+  EXPECT_DEATH(holder.RegisterKVBackends({PosixTestConfig(/*tp_rank=*/0,
+                                                          /*tp_size=*/-1)}),
+               "tp_rank 0 was given without tp_size");
+}
+
+TEST(RaidenControllerDeathTest, WorkerBackendDiesOnPpRankWithoutPpSize) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  kv_cache::BackendConfig cfg = PosixTestConfig();
+  cfg.parallelism.pp_rank = 1;  // pp_size left undeclared.
+  MockTransferManager mgr;
+  KVManagerHolder holder(&mgr);
+  EXPECT_DEATH(holder.RegisterKVBackends({cfg}),
+               "pp_rank 1 was given without pp_size");
+}
+
+TEST_F(RaidenControllerTest, WorkerBackendAcceptsPpAxis) {
+  kv_cache::BackendConfig cfg = PosixTestConfig();
+  cfg.parallelism.pp_size = 2;
+  cfg.parallelism.pp_rank = 1;
+  MockTransferManager mgr;
+  KVManagerHolder holder(&mgr);
   holder.RegisterKVBackends({cfg});
-  EXPECT_EQ(holder.GetKVBackend("posix"), nullptr);
+  auto backend = holder.GetKVBackend("posix");
+  ASSERT_NE(backend, nullptr);
+  ASSERT_NE(backend->mapper(), nullptr);
+  EXPECT_EQ(backend->mapper()->pp_size(), 2);
+  EXPECT_EQ(backend->mapper()->shards_per_block(), 2);
 }
 
 TEST_F(RaidenControllerTest, InitializeSecondaryBackendsProgrammaticConfig) {

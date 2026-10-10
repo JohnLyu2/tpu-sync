@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "grpc/impl/channel_arg_names.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -43,6 +44,7 @@
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/grpc_util.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -222,11 +224,15 @@ absl::StatusOr<int> GrpcControlPlaneBackend::StartServer(
   grpc::ServerBuilder builder;
   builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
   builder.SetMaxSendMessageSize(64 * 1024 * 1024);
-  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
-  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS,
+                             ControlPipeConfig::kDefaultGrpcKeepaliveTimeMs);
+  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS,
+                             ControlPipeConfig::kDefaultGrpcKeepaliveTimeoutMs);
   builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
   builder.AddChannelArgument(
-      GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 5000);
+      GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS,
+      ControlPipeConfig::kDefaultGrpcMinRecvPingIntervalWithoutDataMs);
+  builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PING_STRIKES, 0);
 
   int bound_port = 0;
   std::string listen_addr = absl::StrCat("[::]:", requested_port);
@@ -266,8 +272,10 @@ GrpcControlPlaneBackend::GetOrCreateStub(absl::string_view endpoint) {
   std::string ep_str(endpoint);
   grpc::ChannelArguments args;
   args.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS,
+              ControlPipeConfig::kDefaultGrpcKeepaliveTimeMs);
+  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS,
+              ControlPipeConfig::kDefaultGrpcKeepaliveTimeoutMs);
   args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
   args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
   args.SetMaxReceiveMessageSize(64 * 1024 * 1024);

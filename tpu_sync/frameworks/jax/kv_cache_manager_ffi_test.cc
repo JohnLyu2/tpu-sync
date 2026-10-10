@@ -23,8 +23,8 @@
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/tsl/platform/test.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/frameworks/jax/kv_cache_manager_ffi_internal.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

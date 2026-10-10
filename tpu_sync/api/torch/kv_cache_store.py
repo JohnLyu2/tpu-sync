@@ -197,7 +197,11 @@ class KVCacheStore:
         under in global registry; empty falls back to raiden_id.job_name.
       secondary_backend_configs: Optional sequence of BackendConfig instances
         (e.g. persistent storage) to register with this store coordinator at
-        initialization for offload and recall operations.
+        initialization for offload and recall operations. Pass the same
+        BackendConfig objects given to every KVCacheManager(backend_configs=).
+        The posix backend derives its storage topology from `parallelism`:
+        declare the same axes and sizes (`<axis>_size`) as the workers. Ranks
+        are ignored. An invalid config fails construction.
     """
     raw_raiden_id = RaidenId()
     if raiden_id is not None:

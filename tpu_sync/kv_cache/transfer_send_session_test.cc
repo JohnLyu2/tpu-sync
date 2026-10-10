@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/transfer_send_session.h"
+#include "tpu_sync/kv_cache/transfer_send_session.h"
 
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
@@ -35,23 +35,15 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_session.h"
 
 namespace tpu_raiden {
 namespace {
 
 using ::absl_testing::StatusIs;
-
-kv_cache::KVCacheManagerBase MakeTestBase(size_t num_layers = 1) {
-  return kv_cache::KVCacheManagerBase(
-      /*num_layers=*/num_layers, /*num_shards=*/1,
-      /*slice_byte_size=*/128,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::make_optional(4));
-}
 
 class FakeSendBase : public kv_cache::KVCacheManagerBase {
  public:

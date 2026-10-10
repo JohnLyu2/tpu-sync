@@ -22,7 +22,7 @@ extra axioms, `leanprover/lean4:v4.34.0` (`verification/README.md` §Building).
 
 ## Correction trail
 
-[SUPERSEDED → journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md]
+[SUPERSEDED → ../journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md]
 (2026-10-06) The 2026-10-05 table named bazel targets `bughunt_f1_test` /
 `bughunt_f2_test` and a test `ShapeB_DeadlineFreesStagingWhilePullInFlight` —
 none exist (shape B has no C++ test); put `raiden_controller.cc` at

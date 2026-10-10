@@ -13,7 +13,7 @@ Load this note when resuming work on the prefill-to-decode formal verification, 
 4. **UUID registration tables & drain-before-reuse (4 C++ tests):** `UuidTable.lean` (`4c153f5`)
 5. **Cross-peer fault isolation & staging quota (5 C++ tests, Issue #888):** `PeerIsolation.lean` (`5e2d770`)
 6. **Multi-layer out-of-order & multi-request concurrent buffer recycling (3 E2E tests):** `Pipeline.lean`, `MultiRequest.lean`, `PipelineChecks.lean` (`c967abc`, `2e07a3e`, `3d90a73`)
-       → `verification/docs/test_suite_correspondence.md`
+       → [SUPERSEDED: section in `verification/docs/transfer/prefill_decode.md` §"Test suite correspondence"]
        → `verification/slides/prefill_decode.typ:472-519`
 
 [FACT] The 18-slide deck (`verification/slides/prefill_decode.typ` at `d69c7c9`) is structured into four self-contained arcs:

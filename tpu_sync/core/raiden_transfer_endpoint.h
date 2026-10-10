@@ -15,18 +15,66 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_CORE_RAIDEN_TRANSFER_ENDPOINT_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_CORE_RAIDEN_TRANSFER_ENDPOINT_H_
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include "tpu_sync/proto/worker_service.pb.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 
 struct RaidenTransferEndpoint {
   std::string endpoint;
   std::vector<int64_t> shards;
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
+
+  ::tpu_sync::proto::RaidenTransferEndpointProto ToProto() const {
+    ::tpu_sync::proto::RaidenTransferEndpointProto proto;
+    proto.set_endpoint(endpoint);
+    proto.mutable_shards()->Add(shards.begin(), shards.end());
+    proto.mutable_layer_host_addrs()->Reserve(layer_host_addrs.size());
+    for (const auto& addr : layer_host_addrs) {
+      *proto.add_layer_host_addrs() = addr;
+    }
+    return proto;
+  }
+
+  static RaidenTransferEndpoint FromProto(
+      const ::tpu_sync::proto::RaidenTransferEndpointProto& proto) {
+    return {
+        .endpoint = proto.endpoint(),
+        .shards = {proto.shards().begin(), proto.shards().end()},
+        .layer_host_addrs = {proto.layer_host_addrs().begin(),
+                             proto.layer_host_addrs().end()},
+    };
+  }
 
   bool operator==(const RaidenTransferEndpoint& other) const {
-    return endpoint == other.endpoint && shards == other.shards;
+    if (endpoint != other.endpoint || shards != other.shards ||
+        layer_host_addrs.size() != other.layer_host_addrs.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < layer_host_addrs.size(); ++i) {
+      const auto& a = layer_host_addrs[i];
+      const auto& b = other.layer_host_addrs[i];
+      if (a.block_stride_bytes() != b.block_stride_bytes() ||
+          a.num_blocks() != b.num_blocks() ||
+          !std::equal(a.host_base_addrs().begin(), a.host_base_addrs().end(),
+                      b.host_base_addrs().begin(), b.host_base_addrs().end()) ||
+          a.host_slot_by_block().size() != b.host_slot_by_block().size()) {
+        return false;
+      }
+      for (const auto& [block, slot] : a.host_slot_by_block()) {
+        auto it = b.host_slot_by_block().find(block);
+        if (it == b.host_slot_by_block().end() || it->second != slot) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 };
 

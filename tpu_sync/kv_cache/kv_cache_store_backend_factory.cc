@@ -25,6 +25,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -82,8 +83,117 @@ bool BackendConfig::HasProperty(absl::string_view key) const {
 
 void ApplyParallelismToProperties(
     const backends::ParallelismConfig& parallelism, BackendConfig* config) {
-  config->SetProperty("tp_size", absl::StrCat(parallelism.tp_size));
-  config->SetProperty("tp_rank", absl::StrCat(parallelism.tp_rank));
+  auto apply = [config](absl::string_view key, int value) {
+    if (value == backends::kAxisUndeclared) {
+      config->properties.erase(key);
+      return;
+    }
+    config->SetProperty(key, absl::StrCat(value));
+  };
+  apply("tp_size", parallelism.tp_size);
+  apply("tp_rank", parallelism.tp_rank);
+  apply("pcp_size", parallelism.pcp_size);
+  apply("pcp_rank", parallelism.pcp_rank);
+  apply("pp_size", parallelism.pp_size);
+  apply("pp_rank", parallelism.pp_rank);
+}
+
+namespace {
+
+absl::Status ValidateWorkerAxis(absl::string_view axis, int size, int rank) {
+  if (size == 0 || size < backends::kAxisUndeclared) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(axis, "_size must be >= 1, or -1 when the ", axis,
+                     " axis is undeclared; got ", size));
+  }
+  if (size == backends::kAxisUndeclared) {
+    if (rank == backends::kAxisUndeclared) return absl::OkStatus();
+    return absl::InvalidArgumentError(absl::StrCat(
+        axis, "_rank ", rank, " was given without ", axis, "_size; declare ",
+        axis, "_size >= 1 or leave ", axis, "_rank at -1"));
+  }
+  if (rank < 0 || rank >= size) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(axis, "_rank must be in [0, ", size, ") for ", axis,
+                     "_size ", size, "; got ", rank));
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+absl::Status ValidateWorkerParallelism(
+    const backends::ParallelismConfig& parallelism) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateWorkerAxis("tp", parallelism.tp_size, parallelism.tp_rank));
+  ABSL_RETURN_IF_ERROR(
+      ValidateWorkerAxis("pcp", parallelism.pcp_size, parallelism.pcp_rank));
+  return ValidateWorkerAxis("pp", parallelism.pp_size, parallelism.pp_rank);
+}
+
+bool HasDeclaredAxis(const backends::ParallelismConfig& parallelism) {
+  return parallelism.tp_size != backends::kAxisUndeclared ||
+         parallelism.pcp_size != backends::kAxisUndeclared ||
+         parallelism.pp_size != backends::kAxisUndeclared;
+}
+
+std::string FormatParallelism(const backends::ParallelismConfig& parallelism) {
+  auto format_axis = [](absl::string_view axis, int size, int rank) {
+    std::string formatted = absl::StrCat(
+        axis, "=",
+        size == backends::kAxisUndeclared ? "undeclared" : absl::StrCat(size));
+    if (rank != backends::kAxisUndeclared) {
+      absl::StrAppend(&formatted, "/r", rank);
+    }
+    return formatted;
+  };
+  return absl::StrCat(
+      format_axis("pp", parallelism.pp_size, parallelism.pp_rank), " ",
+      format_axis("pcp", parallelism.pcp_size, parallelism.pcp_rank), " ",
+      format_axis("tp", parallelism.tp_size, parallelism.tp_rank));
+}
+
+absl::Status RequireDeclaredAxis(
+    const backends::ParallelismConfig& received,
+    const backends::ParallelismConfig& coordinator) {
+  if (HasDeclaredAxis(coordinator)) return absl::OkStatus();
+  return absl::InvalidArgumentError(absl::StrCat(
+      "no parallelism axis is declared (received topology: ",
+      FormatParallelism(received),
+      "); declare the axes and sizes every worker declares (tp_size, "
+      "pcp_size, pp_size); a single worker uses tp_size=1"));
+}
+
+absl::StatusOr<backends::ParallelismConfig> ResolveCoordinatorParallelism(
+    const backends::ParallelismConfig& parallelism) {
+  // An undeclared axis must not carry a rank: for size == -1,
+  // ValidateWorkerAxis accepts only rank == -1.
+  if (parallelism.tp_size == backends::kAxisUndeclared) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateWorkerAxis("tp", parallelism.tp_size, parallelism.tp_rank));
+  }
+  if (parallelism.pcp_size == backends::kAxisUndeclared) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateWorkerAxis("pcp", parallelism.pcp_size, parallelism.pcp_rank));
+  }
+  if (parallelism.pp_size == backends::kAxisUndeclared) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateWorkerAxis("pp", parallelism.pp_size, parallelism.pp_rank));
+  }
+  auto pinned_rank = [](int size) {
+    return size >= 1 ? 0 : backends::kAxisUndeclared;
+  };
+  const backends::ParallelismConfig coordinator = {
+      .tp_size = parallelism.tp_size,
+      .tp_rank = pinned_rank(parallelism.tp_size),
+      .pcp_size = parallelism.pcp_size,
+      .pcp_rank = pinned_rank(parallelism.pcp_size),
+      .pp_size = parallelism.pp_size,
+      .pp_rank = pinned_rank(parallelism.pp_size),
+  };
+  // With the ranks pinned, only an invalid size can fail.
+  ABSL_RETURN_IF_ERROR(ValidateWorkerParallelism(coordinator));
+  return coordinator;
 }
 
 KVCacheStoreBackendFactory& KVCacheStoreBackendFactory::Instance() {

@@ -425,7 +425,13 @@ KVCacheManagerBase::KVCacheManagerBase(
           local_port, parallelism, bind_ip,
           assigned_numa_node_override.has_value()
               ? std::vector<int>{*assigned_numa_node_override}
-              : raiden::DetectNumaNodes(layer_buffers)),
+              : raiden::DetectNumaNodes(layer_buffers),
+          GetLocalHostNicAddresses(),
+          // An explicit NUMA override pins every shard to that node, so no
+          // per-shard placement is derived from the buffers.
+          assigned_numa_node_override.has_value()
+              ? std::vector<transport::ShardInfo>{}
+              : raiden::DetectShards(layer_buffers)),
       host_allocator_(host_allocator) {
   if (num_layers_ == 0 || num_shards_ == 0) {
     return;
@@ -2906,10 +2912,11 @@ void KVCacheManagerBase::RegisterBlockReadinessCallback(
   cb(absl::OkStatus());
 }
 
-absl::Status KVCacheManagerBase::OnBlocksReceived(
-    const std::vector<int>& block_ids, uint64_t uuid) {
-  if (transfer_hooks_.on_blocks_received) {
-    return transfer_hooks_.on_blocks_received(block_ids, uuid);
+absl::Status KVCacheManagerBase::OnBlockShardsReceived(
+    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
+    uint64_t uuid) {
+  if (transfer_hooks_.on_block_shards_received) {
+    return transfer_hooks_.on_block_shards_received(block_ids, shard_ids, uuid);
   }
   return absl::OkStatus();
 }
@@ -3633,38 +3640,45 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     const BackendConfig& config) {
   if (config.type.empty()) return false;
 
+  const std::string received = FormatParallelism(config.parallelism);
+  LOG(INFO) << "[Worker] secondary backend " << config.type
+            << " received topology: " << received;
+
   if (!absl::EqualsIgnoreCase(config.type,
                               backends::storage::kPosixBackendName)) {
-    LOG(WARNING) << "[Worker] Unsupported secondary backend: " << config.type;
-    return false;
-  }
-  if (config.parallelism.tp_rank < 0) {
-    LOG(ERROR) << "[Worker] secondary backend config for " << config.type
-               << " has no tp_rank; refusing to register. Every worker would "
-                  "otherwise share the rank-0 shard directory.";
-    return false;
+    LOG(FATAL) << "[Worker] unsupported secondary backend type '" << config.type
+               << "' (received topology: " << received
+               << "); supported: " << backends::storage::kPosixBackendName;
   }
 
   const std::string canonical_name =
       std::string(backends::storage::kPosixBackendName);
   if (GetKVBackend(canonical_name) != nullptr) return false;
 
-  // Storage topology comes only from BackendConfig::parallelism, resolved the
-  // same way as on the coordinator (see ResolveSecondaryBackendTopology).
-  BackendConfig resolved = config;
-  const backends::ParallelismConfig effective = {
-      .tp_size =
-          config.parallelism.tp_size > 0 ? config.parallelism.tp_size : 1,
-      .tp_rank = config.parallelism.tp_rank};
-  ApplyParallelismToProperties(effective, &resolved);
-  if (absl::Status status =
-          backends::storage::PosixBackendOptions::FromProperties(
-              resolved.properties)
-              .status();
+  // Storage topology comes only from BackendConfig::parallelism. Each declared
+  // axis (tp, pcp, pp) must carry this worker's rank; a rank without a size and
+  // a rank outside [0, size) are rejected.
+  if (absl::Status status = ValidateWorkerParallelism(config.parallelism);
       !status.ok()) {
-    LOG(ERROR) << "[Worker] invalid " << config.type
-               << " backend config; refusing to register: " << status;
-    return false;
+    LOG(FATAL) << "[Worker] invalid " << config.type
+               << " backend config (received topology: " << received
+               << "): " << status.message();
+  }
+  // With no axis declared every worker would write the same shard files.
+  if (!HasDeclaredAxis(config.parallelism)) {
+    LOG(FATAL) << "[Worker] invalid " << config.type
+               << " backend config (received topology: " << received
+               << "): declares no parallelism axis";
+  }
+  BackendConfig resolved = config;
+  ApplyParallelismToProperties(config.parallelism, &resolved);
+  absl::StatusOr<backends::storage::PosixBackendOptions> options =
+      backends::storage::PosixBackendOptions::FromProperties(
+          resolved.properties);
+  if (!options.ok()) {
+    LOG(FATAL) << "[Worker] invalid " << config.type
+               << " backend config (received topology: " << received
+               << "): " << options.status().message();
   }
   auto backend = std::make_shared<backends::storage::PosixKVBackend>(
       canonical_name, resolved.properties);
@@ -3673,8 +3687,10 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     backends_[canonical_name] = std::move(backend);
   }
   LOG(INFO) << "[Worker] Initialized secondary backend " << canonical_name
-            << " at tp_rank " << effective.tp_rank << " of tp_size "
-            << effective.tp_size;
+            << " with topology " << received << "; shard directory "
+            << options->root_dir << "/"
+            << backends::storage::SanitizeModelName(options->model_name) << "/"
+            << backends::storage::FormatTopologyDir(config.parallelism) << "/";
   return true;
 }
 
@@ -3889,8 +3905,9 @@ xla::PjRtClient* KVCacheManagerBase::GetPjRtClient() const {
   return nullptr;
 }
 
-absl::Status KVCacheManagerBase::MapSharedMemory(void* mapped_address,
-                                                 size_t pool_size_bytes) {
+absl::Status KVCacheManagerBase::MapSharedMemory(
+    void* mapped_address, size_t pool_size_bytes,
+    std::optional<size_t> page_nbytes) {
   if (mapped_address == nullptr) {
     return absl::InvalidArgumentError("mapped_address must be non-null");
   }
@@ -3926,6 +3943,32 @@ absl::Status KVCacheManagerBase::MapSharedMemory(void* mapped_address,
         "KVCacheManagerBase has no active PJRT client for DMA mapping");
   }
 
+  // Object transfers address block b at byte b * page_nbytes of every layer.
+  // A page of whole slices that evenly divides every layer's buffer keeps each
+  // block on slice boundaries and inside the buffer.
+  const size_t slice_bytes = slice_byte_size();
+  const size_t mapped_page_nbytes = page_nbytes.value_or(slice_bytes);
+  if (mapped_page_nbytes == 0) {
+    return absl::InvalidArgumentError(
+        page_nbytes.has_value()
+            ? "page_nbytes must be greater than zero"
+            : "page_nbytes is required because slice_byte_size is 0");
+  }
+  if (slice_bytes > 0 && mapped_page_nbytes % slice_bytes != 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("page_nbytes=", mapped_page_nbytes,
+                     " must be a multiple of slice_byte_size=", slice_bytes));
+  }
+  for (size_t layer_id = 0; layer_id < buffer_holds_.size(); ++layer_id) {
+    const size_t layer_bytes = buffer_holds_[layer_id].physical_size;
+    if (layer_bytes % mapped_page_nbytes != 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("layer ", layer_id, " device buffer of ", layer_bytes,
+                       " bytes is not a whole number of pages of page_nbytes=",
+                       mapped_page_nbytes));
+    }
+  }
+
   {
     absl::MutexLock lock(external_mapping_mu_);
     if (external_mapping_phase_ != MappingPhase::kUnmapped) {
@@ -3950,6 +3993,7 @@ absl::Status KVCacheManagerBase::MapSharedMemory(void* mapped_address,
     absl::MutexLock lock(external_mapping_mu_);
     external_mapped_address_ = mapped_address;
     external_mapped_size_ = pool_size_bytes;
+    external_page_nbytes_ = mapped_page_nbytes;
     external_mapping_phase_ = MappingPhase::kMapped;
   }
   return absl::OkStatus();
@@ -4018,6 +4062,7 @@ absl::Status KVCacheManagerBase::UnmapSharedMemory() {
     absl::MutexLock lock(external_mapping_mu_);
     external_mapped_address_ = nullptr;
     external_mapped_size_ = 0;
+    external_page_nbytes_ = 0;
     deferred_external_copy_error_ = absl::OkStatus();
     external_mapping_phase_ = MappingPhase::kUnmapped;
   }
@@ -4175,20 +4220,7 @@ KVCacheManagerBase::CopyExternalObjectBlocks(
   }
 
   const size_t num_layers_local = num_layers();
-  const size_t slice_bytes = slice_byte_size();
-  if (slice_bytes > 0 && page_nbytes != slice_bytes) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("object page_nbytes=", page_nbytes,
-                     " does not match manager slice_byte_size=", slice_bytes));
-  }
-
   const size_t dev_physical_size = buffer_holds_[0].physical_size;
-  if (dev_physical_size == 0 || dev_physical_size % page_nbytes != 0) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "device physical size ", dev_physical_size,
-        " is not divisible by page_nbytes ", page_nbytes));
-  }
-  const size_t num_blocks = dev_physical_size / page_nbytes;
 
   // MapSharedMemory registered the pool against a single client, the one
   // GetPjRtClient() resolves to.  DmaMap registration is per client, so a
@@ -4240,6 +4272,38 @@ KVCacheManagerBase::CopyExternalObjectBlocks(
     }
   }
 
+  // The checks above depend only on the request and the device buffers; the
+  // ones below depend on the mapping.  Pin the DMA registration for the rest
+  // of this call.  Checking is_shared_memory_mapped() here instead would be
+  // racy: the pool could be unmapped between the check and IssueH2dShard
+  // below.  The lease also pins the mapped page size, which only an unmap can
+  // clear.
+  absl::StatusOr<ExternalCopyLease> lease = AcquireExternalCopyLease();
+  if (!lease.ok()) {
+    return lease.status();
+  }
+
+  // Block ids count pages of the size the pool was mapped with.  Any other
+  // size would make one block id name different device bytes on different
+  // calls, so it is an error rather than a reinterpretation.
+  size_t mapped_page_nbytes = 0;
+  {
+    absl::MutexLock lock(external_mapping_mu_);
+    mapped_page_nbytes = external_page_nbytes_;
+  }
+  if (page_nbytes != mapped_page_nbytes) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "object page_nbytes=", page_nbytes, " does not match page_nbytes=",
+        mapped_page_nbytes, " that the shared memory pool was mapped with"));
+  }
+
+  if (dev_physical_size == 0 || dev_physical_size % page_nbytes != 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("device physical size ", dev_physical_size,
+                     " is not divisible by page_nbytes ", page_nbytes));
+  }
+  const size_t num_blocks = dev_physical_size / page_nbytes;
+
   absl::flat_hash_set<int64_t> unique_blocks;
   unique_blocks.reserve(block_ids.size());
   std::vector<int64_t> device_offsets;
@@ -4265,14 +4329,6 @@ KVCacheManagerBase::CopyExternalObjectBlocks(
   host_layer_offsets.reserve(num_layers_local);
   for (size_t layer_id = 0; layer_id < num_layers_local; ++layer_id) {
     host_layer_offsets.push_back(host_rank_offset + layer_id * page_nbytes);
-  }
-
-  // Pin the DMA registration for the rest of this call.  Checking
-  // is_shared_memory_mapped() here instead would be racy: the pool could be
-  // unmapped between the check and IssueH2dShard below.
-  absl::StatusOr<ExternalCopyLease> lease = AcquireExternalCopyLease();
-  if (!lease.ok()) {
-    return lease.status();
   }
 
   // Every byte handed to the DMA engine must lie inside the pool that was

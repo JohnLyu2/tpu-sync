@@ -34,9 +34,9 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 namespace xla {
 class PjRtBuffer;

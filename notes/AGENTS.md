@@ -13,15 +13,16 @@ conventions: `../AGENTS.md`.
   correction trail. Never copy a fact table or a citation list into a note;
   every copy made so far went stale within a week.
 - Upstream-sync facts (what changed in cited code, what was re-pinned) go in
-  `verification/docs/transfer/prefill_decode.md` §"Upstream re-checks" and
+  `verification/docs/upstream_rechecks.md` and
   `verification/findings/README.md` §"History"; the journal records the delta
   of understanding, corrections and tooling lessons, with a link.
-- `loose-ends/parked.md` is the only backlog. Items that mirror a row of
-  `prefill_decode.md` §"Future work" cite the row and hold only the
-  "To resume" steps.
+- `loose-ends/parked.md` is the only backlog.
 - Version stamps: every note names the tpu-sync commit its claims were read at.
   Notes dated before 2026-10-06 are at `01ffa3d`; the line-shift table to
-  `50b0774` is in `journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md`.
+  `50b0774` is in `journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md`;
+  notes dated 2026-10-06..09 are at `50b0774`; since 2026-10-10 the pin is
+  `1fa06d1` and the session/manager sources live under `tpu_sync/kv_cache/`
+  (`journal/2026-10/2026-10-10-upstream-1fa06d1-sync.md`).
 - Markers as in the skill: `[FACT]` source-grounded or Lean-proved (`durable/`);
   `[EMP]` reproducible result with a "Verified against" stamp (`empirical/`);
   `[OBS YYYY-MM-DD]` and `[HYP]` (`journal/YYYY-MM/`); `[OPEN]` with a parked

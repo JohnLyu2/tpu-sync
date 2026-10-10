@@ -118,8 +118,7 @@ class RawBufferTransport final {
 
   // Synchronously pulls a buffer identified by `buffer_id` from the remote
   // `peer`, by sending out a `kOpBufferPull ChunkHeader` and then receiving
-  // the data from the peer.
-  // Note: This function is only used in RawBufferTransportTest, nowhere else.
+  // the data from the peer. Used by BlockTransport::PullBuffer.
   absl::Status PullBuffer(absl::string_view peer, size_t buffer_id,
                           size_t src_shard_idx, size_t src_offset_bytes,
                           size_t dst_shard_idx, size_t dst_offset_bytes,
@@ -152,9 +151,10 @@ class RawBufferTransport final {
   void ForgetPushProgress(uint64_t uuid);
 
   // Registers incoming client PSP key and returns server's allocated RX key.
-  // Triggered by ExchangePspKey() in PeregrineControlServiceImpl.
+  // Triggered by ProcessUnary() in PeregrineControlServiceImpl.
   absl::StatusOr<PspPeerKey> RegisterPspPeer(uint32_t client_spi,
-                                             absl::string_view client_key);
+                                             absl::string_view client_key,
+                                             absl::string_view peer_target);
 
   void SetTestOnlyRateLimiters(std::shared_ptr<TestOnlyRateLimiter> egress,
                                std::shared_ptr<TestOnlyRateLimiter> ingress);
@@ -187,6 +187,10 @@ class RawBufferTransport final {
   const std::vector<std::string> local_ips_;
   int local_port_;
   const bool require_psp_tcp_;
+  // When true (TPU_RAIDEN_PIN_RECV_THREAD_TO_NIC_NUMA), each accepted
+  // connection's worker thread pins itself to the NUMA node of the local NIC
+  // the connection arrived on. See ConnectionWorker().
+  const bool pin_recv_threads_to_nic_numa_;
   std::atomic<int> server_fd_;  // owned by listener_thread_
   std::atomic<bool> stopping_;
 

@@ -32,8 +32,8 @@ was maintained:
   `StagingBlockAllocator`); `Transfer/Manager.lean`; theorem names
   `Receive.sound_completion`, `Receive.MissingCancelRecheck`,
   `Session.invariant_preserved`, `MultiRequest.hbm_exclusive_ownership` — none
-  exist. Real names: `Session.Consistent`, `Receive.trace_finish_between_locks`,
-  `ReceivePoll.trace_poll_skips_metrics`, `MultiRequest.system_data_correct`.
+  exist. Real names: `Lifecycle.Consistent`, `Recv.trace_finish_between_locks`,
+  `Recv.trace_poll_skips_metrics`, `Pipeline.system_data_correct`.
 - `durable/lean-step-models-…md`: `Common/Tactics.lean` with `unpack_step` /
   `reachable_invariant` / `StepPreserves`, and `docs/test_suite_correspondence.md`
   — none exist.

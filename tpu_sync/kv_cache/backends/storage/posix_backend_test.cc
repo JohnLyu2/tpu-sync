@@ -120,10 +120,10 @@ class StorageDriverTest : public ::testing::Test {
 
   StoreTestEnv CreateStoreBackend(size_t batch_size = 16) {
     auto backend = std::make_shared<PosixKVBackend>(
-        "posix_disk",
-        absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
-    auto mapper =
-        std::make_shared<PosixPathMapper>(scratch_dir_, "model_test", 1, 0);
+        "posix_disk", absl::flat_hash_map<std::string, std::string>{});
+    auto mapper = std::make_shared<PosixPathMapper>(
+        scratch_dir_, "model_test",
+        ParallelismConfig{.tp_size = 1, .tp_rank = 0});
     backend->set_mapper(mapper);
     auto store = std::make_unique<PosixKVCacheStoreBackend>(
         backend, "posix_disk", 0, batch_size);
@@ -197,7 +197,8 @@ using PosixBackendTest = StorageDriverTest;
 // ===========================================================================
 
 TEST_F(StorageDriverTest, PosixPathMapperResolution) {
-  PosixPathMapper mapper(scratch_dir_, "llama3", /*tp_size=*/4, /*tp_rank=*/2);
+  PosixPathMapper mapper(scratch_dir_, "llama3",
+                         ParallelismConfig{.tp_size = 4, .tp_rank = 2});
   EXPECT_EQ(mapper.tp_size(), 4);
 
   // "hash_12345" hex-encodes to 686173685f3132333435.
@@ -230,7 +231,8 @@ TEST_F(StorageDriverTest, PosixPathMapperResolution) {
 // The prefix directories are right-padded, so every input length yields the
 // same directory depth and the same component widths.
 TEST_F(PosixBackendTest, PosixPathMapperFixedWidthAndEmptyHashHandling) {
-  PosixPathMapper mapper(scratch_dir_, "llama3", /*tp_size=*/1, /*tp_rank=*/0);
+  PosixPathMapper mapper(scratch_dir_, "llama3",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   const std::string base = absl::StrCat(scratch_dir_, "/llama3/tp1_r0");
 
   EXPECT_THAT(mapper.MapKey("", {.parallelism = {.tp_rank = 0}}),
@@ -255,8 +257,8 @@ TEST_F(PosixBackendTest, PosixPathMapperFixedWidthAndEmptyHashHandling) {
 
 // Real block hashes are raw digests, not printable text.
 TEST_F(PosixBackendTest, PosixPathMapperHexEncodesArbitraryBytes) {
-  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
-                         /*tp_rank=*/2);
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   const std::string binary_hash("\xff\xff\xff\xff\xff\xff\xff\xff", 8);
   TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey(binary_hash));
@@ -268,8 +270,8 @@ TEST_F(PosixBackendTest, PosixPathMapperHexEncodesArbitraryBytes) {
 
 // 0x2F is a path separator: unencoded, it escapes the intended directory.
 TEST_F(PosixBackendTest, PosixPathMapperHashSeparatorBytesDoNotInjectDirs) {
-  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
-                         /*tp_rank=*/2);
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   const std::string injecting_hash("\x2f\x2e\x2e\x2f", 4);  // "/../"
   TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey(injecting_hash));
@@ -286,8 +288,8 @@ TEST_F(PosixBackendTest, PosixPathMapperHashSeparatorBytesDoNotInjectDirs) {
 
 // 0x00 truncates at open(2), so unencoded prefixes alias onto one file.
 TEST_F(PosixBackendTest, PosixPathMapperNulBytesDoNotAlias) {
-  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
-                         /*tp_rank=*/2);
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey shorter,
                           mapper.MapKey(std::string("\x01\x00", 2)));
@@ -306,8 +308,8 @@ TEST_F(PosixBackendTest, PosixPathMapperNulBytesDoNotAlias) {
 
 // Hex encoding doubles the filename length, so the cap is half of NAME_MAX.
 TEST_F(PosixBackendTest, PosixPathMapperRejectsOverlongHash) {
-  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
-                         /*tp_rank=*/2);
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   ABSL_EXPECT_OK(mapper.MapKey(std::string(kMaxBlockHashBytes, 'a')));
   EXPECT_THAT(
@@ -318,7 +320,7 @@ TEST_F(PosixBackendTest, PosixPathMapperRejectsOverlongHash) {
 // HuggingFace-style IDs must not inject an extra directory level.
 TEST_F(PosixBackendTest, PosixPathMapperSanitizesModelName) {
   PosixPathMapper mapper("/tmp/kv_cache", "meta-llama/Llama-3.1-70B",
-                         /*tp_size=*/8, /*tp_rank=*/2);
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("a"));
   EXPECT_EQ(key.resolved_key,
@@ -330,11 +332,296 @@ TEST_F(PosixBackendTest, PosixPathMapperSanitizesModelName) {
   EXPECT_EQ(components.size(), 7);
 }
 
+// "a" hex-encodes to 61, so every key below lands in .../610/00/61.bin.
+TEST_F(PosixBackendTest, PosixPathMapperPcpAndTpTopologyDir) {
+  PosixPathMapper mapper(
+      "/tmp/kv_cache", "llama3",
+      ParallelismConfig{
+          .tp_size = 1, .tp_rank = 0, .pcp_size = 8, .pcp_rank = 3});
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("a"));
+  EXPECT_EQ(key.resolved_key,
+            "/tmp/kv_cache/llama3/pcp8_r3_tp1_r0/610/00/61.bin");
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperTpOnlyTopologyDir) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 5});
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("a"));
+  EXPECT_EQ(key.resolved_key, "/tmp/kv_cache/llama3/tp8_r5/610/00/61.bin");
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperPcpOnlyTopologyDir) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3",
+                         ParallelismConfig{.pcp_size = 8, .pcp_rank = 3});
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("a"));
+  EXPECT_EQ(key.resolved_key, "/tmp/kv_cache/llama3/pcp8_r3/610/00/61.bin");
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperNoAxesOmitsTopologyDir) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3", ParallelismConfig{});
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("a"));
+  EXPECT_EQ(key.resolved_key, "/tmp/kv_cache/llama3/610/00/61.bin");
+}
+
+// A declared size-1 axis still adds a segment, so `tp8_r3`, `pp1_r0_tp8_r3`
+// and `pp1_r0_pcp1_r0_tp8_r3` are three different directories.
+TEST(FormatTopologyDirTest, OneSegmentPerDeclaredAxisInPpPcpTpOrder) {
+  struct Case {
+    ParallelismConfig parallelism;
+    std::string expected;
+  };
+  const Case cases[] = {
+      {ParallelismConfig{}, ""},
+      {ParallelismConfig{.tp_size = 8, .tp_rank = 3}, "tp8_r3"},
+      {ParallelismConfig{.tp_size = 1, .tp_rank = 0}, "tp1_r0"},
+      {ParallelismConfig{.pcp_size = 8, .pcp_rank = 3}, "pcp8_r3"},
+      {ParallelismConfig{.pp_size = 2, .pp_rank = 1}, "pp2_r1"},
+      {ParallelismConfig{
+           .tp_size = 8, .tp_rank = 3, .pp_size = 1, .pp_rank = 0},
+       "pp1_r0_tp8_r3"},
+      {ParallelismConfig{.tp_size = 8,
+                         .tp_rank = 3,
+                         .pcp_size = 1,
+                         .pcp_rank = 0,
+                         .pp_size = 1,
+                         .pp_rank = 0},
+       "pp1_r0_pcp1_r0_tp8_r3"},
+      {ParallelismConfig{.tp_size = 4,
+                         .tp_rank = 3,
+                         .pcp_size = 2,
+                         .pcp_rank = 0,
+                         .pp_size = 2,
+                         .pp_rank = 1},
+       "pp2_r1_pcp2_r0_tp4_r3"},
+  };
+  for (const Case& c : cases) {
+    EXPECT_EQ(FormatTopologyDir(c.parallelism), c.expected);
+  }
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperPerCallPcpRankOverride) {
+  PosixPathMapper mapper(
+      "/tmp/kv_cache", "llama3",
+      ParallelismConfig{
+          .tp_size = 1, .tp_rank = 0, .pcp_size = 8, .pcp_rank = 3});
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key,
+                          mapper.MapKey("a", {.parallelism = {.pcp_rank = 5}}));
+  EXPECT_EQ(key.resolved_key,
+            "/tmp/kv_cache/llama3/pcp8_r5_tp1_r0/610/00/61.bin");
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperRejectsZeroSize) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3", ParallelismConfig{});
+
+  EXPECT_THAT(mapper.MapKey("a", {.parallelism = {.tp_size = 0}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("tp_size must be >= 1")));
+  EXPECT_THAT(mapper.MapKey("a", {.parallelism = {.pcp_size = 0}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pcp_size must be >= 1")));
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperRejectsRankOutOfRange) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3", ParallelismConfig{});
+
+  EXPECT_THAT(
+      mapper.MapKey("a", {.parallelism = {.tp_size = 2, .tp_rank = 2}}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("tp_rank must be in [0, 2) for tp_size 2; got 2")));
+  EXPECT_THAT(
+      mapper.MapKey("a", {.parallelism = {.pcp_size = 4, .pcp_rank = 4}}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("pcp_rank must be in [0, 4) for pcp_size 4; got 4")));
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperRejectsRankWithoutSize) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3", ParallelismConfig{});
+
+  EXPECT_THAT(mapper.MapKey("a", {.parallelism = {.tp_rank = 0}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("tp_rank 0 was given without tp_size")));
+  EXPECT_THAT(mapper.MapKey("a", {.parallelism = {.pcp_rank = 1}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pcp_rank 1 was given without pcp_size")));
+}
+
+// Only -1 means "use the configured value"; other negative per-call values
+// are rejected rather than replaced by the mapper's valid topology.
+TEST_F(PosixBackendTest, PosixPathMapperRejectsInvalidNegativeOverride) {
+  PosixPathMapper mapper(
+      "/tmp/kv_cache", "llama3",
+      ParallelismConfig{
+          .tp_size = 2, .tp_rank = 1, .pcp_size = 4, .pcp_rank = 3});
+
+  EXPECT_THAT(mapper.MapKey("a", {.parallelism = {.tp_size = -2}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("tp_size must be >= 1")));
+  EXPECT_THAT(
+      mapper.MapKey("a", {.parallelism = {.pcp_rank = -3}}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("pcp_rank must be in [0, 4) for pcp_size 4; got -3")));
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_ParsesPcpTopology) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      PosixBackendOptions opts,
+      PosixBackendOptions::FromProperties({{"pcp_size", "4"},
+                                           {"pcp_rank", "3"},
+                                           {"tp_size", "2"},
+                                           {"tp_rank", "1"}}));
+  EXPECT_EQ(opts.pcp_size, 4);
+  EXPECT_EQ(opts.pcp_rank, 3);
+  EXPECT_EQ(opts.tp_size, 2);
+  EXPECT_EQ(opts.tp_rank, 1);
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_LeavesUndeclaredAxes) {
+  TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                          PosixBackendOptions::FromProperties({}));
+  EXPECT_EQ(opts.pcp_size, kAxisUndeclared);
+  EXPECT_EQ(opts.pcp_rank, kAxisUndeclared);
+  EXPECT_EQ(opts.tp_size, kAxisUndeclared);
+  EXPECT_EQ(opts.tp_rank, kAxisUndeclared);
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_RejectsZeroSize) {
+  EXPECT_THAT(PosixBackendOptions::FromProperties({{"tp_size", "0"}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("tp_size must be >= 1")));
+  EXPECT_THAT(PosixBackendOptions::FromProperties({{"pcp_size", "0"}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pcp_size must be >= 1")));
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_RejectsRankOutOfRange) {
+  EXPECT_THAT(
+      PosixBackendOptions::FromProperties({{"tp_size", "2"}, {"tp_rank", "2"}}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("tp_rank must be in [0, 2) for tp_size 2; got 2")));
+  EXPECT_THAT(
+      PosixBackendOptions::FromProperties(
+          {{"pcp_size", "4"}, {"pcp_rank", "-3"}}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("pcp_rank must be in [0, 4) for pcp_size 4; got -3")));
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_RejectsRankWithoutSize) {
+  EXPECT_THAT(PosixBackendOptions::FromProperties({{"tp_rank", "0"}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("tp_rank 0 was given without tp_size")));
+  EXPECT_THAT(PosixBackendOptions::FromProperties({{"pcp_rank", "2"}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pcp_rank 2 was given without pcp_size")));
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperPpPcpTpTopologyDir) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3",
+                         ParallelismConfig{.tp_size = 4,
+                                           .tp_rank = 3,
+                                           .pcp_size = 2,
+                                           .pcp_rank = 0,
+                                           .pp_size = 2,
+                                           .pp_rank = 1});
+  EXPECT_EQ(mapper.pp_size(), 2);
+  EXPECT_EQ(mapper.shards_per_block(), 16);
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("a"));
+  EXPECT_EQ(key.resolved_key,
+            "/tmp/kv_cache/llama3/pp2_r1_pcp2_r0_tp4_r3/610/00/61.bin");
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperPpOnlyTopologyDir) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3",
+                         ParallelismConfig{.pp_size = 4, .pp_rank = 2});
+  EXPECT_EQ(mapper.tp_size(), kAxisUndeclared);
+  EXPECT_EQ(mapper.pcp_size(), kAxisUndeclared);
+  EXPECT_EQ(mapper.shards_per_block(), 4);
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("a"));
+  EXPECT_EQ(key.resolved_key, "/tmp/kv_cache/llama3/pp4_r2/610/00/61.bin");
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperUnsetPpAxisIsUndeclared) {
+  PosixPathMapper mapper(
+      "/tmp/kv_cache", "llama3",
+      ParallelismConfig{
+          .tp_size = 2, .tp_rank = 1, .pcp_size = 2, .pcp_rank = 0});
+  EXPECT_EQ(mapper.pp_size(), kAxisUndeclared);
+  EXPECT_EQ(mapper.shards_per_block(), 4);
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperPerCallPpRankOverride) {
+  PosixPathMapper mapper(
+      "/tmp/kv_cache", "llama3",
+      ParallelismConfig{
+          .tp_size = 2, .tp_rank = 0, .pp_size = 4, .pp_rank = 0});
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key,
+                          mapper.MapKey("a", {.parallelism = {.pp_rank = 3}}));
+  EXPECT_EQ(key.resolved_key,
+            "/tmp/kv_cache/llama3/pp4_r3_tp2_r0/610/00/61.bin");
+}
+
+TEST_F(PosixBackendTest, PosixPathMapperRejectsInvalidPpAxis) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama3", ParallelismConfig{});
+
+  EXPECT_THAT(mapper.MapKey("a", {.parallelism = {.pp_size = 0}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pp_size must be >= 1")));
+  EXPECT_THAT(
+      mapper.MapKey("a", {.parallelism = {.pp_size = 2, .pp_rank = 2}}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("pp_rank must be in [0, 2) for pp_size 2; got 2")));
+  EXPECT_THAT(mapper.MapKey("a", {.parallelism = {.pp_rank = 1}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pp_rank 1 was given without pp_size")));
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_ParsesPpTopology) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      PosixBackendOptions opts,
+      PosixBackendOptions::FromProperties({{"pp_size", "2"},
+                                           {"pp_rank", "1"},
+                                           {"pcp_size", "4"},
+                                           {"pcp_rank", "3"},
+                                           {"tp_size", "2"},
+                                           {"tp_rank", "0"}}));
+  EXPECT_EQ(opts.pp_size, 2);
+  EXPECT_EQ(opts.pp_rank, 1);
+  EXPECT_EQ(opts.pcp_size, 4);
+  EXPECT_EQ(opts.pcp_rank, 3);
+  EXPECT_EQ(opts.tp_size, 2);
+  EXPECT_EQ(opts.tp_rank, 0);
+
+  TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions empty,
+                          PosixBackendOptions::FromProperties({}));
+  EXPECT_EQ(empty.pp_size, kAxisUndeclared);
+  EXPECT_EQ(empty.pp_rank, kAxisUndeclared);
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_RejectsInvalidPpAxis) {
+  EXPECT_THAT(PosixBackendOptions::FromProperties({{"pp_size", "0"}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pp_size must be >= 1")));
+  EXPECT_THAT(
+      PosixBackendOptions::FromProperties({{"pp_size", "2"}, {"pp_rank", "2"}}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("pp_rank must be in [0, 2) for pp_size 2; got 2")));
+  EXPECT_THAT(PosixBackendOptions::FromProperties({{"pp_rank", "0"}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pp_rank 0 was given without pp_size")));
+}
+
 // End-to-end: a raw binary hash survives a real write/read round trip.
 TEST_F(PosixBackendTest, BinaryHashWriteReadRoundTrip) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_binary", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_binary",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   const std::string binary_hash("\x00\x2f\xff\x41", 4);
   TF_ASSERT_OK_AND_ASSIGN(
@@ -374,9 +661,9 @@ TEST_F(PosixBackendTest, BinaryHashWriteReadRoundTrip) {
 
 // End-to-end: NUL-containing hashes must not read back each other's data.
 TEST_F(PosixBackendTest, NulContainingHashesDoNotAliasOnDisk) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_nul", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_nul",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey shorter,
                           mapper.MapKey(std::string("\x01\x00", 2),
@@ -426,7 +713,7 @@ std::shared_ptr<PosixKVCacheStoreBackend> AsPosixStoreBackend(
   return std::dynamic_pointer_cast<PosixKVCacheStoreBackend>(b);
 }
 
-TEST_F(StorageDriverTest, FactoryDefaultsTpSizeToOne) {
+TEST_F(StorageDriverTest, FactoryTopologyIgnoresControllerShardsAndWorkers) {
   ::tpu_sync::rpc::RaidenIdProto unit;
   unit.set_job_name("test_job");
   unit.set_job_replica_id("0");
@@ -437,6 +724,7 @@ TEST_F(StorageDriverTest, FactoryDefaultsTpSizeToOne) {
   config.type = "posix";
   config.SetProperty("root_dir", scratch_dir_);
   config.SetProperty("model_name", "auto_model");
+  config.parallelism = {.tp_size = 1, .tp_rank = 0};
 
   // num_shards counts controller buffer shards (e.g. chips), not storage
   // writers, so it must not leak into tp_size.
@@ -477,6 +765,24 @@ TEST_F(StorageDriverTest, FactoryDefaultsTpSizeToOne) {
   auto b3 = AsPosixStoreBackend(*b3_or);
   ASSERT_NE(b3, nullptr);
   EXPECT_EQ(b3->storage_backend()->mapper()->tp_size(), 1);
+  EXPECT_EQ(b3->storage_backend()->mapper()->pcp_size(), kAxisUndeclared);
+  EXPECT_EQ(b3->storage_backend()->mapper()->shards_per_block(), 1);
+}
+
+// With no axis declared every worker would write the same shard files.
+TEST_F(StorageDriverTest, FactoryRejectsConfigWithNoAxisDeclared) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("model_name", "auto_model");
+
+  EXPECT_THAT(::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+                  .CreateBackend(config, /*controller=*/nullptr)
+                  .status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("no parallelism axis is declared (received "
+                                 "topology: pp=undeclared pcp=undeclared "
+                                 "tp=undeclared)")));
 }
 
 TEST_F(StorageDriverTest, FactoryUsesParallelismTpSize) {
@@ -524,11 +830,91 @@ TEST_F(StorageDriverTest, FactoryReturnsErrorForInvalidOptions) {
   config.SetProperty("root_dir", scratch_dir_);
   config.SetProperty("model_name", "auto_model");
   config.SetProperty("metadata_cache_ttl_secs", "0");
+  config.parallelism = {.tp_size = 1, .tp_rank = 0};
 
   EXPECT_THAT(::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
                   .CreateBackend(config, /*controller=*/nullptr)
                   .status(),
-              StatusIs(absl::StatusCode::kInvalidArgument));
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("metadata_cache_ttl_secs")));
+}
+
+TEST_F(StorageDriverTest, FactoryUsesParallelismPcpSize) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("model_name", "auto_model");
+  config.parallelism = {
+      .tp_size = 2, .tp_rank = 1, .pcp_size = 4, .pcp_rank = 3};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend> created,
+      ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+          .CreateBackend(config, /*controller=*/nullptr));
+  auto b = AsPosixStoreBackend(created);
+  ASSERT_NE(b, nullptr);
+  EXPECT_EQ(b->storage_backend()->mapper()->pcp_size(), 4);
+  EXPECT_EQ(b->storage_backend()->mapper()->tp_size(), 2);
+  EXPECT_EQ(b->storage_backend()->mapper()->shards_per_block(), 8);
+  // The coordinator is pinned to rank 0 on every declared axis.
+  auto posix = std::dynamic_pointer_cast<PosixKVBackend>(b->storage_backend());
+  ASSERT_NE(posix, nullptr);
+  EXPECT_EQ(posix->options().pcp_rank, 0);
+  EXPECT_EQ(posix->options().tp_rank, 0);
+}
+
+TEST_F(StorageDriverTest, FactoryRejectsZeroPcpSize) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.parallelism.pcp_size = 0;
+
+  EXPECT_THAT(::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+                  .CreateBackend(config, /*controller=*/nullptr)
+                  .status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pcp_size must be >= 1")));
+}
+
+TEST_F(StorageDriverTest, FactoryUsesParallelismPpSize) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("model_name", "auto_model");
+  config.parallelism = {.tp_size = 2,
+                        .tp_rank = 1,
+                        .pcp_size = 2,
+                        .pcp_rank = 1,
+                        .pp_size = 2,
+                        .pp_rank = 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend> created,
+      ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+          .CreateBackend(config, /*controller=*/nullptr));
+  auto b = AsPosixStoreBackend(created);
+  ASSERT_NE(b, nullptr);
+  EXPECT_EQ(b->storage_backend()->mapper()->pp_size(), 2);
+  EXPECT_EQ(b->storage_backend()->mapper()->shards_per_block(), 8);
+  // The coordinator is pinned to rank 0 on every declared axis.
+  auto posix = std::dynamic_pointer_cast<PosixKVBackend>(b->storage_backend());
+  ASSERT_NE(posix, nullptr);
+  EXPECT_EQ(posix->options().pp_rank, 0);
+  EXPECT_EQ(posix->options().pcp_rank, 0);
+  EXPECT_EQ(posix->options().tp_rank, 0);
+}
+
+TEST_F(StorageDriverTest, FactoryRejectsPpRankWithoutPpSize) {
+  ::tpu_raiden::kv_cache::BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.parallelism.pp_rank = 0;
+
+  EXPECT_THAT(::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
+                  .CreateBackend(config, /*controller=*/nullptr)
+                  .status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pp_rank 0 was given without pp_size")));
 }
 
 // ===========================================================================
@@ -536,11 +922,11 @@ TEST_F(StorageDriverTest, FactoryReturnsErrorForInvalidOptions) {
 // ===========================================================================
 
 TEST_F(StorageDriverTest, BatchExistsMixedHitsAndMisses) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
+  PosixKVBackend backend("posix_disk", {});
   EXPECT_TRUE(RunBatchExists(backend, {}).empty());
 
-  PosixPathMapper mapper(scratch_dir_, "model_test", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixPathMapper mapper(scratch_dir_, "model_test",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   const int kNumFiles = 32;
   std::vector<BlockKey> keys;
@@ -575,10 +961,9 @@ TEST_F(StorageDriverTest, BatchExistsMixedHitsAndMisses) {
 }
 
 TEST_F(StorageDriverTest, BatchExistsAsyncAndWorkerThreads) {
-  PosixKVBackend backend(
-      "posix_disk", {{"storage_io_thread_pool_size", "1"}, {"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_test", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {{"storage_io_thread_pool_size", "1"}});
+  PosixPathMapper mapper(scratch_dir_, "model_test",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   const int kNumFiles = 16;
   std::vector<BlockKey> keys;
@@ -679,9 +1064,9 @@ TEST_F(StorageDriverTest, LookupWindowedPrefixHitsAndChunkBoundaries) {
 // ===========================================================================
 
 TEST_F(PosixBackendTest, PosixKVBackendAtomicRenameCommit) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_atomic", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_atomic",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   TF_ASSERT_OK_AND_ASSIGN(
       BlockKey key,
       mapper.MapKey("block_atomic_commit", {.parallelism = {.tp_rank = 0}}));
@@ -731,7 +1116,7 @@ TEST_F(PosixBackendTest, PosixKVBackendAtomicRenameCommit) {
 }
 
 TEST_F(PosixBackendTest, PosixKVBackendAtomicRenameCleansUpOnFailure) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
+  PosixKVBackend backend("posix_disk", {});
   std::string read_only_dir = absl::StrCat(scratch_dir_, "/read_only_dir");
   fs::create_directories(read_only_dir);
   fs::permissions(read_only_dir, fs::perms::owner_read | fs::perms::owner_exec,
@@ -771,9 +1156,9 @@ TEST_F(PosixBackendTest, PosixKVBackendAtomicRenameCleansUpOnFailure) {
 // directly on the final path, which Lookup (a bare existence check) then
 // reported as a hit forever, failing every subsequent recall with DataLoss.
 TEST_F(PosixBackendTest, PosixKVBackendWriteFailureLeavesNoVisibleFile) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_partial", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_partial",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   TF_ASSERT_OK_AND_ASSIGN(
       BlockKey key,
       mapper.MapKey("block_partial_write", {.parallelism = {.tp_rank = 0}}));
@@ -820,9 +1205,9 @@ TEST_F(PosixBackendTest, PosixKVBackendWriteFailureLeavesNoVisibleFile) {
 // so a non-zero offset must be refused rather than silently truncating the
 // other writers' slices away.
 TEST_F(PosixBackendTest, PosixKVBackendWriteRejectsNonZeroOffset) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_offset", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_offset",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   TF_ASSERT_OK_AND_ASSIGN(
       BlockKey key,
       mapper.MapKey("block_offset_write", {.parallelism = {.tp_rank = 0}}));
@@ -861,9 +1246,9 @@ TEST_F(PosixBackendTest, PosixKVBackendWriteRejectsNonZeroOffset) {
 }
 
 TEST_F(PosixBackendTest, PosixKVBackendPreadPrematureEOFReturnsDataLossError) {
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_trunc", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_trunc",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   TF_ASSERT_OK_AND_ASSIGN(
       BlockKey key,
       mapper.MapKey("block_truncated", {.parallelism = {.tp_rank = 0}}));
@@ -895,8 +1280,9 @@ TEST_F(PosixBackendTest, PosixKVBackendPreadPrematureEOFReturnsDataLossError) {
 }
 
 TEST_F(StorageDriverTest, StorageErrorHandlingAndRecovery) {
-  PosixKVBackend backend("posix_disk",
-                         {{"root_dir", scratch_dir_}, {"tp_rank", "0"}});
+  PosixKVBackend backend(
+      "posix_disk",
+      {{"root_dir", scratch_dir_}, {"tp_size", "1"}, {"tp_rank", "0"}});
 
   // Non-existent file read returns NotFoundError
   TF_ASSERT_OK_AND_ASSIGN(
@@ -958,8 +1344,9 @@ TEST_F(StorageDriverTest, StorageErrorHandlingAndRecovery) {
 // ===========================================================================
 
 TEST_F(StorageDriverTest, MultiSliceScatterGatherFidelityAndStress) {
-  PosixKVBackend backend("posix_disk",
-                         {{"root_dir", scratch_dir_}, {"tp_rank", "0"}});
+  PosixKVBackend backend(
+      "posix_disk",
+      {{"root_dir", scratch_dir_}, {"tp_size", "1"}, {"tp_rank", "0"}});
   // 1. Multi-layer 8 slices (4 KB per slice = 32 KB total)
   TF_ASSERT_OK_AND_ASSIGN(
       BlockKey key_8,
@@ -979,8 +1366,9 @@ TEST_F(StorageDriverTest, MultiSliceScatterGatherFidelityAndStress) {
 
 TEST_F(StorageDriverTest, MultiTpPartitionedIsolation) {
   const int tp_size = 2;
-  PosixKVBackend backend("posix_disk", {{"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "model_tp_test", tp_size, /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_tp_test",
+                         ParallelismConfig{.tp_size = tp_size, .tp_rank = 0});
 
   const size_t kBlockSize = 4096;
   std::vector<std::vector<uint8_t>> written(tp_size,
@@ -1028,10 +1416,9 @@ TEST_F(StorageDriverTest, MultiTpPartitionedIsolation) {
 }
 
 TEST_F(StorageDriverTest, RealFilesystemFaccessatExistsAndBatchExists) {
-  PosixKVBackend backend("posix_disk",
-                         {{"root_dir", scratch_dir_}, {"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "llama_70b", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {{"root_dir", scratch_dir_}});
+  PosixPathMapper mapper(scratch_dir_, "llama_70b",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   // Real 32-byte binary SHA-256 digests.
   const std::string hash_present =
@@ -1074,10 +1461,9 @@ TEST_F(StorageDriverTest, RealFilesystemFaccessatExistsAndBatchExists) {
 }
 
 TEST_F(StorageDriverTest, OptimisticOpenCreatesDirectoriesOnEnoent) {
-  PosixKVBackend backend("posix_disk",
-                         {{"root_dir", scratch_dir_}, {"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "llama_70b", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {{"root_dir", scratch_dir_}});
+  PosixPathMapper mapper(scratch_dir_, "llama_70b",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   const std::string hash_new_dir =
       "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10"
@@ -1127,10 +1513,9 @@ TEST_F(StorageDriverTest, OptimisticOpenCreatesDirectoriesOnEnoent) {
 }
 
 TEST_F(StorageDriverTest, VectoredIovMaxChunkingOver1024Slices) {
-  PosixKVBackend backend("posix_disk",
-                         {{"root_dir", scratch_dir_}, {"tp_rank", "0"}});
-  PosixPathMapper mapper(scratch_dir_, "llama_70b", /*tp_size=*/1,
-                         /*tp_rank=*/0);
+  PosixKVBackend backend("posix_disk", {{"root_dir", scratch_dir_}});
+  PosixPathMapper mapper(scratch_dir_, "llama_70b",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   const std::string hash_2048 =
       "\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff\x00\x11\x22\x33"
@@ -1168,9 +1553,8 @@ static int64_t ReadDirtyPageCacheKb() {
 TEST_F(PosixBackendTest, PosixBackendOptions_DirectIOPropertyParsing) {
   // 1. Defaults to false when omitted
   {
-    TF_ASSERT_OK_AND_ASSIGN(
-        PosixBackendOptions opts,
-        PosixBackendOptions::FromProperties({{"tp_rank", "0"}}));
+    TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                            PosixBackendOptions::FromProperties({}));
     EXPECT_FALSE(opts.direct_io);
   }
 
@@ -1178,8 +1562,7 @@ TEST_F(PosixBackendTest, PosixBackendOptions_DirectIOPropertyParsing) {
   for (const char* true_val : {"true", "TRUE", "True"}) {
     TF_ASSERT_OK_AND_ASSIGN(
         PosixBackendOptions opts,
-        PosixBackendOptions::FromProperties(
-            {{"tp_rank", "0"}, {"direct_io", true_val}}));
+        PosixBackendOptions::FromProperties({{"direct_io", true_val}}));
     EXPECT_TRUE(opts.direct_io) << "Failed for: " << true_val;
   }
 
@@ -1187,17 +1570,16 @@ TEST_F(PosixBackendTest, PosixBackendOptions_DirectIOPropertyParsing) {
   for (const char* false_val : {"false", "FALSE", "False"}) {
     TF_ASSERT_OK_AND_ASSIGN(
         PosixBackendOptions opts,
-        PosixBackendOptions::FromProperties(
-            {{"tp_rank", "0"}, {"direct_io", false_val}}));
+        PosixBackendOptions::FromProperties({{"direct_io", false_val}}));
     EXPECT_FALSE(opts.direct_io) << "Failed for: " << false_val;
   }
 
   // 4. Invalid strings return InvalidArgument
   for (const char* invalid_val : {"1", "yes", "0", "no", "invalid"}) {
-    EXPECT_THAT(PosixBackendOptions::FromProperties(
-                    {{"tp_rank", "0"}, {"direct_io", invalid_val}}),
-                StatusIs(absl::StatusCode::kInvalidArgument,
-                         HasSubstr("expected 'true' or 'false'")));
+    EXPECT_THAT(
+        PosixBackendOptions::FromProperties({{"direct_io", invalid_val}}),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 HasSubstr("expected 'true' or 'false'")));
   }
 }
 
@@ -1292,13 +1674,13 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_AlignedWriteAndReadFidelity) {
   auto backend = std::make_shared<PosixKVBackend>(
       "posix_directio",
       absl::flat_hash_map<std::string, std::string>{
-          {"tp_rank", "0"},
           {"root_dir", scratch_dir_},
           {"direct_io", "true"}});
   ASSERT_TRUE(backend->is_direct_io_supported());
 
-  auto mapper =
-      std::make_shared<PosixPathMapper>(scratch_dir_, "model_test", 1, 0);
+  auto mapper = std::make_shared<PosixPathMapper>(
+      scratch_dir_, "model_test",
+      ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   backend->set_mapper(mapper);
 
   TF_ASSERT_OK_AND_ASSIGN(
@@ -1349,7 +1731,6 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnsupportedFilesystemIsFatal) {
         PosixKVBackend backend(
             "posix_unsupported",
             absl::flat_hash_map<std::string, std::string>{
-                {"tp_rank", "0"},
                 {"root_dir", "/proc/raiden_no_o_direct"},
                 {"direct_io", "true"}});
       },
@@ -1363,11 +1744,11 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnalignedBufferRejected) {
   auto backend = std::make_shared<PosixKVBackend>(
       "posix_unaligned",
       absl::flat_hash_map<std::string, std::string>{
-          {"tp_rank", "0"},
           {"root_dir", scratch_dir_},
           {"direct_io", "true"}});
-  auto mapper =
-      std::make_shared<PosixPathMapper>(scratch_dir_, "model_test", 1, 0);
+  auto mapper = std::make_shared<PosixPathMapper>(
+      scratch_dir_, "model_test",
+      ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   backend->set_mapper(mapper);
 
   TF_ASSERT_OK_AND_ASSIGN(
@@ -1457,27 +1838,54 @@ class MetadataCacheTest : public StorageDriverTest {
     std::shared_ptr<PosixPathMapper> mapper;
     std::unique_ptr<PosixKVCacheStoreBackend> store;
 
-    std::string PathOf(const std::string& hash, int tp_rank = 0) {
-      absl::StatusOr<BlockKey> key =
-          mapper->MapKey(hash, {.parallelism = {.tp_rank = tp_rank}});
+    // A rank is ignored when the mapper leaves its axis undeclared.
+    std::string PathOf(const std::string& hash, int tp_rank = 0,
+                       int pcp_rank = 0, int pp_rank = 0) {
+      KeyMappingOptions options;
+      if (mapper->tp_size() != kAxisUndeclared) {
+        options.parallelism.tp_rank = tp_rank;
+      }
+      if (mapper->pcp_size() != kAxisUndeclared) {
+        options.parallelism.pcp_rank = pcp_rank;
+      }
+      if (mapper->pp_size() != kAxisUndeclared) {
+        options.parallelism.pp_rank = pp_rank;
+      }
+      absl::StatusOr<BlockKey> key = mapper->MapKey(hash, options);
       EXPECT_TRUE(key.ok()) << key.status();
       return key.ok() ? key->resolved_key : "";
     }
-    void CreateBlock(const std::string& hash, int tp_rank = 0) {
-      const std::string path = PathOf(hash, tp_rank);
+    void CreateBlock(const std::string& hash, int tp_rank = 0, int pcp_rank = 0,
+                     int pp_rank = 0) {
+      const std::string path = PathOf(hash, tp_rank, pcp_rank, pp_rank);
       fs::create_directories(fs::path(path).parent_path());
       std::ofstream file(path, std::ios::binary);
       file << "data";
     }
-    void RemoveBlock(const std::string& hash, int tp_rank = 0) {
-      ASSERT_TRUE(fs::remove(PathOf(hash, tp_rank))) << hash << " r" << tp_rank;
+    void RemoveBlock(const std::string& hash, int tp_rank = 0, int pcp_rank = 0,
+                     int pp_rank = 0) {
+      ASSERT_TRUE(fs::remove(PathOf(hash, tp_rank, pcp_rank, pp_rank)))
+          << hash << " pp_r" << pp_rank << " pcp_r" << pcp_rank << " tp_r"
+          << tp_rank;
     }
-    // Writes the shard of every rank in [0, tp_size).
+    // Writes the shard of every (pp_rank, pcp_rank, tp_rank) triple.
     void CreateAllShards(const std::string& hash) {
-      for (int r = 0; r < mapper->tp_size(); ++r) CreateBlock(hash, r);
+      for (int q = 0; q < std::max(1, mapper->pp_size()); ++q) {
+        for (int p = 0; p < std::max(1, mapper->pcp_size()); ++p) {
+          for (int r = 0; r < std::max(1, mapper->tp_size()); ++r) {
+            CreateBlock(hash, r, p, q);
+          }
+        }
+      }
     }
     void RemoveAllShards(const std::string& hash) {
-      for (int r = 0; r < mapper->tp_size(); ++r) RemoveBlock(hash, r);
+      for (int q = 0; q < std::max(1, mapper->pp_size()); ++q) {
+        for (int p = 0; p < std::max(1, mapper->pcp_size()); ++p) {
+          for (int r = 0; r < std::max(1, mapper->tp_size()); ++r) {
+            RemoveBlock(hash, r, p, q);
+          }
+        }
+      }
     }
     size_t LookupCount(const std::vector<std::string>& hashes) {
       absl::StatusOr<BlockSliceList> result = store->Lookup(hashes);
@@ -1491,13 +1899,23 @@ class MetadataCacheTest : public StorageDriverTest {
     return MetadataCacheOptions{.max_entries = max_entries, .ttl = ttl};
   }
 
+  // Each axis is declared (with rank 0) only when its size != -1.
   Env CreateEnv(MetadataCacheOptions cache_options, size_t batch_size = 4,
-                int tp_size = 1) {
+                int tp_size = 1, int pcp_size = kAxisUndeclared,
+                int pp_size = kAxisUndeclared) {
     auto backend = std::make_shared<CountingPosixKVBackend>(
-        "posix",
-        absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
-    auto mapper = std::make_shared<PosixPathMapper>(scratch_dir_, "model_test",
-                                                    tp_size, 0);
+        "posix", absl::flat_hash_map<std::string, std::string>{});
+    auto rank_for = [](int size) {
+      return size == kAxisUndeclared ? kAxisUndeclared : 0;
+    };
+    auto mapper = std::make_shared<PosixPathMapper>(
+        scratch_dir_, "model_test",
+        ParallelismConfig{.tp_size = tp_size,
+                          .tp_rank = rank_for(tp_size),
+                          .pcp_size = pcp_size,
+                          .pcp_rank = rank_for(pcp_size),
+                          .pp_size = pp_size,
+                          .pp_rank = rank_for(pp_size)});
     backend->set_mapper(mapper);
     auto store = std::make_unique<PosixKVCacheStoreBackend>(
         backend, "posix", 0, batch_size, cache_options);
@@ -1507,9 +1925,8 @@ class MetadataCacheTest : public StorageDriverTest {
 
 TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
   {
-    TF_ASSERT_OK_AND_ASSIGN(
-        PosixBackendOptions opts,
-        PosixBackendOptions::FromProperties({{"tp_rank", "0"}}));
+    TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                            PosixBackendOptions::FromProperties({}));
     EXPECT_EQ(opts.metadata_cache_max_entries, 0);
     EXPECT_EQ(opts.metadata_cache_ttl_secs, 60);
     const MetadataCacheOptions cache =
@@ -1521,8 +1938,7 @@ TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
   {
     TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
                             PosixBackendOptions::FromProperties(
-                                {{"tp_rank", "0"},
-                                 {"metadata_cache_max_entries", "-1"},
+                                {{"metadata_cache_max_entries", "-1"},
                                  {"metadata_cache_ttl_secs", "-1"}}));
     const MetadataCacheOptions cache =
         MetadataCacheOptions::FromPosixOptions(opts);
@@ -1533,8 +1949,7 @@ TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
   {
     TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
                             PosixBackendOptions::FromProperties(
-                                {{"tp_rank", "0"},
-                                 {"metadata_cache_max_entries", "7"},
+                                {{"metadata_cache_max_entries", "7"},
                                  {"metadata_cache_ttl_secs", "5"}}));
     const MetadataCacheOptions cache =
         MetadataCacheOptions::FromPosixOptions(opts);
@@ -1543,19 +1958,17 @@ TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
     EXPECT_EQ(cache.ttl, absl::Seconds(5));
   }
   for (const char* invalid_val : {"-2", "abc"}) {
-    EXPECT_THAT(
-        PosixBackendOptions::FromProperties(
-            {{"tp_rank", "0"}, {"metadata_cache_max_entries", invalid_val}}),
-        StatusIs(absl::StatusCode::kInvalidArgument,
-                 HasSubstr("metadata_cache_max_entries")))
+    EXPECT_THAT(PosixBackendOptions::FromProperties(
+                    {{"metadata_cache_max_entries", invalid_val}}),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("metadata_cache_max_entries")))
         << invalid_val;
   }
   for (const char* invalid_val : {"0", "-2", "abc"}) {
-    EXPECT_THAT(
-        PosixBackendOptions::FromProperties(
-            {{"tp_rank", "0"}, {"metadata_cache_ttl_secs", invalid_val}}),
-        StatusIs(absl::StatusCode::kInvalidArgument,
-                 HasSubstr("metadata_cache_ttl_secs")))
+    EXPECT_THAT(PosixBackendOptions::FromProperties(
+                    {{"metadata_cache_ttl_secs", invalid_val}}),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("metadata_cache_ttl_secs")))
         << invalid_val;
   }
 }
@@ -1566,6 +1979,7 @@ TEST_F(StorageDriverTest, FactoryWiresMetadataCacheOptions) {
   config.SetProperty("root_dir", scratch_dir_);
   config.SetProperty("metadata_cache_max_entries", "10");
   config.SetProperty("metadata_cache_ttl_secs", "5");
+  config.parallelism = {.tp_size = 1, .tp_rank = 0};
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend> created,
       ::tpu_raiden::kv_cache::KVCacheStoreBackendFactory::Instance()
@@ -1692,6 +2106,147 @@ TEST_F(MetadataCacheTest, DeleteInvalidatesAllRankShards) {
 
   // a's rank-2 shard is gone; the re-probe sees it.
   env.RemoveBlock("a", /*tp_rank=*/2);
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 0);
+}
+
+TEST_F(MetadataCacheTest, PcpOnlyTpUndeclaredHitRequiresEveryPcpShard) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/8, kAxisUndeclared,
+                      /*pcp_size=*/4);
+  EXPECT_EQ(env.mapper->shards_per_block(), 4);
+  // "a" hex-encodes to 61.
+  EXPECT_EQ(env.PathOf("a", /*tp_rank=*/0, /*pcp_rank=*/3),
+            absl::StrCat(scratch_dir_, "/model_test/pcp4_r3/610/00/61.bin"));
+  for (int p : {0, 1, 2}) env.CreateBlock("a", /*tp_rank=*/0, p);
+  // pcp rank 3 has not landed yet: miss, but the 3 confirmed shards are cached.
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.store->metadata_cache_size(), 3);
+
+  // Once pcp rank 3 lands, only that shard is probed.
+  env.CreateBlock("a", /*tp_rank=*/0, /*pcp_rank=*/3);
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 4);
+}
+
+TEST_F(MetadataCacheTest, NoAxesDeclaredSingleShard) {
+  Env env =
+      CreateEnv(Enabled(), /*batch_size=*/4, kAxisUndeclared, kAxisUndeclared);
+  EXPECT_EQ(env.mapper->shards_per_block(), 1);
+  EXPECT_EQ(env.PathOf("a"),
+            absl::StrCat(scratch_dir_, "/model_test/610/00/61.bin"));
+  env.CreateBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 1);
+
+  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->metadata_cache_size(), 0);
+  env.RemoveBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+}
+
+TEST_F(MetadataCacheTest, PcpAndTp1HitRequiresEveryPcpShard) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/8, /*tp_size=*/1,
+                      /*pcp_size=*/4);
+  for (int p : {0, 1, 2}) env.CreateBlock("a", /*tp_rank=*/0, p);
+  // pcp rank 3 has not landed yet: miss, but the 3 confirmed shards are cached.
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.store->metadata_cache_size(), 3);
+
+  // Once pcp rank 3 lands, only that shard is probed.
+  env.CreateBlock("a", /*tp_rank=*/0, /*pcp_rank=*/3);
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 4);
+
+  // Every shard is now cached.
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->batch_calls(), 0);
+}
+
+TEST_F(MetadataCacheTest, PcpTimesTpHitRequiresEveryShard) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/8, /*tp_size=*/2,
+                      /*pcp_size=*/2);
+  env.CreateBlock("a", /*tp_rank=*/0, /*pcp_rank=*/0);
+  env.CreateBlock("a", /*tp_rank=*/1, /*pcp_rank=*/0);
+  env.CreateBlock("a", /*tp_rank=*/0, /*pcp_rank=*/1);
+  // Shard (pcp 1, tp 1) is missing: miss, the other 3 are cached.
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.store->metadata_cache_size(), 3);
+
+  env.CreateBlock("a", /*tp_rank=*/1, /*pcp_rank=*/1);
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 4);
+}
+
+TEST_F(MetadataCacheTest, DeleteInvalidatesAllPcpTimesTpShards) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/8, /*tp_size=*/2,
+                      /*pcp_size=*/2);
+  env.CreateAllShards("a");
+  env.CreateAllShards("b");
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
+  EXPECT_EQ(env.store->metadata_cache_size(), 8);
+
+  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->metadata_cache_size(), 4);
+
+  // a's (pcp 1, tp 1) shard is gone; the re-probe sees it.
+  env.RemoveBlock("a", /*tp_rank=*/1, /*pcp_rank=*/1);
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 0);
+}
+
+TEST_F(MetadataCacheTest, PpTimesPcpTimesTpHitRequiresEveryShard) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/16, /*tp_size=*/2,
+                      /*pcp_size=*/2, /*pp_size=*/2);
+  EXPECT_EQ(env.mapper->shards_per_block(), 8);
+  // "a" hex-encodes to 61.
+  EXPECT_EQ(env.PathOf("a", /*tp_rank=*/1, /*pcp_rank=*/0, /*pp_rank=*/1),
+            absl::StrCat(scratch_dir_,
+                         "/model_test/pp2_r1_pcp2_r0_tp2_r1/610/00/61.bin"));
+  env.CreateAllShards("a");
+  // Shard (pp 1, pcp 1, tp 1) is missing: miss, the other 7 are cached.
+  env.RemoveBlock("a", /*tp_rank=*/1, /*pcp_rank=*/1, /*pp_rank=*/1);
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  EXPECT_EQ(env.store->metadata_cache_size(), 7);
+
+  // Once it lands, only that shard is probed.
+  env.CreateBlock("a", /*tp_rank=*/1, /*pcp_rank=*/1, /*pp_rank=*/1);
+  env.backend->ResetCounts();
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.backend->probed_keys(), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 8);
+}
+
+TEST_F(MetadataCacheTest, PpOnlyHitRequiresEveryPpShard) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/8, kAxisUndeclared,
+                      kAxisUndeclared, /*pp_size=*/4);
+  EXPECT_EQ(env.mapper->shards_per_block(), 4);
+  EXPECT_EQ(env.PathOf("a", /*tp_rank=*/0, /*pcp_rank=*/0, /*pp_rank=*/3),
+            absl::StrCat(scratch_dir_, "/model_test/pp4_r3/610/00/61.bin"));
+  for (int q : {0, 1, 2})
+    env.CreateBlock("a", /*tp_rank=*/0, /*pcp_rank=*/0, q);
+  EXPECT_EQ(env.LookupCount({"a"}), 0);
+  env.CreateBlock("a", /*tp_rank=*/0, /*pcp_rank=*/0, /*pp_rank=*/3);
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+}
+
+TEST_F(MetadataCacheTest, DeleteInvalidatesAllPpPcpTpShards) {
+  Env env = CreateEnv(Enabled(), /*batch_size=*/16, /*tp_size=*/2,
+                      /*pcp_size=*/2, /*pp_size=*/2);
+  env.CreateAllShards("a");
+  env.CreateAllShards("b");
+  EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
+  EXPECT_EQ(env.store->metadata_cache_size(), 16);
+
+  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->metadata_cache_size(), 8);
+
+  // a's (pp 1, pcp 0, tp 0) shard is gone; the re-probe sees it.
+  env.RemoveBlock("a", /*tp_rank=*/0, /*pcp_rank=*/0, /*pp_rank=*/1);
   EXPECT_EQ(env.LookupCount({"a", "b"}), 0);
 }
 

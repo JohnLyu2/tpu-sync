@@ -34,6 +34,7 @@
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/absl_check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -45,6 +46,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -52,7 +54,6 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden {
@@ -74,17 +75,75 @@ namespace metric_names = ::tpu_raiden::telemetry::metric_names;
 SocketTransportAdapter::Config ReadConfigFromEnv() {
   SocketTransportAdapter::Config config;
   if (const char* val =
-          std::getenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S")) {
-    double s = 0.0;
-    if (absl::SimpleAtod(val, &s) && s > 0) {
-      config.handshake_ack_read_timeout = absl::Seconds(s);
+          std::getenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.handshake_ack_read_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S=\""
+                   << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
     }
   }
   if (const char* val =
-          std::getenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S")) {
-    double s = 0.0;
-    if (absl::SimpleAtod(val, &s) && s > 0) {
-      config.final_ack_read_timeout = absl::Seconds(s);
+          std::getenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.final_ack_read_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.payload_read_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.handshake_write_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.payload_write_timeout_ms =
+          static_cast<int>(absl::ToInt64Milliseconds(absl::Seconds(parsed)));
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
+  if (const char* val = std::getenv("TPU_RAIDEN_MAX_SOCKET_WORKERS")) {
+    int w = 0;
+    if (absl::SimpleAtoi(val, &w) && w > 0) {
+      config.max_socket_workers = w;
     }
   }
   return config;
@@ -147,8 +206,6 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   return status;
 }
 
-}  // namespace
-
 // Whether to pin the client-side source address of outbound data connections.
 //
 // Binding a source IP only steers egress onto a particular NIC when the host
@@ -161,7 +218,8 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
 // anti-spoofing filters drop it. bind() itself succeeds and only the data path
 // breaks, so the failure surfaces as a hang rather than an error. Since the
 // routing rule is a property of the host that this process cannot reliably
-// detect, source binding is opt-in rather than default-on.
+// detect, source binding is opt-in rather than default-on
+// (TPU_RAIDEN_ENABLE_SOURCE_IP_BIND).
 bool SourceBindEnabled() {
   const char* v = std::getenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
   if (v == nullptr) return false;
@@ -177,19 +235,55 @@ std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i) {
   return local_ips[i % local_ips.size()];
 }
 
+// Subset of |local_ips| owned by a NIC in |nics| on |numa_node|, in
+// |local_ips| order. Empty when |numa_node| < 0 or no local IP is on that
+// node.
+std::vector<std::string> SourceIpsForNumaNode(
+    absl::Span<const std::string> local_ips,
+    absl::Span<const HostNicAddress> nics, int numa_node) {
+  std::vector<std::string> result;
+  if (numa_node < 0) return result;
+  for (const std::string& ip : local_ips) {
+    const bool on_node =
+        std::any_of(nics.begin(), nics.end(), [&](const HostNicAddress& nic) {
+          return nic.ip_address == ip && nic.numa_node == numa_node;
+        });
+    if (on_node) result.push_back(ip);
+  }
+  return result;
+}
+
+// Source IPs for an adapter pinned to |numa_node|: the local IPs on that
+// node, or every local IP when unpinned or none is on that node. NIC
+// discovery is only consulted for pinned adapters, so the default adapter's
+// construction is unchanged.
+std::vector<std::string> ResolveSourceIps(
+    absl::Span<const std::string> local_ips, int numa_node) {
+  if (numa_node >= 0) {
+    std::vector<std::string> on_node =
+        SourceIpsForNumaNode(local_ips, GetLocalHostNicAddresses(), numa_node);
+    if (!on_node.empty()) return on_node;
+    LOG(WARNING) << "No local IP on NUMA node " << numa_node
+                 << "; pinned send workers will use every local IP";
+  }
+  return std::vector<std::string>(local_ips.begin(), local_ips.end());
+}
+
+}  // namespace
+
 SocketTransportAdapter::SocketTransportAdapter(
-    RawBufferTransport* raw_transport, int parallelism)
+    RawBufferTransport* raw_transport, int parallelism, int numa_node)
     : raw_transport_(raw_transport),
       parallelism_(parallelism),
+      numa_node_(numa_node),
+      source_ips_(ResolveSourceIps(raw_transport == nullptr
+                                       ? absl::Span<const std::string>()
+                                       : raw_transport->local_ips(),
+                                   numa_node)),
       config_(ReadConfigFromEnv()),
       rr_index_(0),
       scheduler_stopping_(false) {
   ABSL_DCHECK(raw_transport_ != nullptr);
-  socket_workers_.reserve(parallelism_);
-  for (int i = 0; i < parallelism_; ++i) {
-    socket_workers_.push_back(
-        std::thread(&SocketTransportAdapter::SocketWorkerLoop, this));
-  }
 }
 
 SocketTransportAdapter::~SocketTransportAdapter() {
@@ -204,6 +298,12 @@ SocketTransportAdapter::~SocketTransportAdapter() {
 }
 
 void SocketTransportAdapter::SocketWorkerLoop() {
+  if (numa_node_ >= 0) {
+    const int rc = PinCurrentThreadToNumaNode(numa_node_);
+    LOG_IF(WARNING, rc != 0)
+        << "Failed to pin send worker to NUMA node " << numa_node_
+        << " (rc=" << rc << "); continuing unpinned";
+  }
   while (!scheduler_stopping_) {
     std::unique_ptr<WriteTask> task;
     {
@@ -288,6 +388,31 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
                                         "parallelism must be positive"));
   }
 
+  std::shared_ptr<std::atomic<bool>> session_failed = nullptr;
+  if (uuid != 0) {
+    absl::MutexLock lock(scheduler_mu_);
+    auto it = session_failed_by_uuid_.find(uuid);
+    if (it != session_failed_by_uuid_.end()) {
+      session_failed = it->second;
+    } else {
+      if (uuid_lru_order_.size() >= kMaxTrackedUuids) {
+        uint64_t oldest = uuid_lru_order_.front();
+        uuid_lru_order_.pop_front();
+        session_failed_by_uuid_.erase(oldest);
+      }
+      session_failed = std::make_shared<std::atomic<bool>>(false);
+      session_failed_by_uuid_[uuid] = session_failed;
+      uuid_lru_order_.push_back(uuid);
+    }
+  }
+
+  if (session_failed != nullptr &&
+      session_failed->load(std::memory_order_relaxed)) {
+    return ReportError(
+        on_complete, absl::CancelledError("Request cancelled due to previous "
+                                          "failure on same transfer session"));
+  }
+
   auto shared_requests =
       std::make_shared<std::vector<Request>>(requests.begin(), requests.end());
   auto shared_src_block_ids = std::make_shared<std::vector<int>>(
@@ -308,6 +433,38 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
   const size_t base_blocks_per_stream = num_blocks / P;
   const size_t remainder = num_blocks % P;
   size_t req_offset = 0;
+
+  std::vector<std::unique_ptr<WriteTask>> new_tasks;
+  new_tasks.reserve(P);
+
+  auto finish_stream = [statuses, remaining_workers, shared_on_complete,
+                        allocated_ids, push_start_ts, local_ips,
+                        dst_ip](int stream_idx, absl::Status status) {
+    (*statuses)[stream_idx] = std::move(status);
+    if (remaining_workers->fetch_sub(1) == 1) {
+      absl::Status final_status = absl::OkStatus();
+      for (const auto& s : *statuses) {
+        if (!s.ok()) {
+          final_status = s;
+          break;
+        }
+      }
+      if (final_status.ok()) {
+        const std::chrono::steady_clock::time_point push_end_ts =
+            std::chrono::steady_clock::now();
+        RecordP2pTransferTime(push_start_ts, push_end_ts,
+                              ExtractFirstEndpointIp(local_ips), dst_ip);
+      }
+      if (*shared_on_complete) {
+        if (!final_status.ok()) {
+          (*shared_on_complete)(final_status);
+        } else {
+          (*shared_on_complete)(*allocated_ids);
+        }
+      }
+    }
+  };
+
   for (int i = 0; i < P; ++i) {
     const size_t block_offset =
         i * base_blocks_per_stream + std::min<size_t>(i, remainder);
@@ -318,7 +475,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
       ++req_end;
     }
 
-    const std::string local_ip = SelectSourceIp(local_ips, i);
+    const std::string local_ip = SelectSourceIp(source_ips_, i);
     const std::string remote_peer = peers[i % peers.size()];
 
     absl::Span<const Request> stream_requests =
@@ -326,37 +483,28 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
             .subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    auto task_run = [this, i, remote_peer, local_ip, local_ips, dst_ip,
-                     block_offset, shared_requests, stream_requests,
-                     shared_src_block_ids, shared_dst_block_ids, allocated_ids,
-                     statuses, remaining_workers, shared_on_complete,
-                     push_start_ts]() {
-      (*statuses)[i] = PostSocketPushInternal(
+    auto task_run = [this, i, remote_peer, local_ip, dst_ip, block_offset,
+                     shared_requests, stream_requests, shared_src_block_ids,
+                     shared_dst_block_ids, allocated_ids, session_failed,
+                     finish_stream]() {
+      if (session_failed != nullptr &&
+          session_failed->load(std::memory_order_relaxed)) {
+        finish_stream(
+            i,
+            absl::CancelledError(
+                "Request cancelled due to failure on another stream or layer"));
+        return;
+      }
+
+      absl::Status status = PostSocketPushInternal(
           remote_peer, local_ip, dst_ip, stream_requests, *shared_src_block_ids,
           *shared_dst_block_ids, block_offset, *allocated_ids);
 
-      if (remaining_workers->fetch_sub(1) == 1) {
-        absl::Status final_status = absl::OkStatus();
-        for (const auto& s : *statuses) {
-          if (!s.ok()) {
-            final_status = s;
-            break;
-          }
-        }
-        if (final_status.ok()) {
-          const std::chrono::steady_clock::time_point push_end_ts =
-              std::chrono::steady_clock::now();
-          RecordP2pTransferTime(push_start_ts, push_end_ts,
-                                ExtractFirstEndpointIp(local_ips), dst_ip);
-        }
-        if (*shared_on_complete) {
-          if (!final_status.ok()) {
-            (*shared_on_complete)(final_status);
-          } else {
-            (*shared_on_complete)(*allocated_ids);
-          }
-        }
+      if (!status.ok() && session_failed != nullptr) {
+        session_failed->store(true, std::memory_order_relaxed);
       }
+
+      finish_stream(i, std::move(status));
     };
 
     auto task = std::make_unique<WriteTask>();
@@ -364,18 +512,28 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
     task->stream_idx = i;
     task->peer = remote_peer;
     task->run = std::move(task_run);
-
-    {
-      absl::MutexLock lock(scheduler_mu_);
-      auto& pq = peer_queues_[task->peer];
-      pq.tasks.push_back(std::move(task));
-      if (std::find(active_peers_.begin(), active_peers_.end(), remote_peer) ==
-          active_peers_.end()) {
-        active_peers_.push_back(remote_peer);
-      }
-    }
-    scheduler_cv_.SignalAll();
+    new_tasks.push_back(std::move(task));
   }
+
+  {
+    absl::MutexLock lock(scheduler_mu_);
+    for (auto& task : new_tasks) {
+      const std::string& remote_peer = task->peer;
+      auto [it, inserted] = peer_queues_.try_emplace(remote_peer);
+      if (inserted) {
+        active_peers_.push_back(remote_peer);
+        const size_t target_workers = active_peers_.size() * parallelism_;
+        while (socket_workers_.size() < target_workers &&
+               socket_workers_.size() <
+                   static_cast<size_t>(config_.max_socket_workers)) {
+          socket_workers_.push_back(
+              std::thread(&SocketTransportAdapter::SocketWorkerLoop, this));
+        }
+      }
+      it->second.tasks.push_back(std::move(task));
+    }
+  }
+  scheduler_cv_.SignalAll();
   return 0;
 }
 
@@ -418,15 +576,19 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   header.version = 1;
   header.op = socket_opcode;
   header.flags = major_order;
-  header.buffer_id = 0;
-  header.reserved = static_cast<uint16_t>(parallelism);
+  // Shard subset of these streams (0 = every shard) and the total stream
+  // count the receiver completes the push on.
+  header.buffer_id = first.shard_mask;
+  header.reserved = static_cast<uint16_t>(
+      first.total_streams > 0 ? first.total_streams : parallelism);
   header.remote_id = remote_id;
   header.local_id = local_id;
   header.count_or_size = count_or_size;
   header.uuid = uuid;
   const auto s_header = SerializeChunkHeader(header);
   FaultInjectSocket(hooks::kSocketTransportPushSendHeader, fd);
-  absl::Status s = WriteExact(fd, s_header.data(), s_header.size());
+  absl::Status s = WriteExact(fd, s_header.data(), s_header.size(),
+                              config_.handshake_write_timeout_ms);
   if (!s.ok()) {
     return s;
   }
@@ -435,13 +597,15 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     ABSL_DCHECK_LE(block_offset + block_count, dst_block_ids.size());
     const auto s_dst_ids =
         SerializeBlockIds({dst_block_ids.data() + block_offset, block_count});
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_dst_ids.data(), s_dst_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_dst_ids.data(), s_dst_ids.size(),
+                                    config_.handshake_write_timeout_ms));
     const auto s_src_ids =
         SerializeBlockIds({src_block_ids.data() + block_offset, block_count});
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size(),
+                                    config_.handshake_write_timeout_ms));
     uint8_t ack = 0;
     FaultInjectSocket(hooks::kSocketTransportPushRecvHandshakeAck, fd);
-    s = ReadExactWithTimeout(fd, &ack, 1, config_.handshake_ack_read_timeout);
+    s = ReadExact(fd, &ack, 1, config_.handshake_ack_read_timeout_ms);
     if (!s.ok()) {
       return s;
     }
@@ -453,9 +617,8 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     }
   } else {
     std::vector<uint8_t> ids_buf(block_count * sizeof(uint32_t));
-    ABSL_RETURN_IF_ERROR(
-        ReadExactWithTimeout(fd, ids_buf.data(), ids_buf.size(),
-                             config_.handshake_ack_read_timeout));
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, ids_buf.data(), ids_buf.size(),
+                                   config_.handshake_ack_read_timeout_ms));
     const std::vector<int> stream_allocated_ids = DeserializeBlockIds(ids_buf);
 
     for (size_t k = 0; k < block_count; ++k) {
@@ -489,11 +652,14 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
           fault_injection_payload_index < j) {
         FaultInjectSocket(hooks::kSocketTransportPushSendPayload, fd);
       }
+      FaultInjectSocket(hooks::kSocketTransportPushWriteChunk, fd);
       const std::array<uint8_t, kChunkSizeFieldSize> s_size =
           SerializeChunkSize(total_size);
-      ABSL_RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));
+      ABSL_RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size(),
+                                      config_.payload_write_timeout_ms));
       if (total_size > 0) {
-        ABSL_RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
+        ABSL_RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov),
+                                         config_.payload_write_timeout_ms));
         stream_bytes_sent += total_size;
       }
       i = j;
@@ -506,7 +672,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
 
   uint8_t ack = 0;
   FaultInjectSocket(hooks::kSocketTransportPushRecvAck, fd);
-  s = ReadExactWithTimeout(fd, &ack, 1, config_.final_ack_read_timeout);
+  s = ReadExact(fd, &ack, 1, config_.final_ack_read_timeout_ms);
   if (!s.ok()) {
     return s;
   }
@@ -556,7 +722,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
         requests.subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    const std::string local_ip = SelectSourceIp(local_ips, i);
+    const std::string local_ip = SelectSourceIp(source_ips_, i);
     const std::string remote_peer = peers[i % peers.size()];
 
     threads.emplace_back(
@@ -633,10 +799,12 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
     header.count_or_size = remote_count;
     header.uuid = uuid;
     const auto s_header = SerializeChunkHeader(header);
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size(),
+                                    config_.handshake_write_timeout_ms));
 
     char resp_buf[kChunkHeaderSize];
-    ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_buf, sizeof(resp_buf)));
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_buf, sizeof(resp_buf),
+                                   config_.handshake_ack_read_timeout_ms));
     ABSL_ASSIGN_OR_RETURN(const ChunkHeader resp_header,
                           DeserializeChunkHeader(resp_buf));
     if (resp_header.op != socket_opcode ||
@@ -672,7 +840,8 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
       }
 
       uint8_t size_buf[kChunkSizeFieldSize];
-      ABSL_RETURN_IF_ERROR(ReadExact(fd, size_buf, sizeof(size_buf)));
+      ABSL_RETURN_IF_ERROR(ReadExact(fd, size_buf, sizeof(size_buf),
+                                     config_.payload_read_timeout_ms));
       const uint32_t sender_size = DeserializeChunkSize(size_buf);
 
       if (sender_size != expected_size) {
@@ -683,7 +852,8 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
       }
 
       if (expected_size > 0) {
-        ABSL_RETURN_IF_ERROR(ReadVExact(fd, absl::MakeSpan(iov)));
+        ABSL_RETURN_IF_ERROR(ReadVExact(fd, absl::MakeSpan(iov),
+                                        config_.payload_read_timeout_ms));
         stream_bytes_received += expected_size;
       }
 

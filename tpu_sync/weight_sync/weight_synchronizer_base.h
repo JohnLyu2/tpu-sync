@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"
@@ -34,6 +35,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -89,24 +91,6 @@ struct WeightSyncMetrics {
 
 class WeightSynchronizerListener;
 
-class WeightSynchronizerControlDelegate {
- public:
-  virtual ~WeightSynchronizerControlDelegate() = default;
-  virtual absl::Status PushWeights(const std::vector<std::string>& peers) = 0;
-  virtual absl::Status PushWeightsResharded(
-      const tpu_sync::rpc::StartTransferRequest& request) = 0;
-  virtual void StoreSkipTiling(
-      uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request) = 0;
-  virtual absl::Status RegisterExpectedChunks(uint64_t uuid,
-                                              uint32_t expected_chunks) = 0;
-  virtual absl::Status RegisterExpectedLayerChunks(
-      uint64_t uuid,
-      const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) = 0;
-  virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0) = 0;
-  virtual void ForgetPushProgress(uint64_t uuid) = 0;
-  virtual void DrainPendingH2d() = 0;
-};
-
 class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
  public:
   // Symmetrical core constructor wrapping raw PJRT buffers directly E2E
@@ -146,12 +130,6 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   ~WeightSynchronizerBase() override;
 
-  void SetControlDelegate(WeightSynchronizerControlDelegate* delegate) {
-    control_delegate_ = delegate;
-  }
-  WeightSynchronizerControlDelegate* control_delegate() const {
-    return control_delegate_;
-  }
   void SetGlobalShardIndices(std::vector<int64_t> indices) {
     global_shard_indices_ = std::move(indices);
   }
@@ -207,9 +185,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                 size_t shard_idx) const override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
 
+  // Returns the tiling scratchpad of `shard_idx`, shared by all layers. The
+  // pointer may be reallocated by a later H2D/D2H that needs more space.
   uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) {
     if (shard_idx < tiled_scratchpads_.size() &&
         tiled_scratchpads_[shard_idx]) {
+      absl::MutexLock lock(tiled_scratchpads_[shard_idx]->mu);
       return tiled_scratchpads_[shard_idx]->ptr;
     }
     return nullptr;
@@ -217,6 +198,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   const uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) const {
     if (shard_idx < tiled_scratchpads_.size() &&
         tiled_scratchpads_[shard_idx]) {
+      absl::MutexLock lock(tiled_scratchpads_[shard_idx]->mu);
       return tiled_scratchpads_[shard_idx]->ptr;
     }
     return nullptr;
@@ -323,8 +305,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
   size_t GetPipelineGroupSize() const;
 
-  absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
-                                uint64_t uuid = 0) override;
+  // Block-push completion. Counts the shards reported for |uuid| and runs the
+  // auto H2D (which copies every layer and shard) only once the count reaches
+  // num_shards(); see block_push_shards_.
+  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
+                                     absl::Span<const int> shard_ids,
+                                     uint64_t uuid = 0) override;
 
   absl::Status RegisterExpectedChunks(uint64_t uuid,
                                       uint32_t expected_chunks) override;
@@ -349,6 +335,13 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   void ForgetPushProgress(uint64_t uuid) override;
 
  protected:
+  // Records the shards of one block-push stream for |uuid| and returns true
+  // once the shards reported so far reach num_shards(), i.e. the host buffers
+  // of |uuid| are complete and may be copied to device. Subclasses that
+  // override OnBlockShardsReceived() should gate their device copy on this.
+  bool RecordBlockPushShards(absl::Span<const int> shard_ids, uint64_t uuid)
+      ABSL_LOCKS_EXCLUDED(block_push_shards_mu_);
+
   std::unique_ptr<WeightSynchronizerListener> listener_;
   const PJRT_Api* c_api_ = nullptr;
   const PJRT_RawBuffer_Extension* extension_ = nullptr;
@@ -379,7 +372,6 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  private:
-  WeightSynchronizerControlDelegate* control_delegate_ = nullptr;
   std::vector<int64_t> global_shard_indices_;
   std::vector<int> local_shard_indices_;
 
@@ -449,24 +441,32 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
+  // Runs ForEachShardNumaLocal()'s per-shard tasks (tiling, H2D/D2H issue).
+  // Separate from |h2d_pool_| so that H2d() never waits on tasks queued behind
+  // its own caller. It has one thread per shard, so a task on it must never
+  // block on another task of this pool (e.g. H2d() waiting for in-place tiling
+  // done by TileLayer()).
+  absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> shard_pool_;
   std::unique_ptr<HostMemoryAllocator> host_allocator_;
 
   // Shared reusable scratchpad per shard (one per local device/chip) to avoid
   // allocating redundant tiled staging buffers across all layers.
   struct ShardScratchpad {
     absl::Mutex mu;
-    uint8_t* ptr = nullptr;
-    size_t capacity = 0;
-    std::shared_ptr<void> owner;
-    std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer = {nullptr,
-                                                                [](void*) {}};
-    xla::Future<> in_flight_future;
+    uint8_t* ptr ABSL_GUARDED_BY(mu) = nullptr;
+    size_t capacity ABSL_GUARDED_BY(mu) = 0;
+    std::shared_ptr<void> owner ABSL_GUARDED_BY(mu);
+    std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer ABSL_GUARDED_BY(
+        mu) = {nullptr, [](void*) {}};
+    // Copy that still reads (H2D) or writes (D2H) |ptr|. Awaited before the
+    // buffer is reused or reallocated.
+    xla::Future<> in_flight_future ABSL_GUARDED_BY(mu);
   };
   std::vector<std::unique_ptr<ShardScratchpad>> tiled_scratchpads_;
 
   absl::StatusOr<uint8_t*> AcquireTiledScratchpadLocked(
       ShardScratchpad& sp, size_t required_bytes,
-      const xla::PjRtDevice* device);
+      const xla::PjRtDevice* device) ABSL_EXCLUSIVE_LOCKS_REQUIRED(sp.mu);
 
   // Returns the per-layer skip-tiling mask for |uuid|, falling back to the
   // latest mask set via SetSkipTiling() and then to all-false.
@@ -483,6 +483,14 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                                              bool tile);
   // Copies all shards of |layer_idx| to device via H2dShard().
   absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx, bool tile);
+  // Starts the device-to-host copy of shard |shard_idx| of layer |layer_idx|
+  // into its host staging buffer. If the shard has a tiled layout and
+  // |skip_tiling| is false, copies into the shard's scratchpad and detiles into
+  // the staging buffer once the copy completes, recording the detile time in
+  // |max_detile_ms| when non-null. Errors are returned as a failed future.
+  xla::Future<raiden::BufferHolder> D2hShard(
+      size_t layer_idx, size_t shard_idx, bool skip_tiling,
+      std::shared_ptr<std::atomic<double>> max_detile_ms);
   // A local shard and its schedule in a StartTransferRequest.
   struct ShardPushSchedule {
     size_t shard_idx;
@@ -506,15 +514,6 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                                             size_t shard_idx,
                                                             ShardScratchpad& sp)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(sp.mu);
-
-  // Returns the pool that runs H2d()'s per-shard tasks, creating it on first
-  // use. It is separate from |h2d_pool_| so that H2d() never waits on tasks
-  // queued behind its own caller.
-  tpu_raiden::NumaThreadPool* GetH2dShardPool();
-
-  absl::Mutex h2d_shard_pool_mu_;
-  std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_shard_pool_
-      ABSL_GUARDED_BY(h2d_shard_pool_mu_);
 
   // Per-layer in-place tiling state of the host staging buffers, indexed by
   // layer. A non-null entry means the layer's host buffers hold device-layout
@@ -563,6 +562,14 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   mutable absl::Mutex completed_transfers_mu_;
   absl::flat_hash_set<uint64_t> completed_transfers_
       ABSL_GUARDED_BY(completed_transfers_mu_);
+
+  // Number of shards reported by OnBlockShardsReceived per block-push uuid. A
+  // routed push delivers a block range over several streams that each carry a
+  // shard subset; H2d(uuid) copies all shards, so it waits until the count
+  // reaches num_shards(). Cleared by ForgetPushProgress.
+  mutable absl::Mutex block_push_shards_mu_;
+  absl::flat_hash_map<uint64_t, size_t> block_push_shards_
+      ABSL_GUARDED_BY(block_push_shards_mu_);
 
   std::optional<size_t> pipeline_group_size_override_;
   void UpdateAllocatedOccupancyMetric(size_t delta = 0);

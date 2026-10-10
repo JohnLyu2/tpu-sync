@@ -20,19 +20,15 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #ifndef WITHOUT_PYTHON
 #include "ATen/core/TensorBody.h"
 #include "csrc/api/tensor_buffer.h"
-#include "tpu_sync/frameworks/torch/torch_utils.h"
 #endif
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -45,138 +41,10 @@ class StartTransferRequest;
 namespace tpu_raiden {
 namespace torch {
 
-class NumaAwareWeightSynchronizer
-    : public weight_sync::WeightSynchronizerControlDelegate {
- public:
-  NumaAwareWeightSynchronizer(const NumaAwareWeightSynchronizer&) = delete;
-  NumaAwareWeightSynchronizer& operator=(const NumaAwareWeightSynchronizer&) =
-      delete;
-  NumaAwareWeightSynchronizer(NumaAwareWeightSynchronizer&&) = default;
-  NumaAwareWeightSynchronizer& operator=(NumaAwareWeightSynchronizer&&) =
-      default;
-
-#ifndef WITHOUT_PYTHON
-  NumaAwareWeightSynchronizer(
-      const std::vector<std::vector<at::Tensor>>& device_tensors,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt,
-      bool unsafe_skip_buffer_lock = true, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
-
-  absl::Status BindWeights(
-      const std::vector<std::vector<at::Tensor>>& device_tensors);
-#endif
-  // Releases all bound device tensors (buffer_refs_) and TPU HBM buffer holds
-  // across every sub-synchronizer while keeping host staging memory, metadata,
-  // and listeners alive. Must not be called while a D2H/H2D/push is in flight.
-  // See WeightSynchronizerBase::UnbindWeights for the full contract.
-  void UnbindWeights();
-
-  // CPU / Mock metadata constructor for tests without PJRT TPU devices
-  NumaAwareWeightSynchronizer(
-      size_t num_layers, size_t num_shards, size_t slice_byte_size,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
-  NumaAwareWeightSynchronizer(
-      size_t num_layers, size_t num_shards,
-      std::vector<size_t> slice_byte_sizes,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
-
-  // Test-only constructor for injecting mock sub-synchronizers
-  explicit NumaAwareWeightSynchronizer(
-      std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>>
-          sub_synchronizers);
-
-  virtual ~NumaAwareWeightSynchronizer();
-
-  size_t num_layers() const { return num_layers_; }
-  size_t num_shards() const { return total_num_shards_; }
-  size_t slice_byte_size() const { return slice_byte_size_; }
-
-  std::optional<int> local_port() const;
-  std::optional<int> listener_port() const;
-  bool is_listener_active() const;
-
-  std::vector<std::string> local_ips() const;
-  std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
-
-  const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const;
-  size_t GetHostBufferSize(size_t layer_idx, size_t shard_idx) const;
-
-  absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
-  absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
-
-  void SetSkipTiling(const std::vector<bool>& skip_tiling);
-  void SetSkipTiling(bool skip_all);
-
-  weight_sync::WeightSyncMetrics GetMetrics() const;
-  void ResetMetrics();
-
-  absl::Status PushWeights(const std::vector<std::string>& peers) override;
-  absl::Status PushWeightsResharded(
-      const tpu_sync::rpc::StartTransferRequest& request) override;
-  void StoreSkipTiling(
-      uint64_t uuid,
-      const tpu_sync::rpc::StartTransferRequest& request) override;
-  absl::Status RegisterExpectedChunks(uint64_t uuid,
-                                      uint32_t expected_chunks) override;
-  absl::Status RegisterExpectedLayerChunks(
-      uint64_t uuid,
-      const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks)
-      override;
-  absl::Status WaitForTransferCompletion(uint64_t uuid) override;
-  void ForgetPushProgress(uint64_t uuid) override;
-  void DrainPendingH2d() override;
-
-  const std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>>&
-  sub_synchronizers() const {
-    return sub_synchronizers_;
-  }
-
-  void SetSubmanagerShardsForTesting(
-      const std::vector<std::vector<int64_t>>& assignment);
-
-  void SetTestOnlyRateLimiters(double test_only_simulated_egress_gbps,
-                               double test_only_simulated_ingress_gbps);
-
- private:
-  void InitSubManagers(
-      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
-      std::optional<int> local_port, bool unsafe_skip_buffer_lock,
-      int parallelism, std::optional<int> listener_port,
-      std::optional<std::string> bind_ip, bool auto_h2d,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
-
-  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>>
-      sub_synchronizers_;
-  std::vector<std::pair<int, int>> global_shard_to_submanager_;
-  std::vector<std::vector<int64_t>> submanager_to_global_shards_;
-  std::vector<std::vector<int>> submanager_to_local_shards_;
-  std::vector<int64_t> global_shard_indices_;
-  size_t total_num_shards_ = 0;
-  size_t num_layers_ = 0;
-  size_t slice_byte_size_ = 0;
-  bool unsafe_skip_buffer_lock_ = false;
-  std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
-
-  absl::Mutex expected_counts_mu_;
-  absl::flat_hash_map<uint64_t,
-                      std::vector<absl::flat_hash_map<size_t, uint32_t>>>
-      uuid_to_sub_layer_counts_ ABSL_GUARDED_BY(expected_counts_mu_);
-  absl::flat_hash_map<uint64_t, std::vector<uint32_t>> uuid_to_sub_total_counts_
-      ABSL_GUARDED_BY(expected_counts_mu_);
-
-#ifndef WITHOUT_PYTHON
-  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
-#endif
-};
-
+// PyTorch facade over weight_sync::WeightSynchronizerBase. Unpacks at::Tensor
+// shards into PJRT buffer handles and keeps the tensor buffer references alive
+// for the lifetime of the binding. NUMA placement of host tiling, H2D and
+// transport listeners is handled by the base class per shard.
 class WeightSynchronizer {
  public:
   WeightSynchronizer(const WeightSynchronizer&) = delete;
@@ -218,16 +86,7 @@ class WeightSynchronizer {
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
       std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
-  // Test-only constructor for injecting mock sub-synchronizers
-  explicit WeightSynchronizer(
-      std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>>
-          sub_synchronizers);
-
   ~WeightSynchronizer();
-
-  NumaAwareWeightSynchronizer* numa_manager() const {
-    return numa_manager_.get();
-  }
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
@@ -280,7 +139,11 @@ class WeightSynchronizer {
       double test_only_simulated_ingress_gbps = 0.0);
 
  private:
-  std::unique_ptr<NumaAwareWeightSynchronizer> numa_manager_;
+  std::unique_ptr<weight_sync::WeightSynchronizerBase> base_;
+#ifndef WITHOUT_PYTHON
+  bool unsafe_skip_buffer_lock_ = true;
+  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
+#endif
 };
 
 }  // namespace torch

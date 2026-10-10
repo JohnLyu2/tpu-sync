@@ -16,6 +16,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,7 @@
 #include <optional>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
+#include <utility>
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
@@ -34,6 +36,7 @@
 #include "c10/core/ScalarType.h"
 #include "c10/core/TensorOptions.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/match.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -282,6 +285,37 @@ TEST_F(KVCacheManagerTorchTest, MapSharedMemoryValidation) {
   // Unmap when not mapped
   EXPECT_FALSE(manager.UnmapSharedMemory().ok());
 
+  // page_nbytes is checked before DmaMap, so a bad page is rejected even on
+  // the CPU client.  The device buffer is [8, 1024] f32: 4096-byte slices and
+  // 32768 bytes per layer.
+  struct BadPage {
+    size_t page_nbytes;
+    const char* reason;
+  };
+  for (const BadPage& bad : {BadPage{0, "greater than zero"},
+                             BadPage{2048, "multiple of slice_byte_size"},
+                             BadPage{6144, "multiple of slice_byte_size"},
+                             BadPage{12288, "whole number of pages"}}) {
+    const absl::Status bad_status = manager.MapSharedMemory(
+        reinterpret_cast<uintptr_t>(aligned_ptr), page_size, bad.page_nbytes);
+    EXPECT_EQ(bad_status.code(), absl::StatusCode::kInvalidArgument)
+        << "page_nbytes=" << bad.page_nbytes << ": " << bad_status;
+    EXPECT_TRUE(absl::StrContains(bad_status.message(), bad.reason))
+        << "page_nbytes=" << bad.page_nbytes << ": " << bad_status;
+    EXPECT_FALSE(manager.is_shared_memory_mapped());
+  }
+
+  // A two-slice page passes validation, so the call gets as far as DmaMap,
+  // which the CPU client does not implement.
+  const absl::Status two_slice_status =
+      manager.MapSharedMemory(reinterpret_cast<uintptr_t>(aligned_ptr),
+                              page_size, /*page_nbytes=*/8192);
+  EXPECT_EQ(two_slice_status.code(), absl::StatusCode::kUnimplemented)
+      << two_slice_status;
+  EXPECT_TRUE(absl::StrContains(two_slice_status.message(), "DmaMap"))
+      << two_slice_status;
+  EXPECT_FALSE(manager.is_shared_memory_mapped());
+
   // Calling MapSharedMemory delegates to client->DmaMap, which fails with
   // Unimplemented on CPU PJRT client, leaving mapping state unmapped.
   absl::Status status = manager.MapSharedMemory(
@@ -357,9 +391,18 @@ TEST_F(KVCacheManagerTorchTest, H2dD2hWithObjectTensorsValidation) {
   at::Tensor wrong_layers = at::zeros({2, 2, page_nbytes}, at::kChar);
   EXPECT_FALSE(manager.H2d({0}, {wrong_layers}, 0).ok());
 
-  // Slice size mismatch (2048 vs 4096)
-  at::Tensor wrong_slice = at::zeros({2, 1, 2048}, at::kChar);
-  EXPECT_FALSE(manager.H2d({0}, {wrong_slice}, 0).ok());
+  // Page size mismatch: the default mapping pins page_nbytes to one 4096-byte
+  // slice, so both a smaller and a larger object page are refused.
+  for (const int64_t wrong_page_nbytes : {int64_t{2048}, 2 * page_nbytes}) {
+    at::Tensor wrong_page = at::zeros({2, 1, wrong_page_nbytes}, at::kChar);
+    const absl::Status wrong_page_status =
+        manager.H2d({0}, {wrong_page}, 0).status();
+    EXPECT_EQ(wrong_page_status.code(), absl::StatusCode::kInvalidArgument)
+        << "page_nbytes=" << wrong_page_nbytes << ": " << wrong_page_status;
+    EXPECT_TRUE(
+        absl::StrContains(wrong_page_status.message(), "does not match"))
+        << "page_nbytes=" << wrong_page_nbytes << ": " << wrong_page_status;
+  }
 
   // rank_id out of range (rank_id=2 >= num_ranks=2)
   EXPECT_FALSE(manager.H2d({0}, {valid_obj}, /*rank_id=*/2).ok());
@@ -461,6 +504,147 @@ TEST_F(KVCacheManagerTorchTest, H2dD2hWithObjectTensorsEndToEnd) {
   at::Tensor outside_obj = at::zeros({2, 1, page_nbytes}, at::kChar);
   EXPECT_FALSE(manager.H2d({1}, {outside_obj}, /*rank_id=*/0).ok());
   EXPECT_FALSE(manager.D2h({1}, {outside_obj}, /*rank_id=*/0).ok());
+
+  manager.ResetSharedMemoryMappedForTest();
+  free(pool);
+}
+
+// A page may span several consecutive slices of the device KV cache, for a
+// caller whose block covers more than one device block.  Block ids then count
+// pages, so block b starts at slice b * slices_per_page of every layer.  Two
+// layers and two ranks check that the host offsets scale with the page too.
+TEST_F(KVCacheManagerTorchTest, H2dD2hWithMultiSlicePages) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client_->addressable_devices()[0]->default_memory_space());
+
+  // Two [8, 1024] f32 layers on one client, each its own allocation.
+  constexpr int64_t kNumLayers = 2;
+  constexpr int64_t kNumRanks = 2;
+  constexpr int64_t kRank = 1;
+  std::vector<std::vector<float>> host_data(kNumLayers,
+                                            std::vector<float>(8 * 1024, 0.0f));
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::vector<std::vector<at::Tensor>> device_tensors;
+  for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<xla::PjRtBuffer> pjrt_buffer,
+        client_->BufferFromHostBuffer(
+            host_data[layer].data(), xla::F32, {8, 1024},
+            /*byte_strides=*/std::nullopt,
+            xla::PjRtClient::HostBufferSemantics::
+                kImmutableUntilTransferCompletes,
+            /*on_done_with_host_buffer=*/nullptr, memory_space,
+            /*device_layout=*/nullptr));
+    at::Tensor tensor = at::zeros({8, 1024}, at::kFloat);
+    RegisterMockTensor(tensor, pjrt_buffer.get());
+    pjrt_buffers.push_back(std::move(pjrt_buffer));
+    device_tensors.push_back({tensor});
+  }
+
+  KVCacheManager manager(device_tensors,
+                         /*local_port=*/std::nullopt,
+                         /*host_blocks_to_allocate=*/8);
+  ASSERT_EQ(manager.num_layers(), static_cast<size_t>(kNumLayers));
+
+  // 8 slices of 4096 bytes per layer, so two-slice pages leave 4 pages.
+  const int64_t slice_nbytes = manager.slice_byte_size();
+  const int64_t page_nbytes = 2 * slice_nbytes;
+
+  // Every object is [kNumRanks, kNumLayers, nbytes] and lives in the pool: a
+  // source page object, a destination page object, then two one-slice
+  // objects for reading device slices back one at a time.
+  const int64_t page_obj_nbytes = kNumRanks * kNumLayers * page_nbytes;
+  const int64_t slice_obj_nbytes = kNumRanks * kNumLayers * slice_nbytes;
+  const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  const size_t used_bytes =
+      static_cast<size_t>(2 * page_obj_nbytes + 2 * slice_obj_nbytes);
+  const size_t pool_size =
+      ((used_bytes + page_size - 1) / page_size) * page_size;
+  void* pool = nullptr;
+  ASSERT_EQ(posix_memalign(&pool, page_size, pool_size), 0);
+  std::memset(pool, 0, pool_size);
+  auto* pool_bytes = static_cast<uint8_t*>(pool);
+
+  const c10::TensorOptions options = c10::TensorOptions().dtype(at::kByte);
+  at::Tensor src =
+      at::from_blob(pool_bytes, {kNumRanks, kNumLayers, page_nbytes}, options);
+  at::Tensor dst = at::from_blob(pool_bytes + page_obj_nbytes,
+                                 {kNumRanks, kNumLayers, page_nbytes}, options);
+  at::Tensor first =
+      at::from_blob(pool_bytes + 2 * page_obj_nbytes,
+                    {kNumRanks, kNumLayers, slice_nbytes}, options);
+  at::Tensor second =
+      at::from_blob(pool_bytes + 2 * page_obj_nbytes + slice_obj_nbytes,
+                    {kNumRanks, kNumLayers, slice_nbytes}, options);
+
+  // True if every byte of the contiguous uint8 tensor `t` equals `value`.
+  const auto all_bytes_are = [](const at::Tensor& t, uint8_t value) {
+    const uint8_t* bytes = t.data_ptr<uint8_t>();
+    return std::all_of(bytes, bytes + t.numel(),
+                       [value](uint8_t b) { return b == value; });
+  };
+
+  // Rank kRank's page holds a distinct byte per layer and half, so the
+  // readbacks below can tell which layer and device slice each half landed
+  // in.  Rank 0 is a decoy that no transfer below may touch.
+  constexpr uint8_t kPattern[kNumLayers][2] = {{0x11, 0x22}, {0x33, 0x44}};
+  constexpr uint8_t kDecoy = 0x5A;
+  std::memset(src[0].data_ptr<uint8_t>(), kDecoy, kNumLayers * page_nbytes);
+  for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+    uint8_t* page = src[kRank][layer].data_ptr<uint8_t>();
+    std::memset(page, kPattern[layer][0], slice_nbytes);
+    std::memset(page + slice_nbytes, kPattern[layer][1], slice_nbytes);
+  }
+
+  manager.SetSharedMemoryMappedForTest(reinterpret_cast<uintptr_t>(pool),
+                                       pool_size, page_nbytes);
+
+  // Page 1 -> device slices 2 and 3 of each layer -> back into dst.
+  TF_ASSERT_OK_AND_ASSIGN(auto h2d, manager.H2d({1}, {src}, kRank));
+  ABSL_ASSERT_OK(h2d.Await());
+  TF_ASSERT_OK_AND_ASSIGN(auto d2h, manager.D2h({1}, {dst}, kRank));
+  ABSL_ASSERT_OK(d2h.Await());
+  EXPECT_EQ(
+      std::memcmp(src[kRank].data_ptr<uint8_t>(),
+                  dst[kRank].data_ptr<uint8_t>(), kNumLayers * page_nbytes),
+      0);
+  EXPECT_TRUE(all_bytes_are(dst[0], 0)) << "D2H wrote outside rank " << kRank;
+
+  // The mapping pins the page size: a one-slice object is refused, rather
+  // than block 1 quietly meaning slice 1 instead of page 1.
+  const absl::Status slice_sized = manager.H2d({1}, {first}, kRank).status();
+  EXPECT_EQ(slice_sized.code(), absl::StatusCode::kInvalidArgument)
+      << slice_sized;
+  EXPECT_TRUE(absl::StrContains(slice_sized.message(), "does not match"))
+      << slice_sized;
+
+  // 4 pages per layer, so page 4 is past the end.
+  const absl::Status past_end = manager.H2d({4}, {src}, kRank).status();
+  EXPECT_EQ(past_end.code(), absl::StatusCode::kOutOfRange) << past_end;
+
+  // Re-map with the default one-slice page and read slices back one at a time
+  // to check where page 1 landed in each layer.
+  manager.ResetSharedMemoryMappedForTest();
+  manager.SetSharedMemoryMappedForTest(reinterpret_cast<uintptr_t>(pool),
+                                       pool_size);
+  TF_ASSERT_OK_AND_ASSIGN(auto readback,
+                          manager.D2h({2, 3}, {first, second}, kRank));
+  ABSL_ASSERT_OK(readback.Await());
+  for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+    EXPECT_TRUE(all_bytes_are(first[kRank][layer], kPattern[layer][0]))
+        << "layer " << layer << ", slice 2";
+    EXPECT_TRUE(all_bytes_are(second[kRank][layer], kPattern[layer][1]))
+        << "layer " << layer << ", slice 3";
+  }
+
+  // Slice 1, just below page 1, was never written in any layer.
+  TF_ASSERT_OK_AND_ASSIGN(auto below, manager.D2h({1}, {first}, kRank));
+  ABSL_ASSERT_OK(below.Await());
+  for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+    EXPECT_TRUE(all_bytes_are(first[kRank][layer], 0))
+        << "layer " << layer << ", slice 1";
+  }
 
   manager.ResetSharedMemoryMappedForTest();
   free(pool);

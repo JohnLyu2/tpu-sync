@@ -39,6 +39,7 @@
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/plugin/xla_cpu/cpu_client_options.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -2041,6 +2042,77 @@ TEST_F(WeightSynchronizerTest, DeferredReceiverKeepsHostBufferLogical) {
   }
 }
 
+// A block push whose streams carry shard subsets must not trigger the auto
+// H2D (which copies every shard) until every shard of the uuid has landed.
+TEST_F(WeightSynchronizerTest, AutoH2dWaitsForEveryShardOfBlockPush) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
+  std::unique_ptr<xla::PjRtClient> client = *std::move(client_status_or);
+  absl::StatusOr<xla::PjRtMemorySpace*> memory_space =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_TRUE(memory_space.ok()) << memory_space.status().message();
+
+  constexpr int kShards = 2;
+  std::vector<float> placeholder(64, 0.0f);
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::vector<raiden::RaidenBufferHandle> shard_handles;
+  for (int sh = 0; sh < kShards; ++sh) {
+    absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffer =
+        client->BufferFromHostBuffer(
+            placeholder.data(), xla::PrimitiveType::F32, {8, 8},
+            /*byte_strides=*/std::nullopt,
+            xla::PjRtClient::HostBufferSemantics::
+                kImmutableUntilTransferCompletes,
+            /*on_done_with_host_buffer=*/nullptr, *memory_space,
+            /*device_layout=*/nullptr);
+    ASSERT_TRUE(pjrt_buffer.ok()) << pjrt_buffer.status().message();
+    absl::StatusOr<raiden::RaidenBufferHandle> handle =
+        raiden::RaidenBufferHandle::Acquire(pjrt_buffer->get());
+    ASSERT_TRUE(handle.ok()) << handle.status().message();
+    handle->shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
+    pjrt_buffers.push_back(*std::move(pjrt_buffer));
+    shard_handles.push_back(*handle);
+  }
+  std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {
+      shard_handles};
+
+  auto ws = std::make_unique<WeightSynchronizerBase>(
+      buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/true);
+  for (int sh = 0; sh < kShards; ++sh) {
+    float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, sh));
+    for (int i = 0; i < 64; ++i) {
+      host[i] = static_cast<float>(i);
+    }
+  }
+
+  constexpr uint64_t kUuid = 781;
+  auto device_value_at = [&](int sh, int idx) -> float {
+    std::vector<float> dev_raw(64, -1.0f);
+    absl::Status copied =
+        shard_handles[sh]
+            .CopyRawDeviceToHost(dev_raw.data(), 0, 64 * sizeof(float))
+            .Await();
+    EXPECT_OK(copied);
+    return dev_raw[idx];
+  };
+
+  // Shard 0 alone: H2D is deferred, device still holds the placeholder.
+  ASSERT_OK(
+      ws->OnBlockShardsReceived(/*block_ids=*/{0}, /*shard_ids=*/{0}, kUuid));
+  EXPECT_EQ(device_value_at(0, 4), 0.0f);
+  EXPECT_EQ(device_value_at(1, 4), 0.0f);
+
+  // Shard 1 completes the uuid: H2D runs for every shard.
+  ASSERT_OK(
+      ws->OnBlockShardsReceived(/*block_ids=*/{0}, /*shard_ids=*/{1}, kUuid));
+  EXPECT_EQ(device_value_at(0, 4), 8.0f);
+  EXPECT_EQ(device_value_at(1, 4), 8.0f);
+}
+
 TEST_F(WeightSynchronizerTest, DrainPendingH2dDrainsActivePendingFutures) {
   auto ws = std::make_unique<WeightSynchronizerBase>(
       /*num_layers=*/2, /*num_shards=*/1, slice_byte_size_,
@@ -2173,6 +2245,103 @@ TEST_F(WeightSynchronizerTest, H2dWaitsForArmedInPlaceTiling) {
   ws->ForgetPushProgress(kFirstUuid);
 }
 
+// SHUTDOWN runs DrainPendingH2d() on every receiver. A receiver that was armed
+// with an in-place tiling mode but whose data never arrived (sender died,
+// partial transfer) must be released by the drain: H2d() fails instead of
+// blocking on the layer's readiness signal and WaitForTransferCompletion(uuid)
+// returns. Synthetic reproduction; no transport or controller involved.
+TEST_F(WeightSynchronizerTest, DrainPendingH2dReleasesArmedLayers) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
+  std::unique_ptr<xla::PjRtClient> client = *std::move(client_status_or);
+  absl::StatusOr<xla::PjRtMemorySpace*> memory_space =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_TRUE(memory_space.ok()) << memory_space.status().message();
+
+  for (bool auto_h2d : {true, false}) {
+    SCOPED_TRACE(absl::StrCat("auto_h2d=", auto_h2d));
+    std::vector<float> placeholder(64, 0.0f);
+    absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffer =
+        client->BufferFromHostBuffer(
+            placeholder.data(), xla::PrimitiveType::F32, {8, 8},
+            /*byte_strides=*/std::nullopt,
+            xla::PjRtClient::HostBufferSemantics::
+                kImmutableUntilTransferCompletes,
+            /*on_done_with_host_buffer=*/nullptr, *memory_space,
+            /*device_layout=*/nullptr);
+    ASSERT_TRUE(pjrt_buffer.ok()) << pjrt_buffer.status().message();
+    absl::StatusOr<raiden::RaidenBufferHandle> handle =
+        raiden::RaidenBufferHandle::Acquire(pjrt_buffer->get());
+    ASSERT_TRUE(handle.ok()) << handle.status().message();
+    handle->shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
+    std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
+
+    auto ws = std::make_unique<WeightSynchronizerBase>(
+        buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+        /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+        /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+
+    // The controller arms the receiver (START_TRANSFER with is_sender=false),
+    // but no chunk ever lands, so OnLayerDataReceived/OnDataReceived never run.
+    constexpr uint64_t kUuid = 883;
+    tpu_sync::rpc::StartTransferRequest req;
+    req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+    ws->StoreSkipTiling(kUuid, req);
+    ASSERT_OK(ws->RegisterExpectedLayerChunks(kUuid, {{0, 1}}));
+
+    // SHUTDOWN.
+    ws->DrainPendingH2d();
+
+    // What the benchmark client does next, each on its own thread so that a
+    // hang shows up as a failure instead of wedging the test.
+    absl::Notification wait_done;
+    absl::Status wait_status;
+    std::thread wait_caller([&] {
+      wait_status = ws->WaitForTransferCompletion(kUuid);
+      wait_done.Notify();
+    });
+    absl::Notification h2d_done;
+    absl::Status h2d_status;
+    std::thread h2d_caller([&] {
+      absl::StatusOr<raiden::PjRtCopyFuture> h2d_fut = ws->H2d(kUuid);
+      h2d_status = h2d_fut.ok() ? h2d_fut->Await() : h2d_fut.status();
+      h2d_done.Notify();
+    });
+
+    const bool wait_returned =
+        wait_done.WaitForNotificationWithTimeout(absl::Seconds(3));
+    const bool h2d_returned =
+        h2d_done.WaitForNotificationWithTimeout(absl::Seconds(3));
+    EXPECT_TRUE(wait_returned)
+        << "WaitForTransferCompletion(uuid) is still blocked 3s after "
+           "DrainPendingH2d()";
+    EXPECT_TRUE(h2d_returned)
+        << "H2d() is still blocked on the armed layer 3s after "
+           "DrainPendingH2d()";
+    if (wait_returned) {
+      EXPECT_OK(wait_status);
+    }
+    if (h2d_returned) {
+      EXPECT_EQ(h2d_status.code(), absl::StatusCode::kCancelled) << h2d_status;
+    }
+
+    // Unblock whatever the drain left behind so the threads can be joined.
+    if (!h2d_returned) {
+      ws->ForgetPushProgress(kUuid);  // Cancels the armed signal.
+    }
+    h2d_caller.join();
+    if (!wait_returned) {
+      // Pretend the missing layer arrived after all.
+      EXPECT_OK(ws->OnLayerDataReceived(/*layer_idx=*/0, kUuid));
+      EXPECT_OK(ws->OnDataReceived(kUuid));
+    }
+    wait_caller.join();
+    ws->ForgetPushProgress(kUuid);
+  }
+}
+
 // A relay receiver gets bytes that the seed already tiled: it must neither
 // tile them again on receive nor at H2D.
 TEST_F(WeightSynchronizerTest, PreTiledReceiverCopiesHostBufferAsIs) {
@@ -2268,6 +2437,70 @@ TEST_F(WeightSynchronizerTest, ReArmKeepsReceivedLayersReady) {
   ASSERT_TRUE(h2d_fut.ok()) << h2d_fut.status().message();
   ASSERT_OK(h2d_fut->Await());
   ws->ForgetPushProgress(kUuid);
+}
+
+// A seed relays each received shard as is once it has been tiled in place:
+// the whole device-size shard, whatever span the schedule entry names, and
+// only after the layer's in-place tiling has finished.
+TEST_F(WeightSynchronizerTest, PreTiledPushSendsWholeShardAfterTiling) {
+  constexpr size_t kSliceBytes = 16384;
+  auto ws_seed = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_relay = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  ASSERT_TRUE(ws_relay->local_port().has_value());
+  const std::string relay_peer =
+      absl::StrCat("localhost:", *ws_relay->local_port());
+
+  uint8_t* seed_host = ws_seed->GetHostPointer(0, 0);
+  uint8_t* relay_host = ws_relay->GetHostPointer(0, 0);
+  ASSERT_NE(seed_host, nullptr);
+  ASSERT_NE(relay_host, nullptr);
+  std::memset(seed_host, 0xAB, kSliceBytes);
+  std::memset(relay_host, 0x00, kSliceBytes);
+
+  constexpr uint64_t kUuid = 884;
+  // The seed is still receiving (and tiling) layer 0 from the trainer.
+  tpu_sync::rpc::StartTransferRequest recv_req;
+  recv_req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  ws_seed->StoreSkipTiling(kUuid, recv_req);
+  ASSERT_OK(ws_seed->RegisterExpectedLayerChunks(kUuid, {{0, 1}}));
+
+  tpu_sync::rpc::StartTransferRequest push_req;
+  push_req.set_is_sender(true);
+  push_req.set_skip_d2h(true);
+  push_req.set_uuid(kUuid);
+  push_req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  auto* entry = (*push_req.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(relay_peer);
+  entry->set_dst_shard_idx(0);
+  // A logical span shorter than the shard.
+  entry->set_src_offset_bytes(64);
+  entry->set_dst_offset_bytes(64);
+  entry->set_size_bytes(128);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  ASSERT_OK(ws_relay->RegisterExpectedChunks(kUuid, 1));
+  absl::Notification push_done;
+  absl::Status push_status;
+  std::thread pusher([&] {
+    push_status = ws_seed->PushWeightsResharded(push_req);
+    push_done.Notify();
+  });
+  EXPECT_FALSE(push_done.WaitForNotificationWithTimeout(absl::Seconds(1)));
+
+  ASSERT_OK(ws_seed->OnLayerDataReceived(/*layer_idx=*/0, kUuid));
+  pusher.join();
+  ASSERT_OK(push_status);
+  ASSERT_OK(ws_relay->WaitForTransferCompletion(kUuid));
+  for (size_t i = 0; i < kSliceBytes; ++i) {
+    ASSERT_EQ(relay_host[i], 0xAB) << "Mismatch at byte " << i;
+  }
+  ws_seed->ForgetPushProgress(kUuid);
+  ws_relay->ForgetPushProgress(kUuid);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
@@ -2505,6 +2738,59 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedLocalShardIndicesFallback) {
       EXPECT_EQ(dst_ptr[b], fill_bytes[s])
           << "Mismatch at slot " << s << " byte " << b;
     }
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedLocalKeysWithoutExplicitLocalShardIndices) {
+  // One shard per process with a non-zero global index and no explicit local
+  // indices (empty local_shard_indices_ == identity). A schedule keyed by the
+  // local index 0 must still be resolved rather than looked up by global key.
+  const size_t num_layers = 1;
+  const size_t num_shards = 1;
+  const size_t slice_byte_size = 256;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  ws_source->SetGlobalShardIndices({3});
+  ws_dest->SetGlobalShardIndices({3});
+
+  uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
+  ASSERT_NE(src_ptr, nullptr);
+  ASSERT_NE(dst_ptr, nullptr);
+  std::memset(src_ptr, 0x5A, slice_byte_size);
+  std::memset(dst_ptr, 0x00, slice_byte_size);
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(54324);
+  auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(slice_byte_size);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(request));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  const uint8_t* out = ws_dest->GetHostBufferPtr(0, 0);
+  ASSERT_NE(out, nullptr);
+  for (size_t b = 0; b < slice_byte_size; ++b) {
+    EXPECT_EQ(out[b], 0x5A) << "Mismatch at byte " << b;
   }
 }
 

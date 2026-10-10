@@ -60,6 +60,7 @@ namespace {
 
 using ::absl_testing::StatusIs;
 using ::testing::Contains;
+using ::testing::ElementsAre;
 using ::testing::UnorderedElementsAre;
 
 class KVCacheStoreServiceTest : public ::testing::Test {
@@ -170,6 +171,10 @@ TEST_F(KVCacheStoreServiceTest, Fetch5StepWorkflowSuccess) {
   client_ep.set_worker_id("dst_worker_0");
   auto* ep = client_ep.add_endpoints();
   ep->set_endpoint(test_worker_server_->server_address);
+  auto* pool_addrs = ep->add_layer_host_addrs();
+  pool_addrs->add_host_base_addrs(0x100000);
+  pool_addrs->set_block_stride_bytes(4096);
+  pool_addrs->set_num_blocks(256);
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids, client_id,
@@ -178,6 +183,15 @@ TEST_F(KVCacheStoreServiceTest, Fetch5StepWorkflowSuccess) {
   EXPECT_THAT(response.done_block_hashes(),
               UnorderedElementsAre("block_hash_1", "block_hash_2"));
   EXPECT_EQ(response.failed_block_hashes_size(), 0);
+  ASSERT_EQ(dst_transfer_mock_->last_write_descriptors.size(), 1u);
+  ASSERT_EQ(
+      dst_transfer_mock_->last_write_descriptors[0].layer_host_addrs.size(),
+      1u);
+  const auto& got_addrs =
+      dst_transfer_mock_->last_write_descriptors[0].layer_host_addrs[0];
+  EXPECT_THAT(got_addrs.host_base_addrs(), ElementsAre(0x100000));
+  EXPECT_EQ(got_addrs.block_stride_bytes(), 4096);
+  EXPECT_EQ(got_addrs.num_blocks(), 256);
 }
 
 TEST_F(KVCacheStoreServiceTest, FetchCrossNodeMissingEndpointsFails) {

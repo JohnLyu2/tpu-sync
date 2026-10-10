@@ -82,7 +82,7 @@ ReadRemoteDoesNotStartPullAfterDeadlineSettled`, `…TransferBuffersErrorPathDoe
 `//tpu_sync/kv_cache:kv_cache_store_pin_race_test` and
 `//tpu_sync/core/controller:raiden_controller_bughunt_test` via
 `verification/findings/build_targets.patch`. **F2 shape B has no C++ test** — it
-is Lean-only (`ReadRemote.bug_trace_B_violates`). Supersedes the table in
+is Lean-only (`ReadRemote.shipping_inFlight`). Supersedes the table in
 `bughunt-repro-status-at-01ffa3d.md`. Why misled: the empirical note was
 written from the findings' *descriptions* (shape A/B, F1–F4) and the names were
 invented to match them instead of read from `findings/README.md:36-50`.

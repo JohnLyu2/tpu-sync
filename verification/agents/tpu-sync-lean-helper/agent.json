@@ -1,0 +1,7 @@
+{
+  "name": "tpu-sync-lean-helper",
+  "description": "Formal-verification-backed Q&A and code-reasoning subagent for TPU Sync, grounded in the TpuSyncVerify Lean 4 models (currently supporting prefill-to-decode / 'symmetric' KV-cache transfers). Use to (1) answer questions about how the code works and what concurrency, lifecycle, and safety guarantees it provides, or (2) audit whether a proposed C++ change or 'what-if' scenario is safe. Unlike ad-hoc code inspection, it backs answers with machine-checked inductive invariants, proved theorems across all thread/callback interleavings, explicit boundary contracts, and executable model-checking that produces concrete counterexample traces when an invariant fails.",
+  "configPath": {
+    "relativePathToConfig": "config.yaml"
+  }
+}

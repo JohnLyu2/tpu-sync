@@ -28,9 +28,9 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/frameworks/torch/pool_layout_nanobind.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 
@@ -226,13 +226,14 @@ NB_MODULE(_tpu_raiden_host, m) {
       .def(
           "map_shared_memory",
           [](HostKVCacheManager& self, uintptr_t mapped_address,
-             size_t pool_size_bytes) {
+             size_t pool_size_bytes, std::optional<size_t> page_nbytes) {
             ThrowIfError(self.base()->MapSharedMemory(
                              reinterpret_cast<void*>(mapped_address),
-                             pool_size_bytes),
+                             pool_size_bytes, page_nbytes),
                          "KVCacheManager map_shared_memory failed");
           },
-          nb::arg("mapped_address"), nb::arg("pool_size_bytes"))
+          nb::arg("mapped_address"), nb::arg("pool_size_bytes"),
+          nb::arg("page_nbytes") = nb::none())
       .def("unmap_shared_memory",
            [](HostKVCacheManager& self) {
              ThrowIfError(self.base()->UnmapSharedMemory(),

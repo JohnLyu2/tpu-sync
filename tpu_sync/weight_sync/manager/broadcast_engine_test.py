@@ -781,8 +781,9 @@ class BroadcastEngineTest(absltest.TestCase):
         train_0: {100: {0: [(0, 0, 0, 512, 0, 0, 512, 512, 1)]}},
         train_1: {100: {0: [(0, 512, 0, 512, 0, 0, 512, 512, 1)]}},
     }
-    # Whole-block relay specification: (min_offset=0, block_size=1024, dst_block_id=0)
-    canonical_relay = {100: {0: [(0, 1024, 0)]}}
+    # Relay spans (min_offset, block_size, dst_block_id); relays collapse them
+    # into one whole-shard push.
+    canonical_relay = {100: {0: [(0, 512, 0), (512, 512, 0)]}}
 
     stage_group = controller_types.StageBroadcastGroup(
         pool_group=0,
@@ -830,6 +831,11 @@ class BroadcastEngineTest(absltest.TestCase):
       ]
       self.assertLen(seed_receiver_calls, 1)
       self.assertEqual(seed_receiver_calls[0].expected_block_count, 2)
+      # Seeds tile their host buffers in place as layers arrive.
+      self.assertEqual(
+          seed_receiver_calls[0].host_tiling_mode,
+          raiden_service_pb2.HOST_TILING_MODE_ON_ARRIVAL,
+      )
 
     # 2. Verify Sampler -> Sampler Relay transfers
     # With n_seed=2 and 4 samplers:
@@ -841,9 +847,16 @@ class BroadcastEngineTest(absltest.TestCase):
     ]
     self.assertNotEmpty(relay_sender_calls)
     for relay_plan in relay_sender_calls:
+      # Relays forward the seeds' tiled shards as is.
+      self.assertEqual(
+          relay_plan.host_tiling_mode,
+          raiden_service_pb2.HOST_TILING_MODE_PRE_TILED,
+      )
+      self.assertEqual(relay_plan.expected_layer_chunk_counts, {0: 1})
       s_u = relay_plan.src_units[0]
       sched = relay_plan.shard_push_schedules[s_u]
       for s_idx, entries in sched.items():
+        self.assertLen(entries, 1)
         for entry in entries:
           (
               dst_peer,
@@ -876,6 +889,20 @@ class BroadcastEngineTest(absltest.TestCase):
         if target_id == plan.dst_units[0] and target_id in dst_units
     }
     self.assertEqual(receivers, set(dst_units))
+
+    # 4. Relay receivers get pre-tiled data and do not tile it again.
+    for leaf in (dst_units[2], dst_units[3]):
+      leaf_receiver_calls = [
+          plan
+          for target_id, plan in rpc_client.invocations
+          if target_id == leaf and plan.dst_units[0] == leaf
+      ]
+      self.assertNotEmpty(leaf_receiver_calls)
+      for plan in leaf_receiver_calls:
+        self.assertEqual(
+            plan.host_tiling_mode,
+            raiden_service_pb2.HOST_TILING_MODE_PRE_TILED,
+        )
 
   def test_all_source_binomial_tree_population_and_destinations(self) -> None:
     """Verifies population counts across rounds and round-grouped destination logging."""
@@ -969,7 +996,7 @@ class BroadcastEngineTest(absltest.TestCase):
     )
 
     receiver_to_sender = {}
-    for target_id, plan in rpc_client.invocations:
+    for _, plan in rpc_client.invocations:
       if plan.is_sender:
         receiver_to_sender[plan.dst_units[0]] = plan.src_units[0]
 
@@ -981,6 +1008,12 @@ class BroadcastEngineTest(absltest.TestCase):
     # Round 2: Newest first: dsts[2] -> dsts[3], dsts[1] -> dsts[4]
     self.assertEqual(receiver_to_sender[dsts[3]], dsts[2])
     self.assertEqual(receiver_to_sender[dsts[4]], dsts[1])
+
+    # The slice-list path never tiles host buffers in place.
+    for _, plan in rpc_client.invocations:
+      self.assertEqual(
+          plan.host_tiling_mode, raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED
+      )
 
   def test_stream_ordered_multi_chunk_dispatch(self) -> None:
     """Verifies (child_order, g_idx) stream ordering across 3 binomial rounds with M=3 chunks."""

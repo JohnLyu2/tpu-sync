@@ -129,11 +129,14 @@ class KVCacheManager:
         segments named by RAIDEN_SHM_KEY. The env var supplies the segment
         namespace; this flag supplies the per-manager decision. Managers whose
         host buffers are transient staging must leave it off.
-      backend_configs: Optional backend configurations (e.g persistent storage).
-        Pass the same BackendConfig objects given to the store's
-        secondary_backend_configs, with `parallelism.tp_rank` set to this
-        worker's rank (required) and `parallelism.tp_size` matching the store
-        (defaults to 1).
+      backend_configs: Optional backend configurations (e.g. persistent
+        storage). Pass the same BackendConfig objects given to the store's
+        secondary_backend_configs. The posix backend derives its storage
+        topology from `parallelism`: declare at least one axis (`tp`, `pcp`,
+        `pp`) with `<axis>_size`, using the same axes and sizes as the store,
+        and set `<axis>_rank` to this worker's rank in [0, size). Duplicate or
+        missing ranks cause wrong or missed recalls. An invalid config aborts
+        the process (LOG(FATAL)) at registration.
     """
     self._admission_summary = None
     impl = _torch_impl()
@@ -594,7 +597,11 @@ class KVCacheManager:
   # =========================================================================
 
   def experimental_map_shared_memory(
-      self, mapped_address: int, pool_size_bytes: int
+      self,
+      mapped_address: int,
+      pool_size_bytes: int,
+      *,
+      page_nbytes: Optional[int] = None,
   ) -> None:
     """[EXPERIMENTAL] Registers an existing whole-pool mapping for TPU DMA.
 
@@ -607,11 +614,24 @@ class KVCacheManager:
     At most one pool may be mapped at a time; mapping a different pool
     requires unmapping the current one first.
 
+    ``page_nbytes`` fixes how many bytes ``experimental_h2d`` and
+    ``experimental_d2h`` move per block per layer while this pool stays
+    mapped. Block ids count pages of this size: block ``b`` starts at byte
+    ``b * page_nbytes`` of each layer's device buffer. A page of ``k`` device
+    blocks lets a caller whose block spans ``k`` consecutive device blocks
+    move it with one block id.
+
     Args:
       mapped_address: Process-local virtual address of the shared pool.
       pool_size_bytes: Total byte length of the shared pool.
+      page_nbytes: Bytes per block per layer. Must be a positive multiple of
+        the device block size (the device bytes of one index along the KV
+        cache's leading dimension) and divide each layer's device buffer.
+        Every object tensor passed to ``experimental_h2d`` or
+        ``experimental_d2h`` must have it as its last dimension. Defaults to
+        one device block, which is checked the same way.
     """
-    self._impl.map_shared_memory(mapped_address, pool_size_bytes)
+    self._impl.map_shared_memory(mapped_address, pool_size_bytes, page_nbytes)
 
   def experimental_unmap_shared_memory(self) -> None:
     """[EXPERIMENTAL] Drains submitted copies and releases the registration.
@@ -646,15 +666,18 @@ class KVCacheManager:
     tensor must lie entirely inside it.
 
     Each object tensor is contiguous with a 1-byte dtype (e.g. ``uint8`` or
-    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``. Only the
+    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``, where
+    ``page_nbytes`` is the page size the pool was mapped with. Only the
     ``rank_id`` slice takes part: for layer ``l``, the ``page_nbytes`` bytes at
     ``tensor[rank_id, l]`` are filled from block ``block_ids[i]`` of layer
     ``l``'s device buffer, where ``i`` is that tensor's index.
 
     Args:
-      block_ids: Device block ids, one per object tensor. These are block
-        indices, not byte offsets. Must be unique and within
-        ``[0, num_blocks)``.
+      block_ids: Block ids, one per object tensor. Block ``b`` is the page at
+        byte ``b * page_nbytes`` of each layer's device buffer, so ids count
+        pages, not bytes. Must be unique and within
+        ``[0, layer_nbytes // page_nbytes)``, where ``layer_nbytes`` is the
+        size of one layer's device buffer.
       object_tensors: Caller-owned contiguous CPU tensors with a 1-byte dtype
         and shape ``[num_ranks, num_layers, page_nbytes]``, residing inside the
         mapped pool. One per entry of ``block_ids``.
@@ -684,15 +707,18 @@ class KVCacheManager:
     tensor must lie entirely inside it.
 
     Each object tensor is contiguous with a 1-byte dtype (e.g. ``uint8`` or
-    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``. Only the
+    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``, where
+    ``page_nbytes`` is the page size the pool was mapped with. Only the
     ``rank_id`` slice takes part: for layer ``l``, the ``page_nbytes`` bytes at
     ``tensor[rank_id, l]`` are written to block ``block_ids[i]`` of layer
     ``l``'s device buffer, where ``i`` is that tensor's index.
 
     Args:
-      block_ids: Device block ids, one per object tensor. These are block
-        indices, not byte offsets. Must be unique and within
-        ``[0, num_blocks)``.
+      block_ids: Block ids, one per object tensor. Block ``b`` is the page at
+        byte ``b * page_nbytes`` of each layer's device buffer, so ids count
+        pages, not bytes. Must be unique and within
+        ``[0, layer_nbytes // page_nbytes)``, where ``layer_nbytes`` is the
+        size of one layer's device buffer.
       object_tensors: Caller-owned contiguous CPU tensors with a 1-byte dtype
         and shape ``[num_ranks, num_layers, page_nbytes]``, residing inside the
         mapped pool. One per entry of ``block_ids``.

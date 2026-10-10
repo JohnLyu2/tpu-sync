@@ -55,6 +55,21 @@ struct PoolPushProgressSpec {
   size_t expected_pools = 0;
 };
 
+// Placement of one shard of a delegate's buffers. Descriptive only: the wire
+// (chunk headers, shard masks) keeps addressing shards by `local_index`.
+struct ShardInfo {
+  // Position of the shard within this delegate, i.e. the `shard_idx` passed to
+  // GetHostPointer() and carried in chunk headers.
+  int local_index = 0;
+  // Index of the shard in the full sharding of the tensor across every
+  // manager and host (e.g. its mesh position), or -1 when unknown. Not
+  // necessarily `rank * num_shards + local_index`; only equal to that under a
+  // uniform split.
+  int64_t global_index = -1;
+  // NUMA node of the device backing the shard, or -1 when unknown.
+  int numa_node = -1;
+};
+
 // Delegate interface for BlockTransport inheriting raw memory primitives.
 class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
  public:
@@ -97,6 +112,13 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
 
   // Returns the active node ID (rank) of the worker.
   virtual int64_t node_id() const { return -1; }
+
+  // Placement of each local shard, in `local_index` order, with
+  // `size() == num_shards()` when known. Descriptive only (NIC selection,
+  // endpoint advertisement); it never changes how the wire addresses shards.
+  // The default reports nothing, so callers must fall back to `num_shards()`
+  // with unknown global index and NUMA node.
+  virtual absl::Span<const ShardInfo> shards() const { return {}; }
 
   // Returns the list of contiguous chunks that constitute a block range
   // for a specific transaction (identified by uuid).
@@ -160,8 +182,16 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return absl::OkStatus();
   }
 
-  virtual absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
-                                        uint64_t uuid = 0) {
+  // Fired once per incoming push stream after its payload for |block_ids| has
+  // landed in host memory. |shard_ids| is the set of shards that stream
+  // carried: every shard for an unrouted push, or one route's subset for a
+  // shard-routed push, in which case the same |block_ids| are reported again
+  // by the streams carrying the remaining shards. A delegate that needs
+  // "all shards of a block are present" must accumulate |shard_ids| across
+  // calls; the transport does not merge streams.
+  virtual absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
+                                             absl::Span<const int> shard_ids,
+                                             uint64_t uuid = 0) {
     return OnDataReceived();
   }
 

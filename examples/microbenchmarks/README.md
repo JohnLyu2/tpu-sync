@@ -12,6 +12,8 @@ part of the transfer path they isolate:
 | `jax_d2d_read_benchmark_runner.py` | Cross-node device-to-device pull: D2H + H2H + H2D end to end | yes, on both nodes | JAX |
 | `h2h_benchmark_runner.cc` | The middle hop only: host memory to host memory across the NIC | no | None (C++) |
 | `torch_d2d_read_benchmark_runner.py` | Cross-node device-to-device pull: D2H + H2H + H2D end to end | yes, on both nodes | PyTorch |
+| `jax_pathways_mcjax_weight_sync_benchmark_runner.py` | Multi-host weight sync: Pathways source -> McJAX destination, D2H + Net + H2D per stage | yes, on all hosts | JAX / Pathways |
+| `torch_weight_sync_benchmark_runner.py` | Cross-node weight sync: PyTorch source -> PyTorch destination (row -> column reshard), D2H + Net + H2D per stage | yes, on both nodes | PyTorch |
 
 Pick by what you are trying to localise. The C++ H2H runner gives the wire
 ceiling; the D2D read runner shows what the device path delivers against that

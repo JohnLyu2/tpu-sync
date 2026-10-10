@@ -40,6 +40,7 @@
 #include "xla/tsl/concurrency/ref_count.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/xla_compat.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace raiden {
 
@@ -291,7 +292,17 @@ struct RaidenBufferHandle {
 
 using BufferHoldAndAlias = RaidenBufferHandle;
 
+// Distinct NUMA nodes (in first-seen order) of the devices backing
+// |layer_buffers|. Devices whose NUMA node cannot be resolved are skipped.
 std::vector<int> DetectNumaNodes(
+    const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers);
+
+// Placement of each shard of |layer_buffers| (one entry per
+// `layer_buffers[0]` element, in shard order): `local_index` is the shard's
+// position, `numa_node` the NUMA node of its device (-1 when it cannot be
+// resolved) and `global_index` is left unknown (-1). Returns an empty vector
+// when |layer_buffers| is empty.
+std::vector<tpu_raiden::transport::ShardInfo> DetectShards(
     const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers);
 
 struct BufferHolder {

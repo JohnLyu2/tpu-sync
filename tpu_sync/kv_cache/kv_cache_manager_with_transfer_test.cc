@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -672,6 +672,50 @@ TEST(KVCacheManagerWithTransferTest, MultiIpOrchestratedTransfer) {
   }
   for (int i = 0; i < elements_per_slice; ++i) {
     EXPECT_EQ(read_back[elements_per_slice + i], static_cast<float>(i));
+  }
+}
+
+TEST(KVCacheManagerWithTransferTest, LocalDataEndpointsCarryLayerHostAddrs) {
+  TF_ASSERT_OK_AND_ASSIGN(TpuPjrtManager * pjrt_manager,
+                          TpuPjrtManager::GetDefault());
+
+  std::vector<int64_t> shape_dims = {2, 32, 32};
+  int64_t elements_per_slice = 32 * 32;
+  int64_t total_elements = 2 * elements_per_slice;
+  std::vector<float> host_data(total_elements, 1.0f);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<xla::PjRtBuffer> buffer,
+      pjrt_manager->BufferFromHost(host_data.data(), xla::F32, shape_dims));
+  ASSERT_THAT(buffer->GetReadyFuture().Await(), IsOk());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                          raiden::RaidenBufferHandle::Acquire(buffer.get()));
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
+      {std::move(handle)}};
+
+  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
+      layer_buffers,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/4,
+      /*unsafe_skip_buffer_lock=*/true,
+      /*parallelism=*/1,
+      /*host_allocator=*/nullptr,
+      /*node_id=*/0,
+      /*local_control_port=*/0,
+      /*max_blocks=*/2,
+      /*num_slots=*/2,
+      /*timeout_s=*/10.0);
+
+  auto data_eps = engine->get_local_data_endpoints();
+  ASSERT_FALSE(data_eps.empty());
+  for (const auto& ep : data_eps) {
+    ASSERT_EQ(ep.layer_host_addrs.size(), 1u);
+    EXPECT_EQ(ep.layer_host_addrs[0].host_base_addrs_size(), 1);
+    EXPECT_GT(ep.layer_host_addrs[0].host_base_addrs(0), 0u);
+    EXPECT_EQ(ep.layer_host_addrs[0].block_stride_bytes(),
+              engine->base()->slice_byte_size());
+    EXPECT_EQ(ep.layer_host_addrs[0].num_blocks(), 4u);
   }
 }
 

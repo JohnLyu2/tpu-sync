@@ -52,18 +52,29 @@ class FakePeregrineService final
  public:
   explicit FakePeregrineService(int server_fd) : server_fd_(server_fd) {}
 
-  grpc::Status ExchangePspKey(
+  grpc::Status ProcessUnary(
       grpc::ServerContext* context,
-      const ::peregrine::internal::control::PspKeyExchangeRequest* request,
-      ::peregrine::internal::control::PspKeyExchangeResponse* response)
-      override {
-    auto rx_key = RegisterPspPeerKey(server_fd_, request->client_spi(),
-                                     request->client_key());
+      const ::peregrine::internal::control::ReqMsg* request,
+      ::peregrine::internal::control::RespMsg* response) override {
+    if (!request->has_psp_tcp_req() || !request->psp_tcp_req().has_psp()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "Missing psp_tcp_req or psp");
+    }
+    const auto& psp_req = request->psp_tcp_req();
+    if (psp_req.peer_target().ip_port().empty() || !psp_req.psp().has_gen()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "Missing peer_target.ip_port or psp.gen");
+    }
+    auto rx_key =
+        RegisterPspPeerKey(server_fd_, psp_req.psp().spi(), psp_req.psp().key(),
+                           psp_req.peer_target().ip_port());
     if (!rx_key.ok()) {
       return grpc::Status(rx_key.status());
     }
-    response->set_server_spi(rx_key->spi);
-    response->set_server_key(rx_key->key);
+    auto* resp_psp = response->mutable_psp_tcp_resp()->mutable_psp();
+    resp_psp->set_spi(rx_key->spi);
+    resp_psp->set_gen(rx_key->gen);
+    resp_psp->set_key(rx_key->key);
     return grpc::Status::OK;
   }
 
@@ -78,12 +89,36 @@ TEST(TcpPspHelperTest, RegisterPspKey) {
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(server_fd, 0);
 
-  EXPECT_THAT(RegisterPspPeerKey(server_fd, 0x12345678, kValidKey),
-              IsOkAndHolds(Field(&PspPeerKey::spi, Ne(0))));
-  EXPECT_THAT(RegisterPspPeerKey(server_fd, 0, kValidKey),
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "127.0.0.1:12345"),
+      IsOkAndHolds(Field(&PspPeerKey::spi, Ne(0))));
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "[::1]:12345"),
+      IsOkAndHolds(Field(&PspPeerKey::spi, Ne(0))));
+  EXPECT_THAT(RegisterPspPeerKey(server_fd, 0, kValidKey, "127.0.0.1:12345"),
               StatusIs(absl::StatusCode::kInvalidArgument));
-  EXPECT_THAT(RegisterPspPeerKey(server_fd, 0x12345678, "short"),
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, "short", "127.0.0.1:12345"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, ""),
               StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "invalid"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "127.0.0.1:0"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "127.0.0.1:70000"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "127.0.0.1:abc"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "0.0.0.0:12345"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      RegisterPspPeerKey(server_fd, 0x12345678, kValidKey, "[::]:12345"),
+      StatusIs(absl::StatusCode::kInvalidArgument));
 
   ::close(server_fd);
 }

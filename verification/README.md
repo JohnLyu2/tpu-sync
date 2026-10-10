@@ -20,45 +20,41 @@ verification/
 │   │   └── Reshard/                         # Receive, Send, Pipeline, Coverage, PoolStaging,
 │   │                                        # Registry, Coordinator (Stages 1–4 of docs/transfer/reshard.md)
 │   └── Controller/ReadRemote.lean           # exhaustive check behind finding F2
-├── docs/                                    # correspondence tables, results, upstream re-checks, future work
+├── agents/tpu-sync-lean-helper/             # Lean-backed Q&A and code-reasoning subagent
+├── docs/                                    # prefill_decode.md (C++→Lean map, results), conventions, upstream_rechecks.md
 ├── findings/                                # bug-hunt write-up, repro tests, patches
-├── tools/repin_citations.py                 # moves file:line citations to a new upstream commit
+├── tools/                                   # repin_citations.py, run_lean.sh (stdin counterfactual runner)
 └── slides/                                  # Typst deck (prefill_decode.typ)
 ```
 
 ## Status
 
-All citations (models, `docs/`, `findings/`) are to tpu-sync `50b0774`
-(upstream `main` as merged into this fork on 2026-10-06).
+All citations (models, `docs/`, `findings/`) are to tpu-sync `1fa06d1`
+(upstream `main` as merged into this fork on 2026-10-10); `findings/filed_bugs.md`
+and `proposal.md` are frozen at the commit they name.
 
-| Model | Properties | State | Doc |
-|---|---|---|---|
-| `Transfer/Session` | settle protocol invariant (`Consistent`) | proved | [prefill_decode.md](docs/transfer/prefill_decode.md) |
-| `Transfer/PrefillDecode/Receive` | settle safety, no retired callback, staging integrity, prompt settle, readiness soundness, publication (counter form), no op leak / termination | proved; bounded search + mutants | same |
-| `Transfer/PrefillDecode/ReceivePoll` | audit of the poll-side `IsReadyToComplete` finish: the last callback finishes first (`reachable_callbackFinishes`), the poll only fires in the pre-callback window and never settles (`pollReady_window`, `pollReady_no_settle`), `OnBlocksReceived` never finishes (`netAccount_frame`); without the poll every property and settlement are kept (`noPoll_safe`, `noPoll_can_settle`) and the end-of-transfer metrics are always recorded on success (`noPoll_metrics_on_success`, violated with the poll: `trace_poll_skips_metrics`); zero layers is the one case that needs it (`noPoll_zero_layers_never_succeeds`) | proved; bounded search | same |
-| `Transfer/PrefillDecode/Send` | settle safety, drained, staging integrity, prompt settle, no underflow, publication (counter form), no op leak / termination | proved; bounded search + mutants | same |
-| `Transfer/PrefillDecode/Pipeline` | single-request **publication correctness**, **decode HBM safety** (`DecodeHbmSafe`, `decodeHbm_quiet`, `attention_safe`), **prefill HBM safety** (`PrefillHbmSafe`, `prefillHbm_quiet`), **staging safety** (`StagingSafe`, `prefillStaging_quiet`, `decodeStaging_quiet`), **no op leak / termination** (`NoOpLeak`, `reachable_can_settle`), and handoff (`PrefillReleased`, `HandedOff`, `handedOff_quiet`, `inv_can_handoff`); layer-indexed, so layers complete in any order at every stage | proved | same |
-| `Transfer/PrefillDecode/MultiRequest` | **system data correctness & attention safety across requests** (`system_data_correct`, `system_attention_safe`), **system progress across requests** (`system_progress`), proved over concurrent/overlapped requests (`reqs : List Pipeline`) with per-buffer read-after-release and write-after-release (`wroteReleased`) checks | proved | same |
-| `Transfer/PrefillDecode/PipelineChecks` | concrete `decide` traces (normal, out-of-order layers, overlapped & recycled requests), `#guard` bounded searches, and mutants | checked | same |
-| `Transfer/PrefillDecode/PeerIsolation` | cross-peer fault isolation: a decode consumer pulling from a `sick` and a `healthy` prefill peer that share `StagingBlockAllocator` slots and the `push_pool_`. Under the shipping unbounded-per-peer admission the sick peer pins every slot and healthy reads are *rejected* (`trace_sick_peer_starves_staging_slots`); on the TCP control plane a full pool blocks the healthy handshake (`tcp_healthy_blocked_when_pool_full`), on gRPC it completes (`grpc_healthy_can_complete`); a per-peer quota admits the healthy peer (`reachable_quota_admits_healthy`) | proved; `decide` traces, bounded search | same |
-| `Transfer/PrefillDecode/UuidTable` | manager UUID tables (`active_recv_sessions_`, `send_sessions_`) and the drain-before-reuse discipline: a live session is never displaced by a same-uuid retry (`active_recv_preserved`, `active_send_preserved`), per-table safety (`reachable_recv_safe`, `reachable_send_safe`) | proved; bounded search + mutants | same |
-| `Transfer/PrefillDecode/BlockOrdering` | within-layer block refinement of `Pipeline` (discharges its A1): block-index gather and dual-permutation `BuildLoadCopyPlan`, coalesced DMA runs equal element-wise copies on every memory (`execCoalesced_buildCoalescedSpec`), subset/uniqueness validation, custom host staging; `BlockPipeline.step_pipe` couples each block step to `Pipeline.step`, `BlockPipeline.reachable_safe` | proved; `decide` traces + mutants | same |
-| `Transfer/Reshard/Receive` | `ReshardReceiveSession` on `Session.Lifecycle`: settle safety, no retired callback, `PoolStagingLease` integrity, deferred plan unregistration (`PlanIntegrity`), prompt settle, **rank-ordered pool H2D waves** (`RankWaveOrder`, `rankWaveOrder_iff`), readiness soundness, publication, no op leak / termination (`reachable_can_settle`), `IsReadyToComplete` poll-finish redundancy (`reachable_pollReady_disabled`), shipping vs. `finishOnError` `end_incoming_push` policy (`trace_r1_failed_incoming_push`) | proved; `decide` traces, bounded search + mutants | [reshard.md](docs/transfer/reshard.md) |
-| `Transfer/Reshard/Send` | `ReshardSendSession` + `CountPoolReshardSendSlots` on `Session.Lifecycle`: settle safety, no retired callback, `PoolStagingLease` integrity, prompt settle, active-or-draining (`ActiveOrDraining`), plan unregistration (`UnregisterPolicy.shipping` vs. `onSettle`, `reachable_onSettle_plan_iff_done`), multi-pool multi-peer publication, no op leak / termination (`reachable_can_settle`) | proved; `decide` traces, bounded search + mutants | same |
-| `Transfer/Reshard/Pipeline` | composed end-to-end reshard pipeline (`Send` + `Recv` + per-pool transport stream counters + 5 explicit memories + aliased-page `writePoolHbm` + Arm-then-Dispatch barrier): **publication & aliased-page correctness** (`PublicationCorrect`, `AliasedPageCorrect`, `reachable_safe`, `reachable_unarmed_safe`), **destination & source HBM safety** (`DstHbmSafe`, `dstHbm_quiet`, `attention_safe`, `SrcHbmSafe`, `srcHbm_quiet`), **staging safety** (`StagingSafe`, `srcStaging_quiet`, `dstStaging_quiet`), **stream accounting & arming** (`StreamAccountingSafe`, `NoUnarmedPush`), **no op leak / termination** (`NoOpLeak`, `reachable_can_settle`, `reachable_unarmed_can_settle`) | proved; `decide` traces, bounded search + mutants | same |
-| `Transfer/Reshard/Coverage` | sub-block byte-interval coverage & multi-sender push-stream accounting refinement of `Reshard/Pipeline`: **multi-sender stream conservation** (`stream_count_matches`, `senderStreams_pos_iff`), **contiguous partition coverage & disjointness** (`checkContiguous_covers`, `checkContiguous_head_disjoint`, `writeInterval_comm`), **permutation-invariant block reconstruction** (`partition_reconstructs_perm`, `partition_reconstructs_block`), and **refinement coupling** (`CoveragePipeline.step_pipe`, `CoveragePipeline.reachable_safe`) | proved; `decide` traces + mutants | same |
-| `Transfer/Reshard/PoolStaging` | bounded `PoolStagingStorage` arena & per-UUID page-lease lifecycle: **idempotent per-UUID re-acquisition** (`acquireLease_idempotent`, `acquireLease_resolves_all`), **slot conservation & cross-UUID disjointness** (`allocateMissing_slot_sum`, `no_slot_aliasing_between_distinct_uuids`, `acquireLease_preserves_other_resolve`, `releaseLease_preserves_other_resolve`), and **receive registration R5 analysis** (`trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot` under `.shipping`, `reachable_reserveBeforeLease_safe` under `.reserveBeforeLease`) | proved; `decide` traces (`pool_staging_test.cc` parity) + mutants | same |
-| `Transfer/Reshard/Registry` | `RequestBlockRegistry` generation lifecycle (`Register`, multi-owner `LookupAndClaim`, `AbandonClaim`, `Complete` full-set voting, `CancelIfUnclaimed` tombstone): **inductive safety** (`reachable_safe`: `ClaimOwnersConsistent`, `TombstoneClean`, `RetiredClean`, `PartialVotesNotAllVoted`), **tombstone & claim exclusivity** (`tombstone_blocks_register_and_claim`, `claimed_blocks_register_and_cancel`), **multi-owner claim survival** (`abandonClaim_preserves_when_other_owner_present`), **full-set voting retirement** (`complete_retires_iff_all_claimed_voted`), and **Observation R7** (`trace_r7_single_stage_votes_retire_multi_owner_claim`) | proved; `decide` traces + mutants | same |
-| `Transfer/Reshard/Coordinator` | two-stage `ReshardCoordinator::ExecutePoolReshard` (`PoolReshardRegisterRecv` arm barrier + `PoolReshardSend` dispatch barrier) composed with `RequestBlockRegistry`: **universal protocol invariants** (`reachable_coord_inv`, `no_push_before_all_armed`, `claimed_while_arming`), **Risk R2a & R2b counterexamples** under `.shipping` (`trace_r2a_partial_arm_orphans_armed_receiver`, `trace_r2b_dispatch_failure_orphans_receivers_and_claim`), and **hardened cleanup guarantee** (`reachable_disarmAndAbandon_no_orphans` under `.disarmAndAbandonOnFailure`) | proved; `decide` / `rfl` traces + mutants | same |
-| `Controller/ReadRemote` | `NoWriteAfterRelease` | shipping code: counterexamples (shapes A, B); deferred-settle fix: safe by exhaustive search | [read_remote.md](docs/controller/read_remote.md) |
+| Model | Proved | Doc |
+|---|---|---|
+| `Transfer/Session` | settle-protocol invariant `Lifecycle.Consistent` | [prefill_decode.md](docs/transfer/prefill_decode.md) |
+| `PrefillDecode/Receive`, `Send` | per-session settle safety, staging integrity, counter conservation, readiness soundness, publication (counter form), no op leak; bounded search + mutants | same |
+| `PrefillDecode/ReceivePoll` | what the poll-side `IsReadyToComplete` finish contributes; without it every property holds and metrics are always recorded | same |
+| `PrefillDecode/Pipeline`, `BlockOrdering` | single-request publication correctness, decode/prefill HBM and staging safety, handoff, termination; refined to block level (gather, dual-permutation `BuildLoadCopyPlan`, DMA coalescing) | same |
+| `PrefillDecode/MultiRequest` | data correctness, attention safety and progress across concurrent/overlapped requests recycling the four buffers | same |
+| `PrefillDecode/PeerIsolation`, `UuidTable` | cross-peer fault isolation (staging slots, `push_pool_`, TCP vs gRPC; per-peer quota admits healthy peers); UUID drain-before-reuse | same |
+| `PrefillDecode/PipelineChecks` | `decide` traces, `#guard` searches, mutants | same |
+| `Reshard/Receive`, `Send` | `ReshardReceiveSession` and `ReshardSendSession` (`CountPoolReshardSendSlots`) on `Session.Lifecycle`: settle safety, `PoolStagingLease` & plan-registration lifecycle (`PlanIntegrity`), rank-ordered pool H2D waves (`RankWaveOrder`), multi-pool publication, termination, `IsReadyToComplete` redundancy (R4), `end_incoming_push` error policy (R1); `decide` traces, bounded search + mutants | [reshard.md](docs/transfer/reshard.md) |
+| `Reshard/Pipeline`, `Coverage` | end-to-end reshard pipeline (`Send` + `Recv` + per-pool transport streams + 5 memories + aliased-page `writePoolHbm` + arm-then-dispatch barrier): publication & aliased-page correctness, HBM/staging safety, stream accounting, termination; refined to sub-block byte-interval coverage, multi-sender stream conservation, and permutation-invariant block reconstruction | same |
+| `Reshard/PoolStaging` | bounded `PoolStagingStorage` arena & per-UUID page-lease lifecycle: idempotent re-acquisition, slot conservation, cross-UUID disjointness, duplicate-UUID registration race (R5: `.shipping` counterexample vs. `.reserveBeforeLease` fix) | same |
+| `Reshard/Registry`, `Coordinator` | `RequestBlockRegistry` generation lifecycle (multi-owner claims, full-set voting, tombstones, R7) composed with two-stage `ReshardCoordinator::ExecutePoolReshard` (arm + dispatch barriers, R2a/R2b orphan counterexamples under `.shipping` vs. `.disarmAndAbandonOnFailure` cleanup) | same |
+| `Controller/ReadRemote` | `NoWriteAfterRelease`: counterexamples on shipping code, deferred-settle fix safe by exhaustive search | [read_remote.md](docs/controller/read_remote.md) |
 
 Outcome so far: no data-correctness or safety bugs in the prefill-to-decode
-transfer path at `50b0774` (observations in the doc); one owner-acknowledged
+transfer path at `1fa06d1` (non-bug observations in [findings/](findings/README.md) §Observations); one owner-acknowledged
 availability gap on that path (F5, no per-peer staging admission at
 `StartRead`) confirmed with the owners' own parked test and fixed by
 `findings/per_peer_staging_admission.patch`; four confirmed defects in the
 controller / KV-cache-store path, written up in
-[findings/](findings/README.md). None fixed upstream as of `50b0774`.
+[findings/](findings/README.md). F4 was fixed upstream in `72255dd`; the others are open as of `1fa06d1`.
 
 ## Building
 
@@ -93,4 +89,4 @@ backticked ranges after a comma (the script does not follow either). Update the
 commit sentence in each module preamble, in this file, in `docs/*/*.md` and in
 `findings/README.md` / `findings/filed_bugs.md`; re-run `git apply --check` on
 the three patches in `findings/`; run `lake build`; add a row to
-[prefill_decode.md](docs/transfer/prefill_decode.md) §"Upstream re-checks".
+[docs/upstream_rechecks.md](docs/upstream_rechecks.md).

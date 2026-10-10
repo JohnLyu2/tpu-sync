@@ -65,6 +65,19 @@ struct Request {
   size_t stride_count = 1;
   size_t src_stride_bytes = 0;
 
+  // Block push streams only (socket_opcode 1/6); identical across the
+  // requests of one Post(). Both are wire-only: they go into the chunk header
+  // and do not change how the adapter schedules its `parallelism` streams.
+  //
+  // Bitmask of shard indices carried by these streams (bit `i` = shard `i`);
+  // 0 = legacy, every shard. Sent as `ChunkHeader::buffer_id` so the receiver
+  // iterates the same shard subset.
+  uint16_t shard_mask = 0;
+  // Total number of streams the receiver should expect for this push across
+  // every Post() that contributes to it (one per shard group); 0 = this
+  // Post()'s `parallelism`. Sent as `ChunkHeader::reserved`.
+  int total_streams = 0;
+
   BlockReceivedCallback on_block_received = nullptr;
 };
 

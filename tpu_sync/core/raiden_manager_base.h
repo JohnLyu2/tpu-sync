@@ -21,14 +21,19 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
+#include "xla/future.h"
+#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tpu_utils.h"
@@ -45,12 +50,21 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   using LayerInfoBase = ::tpu_raiden::LayerInfoBase;
   using StagingArena = ::tpu_raiden::StagingArena;
 
+  // |numa_nodes| lists the distinct NUMA nodes of the incoming buffers (the
+  // first one becomes `assigned_numa_node()`). |shards|, when non-empty,
+  // describes every local shard (one entry per shard, in shard order; see
+  // `transport::ShardInfo`, `raiden::DetectShards()`), and its NUMA nodes
+  // drive per-shard NIC selection (`local_ips()` then spans the data NICs of
+  // every shard's NUMA node, see `local_ips_for_shard()` /
+  // `shards_for_local_ip()`). When empty, every shard is attributed to
+  // `assigned_numa_node()` and NIC selection is the single-node behaviour.
   RaidenManagerBase(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<std::string> bind_ip = std::nullopt,
       std::vector<int> numa_nodes = {},
-      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses());
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
+      std::vector<transport::ShardInfo> shards = {});
 
   ~RaidenManagerBase() override;
 
@@ -92,6 +106,13 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
                                 const uint8_t* data_ptr, size_t size_bytes,
                                 uint64_t uuid = 0, size_t layer_idx = 0);
 
+  // Synchronously pulls a contiguous byte range from |peer|'s |src_shard_idx|
+  // into this host's |dst_shard_idx| for |buffer_id| (layer index).
+  absl::Status PullBuffer(absl::string_view peer, size_t buffer_id,
+                          size_t src_shard_idx, size_t src_offset_bytes,
+                          size_t dst_shard_idx, size_t dst_offset_bytes,
+                          size_t size_bytes);
+
   absl::Status PushWeightsChunks(
       const std::vector<transport::BufferPushTask>& tasks, int parallelism,
       uint64_t uuid);
@@ -115,6 +136,30 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   virtual std::string local_ip() const;
   virtual std::vector<std::string> local_ips() const;
   std::optional<int> assigned_numa_node() const { return assigned_numa_node_; }
+
+  // Placement of every local shard (`local_index` order, one entry per
+  // shard): the constructor's |shards|, or one entry per shard on
+  // `assigned_numa_node()` with unknown global index when none was supplied.
+  absl::Span<const transport::ShardInfo> shards() const override {
+    return shards_;
+  }
+  // NUMA node of the device backing |shard_idx|, or nullopt when unknown.
+  // Falls back to `assigned_numa_node()` when no per-shard map was supplied.
+  std::optional<int> shard_numa_node(size_t shard_idx) const;
+  // NUMA node of the NIC that owns local address |ip|, or nullopt when |ip| is
+  // not one of the host NICs handed to the constructor.
+  std::optional<int> numa_node_for_ip(absl::string_view ip) const;
+  // Subset of `local_ips()` whose NIC sits on the NUMA node of |shard_idx|.
+  // Returns all of `local_ips()` when the shard or the NICs have no NUMA
+  // information, so callers can always use the result as a peer list.
+  std::vector<std::string> local_ips_for_shard(size_t shard_idx) const;
+  // Shards to advertise on local address |ip|: those whose device sits on the
+  // NIC's NUMA node, plus every shard that no local IP is NUMA-local to (or
+  // whose NUMA node is unknown), so that the union over `local_ips()` always
+  // covers every shard. Returns every shard when |ip| is not a local address,
+  // when |ip| or the shards carry no NUMA information, or when nothing else
+  // would be selected.
+  std::vector<int64_t> shards_for_local_ip(absl::string_view ip) const;
 
   uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) override;
@@ -146,6 +191,11 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   size_t shard_factor_ = 1;
   int64_t major_dim_size_ = 0;
   std::optional<int> assigned_numa_node_ = std::nullopt;
+  // Placement of every local shard; always `num_shards_` entries.
+  std::vector<transport::ShardInfo> shards_;
+  // Local IP address -> NUMA node of the owning NIC, for every NIC handed to
+  // the constructor (not only the ones selected into `local_ips_`).
+  absl::flat_hash_map<std::string, int> ip_numa_nodes_;
   int local_port_cfg_ = 0;
   std::optional<std::string> bind_ip_cfg_ = std::nullopt;
   std::vector<std::string> local_ips_;
@@ -176,7 +226,55 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   absl::Status OnDataReceived(uint64_t uuid = 0) override {
     return absl::OkStatus();
   }
+
+  // Runs |fn| once per shard, concurrently, each as a task on |pool| pinned to
+  // that shard's NUMA node so host-side work on the shard's buffers touches
+  // local memory. Returns as soon as the tasks are scheduled; the returned
+  // future is the join of the futures returned by |fn|, indexed by shard, and
+  // fails with the first error. Shard tasks never block on those futures. |fn|
+  // outlives this call and is invoked concurrently, so it must own its state
+  // and be const-callable. |pool| must outlive the scheduled tasks.
+  template <typename T>
+  xla::Future<std::vector<T>> ForEachShardNumaLocal(
+      tpu_raiden::NumaThreadPool& pool,
+      absl::AnyInvocable<xla::Future<T>(size_t shard_idx) const> fn);
+  // Same, for |fn| without a result.
+  xla::Future<> ForEachShardNumaLocal(
+      tpu_raiden::NumaThreadPool& pool,
+      absl::AnyInvocable<xla::Future<>(size_t shard_idx) const> fn);
 };
+
+template <typename T>
+xla::Future<std::vector<T>> RaidenManagerBase::ForEachShardNumaLocal(
+    tpu_raiden::NumaThreadPool& pool,
+    absl::AnyInvocable<xla::Future<T>(size_t shard_idx) const> fn) {
+  std::shared_ptr<const absl::AnyInvocable<xla::Future<T>(size_t) const>>
+      shared_fn = std::make_shared<
+          const absl::AnyInvocable<xla::Future<T>(size_t) const>>(
+          std::move(fn));
+  std::vector<xla::Future<T>> shard_futures;
+  shard_futures.reserve(num_shards_);
+  // One task per shard, pinned to that shard's NUMA node. The task forwards
+  // the future returned by |fn| into the shard's promise without blocking on
+  // it.
+  for (size_t i = 0; i < num_shards_; ++i) {
+    auto [promise, future] = xla::MakePromise<T>();
+    shard_futures.push_back(std::move(future));
+    pool.Schedule(
+        shard_numa_node(i),
+        [shared_fn, i, promise = std::move(promise).ToShared()]() {
+          xla::Future<T> result = (*shared_fn)(i);
+          if (!result.IsValid()) {
+            promise->Set(absl::InternalError(
+                "ForEachShardNumaLocal: shard task returned no future"));
+            return;
+          }
+          std::move(result).OnReady(
+              [promise](const auto& value) { promise->Set(value); });
+        });
+  }
+  return xla::JoinFutures(absl::MakeSpan(shard_futures));
+}
 
 }  // namespace tpu_raiden
 

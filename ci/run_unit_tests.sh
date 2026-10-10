@@ -158,6 +158,12 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   echo "ERROR: no test targets selected from '${RAIDEN_TEST_SCOPE}'" >&2
   exit 1
 fi
+for target in "${TARGETS[@]}"; do
+  if [[ "${target}" == *torch* ]]; then
+    EXTRA_BAZEL_FLAGS+=" --nocheck_visibility"
+    break
+  fi
+done
 
 echo "=== Phase 1: Running Bazel CPU Unit Test Suite (${#TARGETS[@]} targets) ==="
 printf '  %s\n' "${TARGETS[@]}"

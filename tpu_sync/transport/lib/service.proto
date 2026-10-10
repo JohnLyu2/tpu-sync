@@ -18,16 +18,37 @@ package peregrine.internal.control;
 
 // Service for transport PSP control plane communication.
 service PeregrineService {
-  // Client sends its local RX SPI and key; server returns its RX SPI and key.
-  rpc ExchangePspKey(PspKeyExchangeRequest) returns (PspKeyExchangeResponse) {  }
+  // A generic unary rpc function to process Peregrine control messages.
+  rpc ProcessUnary(ReqMsg) returns (RespMsg) {  }
 }
 
-message PspKeyExchangeRequest {
-  uint32 client_spi = 1;
-  bytes client_key = 2;  // 16-byte raw AES session key
+message ReqMsg {
+  oneof msg {
+    PspTcpReq psp_tcp_req = 3;
+  }
 }
 
-message PspKeyExchangeResponse {
-  uint32 server_spi = 1;
-  bytes server_key = 2;  // 16-byte raw AES session key
+message RespMsg {
+  oneof msg {
+    PspTcpResp psp_tcp_resp = 3;
+  }
+}
+
+message PspTcpReq {
+  PspToken psp = 1;
+  Endpoint peer_target = 2;
+}
+
+message PspTcpResp {
+  PspToken psp = 1;
+}
+
+message Endpoint {
+  string ip_port = 1;  // e.g. "127.0.0.1:56789" or "[::1]:56789"
+}
+
+message PspToken {
+  uint32 spi = 1;  // security parameter index
+  uint32 gen = 2;  // generation
+  bytes key = 3;   // 16-byte raw AES session key
 }

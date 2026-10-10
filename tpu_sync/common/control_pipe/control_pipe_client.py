@@ -52,10 +52,16 @@ CPIP_MAGIC = b"CPIP"
 PIPC_MAGIC = b"PIPC"
 DEFAULT_MAX_FRAME_BYTES = 2 * 1024 * 1024 * 1024 - 1  # 2 GiB - 1
 DEFAULT_MAX_CACHED_GRPC_STUBS = 100000
+DEFAULT_GRPC_KEEPALIVE_TIME_MS = 60000
+DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS = 20000
 _HEADER_STRUCT = struct.Struct("!4sI")
 _GRPC_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", DEFAULT_MAX_FRAME_BYTES),
     ("grpc.max_receive_message_length", DEFAULT_MAX_FRAME_BYTES),
+    ("grpc.keepalive_time_ms", DEFAULT_GRPC_KEEPALIVE_TIME_MS),
+    ("grpc.keepalive_timeout_ms", DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS),
+    ("grpc.keepalive_permit_without_calls", 1),
+    ("grpc.http2.max_pings_without_data", 0),
 )
 
 

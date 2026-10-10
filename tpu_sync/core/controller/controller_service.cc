@@ -57,10 +57,7 @@ grpc::Status RaidenControllerServiceImpl::RegisterWorker(
   std::vector<::tpu_raiden::RaidenTransferEndpoint> eps;
   eps.reserve(request->raiden_transfer_endpoints_size());
   for (const auto& desc_proto : request->raiden_transfer_endpoints()) {
-    ::tpu_raiden::RaidenTransferEndpoint ep;
-    ep.endpoint = desc_proto.endpoint();
-    ep.shards.assign(desc_proto.shards().begin(), desc_proto.shards().end());
-    eps.push_back(std::move(ep));
+    eps.push_back(::tpu_raiden::RaidenTransferEndpoint::FromProto(desc_proto));
   }
 
   WorkerRegistration reg = {

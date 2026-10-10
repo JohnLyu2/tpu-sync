@@ -36,10 +36,12 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/log_severity.h"
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
+#include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -3935,6 +3937,7 @@ TEST_F(StoreDiscoveryTest, AdoptsAndPublishesTheBackendsServer) {
   pooling_config.capacity = 16;
   pooling_config.global_registry_address = registry_address_;
   pooling_config.raiden_id = rid;
+  pooling_config.parallelism = {.tp_size = 1, .tp_rank = 0};
 
   const BackendConfig configs[] = {host_config, pooling_config};
   TF_ASSERT_OK_AND_ASSIGN(
@@ -6540,12 +6543,16 @@ TEST(KVCacheStoreTest, MultiBackendConstructionValidation) {
   // Accepts 1 tier-0 backend + 1 secondary backend.
   BackendConfig sec1;
   sec1.type = "posix";
+  sec1.parallelism.tp_size = 1;
+  sec1.parallelism.tp_rank = 0;
   sec1.SetProperty("storage_root", "/tmp/raiden_test_sec1");
   EXPECT_TRUE(CreateStore(std::vector<BackendConfig>{tier0, sec1}).ok());
 
   // Rejects 1 tier-0 backend + 2 secondary backends.
   BackendConfig sec2;
   sec2.type = "posix";
+  sec2.parallelism.tp_size = 1;
+  sec2.parallelism.tp_rank = 0;
   sec2.SetProperty("storage_root", "/tmp/raiden_test_sec2");
   auto status =
       CreateStore(std::vector<BackendConfig>{tier0, sec1, sec2}).status();
@@ -6571,10 +6578,11 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   worker_backend->set_mapper(
-      std::make_shared<backends::storage::PosixPathMapper>(scratch_dir,
-                                                           "model_test", 1, 0));
+      std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0}));
   KVCacheStoreTest::AddBackend(
       store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
                  worker_backend, "posix"));
@@ -6642,10 +6650,11 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   worker_backend->set_mapper(
-      std::make_shared<backends::storage::PosixPathMapper>(scratch_dir,
-                                                           "model_test", 1, 0));
+      std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0}));
   KVCacheStoreTest::AddBackend(
       store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
                  worker_backend, "posix"));
@@ -6725,9 +6734,10 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto mapper = std::make_shared<backends::storage::PosixPathMapper>(
-      scratch_dir, "model_test", 1, 0);
+      scratch_dir, "model_test",
+      backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   worker_backend->set_mapper(mapper);
   auto storage_tier =
       std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
@@ -6785,10 +6795,11 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   worker_backend->set_mapper(
-      std::make_shared<backends::storage::PosixPathMapper>(scratch_dir,
-                                                           "model_test", 1, 0));
+      std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0}));
   KVCacheStoreTest::AddBackend(
       store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
                  worker_backend, "posix"));
@@ -6870,10 +6881,11 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   worker_backend->set_mapper(
-      std::make_shared<backends::storage::PosixPathMapper>(scratch_dir,
-                                                           "model_test", 1, 0));
+      std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0}));
   KVCacheStoreTest::AddBackend(
       store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
                  worker_backend, "posix"));
@@ -6938,10 +6950,11 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   worker_backend->set_mapper(
-      std::make_shared<backends::storage::PosixPathMapper>(scratch_dir,
-                                                           "model_test", 1, 0));
+      std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0}));
   KVCacheStoreTest::AddBackend(
       store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
                  worker_backend, "posix"));
@@ -7003,10 +7016,11 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   worker_backend->set_mapper(
-      std::make_shared<backends::storage::PosixPathMapper>(scratch_dir,
-                                                           "model_test", 1, 0));
+      std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0}));
   KVCacheStoreTest::AddBackend(
       store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
                  worker_backend, "posix"));
@@ -7056,6 +7070,8 @@ TEST(KVCacheStoreTest, CreateWithProgrammaticSecondaryConfigs) {
 
   BackendConfig sec_cfg;
   sec_cfg.type = "posix";
+  sec_cfg.parallelism.tp_size = 1;
+  sec_cfg.parallelism.tp_rank = 0;
   sec_cfg.properties["root_dir"] = "/tmp/test";
 
   std::vector<BackendConfig> sec_cfgs = {sec_cfg};
@@ -7091,9 +7107,10 @@ TEST(KVCacheStoreTest, PeerLookupPriorityOverStorageFallback) {
       std::string(testing::TempDir()) + "/" +
       ::testing::UnitTest::GetInstance()->current_test_info()->name();
   auto real_backend = std::make_shared<backends::storage::PosixKVBackend>(
-      "posix", absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      "posix", absl::flat_hash_map<std::string, std::string>{});
   auto mapper = std::make_shared<backends::storage::PosixPathMapper>(
-      scratch_dir, "model_test", 1, 0);
+      scratch_dir, "model_test",
+      backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0});
   real_backend->set_mapper(mapper);
   auto storage_backend =
       std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
@@ -7268,10 +7285,10 @@ class ReadRemoteTest : public KVCacheStoreEmbeddedControllerTest {
                        ::testing::UnitTest::GetInstance()
                            ->current_test_info()->name());
       posix_ = std::make_shared<backends::storage::PosixKVBackend>(
-          "posix",
-          absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+          "posix", absl::flat_hash_map<std::string, std::string>{});
       mapper_ = std::make_shared<backends::storage::PosixPathMapper>(
-          scratch_dir, "model_test", 1, 0);
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0});
       posix_->set_mapper(mapper_);
       KVCacheStoreTest::AddBackend(
           *store_, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
@@ -7923,12 +7940,151 @@ TEST_F(SecondaryBackendTopologyTest, UsesParallelismTpSize) {
   EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp2_r0/"));
 }
 
-// num_shards counts controller buffer shards, not storage writers (e.g.
-// PCP=8, TP=1), so an unset tp_size defaults to 1, matching KVCacheManager.
-TEST_F(SecondaryBackendTopologyTest, DefaultsToOneWithoutParallelism) {
-  TF_ASSERT_OK_AND_ASSIGN(auto tier,
-                          CreateStorageTier(PosixConfig(), /*num_shards=*/4));
-  EXPECT_EQ(tier->storage_backend()->mapper()->tp_size(), 1);
+// With no axis declared, every worker would write the same shard files, so
+// the store refuses the config instead of probing one shard per block. The
+// store still logs the topology it received.
+TEST_F(SecondaryBackendTopologyTest, RejectsConfigWithNoAxisDeclared) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kInfo, ::testing::_,
+                  ::testing::HasSubstr(
+                      "[Store] secondary backend posix received topology: "
+                      "pp=undeclared pcp=undeclared tp=undeclared; coordinator "
+                      "topology: pp=undeclared pcp=undeclared tp=undeclared; "
+                      "no parallelism axis declared")));
+  log.StartCapturingLogs();
+
+  EXPECT_THAT(CreateStorageTier(PosixConfig(), /*num_shards=*/4),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument,
+                  ::testing::HasSubstr("no parallelism axis is declared")));
+}
+
+// Create rejects an axis-less secondary tier before it creates the
+// controller. Were the controller created first, it would wait for the
+// expected worker and fail with DeadlineExceeded instead.
+TEST_F(SecondaryBackendTopologyTest, RejectsNoAxisBeforeCreatingController) {
+  setenv("RAIDEN_EXPECTED_WORKERS_TIMEOUT_S", "1", /*overwrite=*/1);
+  BackendConfig host_cfg;
+  host_cfg.type = "HostOffloadBackend";
+  host_cfg.capacity = 16;
+  const BackendConfig configs[] = {host_cfg, PosixConfig()};
+  absl::StatusOr<std::unique_ptr<KVCacheStore>> store = KVCacheStore::Create(
+      absl::MakeConstSpan(configs), /*capacity=*/16,
+      /*global_registry_address=*/"", RaidenId{"topology_job", "0", "kv", 0},
+      /*num_shards=*/4, /*shard_size_bytes=*/512,
+      /*store_server_ip=*/"127.0.0.1", /*raiden_controller_port=*/0,
+      /*metadata=*/std::nullopt, /*expected_worker_count=*/1);
+  unsetenv("RAIDEN_EXPECTED_WORKERS_TIMEOUT_S");
+  EXPECT_THAT(store,
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument,
+                  ::testing::HasSubstr("no parallelism axis is declared")));
+}
+
+// The store logs the topology it received next to the coordinator topology it
+// resolved, so a mismatch with the workers' "received topology" lines shows.
+TEST_F(SecondaryBackendTopologyTest, LogsReceivedTopologyAndProbedShards) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism = {.tp_size = 4, .tp_rank = 3, .pp_size = 2, .pp_rank = 1};
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kInfo, ::testing::_,
+                  ::testing::HasSubstr(
+                      "[Store] secondary backend posix received topology: "
+                      "pp=2/r1 pcp=undeclared tp=4/r3; coordinator topology: "
+                      "pp=2/r0 pcp=undeclared tp=4/r0")));
+  EXPECT_CALL(
+      log, Log(absl::LogSeverity::kInfo, ::testing::_,
+               ::testing::HasSubstr(absl::StrCat(
+                   "[Store] posix backend probes 8 shard file(s) per block "
+                   "under ",
+                   scratch_dir_, "/topology_model/pp2_r{0..1}_tp4_r{0..3}/"))));
+  log.StartCapturingLogs();
+
+  ABSL_EXPECT_OK(CreateStorageTier(cfg, /*num_shards=*/1));
+}
+
+TEST_F(SecondaryBackendTopologyTest, PinsPcpRankToZero) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.pcp_rank = 3;  // Worker-only; ignored by the coordinator.
+  cfg.parallelism.pcp_size = 4;
+  TF_ASSERT_OK_AND_ASSIGN(auto tier, CreateStorageTier(cfg, /*num_shards=*/1));
+  auto mapper = tier->storage_backend()->mapper();
+  ASSERT_NE(mapper, nullptr);
+  EXPECT_EQ(mapper->pcp_size(), 4);
+  EXPECT_EQ(mapper->shards_per_block(), 4);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, mapper->MapKey("hash"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/pcp4_r0/"));
+}
+
+TEST_F(SecondaryBackendTopologyTest, UsesPcpAndTpTogether) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism = {.tp_size = 2, .tp_rank = 1, .pcp_size = 2, .pcp_rank = 1};
+  TF_ASSERT_OK_AND_ASSIGN(auto tier, CreateStorageTier(cfg, /*num_shards=*/1));
+  auto mapper = tier->storage_backend()->mapper();
+  ASSERT_NE(mapper, nullptr);
+  EXPECT_EQ(mapper->shards_per_block(), 4);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, mapper->MapKey("hash"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/pcp2_r0_tp2_r0/"));
+}
+
+TEST_F(SecondaryBackendTopologyTest, RejectsZeroPcpSize) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.pcp_size = 0;
+  EXPECT_THAT(
+      CreateStorageTier(cfg, /*num_shards=*/1),
+      ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("pcp_size must be >= 1")));
+}
+
+TEST_F(SecondaryBackendTopologyTest, RejectsRankWithoutSize) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.pcp_rank = 3;  // pcp_size left undeclared.
+  EXPECT_THAT(
+      CreateStorageTier(cfg, /*num_shards=*/1),
+      ::absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          ::testing::HasSubstr("pcp_rank 3 was given without pcp_size")));
+}
+
+TEST_F(SecondaryBackendTopologyTest, PinsPpRankToZero) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.pp_rank = 1;  // Worker-only; ignored by the coordinator.
+  cfg.parallelism.pp_size = 2;
+  TF_ASSERT_OK_AND_ASSIGN(auto tier, CreateStorageTier(cfg, /*num_shards=*/1));
+  auto mapper = tier->storage_backend()->mapper();
+  ASSERT_NE(mapper, nullptr);
+  EXPECT_EQ(mapper->pp_size(), 2);
+  EXPECT_EQ(mapper->shards_per_block(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, mapper->MapKey("hash"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/pp2_r0/"));
+}
+
+TEST_F(SecondaryBackendTopologyTest, UsesPpPcpTpTogether) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism = {.tp_size = 2,
+                     .tp_rank = 1,
+                     .pcp_size = 2,
+                     .pcp_rank = 1,
+                     .pp_size = 2,
+                     .pp_rank = 1};
+  TF_ASSERT_OK_AND_ASSIGN(auto tier, CreateStorageTier(cfg, /*num_shards=*/1));
+  auto mapper = tier->storage_backend()->mapper();
+  ASSERT_NE(mapper, nullptr);
+  EXPECT_EQ(mapper->shards_per_block(), 8);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, mapper->MapKey("hash"));
+  EXPECT_THAT(key.resolved_key,
+              ::testing::HasSubstr("/pp2_r0_pcp2_r0_tp2_r0/"));
+}
+
+TEST_F(SecondaryBackendTopologyTest, RejectsPpRankWithoutPpSize) {
+  BackendConfig cfg = PosixConfig();
+  cfg.parallelism.pp_rank = 1;  // pp_size left undeclared.
+  EXPECT_THAT(CreateStorageTier(cfg, /*num_shards=*/1),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument,
+                  ::testing::HasSubstr("pp_rank 1 was given without pp_size")));
 }
 
 TEST_F(SecondaryBackendTopologyTest, IgnoresCallerTpSizeProperty) {
@@ -7973,8 +8129,9 @@ TEST_F(SecondaryBackendTopologyTest, CoordinatorAndWorkerShareShardPaths) {
           "hash", {.parallelism = {.tp_size = 2, .tp_rank = 1}}));
 
   backends::storage::PosixPathMapper worker_mapper(
-      scratch_dir_, "topology_model", cfg.parallelism.tp_size,
-      cfg.parallelism.tp_rank);
+      scratch_dir_, "topology_model",
+      backends::ParallelismConfig{.tp_size = cfg.parallelism.tp_size,
+                                  .tp_rank = cfg.parallelism.tp_rank});
   TF_ASSERT_OK_AND_ASSIGN(auto worker_key, worker_mapper.MapKey("hash"));
   EXPECT_EQ(coordinator_key.resolved_key, worker_key.resolved_key);
   EXPECT_THAT(worker_key.resolved_key, ::testing::HasSubstr("/tp2_r1/"));
@@ -7983,7 +8140,9 @@ TEST_F(SecondaryBackendTopologyTest, CoordinatorAndWorkerShareShardPaths) {
 // Writes the shard file worker `tp_rank` would write for `hash`.
 void WriteWorkerShard(const std::string& root, const std::string& model,
                       int tp_size, int tp_rank, const std::string& hash) {
-  backends::storage::PosixPathMapper mapper(root, model, tp_size, tp_rank);
+  backends::storage::PosixPathMapper mapper(
+      root, model,
+      backends::ParallelismConfig{.tp_size = tp_size, .tp_rank = tp_rank});
   absl::StatusOr<backends::BlockKey> key = mapper.MapKey(hash);
   ASSERT_TRUE(key.ok()) << key.status();
   std::filesystem::create_directories(

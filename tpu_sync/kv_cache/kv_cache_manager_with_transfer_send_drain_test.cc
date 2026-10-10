@@ -20,8 +20,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -36,16 +38,17 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/transfer_receive_session.h"
-#include "tpu_sync/core/transfer_send_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_receive_session.h"
+#include "tpu_sync/kv_cache/transfer_send_session.h"
 
 namespace tpu_raiden {
 namespace {
@@ -186,7 +189,9 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   }
 
   absl::Status ReceiveBlocks(const std::vector<int>& blocks, uint64_t uuid) {
-    return OnBlocksReceived(blocks, uuid);
+    std::vector<int> all_shards(base()->num_shards());
+    std::iota(all_shards.begin(), all_shards.end(), 0);
+    return OnBlockShardsReceived(blocks, all_shards, uuid);
   }
 
   void FinishCopy(size_t index, absl::Status status) {
@@ -830,14 +835,15 @@ TEST(RecvLifecycleTest,
   ASSERT_EQ(consumer.free_slots(), kSlots - 1);
 
   // Simulate BlockTransport::HandleIncomingPush holding the incoming push lease
-  // across OnLayerReceived, synchronous H2D completion, and OnBlocksReceived.
+  // across OnLayerReceived, synchronous H2D completion, and
+  // OnBlockShardsReceived.
   ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/92),
               ::absl_testing::IsOk());
   ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/92),
               ::absl_testing::IsOk());
   consumer.FinishCopy(0, absl::OkStatus());
   // Even though the H2D copy finished, staging must remain pinned until
-  // OnBlocksReceived and EndIncomingPush complete.
+  // OnBlockShardsReceived and EndIncomingPush complete.
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
   ASSERT_THAT(consumer.ReceiveBlocks({0}, /*uuid=*/92), ::absl_testing::IsOk());

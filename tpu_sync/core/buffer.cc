@@ -38,22 +38,14 @@ namespace tpu_raiden {
     proto.set_remote_address(*remote_address_);
   }
   for (const auto& ep : remote_descriptors_) {
-    auto* proto_ep = proto.add_remote_descriptors();
-    proto_ep->set_endpoint(ep.endpoint);
-    for (int64_t shard : ep.shards) {
-      proto_ep->add_shards(shard);
-    }
+    *proto.add_remote_descriptors() = ep.ToProto();
   }
   for (const auto& group : remote_worker_endpoints_) {
     auto* proto_group = proto.add_remote_worker_endpoints();
     proto_group->set_node_id(group.node_id);
     proto_group->set_worker_id(group.worker_id);
     for (const auto& ep : group.endpoints) {
-      auto* proto_ep = proto_group->add_endpoints();
-      proto_ep->set_endpoint(ep.endpoint);
-      for (int64_t shard : ep.shards) {
-        proto_ep->add_shards(shard);
-      }
+      *proto_group->add_endpoints() = ep.ToProto();
     }
   }
   return proto;
@@ -79,9 +71,7 @@ Buffer Buffer::FromProto(const ::tpu_sync::proto::BufferProto& proto,
   std::vector<RaidenTransferEndpoint> remote_descriptors;
   remote_descriptors.reserve(proto.remote_descriptors_size());
   for (const auto& ep_proto : proto.remote_descriptors()) {
-    std::vector<int64_t> shards(ep_proto.shards().begin(),
-                                ep_proto.shards().end());
-    remote_descriptors.push_back({ep_proto.endpoint(), std::move(shards)});
+    remote_descriptors.push_back(RaidenTransferEndpoint::FromProto(ep_proto));
   }
   Buffer buffer(index, std::move(shards), std::move(addr), memory_type,
                 std::move(remote_descriptors));
@@ -93,9 +83,7 @@ Buffer Buffer::FromProto(const ::tpu_sync::proto::BufferProto& proto,
     group.worker_id = group_proto.worker_id();
     group.endpoints.reserve(group_proto.endpoints_size());
     for (const auto& ep_proto : group_proto.endpoints()) {
-      std::vector<int64_t> shards(ep_proto.shards().begin(),
-                                  ep_proto.shards().end());
-      group.endpoints.push_back({ep_proto.endpoint(), std::move(shards)});
+      group.endpoints.push_back(RaidenTransferEndpoint::FromProto(ep_proto));
     }
     remote_worker_endpoints.push_back(std::move(group));
   }

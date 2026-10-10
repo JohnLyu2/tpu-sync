@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <thread>  // NOLINT
 #include <type_traits>
 #include <utility>
@@ -268,15 +269,15 @@ tpu_raiden::NumaThreadPool* GetThreadPool() {
   return global_pool.get();
 }
 
+// Splits |total_tasks| into chunks and runs |run_task| on them: one chunk on
+// the calling thread, the rest as helper tasks on the shared pool pinned to
+// |numa_node| when set.
 template <typename TaskFn>
 void ExecuteParallelTasks(int64_t total_tasks, int64_t num_tiles_0,
-                          int64_t desired_chunks,
-                          tpu_raiden::NumaThreadPool* pool, TaskFn&& run_task) {
-  tpu_raiden::NumaThreadPool* target_pool =
-      (pool != nullptr) ? pool : GetThreadPool();
-  int64_t pool_threads = (target_pool != nullptr)
-                             ? static_cast<int64_t>(target_pool->num_threads())
-                             : 0;
+                          int64_t desired_chunks, std::optional<int> numa_node,
+                          TaskFn&& run_task) {
+  tpu_raiden::NumaThreadPool* target_pool = GetThreadPool();
+  int64_t pool_threads = static_cast<int64_t>(target_pool->num_threads());
   int64_t max_threads =
       std::min<int64_t>({kMaxChunksPerTensor, pool_threads, desired_chunks});
 
@@ -301,13 +302,13 @@ void ExecuteParallelTasks(int64_t total_tasks, int64_t num_tiles_0,
 
     // Schedule num_workers helper tasks to the pool
     for (int64_t t = 0; t < num_workers; ++t) {
-      target_pool->Schedule(
-          [&work_loop, &next_idx, &remaining_workers, total_tasks]() {
-            if (next_idx.load(std::memory_order_relaxed) < total_tasks) {
-              work_loop();
-            }
-            remaining_workers.fetch_sub(1, std::memory_order_release);
-          });
+      target_pool->Schedule(numa_node, [&work_loop, &next_idx,
+                                        &remaining_workers, total_tasks]() {
+        if (next_idx.load(std::memory_order_relaxed) < total_tasks) {
+          work_loop();
+        }
+        remaining_workers.fetch_sub(1, std::memory_order_release);
+      });
     }
 
     // Execute directly on the calling thread via shared dynamic work-stealing
@@ -315,7 +316,7 @@ void ExecuteParallelTasks(int64_t total_tasks, int64_t num_tiles_0,
 
     // While waiting for helper tasks to complete, drain pending pool tasks
     while (remaining_workers.load(std::memory_order_acquire) > 0) {
-      if (target_pool != nullptr && target_pool->ExecuteOneTask()) {
+      if (target_pool->ExecuteOneTask()) {
         continue;
       }
       sched_yield();
@@ -916,10 +917,9 @@ absl::Status DetileBuffer1DOptimized(const uint8_t* src_tiled,
 // Tiles a buffer using an optimized path for standard row-major layouts.
 // It avoids global zero-initialization of the destination buffer to prevent
 // CPU cache pollution, instead zeroing padding elements locally per tile.
-absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
-                                   uint8_t* dst_tiled, const xla::Shape& shape,
-                                   const xla::Layout& layout,
-                                   tpu_raiden::NumaThreadPool* pool = nullptr) {
+absl::Status TileBufferNDOptimized(
+    const uint8_t* src_linear, uint8_t* dst_tiled, const xla::Shape& shape,
+    const xla::Layout& layout, std::optional<int> numa_node = std::nullopt) {
   const int R = shape.dimensions().size();
   if (R == 1 && layout.tiles(0).dimensions().size() == 1) {
     return TileBuffer1DOptimized(src_linear, dst_tiled, shape, layout);
@@ -1067,8 +1067,8 @@ absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
           }
         };
 
-        ExecuteParallelTasks(total_tasks, num_tiles_0, desired_chunks, pool,
-                             run_task);
+        ExecuteParallelTasks(total_tasks, num_tiles_0, desired_chunks,
+                             numa_node, run_task);
       });
     }
   });
@@ -1078,7 +1078,7 @@ absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
 
 absl::Status DetileBufferNDOptimized(
     const uint8_t* src_tiled, uint8_t* dst_linear, const xla::Shape& shape,
-    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
+    const xla::Layout& layout, std::optional<int> numa_node = std::nullopt) {
   const int R = shape.dimensions().size();
   if (R == 1 && layout.tiles(0).dimensions().size() == 1) {
     return DetileBuffer1DOptimized(src_tiled, dst_linear, shape, layout);
@@ -1219,8 +1219,8 @@ absl::Status DetileBufferNDOptimized(
           }
         };
 
-        ExecuteParallelTasks(total_tasks, num_tiles_0, desired_chunks, pool,
-                             run_detile_task);
+        ExecuteParallelTasks(total_tasks, num_tiles_0, desired_chunks,
+                             numa_node, run_detile_task);
       });
     }
   });
@@ -1703,7 +1703,7 @@ void DetileSingleTileColMajorWithPadding(const uint8_t* src_tile_ptr,
 // tile_row advances sequentially along the stride-1 dimension H = D1.
 absl::Status TileBufferColMajorOptimized(
     const uint8_t* src_linear, uint8_t* dst_tiled, const xla::Shape& shape,
-    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
+    const xla::Layout& layout, std::optional<int> numa_node = std::nullopt) {
   const int R = shape.dimensions().size();
   int64_t H = shape.dimensions(layout.minor_to_major(1));
   int64_t W = shape.dimensions(layout.minor_to_major(0));
@@ -1774,7 +1774,7 @@ absl::Status TileBufferColMajorOptimized(
       }
     }
   } else {
-    ExecuteParallelTasks(total_tasks, num_tiles_1, desired_chunks, pool,
+    ExecuteParallelTasks(total_tasks, num_tiles_1, desired_chunks, numa_node,
                          process_tile_col);
   }
 
@@ -1783,7 +1783,7 @@ absl::Status TileBufferColMajorOptimized(
 
 absl::Status DetileBufferColMajorOptimized(
     const uint8_t* src_tiled, uint8_t* dst_linear, const xla::Shape& shape,
-    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
+    const xla::Layout& layout, std::optional<int> numa_node = std::nullopt) {
   const int R = shape.dimensions().size();
   int64_t H = shape.dimensions(layout.minor_to_major(1));
   int64_t W = shape.dimensions(layout.minor_to_major(0));
@@ -1856,7 +1856,7 @@ absl::Status DetileBufferColMajorOptimized(
       }
     }
   } else {
-    ExecuteParallelTasks(total_tasks, num_tiles_1, desired_chunks, pool,
+    ExecuteParallelTasks(total_tasks, num_tiles_1, desired_chunks, numa_node,
                          process_tile_col);
   }
 
@@ -2051,9 +2051,9 @@ void TileRowMajorBandsInPlace(uint8_t* buffer,
 }
 
 // Dispatches a standard row-major tiled tensor to the matching in-place tiler.
-absl::Status TileBufferInPlaceRowMajor(
-    uint8_t* buffer, size_t buffer_capacity, const xla::Shape& shape,
-    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
+absl::Status TileBufferInPlaceRowMajor(uint8_t* buffer, size_t buffer_capacity,
+                                       const xla::Shape& shape,
+                                       const xla::Layout& layout) {
   const int R = shape.dimensions().size();
   if (R == 1 && layout.tiles(0).dimensions().size() == 1) {
     const int64_t W = shape.dimensions(0);
@@ -2152,7 +2152,7 @@ int64_t GetTiledBufferElements(const xla::Shape& shape) {
 
 absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
                           const xla::Shape& shape, const xla::Layout& layout,
-                          tpu_raiden::NumaThreadPool* pool) {
+                          std::optional<int> numa_node) {
   if (layout.tiles().empty()) {
     const int64_t bytes = xla::ShapeUtil::ByteSizeOf(shape);
     if (bytes > 0) {
@@ -2162,12 +2162,13 @@ absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
   }
 
   if (IsStandardRowMajorTiled(shape, layout)) {
-    return DetileBufferNDOptimized(src_tiled, dst_linear, shape, layout, pool);
+    return DetileBufferNDOptimized(src_tiled, dst_linear, shape, layout,
+                                   numa_node);
   }
 
   if (IsStandardColMajorTiled(shape, layout)) {
     return DetileBufferColMajorOptimized(src_tiled, dst_linear, shape, layout,
-                                         pool);
+                                         numa_node);
   }
 
   int64_t itemsize =
@@ -2197,7 +2198,7 @@ absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
 
 absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
                         const xla::Shape& shape, const xla::Layout& layout,
-                        tpu_raiden::NumaThreadPool* pool) {
+                        std::optional<int> numa_node) {
   if (src_linear == dst_tiled) {
     xla::Shape tiled_shape = shape;
     *tiled_shape.mutable_layout() = layout;
@@ -2205,7 +2206,7 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
         xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
     int64_t total_physical_elements = GetTiledBufferElements(tiled_shape);
     return TileBufferInPlace(dst_tiled, total_physical_elements * itemsize,
-                             shape, layout, pool);
+                             shape, layout, numa_node);
   }
 
   if (layout.tiles().empty()) {
@@ -2217,12 +2218,13 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
   }
 
   if (IsStandardRowMajorTiled(shape, layout)) {
-    return TileBufferNDOptimized(src_linear, dst_tiled, shape, layout, pool);
+    return TileBufferNDOptimized(src_linear, dst_tiled, shape, layout,
+                                 numa_node);
   }
 
   if (IsStandardColMajorTiled(shape, layout)) {
     return TileBufferColMajorOptimized(src_linear, dst_tiled, shape, layout,
-                                       pool);
+                                       numa_node);
   }
 
   int64_t itemsize =
@@ -2262,14 +2264,13 @@ absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
 absl::Status TileBufferInPlace(uint8_t* buffer, size_t buffer_capacity,
                                const xla::Shape& shape,
                                const xla::Layout& layout,
-                               tpu_raiden::NumaThreadPool* pool) {
+                               std::optional<int> numa_node) {
   if (layout.tiles().empty()) {
     return absl::OkStatus();
   }
 
   if (IsStandardRowMajorTiled(shape, layout)) {
-    return TileBufferInPlaceRowMajor(buffer, buffer_capacity, shape, layout,
-                                     pool);
+    return TileBufferInPlaceRowMajor(buffer, buffer_capacity, shape, layout);
   }
 
   xla::Shape tiled_shape = shape;
@@ -2287,7 +2288,7 @@ absl::Status TileBufferInPlace(uint8_t* buffer, size_t buffer_capacity,
 
   // Fallback for non-row-major layouts: allocate scratchpad, tile, and copy.
   std::vector<uint8_t> tmp(total_physical_elements * itemsize);
-  TF_RETURN_IF_ERROR(TileBuffer(buffer, tmp.data(), shape, layout, pool));
+  TF_RETURN_IF_ERROR(TileBuffer(buffer, tmp.data(), shape, layout, numa_node));
   std::memcpy(buffer, tmp.data(), tmp.size());
   return absl::OkStatus();
 }

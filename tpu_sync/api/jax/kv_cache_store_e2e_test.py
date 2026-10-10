@@ -147,6 +147,24 @@ def tearDownModule():
   pass
 
 
+def _expected_shard_path(root, model_name, key, axes):
+  """Returns the file PosixPathMapper::MapKey picks for `key`.
+
+  Args:
+    root: The backend's root_dir.
+    model_name: The backend's model_name (already path-safe).
+    key: The raw block key bytes.
+    axes: (name, size, rank) for each declared axis, outermost first (pp, pcp,
+      tp). An empty list means no topology directory.
+  """
+  topology = "_".join(f"{name}{size}_r{rank}" for name, size, rank in axes)
+  key_hex = key.hex()
+  padded = key_hex + "0" * 5  # l1/l2 are fixed width; short keys are padded.
+  parts = [root, model_name] + ([topology] if topology else [])
+  parts += [padded[:3], padded[3:5], f"{key_hex}.bin"]
+  return os.path.join(*parts)
+
+
 class KVCacheStoreE2ETest(parameterized.TestCase):
 
   @classmethod
@@ -444,7 +462,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       print(
           "[JAX E2E Storage][Step 2/11] Configuring POSIX secondary storage"
           f" backend (direct_io={direct_io}):\n  root_dir: {temp_dir}\n "
-          " model_name: llama_70b_jax\n "
+          " model_name: test_model_jax\n "
           " tp_size: 1, tp_rank: 0\n  shard_size_bytes:"
           f" {shard_size_bytes} B",
           flush=True,
@@ -455,7 +473,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       # One process writes every chip's data to tp1_r0.
       cfg.parallelism.tp_size = 1
       cfg.set_property("root_dir", temp_dir)
-      cfg.set_property("model_name", "llama_70b_jax")
+      cfg.set_property("model_name", "test_model_jax")
       if direct_io:
         cfg.set_property("direct_io", "true")
 
@@ -595,19 +613,21 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
             f" {len(all_disk_files)} filesystem entries under {temp_dir}.",
             flush=True,
         )
-        # Expected shard path:
-        #   {storage_root}/llama_70b_jax/tp1_r0/{hash[:3]}/{hash[3:5]}/{hash}.bin
+        # One file per hash at exactly
+        #   {storage_root}/test_model_jax/tp1_r0/{l1}/{l2}/{hash}.bin
+        # and no other .bin anywhere under storage_root.
         bin_files = glob.glob(
-            os.path.join(
-                temp_dir,
-                "llama_70b_jax",
-                "tp1_r0",
-                "**",
-                "*.bin",
-            ),
-            recursive=True,
+            os.path.join(temp_dir, "**", "*.bin"), recursive=True
         )
-        self.assertLen(bin_files, 2)
+        self.assertCountEqual(
+            bin_files,
+            [
+                _expected_shard_path(
+                    temp_dir, "test_model_jax", h, [("tp", 1, 0)]
+                )
+                for h in hashes
+            ],
+        )
         print(
             f"[JAX E2E Storage][Step 6/11] Discovered {len(bin_files)} disk"
             f" block files: {[os.path.basename(f) for f in bin_files]}",
@@ -899,7 +919,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     shard_size_bytes = (128 * 8 * 8 * 128 * 4) // self.num_devices
     h0, r0, s0 = b"3src_h0", b"3src_r0", b"3src_s0"
-    model_name = "llama_70b_jax_three_source"
+    model_name = "test_model_jax_three_source"
 
     temp_dir, is_custom_root = self._make_storage_dir("jax_three_source")
     cfg = self._posix_cfg(temp_dir, model_name)
