@@ -31,7 +31,7 @@ receive before its last H2D callbacks run. The
 outcome is unaffected (`done` still waits through `in_flight_`); only the
 per-transfer metrics are skipped (`Recv.trace_poll_skips_metrics`). Not
 a bug — do not re-open it as one; the audit is `ReceivePoll.lean` and
-`prefill_decode.md` §"C++ observations (non-bugs at `50b0774`)".
+`verification/findings/README.md` §"Observations on the prefill-to-decode path (non-bugs at `50b0774`)".
 
 [FACT] Consumer-side staging admission is first-come-first-served with no
 per-peer bound: `StartRead` takes a slot before the handshake and keeps it

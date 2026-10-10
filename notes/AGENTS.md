@@ -13,7 +13,7 @@ conventions: `../AGENTS.md`.
   correction trail. Never copy a fact table or a citation list into a note;
   every copy made so far went stale within a week.
 - Upstream-sync facts (what changed in cited code, what was re-pinned) go in
-  `verification/docs/transfer/prefill_decode.md` §"Upstream re-checks" and
+  `verification/docs/upstream_rechecks.md` and
   `verification/findings/README.md` §"History"; the journal records the delta
   of understanding, corrections and tooling lessons, with a link.
 - `loose-ends/parked.md` is the only backlog.
