@@ -7,13 +7,13 @@
   per-UUID page-lease lifecycle in `KVCacheManagerBase` and
   `KVCacheManagerWithTransfer`.
 
-  Pinned to upstream commit `50b0774`.
+  Pinned to upstream commit `1fa06d1`.
 
   ## C++ anchorage
 
   1. **Bounded staging arena (`PoolStagingStorage`,
-     `tpu_sync/kv_cache/kv_cache_manager_base.h:963-975`,
-     `tpu_sync/kv_cache/kv_cache_manager_base.cc:2002-2059`):**
+     `tpu_sync/kv_cache/kv_cache_manager_base.h:985-997`,
+     `tpu_sync/kv_cache/kv_cache_manager_base.cc:2008-2065`):**
      When a storage's pools declare `staging_blocks_per_request > 0` and
      `staging_leases > 0` such that `num_slots = staging_leases *
      blocks_per_lease < max_pool_blocks`, `ConfigurePoolStaging` allocates a
@@ -21,32 +21,32 @@
      ..., 0]`, so `.back()` pops `0, 1, ...` in order).
 
   2. **Idempotent per-UUID lease acquisition (`AcquirePoolStagingLease`,
-     `tpu_sync/kv_cache/kv_cache_manager_base.cc:2080-2137`):**
+     `tpu_sync/kv_cache/kv_cache_manager_base.cc:2086-2143`):**
      Filters `block_ids` down to `missing` — deduplicated block IDs not already
-     present in `st.leases[uuid]->slot_by_block` (`:2091-2104`). Multiple pools
+     present in `st.leases[uuid]->slot_by_block` (`:2097-2110`). Multiple pools
      sharing a physical storage (`storage_index`) therefore share one page lease
      under the same `uuid` without double-allocating slots. If
      `missing.size() > st.num_slots` or `st.free_slots.size() < missing.size()`,
-     acquisition fails with `ResourceExhausted` (`:2108-2124`). Otherwise it
+     acquisition fails with `ResourceExhausted` (`:2114-2130`). Otherwise it
      pops `missing.size()` slots from `free_slots` and records `block_id ↦ slot`
-     in `st.leases[uuid]` (`:2125-2136`).
+     in `st.leases[uuid]` (`:2131-2142`).
 
   3. **Lease release (`ReleasePoolStagingLeases`,
-     `tpu_sync/kv_cache/kv_cache_manager_base.cc:2139-2155`):**
+     `tpu_sync/kv_cache/kv_cache_manager_base.cc:2145-2161`):**
      Looks up `st.leases.find(uuid)`, pushes every `slot ∈ lease->slots` back
      onto `st.free_slots`, and erases `uuid` from `st.leases`.
 
   4. **Receive registration lifecycle & Risk R5 (`PoolReshardRegisterRecv`,
-     `tpu_sync/core/kv_cache_manager_with_transfer.cc:640-675`,
-     `tpu_sync/core/reshard_receive_session.cc:373-378, 408-456`):**
+     `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:642-677`,
+     `tpu_sync/kv_cache/reshard_receive_session.cc:372-377, 407-455`):**
      `PoolReshardRegisterRecv` executes in three separate lock scopes:
-     - Phase 1 (`kv_cache_manager_with_transfer.cc:648-661`, under `mu_`):
+     - Phase 1 (`kv_cache_manager_with_transfer.cc:650-663`, under `mu_`):
        checks `active_pool_reshard_recvs_`.
-     - Phase 2 (`:663-666`, outside `mu_`): `ReshardReceiveSession::Create`
-       calls `AcquireStagingLeases(plan)` (`reshard_receive_session.cc:376`),
+     - Phase 2 (`:665-668`, outside `mu_`): `ReshardReceiveSession::Create`
+       calls `AcquireStagingLeases(plan)` (`reshard_receive_session.cc:375`),
        which calls `AcquirePoolStagingLease(uuid, ...)` and sets
-       `staging_released_ = false` (`:420`).
-     - Phase 3 (`kv_cache_manager_with_transfer.cc:668-673`): calls
+       `staging_released_ = false` (`:419`).
+     - Phase 3 (`kv_cache_manager_with_transfer.cc:670-675`): calls
        `RegisterActivePlanDirect(uuid, ...)` and inserts the session into
        `active_pool_reshard_recvs_`.
      Because Phase 2 runs before `uuid` is reserved in `active_pool_reshard_recvs_`
@@ -56,7 +56,7 @@
      `RegisterActivePlanDirect` (`AlreadyExistsError`) in Phase 3, destroying
      its temporary `ReshardReceiveSession` runs
      `~ReshardReceiveSession() -> ReleaseStaging() -> ReleasePoolStagingLeases(uuid)`
-     (`reshard_receive_session.h:67`, `reshard_receive_session.cc:447-456`),
+     (`reshard_receive_session.h:67`, `reshard_receive_session.cc:446-455`),
      which erases `st.leases[uuid]` and returns the first (surviving) session's
      slots to `free_slots` while the first session is still active.
 
@@ -64,7 +64,7 @@
 
   - `missingBlocks_empty_of_subset` & `acquireLease_idempotent`: re-acquiring a
     subset of already-leased block IDs for the same `uuid` is a no-op
-    (`kv_cache_manager_base.cc:2101-2106`).
+    (`kv_cache_manager_base.cc:2107-2112`).
   - `slot_conservation` & `acquireLease_slot_count` & `releaseLease_slot_count`:
     total slots across `freeSlots` and all active leases equals `numSlots`.
   - `no_slot_aliasing_of_disjoint_leases`: when active leases hold disjoint
@@ -90,7 +90,7 @@ open TpuSyncVerify
 
 /-- One UUID's staging lease on a bounded storage
 (`KVCacheManagerBase::PoolStagingLease`,
-`tpu_sync/kv_cache/kv_cache_manager_base.h:963-966`).
+`tpu_sync/kv_cache/kv_cache_manager_base.h:985-988`).
 `slotByBlock` maps `blockId ↦ slot`; `slots` records the leased slot indices in
 allocation order. -/
 structure Lease where
@@ -100,13 +100,13 @@ structure Lease where
 
 /-- Look up the arena slot assigned to `blockId` in `lease`
 (`lease->slot_by_block.find(block_id)`,
-`tpu_sync/kv_cache/kv_cache_manager_base.cc:2101, 3282`). -/
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2107, 3289`). -/
 def Lease.lookupSlot (l : Lease) (blockId : Nat) : Option Nat :=
   (l.slotByBlock.find? (fun p => p.1 == blockId)).map Prod.snd
 
 /-- One physical storage's bounded staging arena
 (`KVCacheManagerBase::PoolStagingStorage`,
-`tpu_sync/kv_cache/kv_cache_manager_base.h:967-975`).
+`tpu_sync/kv_cache/kv_cache_manager_base.h:989-997`).
 `freeSlots` is modeled with its top-of-stack (`back()` in C++) at the head of
 the list so popping one slot is `freeSlots.head?` / `freeSlots.tail`. -/
 structure Arena where
@@ -116,7 +116,7 @@ structure Arena where
   deriving DecidableEq, Repr
 
 /-- Initial arena with `numSlots` free slots `[0, 1, ..., numSlots - 1]` in pop
-order (`tpu_sync/kv_cache/kv_cache_manager_base.cc:2047-2050`: C++ pushes
+order (`tpu_sync/kv_cache/kv_cache_manager_base.cc:2053-2056`: C++ pushes
 `num_slots - 1` down to `0` so `free_slots.back()` pops `0, 1, ...`). -/
 def Arena.init (numSlots : Nat) : Arena :=
   { numSlots := numSlots
@@ -124,13 +124,13 @@ def Arena.init (numSlots : Nat) : Arena :=
   , leases := [] }
 
 /-- Look up `uuid`'s current lease on `a` (`st.leases.find(uuid)`,
-`tpu_sync/kv_cache/kv_cache_manager_base.cc:2076, 2093`). -/
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2082, 2099`). -/
 def Arena.lookupLease (a : Arena) (uuid : Nat) : Option Lease :=
   (a.leases.find? (fun p => p.1 == uuid)).map Prod.snd
 
 /-- Look up the slot assigned to `(uuid, blockId)` on `a`
 (`PoolBlockHostBase` / `GetBlockChunks`,
-`tpu_sync/kv_cache/kv_cache_manager_base.cc:2506-2523, 3264-3288`). -/
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2512-2529, 3271-3295`). -/
 def Arena.resolveBlockSlot (a : Arena) (uuid blockId : Nat) : Option Nat :=
   match a.lookupLease uuid with
   | none => none
@@ -138,14 +138,14 @@ def Arena.resolveBlockSlot (a : Arena) (uuid blockId : Nat) : Option Nat :=
 
 /-- Whether `blockId` is already mapped in `cur` (`cur != nullptr &&
 cur->slot_by_block.contains(block_id)`,
-`tpu_sync/kv_cache/kv_cache_manager_base.cc:2101`). -/
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2107`). -/
 def alreadyLeased (cur : Option Lease) (blockId : Nat) : Bool :=
   match cur with
   | none => false
   | some l => (l.lookupSlot blockId).isSome
 
 /-- Deduplicate `blockIds` in first-seen order while filtering out blocks
-already mapped in `cur` (`tpu_sync/kv_cache/kv_cache_manager_base.cc:2091-2104`). -/
+already mapped in `cur` (`tpu_sync/kv_cache/kv_cache_manager_base.cc:2097-2110`). -/
 def missingBlocksAux (cur : Option Lease) : List Nat → List Nat → List Nat
   | [], _ => []
   | b :: rest, seen =>
@@ -158,7 +158,7 @@ def missingBlocks (cur : Option Lease) (blockIds : List Nat) : List Nat :=
   missingBlocksAux cur blockIds []
 
 /-- Assign the next `missing.length` slots from `freeSlots` to `missing` block
-IDs, extending `cur` (`tpu_sync/kv_cache/kv_cache_manager_base.cc:2125-2134`). -/
+IDs, extending `cur` (`tpu_sync/kv_cache/kv_cache_manager_base.cc:2131-2140`). -/
 def allocateMissing : List Nat → List Nat → Lease → Option (List Nat × Lease)
   | [], free, acc => some (free, acc)
   | b :: bs, s :: free, acc =>
@@ -169,7 +169,7 @@ def allocateMissing : List Nat → List Nat → Lease → Option (List Nat × Le
 
 /-- Update or insert `(uuid, l)` in `leases`, preserving key uniqueness
 (`st.leases[uuid] = std::move(lease)`,
-`tpu_sync/kv_cache/kv_cache_manager_base.cc:2135`). -/
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2141`). -/
 def upsertLease : List (Nat × Lease) → Nat → Lease → List (Nat × Lease)
   | [], uuid, l => [(uuid, l)]
   | (u, old) :: rest, uuid, l =>
@@ -179,7 +179,7 @@ def upsertLease : List (Nat × Lease) → Nat → Lease → List (Nat × Lease)
       (u, old) :: upsertLease rest uuid l
 
 /-- `KVCacheManagerBase::AcquirePoolStagingLease`
-(`tpu_sync/kv_cache/kv_cache_manager_base.cc:2080-2137`).
+(`tpu_sync/kv_cache/kv_cache_manager_base.cc:2086-2143`).
 Returns `some a'` on `OkStatus` and `none` on `ResourceExhausted`. -/
 def Arena.acquireLease (a : Arena) (uuid : Nat) (blockIds : List Nat) : Option Arena :=
   let cur := a.lookupLease uuid
@@ -198,7 +198,7 @@ def Arena.acquireLease (a : Arena) (uuid : Nat) (blockIds : List Nat) : Option A
         leases := upsertLease a.leases uuid lease' }
 
 /-- `KVCacheManagerBase::ReleasePoolStagingLeases`
-(`tpu_sync/kv_cache/kv_cache_manager_base.cc:2139-2155`).
+(`tpu_sync/kv_cache/kv_cache_manager_base.cc:2145-2161`).
 Pushes `uuid`'s leased slots back onto the top of `freeSlots` (`push_back` in
 C++, where `back()` is the head of `freeSlots`) and removes `uuid` from
 `leases`. -/
@@ -228,7 +228,7 @@ theorem missingBlocksAux_empty_of_covered (cur : Option Lease) (blockIds seen : 
     simp only [hcond, ↓reduceIte]
     exact ih seen (fun b' hb' => hcov b' (List.mem_cons_of_mem b hb'))
 
-/-- **Idempotent Re-Acquisition Lemma (`kv_cache_manager_base.cc:2101-2106`)**:
+/-- **Idempotent Re-Acquisition Lemma (`kv_cache_manager_base.cc:2107-2112`)**:
 if every block in `blockIds` is already leased to `uuid`, `missingBlocks` is
 empty and `acquireLease` returns `some a` without touching `freeSlots` or
 `leases`. -/
@@ -376,7 +376,7 @@ theorem lookupLease_mem {a : Arena} {uuid : Nat} {l : Lease}
     subst h hp1
     exact hmem
 
-/-- **No Slot Aliasing Theorem (`kv_cache_manager_base.cc:2080-2155`)**:
+/-- **No Slot Aliasing Theorem (`kv_cache_manager_base.cc:2086-2161`)**:
 In any arena satisfying `ArenaInv`, two distinct UUIDs `u₁ ≠ u₂` never resolve
 any block IDs `b₁, b₂` (even identical device block IDs on two concurrent
 sessions) to the same host staging slot. -/
@@ -409,8 +409,8 @@ theorem no_slot_aliasing_between_distinct_uuids {a : Arena} (hinv : ArenaInv a)
 /-! ## Part III — Receive Registration Lifecycle & Risk R5 (`PoolReshardRegisterRecv`)
 
 We now model the interaction between `PoolReshardRegisterRecv`
-(`tpu_sync/core/kv_cache_manager_with_transfer.cc:640-675`),
-`ReshardReceiveSession` (`tpu_sync/core/reshard_receive_session.cc:373-378, 408-456`),
+(`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:642-677`),
+`ReshardReceiveSession` (`tpu_sync/kv_cache/reshard_receive_session.cc:372-377, 407-455`),
 and `PoolStagingStorage` across two registration policies:
 - `RegistrationPolicy.shipping`: the shipping 3-phase lock pattern where
   `ReshardReceiveSession::Create` (and thus `AcquirePoolStagingLease`) runs
@@ -445,20 +445,20 @@ structure RegState where
   deriving DecidableEq, Repr
 
 inductive RegEv where
-  /-- Phase 1 (`kv_cache_manager_with_transfer.cc:648-661`): check if `uuid` is
+  /-- Phase 1 (`kv_cache_manager_with_transfer.cc:650-663`): check if `uuid` is
   already active; under `.reserveBeforeLease`, also reserve `uuid` against
   concurrent arms immediately. -/
   | beginArm (callId uuid : Nat) (blocks : List Nat)
-  /-- Phase 2 (`kv_cache_manager_with_transfer.cc:663-666`,
-  `reshard_receive_session.cc:376, 438-439`): call
+  /-- Phase 2 (`kv_cache_manager_with_transfer.cc:665-668`,
+  `reshard_receive_session.cc:375, 437-438`): call
   `AcquirePoolStagingLease(uuid, blocks)` outside `mu_`. -/
   | acquireArmLease (callId : Nat)
-  /-- Phase 3 (`kv_cache_manager_with_transfer.cc:668-673`): call
+  /-- Phase 3 (`kv_cache_manager_with_transfer.cc:670-675`): call
   `RegisterActivePlanDirect(uuid, ...)` and insert into
   `active_pool_reshard_recvs_`. If `uuid` is already in `activeSessions`,
   `RegisterActivePlanDirect` returns `AlreadyExistsError` and the temporary
   `ReshardReceiveSession` destructor runs `ReleasePoolStagingLeases(uuid)`
-  (`reshard_receive_session.h:67`, `reshard_receive_session.cc:447-456`)! -/
+  (`reshard_receive_session.h:67`, `reshard_receive_session.cc:446-455`)! -/
   | finishArm (callId : Nat)
   /-- Normal session completion (`FinishPoolH2d` / `UnregisterActivePlan`):
   releases `uuid`'s staging lease and removes `uuid` from `activeSessions`. -/
@@ -501,7 +501,7 @@ def RegState.step (policy : RegistrationPolicy) (s : RegState) (e : RegEv) : Opt
         | none =>
           -- Phase 2 `AcquireStagingLeases` failed (`ResourceExhausted`):
           -- ` ~ReshardReceiveSession` runs `ReleasePoolStagingLeases(uuid)`
-          -- (`reshard_receive_session.cc:376, 420, 447-456`) and aborts arm.
+          -- (`reshard_receive_session.cc:375, 419, 446-455`) and aborts arm.
           some { s with
             arena := s.arena.releaseLease arm.uuid
             inFlightArms := s.removeArm callId }
@@ -517,8 +517,8 @@ def RegState.step (policy : RegistrationPolicy) (s : RegState) (e : RegEv) : Opt
       if !arm.leasedInPhase2 then none
       else if s.hasActiveUuid arm.uuid then
         -- `RegisterActivePlanDirect` returns `AlreadyExistsError`
-        -- (`kv_cache_manager_with_transfer.cc:668-669`,
-        -- `kv_cache_manager_base.cc:3149-3156`). The local `recv_session` in
+        -- (`kv_cache_manager_with_transfer.cc:670-671`,
+        -- `kv_cache_manager_base.cc:3156-3163`). The local `recv_session` in
         -- `PoolReshardRegisterRecv` goes out of scope and its destructor calls
         -- `ReleasePoolStagingLeases(arm.uuid)`!
         some { s with
@@ -550,14 +550,14 @@ def ActiveSessionsHoldLeases (s : RegState) : Bool :=
     blocks.all (fun b => (s.arena.resolveBlockSlot uuid b).isSome))
 
 /-- **Risk R5 Constructive Counterexample Trace
-(`kv_cache_manager_with_transfer.cc:647-675`, `reshard_receive_session.cc:376, 447-456`)**:
+(`kv_cache_manager_with_transfer.cc:649-677`, `reshard_receive_session.cc:375, 446-455`)**:
 Under `.shipping`:
 1. Call 1 (`uuid = 7`, `blocks = [5]`) and Call 2 (duplicate `uuid = 7`,
    `blocks = [5]`) both pass Phase 1 (`beginArm`) before either reaches Phase 3.
 2. Call 1 acquires slot `0` for `(uuid = 7, block = 5)` in Phase 2 and completes
    Phase 3 (`finishArm 1`), becoming an active receive session.
 3. Call 2 executes Phase 2 (`acquireArmLease 2`), which succeeds idempotently on
-   `uuid = 7`'s existing lease (`kv_cache_manager_base.cc:2101-2106`), and then
+   `uuid = 7`'s existing lease (`kv_cache_manager_base.cc:2107-2112`), and then
    reaches Phase 3 (`finishArm 2`). `RegisterActivePlanDirect` rejects Call 2
    with `AlreadyExistsError`, and Call 2's `~ReshardReceiveSession` runs
    `ReleasePoolStagingLeases(7)` — freeing Call 1's slot `0` back to `freeSlots`
@@ -781,7 +781,7 @@ theorem mem_missingBlocksAux (cur : Option Lease) (blockIds seen : List Nat)
           · exact Or.inr (Or.inl h2)
         · exact Or.inr (Or.inr (List.mem_cons_of_mem hd h3))
 
-/-- **Postcondition of `acquireLease` (`kv_cache_manager_base.cc:2080-2137`)**:
+/-- **Postcondition of `acquireLease` (`kv_cache_manager_base.cc:2086-2143`)**:
 Whenever `a.acquireLease uuid blockIds = some a'`, every `b ∈ blockIds`
 resolves to `some slot` under `a'.resolveBlockSlot uuid b`. -/
 theorem acquireLease_resolves_all {a a' : Arena} {uuid : Nat} {blockIds : List Nat}
@@ -1224,7 +1224,7 @@ theorem trace_reserveBeforeLease_end_to_end :
   decide
 
 /-- Mutant 1: If `AcquirePoolStagingLease` did not deduplicate/skip blocks
-already leased to the same `uuid` (`kv_cache_manager_base.cc:2101`), two pools
+already leased to the same `uuid` (`kv_cache_manager_base.cc:2107`), two pools
 sharing a 3-slot storage and each needing 2 blocks `[10, 20]` would require
 `2 + 2 = 4 > 3` slots and fail with `ResourceExhausted`. -/
 def acquireLeaseWithoutIdempotence (a : Arena) (uuid : Nat) (blockIds : List Nat) : Option Arena :=
@@ -1245,7 +1245,7 @@ theorem mutant_non_idempotent_acquire_exhausts_shared_storage :
   decide
 
 /-- Mutant 2: If `ReleasePoolStagingLeases` erased `uuid` from `leases` without
-returning `lease.slots` to `free_slots` (`kv_cache_manager_base.cc:2146-2148`),
+returning `lease.slots` to `free_slots` (`kv_cache_manager_base.cc:2152-2154`),
 total slots would shrink and subsequent sessions would starve with
 `ResourceExhausted`. -/
 def releaseLeaseLeakingSlots (a : Arena) (uuid : Nat) : Arena :=

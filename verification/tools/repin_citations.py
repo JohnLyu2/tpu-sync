@@ -68,6 +68,12 @@ ALIASES = {
     "mgr.h": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h",
     "bt.cc": "tpu_sync/transport/block_transport.cc",
     "bt.h": "tpu_sync/transport/block_transport.h",
+    "coord.cc": "tpu_sync/kv_cache/reshard/reshard_coordinator.cc",
+    "coord.h": "tpu_sync/kv_cache/reshard/reshard_coordinator.h",
+    "base.cc": "tpu_sync/kv_cache/kv_cache_manager_base.cc",
+    "base.h": "tpu_sync/kv_cache/kv_cache_manager_base.h",
+    "slots.cc": "tpu_sync/core/pool_reshard_send_slots.cc",
+    "slots.h": "tpu_sync/core/pool_reshard_send_slots.h",
     "send_drain_test.cc":
         "tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc",
     "control_test.cc":
@@ -84,6 +90,8 @@ FROZEN = {"filed_bugs.md"}
 # Unqualified `.cc` / `.h` per source module: the stem of the default pair.
 RECV = "tpu_sync/kv_cache/transfer_receive_session"
 SEND = "tpu_sync/kv_cache/transfer_send_session"
+RESHARD_RECV = "tpu_sync/kv_cache/reshard_receive_session"
+RESHARD_SEND = "tpu_sync/kv_cache/reshard_send_session"
 DEFAULTS = {
     "TpuSyncVerify/Transfer/PrefillDecode/Receive.lean": RECV,
     "TpuSyncVerify/Transfer/PrefillDecode/ReceivePoll.lean": RECV,
@@ -91,8 +99,13 @@ DEFAULTS = {
     # any `send` paragraph must be checked by hand in the report.
     "TpuSyncVerify/Transfer/Session.lean": RECV,
     "TpuSyncVerify/Transfer/PrefillDecode/Send.lean": SEND,
+    "TpuSyncVerify/Transfer/Reshard/Receive.lean": RESHARD_RECV,
+    "TpuSyncVerify/Transfer/Reshard/Send.lean": RESHARD_SEND,
     # prefill_decode.md: rows about `Send.*` theorems cite send.cc — check.
     "docs/transfer/prefill_decode.md": RECV,
+    # reshard.md: rows about `Send.*` cite reshard_send_session.cc (which had
+    # zero line shifts between 50b0774 and 1fa06d1) — check.
+    "docs/transfer/reshard.md": RESHARD_RECV,
 }
 
 # File assumed by a bare `:N` citation when no explicit citation precedes it
@@ -178,8 +191,17 @@ class Mapper:
             self._hunks[path] = hs
         return self._hunks[path]
 
-    def resolve(self, tok):
+    def resolve(self, tok, rel=""):
         """Return (OLD-tree path | None, reason)."""
+        if "/Reshard/" in rel or rel.endswith("/reshard.md"):
+            if tok == "recv.cc":
+                return self.old_path(f"{RESHARD_RECV}.cc"), ""
+            if tok == "recv.h":
+                return self.old_path(f"{RESHARD_RECV}.h"), ""
+            if tok == "send.cc":
+                return self.old_path(f"{RESHARD_SEND}.cc"), ""
+            if tok == "send.h":
+                return self.old_path(f"{RESHARD_SEND}.h"), ""
         if tok in ALIASES:
             return self.old_path(ALIASES[tok]), ""
         if tok in EXTERNAL:
@@ -250,7 +272,7 @@ def process(src, rel, mapper, skips, apply):
         for m in CITE.finditer(line):
             tok, unq, nums = m.group("tok"), m.group("unq"), m.group("nums")
             if tok:
-                path, why = mapper.resolve(tok)
+                path, why = mapper.resolve(tok, rel)
                 label = tok
             elif unq:
                 ext = unq[2:]  # "cc" or "h"

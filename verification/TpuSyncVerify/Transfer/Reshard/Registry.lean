@@ -9,7 +9,7 @@
   registration, multi-owner planning claims, claim abandonment, per-unit
   completion voting, and unclaimed cancellation tombstones.
 
-  Pinned to upstream commit `50b0774`.
+  Pinned to upstream commit `1fa06d1`.
 
   ## C++ anchorage
 

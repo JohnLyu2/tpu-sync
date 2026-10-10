@@ -13,50 +13,50 @@ drives it (`PoolReshardRegisterRecv`, `OnPoolReceived`, `begin_incoming_push`,
 and aliased-page memory contents come in `Reshard/Send.lean` and Stage 2
 (`Reshard/Pipeline.lean`).
 
-Citations are to tpu-sync `50b0774`. Unqualified `.h`/`.cc` are
-`tpu_sync/core/reshard_receive_session.{h,cc}`; `mgr.cc` is
-`tpu_sync/core/kv_cache_manager_with_transfer.cc`; `bt.cc` is
+Citations are to tpu-sync `1fa06d1`. Unqualified `.h`/`.cc` are
+`tpu_sync/kv_cache/reshard_receive_session.{h,cc}`; `mgr.cc` is
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`; `utils.h` is
 `tpu_sync/core/utils.h`.
 
 ## How a reshard receive runs
 
-`PoolReshardRegisterRecv` (`mgr.cc:640-675`) creates a `ReshardReceiveSession`
-(`.cc:351-406`), acquiring bounded per-UUID `PoolStagingLease`s across the
-plan's destination storages (`.cc:408-445`), and registers the active plan
-(`mgr.cc:669`). Each transferred pool in `expected_pool_indices_` (`.h:177`)
-has an order rank in `pool_order_ranks_` (`.h:185`, `.cc:394-405`).
+`PoolReshardRegisterRecv` (`mgr.cc:642-677`) creates a `ReshardReceiveSession`
+(`.cc:350-405`), acquiring bounded per-UUID `PoolStagingLease`s across the
+plan's destination storages (`.cc:407-444`), and registers the active plan
+(`mgr.cc:671`). Each transferred pool in `expected_pool_indices_` (`.h:177`)
+has an order rank in `pool_order_ranks_` (`.h:185`, `.cc:393-404`).
 
 As incoming push streams arrive at `BlockTransport::HandleIncomingPush`
-(`bt.cc:374-622`), each stream takes a receive op via `begin_incoming_push`
-(`TryBeginRecvOp`, `mgr.cc:197-221`) and releases it in `end_incoming_push`
-(`EndRecvOp`, `mgr.cc:222-262`). When all `expected_pushes` streams for a pool
-have landed, the transport fires `OnPoolReceived(pool_idx)` (`bt.cc:605`,
-`mgr.cc:154-175`, `.cc:586-598`), which records the pool in
-`started_pool_indices_` (`.cc:527-538`) and calls `ExecuteEligiblePoolH2ds`
-(`.cc:600-652`).
+(`bt.cc:495-793`), each stream takes a receive op via `begin_incoming_push`
+(`TryBeginRecvOp`, `mgr.cc:198-223`) and releases it in `end_incoming_push`
+(`EndRecvOp`, `mgr.cc:224-264`). When all `expected_pushes` streams for a pool
+have landed, the transport fires `OnPoolReceived(pool_idx)` (`bt.cc:787`,
+`mgr.cc:155-176`, `.cc:585-597`), which records the pool in
+`started_pool_indices_` (`.cc:526-537`) and calls `ExecuteEligiblePoolH2ds`
+(`.cc:599-651`).
 
 `ExecuteEligiblePoolH2ds` selects under `mu_` every started, unlaunched pool
 whose strictly lower-rank prerequisite pools are all in
-`completed_pool_indices_` (`CollectEligiblePoolH2dsLocked`, `.cc:540-569`),
+`completed_pool_indices_` (`CollectEligiblePoolH2dsLocked`, `.cc:539-568`),
 marks them in `h2d_launched_pools_`, and adds `to_launch.size()` to `in_flight_`
-(`.cc:608-609`). Outside `mu_`, it loops over `to_launch`: for each pool it
-re-checks `done_ || draining_` under `mu_` (`.cc:619-624`, calling
+(`.cc:607-608`). Outside `mu_`, it loops over `to_launch`: for each pool it
+re-checks `done_ || draining_` under `mu_` (`.cc:618-623`, calling
 `EndRecvOpLocked()` and skipping the upload if the session finished in the
-window), dispatches `base_->H2dPoolBlocks` (`.cc:625-626`), pushes the future
-into `h2d_futures_` (`.cc:637-639`), and attaches `FinishPoolH2d` +
+window), dispatches `base_->H2dPoolBlocks` (`.cc:624-625`), pushes the future
+into `h2d_futures_` (`.cc:636-638`), and attaches `FinishPoolH2d` +
 `EndRecvOp` + `MaybeUnregisterSettledReshardRecv` to `future.OnReady`
-(`.cc:640-650`).
+(`.cc:639-649`).
 
-When a pool's H2D finishes, `FinishPoolH2d` (`.cc:654-692`) calls
-`RecordPoolH2dResultLocked` (`.cc:571-584`). On an intermediate OK completion
-(`!finished && status.ok()`, `.cc:665-667`), it calls `ExecuteEligiblePoolH2ds`
+When a pool's H2D finishes, `FinishPoolH2d` (`.cc:653-691`) calls
+`RecordPoolH2dResultLocked` (`.cc:570-583`). On an intermediate OK completion
+(`!finished && status.ok()`, `.cc:664-666`), it calls `ExecuteEligiblePoolH2ds`
 to launch the next rank wave before the outer callback's `EndRecvOp()` releases
-the completed pool's op (`.cc:645`). On the first error or when
+the completed pool's op (`.cc:644`). On the first error or when
 `completed_pool_indices_ == expected_pool_indices_`, `reshard_finalizing_` is
 set (`finished = true`), `network_completed_` and `should_record_duration` are
-latched on success (`.cc:681-684`), and `Finish(terminal_status)` drains the
-session (`.cc:686`).
+latched on success (`.cc:680-683`), and `Finish(terminal_status)` drains the
+session (`.cc:685`).
 
 ## State
 
@@ -68,11 +68,11 @@ pool is a `Pool := ⟨rank, stage⟩` in `pools : List Pool`:
 |--------------|------------------------------------------------------|--------------------------|
 | `.waiting`   | in `expected_pool_indices_`, not yet in `started_pool_indices_` | no |
 | `.received`  | in `started_pool_indices_`, not yet in `h2d_launched_pools_` | no |
-| `.queued`    | in `h2d_launched_pools_` after `in_flight_ += to_launch.size()` (`.cc:560, 609`), before the per-pool re-check lock (`.cc:619`) | yes |
-| `.issued`    | `H2dPoolBlocks` succeeded; future in `h2d_futures_` (`.cc:638`) with `!IsReady()` | yes |
+| `.queued`    | in `h2d_launched_pools_` after `in_flight_ += to_launch.size()` (`.cc:559, 608`), before the per-pool re-check lock (`.cc:618`) | yes |
+| `.issued`    | `H2dPoolBlocks` succeeded; future in `h2d_futures_` (`.cc:637`) with `!IsReady()` | yes |
 | `.ready`     | future in `h2d_futures_` has `IsReady()`, `OnReady` callback not yet completed | yes |
-| `.completed` | in `completed_pool_indices_` (`.cc:578`) and `EndRecvOp` ran (`.cc:645`) | no |
-| `.aborted`   | op ended without completing: skipped at re-check (`.cc:621`), or `H2dPoolBlocks`/`OnReady` failed or saw `reshard_finalizing_` | no |
+| `.completed` | in `completed_pool_indices_` (`.cc:577`) and `EndRecvOp` ran (`.cc:644`) | no |
+| `.aborted`   | op ended without completing: skipped at re-check (`.cc:620`), or `H2dPoolBlocks`/`OnReady` failed or saw `reshard_finalizing_` | no |
 
 Session-level fields:
 
@@ -81,37 +81,37 @@ Session-level fields:
 | `pools`            | `expected_pool_indices_`, `pool_order_ranks_`, `started_pool_indices_`, `h2d_launched_pools_`, `h2d_futures_`, `completed_pool_indices_` | per-pool state |
 | `life`             | `in_flight_`, `draining_`, `done_`, `status_`, `!staging_released_` (`.h:168-173`) | `Transfer.Lifecycle` |
 | `finalizing`       | `reshard_finalizing_` (`.h:174`)                                    | stops further H2D launches and results after first error or full completion |
-| `networkCompleted` | `network_completed_` (`.h:169`, set at `.cc:683`)                   | latched on final pool H2D success |
-| `planUnregistered` | `!unregister_on_settle_` (`.h:175`, claimed in `TakePendingUnregister` `.cc:498-506`) | active plan unregistered on settle |
-| `durationRecorded` | ghost (`should_record_duration` / `RecordTransferDuration`, `.cc:682, 688-691`) | end-of-transfer latency histogram recorded |
-| `published`        | membership in `done_recving_` / `failed_recving_` (`mgr.cc:1011-1012`) | what `poll_stats()` shows the engine |
-| `pushes`           | ghost                                                               | incoming pushes between `TryBeginRecvOp` (`mgr.cc:217`) and `EndRecvOp` (`mgr.cc:251`) |
+| `networkCompleted` | `network_completed_` (`.h:169`, set at `.cc:682`)                   | latched on final pool H2D success |
+| `planUnregistered` | `!unregister_on_settle_` (`.h:175`, claimed in `TakePendingUnregister` `.cc:497-505`) | active plan unregistered on settle |
+| `durationRecorded` | ghost (`should_record_duration` / `RecordTransferDuration`, `.cc:681, 687-690`) | end-of-transfer latency histogram recorded |
+| `published`        | membership in `done_recving_` / `failed_recving_` (`mgr.cc:1013-1014`) | what `poll_stats()` shows the engine |
+| `pushes`           | ghost                                                               | incoming pushes between `TryBeginRecvOp` (`mgr.cc:219`) and `EndRecvOp` (`mgr.cc:253`) |
 
 ## Events
 
 | Event               | C++ |
 |---------------------|-----|
-| `pushBegin`         | `TryBeginRecvOp` (`.h:96-101`) from `begin_incoming_push` (`mgr.cc:197-221`), called at `bt.cc:374` |
-| `pushEnd ok`        | `end_incoming_push` (`mgr.cc:222-262`), called at `bt.cc:617`. Parameterized by `PushEndPolicy`: `.shipping` runs `EndRecvOp()` unconditionally (`mgr.cc:251`), whereas `.finishOnError` calls `Finish(status)` before `EndRecvOp()` on `ok = false` (matching `4efb0dd` on `TransferReceiveSession`, `mgr.cc:239-242`) |
-| `onPoolReceived p`  | `OnPoolReceived(pool_idx)` (`.cc:586-598`) + `ExecuteEligiblePoolH2ds` first lock (`.cc:604-610`): records `p` in `started_pool_indices_` and batch-queues every eligible started pool |
-| `h2dIssue p ok`     | `ExecuteEligiblePoolH2ds` loop body for queued pool `p` (`.cc:611-651`): re-checks `done_ \|\| draining_` under `mu_` (`.cc:619-624`), otherwise dispatches `H2dPoolBlocks` |
+| `pushBegin`         | `TryBeginRecvOp` (`.h:96-101`) from `begin_incoming_push` (`mgr.cc:198-223`), called at `bt.cc:507` |
+| `pushEnd ok`        | `end_incoming_push` (`mgr.cc:224-264`), called at `bt.cc:632`. Parameterized by `PushEndPolicy`: `.shipping` runs `EndRecvOp()` unconditionally (`mgr.cc:253`), whereas `.finishOnError` calls `Finish(status)` before `EndRecvOp()` on `ok = false` (matching `4efb0dd` on `TransferReceiveSession`, `mgr.cc:241-244`) |
+| `onPoolReceived p`  | `OnPoolReceived(pool_idx)` (`.cc:585-597`) + `ExecuteEligiblePoolH2ds` first lock (`.cc:603-609`): records `p` in `started_pool_indices_` and batch-queues every eligible started pool |
+| `h2dIssue p ok`     | `ExecuteEligiblePoolH2ds` loop body for queued pool `p` (`.cc:610-650`): re-checks `done_ \|\| draining_` under `mu_` (`.cc:618-623`), otherwise dispatches `H2dPoolBlocks` |
 | `h2dReady p`        | device finishes pool `p`'s H2D copy: its future in `h2d_futures_` becomes `IsReady()` |
-| `h2dDone p ok`      | `future.OnReady` callback (`.cc:640-650`) calling `FinishPoolH2d` (`.cc:654-692`), `EndRecvOp`, and `MaybeUnregisterSettledReshardRecv` |
-| `pollReady`         | `CompleteReadWithDetails` sees `!IsDraining() && IsReadyToComplete()` and calls `Finish()` (`mgr.cc:999-1004`) |
-| `cancel`            | external `Finish(error)`: deadline (`mgr.cc:1004-1007`), shutdown (`mgr.cc:361-376`), or `UnregisterActivePlan` (`mgr.cc:707-713`) |
-| `publish`           | `CompleteReadWithDetails` moves a settled session into `done_recving_` or `failed_recving_`, claims `TakePendingUnregister`, and erases it (`mgr.cc:1010-1017`) |
+| `h2dDone p ok`      | `future.OnReady` callback (`.cc:639-649`) calling `FinishPoolH2d` (`.cc:653-691`), `EndRecvOp`, and `MaybeUnregisterSettledReshardRecv` |
+| `pollReady`         | `CompleteReadWithDetails` sees `!IsDraining() && IsReadyToComplete()` and calls `Finish()` (`mgr.cc:1001-1006`) |
+| `cancel`            | external `Finish(error)`: deadline (`mgr.cc:1006-1009`), shutdown (`mgr.cc:363-378`), or `UnregisterActivePlan` (`mgr.cc:709-715`) |
+| `publish`           | `CompleteReadWithDetails` moves a settled session into `done_recving_` or `failed_recving_`, claims `TakePendingUnregister`, and erases it (`mgr.cc:1012-1019`) |
 
 ## Assumptions
 
 * **A1 (at-most-once `OnPoolReceived` per declared pool).** `BlockTransport`
-  fires `OnPoolReceived(l, uuid)` only when `completed_chunks == expected_pushes`
-  (`bt.cc:532-605`), and `RecordPoolReceivedLocked` rejects undeclared or
-  duplicate pool indices (`.cc:527-538`). Encoded as the `onPoolReceived p`
+  fires `OnPoolReceived(l, uuid)` only when `plan_pushes == expected_chunks`
+  (`bt.cc:686-787`), and `RecordPoolReceivedLocked` rejects undeclared or
+  duplicate pool indices (`.cc:526-537`). Encoded as the `onPoolReceived p`
   guard `pool.stage == .waiting`. (Discharged in Stage 2 `Reshard/Pipeline.lean`
   by explicit stream counting.)
-* **A2 (registration before visibility).** `AcquireStagingLeases` (`.cc:376,
-  408-445`) and `RegisterActivePlanDirect` (`mgr.cc:669`) succeed before the
-  session is inserted into `active_pool_reshard_recvs_` (`mgr.cc:673`). If
+* **A2 (registration before visibility).** `AcquireStagingLeases` (`.cc:375,
+  407-444`) and `RegisterActivePlanDirect` (`mgr.cc:671`) succeed before the
+  session is inserted into `active_pool_reshard_recvs_` (`mgr.cc:675`). If
   registration fails, `~ReshardReceiveSession` releases the leases before any
   hook can find the session.
 * **A3 (no double end).** Each push and each H2D op ends at most once: `pushEnd`
@@ -119,11 +119,11 @@ Session-level fields:
   `h2dDone p` requires `stage == .ready`.
 * **A4 (fold of `RecordPoolReceivedLocked` / `RecordPoolH2dResultLocked` with
   `ExecuteEligiblePoolH2ds` first lock).** Between unlocking `mu_` after
-  recording a pool (`.cc:595` or `.cc:664`) and locking `mu_` in
-  `ExecuteEligiblePoolH2ds` (`.cc:604`), an external `Finish` has the same
-  effect as one arriving either before the event (where `.cc:605` skips
-  `CollectEligiblePoolH2dsLocked`) or immediately after `.cc:610` (where the
-  per-pool re-check at `.cc:620` aborts each queued pool and releases its op).
+  recording a pool (`.cc:594` or `.cc:663`) and locking `mu_` in
+  `ExecuteEligiblePoolH2ds` (`.cc:603`), an external `Finish` has the same
+  effect as one arriving either before the event (where `.cc:604` skips
+  `CollectEligiblePoolH2dsLocked`) or immediately after `.cc:609` (where the
+  per-pool re-check at `.cc:619` aborts each queued pool and releases its op).
 
 ## Properties
 
@@ -131,29 +131,29 @@ All proved on every reachable state (`reachable_safe`), under both
 `PushEndPolicy.shipping` and `PushEndPolicy.finishOnError`:
 
 * **Settle safety (`SettleSafe`).** `done → inFlight = 0`: a settled session
-  owns no in-flight push or H2D copy, as required by `.cc:616-618` and
-  `.cc:671-674`.
+  owns no in-flight push or H2D copy, as required by `.cc:615-617` and
+  `.cc:670-673`.
 * **No retired callback (`NoRetiredCallback`).** `done → poolOps pools = 0`:
   no pool is `.queued`, `.issued`, or `.ready` once settled, so the early return
-  `if (done_) return;` in `FinishPoolH2d` (`.cc:660`) is unreachable.
+  `if (done_) return;` in `FinishPoolH2d` (`.cc:659`) is unreachable.
 * **Staging integrity (`StagingIntegrity`).** `hasStaging = !done`: the bounded
   `PoolStagingLease` is held exactly until the session settles.
 * **Plan integrity (`PlanIntegrity`).** `(planUnregistered → done) ∧
   (published ≠ none → planUnregistered)`: the active transfer plan is never
   unregistered while any push or H2D copy can still resolve through it
-  (`.cc:671-674`, `mgr.cc:695-700`), and is always unregistered once published.
+  (`.cc:670-673`, `mgr.cc:697-702`), and is always unregistered once published.
 * **Prompt settle (`SettlesPromptly`).** `draining → inFlight = 0 → done`.
 * **Rank-wave ordering (`RankWaveOrder`).** For every pair of pools `p, q ∈ pools`,
   if `p` has launched (`p.stage.launched = true`) and `q.rank < p.rank`, then
   `q.stage = .completed`: no higher-rank pool is ever queued, issued, or
   completed before every strictly lower-rank pool has completed its H2D upload
-  (`.h:180-184`, `.cc:548-559`).
+  (`.h:180-184`, `.cc:547-558`).
 * **Readiness soundness (`ReadinessSound`).** `isReadyToComplete → allCompleted pools`:
   when `IsReadyToComplete()` holds, every expected pool has completed its H2D
   upload. Moreover, at callback granularity `pollReady` is never enabled on any
   reachable state (`reachable_pollReady_disabled`), because `FinishPoolH2d` sets
-  `network_completed_ = true` at `.cc:683` immediately before calling `Finish`
-  at `.cc:686` (and after latching `should_record_duration` at `.cc:682`).
+  `network_completed_ = true` at `.cc:682` immediately before calling `Finish`
+  at `.cc:685` (and after latching `should_record_duration` at `.cc:681`).
 * **Publication (`Publication`).** `published = some true → allCompleted pools ∧
   durationRecorded`: when `poll_stats()` reports `done_recving`, every expected
   pool has completed its H2D upload and the transfer duration metric has been
@@ -181,12 +181,12 @@ inductive PoolStage where
 namespace PoolStage
 
 /-- Stages that hold one unit of `in_flight_` (from `in_flight_ += to_launch.size()`
-at `.cc:609` until `EndRecvOpLocked` at `.cc:621` or `EndRecvOp` at `.cc:629, 645`). -/
+at `.cc:608` until `EndRecvOpLocked` at `.cc:620` or `EndRecvOp` at `.cc:628, 644`). -/
 def holdsOp : PoolStage → Bool
   | .queued | .issued | .ready => true
   | _ => false
 
-/-- Stages in `h2d_launched_pools_` (`.h:186`, inserted at `.cc:560`). -/
+/-- Stages in `h2d_launched_pools_` (`.h:186`, inserted at `.cc:559`). -/
 def launched : PoolStage → Bool
   | .waiting | .received => false
   | _ => true
@@ -208,9 +208,9 @@ structure Pool where
   stage : PoolStage := .waiting
   deriving Repr, DecidableEq
 
-/-- Policy for `end_incoming_push` on `ReshardReceiveSession` (`mgr.cc:251-261`):
+/-- Policy for `end_incoming_push` on `ReshardReceiveSession` (`mgr.cc:253-263`):
 `shipping` calls `EndRecvOp()` unconditionally; `finishOnError` mirrors the
-`TransferReceiveSession` branch (`4efb0dd`, `mgr.cc:239-242`) by calling
+`TransferReceiveSession` branch (`4efb0dd`, `mgr.cc:241-244`) by calling
 `Finish(status)` before `EndRecvOp()` when the incoming push failed. -/
 inductive PushEndPolicy where
   | shipping
@@ -240,17 +240,17 @@ def poolDrainSteps : List Pool → Nat
   | [] => 0
   | p :: ps => p.stage.drainSteps + poolDrainSteps ps
 
-/-- `completed_pool_indices_ == expected_pool_indices_` (`.cc:579`). -/
+/-- `completed_pool_indices_ == expected_pool_indices_` (`.cc:578`). -/
 def allCompleted (pools : List Pool) : Bool :=
   pools.all fun p => p.stage == .completed
 
-/-- `AllH2dDoneLocked` (`.cc:508-513`): every future pushed into `h2d_futures_`
-(`.cc:638`, stage `.issued`) has become `IsReady()`. -/
+/-- `AllH2dDoneLocked` (`.cc:507-512`): every future pushed into `h2d_futures_`
+(`.cc:637`, stage `.issued`) has become `IsReady()`. -/
 def allH2dDone (pools : List Pool) : Bool :=
   pools.all fun p => p.stage != .issued
 
 /-- Every expected pool of order rank strictly below `r` has completed its H2D
-upload (`.cc:548-559`). -/
+upload (`.cc:547-558`). -/
 def prereqsCompleted (pools : List Pool) (r : Nat) : Bool :=
   pools.all fun q => !(q.rank < r) || q.stage == .completed
 
@@ -259,7 +259,7 @@ lower-rank pools completed. -/
 def rankWaveOrder (pools : List Pool) : Bool :=
   pools.all fun p => !p.stage.launched || prereqsCompleted pools p.rank
 
-/-- `CollectEligiblePoolH2dsLocked` pass (`.cc:540-569`): transitions every
+/-- `CollectEligiblePoolH2dsLocked` pass (`.cc:539-568`): transitions every
 `.received` pool satisfying `canLaunch p.rank` to `.queued` and counts how many
 were launched. -/
 def launchPass (canLaunch : Nat → Bool) : List Pool → List Pool × Nat
@@ -272,20 +272,20 @@ def launchPass (canLaunch : Nat → Bool) : List Pool → List Pool × Nat
       (p :: ps', n)
 
 /-- Initial receiver armed for a plan whose transferred pools have order ranks
-`ranks` (`.cc:380-406`). -/
+`ranks` (`.cc:379-405`). -/
 def init (ranks : List Nat) : Recv :=
   { pools := ranks.map fun r => { rank := r, stage := .waiting } }
 
-/-- `IsReadyToComplete` (`.cc:515-518`). -/
+/-- `IsReadyToComplete` (`.cc:514-517`). -/
 def isReadyToComplete (s : Recv) : Bool :=
   s.networkCompleted && allH2dDone s.pools
 
-/-- `MaybeUnregisterSettledReshardRecv` (`mgr.cc:742-748`, `.cc:498-506`): once
+/-- `MaybeUnregisterSettledReshardRecv` (`mgr.cc:744-750`, `.cc:497-505`): once
 `done_` is set, claims `unregister_on_settle_` and unregisters the plan. -/
 def maybeUnregisterSettled (s : Recv) : Recv :=
   if s.life.done = true then { s with planUnregistered := true } else s
 
-/-- First critical section of `ExecuteEligiblePoolH2ds` (`.cc:604-610`): if not
+/-- First critical section of `ExecuteEligiblePoolH2ds` (`.cc:603-609`): if not
 done, draining, or finalizing, launches all eligible `.received` pools and adds
 `to_launch.size()` to `in_flight_`. -/
 def launchEligible (s : Recv) : Recv :=
@@ -306,22 +306,22 @@ inductive Ev where
   | publish
   deriving Repr, DecidableEq
 
-/-- `TryBeginRecvOp` (`.h:96-101`) from `begin_incoming_push` (`mgr.cc:197-221`). -/
+/-- `TryBeginRecvOp` (`.h:96-101`) from `begin_incoming_push` (`mgr.cc:198-223`). -/
 def pushBegin (s : Recv) : Option Recv :=
   s.life.beginOp.map fun l => { s with life := l, pushes := s.pushes + 1 }
 
-/-- `end_incoming_push` (`mgr.cc:222-262`). Under `.shipping`, only `EndRecvOp()`
-runs (`mgr.cc:251`); under `.finishOnError`, a failed push calls `Finish(status)`
-before `EndRecvOp()` (`mgr.cc:239-242`). If the session is now settled,
-`TakePendingUnregister` unregisters the plan (`mgr.cc:253-256`). -/
+/-- `end_incoming_push` (`mgr.cc:224-264`). Under `.shipping`, only `EndRecvOp()`
+runs (`mgr.cc:253`); under `.finishOnError`, a failed push calls `Finish(status)`
+before `EndRecvOp()` (`mgr.cc:241-244`). If the session is now settled,
+`TakePendingUnregister` unregisters the plan (`mgr.cc:255-258`). -/
 def pushEnd (pol : PushEndPolicy) (ok : Bool) (s : Recv) : Option Recv :=
   if s.pushes = 0 then none
   else
     let l := if pol == .finishOnError && !ok then s.life.finishLocked false else s.life
     some (maybeUnregisterSettled { s with life := l.endOpLocked, pushes := s.pushes - 1 })
 
-/-- `OnPoolReceived(pool_idx)` (`.cc:586-598`): records `p` in
-`started_pool_indices_` (`.cc:527-538`) and calls `ExecuteEligiblePoolH2ds`. -/
+/-- `OnPoolReceived(pool_idx)` (`.cc:585-597`): records `p` in
+`started_pool_indices_` (`.cc:526-537`) and calls `ExecuteEligiblePoolH2ds`. -/
 def onPoolReceived (p : Nat) (s : Recv) : Option Recv :=
   match s.pools[p]? with
   | some pool =>
@@ -331,12 +331,12 @@ def onPoolReceived (p : Nat) (s : Recv) : Option Recv :=
       some (launchEligible s₁)
   | none => none
 
-/-- Per-pool body of `ExecuteEligiblePoolH2ds` (`.cc:611-651`). Re-checks
-`done_ || draining_` under `mu_` (`.cc:619-624`); if set, calls
+/-- Per-pool body of `ExecuteEligiblePoolH2ds` (`.cc:610-650`). Re-checks
+`done_ || draining_` under `mu_` (`.cc:618-623`); if set, calls
 `EndRecvOpLocked()` and skips the upload. Otherwise dispatches `H2dPoolBlocks`:
 on synchronous failure calls `FinishPoolH2d`, `EndRecvOp`, and
-`MaybeUnregisterSettledReshardRecv` (`.cc:627-633`); on success pushes the
-future into `h2d_futures_` (`.cc:637-639`). -/
+`MaybeUnregisterSettledReshardRecv` (`.cc:626-632`); on success pushes the
+future into `h2d_futures_` (`.cc:636-638`). -/
 def h2dIssue (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
   match s.pools[p]? with
   | some pool =>
@@ -365,9 +365,9 @@ def h2dReady (p : Nat) (s : Recv) : Option Recv :=
     else none
   | none => none
 
-/-- `future.OnReady` callback (`.cc:640-650`) calling `FinishPoolH2d`
-(`.cc:654-692`), `EndRecvOp` (`.cc:645`), and `MaybeUnregisterSettledReshardRecv`
-(`.cc:648`). -/
+/-- `future.OnReady` callback (`.cc:639-649`) calling `FinishPoolH2d`
+(`.cc:653-691`), `EndRecvOp` (`.cc:644`), and `MaybeUnregisterSettledReshardRecv`
+(`.cc:647`). -/
 def h2dDone (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
   match s.pools[p]? with
   | some pool =>
@@ -400,17 +400,17 @@ def h2dDone (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
   | none => none
 
 /-- `CompleteReadWithDetails` polls a non-draining session and sees
-`IsReadyToComplete()` (`mgr.cc:999-1004`). -/
+`IsReadyToComplete()` (`mgr.cc:1001-1006`). -/
 def pollReady (s : Recv) : Option Recv :=
   if s.life.draining = false ∧ isReadyToComplete s = true then
     some { s with life := s.life.finishLocked true }
   else none
 
-/-- External `Finish(error)` (`mgr.cc:361-376, 707-713, 1004-1007`). -/
+/-- External `Finish(error)` (`mgr.cc:363-378, 709-715, 1006-1009`). -/
 def cancel (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false }
 
-/-- `CompleteReadWithDetails` publishes a settled session (`mgr.cc:1010-1017`). -/
+/-- `CompleteReadWithDetails` publishes a settled session (`mgr.cc:1012-1019`). -/
 def publish (s : Recv) : Option Recv :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk, planUnregistered := true }
@@ -671,7 +671,7 @@ def SettlesPromptly (s : Recv) : Prop :=
   s.life.draining = true → s.life.inFlight = 0 → s.life.done = true
 
 /-- Every launched pool has all strictly lower-rank pools completed (`.h:180-184`,
-`.cc:548-559`). -/
+`.cc:547-558`). -/
 def RankWaveOrder (s : Recv) : Prop := rankWaveOrder s.pools = true
 
 theorem rankWaveOrder_iff {s : Recv} :
@@ -1185,9 +1185,9 @@ theorem reachable_safe {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
   inv_safe pol (reachable_inv h)
 
 /-- Audit R3: at callback granularity `pollReady` (`IsReadyToComplete` in
-`CompleteReadWithDetails`, `mgr.cc:999-1004`) is disabled on every reachable
-state, because `FinishPoolH2d` sets `network_completed_ = true` (`.cc:683`)
-immediately before `Finish` (`.cc:686`). -/
+`CompleteReadWithDetails`, `mgr.cc:1001-1006`) is disabled on every reachable
+state, because `FinishPoolH2d` sets `network_completed_ = true` (`.cc:682`)
+immediately before `Finish` (`.cc:685`). -/
 theorem reachable_pollReady_disabled {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
     (h : (sys ranks pol).Reachable s) : step pol s .pollReady = none := by
   have hinv := reachable_inv h
@@ -1353,7 +1353,7 @@ Concrete traces, checked by `decide`, covering rank-wave ordering when a
 higher-rank pool arrives over the network before a lower-rank pool, batch H2D
 launch across same-rank pools, cancellation between the two locks of
 `ExecuteEligiblePoolH2ds`, duration metric recording (`FinishPoolReshardRecv*`
-in `kv_cache_manager_with_transfer_pool_reshard_test.cc:563-623`), and the R1
+in `kv_cache_manager_with_transfer_pool_reshard_test.cc:561-621`), and the R1
 comparison between `PushEndPolicy.shipping` and `PushEndPolicy.finishOnError`. -/
 
 /-- Two pools with order ranks `[0, 1]` (FA at rank 0, state class at rank 1 on
@@ -1406,7 +1406,7 @@ theorem trace_batch_launch_on_rank_wave :
       some (true, some true, true) := by
   decide
 
-/-- The race closed by the per-pool re-check at `.cc:619-624`: two rank-0 pools
+/-- The race closed by the per-pool re-check at `.cc:618-623`: two rank-0 pools
 are queued (`inFlight = 2`), the first issues its H2D copy, and `cancel` fires
 before the loop reaches the second pool's re-check lock. The second pool aborts
 and drops its op without starting an upload, while the first pool's in-flight
@@ -1425,7 +1425,7 @@ theorem trace_cancel_between_batch_queue_and_issue :
 
 /-- `FinishPoolReshardRecvRecordsDurationMetric` and
 `FinishPoolReshardRecvDoesNotRecordMetricOnFailure`
-(`kv_cache_manager_with_transfer_pool_reshard_test.cc:563-623`): duration is
+(`kv_cache_manager_with_transfer_pool_reshard_test.cc:561-621`): duration is
 recorded when the final pool's H2D completes OK, and is not recorded when a
 pool's H2D fails. -/
 theorem trace_duration_metric_on_success_and_failure :
@@ -1438,7 +1438,7 @@ theorem trace_duration_metric_on_success_and_failure :
       some (some false, false, true)) := by
   decide
 
-/-- Candidate observation R1 (`mgr.cc:251-261` vs. `:239-242`): when an incoming
+/-- Candidate observation R1 (`mgr.cc:253-263` vs. `:241-244`): when an incoming
 push fails (`pushEnd false`), the shipping hook ends the op without finishing
 the session, leaving `draining = false`, `done = false`, `hasStaging = true`,
 and `planUnregistered = false` until the external deadline (`cancel`). Under
@@ -1479,7 +1479,7 @@ def violates (pol : PushEndPolicy) (s : Recv) : Bool :=
 #guard ModelCheck.check (sys [0, 1] .finishOnError) (events 2) (violates .finishOnError) 8 = .outOfFuel
 
 /-- Mutant 1 (`launchIgnoringRank`): `CollectEligiblePoolH2dsLocked` ignores
-`pool_order_ranks_` (`.cc:548-559`) and launches every started pool immediately.
+`pool_order_ranks_` (`.cc:547-558`) and launches every started pool immediately.
 When pool 1 (rank 1) arrives before pool 0 (rank 0), pool 1 launches while
 pool 0 is still `.waiting`, violating `RankWaveOrder`. -/
 def onPoolReceivedIgnoringRank (p : Nat) (s : Recv) : Option Recv :=
@@ -1502,7 +1502,7 @@ def onPoolReceivedIgnoringRank (p : Nat) (s : Recv) : Option Recv :=
         | _ => false)
 
 /-- Mutant 2 (`h2dIssueLeak`): the re-check in `ExecuteEligiblePoolH2ds`
-(`.cc:619-623`) skips the upload on `done_ || draining_` without calling
+(`.cc:618-622`) skips the upload on `done_ || draining_` without calling
 `EndRecvOpLocked()`. A cancellation between queuing and issuing leaks the op,
 caught by `NoOpLeak`. -/
 def h2dIssueLeak (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
@@ -1521,7 +1521,7 @@ def h2dIssueLeak (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
         | _ => false)
 
 /-- Mutant 3 (`unregisterEarly`): `FinishPoolH2d` unregisters the active plan
-as soon as `reshard_finalizing_` is set (`.cc:671-674`), before waiting for an
+as soon as `reshard_finalizing_` is set (`.cc:670-673`), before waiting for an
 open incoming push (`pushes > 0`) to end, violating `PlanIntegrity`. -/
 def cancelUnregisterEarly (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false, planUnregistered := true }

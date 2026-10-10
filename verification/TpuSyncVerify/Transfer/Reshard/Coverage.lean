@@ -4,28 +4,28 @@
   Stage 3a of `docs/transfer/reshard.md`: horizontal data-plane refinement of
   `Reshard/Pipeline.lean` for sub-block byte-interval coverage and multi-sender
   push-stream accounting:
-    * `tpu_sync/core/reshard_receive_session.cc` (`ValidatePlan`,
-      `ValidateReceiverCoverage`, lines 80–349)
+    * `tpu_sync/kv_cache/reshard_receive_session.cc` (`ValidatePlan`,
+      `ValidateReceiverCoverage`, lines 79–348)
     * `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (`expected_pushes`
       computation and `ValidateSpanCoverage`, lines 1091–1140)
-    * `tpu_sync/core/reshard_send_session.cc` (`ExecutePush` / `StartPoolPush`
+    * `tpu_sync/kv_cache/reshard_send_session.cc` (`ExecutePush` / `StartPoolPush`
       per-peer `(src_block_id, dst_block_id)` deduplication, lines 195–216,
       283–339)
     * `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`,
       lines 23–54)
     * `tpu_sync/transport/block_transport.cc` (`AsyncPush` stream clamping
       `P = min(parallelism, num_blocks)` and `HandleIncomingPush` plan-declared
-      progress counter, lines 485–580, 801–827)
+      progress counter, lines 651–762, 1010–1046)
 
-  Citations in this file are checked against tpu-sync `50b0774`.
+  Citations in this file are checked against tpu-sync `1fa06d1`.
 
   What this module proves:
   1. **Multi-sender stream count conservation (`stream_count_matches`,
      `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
      `(src_block_id, dst_block_id)` pairs for a pool group and opens
-     `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:811-816`,
+     `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:1020-1025`,
      `reshard_send_session.cc:283-331`). `ValidateReceiverCoverage`
-     (`reshard_receive_session.cc:314-324`) checks that the receiver's
+     (`reshard_receive_session.cc:313-323`) checks that the receiver's
      `expected_pushes` equals `∑_s min(parallelism, |pairs_s|)`, matching the
      planner (`pool_reshard_planner.cc:1108-1116`).
   2. **Exact sub-block byte reconstruction under out-of-order stream arrival
@@ -34,7 +34,7 @@
      `ValidateReceiverCoverage` sorts the logical live-byte intervals
      `[start_bytes, end_bytes)` targeting a destination block and checks that
      they partition `[0, extent)` without gaps or overlaps
-     (`reshard_receive_session.cc:325-346`). We prove that any interval list
+     (`reshard_receive_session.cc:324-345`). We prove that any interval list
      accepted by this check is pairwise disjoint and covers every byte
      `b < extent`, so landing the intervals in *any* network arrival order
      reconstructs `good extent` (`[kv 0, …, kv (extent - 1)]`).
@@ -57,13 +57,13 @@ open TpuSyncVerify.Transfer.Reshard.Pipeline
 /-! ## Part 1: Multi-sender `(src_block, dst_block)` pair deduplication and stream counts -/
 
 /-- Alogical sub-block range `[startByte, endByte)` inside a destination block's
-live byte extent (`reshard_receive_session.cc:289-304`). -/
+live byte extent (`reshard_receive_session.cc:288-303`). -/
 structure Interval where
   startByte : Nat
   endByte : Nat
   deriving Repr, DecidableEq
 
-/-- One entry of a pool group's push schedule (`reshard_receive_session.cc:266-308`,
+/-- One entry of a pool group's push schedule (`reshard_receive_session.cc:265-307`,
 `reshard_send_session.cc:285-294`), attributed to `sender` (`source_rank`). -/
 structure ScheduleEntry where
   sender : Nat
@@ -73,26 +73,26 @@ structure ScheduleEntry where
   deriving Repr, DecidableEq
 
 /-- Distinct `(srcBlock, dstBlock)` pairs scheduled for `sender`
-(`reshard_send_session.cc:283-294`, `reshard_receive_session.cc:305-307`). -/
+(`reshard_send_session.cc:283-294`, `reshard_receive_session.cc:304-306`). -/
 def senderPairs (entries : List ScheduleEntry) (sender : Nat) : List (Nat × Nat) :=
   ((entries.filter fun e => e.sender == sender).map fun e => (e.srcBlock, e.dstBlock)).eraseDups
 
 /-- Number of TCP push streams opened by `sender` under `parallelism`:
 `BlockTransport::AsyncPush` clamps `P = min(parallelism, num_blocks)`
-(`block_transport.cc:801-816`), and a sender with zero pairs opens no streams
+(`block_transport.cc:1010-1025`), and a sender with zero pairs opens no streams
 (`reshard_send_session.cc:208-215`). -/
 def senderStreams (parallelism : Nat) (entries : List ScheduleEntry) (sender : Nat) : Nat :=
   Nat.min parallelism (senderPairs entries sender).length
 
 /-- Total push streams recomputed across `senders` (`pool_reshard_planner.cc:1108-1116`,
-`reshard_receive_session.cc:314-318`). -/
+`reshard_receive_session.cc:313-317`). -/
 def recomputedExpectedPushes (parallelism : Nat) (senders : List Nat)
     (entries : List ScheduleEntry) : Nat :=
   match senders with
   | [] => 0
   | s :: ss => senderStreams parallelism entries s + recomputedExpectedPushes parallelism ss entries
 
-/-- Receiver push-count validation (`reshard_receive_session.cc:188-192, 314-324`
+/-- Receiver push-count validation (`reshard_receive_session.cc:187-191, 313-323`
 and `pool_reshard_planner.cc:1118-1126`). -/
 def validateExpectedPushes (parallelism : Nat) (senders : List Nat)
     (entries : List ScheduleEntry) (expectedPushes : Nat) : Bool :=
@@ -122,7 +122,7 @@ theorem senderStreams_le_pairs (parallelism : Nat) (entries : List ScheduleEntry
 
 /-- When `validateExpectedPushes` succeeds, the sum of streams emitted by all
 senders in `senders` equals the receiver's `expectedPushes`, and `0 < expectedPushes`
-(`reshard_receive_session.cc:319-324`, `pool_reshard_planner.cc:1108-1126`). -/
+(`reshard_receive_session.cc:318-323`, `pool_reshard_planner.cc:1108-1126`). -/
 theorem stream_count_matches {parallelism : Nat} {senders : List Nat}
     {entries : List ScheduleEntry} {expectedPushes : Nat}
     (h : validateExpectedPushes parallelism senders entries expectedPushes = true) :
@@ -134,7 +134,7 @@ theorem stream_count_matches {parallelism : Nat} {senders : List Nat}
 /-! ## Part 2: Sub-block interval partition and byte-level block reconstruction -/
 
 /-- Contiguous interval scan from `ValidateReceiverCoverage`
-(`reshard_receive_session.cc:329-345`): starting at `coveredUntil`, each
+(`reshard_receive_session.cc:328-344`): starting at `coveredUntil`, each
 interval `[startByte, endByte)` must start at `coveredUntil` (`start_bytes ==
 covered_until`, rejecting both overlaps `start_bytes < covered_until` and gaps
 `start_bytes > covered_until`) and be non-empty (`startByte < endByte`, from
@@ -148,13 +148,13 @@ def checkContiguousIntervals (coveredUntil : Nat) : List Interval → Option Nat
     else
       none
 
-/-- Full block coverage check (`reshard_receive_session.cc:246-252, 329-346`):
+/-- Full block coverage check (`reshard_receive_session.cc:245-251, 328-345`):
 `0 < extent` and the sorted intervals partition `[0, extent)`. -/
 def validBlockCoverage (extent : Nat) (intervals : List Interval) : Bool :=
   decide (0 < extent) && decide (checkContiguousIntervals 0 intervals = some extent)
 
 /-- Write one logical byte interval `[iv.startByte, iv.endByte)` into a
-destination block byte buffer (`block_transport.cc:463-466`). Byte `b` in range
+destination block byte buffer (`block_transport.cc:603-606`). Byte `b` in range
 receives `.kv b`. -/
 def writeInterval (iv : Interval) (buf : List Cell) : List Cell :=
   buf.mapIdx fun b c => if iv.startByte ≤ b ∧ b < iv.endByte then .kv b else c
@@ -461,14 +461,14 @@ theorem mutant_gap_in_coverage_leaves_unwritten_byte :
   decide
 
 /-- Mutant 2: overlapping sub-block intervals (`[0, 20)` and `[16, 32)`) are
-rejected by `validBlockCoverage` (`reshard_receive_session.cc:331-336`). -/
+rejected by `validBlockCoverage` (`reshard_receive_session.cc:330-335`). -/
 theorem mutant_overlap_in_coverage_rejected :
     validBlockCoverage 32 [⟨0, 20⟩, ⟨16, 32⟩] = false := by
   decide
 
 /-- Mutant 3: declaring `expected_pushes = 4` (e.g. summing raw pairs instead
 of `min(parallelism, |pairs_s|)`) is rejected by `validateExpectedPushes`
-(`reshard_receive_session.cc:319-324`). -/
+(`reshard_receive_session.cc:318-323`). -/
 theorem mutant_mismatched_expected_pushes_rejected :
     let entries : List ScheduleEntry :=
       [ ⟨0, 10, 0, ⟨0, 8⟩⟩

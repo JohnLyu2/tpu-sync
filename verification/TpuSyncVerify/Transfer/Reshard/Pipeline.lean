@@ -8,18 +8,18 @@ import TpuSyncVerify.Transfer.Reshard.Send
 Stage 2 of the pool-addressed resharding model (`docs/transfer/reshard.md`):
 composes `Reshard.Send` (`ReshardSendSession`, `Send.lean`), `Reshard.Recv`
 (`ReshardReceiveSession`, `Receive.lean`), the plan-declared stream progress in
-`BlockTransport::HandleIncomingPush` (`bt.cc:478-622`), the Arm-then-Dispatch
+`BlockTransport::HandleIncomingPush` (`bt.cc:640-793`), the Arm-then-Dispatch
 coordination barrier in `ReshardCoordinator::ExecutePoolReshard`
-(`coord.cc:414-530`), and the five memories KV data moves through between source
+(`coord.cc:429-549`), and the five memories KV data moves through between source
 and destination HBM — including **aliased device pages** shared across pool
-ranks (`recv.h:180-184`, `base.h:667-670`).
+ranks (`recv.h:180-184`, `base.h:689-692`).
 
-Citations are to tpu-sync `50b0774`:
-* `send.cc` — `tpu_sync/core/reshard_send_session.cc`
+Citations are to tpu-sync `1fa06d1`:
+* `send.cc` — `tpu_sync/kv_cache/reshard_send_session.cc`
 * `slots.cc` — `tpu_sync/core/pool_reshard_send_slots.cc`
-* `recv.h` / `recv.cc` — `tpu_sync/core/reshard_receive_session.{h,cc}`
+* `recv.h` / `recv.cc` — `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`
 * `bt.cc` — `tpu_sync/transport/block_transport.cc`
-* `mgr.cc` — `tpu_sync/core/kv_cache_manager_with_transfer.cc`
+* `mgr.cc` — `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`
 * `base.h` — `tpu_sync/kv_cache/kv_cache_manager_base.h`
 * `coord.cc` — `tpu_sync/kv_cache/reshard/reshard_coordinator.cc`
 
@@ -34,12 +34,12 @@ padding on an aliased page), or `.blank` (never written on the wire).
 | `srcHbm`     | producer KV cache in source HBM | `reclaim` (after `send.published ≠ none`) |
 | `srcStaging` | sender `PoolStagingStorage` (`send.cc:139-145`) | `send (.d2hDone p true)`, `reseatSrcStaging` |
 | `wire`       | bytes delivered by sender peer pushes (`send.cc:332-337`) | `send (.pushDone p true)` |
-| `dstStaging` | receiver `PoolStagingStorage` (`recv.cc:302-308`) | `landStream p` (`bt.cc:467-524`), `reseatDstStaging` |
-| `dstHbm`     | consumer KV cache in destination HBM (`recv.cc:592-691`) | `recv (.h2dDone p true)` via `writePoolHbm` |
+| `dstStaging` | receiver `PoolStagingStorage` (`recv.cc:301-307`) | `landStream p` (`bt.cc:603-685`), `reseatDstStaging` |
+| `dstHbm`     | consumer KV cache in destination HBM (`recv.cc:591-690`) | `recv (.h2dDone p true)` via `writePoolHbm` |
 
 ### Modelling aliased device pages (`writePoolHbm`)
 
-On hybrid attention + state arenas (`base.h:667-670`, `recv.h:180-184`), pools
+On hybrid attention + state arenas (`base.h:689-692`, `recv.h:180-184`), pools
 of different ranks can share physical HBM pages: a lower-rank pool's coarse H2D
 copy writes across the page (clobbering bytes belonging to higher-rank pools),
 and higher-rank H2D waves are meant to run afterwards to overwrite those bytes
@@ -75,7 +75,7 @@ namespace Pipeline
 def good (n : Nat) : List Cell := (List.range n).map Cell.kv
 
 /-- Coarse lower-rank H2D copy clobbers any strictly higher-rank pool slot on an
-aliased arena page (`recv.h:180-184`, `base.h:667-670`). -/
+aliased arena page (`recv.h:180-184`, `base.h:689-692`). -/
 def clobberHigherRanks (pools : List Pool) (r : Nat) (hbm : List Cell) : List Cell :=
   List.zipWith (fun pool c => if r < pool.rank then .junk else c) pools hbm
 
@@ -87,7 +87,7 @@ def writePoolHbm (pools : List Pool) (p : Nat) (r : Nat) (val : Cell)
 
 /-- A reshard pipeline schedule is valid when there is at least one pool,
 `ranks` and `peerCounts` have the same length, and every pool has at least one
-expected push stream (`recv.cc:138-140`, `slots.cc:43-49`). -/
+expected push stream (`recv.cc:137-139`, `slots.cc:43-49`). -/
 def validConfig (ranks peerCounts : List Nat) : Bool :=
   !ranks.isEmpty && (ranks.length == peerCounts.length) && peerCounts.all (0 < ·)
 
@@ -106,11 +106,11 @@ structure Pipeline where
   dstHbm : List Cell
   /-- Completed sender peer pushes per pool (`send.cc:332-337`). -/
   sentStreams : List Nat
-  /-- Streams landed by `BlockTransport::HandleIncomingPush` per pool (`bt.cc:519`). -/
+  /-- Streams landed by `BlockTransport::HandleIncomingPush` per pool (`bt.cc:684`). -/
   landedStreams : List Nat
   /-- Whether source HBM has been freed after `send.published ≠ none`. -/
   reclaimed : Bool := false
-  /-- Whether `PoolReshardRegisterRecv` has armed the receiver (`coord.cc:418-452`). -/
+  /-- Whether `PoolReshardRegisterRecv` has armed the receiver (`coord.cc:433-475`). -/
   armed : Bool := true
   deriving Repr, DecidableEq
 
@@ -136,7 +136,7 @@ def init (ranks peerCounts : List Nat) : Pipeline :=
     armed := true }
 
 /-- Initial state before Phase 1 of `ReshardCoordinator::ExecutePoolReshard`
-(`PoolReshardRegisterRecv`, `coord.cc:418-452`) has armed the receiver. -/
+(`PoolReshardRegisterRecv`, `coord.cc:433-475`) has armed the receiver. -/
 def initUnarmed (ranks peerCounts : List Nat) : Pipeline :=
   { init ranks peerCounts with armed := false }
 
@@ -150,15 +150,15 @@ inductive Ev where
   | reseatDstStaging
   deriving Repr, DecidableEq
 
-/-- Phase 1 of `ReshardCoordinator::ExecutePoolReshard` (`coord.cc:418-452`,
-`mgr.cc:640-725`): `PoolReshardRegisterRecv` arms the destination receiver. -/
+/-- Phase 1 of `ReshardCoordinator::ExecutePoolReshard` (`coord.cc:433-475`,
+`mgr.cc:642-727`): `PoolReshardRegisterRecv` arms the destination receiver. -/
 def armRecv (s : Pipeline) : Option Pipeline :=
   if s.armed = false then
     some { s with armed := true }
   else none
 
 /-- Sender transition (`send.cc:220-430`). Launching a D2H copy
-(`d2hIssue p true`) requires the receiver to be armed (`coord.cc:454-525`);
+(`d2hIssue p true`) requires the receiver to be armed (`coord.cc:480-544`);
 `d2hDone p true` copies `srcHbm[p]` into `srcStaging[p]`; `pushDone p true`
 places `srcStaging[p]` on `wire[p]` and increments `sentStreams[p]`. -/
 def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
@@ -184,9 +184,9 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   | e =>
     (Send.step .shipping s.send e).map fun snd => { s with send := snd }
 
-/-- Receiver transition (`recv.cc:498-695`, `bt.cc:557-605`). `pushBegin`
-requires the receiver to be armed (`mgr.cc:154-200`); `onPoolReceived p`
-requires all `peerCounts[p]` expected streams to have landed (`bt.cc:557-605`);
+/-- Receiver transition (`recv.cc:497-694`, `bt.cc:742-787`). `pushBegin`
+requires the receiver to be armed (`mgr.cc:155-201`); `onPoolReceived p`
+requires all `peerCounts[p]` expected streams to have landed (`bt.cc:742-787`);
 `h2dDone p true` writes `dstStaging[p]` to `dstHbm[p]` and clobbers any strictly
 higher-rank pool slots on the aliased page (`writePoolHbm`). -/
 def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
@@ -214,7 +214,7 @@ def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
     (Recv.step .shipping s.recv e).map fun rcv => { s with recv := rcv }
 
 /-- `BlockTransport::HandleIncomingPush` lands one push stream for pool `p` into
-`dstStaging[p]` and increments `completed_chunks` (`bt.cc:467-524`). -/
+`dstStaging[p]` and increments `completed_chunks` (`bt.cc:603-685`). -/
 def landStream (s : Pipeline) (p : Nat) : Option Pipeline :=
   if 0 < s.recv.pushes then
     match s.landedStreams[p]?, s.sentStreams[p]?, s.wire[p]? with
@@ -227,21 +227,21 @@ def landStream (s : Pipeline) (p : Nat) : Option Pipeline :=
   else none
 
 /-- Source engine/registry reclaims producer HBM once `CompleteReadWithDetails`
-has published the send session (`mgr.cc:947-953`, `coord.cc:624-662`). -/
+has published the send session (`mgr.cc:949-955`, `coord.cc:643-681`). -/
 def reclaim (s : Pipeline) : Option Pipeline :=
   if s.send.published ≠ none ∧ s.reclaimed = false then
     some { s with srcHbm := List.replicate s.numPools .junk, reclaimed := true }
   else none
 
 /-- Released sender `PoolStagingLease` slots may be reused by another transfer
-(`mgr.cc:609-637`, `send.cc:412-424`). -/
+(`mgr.cc:611-639`, `send.cc:412-424`). -/
 def reseatSrcStaging (s : Pipeline) : Option Pipeline :=
   if s.send.life.hasStaging = false then
     some { s with srcStaging := List.replicate s.numPools .junk }
   else none
 
 /-- Released receiver `PoolStagingLease` slots may be reused by another transfer
-(`mgr.cc:647-675`, `recv.cc:468-472`). -/
+(`mgr.cc:649-677`, `recv.cc:467-471`). -/
 def reseatDstStaging (s : Pipeline) : Option Pipeline :=
   if s.recv.life.hasStaging = false then
     some { s with dstStaging := List.replicate s.numPools .junk }
@@ -375,7 +375,7 @@ def StagingSafe (s : Pipeline) : Prop :=
   (s.recv.life.hasStaging = false →
     s.recv.pushes = 0 ∧ Recv.poolOps s.recv.pools = 0)
 
-/-- Plan-declared transport progress accounting (`bt.cc:519-605`): landed streams
+/-- Plan-declared transport progress accounting (`bt.cc:684-787`): landed streams
 never exceed sent streams, sent streams never exceed `peerCounts`, and any pool
 that has passed `OnPoolReceived` (`stage ≠ .waiting`) has landed all
 `peerCounts[p]` expected streams. -/
@@ -386,7 +386,7 @@ def StreamAccountingSafe (s : Pipeline) : Prop :=
     (∀ pool, s.recv.pools[p]? = some pool → pool.stage ≠ .waiting →
       s.landedStreams.getD p 0 = s.peerCounts.getD p 0)
 
-/-- Two-phase Arm-then-Dispatch barrier (`coord.cc:418-525`): before
+/-- Two-phase Arm-then-Dispatch barrier (`coord.cc:433-544`): before
 `PoolReshardRegisterRecv` arms the receiver (`armed = false`), no sender pool
 has launched a D2H copy or push and no receiver push or H2D is active. -/
 def NoUnarmedPush (s : Pipeline) : Prop :=
@@ -2381,7 +2381,7 @@ theorem reachable_unarmed_can_settle {ranks peerCounts : List Nat} {s : Pipeline
 ### Out-of-order network arrival on aliased device pages
 
 Two pools with `ranks = [0, 1]` and `peerCounts = [1, 2]` share an aliased
-device page (`recv.h:180-184`, `base.h:667-670`). Even when pool 1 (rank 1, 2
+device page (`recv.h:180-184`, `base.h:689-692`). Even when pool 1 (rank 1, 2
 peer streams) finishes landing all of its network streams and calls
 `onPoolReceived 1` **before** pool 0 (rank 0, 1 peer stream) has landed its
 stream:
@@ -2432,7 +2432,7 @@ theorem trace_aliased_page_out_of_order_arrival :
       (fun p => (p.send.published, p.recv.published, p.dstHbm, p.reclaimed)) =
       some (some true, some true, [.kv 0, .kv 1], true) := by decide
 
-/-- Two-phase Arm-then-Dispatch trace (`coord.cc:418-525`): from `initUnarmed`,
+/-- Two-phase Arm-then-Dispatch trace (`coord.cc:433-544`): from `initUnarmed`,
 neither sender D2H (`d2hIssue 0 true`) nor receiver `pushBegin` can fire before
 `armRecv`; once `armRecv` runs, the transfer completes cleanly. -/
 theorem trace_arm_before_dispatch :
@@ -2501,7 +2501,7 @@ def violates (s : Pipeline) : Bool := !checkSafe s
 2. **Premature `OnPoolReceived` (`stepPrematurePoolReceived`)**: if
    `BlockTransport::HandleIncomingPush` fires `OnPoolReceived(p)` on the first
    arriving stream (`0 < landedStreams[p]`) instead of waiting for all
-   `peerCounts[p]` streams (`bt.cc:557-605`), `StreamAccountingSafe` is violated.
+   `peerCounts[p]` streams (`bt.cc:742-787`), `StreamAccountingSafe` is violated.
 3. **Premature producer reclamation (`stepReclaimEarly`)**: if producer HBM is
    reclaimed before `send.published ≠ none`, D2H copies `.junk` into destination
    HBM and violates `PublicationCorrect`.
