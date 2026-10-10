@@ -424,6 +424,29 @@ after `transfer_future.Await()` returns (`:475`, `:527`).
   destroyed first among the members that matter, so this is probably safe.
   Not verified.
 
+## Observations on the prefill-to-decode path (non-bugs at `50b0774`)
+
+Behaviours that looked like defects during the prefill-to-decode model work and
+turned out to be intended, dead, or proved unreachable. Kept here so they are not
+re-investigated; the Lean names in the last column are the proofs. Short names
+as in the Lean preambles: `recv.cc` = `tpu_sync/core/transfer_receive_session.cc`,
+`send.cc` = `tpu_sync/core/transfer_send_session.cc`,
+`mgr.cc` = `tpu_sync/core/kv_cache_manager_with_transfer.cc`,
+`bt.cc` = `tpu_sync/transport/block_transport.cc`.
+
+| Observation | Where (`50b0774`) | Note |
+|---|---|---|
+| client-side `SendAck` has no non-test caller; the server-side `OnAck → HandleAck → AckSend → Finish()` handler is wired but never triggered in-repo | `grpc_control_plane_backend.cc:365`, `tcp_control_plane_backend.cc:662`; `mgr.cc:1374-1376, 1551-1554, 1617-1628` | dead path; excluded (`Send` A5) |
+| a failed **send** is reported in `failed_recving_` | `mgr.cc:927-928` | naming/semantics quirk visible through `poll_stats()` |
+| first `Finish` wins on the send side; a later cancel is ignored | `send.cc:167-176` | intended; `trace_cancel_after_ok_finish` |
+| `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:430-436` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:663-669, 683-693`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlocksReceived` are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll (design alternative `stepM false` in `ReceivePoll.lean`) keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). |
+| `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:189-196` vs `recv.cc:387-390` | underflow proved unreachable (`NoUnderflow`) |
+| `LOG(DFATAL) "H2D callback for retired receive"` is unreachable | `recv.cc:655-657` | proved (`NoRetiredCallback`) |
+| `done_` is redundant in six lifecycle guards | `recv.cc:368, 392, 541, 586, 612`, `recv.h:117` (send side: `send.cc:168, 191, 238, 252, 299`) | `done → draining` and `done → in_flight_ == 0` are `Lifecycle.Consistent`, which every model keeps in its invariant (`Inv.life`); the guards without `done_` are the same functions on consistent states (`finishLocked'_eq`, `endOpLocked'_eq`, `beginOp'_eq`, `Consistent.done_or_draining`). Defensive code, not a bug. The two `LOG(DFATAL)` branches (`recv.cc:387-390`, `655-657`) are assertions — unreachable by `Accounted` / `NoRetiredCallback` — and stay. `Session.lean` |
+| a failed incoming push reaches the session as a flat `InternalError("Incoming push failed")` | `bt.cc:376-381` → `mgr.cc:239-242` (`4efb0dd`) | the actual cause (read timeout, size mismatch, `OnLayerReceived` error) is only in the transport log, so `failed_recving` cannot tell them apart. Observability, not correctness; the model does not distinguish error statuses. |
+
+---
+
 ## Fix validation (2026-09-24, on `b68161a`)
 
 `candidate_fixes.patch` was applied to a scratch clone, the tests run, and the

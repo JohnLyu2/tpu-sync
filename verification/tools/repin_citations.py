@@ -24,7 +24,7 @@ For every citation, the cited OLD line range is mapped through
 With --apply, `same`/`shift`/`grown` citations are rewritten in place; a
 citation with any CHECK element is left untouched as a whole. The preamble
 sentence that names the commit is *not* rewritten — change it by hand once the
-report is clean, and record the re-check in `docs/transfer/prefill_decode.md`
+report is clean, and record the re-check in `docs/upstream_rechecks.md`
 (see `docs/conventions.md`).
 
 Recognised forms (the number must follow a colon):
@@ -80,8 +80,9 @@ DEFAULTS = {
     # any `send` paragraph must be checked by hand in the report.
     "TpuSyncVerify/Transfer/Session.lean": RECV,
     "TpuSyncVerify/Transfer/PrefillDecode/Send.lean": SEND,
-    # prefill_decode.md: rows about `Send.*` theorems cite send.cc — check.
+    # prefill_decode*.md: rows about `Send.*` theorems cite send.cc — check.
     "docs/transfer/prefill_decode.md": RECV,
+    "docs/transfer/prefill_decode_tests.md": RECV,
 }
 
 # File assumed by a bare `:N` citation when no explicit citation precedes it

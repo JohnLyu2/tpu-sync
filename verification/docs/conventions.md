@@ -76,8 +76,7 @@ Each model file, in order:
 heavily cited files in the docstring preamble (`recv.cc`, `mgr.cc`, `bt.cc`).
 Line numbers are for reading alongside the code, not for machine checking;
 when upstream moves, re-check the cited regions and update the commit in the
-preamble (`docs/transfer/prefill_decode.md` records what was re-checked and
-when).
+preamble (`docs/upstream_rechecks.md` records what was re-checked and when).
 
 ## Assumptions
 

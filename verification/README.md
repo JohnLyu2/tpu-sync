@@ -19,7 +19,8 @@ verification/
 │   │                                        # PipelineChecks, PeerIsolation, UuidTable, BlockOrdering
 │   └── Controller/ReadRemote.lean           # exhaustive check behind finding F2
 ├── agents/tpu-sync-lean-helper/             # Lean-backed Q&A and code-reasoning subagent
-├── docs/                                    # correspondence tables, results, upstream re-checks
+├── docs/                                    # routing index + results (prefill_decode.md), replay evidence
+│                                            # (prefill_decode_tests.md), conventions, upstream_rechecks.md
 ├── findings/                                # bug-hunt write-up, repro tests, patches
 ├── tools/                                   # repin_citations.py, run_lean.sh (stdin counterfactual runner)
 └── slides/                                  # Typst deck (prefill_decode.typ)
@@ -85,4 +86,4 @@ backticked ranges after a comma (the script does not follow either). Update the
 commit sentence in each module preamble, in this file, in `docs/*/*.md` and in
 `findings/README.md` / `findings/filed_bugs.md`; re-run `git apply --check` on
 the three patches in `findings/`; run `lake build`; add a row to
-[prefill_decode.md](docs/transfer/prefill_decode.md) §"Upstream re-checks".
+[docs/upstream_rechecks.md](docs/upstream_rechecks.md).
