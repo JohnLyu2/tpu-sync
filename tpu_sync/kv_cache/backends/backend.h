@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_BACKEND_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_BACKEND_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -137,12 +138,21 @@ class KVBackend : public std::enable_shared_from_this<KVBackend> {
   std::shared_ptr<BlockKeyMapper> mapper_;
 };
 
+// Value of a ParallelismConfig field whose axis the caller did not declare.
+inline constexpr int kAxisUndeclared = -1;
+
 // Serving parallelism coordinates. Grouped so that adding a dimension later
 // does not change the layout of every struct that carries topology.
 struct ParallelismConfig {
   // Tensor parallelism. Partitions KV heads: H_rank = H_total / tp_size.
-  int tp_size = -1;  // -1 = use the mapper's configured default
-  int tp_rank = -1;  // -1 = use the mapper's configured default
+  int tp_size = kAxisUndeclared;  // -1 = not declared by the caller
+  int tp_rank = kAxisUndeclared;  // -1 = not declared by the caller
+  // Prefill context parallelism: an interleaved split of the token sequence.
+  int pcp_size = kAxisUndeclared;  // -1 = not declared by the caller
+  int pcp_rank = kAxisUndeclared;  // -1 = not declared by the caller
+  // Pipeline parallelism: each stage owns a contiguous range of layers.
+  int pp_size = kAxisUndeclared;  // -1 = not declared by the caller
+  int pp_rank = kAxisUndeclared;  // -1 = not declared by the caller
 };
 
 // Options for mapping a cache block hash to a backend key/path.
@@ -177,6 +187,15 @@ class BlockKeyMapper {
       const std::string& block_hash,
       const KeyMappingOptions& options = {}) const = 0;
   virtual int tp_size() const = 0;
+  virtual int pcp_size() const = 0;
+  virtual int pp_size() const = 0;
+
+  // Number of shard files of one block: one per (pp_rank, pcp_rank, tp_rank)
+  // worker. An undeclared axis (-1) contributes a factor of 1.
+  int shards_per_block() const {
+    return std::max(1, pp_size()) * std::max(1, pcp_size()) *
+           std::max(1, tp_size());
+  }
 };
 
 }  // namespace backends

@@ -32,6 +32,7 @@
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -214,6 +215,216 @@ TEST(ApplyParallelismToPropertiesTest, OverridesCallerTopologyProperties) {
   EXPECT_EQ(config.GetProperty("tp_size"), "4");
   EXPECT_EQ(config.GetProperty("tp_rank"), "1");
   EXPECT_EQ(config.GetProperty("root_dir"), "/some/dir");
+}
+
+TEST(ApplyParallelismToPropertiesTest, SetsPcpTopologyProperties) {
+  BackendConfig config;
+  config.type = "posix";
+  ApplyParallelismToProperties({.pcp_size = 8, .pcp_rank = 3}, &config);
+  EXPECT_EQ(config.GetProperty("pcp_size"), "8");
+  EXPECT_EQ(config.GetProperty("pcp_rank"), "3");
+  EXPECT_FALSE(config.HasProperty("tp_size"));
+  EXPECT_FALSE(config.HasProperty("tp_rank"));
+}
+
+TEST(ApplyParallelismToPropertiesTest, UndeclaredFieldsEraseCallerProperties) {
+  BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("tp_size", "8");
+  config.SetProperty("tp_rank", "7");
+  config.SetProperty("pcp_size", "4");
+  config.SetProperty("pcp_rank", "1");
+  ApplyParallelismToProperties({}, &config);
+  EXPECT_FALSE(config.HasProperty("tp_size"));
+  EXPECT_FALSE(config.HasProperty("tp_rank"));
+  EXPECT_FALSE(config.HasProperty("pcp_size"));
+  EXPECT_FALSE(config.HasProperty("pcp_rank"));
+}
+
+TEST(ValidateWorkerParallelismTest, AcceptsDeclaredAndUndeclaredAxes) {
+  ABSL_EXPECT_OK(ValidateWorkerParallelism({}));
+  ABSL_EXPECT_OK(ValidateWorkerParallelism({.tp_size = 2, .tp_rank = 1}));
+  ABSL_EXPECT_OK(ValidateWorkerParallelism({.pcp_size = 8, .pcp_rank = 7}));
+  ABSL_EXPECT_OK(ValidateWorkerParallelism(
+      {.tp_size = 1, .tp_rank = 0, .pcp_size = 8, .pcp_rank = 3}));
+}
+
+TEST(ValidateWorkerParallelismTest, RejectsInvalidPcpAxis) {
+  EXPECT_THAT(ValidateWorkerParallelism({.pcp_size = 0}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr("pcp_size must be >= 1")));
+  EXPECT_THAT(ValidateWorkerParallelism({.pcp_size = -2}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr("got -2")));
+  EXPECT_THAT(
+      ValidateWorkerParallelism({.pcp_size = 4, .pcp_rank = 4}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               testing::HasSubstr(
+                   "pcp_rank must be in [0, 4) for pcp_size 4; got 4")));
+  EXPECT_THAT(ValidateWorkerParallelism({.pcp_rank = 0}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr("pcp_rank 0 was given without")));
+}
+
+TEST(ResolveCoordinatorParallelismTest, PinsDeclaredRanksToZero) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      backends::ParallelismConfig coordinator,
+      ResolveCoordinatorParallelism(
+          {.tp_size = 2, .tp_rank = 1, .pcp_size = 4, .pcp_rank = 3}));
+  EXPECT_EQ(coordinator.tp_size, 2);
+  EXPECT_EQ(coordinator.tp_rank, 0);
+  EXPECT_EQ(coordinator.pcp_size, 4);
+  EXPECT_EQ(coordinator.pcp_rank, 0);
+}
+
+TEST(ResolveCoordinatorParallelismTest, LeavesUndeclaredAxesUndeclared) {
+  TF_ASSERT_OK_AND_ASSIGN(backends::ParallelismConfig coordinator,
+                          ResolveCoordinatorParallelism({}));
+  EXPECT_EQ(coordinator.tp_size, backends::kAxisUndeclared);
+  EXPECT_EQ(coordinator.tp_rank, backends::kAxisUndeclared);
+  EXPECT_EQ(coordinator.pcp_size, backends::kAxisUndeclared);
+  EXPECT_EQ(coordinator.pcp_rank, backends::kAxisUndeclared);
+}
+
+TEST(ResolveCoordinatorParallelismTest, RejectsPcpRankWithoutPcpSize) {
+  EXPECT_THAT(
+      ResolveCoordinatorParallelism({.pcp_rank = 3}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               testing::HasSubstr("pcp_rank 3 was given without pcp_size")));
+}
+
+TEST(ResolveCoordinatorParallelismTest, RejectsTpRankWithoutTpSize) {
+  EXPECT_THAT(
+      ResolveCoordinatorParallelism({.tp_rank = 1}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               testing::HasSubstr("tp_rank 1 was given without tp_size")));
+}
+
+TEST(ResolveCoordinatorParallelismTest, RejectsZeroPcpSize) {
+  EXPECT_THAT(ResolveCoordinatorParallelism({.pcp_size = 0}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr("pcp_size must be >= 1")));
+}
+
+TEST(ApplyParallelismToPropertiesTest, SetsAndErasesPpTopologyProperties) {
+  BackendConfig config;
+  config.type = "posix";
+  ApplyParallelismToProperties({.pp_size = 4, .pp_rank = 2}, &config);
+  EXPECT_EQ(config.GetProperty("pp_size"), "4");
+  EXPECT_EQ(config.GetProperty("pp_rank"), "2");
+  EXPECT_FALSE(config.HasProperty("pcp_size"));
+  EXPECT_FALSE(config.HasProperty("tp_size"));
+
+  ApplyParallelismToProperties({}, &config);
+  EXPECT_FALSE(config.HasProperty("pp_size"));
+  EXPECT_FALSE(config.HasProperty("pp_rank"));
+}
+
+TEST(ValidateWorkerParallelismTest, AcceptsPpWithOtherAxes) {
+  ABSL_EXPECT_OK(ValidateWorkerParallelism({.pp_size = 4, .pp_rank = 3}));
+  ABSL_EXPECT_OK(ValidateWorkerParallelism({.tp_size = 2,
+                                            .tp_rank = 1,
+                                            .pcp_size = 2,
+                                            .pcp_rank = 0,
+                                            .pp_size = 2,
+                                            .pp_rank = 1}));
+}
+
+TEST(ValidateWorkerParallelismTest, RejectsInvalidPpAxis) {
+  EXPECT_THAT(ValidateWorkerParallelism({.pp_size = 0}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr("pp_size must be >= 1")));
+  EXPECT_THAT(ValidateWorkerParallelism({.pp_size = -2}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr("got -2")));
+  EXPECT_THAT(ValidateWorkerParallelism({.pp_size = 2, .pp_rank = 2}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr(
+                           "pp_rank must be in [0, 2) for pp_size 2; got 2")));
+  EXPECT_THAT(ValidateWorkerParallelism({.pp_rank = 0}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       testing::HasSubstr("pp_rank 0 was given without")));
+}
+
+TEST(ResolveCoordinatorParallelismTest, PinsPpRankToZero) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      backends::ParallelismConfig coordinator,
+      ResolveCoordinatorParallelism({.pp_size = 4, .pp_rank = 3}));
+  EXPECT_EQ(coordinator.pp_size, 4);
+  EXPECT_EQ(coordinator.pp_rank, 0);
+  EXPECT_EQ(coordinator.tp_size, backends::kAxisUndeclared);
+  EXPECT_EQ(coordinator.pcp_size, backends::kAxisUndeclared);
+
+  TF_ASSERT_OK_AND_ASSIGN(backends::ParallelismConfig undeclared,
+                          ResolveCoordinatorParallelism({}));
+  EXPECT_EQ(undeclared.pp_size, backends::kAxisUndeclared);
+  EXPECT_EQ(undeclared.pp_rank, backends::kAxisUndeclared);
+}
+
+TEST(ResolveCoordinatorParallelismTest, RejectsPpRankWithoutPpSize) {
+  EXPECT_THAT(
+      ResolveCoordinatorParallelism({.pp_rank = 1}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               testing::HasSubstr("pp_rank 1 was given without pp_size")));
+}
+
+TEST(FormatParallelismTest, FormatsEveryAxisOutermostFirst) {
+  EXPECT_EQ(FormatParallelism({.tp_size = 4,
+                               .tp_rank = 3,
+                               .pcp_size = 2,
+                               .pcp_rank = 0,
+                               .pp_size = 2,
+                               .pp_rank = 1}),
+            "pp=2/r1 pcp=2/r0 tp=4/r3");
+}
+
+TEST(FormatParallelismTest, FormatsUndeclaredAxes) {
+  EXPECT_EQ(FormatParallelism({}),
+            "pp=undeclared pcp=undeclared tp=undeclared");
+  EXPECT_EQ(FormatParallelism(
+                {.tp_size = 4, .tp_rank = 3, .pp_size = 2, .pp_rank = 1}),
+            "pp=2/r1 pcp=undeclared tp=4/r3");
+}
+
+// Configs that fail validation print as given, so a log names the bad value.
+TEST(FormatParallelismTest, FormatsUnsetRanksAndInvalidValuesAsGiven) {
+  EXPECT_EQ(FormatParallelism({.tp_size = 8}),
+            "pp=undeclared pcp=undeclared tp=8");
+  EXPECT_EQ(FormatParallelism({.tp_size = 1, .tp_rank = 0, .pcp_rank = 3}),
+            "pp=undeclared pcp=undeclared/r3 tp=1/r0");
+  EXPECT_EQ(FormatParallelism({.pcp_size = 0, .pcp_rank = 0}),
+            "pp=undeclared pcp=0/r0 tp=undeclared");
+}
+
+TEST(HasDeclaredAxisTest, TrueWhenAnyAxisSizeIsSet) {
+  EXPECT_TRUE(HasDeclaredAxis({.tp_size = 1}));
+  EXPECT_TRUE(HasDeclaredAxis({.pcp_size = 8}));
+  EXPECT_TRUE(HasDeclaredAxis({.pp_size = 1}));
+  // A size of 0 is declared (and invalid); validation reports it.
+  EXPECT_TRUE(HasDeclaredAxis({.pcp_size = 0}));
+}
+
+TEST(HasDeclaredAxisTest, FalseWhenEverySizeIsUnset) {
+  EXPECT_FALSE(HasDeclaredAxis({}));
+  // A rank alone does not declare its axis.
+  EXPECT_FALSE(HasDeclaredAxis({.tp_rank = 0, .pcp_rank = 1, .pp_rank = 2}));
+}
+
+TEST(RequireDeclaredAxisTest, AcceptsAnyDeclaredAxis) {
+  ABSL_EXPECT_OK(RequireDeclaredAxis({.tp_size = 1}, {.tp_size = 1}));
+  ABSL_EXPECT_OK(RequireDeclaredAxis({.pcp_size = 8}, {.pcp_size = 8}));
+  ABSL_EXPECT_OK(RequireDeclaredAxis({.pp_size = 1}, {.pp_size = 1}));
+}
+
+TEST(RequireDeclaredAxisTest, RejectsNoAxisAndNamesReceivedTopology) {
+  EXPECT_THAT(
+      RequireDeclaredAxis({.tp_rank = 2}, {}),
+      ::absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          ::testing::AllOf(
+              ::testing::HasSubstr("no parallelism axis is declared"),
+              ::testing::HasSubstr("received topology: pp=undeclared "
+                                   "pcp=undeclared tp=undeclared/r2"))));
 }
 
 }  // namespace

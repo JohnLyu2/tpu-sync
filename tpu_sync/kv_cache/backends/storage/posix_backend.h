@@ -68,8 +68,13 @@ inline constexpr size_t kMaxBlockHashBytes = 125;
 struct PosixBackendOptions {
   std::string root_dir = "/tmp/raiden_storage";
   std::string model_name = "unknown";
-  int tp_size = 1;
-  int tp_rank = -1;  // Required; -1 means the caller did not supply it.
+  // Storage topology; see ParallelismConfig. -1 = axis not declared.
+  int tp_size = kAxisUndeclared;
+  int tp_rank = kAxisUndeclared;
+  int pcp_size = kAxisUndeclared;
+  int pcp_rank = kAxisUndeclared;
+  int pp_size = kAxisUndeclared;
+  int pp_rank = kAxisUndeclared;
   size_t capacity_bytes = 0;
   size_t lookup_batch_size = kDefaultLookupBatchSize;
 
@@ -93,6 +98,7 @@ struct PosixBackendOptions {
   // hot prefix skip the existence syscall. Counted in shard entries (one per
   // file). 0 disables the cache (default); kUnboundedMetadataCache (-1) means
   // unbounded. Least recently used entries are dropped past the cap.
+  // Recommended for large topologies; see the lookup cost in PosixPathMapper.
   int64_t metadata_cache_max_entries = 0;
   // Idle TTL, in seconds, of a cached existence entry: it expires once it has
   // gone this long without a cache hit or a storage re-confirmation. Stale
@@ -101,7 +107,9 @@ struct PosixBackendOptions {
   int64_t metadata_cache_ttl_secs = 60;
 
   // Parses and validates `properties`. Returns InvalidArgumentError for an
-  // unparseable value, a negative thread-pool size, or a missing tp_rank.
+  // unparseable value, a negative thread-pool size, or a topology rejected by
+  // ValidateWorkerParallelism (e.g. tp_size 0, a rank out of range, or a rank
+  // given without its axis size).
   static absl::StatusOr<PosixBackendOptions> FromProperties(
       const absl::flat_hash_map<std::string, std::string>& properties);
 };
@@ -137,10 +145,9 @@ bool SlicesAreDirectIOAligned(absl::Span<const HostBufferDescriptor> slices);
 // local disk).
 class PosixKVBackend : public KVBackend {
  public:
-  // Both arguments are required: `properties` must carry the topology
-  // (`tp_rank`, and `tp_size` when sharded), which PosixBackendOptions
-  // validates. Defaulting them would turn a missing rank into a runtime
-  // LOG(FATAL) instead of a compile error.
+  // `properties` carries the topology the caller declares (`tp_size`/`tp_rank`,
+  // `pcp_size`/`pcp_rank`, `pp_size`/`pp_rank`; none declared is valid), which
+  // PosixBackendOptions validates. An invalid configuration is a LOG(FATAL).
   PosixKVBackend(std::string name,
                  absl::flat_hash_map<std::string, std::string> properties);
 
@@ -180,11 +187,38 @@ class PosixKVBackend : public KVBackend {
   std::unique_ptr<NumaThreadPool> thread_pool_;
 };
 
+// Replaces every character of `model_name` outside [A-Za-z0-9._-] with '_',
+// so a HuggingFace-style ID (e.g. "meta-llama/Llama-3.1-70B") stays one path
+// component. Returns "unknown" for an empty name.
+std::string SanitizeModelName(absl::string_view model_name);
+
+// Returns the `<topology_dir>` path component for `parallelism`: one
+// `<axis><size>_r<rank>` segment per declared axis, joined with '_', outermost
+// first in the fixed order pp, pcp, tp (e.g. `pp2_r1_pcp2_r0_tp4_r3`). A
+// declared size-1 axis still contributes a segment (`pp1_r0`). Returns "" when
+// no axis is declared. Does not validate `parallelism`.
+std::string FormatTopologyDir(const ParallelismConfig& parallelism);
+
 // PosixPathMapper implements the filesystem path resolution policy.
-// Maps block hash identifiers and tensor-parallel rank to a rank-partitioned
-// hierarchical directory layout over the HEX-ENCODED block hash (see
-// BlockKeyMapper::MapKey):
-//   `<root_dir>/<model_name>/tp<tp_size>_r<tp_rank>/<l1>/<l2>/<hash_hex>.bin`
+// Maps block hash identifiers and the worker's parallelism coordinates to a
+// rank-partitioned hierarchical directory layout over the HEX-ENCODED block
+// hash (see BlockKeyMapper::MapKey):
+//   `<root_dir>/<model_name>[/<topology_dir>]/<l1>/<l2>/<hash_hex>.bin`
+// `<topology_dir>` joins with '_' one `<axis><size>_r<rank>` segment per
+// declared axis, outermost first in the fixed order pp, pcp, tp (vLLM's rank
+// layout; e.g. `pp2_r1_pcp2_r0_tp4_r3`, `pcp8_r3_tp1_r0`, `tp8_r5`). With no
+// axis declared the directory level is omitted. See FormatTopologyDir.
+//
+// A declared size-1 axis still adds a segment, so `tp8_r3` and `pp1_r0_tp8_r3`
+// are different directories. Every engine sharing a `root_dir`, and the store,
+// must therefore declare the same axes with the same sizes, size-1 axes
+// included. Keeping the segment leaves data written as `tp1_r0/` reachable by
+// a worker that declares `tp_size=1, tp_rank=0`.
+//
+// Lookup cost: the coordinator probes shards_per_block() files per block
+// (pp x pcp x tp, e.g. 64 at PCP=8, TP=8). With the metadata cache off (the
+// default), every hit costs that many existence syscalls per block, so set
+// PosixBackendOptions::metadata_cache_max_entries for large topologies.
 class PosixPathMapper : public BlockKeyMapper {
  public:
   static absl::string_view GetParentDir(absl::string_view path) {
@@ -193,19 +227,26 @@ class PosixPathMapper : public BlockKeyMapper {
     return path.substr(0, last_slash);
   }
 
+  // `parallelism` is the worker's default topology; each axis whose size is
+  // kAxisUndeclared is left out of the path.
   PosixPathMapper(absl::string_view root_dir, absl::string_view model_name,
-                  int tp_size, int tp_rank);
+                  const ParallelismConfig& parallelism);
 
+  // Each `options.parallelism` field other than -1 (kAxisUndeclared) overrides
+  // the configured value of that field, including invalid values. Returns
+  // InvalidArgumentError if the resulting topology fails
+  // ValidateWorkerParallelism.
   absl::StatusOr<BlockKey> MapKey(
       const std::string& block_hash,
       const KeyMappingOptions& options = {}) const override;
-  int tp_size() const override { return tp_size_; }
+  int tp_size() const override { return parallelism_.tp_size; }
+  int pcp_size() const override { return parallelism_.pcp_size; }
+  int pp_size() const override { return parallelism_.pp_size; }
 
  private:
   std::string root_dir_;
   std::string model_name_;
-  int tp_size_;
-  int tp_rank_;
+  ParallelismConfig parallelism_;
 };
 
 // PosixKVCacheStoreBackend probes persistent storage (e.g., Lustre, POSIX).
@@ -286,13 +327,15 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   };
 
   // Returns the storage keys ("shard keys") that must all exist for ONE block,
-  // `block_hash`, to be available: one key per rank in [0, tp_size).
+  // `block_hash`, to be available: one key per (pp_rank, pcp_rank, tp_rank)
+  // worker, mapper()->shards_per_block() keys in total, pp_rank-major, then
+  // pcp_rank.
   absl::StatusOr<std::vector<BlockKey>> MapShardKeys(
       const std::string& block_hash) const;
 
   // Indexing: i = position of the block in the Lookup request
   // (block_hashes[i]); j = position of the shard key within
-  // MapShardKeys(block_hashes[i]) (j = rank).
+  // MapShardKeys(block_hashes[i]).
   // Returns fresh[i][j] = true iff shard_keys[i][j] has a fresh cache entry.
   // Expired entries are erased and reported as absent.
   std::vector<std::vector<bool>> CachedFresh(

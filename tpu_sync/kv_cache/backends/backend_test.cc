@@ -41,8 +41,8 @@ TEST(HostBufferDescriptorTest, DefaultValues) {
 }
 
 TEST(PosixPathMapperTest, MapKeyDefaultOptions) {
-  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
-                         /*tp_rank=*/2);
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
   EXPECT_EQ(mapper.tp_size(), 8);
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("abc123hash"));
@@ -54,8 +54,8 @@ TEST(PosixPathMapperTest, MapKeyDefaultOptions) {
 }
 
 TEST(PosixPathMapperTest, MapKeyCustomOptions) {
-  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
-                         /*tp_rank=*/2);
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   KeyMappingOptions options;
   options.parallelism.tp_size = 16;
@@ -71,8 +71,8 @@ TEST(PosixPathMapperTest, MapKeyCustomOptions) {
 }
 
 TEST(PosixPathMapperTest, MapKeyRejectsEmptyHash) {
-  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
-                         /*tp_rank=*/2);
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b",
+                         ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   EXPECT_THAT(mapper.MapKey(""), StatusIs(absl::StatusCode::kInvalidArgument));
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/reshard_send_session.h"
+#include "tpu_sync/kv_cache/reshard_send_session.h"
 
 #include <algorithm>
 #include <chrono>  // NOLINT(build/c++11)
@@ -37,11 +37,11 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/common/trace.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/pool_reshard_send_slots.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"

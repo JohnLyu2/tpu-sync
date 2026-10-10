@@ -96,6 +96,24 @@ struct ControlPipeConfig {
   // Maximum number of gRPC client stubs retained in the LRU cache by
   // `GrpcControlPipeClient`.
   size_t max_cached_grpc_stubs = 100000;
+
+  static constexpr int kDefaultGrpcKeepaliveTimeMs = 60000;
+  static constexpr int kDefaultGrpcKeepaliveTimeoutMs = 20000;
+  static constexpr int kDefaultGrpcMinRecvPingIntervalWithoutDataMs = 10000;
+
+  // gRPC HTTP/2 keepalive ping interval in milliseconds for both
+  // `GrpcControlPipeClient` and `GrpcControlPipeServer`.
+  int grpc_keepalive_time_ms = kDefaultGrpcKeepaliveTimeMs;
+
+  // gRPC HTTP/2 keepalive ping ACK timeout in milliseconds.
+  int grpc_keepalive_timeout_ms = kDefaultGrpcKeepaliveTimeoutMs;
+
+  // Minimum interval in milliseconds between received HTTP/2 pings without data
+  // frames on `GrpcControlPipeServer`. Must be <= `grpc_keepalive_time_ms` so
+  // client pings never accrue ping strikes (`GOAWAY ENHANCE_YOUR_CALM /
+  // too_many_pings`).
+  int grpc_min_recv_ping_interval_without_data_ms =
+      kDefaultGrpcMinRecvPingIntervalWithoutDataMs;
 };
 
 // Parses a backend type name ("tcp", "grpc", "zmq", case-insensitive).

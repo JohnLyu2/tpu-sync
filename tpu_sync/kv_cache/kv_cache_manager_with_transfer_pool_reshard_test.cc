@@ -21,7 +21,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -35,10 +34,10 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
-#include "tpu_sync/core/reshard_receive_session.h"
-#include "tpu_sync/core/reshard_send_session.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/reshard_receive_session.h"
+#include "tpu_sync/kv_cache/reshard_send_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
@@ -61,7 +60,6 @@ using ::testing::Contains;
 using ::testing::IsEmpty;
 using ::tpu_sync::rpc::MEMORY_TYPE_DRAM;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
-using ::tpu_sync::rpc::ShardPushEntryProto;
 using ::tpu_sync::rpc::StartTransferRequest;
 
 class TestManager : public KVCacheManagerWithTransfer {

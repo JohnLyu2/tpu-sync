@@ -253,10 +253,8 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
     dst_remote_descriptors.reserve(
         transfer.dst_buffers(0).remote_descriptors_size());
     for (const auto& ep_proto : transfer.dst_buffers(0).remote_descriptors()) {
-      std::vector<int64_t> shards(ep_proto.shards().begin(),
-                                  ep_proto.shards().end());
       dst_remote_descriptors.push_back(
-          {ep_proto.endpoint(), std::move(shards)});
+          RaidenTransferEndpoint::FromProto(ep_proto));
     }
   }
 
@@ -266,10 +264,8 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
     src_remote_descriptors.reserve(
         transfer.src_buffers(0).remote_descriptors_size());
     for (const auto& ep_proto : transfer.src_buffers(0).remote_descriptors()) {
-      std::vector<int64_t> shards(ep_proto.shards().begin(),
-                                  ep_proto.shards().end());
       src_remote_descriptors.push_back(
-          {ep_proto.endpoint(), std::move(shards)});
+          RaidenTransferEndpoint::FromProto(ep_proto));
     }
   }
 

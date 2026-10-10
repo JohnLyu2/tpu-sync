@@ -19,12 +19,12 @@
 #include <sys/socket.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
-#include <optional>
 #include <string>
 #include <thread>  // NOLINT
 #include <utility>
@@ -695,13 +695,7 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
   auto cleanup = absl::MakeCleanup(
       [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
 
-  unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
-  EXPECT_FALSE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
-
   setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "0", 1);
-  EXPECT_FALSE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
 
   std::string observed_peer_ip;
   auto server_handler = [&](int client_fd,
@@ -758,15 +752,6 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
 TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
   auto cleanup = absl::MakeCleanup(
       [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
-
-  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
-  EXPECT_TRUE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 1), "10.0.0.2");
-
-  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "true", 1);
-  EXPECT_TRUE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
 
   std::string observed_peer_ip;
   auto server_handler = [&](int client_fd,
@@ -853,20 +838,83 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
     EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
     EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.3"));
   }
+
+  // 3. A NUMA-pinned adapter restricts binding to local IPs on its node. No
+  // loopback alias is a host NIC, so it falls back to every local IP and
+  // still binds to "127.0.0.4".
+  {
+    setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
+    RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                        /*local_ips=*/{"127.0.0.4"});
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1,
+                                          /*numa_node=*/0);
+
+    std::vector<uint8_t> recv_buf(4, 0);
+    Request req = {};
+    req.socket_opcode = 2;
+    req.laddr = recv_buf.data();
+    req.len = recv_buf.size();
+    req.count_or_size = 1;
+    req.remote_id = 10;
+    req.local_id = 20;
+    req.uuid = 104;
+    req.parallelism = 1;
+    req.request_id = 0;
+    req.stream_idx = 0;
+
+    auto handle = client_adapter.Post(
+        /*peers=*/{GetIpPort(server_transport)},
+        /*requests=*/absl::MakeConstSpan(&req, 1));
+
+    ASSERT_THAT(handle.status(), absl_testing::IsOk());
+    EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
+    EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.4"));
+  }
 }
 
 TEST(SocketTransportAdapterTest, DefaultTimeoutsWhenEnvUnset) {
   auto cleanup = absl::MakeCleanup([] {
     unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
     unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S");
   });
   unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
   unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S");
 
   RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
-  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
-  EXPECT_EQ(client_adapter.handshake_ack_read_timeout(), std::nullopt);
-  EXPECT_EQ(client_adapter.final_ack_read_timeout(), std::nullopt);
+  {
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+    EXPECT_EQ(client_adapter.handshake_ack_read_timeout_ms(), -1);
+    EXPECT_EQ(client_adapter.final_ack_read_timeout_ms(), -1);
+    EXPECT_EQ(client_adapter.payload_read_timeout_ms(), -1);
+    EXPECT_EQ(client_adapter.handshake_write_timeout_ms(), -1);
+    EXPECT_EQ(client_adapter.payload_write_timeout_ms(), -1);
+  }
+
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S", "0", 1);
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S", "-1", 1);
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S", "invalid", 1);
+  {
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+    EXPECT_EQ(client_adapter.payload_read_timeout_ms(), -1);
+    EXPECT_EQ(client_adapter.handshake_write_timeout_ms(), -1);
+    EXPECT_EQ(client_adapter.payload_write_timeout_ms(), -1);
+  }
+
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S", "7", 1);
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S", "4", 1);
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S", "9", 1);
+  {
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+    EXPECT_EQ(client_adapter.payload_read_timeout_ms(), 7000);
+    EXPECT_EQ(client_adapter.handshake_write_timeout_ms(), 4000);
+    EXPECT_EQ(client_adapter.payload_write_timeout_ms(), 9000);
+  }
 }
 
 TEST(SocketTransportAdapterTest, PushTimesOutWhenHandshakeNeverResponds) {
@@ -915,10 +963,533 @@ TEST(SocketTransportAdapterTest, PushTimesOutWhenHandshakeNeverResponds) {
   EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_FALSE(push_result.ok());
   EXPECT_THAT(push_result.status(),
-              StatusIs(absl::StatusCode::kDeadlineExceeded,
-                       ::testing::HasSubstr("timed out")));
+              StatusIs(absl::StatusCode::kInternal,
+                       ::testing::HasSubstr("recvmsg timeout")));
   EXPECT_LT(absl::Now() - start, absl::Seconds(1));
 }
 
+TEST(SocketTransportAdapterTest, PullTimesOutWhenHandshakeNeverResponds) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "0.1", 1);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    absl::SleepFor(absl::Milliseconds(500));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> recv_buf(4, 0);
+  Request req = {};
+  req.socket_opcode = 2;
+  req.laddr = recv_buf.data();
+  req.len = recv_buf.size();
+  req.count_or_size = 1;
+  req.remote_id = 10;
+  req.local_id = 20;
+  req.uuid = 42;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> pull_result;
+  const absl::Time start = absl::Now();
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*src_block_ids=*/{},
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        pull_result = std::move(res);
+        done.Notify();
+      });
+
+  EXPECT_THAT(handle.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       ::testing::HasSubstr("recvmsg timeout")));
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_THAT(pull_result.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       ::testing::HasSubstr("recvmsg timeout")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(1));
+}
+
+TEST(SocketTransportAdapterTest, PullTimesOutWhenPayloadReadStalls) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S", "0.1", 1);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    ChunkHeader resp_header = {};
+    resp_header.version = 1;
+    resp_header.op = 2;
+    resp_header.flags = header.flags;
+    resp_header.count_or_size = header.count_or_size;
+    const auto s_resp = SerializeChunkHeader(resp_header);
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
+        !s.ok()) {
+      return s;
+    }
+    const auto s_size = SerializeChunkSize(4);
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
+        !s.ok()) {
+      return s;
+    }
+    absl::SleepFor(absl::Milliseconds(500));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> recv_buf(4, 0);
+  Request req = {};
+  req.socket_opcode = 2;
+  req.laddr = recv_buf.data();
+  req.len = recv_buf.size();
+  req.count_or_size = 1;
+  req.remote_id = 10;
+  req.local_id = 20;
+  req.uuid = 43;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> pull_result;
+  const absl::Time start = absl::Now();
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*src_block_ids=*/{},
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        pull_result = std::move(res);
+        done.Notify();
+      });
+
+  EXPECT_THAT(handle.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       ::testing::HasSubstr("recvmsg timeout")));
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_THAT(pull_result.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       ::testing::HasSubstr("recvmsg timeout")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(1));
+}
+
+TEST(SocketTransportAdapterTest, WorkerCountGrowsPerPeer) {
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    const size_t count = header.count_or_size;
+    std::vector<int> allocated_ids(count, 100);
+    const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    for (size_t i = 0; i < count; ++i) {
+      uint8_t size_buf[kChunkSizeFieldSize];
+      ABSL_RETURN_IF_ERROR(
+          ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+      const uint32_t chunk_size = DeserializeChunkSize(size_buf);
+      std::vector<uint8_t> payload(chunk_size);
+      if (chunk_size > 0) {
+        ABSL_RETURN_IF_ERROR(
+            ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+      }
+    }
+    uint8_t ack = 1;
+    return ::peregrine::WriteExact(client_fd, &ack, 1);
+  };
+  RawBufferTransport server1(/*delegate=*/nullptr, /*local_port=*/0, {},
+                             server_handler);
+  RawBufferTransport server2(/*delegate=*/nullptr, /*local_port=*/0, {},
+                             server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/4);
+
+  // Initially 0 workers.
+  EXPECT_EQ(client_adapter.worker_count(), 0);
+
+  // Post to peer 1 spawns 4 workers.
+  std::vector<uint8_t> test_data = {1, 2};
+  Request req = {};
+  req.socket_opcode = 1;
+  req.laddr = test_data.data();
+  req.len = test_data.size();
+  req.count_or_size = 1;
+  req.uuid = 1;
+  req.parallelism = 1;
+  const int bid = 10;
+  auto handle1 =
+      client_adapter.Post({GetIpPort(server1)}, absl::MakeConstSpan(&req, 1),
+                          absl::MakeConstSpan(&bid, 1), {}, nullptr);
+  ASSERT_THAT(handle1.status(), absl_testing::IsOk());
+  EXPECT_EQ(client_adapter.worker_count(), 4);
+
+  // Another request to peer 1 does NOT spawn additional workers.
+  req.uuid = 2;
+  auto handle2 =
+      client_adapter.Post({GetIpPort(server1)}, absl::MakeConstSpan(&req, 1),
+                          absl::MakeConstSpan(&bid, 1), {}, nullptr);
+  ASSERT_THAT(handle2.status(), absl_testing::IsOk());
+  EXPECT_EQ(client_adapter.worker_count(), 4);
+
+  // Request to peer 2 spawns 4 more workers (total 8).
+  req.uuid = 3;
+  auto handle3 =
+      client_adapter.Post({GetIpPort(server2)}, absl::MakeConstSpan(&req, 1),
+                          absl::MakeConstSpan(&bid, 1), {}, nullptr);
+  ASSERT_THAT(handle3.status(), absl_testing::IsOk());
+  EXPECT_EQ(client_adapter.worker_count(), 8);
+}
+
+TEST(SocketTransportAdapterTest, WorkerCountCappedAtMaxSocketWorkers) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_MAX_SOCKET_WORKERS"); });
+  setenv("TPU_RAIDEN_MAX_SOCKET_WORKERS", "6", 1);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    const size_t count = header.count_or_size;
+    std::vector<int> allocated_ids(count, 100);
+    const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    for (size_t i = 0; i < count; ++i) {
+      uint8_t size_buf[kChunkSizeFieldSize];
+      ABSL_RETURN_IF_ERROR(
+          ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+      const uint32_t chunk_size = DeserializeChunkSize(size_buf);
+      std::vector<uint8_t> payload(chunk_size);
+      if (chunk_size > 0) {
+        ABSL_RETURN_IF_ERROR(
+            ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+      }
+    }
+    uint8_t ack = 1;
+    return ::peregrine::WriteExact(client_fd, &ack, 1);
+  };
+  RawBufferTransport server1(/*delegate=*/nullptr, /*local_port=*/0, {},
+                             server_handler);
+  RawBufferTransport server2(/*delegate=*/nullptr, /*local_port=*/0, {},
+                             server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/4);
+
+  EXPECT_EQ(client_adapter.max_socket_workers(), 6);
+  EXPECT_EQ(client_adapter.worker_count(), 0);
+
+  // Peer 1 spawns 4 workers.
+  std::vector<uint8_t> test_data = {1, 2};
+  Request req = {};
+  req.socket_opcode = 1;
+  req.laddr = test_data.data();
+  req.len = test_data.size();
+  req.count_or_size = 1;
+  req.uuid = 1;
+  req.parallelism = 1;
+  const int bid = 10;
+  auto handle1 =
+      client_adapter.Post({GetIpPort(server1)}, absl::MakeConstSpan(&req, 1),
+                          absl::MakeConstSpan(&bid, 1), {}, nullptr);
+  ASSERT_THAT(handle1.status(), absl_testing::IsOk());
+  EXPECT_EQ(client_adapter.worker_count(), 4);
+
+  // Peer 2 would want 4 more workers (total 8), but is capped at max 6.
+  req.uuid = 2;
+  auto handle2 =
+      client_adapter.Post({GetIpPort(server2)}, absl::MakeConstSpan(&req, 1),
+                          absl::MakeConstSpan(&bid, 1), {}, nullptr);
+  ASSERT_THAT(handle2.status(), absl_testing::IsOk());
+  EXPECT_EQ(client_adapter.worker_count(), 6);
+}
+
+TEST(SocketTransportAdapterTest,
+     RequestStreamFailureCancelsPendingTasksForSameRequest) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "0.1", 1);
+
+  std::atomic<int> server_requests_received = 0;
+  auto server_handler = [&](int client_fd,
+                            const ChunkHeader& header) -> absl::Status {
+    server_requests_received++;
+    absl::SleepFor(absl::Milliseconds(300));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  // Single stream cap per peer so stream 0 runs while stream 1 remains pending
+  // in queue.
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> test_data = {1, 2, 3, 4};
+  std::vector<Request> reqs(2);
+  std::vector<int> src_bids = {1, 2};
+  for (int i = 0; i < 2; ++i) {
+    reqs[i].socket_opcode = 1;
+    reqs[i].laddr = test_data.data();
+    reqs[i].len = test_data.size();
+    reqs[i].count_or_size = 1;
+    reqs[i].uuid = 12345;
+    reqs[i].parallelism = 2;
+    reqs[i].stream_idx = i;
+    reqs[i].request_id = i;
+  }
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  const std::string peer = GetIpPort(server_transport);
+  auto handle = client_adapter.Post(
+      {peer, peer}, absl::MakeConstSpan(reqs), absl::MakeConstSpan(src_bids),
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(push_result.ok());
+  EXPECT_THAT(push_result.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       ::testing::HasSubstr("recvmsg timeout")));
+
+  // Stream 0 was received and timed out; stream 1 was cancelled in queue and
+  // never executed.
+  EXPECT_EQ(server_requests_received.load(), 1);
+}
+
+TEST(SocketTransportAdapterTest,
+     RequestFailureCancelsSubsequentLayerPostsForSameUuid) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "0.1", 1);
+
+  std::atomic<int> server_requests_received = 0;
+  auto server_handler = [&](int client_fd,
+                            const ChunkHeader& header) -> absl::Status {
+    server_requests_received++;
+    absl::SleepFor(absl::Milliseconds(300));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+  const std::string peer = GetIpPort(server_transport);
+
+  const uint64_t session_uuid = 99999;
+  std::vector<uint8_t> test_data = {1, 2};
+  Request layer0_req = {};
+  layer0_req.socket_opcode = 1;
+  layer0_req.laddr = test_data.data();
+  layer0_req.len = test_data.size();
+  layer0_req.count_or_size = 1;
+  layer0_req.uuid = session_uuid;
+  layer0_req.parallelism = 1;
+  const int bid = 1;
+
+  // Layer 0 is posted and times out on handshake.
+  absl::Notification done0;
+  absl::StatusOr<std::vector<int>> res0;
+  auto h0 = client_adapter.Post({peer}, absl::MakeConstSpan(&layer0_req, 1),
+                                absl::MakeConstSpan(&bid, 1), {}, [&](auto r) {
+                                  res0 = std::move(r);
+                                  done0.Notify();
+                                });
+  ASSERT_THAT(h0.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done0.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(res0.ok());
+  EXPECT_THAT(res0.status(), StatusIs(absl::StatusCode::kInternal,
+                                      ::testing::HasSubstr("recvmsg timeout")));
+  EXPECT_EQ(server_requests_received.load(), 1);
+
+  // Layer 1 is posted with the SAME session UUID.
+  // It must immediately fail with CancelledError without sending any RPC to the
+  // server.
+  Request layer1_req = layer0_req;
+  absl::Notification done1;
+  absl::StatusOr<std::vector<int>> res1;
+  auto h1 = client_adapter.Post({peer}, absl::MakeConstSpan(&layer1_req, 1),
+                                absl::MakeConstSpan(&bid, 1), {}, [&](auto r) {
+                                  res1 = std::move(r);
+                                  done1.Notify();
+                                });
+  // Post itself immediately returned CancelledError or called the callback with
+  // CancelledError.
+  if (!h1.ok()) {
+    EXPECT_THAT(h1.status(), StatusIs(absl::StatusCode::kCancelled));
+  } else {
+    EXPECT_TRUE(done1.WaitForNotificationWithTimeout(absl::Seconds(1)));
+    EXPECT_FALSE(res1.ok());
+    EXPECT_THAT(res1.status(), StatusIs(absl::StatusCode::kCancelled));
+  }
+
+  // Server was never contacted for Layer 1.
+  EXPECT_EQ(server_requests_received.load(), 1);
+}
+
+TEST(SocketTransportAdapterTest,
+     PlanlessPushWithUuidZeroDoesNotCancelSiblingOrSubsequentRequests) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "0.1", 1);
+
+  std::atomic<int> server1_requests_received = 0;
+  std::atomic<int> server2_requests_received = 0;
+  // Server 1 hangs and triggers a timeout.
+  auto server1_handler = [&](int client_fd,
+                             const ChunkHeader& header) -> absl::Status {
+    server1_requests_received++;
+    absl::SleepFor(absl::Milliseconds(300));
+    return absl::OkStatus();
+  };
+  // Server 2 responds normally.
+  auto server2_handler = [&](int client_fd,
+                             const ChunkHeader& header) -> absl::Status {
+    server2_requests_received++;
+    const size_t count = header.count_or_size;
+    std::vector<int> allocated_ids(count, 100);
+    const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    for (size_t i = 0; i < count; ++i) {
+      uint8_t size_buf[kChunkSizeFieldSize];
+      ABSL_RETURN_IF_ERROR(
+          ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+      const uint32_t chunk_size = DeserializeChunkSize(size_buf);
+      std::vector<uint8_t> payload(chunk_size);
+      if (chunk_size > 0) {
+        ABSL_RETURN_IF_ERROR(
+            ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+      }
+    }
+    uint8_t ack = 1;
+    return ::peregrine::WriteExact(client_fd, &ack, 1);
+  };
+
+  RawBufferTransport server_transport1(/*delegate=*/nullptr, /*local_port=*/0,
+                                       /*local_ips=*/{}, server1_handler);
+  RawBufferTransport server_transport2(/*delegate=*/nullptr, /*local_port=*/0,
+                                       /*local_ips=*/{}, server2_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+  const std::string peer1 = GetIpPort(server_transport1);
+  const std::string peer2 = GetIpPort(server_transport2);
+
+  // Single Post() with 2 streams to peer1 and peer2 with uuid=0.
+  // Stream 0 to peer1 fails, but sibling Stream 1 to peer2 is NOT cancelled
+  // and still executes against peer2.
+  std::vector<uint8_t> test_data = {1, 2, 3, 4};
+  std::vector<Request> reqs(2);
+  std::vector<int> src_bids = {1, 2};
+  for (int i = 0; i < 2; ++i) {
+    reqs[i].socket_opcode = 1;
+    reqs[i].laddr = test_data.data();
+    reqs[i].len = test_data.size();
+    reqs[i].count_or_size = 1;
+    reqs[i].uuid = 0;  // Planless transfer
+    reqs[i].parallelism = 2;
+    reqs[i].stream_idx = i;
+    reqs[i].request_id = i;
+  }
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  auto handle = client_adapter.Post(
+      {peer1, peer2}, absl::MakeConstSpan(reqs), absl::MakeConstSpan(src_bids),
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  // Stream 1 still executed despite sibling stream 0 timing out.
+  EXPECT_EQ(server1_requests_received.load(), 1);
+  EXPECT_EQ(server2_requests_received.load(), 1);
+}
+
+TEST(SocketTransportAdapterTest, PushTimesOutWhenPayloadWriteStalls) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S", "0.1", 1);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    int rcvbuf = 4096;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    if (header.op != 1) {
+      return absl::InvalidArgumentError("Expected op 1");
+    }
+    std::vector<int> allocated_ids(header.count_or_size, 100);
+    const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
+    if (auto s = ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size());
+        !s.ok()) {
+      return s;
+    }
+    absl::SleepFor(absl::Milliseconds(600));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  const std::string peer = GetIpPort(server_transport);
+  {
+    auto borrowed_fd = client_transport.BorrowConnection(peer);
+    ASSERT_THAT(borrowed_fd.status(), absl_testing::IsOk());
+    int sndbuf = 4096;
+    ASSERT_EQ(setsockopt(*borrowed_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf,
+                         sizeof(sndbuf)),
+              0);
+    client_transport.ReturnConnection(/*ok_to_pool=*/true, *borrowed_fd, peer);
+  }
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> test_data(16 * 1024 * 1024, 1);
+  Request req = {};
+  req.socket_opcode = 1;
+  req.laddr = test_data.data();
+  req.len = test_data.size();
+  req.count_or_size = 1;
+  req.uuid = 43;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  const int src_bid = 10;
+  const absl::Time start = absl::Now();
+  auto handle = client_adapter.Post(
+      /*peers=*/{peer},
+      /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*src_block_ids=*/absl::MakeConstSpan(&src_bid, 1),
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(push_result.ok());
+  EXPECT_THAT(push_result.status(),
+              StatusIs(absl::StatusCode::kInternal,
+                       ::testing::HasSubstr("sendmsg timeout")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+}
 }  // namespace
 }  // namespace tpu_raiden::transport::lib

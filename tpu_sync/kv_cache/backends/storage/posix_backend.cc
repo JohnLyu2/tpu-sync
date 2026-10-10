@@ -114,9 +114,14 @@ PosixKVBackend::PosixKVBackend(
                  << "'. Unset direct_io or use a filesystem that supports it.";
     }
   }
-  mapper_ =
-      std::make_shared<PosixPathMapper>(options_.root_dir, options_.model_name,
-                                        options_.tp_size, options_.tp_rank);
+  mapper_ = std::make_shared<PosixPathMapper>(
+      options_.root_dir, options_.model_name,
+      ParallelismConfig{.tp_size = options_.tp_size,
+                        .tp_rank = options_.tp_rank,
+                        .pcp_size = options_.pcp_size,
+                        .pcp_rank = options_.pcp_rank,
+                        .pp_size = options_.pp_size,
+                        .pp_rank = options_.pp_rank});
   thread_pool_ =
       std::make_unique<NumaThreadPool>(options_.storage_io_thread_pool_size);
 }
@@ -514,8 +519,6 @@ void PosixKVBackend::BatchExistsAsync(
 
 // --- PosixPathMapper Implementation ---
 
-namespace {
-
 // HuggingFace-style model IDs (e.g. "meta-llama/Llama-3.1-70B") embed path
 // separators, which would inject an extra directory level and break the
 // fixed-depth layout. Anything outside [A-Za-z0-9._-] is replaced by '_'.
@@ -531,15 +534,49 @@ std::string SanitizeModelName(absl::string_view model_name) {
   return sanitized;
 }
 
+namespace {
+
+// Joins with '_' one `<axis><size>_r<rank label>` segment per declared axis,
+// outermost first in the fixed order pp, pcp, tp (vLLM's rank layout).
+// `rank_label` renders the rank part of an axis given its size and rank.
+template <typename RankLabel>
+std::string JoinAxisSegments(const ParallelismConfig& parallelism,
+                             RankLabel rank_label) {
+  std::string topology_dir;
+  auto append_axis = [&](absl::string_view axis, int size, int rank) {
+    if (size == kAxisUndeclared) return;
+    absl::StrAppend(&topology_dir, topology_dir.empty() ? "" : "_", axis, size,
+                    "_r", rank_label(size, rank));
+  };
+  append_axis("pp", parallelism.pp_size, parallelism.pp_rank);
+  append_axis("pcp", parallelism.pcp_size, parallelism.pcp_rank);
+  append_axis("tp", parallelism.tp_size, parallelism.tp_rank);
+  return topology_dir;
+}
+
+// The topology directories the coordinator probes for `parallelism`, with
+// each declared axis's rank written as the range it covers, e.g.
+// `pp2_r{0..1}_tp4_r{0..3}`; a size-1 axis has the single rank 0.
+std::string FormatProbedTopologyDirPattern(
+    const ParallelismConfig& parallelism) {
+  return JoinAxisSegments(parallelism, [](int size, int /*rank*/) {
+    return size == 1 ? std::string("0") : absl::StrCat("{0..", size - 1, "}");
+  });
+}
+
 }  // namespace
 
+std::string FormatTopologyDir(const ParallelismConfig& parallelism) {
+  return JoinAxisSegments(parallelism,
+                          [](int /*size*/, int rank) { return rank; });
+}
+
 PosixPathMapper::PosixPathMapper(absl::string_view root_dir,
-                                 absl::string_view model_name, int tp_size,
-                                 int tp_rank)
+                                 absl::string_view model_name,
+                                 const ParallelismConfig& parallelism)
     : root_dir_(root_dir),
       model_name_(SanitizeModelName(model_name)),
-      tp_size_(tp_size),
-      tp_rank_(tp_rank) {}
+      parallelism_(parallelism) {}
 
 absl::StatusOr<PosixBackendOptions> PosixBackendOptions::FromProperties(
     const absl::flat_hash_map<std::string, std::string>& properties) {
@@ -548,7 +585,7 @@ absl::StatusOr<PosixBackendOptions> PosixBackendOptions::FromProperties(
     auto it = properties.find(key);
     if (it != properties.end()) *out = it->second;
   };
-  auto num = [&](absl::string_view key, int64_t* out) -> absl::Status {
+  auto num = [&](absl::string_view key, auto* out) -> absl::Status {
     auto it = properties.find(key);
     if (it == properties.end()) return absl::OkStatus();
     if (!absl::SimpleAtoi(it->second, out)) {
@@ -559,30 +596,30 @@ absl::StatusOr<PosixBackendOptions> PosixBackendOptions::FromProperties(
   };
   str("root_dir", &options.root_dir);
   str("model_name", &options.model_name);
-  int64_t tp_size = options.tp_size;
-  int64_t tp_rank = options.tp_rank;
+  ParallelismConfig parallelism;
   int64_t capacity = 0;
   int64_t batch = options.lookup_batch_size;
   int64_t threads = options.storage_io_thread_pool_size;
-  ABSL_RETURN_IF_ERROR(num("tp_size", &tp_size));
-  ABSL_RETURN_IF_ERROR(num("tp_rank", &tp_rank));
+  ABSL_RETURN_IF_ERROR(num("tp_size", &parallelism.tp_size));
+  ABSL_RETURN_IF_ERROR(num("tp_rank", &parallelism.tp_rank));
+  ABSL_RETURN_IF_ERROR(num("pcp_size", &parallelism.pcp_size));
+  ABSL_RETURN_IF_ERROR(num("pcp_rank", &parallelism.pcp_rank));
+  ABSL_RETURN_IF_ERROR(num("pp_size", &parallelism.pp_size));
+  ABSL_RETURN_IF_ERROR(num("pp_rank", &parallelism.pp_rank));
   ABSL_RETURN_IF_ERROR(num("capacity_bytes", &capacity));
   ABSL_RETURN_IF_ERROR(num("lookup_batch_size", &batch));
   ABSL_RETURN_IF_ERROR(num("storage_io_thread_pool_size", &threads));
-  if (tp_size < 1) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("tp_size must be >= 1, got ", tp_size));
-  }
-  if (tp_rank < 0 || tp_rank >= tp_size) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("tp_rank must be in [0, ", tp_size, "), got ", tp_rank));
-  }
+  ABSL_RETURN_IF_ERROR(kv_cache::ValidateWorkerParallelism(parallelism));
   if (threads < 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "storage_io_thread_pool_size must be >= 1, got ", threads));
   }
-  options.tp_size = static_cast<int>(tp_size);
-  options.tp_rank = static_cast<int>(tp_rank);
+  options.tp_size = parallelism.tp_size;
+  options.tp_rank = parallelism.tp_rank;
+  options.pcp_size = parallelism.pcp_size;
+  options.pcp_rank = parallelism.pcp_rank;
+  options.pp_size = parallelism.pp_size;
+  options.pp_rank = parallelism.pp_rank;
   options.capacity_bytes = static_cast<size_t>(capacity);
   options.lookup_batch_size =
       batch > 0 ? static_cast<size_t>(batch) : kDefaultLookupBatchSize;
@@ -646,12 +683,21 @@ absl::StatusOr<BlockKey> PosixPathMapper::MapKey(
         absl::StrCat("block_hash is ", block_hash.size(), " bytes; maximum is ",
                      kMaxBlockHashBytes, " (NAME_MAX after hex encoding)."));
   }
-  const int target_rank = (options.parallelism.tp_rank == -1)
-                              ? tp_rank_
-                              : options.parallelism.tp_rank;
-  const int target_tp_size = (options.parallelism.tp_size == -1)
-                                 ? tp_size_
-                                 : options.parallelism.tp_size;
+  auto effective = [](int per_call, int configured) {
+    return per_call == kAxisUndeclared ? configured : per_call;
+  };
+  const ParallelismConfig& configured = parallelism_;
+  const ParallelismConfig parallelism = {
+      .tp_size = effective(options.parallelism.tp_size, configured.tp_size),
+      .tp_rank = effective(options.parallelism.tp_rank, configured.tp_rank),
+      .pcp_size = effective(options.parallelism.pcp_size, configured.pcp_size),
+      .pcp_rank = effective(options.parallelism.pcp_rank, configured.pcp_rank),
+      .pp_size = effective(options.parallelism.pp_size, configured.pp_size),
+      .pp_rank = effective(options.parallelism.pp_rank, configured.pp_rank),
+  };
+  ABSL_RETURN_IF_ERROR(kv_cache::ValidateWorkerParallelism(parallelism));
+
+  const std::string topology_dir = FormatTopologyDir(parallelism);
 
   // block_hash is opaque binary; encode before it contributes to a path.
   const std::string hash_hex = absl::BytesToHexString(block_hash);
@@ -663,9 +709,9 @@ absl::StatusOr<BlockKey> PosixPathMapper::MapKey(
   const absl::string_view l1(padded.data(), kHashDirL1Width);
   const absl::string_view l2(padded.data() + kHashDirL1Width, kHashDirL2Width);
 
-  std::string resolved_path =
-      absl::StrCat(root_dir_, "/", model_name_, "/tp", target_tp_size, "_r",
-                   target_rank, "/", l1, "/", l2, "/", hash_hex, ".bin");
+  std::string resolved_path = absl::StrCat(root_dir_, "/", model_name_, "/");
+  if (!topology_dir.empty()) absl::StrAppend(&resolved_path, topology_dir, "/");
+  absl::StrAppend(&resolved_path, l1, "/", l2, "/", hash_hex, ".bin");
   // Block identity stays the raw bytes; only the path is hex-encoded.
   return BlockKey{block_hash, resolved_path, /*offset=*/0, /*size=*/0};
 }
@@ -723,23 +769,33 @@ RaidenBlockId PosixKVCacheStoreBackend::MakeSharedStorageBlock() const {
 absl::StatusOr<std::vector<BlockKey>> PosixKVCacheStoreBackend::MapShardKeys(
     const std::string& block_hash) const {
   const std::shared_ptr<BlockKeyMapper> mapper = storage_backend_->mapper();
+  const int pp_size = mapper->pp_size();
+  const int pcp_size = mapper->pcp_size();
   const int tp_size = mapper->tp_size();
-  if (tp_size < 1) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("invalid mapper tp_size: ", tp_size));
-  }
-  // In secondary storage each block is partitioned across all TP workers
-  // (r0..rN-1), one file per shard. The block is available only if every
-  // shard is present.
+  // In secondary storage every (pp_rank, pcp_rank, tp_rank) worker writes its
+  // own shard file of each block. The block is available only if every shard
+  // is present. An undeclared axis spans a single shard and is left unset in
+  // the mapping options, so it adds no path segment.
+  auto declare = [](int size, int rank, int* size_field, int* rank_field) {
+    if (size == kAxisUndeclared) return;
+    *size_field = size;
+    *rank_field = rank;
+  };
   std::vector<BlockKey> keys;
-  keys.reserve(tp_size);
-  for (int rank = 0; rank < tp_size; ++rank) {
-    const backends::KeyMappingOptions lookup_opts{
-        .parallelism = {.tp_size = tp_size, .tp_rank = rank},
-    };
-    ABSL_ASSIGN_OR_RETURN(BlockKey key,
-                          mapper->MapKey(block_hash, lookup_opts));
-    keys.push_back(std::move(key));
+  keys.reserve(mapper->shards_per_block());
+  for (int pp_rank = 0; pp_rank < std::max(1, pp_size); ++pp_rank) {
+    for (int pcp_rank = 0; pcp_rank < std::max(1, pcp_size); ++pcp_rank) {
+      for (int tp_rank = 0; tp_rank < std::max(1, tp_size); ++tp_rank) {
+        backends::KeyMappingOptions lookup_opts;
+        ParallelismConfig& p = lookup_opts.parallelism;
+        declare(pp_size, pp_rank, &p.pp_size, &p.pp_rank);
+        declare(pcp_size, pcp_rank, &p.pcp_size, &p.pcp_rank);
+        declare(tp_size, tp_rank, &p.tp_size, &p.tp_rank);
+        ABSL_ASSIGN_OR_RETURN(BlockKey key,
+                              mapper->MapKey(block_hash, lookup_opts));
+        keys.push_back(std::move(key));
+      }
+    }
   }
   return keys;
 }
@@ -806,13 +862,15 @@ std::vector<bool> PosixKVCacheStoreBackend::ProbeExists(
 // Returns the longest prefix of `block_hashes` that is available on storage.
 //
 // Block hash -> shard keys.
-//   A KV block is written by every tensor-parallel worker, each storing its own
-//   shard as a separate file. MapKey(hash, {tp_size, tp_rank = r}) resolves the
-//   file for shard r, e.g.
-//     <root>/<model>/tp<tp_size>_r<r>/<l1>/<l2>/<hex(hash)>.bin
-//   so one block hash maps to up to tp_size storage keys ("shard keys").
-//   MapShardKeys(hash) returns the shard keys that must ALL exist for the block
-//   to count as available: one key per rank in [0, tp_size).
+//   A KV block is written by every pipeline-parallel (PP) x
+//   prefill-context-parallel (PCP) x tensor-parallel (TP) worker, each storing
+//   its own shard as a separate file. MapKey(hash, {pp_rank = s, pcp_rank = p,
+//   tp_rank = t}) resolves the file for shard (s, p, t), e.g.
+//     <root>/<model>/pp<S>_r<s>_pcp<P>_r<p>_tp<T>_r<t>/<l1>/<l2>/<hex>.bin
+//   where an undeclared axis is omitted from the topology directory. One block
+//   hash maps to N = max(1, S) * max(1, P) * max(1, T) storage keys ("shard
+//   keys"). MapShardKeys(hash) returns the shard keys that must ALL exist for
+//   the block to count as available, pp_rank-major, then pcp_rank.
 //
 // Metadata cache contents.
 //   When enabled (metadata_cache_max_entries != 0), the cache maps one shard
@@ -827,7 +885,8 @@ std::vector<bool> PosixKVCacheStoreBackend::ProbeExists(
 //   fresh.
 //
 // Algorithm. i = block index (block_hashes[i], request order); j = shard
-// index within MapShardKeys(block_hashes[i]) (j = rank).
+// index within MapShardKeys(block_hashes[i]) (j enumerates (pp_rank,
+// pcp_rank, tp_rank), pp_rank-major, then pcp_rank).
 //   Phase 0 (map):   shard_keys[i] = MapShardKeys(block_hashes[i]), in order.
 //                    The first hash that cannot be mapped ends the prefix.
 //   Phase 1 (cache): mark each shard key present if it has a fresh cache
@@ -936,7 +995,7 @@ void PosixKVCacheStoreBackend::Delete(
   }
   std::vector<std::string> resolved_keys;
   resolved_keys.reserve(block_hashes.size() *
-                        std::max(1, storage_backend_->mapper()->tp_size()));
+                        storage_backend_->mapper()->shards_per_block());
   for (const std::string& hash : block_hashes) {
     absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
     if (!keys.ok()) continue;  // Never cached; keep invalidating the rest.
@@ -967,15 +1026,22 @@ REGISTER_KV_CACHE_STORE_BACKEND(
        ::tpu_raiden::controller::RaidenController* /*controller*/)
         -> absl::StatusOr<
             std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend>> {
-      const int tp_size =
-          config.parallelism.tp_size > 0 ? config.parallelism.tp_size : 1;
-
       // The coordinator probes every rank explicitly (see
-      // PosixKVCacheStoreBackend::MapShardKeys), so its default mapper rank is
-      // pinned to 0. Per-worker tp_rank lives on the worker's own config.
+      // PosixKVCacheStoreBackend::MapShardKeys), so the default mapper rank of
+      // each declared axis is pinned to 0. Per-worker ranks live on the
+      // worker's own config.
+      ABSL_ASSIGN_OR_RETURN(
+          const ::tpu_raiden::kv_cache::backends::ParallelismConfig coordinator,
+          ::tpu_raiden::kv_cache::ResolveCoordinatorParallelism(
+              config.parallelism));
+      // With no axis declared every worker would write the same shard files,
+      // so a recall could load another worker's KV. KVCacheStore::Create
+      // already rejects this; the check stays for direct factory callers.
+      ABSL_RETURN_IF_ERROR(::tpu_raiden::kv_cache::RequireDeclaredAxis(
+          config.parallelism, coordinator));
       ::tpu_raiden::kv_cache::BackendConfig resolved = config;
-      ::tpu_raiden::kv_cache::ApplyParallelismToProperties(
-          {.tp_size = tp_size, .tp_rank = 0}, &resolved);
+      ::tpu_raiden::kv_cache::ApplyParallelismToProperties(coordinator,
+                                                           &resolved);
       ABSL_ASSIGN_OR_RETURN(
           const PosixBackendOptions options,
           PosixBackendOptions::FromProperties(resolved.properties));
@@ -984,6 +1050,15 @@ REGISTER_KV_CACHE_STORE_BACKEND(
           ::tpu_raiden::kv_cache::backends::storage::kPosixBackendName);
       auto backend =
           std::make_shared<PosixKVBackend>(backend_name, resolved.properties);
+      LOG(INFO) << "[Store] " << backend_name << " backend probes "
+                << backend->mapper()->shards_per_block()
+                << " shard file(s) per block under " << options.root_dir << "/"
+                << ::tpu_raiden::kv_cache::backends::storage::SanitizeModelName(
+                       options.model_name)
+                << "/"
+                << ::tpu_raiden::kv_cache::backends::storage::
+                       FormatProbedTopologyDirPattern(coordinator)
+                << "/";
       return std::make_shared<PosixKVCacheStoreBackend>(
           std::move(backend), backend_name, options.capacity_bytes,
           options.lookup_batch_size,

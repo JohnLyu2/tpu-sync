@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -53,13 +53,13 @@
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/reshard_receive_session.h"
-#include "tpu_sync/core/reshard_send_session.h"
-#include "tpu_sync/core/transfer_receive_session.h"
-#include "tpu_sync/core/transfer_send_session.h"
-#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/reshard_receive_session.h"
+#include "tpu_sync/kv_cache/reshard_send_session.h"
+#include "tpu_sync/kv_cache/transfer_receive_session.h"
+#include "tpu_sync/kv_cache/transfer_send_session.h"
+#include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
@@ -129,9 +129,10 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
         RegisterBlockReadinessCallback(layer_idx, shard_idx, block_id, uuid,
                                        std::move(cb));
       };
-  hooks.on_blocks_received = [this](const std::vector<int>& block_ids,
-                                    uint64_t uuid) {
-    return OnBlocksReceived(block_ids, uuid);
+  hooks.on_block_shards_received = [this](const std::vector<int>& block_ids,
+                                          absl::Span<const int> shard_ids,
+                                          uint64_t uuid) {
+    return OnBlockShardsReceived(block_ids, shard_ids, uuid);
   };
   hooks.on_layer_received = [this](size_t layer_idx, uint64_t uuid) {
     RAIDEN_TRACE_FN("KVTransfer::OnLayerReceived", [&]() {
@@ -212,6 +213,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
             absl::StrCat("No active receive session for uuid=", uuid));
       }
     }
+    FaultInjectDelay(hooks::kBlockTransportRecvBeginPush);
     const bool started = recv_session != nullptr
                              ? recv_session->TryBeginRecvOp()
                              : reshard_session->TryBeginRecvOp();
@@ -591,7 +593,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
                                      uuid, req_id, expected_block_count,
                                      deadline.value_or(DeadlineFromNow())));
   // host_to_chip is left empty -> defaults to 1-to-1 mapping in
-  // OnBlocksReceived
+  // OnBlockShardsReceived
   absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
   if (!inserted.ok()) {
     return inserted;
@@ -767,16 +769,16 @@ KVCacheManagerWithTransfer::get_local_data_endpoints() const {
 
 std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
     int64_t port) const {
-  std::vector<int64_t> all_shards(base_->num_shards());
-  for (size_t i = 0; i < base_->num_shards(); ++i) {
-    all_shards[i] = static_cast<int64_t>(i);
-  }
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
+      base_->LayerHostAddrs(/*uuid=*/0);
   std::vector<RaidenTransferEndpoint> eps;
   for (const auto& ip : base_->local_ips()) {
     std::string endpoint = absl::StrContains(ip, ':')
                                ? absl::StrCat("[", ip, "]:", port)
                                : absl::StrCat(ip, ":", port);
-    eps.push_back({endpoint, all_shards});
+    // Shards whose device is NUMA-local to this NIC; every shard when the
+    // host has no usable NUMA topology.
+    eps.push_back({endpoint, base_->shards_for_local_ip(ip), layer_host_addrs});
   }
   return eps;
 }
@@ -1657,13 +1659,16 @@ void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
   local_data_port_ = *data_port;
 }
 
-absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
-    const std::vector<int>& block_ids, uint64_t uuid) {
-  RAIDEN_TRACE_FN("KVTransfer::OnBlocksReceived", [&]() {
-    return absl::StrCat("blocks=", block_ids.size(), " uuid=", uuid);
+absl::Status KVCacheManagerWithTransfer::OnBlockShardsReceived(
+    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
+    uint64_t uuid) {
+  RAIDEN_TRACE_FN("KVTransfer::OnBlockShardsReceived", [&]() {
+    return absl::StrCat("blocks=", block_ids.size(),
+                        " shards=", shard_ids.size(), " uuid=", uuid);
   });
-  VLOG(1) << "KVCacheManagerWithTransfer::OnBlocksReceived called. uuid: "
-          << uuid << ", received blocks count: " << block_ids.size();
+  VLOG(1) << "KVCacheManagerWithTransfer::OnBlockShardsReceived called. uuid: "
+          << uuid << ", received blocks count: " << block_ids.size()
+          << ", shards: " << shard_ids.size();
 
   std::shared_ptr<TransferReceiveSession> session;
   {
@@ -1674,7 +1679,8 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
     }
     session = it->second;
   }
-  absl::Status status = session->OnBlocksReceived(*this, block_ids);
+  absl::Status status =
+      session->OnBlockShardsReceived(*this, block_ids, shard_ids);
   MaybeUnregisterSettledRecv(uuid, *session);
   return status;
 }

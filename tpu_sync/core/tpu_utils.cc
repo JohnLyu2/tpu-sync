@@ -41,12 +41,14 @@
 #include <variant>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/logging.h"
 
@@ -189,9 +191,29 @@ int PinCurrentThreadToCores(const std::vector<int>& cores) {
 #endif
 }
 
+namespace {
+
+// Memoizes GetNumaNodeCpuCores(): the node topology is fixed for the life of
+// the process and PinCurrentThreadToNumaNode() runs on hot-ish paths (every
+// NumaThreadPool task, every accepted transport connection), where the sysfs
+// read would otherwise dominate the cost of the affinity syscall itself.
+// Returns a copy: flat_hash_map rehashes invalidate references.
+std::vector<int> GetCachedNumaNodeCpuCores(int numa_node) {
+  static absl::Mutex* const mu = new absl::Mutex();
+  static auto* const cache = new absl::flat_hash_map<int, std::vector<int>>();
+  absl::MutexLock lock(*mu);
+  auto it = cache->find(numa_node);
+  if (it == cache->end()) {
+    it = cache->emplace(numa_node, GetNumaNodeCpuCores(numa_node)).first;
+  }
+  return it->second;
+}
+
+}  // namespace
+
 int PinCurrentThreadToNumaNode(int node, int mode) {
   if (node < 0) return -1;
-  std::vector<int> cores = GetNumaNodeCpuCores(node);
+  const std::vector<int> cores = GetCachedNumaNodeCpuCores(node);
   if (cores.empty()) {
     LOG(WARNING)
         << "No CPU cores found for NUMA node " << node
@@ -692,12 +714,28 @@ std::optional<HostNicAddress> GetSocketLocalNic(int fd) {
         << "getsockname failed: " << std::strerror(errno);
     return std::nullopt;
   }
-  if (addr.ss_family != AF_INET) {
-    return std::nullopt;
-  }
-  struct sockaddr_in* s_in = (struct sockaddr_in*)&addr;
-  char host[INET_ADDRSTRLEN];
-  if (inet_ntop(AF_INET, &s_in->sin_addr, host, INET_ADDRSTRLEN) == nullptr) {
+  char host[INET6_ADDRSTRLEN];
+  if (addr.ss_family == AF_INET) {
+    struct sockaddr_in* s_in = (struct sockaddr_in*)&addr;
+    if (inet_ntop(AF_INET, &s_in->sin_addr, host, sizeof(host)) == nullptr) {
+      return std::nullopt;
+    }
+  } else if (addr.ss_family == AF_INET6) {
+    // Dual-stack listeners (IPV6_V6ONLY=0) report IPv4 peers as v4-mapped
+    // IPv6 addresses (::ffff:a.b.c.d); unmap so they match the IPv4 strings
+    // that NIC discovery reports.
+    struct sockaddr_in6* s_in6 = (struct sockaddr_in6*)&addr;
+    if (IN6_IS_ADDR_V4MAPPED(&s_in6->sin6_addr)) {
+      struct in_addr v4;
+      std::memcpy(&v4, &s_in6->sin6_addr.s6_addr[12], sizeof(v4));
+      if (inet_ntop(AF_INET, &v4, host, sizeof(host)) == nullptr) {
+        return std::nullopt;
+      }
+    } else if (inet_ntop(AF_INET6, &s_in6->sin6_addr, host, sizeof(host)) ==
+               nullptr) {
+      return std::nullopt;
+    }
+  } else {
     return std::nullopt;
   }
   std::string ip_str(host);

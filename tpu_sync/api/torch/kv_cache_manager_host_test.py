@@ -173,6 +173,11 @@ class KVCacheManagerHostTest(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "no active PJRT client"):
       manager.experimental_map_shared_memory(4096, 4096)
 
+    # The binding accepts page_nbytes, and the missing client is reported
+    # before the page is validated: page_nbytes=0 would otherwise be rejected.
+    with self.assertRaisesRegex(RuntimeError, "no active PJRT client"):
+      manager.experimental_map_shared_memory(4096, 4096, page_nbytes=0)
+
 
 class _FakeDetailsImpl:
 

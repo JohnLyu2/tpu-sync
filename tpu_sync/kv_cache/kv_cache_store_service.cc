@@ -105,9 +105,7 @@ std::vector<RaidenWorkerEndpoints> UnpackWorkerEndpointsProto(
     std::vector<RaidenTransferEndpoint> eps;
     eps.reserve(group_proto.endpoints_size());
     for (const auto& ep_proto : group_proto.endpoints()) {
-      eps.push_back({ep_proto.endpoint(),
-                     std::vector<int64_t>(ep_proto.shards().begin(),
-                                          ep_proto.shards().end())});
+      eps.push_back(RaidenTransferEndpoint::FromProto(ep_proto));
     }
     result.push_back(
         {group_proto.node_id(), group_proto.worker_id(), std::move(eps)});

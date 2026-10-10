@@ -14,6 +14,7 @@
 
 #include "tpu_sync/transport/block_transport.h"
 
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -53,6 +54,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "peregrine/src/api/socket_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -264,8 +266,15 @@ class MockDelegate : public BlockTransportDelegate {
       uint64_t uuid, const absl::Status& status = absl::OkStatus()) override {
     (void)uuid;
     absl::MutexLock lock(end_status_mu_);
+    end_incoming_push_called_ = true;
     last_end_incoming_push_status_ = status;
     return absl::OkStatus();
+  }
+
+  bool WaitForEndIncomingPush(absl::Duration timeout) const {
+    absl::MutexLock lock(end_status_mu_);
+    return end_status_mu_.AwaitWithTimeout(
+        absl::Condition(&end_incoming_push_called_), timeout);
   }
 
   absl::Status last_end_incoming_push_status() const {
@@ -295,6 +304,7 @@ class MockDelegate : public BlockTransportDelegate {
   absl::Mutex wait_events_mu_;
   std::vector<std::tuple<size_t, size_t, int>> wait_events_;
   mutable absl::Mutex end_status_mu_;
+  bool end_incoming_push_called_ ABSL_GUARDED_BY(end_status_mu_) = false;
   absl::Status last_end_incoming_push_status_ ABSL_GUARDED_BY(end_status_mu_);
   mutable absl::Mutex peer_channels_mu_;
   std::shared_ptr<grpc::Channel> default_channel_
@@ -562,6 +572,201 @@ TEST_P(BlockTransportTest, PushNamesTheReceiversArrayByWireLayerIndex) {
   EXPECT_EQ(receiver_delegate.data(1)[0], 0xAB);
   EXPECT_EQ(receiver_delegate.data(1)[63], 0xAB);
   EXPECT_EQ(receiver_delegate.data(0)[0], 0x00);
+}
+
+// Receiver delegate recording every OnBlockShardsReceived report as
+// (block_ids, shard_ids).
+class BlockShardsReceivedRecordingDelegate : public MockDelegate {
+ public:
+  using Report = std::pair<std::vector<int>, std::vector<int>>;
+  using MockDelegate::MockDelegate;
+
+  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
+                                     absl::Span<const int> shard_ids,
+                                     uint64_t uuid) override {
+    absl::MutexLock lock(mu_);
+    reports_.emplace_back(block_ids,
+                          std::vector<int>(shard_ids.begin(), shard_ids.end()));
+    return absl::OkStatus();
+  }
+
+  std::vector<Report> reports() const {
+    absl::MutexLock lock(mu_);
+    return reports_;
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  std::vector<Report> reports_ ABSL_GUARDED_BY(mu_);
+};
+
+TEST_P(BlockTransportTest, PushReportsEveryShardPerStream) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  MockDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1, kShards);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(
+      kSlice, kBlocks, /*num_layers=*/1, kShards);
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Two streams, each owning half of the block range; each reports its blocks
+  // with every shard.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{2, 3},
+                     /*parallelism=*/2, MajorOrder::kLayerMajor, /*uuid=*/7,
+                     /*layer_idx=*/-1)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+
+  EXPECT_THAT(receiver_delegate.reports(),
+              ::testing::UnorderedElementsAre(
+                  ::testing::Pair(::testing::ElementsAre(2),
+                                  ::testing::ElementsAre(0, 1, 2, 3)),
+                  ::testing::Pair(::testing::ElementsAre(3),
+                                  ::testing::ElementsAre(0, 1, 2, 3))));
+}
+
+// Sender delegate whose shards are spread over NUMA nodes {0, 0, 1, 1}, so a
+// push is split into two shard groups with their own streams.
+class TwoNumaSenderDelegate : public MockDelegate {
+ public:
+  using MockDelegate::MockDelegate;
+
+  absl::Span<const ShardInfo> shards() const override { return shards_; }
+
+ private:
+  const std::vector<ShardInfo> shards_ = {
+      {.local_index = 0, .numa_node = 0},
+      {.local_index = 1, .numa_node = 0},
+      {.local_index = 2, .numa_node = 1},
+      {.local_index = 3, .numa_node = 1},
+  };
+};
+
+TEST_P(BlockTransportTest, PushSplitBySourceNumaDeliversEachShardGroup) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1,
+                                        kShards);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(
+      kSlice, kBlocks, /*num_layers=*/1, kShards);
+  for (size_t sh = 0; sh < kShards; ++sh) {
+    for (int b = 0; b < kBlocks; ++b) {
+      std::memset(sender_delegate.block_data(b, 0, sh),
+                  static_cast<int>(0x10 * sh + b), kSlice);
+    }
+  }
+
+  // The sender's shards span NUMA nodes 0 and 1, so the transport creates a
+  // pinned send adapter per node and splits the push into two shard groups.
+  BlockTransport sender(&sender_delegate, 0, /*local_ips=*/{"127.0.0.1"},
+                        /*parallelism=*/2);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // 2 shard groups x parallelism 2 = 4 streams, each reporting its block
+  // slice with only its group's shards.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{2, 3},
+                     /*parallelism=*/2, MajorOrder::kLayerMajor, /*uuid=*/8,
+                     /*layer_idx=*/-1)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+  EXPECT_THAT(*pushed, ::testing::ElementsAre(2, 3));
+
+  EXPECT_THAT(receiver_delegate.reports(),
+              ::testing::UnorderedElementsAre(
+                  ::testing::Pair(::testing::ElementsAre(2),
+                                  ::testing::ElementsAre(0, 1)),
+                  ::testing::Pair(::testing::ElementsAre(3),
+                                  ::testing::ElementsAre(0, 1)),
+                  ::testing::Pair(::testing::ElementsAre(2),
+                                  ::testing::ElementsAre(2, 3)),
+                  ::testing::Pair(::testing::ElementsAre(3),
+                                  ::testing::ElementsAre(2, 3))));
+
+  for (size_t sh = 0; sh < kShards; ++sh) {
+    for (int b = 0; b < 2; ++b) {
+      const uint8_t* dst = receiver_delegate.block_data(b + 2, 0, sh);
+      EXPECT_EQ(dst[0], static_cast<uint8_t>(0x10 * sh + b)) << sh << "/" << b;
+      EXPECT_EQ(dst[kSlice - 1], static_cast<uint8_t>(0x10 * sh + b))
+          << sh << "/" << b;
+    }
+  }
+}
+
+TEST_P(BlockTransportTest, PushWithoutDestinationIdsIsNotSplitByNuma) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1,
+                                        kShards);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(
+      kSlice, kBlocks, /*num_layers=*/1, kShards);
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Op 1 (receiver allocates): the receiver cannot pair shard subsets across
+  // streams, so the push falls back to the legacy every-shard layout.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{},
+                     /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/9,
+                     /*layer_idx=*/-1)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+  ASSERT_EQ(pushed->size(), 2);
+
+  EXPECT_THAT(receiver_delegate.reports(),
+              ::testing::ElementsAre(
+                  ::testing::Pair(::testing::ElementsAreArray(*pushed),
+                                  ::testing::ElementsAre(0, 1, 2, 3))));
+}
+
+TEST_P(BlockTransportTest, PushSplitBySourceNumaCompletesPlanDeclaredPool) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  constexpr uint64_t kUuid = 10;
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1,
+                                        kShards);
+  MockDelegate receiver_delegate(kSlice, kBlocks, /*num_layers=*/1, kShards);
+  // The plan counts pushes of `parallelism` streams: one sender, P=2.
+  receiver_delegate.SetPoolPushProgress(kUuid, /*expected_pushes_per_pool=*/2,
+                                        /*transfer_pool_indices=*/{0});
+
+  BlockTransport sender(&sender_delegate, 0, /*local_ips=*/{"127.0.0.1"},
+                        /*parallelism=*/2);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // The sender splits into 2 shard groups x 2 streams; the receiver must
+  // fold the 4 streams back into the plan's 2 pushes and complete the pool
+  // exactly once, after every stream landed.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{2, 3},
+                     /*parallelism=*/2, MajorOrder::kLayerMajor, kUuid,
+                     /*layer_idx=*/0)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+  EXPECT_EQ(receiver_delegate.pool_completion_count(), 1);
 }
 
 TEST_P(BlockTransportTest, PullNonContiguous) {
@@ -1685,6 +1890,70 @@ TEST_P(BlockTransportTest, PushBufferCorrectness) {
               Each(Eq(0)));
 }
 
+TEST_P(BlockTransportTest, PullBufferCorrectness) {
+  constexpr size_t size = 64 * 1024;
+  MockDelegate src(size);
+  MockDelegate dst(size);
+
+  constexpr size_t kLen = 62 * 1024;
+  constexpr size_t kSrcOffset = 256;
+  constexpr size_t kDstOffset = 512;
+  uint8_t* src_buf = src.GetHostPointer(0, 0);
+  for (size_t i = 0; i < size; ++i) {
+    src_buf[i] = static_cast<uint8_t>((i % 255) + 1);
+  }
+
+  BlockTransport src_transport(&src, 0);
+  BlockTransport dst_transport(&dst, 0);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string src_addr =
+      absl::StrCat("localhost:", src_transport.local_port());
+  const absl::Status pull_res = dst_transport.PullBuffer(
+      src_addr, /*buffer_id=*/0, /*src_shard_idx=*/0,
+      /*src_offset_bytes=*/kSrcOffset, /*dst_shard_idx=*/0,
+      /*dst_offset_bytes=*/kDstOffset, kLen);
+  ABSL_EXPECT_OK(pull_res) << pull_res.message();
+
+  const uint8_t* dst_buf = dst.GetHostPointer(0, 0);
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf, kDstOffset), Each(Eq(0)));
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset, kLen),
+              Pointwise(Eq(), absl::MakeConstSpan(src_buf + kSrcOffset, kLen)));
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset + kLen,
+                                  size - kDstOffset - kLen),
+              Each(Eq(0)));
+}
+
+TEST_P(BlockTransportTest, PullBufferZeroBytesIsNoop) {
+  constexpr size_t size = 4 * 1024;
+  MockDelegate dst(size);
+  BlockTransport dst_transport(&dst, 0);
+
+  // No slices are issued, so even an unreachable peer succeeds.
+  ABSL_EXPECT_OK(dst_transport.PullBuffer(
+      "localhost:1", /*buffer_id=*/0, /*src_shard_idx=*/0,
+      /*src_offset_bytes=*/0, /*dst_shard_idx=*/0, /*dst_offset_bytes=*/0,
+      /*size_bytes=*/0));
+}
+
+TEST_P(BlockTransportTest, PullBufferRejectsInvalidArguments) {
+  constexpr size_t size = 4 * 1024;
+  MockDelegate dst(size);
+  BlockTransport dst_transport(&dst, 0);
+
+  EXPECT_THAT(dst_transport.PullBuffer(
+                  /*peer=*/"", /*buffer_id=*/0, /*src_shard_idx=*/0,
+                  /*src_offset_bytes=*/0, /*dst_shard_idx=*/0,
+                  /*dst_offset_bytes=*/0, /*size_bytes=*/16),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(dst_transport.PullBuffer(
+                  "localhost:1", /*buffer_id=*/0, /*src_shard_idx=*/0,
+                  /*src_offset_bytes=*/0, /*dst_shard_idx=*/0,
+                  /*dst_offset_bytes=*/size - 8, /*size_bytes=*/16),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 TEST_P(BlockTransportTest, PollEINTRIsBenign) {
   // Set up src/dst buffers.
   constexpr size_t size = 4096;
@@ -1718,31 +1987,61 @@ TEST(DecodeReadTimeoutTest, TimeoutConfigFromEnv) {
   auto cleanup = absl::MakeCleanup([] {
     unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
     unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S");
   });
   MockDelegate delegate(/*slice_size=*/64);
 
   unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
   unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S");
   {
     BlockTransport transport(&delegate, /*local_port=*/0);
-    EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
-    EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.handshake_read_timeout_ms(), -1);
+    EXPECT_EQ(transport.payload_read_timeout_ms(), -1);
+    EXPECT_EQ(transport.ack_write_timeout_ms(), -1);
+    EXPECT_EQ(transport.payload_write_timeout_ms(), -1);
   }
 
   setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "1.5", 1);
   setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "12.5", 1);
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "9", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S", "6.5", 1);
   {
     BlockTransport transport(&delegate, /*local_port=*/0);
-    EXPECT_EQ(transport.handshake_read_timeout(), absl::Milliseconds(1500));
-    EXPECT_EQ(transport.payload_read_timeout(), absl::Milliseconds(12500));
+    EXPECT_EQ(transport.handshake_read_timeout_ms(), 1500);
+    EXPECT_EQ(transport.payload_read_timeout_ms(), 12500);
+    EXPECT_EQ(transport.ack_write_timeout_ms(), 9000);
+    EXPECT_EQ(transport.payload_write_timeout_ms(), 6500);
   }
 
   setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "-3", 1);
   setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "invalid", 1);
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "0", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S", "0", 1);
   {
     BlockTransport transport(&delegate, /*local_port=*/0);
-    EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
-    EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.handshake_read_timeout_ms(), -1);
+    EXPECT_EQ(transport.payload_read_timeout_ms(), -1);
+    EXPECT_EQ(transport.ack_write_timeout_ms(), -1);
+    EXPECT_EQ(transport.payload_write_timeout_ms(), -1);
+  }
+
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "-5", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S", "-2", 1);
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.ack_write_timeout_ms(), -1);
+    EXPECT_EQ(transport.payload_write_timeout_ms(), -1);
+  }
+
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "abc", 1);
+  setenv("TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S", "bad", 1);
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    EXPECT_EQ(transport.ack_write_timeout_ms(), -1);
+    EXPECT_EQ(transport.payload_write_timeout_ms(), -1);
   }
 }
 
@@ -1773,7 +2072,7 @@ TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
             static_cast<ssize_t>(s_header.size()));
 
   uint8_t ack = 0;
-  EXPECT_THAT(lib::ReadExactWithTimeout(fd, &ack, 1, absl::Seconds(2)),
+  EXPECT_THAT(::peregrine::ReadExact(fd, &ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
@@ -1816,7 +2115,7 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
 
   uint8_t handshake_ack = 0;
   ABSL_ASSERT_OK(
-      lib::ReadExactWithTimeout(fd, &handshake_ack, 1, absl::Seconds(2)));
+      ::peregrine::ReadExact(fd, &handshake_ack, 1, /*timeout_ms=*/2000));
   EXPECT_EQ(handshake_ack, 1);
 
   // Send the 4-byte chunk size (64 bytes) and only 16 bytes of payload, then
@@ -1830,9 +2129,42 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
       16);
 
   uint8_t final_ack = 0;
-  EXPECT_THAT(lib::ReadExactWithTimeout(fd, &final_ack, 1, absl::Seconds(2)),
+  EXPECT_THAT(::peregrine::ReadExact(fd, &final_ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
+  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
+}
+
+TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "0.1", 1);
+
+  MockDelegate delegate(/*slice_size=*/1, /*max_blocks=*/1);
+  BlockTransport receiver(&delegate, /*local_port=*/0);
+
+  TF_ASSERT_OK_AND_ASSIGN(int fd, lib::ConnectToPeer(absl::StrCat(
+                                      "127.0.0.1:", receiver.local_port())));
+  auto close_fd = absl::MakeCleanup([fd] { close(fd); });
+  int rcvbuf = 4096;
+  ASSERT_EQ(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+
+  // Send an Op 1 header requesting 8M block IDs (32 MiB serialized response)
+  // and do not drain `fd`, forcing the receiver's block-ID write to stall and
+  // time out.
+  lib::ChunkHeader header = {};
+  header.version = 1;
+  header.op = 1;
+  header.flags = static_cast<uint8_t>(MajorOrder::kLayerMajor);
+  header.reserved = 1;
+  header.local_id = 0;
+  header.count_or_size = 8 * 1024 * 1024;
+  header.uuid = 99;
+  const auto s_header = lib::SerializeChunkHeader(header);
+  ASSERT_EQ(::send(fd, s_header.data(), s_header.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_header.size()));
+
+  EXPECT_TRUE(delegate.WaitForEndIncomingPush(absl::Seconds(2)));
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
 

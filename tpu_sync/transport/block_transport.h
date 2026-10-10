@@ -31,7 +31,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
-#include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -39,6 +39,8 @@
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/service.grpc.pb.h"
+#include "tpu_sync/transport/lib/socket_transport_adapter.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/lib/transport_metrics_exporter.h"
 
@@ -52,11 +54,21 @@ enum class MajorOrder : uint8_t {
 
 using BlockReceivedCallback = lib::BlockReceivedCallback;
 
+// Maximum shard index addressable by a shard-masked push stream; the
+// per-stream shard subset travels as a 16-bit mask in `ChunkHeader::buffer_id`
+// (0 = every shard, the legacy encoding).
+inline constexpr int kMaxShardMaskBits = 16;
+
 // High-speed Key-Value block transport engine.
 class BlockTransport final {
  public:
   // Constructor sets up a TCP listening socket on the given `local_port`. It
   // starts #`parallelism` worker threads to handle incoming `WriteTask`s.
+  //
+  // When the delegate's shards (`delegate->shards()`) span more than one NUMA
+  // node, push streams whose shards live on node N are sent by worker threads
+  // pinned to N (see lib::SocketTransportAdapter). Otherwise every stream
+  // uses the default (unpinned) send path exactly as before.
   BlockTransport(BlockTransportDelegate* delegate, int local_port,
                  const std::vector<std::string>& local_ips = {},
                  int parallelism = 1);
@@ -65,18 +77,24 @@ class BlockTransport final {
   ~BlockTransport();
 
   struct Config {
-    std::optional<absl::Duration> handshake_read_timeout = std::nullopt;
-    std::optional<absl::Duration> payload_read_timeout = std::nullopt;
+    int handshake_read_timeout_ms = -1;
+    int payload_read_timeout_ms = -1;
+    int ack_write_timeout_ms = -1;
+    int payload_write_timeout_ms = -1;
     size_t coalesce_window_bytes = 0;
   };
 
   const Config& config() const { return config_; }
 
-  std::optional<absl::Duration> handshake_read_timeout() const {
-    return config_.handshake_read_timeout;
+  int handshake_read_timeout_ms() const {
+    return config_.handshake_read_timeout_ms;
   }
-  std::optional<absl::Duration> payload_read_timeout() const {
-    return config_.payload_read_timeout;
+  int payload_read_timeout_ms() const {
+    return config_.payload_read_timeout_ms;
+  }
+  int ack_write_timeout_ms() const { return config_.ack_write_timeout_ms; }
+  int payload_write_timeout_ms() const {
+    return config_.payload_write_timeout_ms;
   }
 
   // Return the TCP listening socket port.
@@ -96,6 +114,15 @@ class BlockTransport final {
   // local block array; `wire_layer_idx`, when set, is the index the receiver
   // resolves the pushed blocks against (a sender whose pool table is a subset
   // of the receiver's).
+  //
+  // The blocks are split evenly into `parallelism` streams and stream `i`
+  // goes to `peers[i % n]`. When the delegate reports shards on more than one
+  // NUMA node (`shards()`), the push is additionally split by NUMA node: each
+  // node gets its own `parallelism` streams carrying only that node's shards
+  // (`ChunkHeader::buffer_id` = shard mask), sent from the node's local NICs by
+  // threads pinned to it. This requires explicit `dst_block_ids` (op 6) and at
+  // most kMaxShardMaskBits shards; otherwise, and whenever every shard is on
+  // one node, the legacy single-group layout is used unchanged.
   //
   // Returns a future that resolves with the destination block ids once every
   // peer has acknowledged, or with the first error. Callers that need a
@@ -132,6 +159,20 @@ class BlockTransport final {
                           const uint8_t* data_ptr, size_t size_bytes,
                           uint64_t uuid = 0);
 
+  // Synchronously pulls |size_bytes| starting at |src_offset_bytes| of the
+  // remote |peer|'s buffer |buffer_id| / |src_shard_idx| into the local
+  // buffer |buffer_id| / |dst_shard_idx| at |dst_offset_bytes|. The transfer
+  // is driven entirely by the caller; the source does not need to be armed.
+  // Ranges larger than 1 GiB are split into sequential slices.
+  // TODO(justinlu): Add a batched pull only if many small ranges make the
+  // per-request round trip dominate. That needs a new wire op (one request
+  // listing N ranges, streamed back with writev) analogous to
+  // kOpBufferPushBatched; looping PullBuffer on a pool gains nothing here.
+  absl::Status PullBuffer(absl::string_view peer, size_t buffer_id,
+                          size_t src_shard_idx, size_t src_offset_bytes,
+                          size_t dst_shard_idx, size_t dst_offset_bytes,
+                          size_t size_bytes);
+
   // Pushes a vector of buffers to multiple peers.
   absl::Status PushBuffers(const std::vector<BufferPushTask>& tasks,
                            int parallelism, uint64_t uuid);
@@ -161,19 +202,42 @@ class BlockTransport final {
   }
 
  private:
+  // One push of |shard_ids| only, through |adapter|. `AsyncPush` calls this
+  // once per source NUMA node group and joins the futures; |num_groups| is the
+  // number of such calls, so the header declares the stream count over all of
+  // them and the receiver completes only once every group has landed.
+  tsl::Future<std::vector<int>> AsyncPushShards(
+      const std::vector<std::string>& peers,
+      const std::vector<int>& src_block_ids,
+      const std::vector<int>& dst_block_ids, int parallelism,
+      MajorOrder major_order, uint64_t uuid, int layer_idx,
+      std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
+      size_t num_groups, lib::TransportAdapter* adapter);
+
   lib::Request BuildBlockRequest(
       uint8_t socket_opcode, uint8_t* laddr, uint8_t* raddr, size_t len,
       uint32_t count_or_size, uint32_t request_id, uint64_t uuid,
       uint64_t buffer_id, int parallelism, MajorOrder major_order,
       uint32_t remote_id, uint32_t local_id, int stream_idx = 0,
-      BlockReceivedCallback on_block_received = nullptr);
+      BlockReceivedCallback on_block_received = nullptr,
+      uint16_t shard_mask = 0, int total_streams = 0);
 
-  // Builds a batch of Requests for block transfer.
+  // Builds the Requests of one block push for |shard_ids| only: `parallelism`
+  // streams (stream_idx 0..parallelism-1) over an even block partition, each
+  // carrying every layer of |shard_ids|. |total_streams| is what the receiver
+  // completes the push on; pass the sum over all shard groups when a push is
+  // split into several calls (one per NUMA node), 0 for `parallelism`. The
+  // wire shard mask is 0 (legacy) when |shard_ids| is every shard.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockRequests(
       absl::string_view peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, MajorOrder major_order,
-      uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1,
-      std::optional<int> wire_layer_idx = std::nullopt);
+      uint64_t uuid, int layer_idx, int parallelism,
+      std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
+      int total_streams = 0);
+
+  // Adapter that sends streams reading from |numa_node|: the per-node adapter
+  // when one exists, otherwise the default `transport_adapter_`.
+  lib::TransportAdapter* AdapterFor(int numa_node);
 
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(
@@ -187,6 +251,10 @@ class BlockTransport final {
                                   const lib::ChunkHeader& header);
   absl::Status HandleIncomingPull(int client_fd,
                                   const lib::ChunkHeader& header);
+  absl::Status CompleteIncomingPush(
+      uint64_t uuid, uint32_t local_id, uint32_t remote_id, size_t num_streams,
+      size_t landed_shards,
+      const std::optional<PoolPushProgressSpec>& pool_progress_spec);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
       const std::vector<std::string>& peers,
@@ -214,6 +282,9 @@ class BlockTransport final {
     struct SenderStreams {
       size_t landed = 0;
       size_t declared = 0;
+      // Plan-declared mode: shards landed beyond the last full shard set; a
+      // full set (one per split push) counts as one landed plan push.
+      size_t landed_shards = 0;
     };
     absl::flat_hash_map<uint32_t, SenderStreams> sender_streams;
     // Senders whose declared streams have all landed.
@@ -248,7 +319,6 @@ class BlockTransport final {
 
   absl::Mutex progress_mu_;
   ProgressMap layer_progress_ ABSL_GUARDED_BY(progress_mu_);
-
   lib::TransportMetricsExporter metrics_exporter_;
   absl::Notification stop_metrics_thread_;
   std::thread metrics_thread_;
@@ -256,6 +326,12 @@ class BlockTransport final {
   lib::RawBufferTransport raw_transport_;
   std::unique_ptr<lib::PeregrineControlServiceImpl> peregrine_control_;
   std::unique_ptr<lib::TransportAdapter> transport_adapter_;
+  // One extra adapter per NUMA node the delegate's shards span (only when
+  // they span more than one), with its send workers pinned to that node.
+  // Push streams for shards on that node go through it; everything else
+  // (pulls, single-group pushes) uses `transport_adapter_`.
+  absl::flat_hash_map<int, std::unique_ptr<lib::SocketTransportAdapter>>
+      numa_adapters_;
 };
 
 }  // namespace transport

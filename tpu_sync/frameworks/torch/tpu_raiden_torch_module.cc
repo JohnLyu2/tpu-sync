@@ -229,7 +229,15 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def_rw("tp_rank",
               &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_rank)
       .def_rw("tp_size",
-              &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_size);
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_size)
+      .def_rw("pcp_rank",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pcp_rank)
+      .def_rw("pcp_size",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pcp_size)
+      .def_rw("pp_rank",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pp_rank)
+      .def_rw("pp_size",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pp_size);
 
   nb::class_<tpu_raiden::kv_cache::BackendConfig>(m, "BackendConfig")
       .def(nb::init<>())
@@ -437,9 +445,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def(
           "map_shared_memory",
           [](KVCacheManager& self, uintptr_t mapped_address,
-             size_t pool_size_bytes) {
-            absl::Status status =
-                self.MapSharedMemory(mapped_address, pool_size_bytes);
+             size_t pool_size_bytes, std::optional<size_t> page_nbytes) {
+            absl::Status status = self.MapSharedMemory(
+                mapped_address, pool_size_bytes, page_nbytes);
             if (!status.ok()) {
               if (status.code() == absl::StatusCode::kInvalidArgument) {
                 throw std::invalid_argument(
@@ -452,6 +460,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
             }
           },
           nb::arg("mapped_address"), nb::arg("pool_size_bytes"),
+          nb::arg("page_nbytes") = nb::none(),
           nb::call_guard<nb::gil_scoped_release>())
       .def(
           "unmap_shared_memory",

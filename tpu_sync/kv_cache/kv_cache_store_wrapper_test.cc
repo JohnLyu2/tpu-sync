@@ -340,6 +340,8 @@ TEST_F(KVCacheStoreWrapperTest, StorageExtensionConfiguration) {
   BackendConfig sec_cfg;
   sec_cfg.type = "posix";
   sec_cfg.SetProperty("root_dir", "/tmp/raiden_storage_test");
+  sec_cfg.parallelism.tp_size = 1;
+  sec_cfg.parallelism.tp_rank = 0;
 
   KVCacheStoreWrapper wrapper(
       /*lru_capacity=*/4, /*global_registry_address=*/"", rid, /*num_shards=*/1,

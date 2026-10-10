@@ -16,9 +16,9 @@
 #define TPU_SYNC_TRANSPORT_LIB_PEREGRINE_CONTROL_SERVICE_H_
 
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/common/grpc_util.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/service.pb.h"
@@ -33,35 +33,51 @@ class PeregrineControlServiceImpl final
   explicit PeregrineControlServiceImpl(RawBufferTransport* transport)
       : transport_(transport) {}
 
-  grpc::Status ExchangePspKey(
+  grpc::Status ProcessUnary(
       grpc::ServerContext* context,
-      const ::peregrine::internal::control::PspKeyExchangeRequest* request,
-      ::peregrine::internal::control::PspKeyExchangeResponse* response)
-      override {
+      const ::peregrine::internal::control::ReqMsg* request,
+      ::peregrine::internal::control::RespMsg* response) override {
     if (transport_ == nullptr) {
       return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                           "RawBufferTransport is not initialized");
     }
-    if (request->client_spi() == 0) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                          "client_spi must be non-zero");
+    if (!request->has_psp_tcp_req()) {
+      return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                          "Unsupported request type");
     }
-    if (request->client_key().size() != 16) {
+    const auto& psp_req = request->psp_tcp_req();
+    if (!psp_req.has_psp()) {
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                          "client_key must be exactly 16 bytes");
+                          "psp token must be present");
+    }
+    const auto& psp = psp_req.psp();
+    if (psp.spi() == 0) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "psp.spi must be non-zero");
+    }
+    if (!psp.has_gen()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "psp.gen must be present");
+    }
+    if (psp.key().size() != 16) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "psp.key must be exactly 16 bytes");
+    }
+    if (psp_req.peer_target().ip_port().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "peer_target.ip_port must be non-empty");
     }
 
-    auto server_rx_key = transport_->RegisterPspPeer(request->client_spi(),
-                                                     request->client_key());
+    auto server_rx_key = transport_->RegisterPspPeer(
+        psp.spi(), psp.key(), psp_req.peer_target().ip_port());
     if (!server_rx_key.ok()) {
-      return grpc::Status(
-          grpc::StatusCode::INTERNAL,
-          absl::StrCat("Failed to register PSP peer: ",
-                       server_rx_key.status().message()));
+      return ToGrpcStatus(server_rx_key.status());
     }
 
-    response->set_server_spi(server_rx_key->spi);
-    response->set_server_key(server_rx_key->key);
+    auto* resp_psp = response->mutable_psp_tcp_resp()->mutable_psp();
+    resp_psp->set_spi(server_rx_key->spi);
+    resp_psp->set_gen(server_rx_key->gen);
+    resp_psp->set_key(server_rx_key->key);
     return grpc::Status::OK;
   }
 

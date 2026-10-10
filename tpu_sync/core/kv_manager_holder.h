@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -114,6 +115,20 @@ struct has_vector_h2h_write<
 
 template <typename T>
 inline constexpr bool has_vector_h2h_write_v = has_vector_h2h_write<T>::value;
+
+template <typename T, typename = void>
+struct has_set_remote_layer_addrs : std::false_type {};
+
+template <typename T>
+struct has_set_remote_layer_addrs<
+    T, std::void_t<decltype(std::declval<T&>().SetRemoteLayerAddrs(
+           std::declval<uint64_t>(),
+           std::declval<std::vector<::tpu_sync::rpc::PoolHostAddrsProto>>()))>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_set_remote_layer_addrs_v =
+    has_set_remote_layer_addrs<T>::value;
 
 template <typename T, typename = void>
 struct has_vector_h2h_read : std::false_type {};
@@ -489,6 +504,18 @@ class KVManagerHolder {
             auto res, base().H2hWrite(remote_descriptors, src_ids, dst_ids));
         return res.second;
       } else {
+        if constexpr (internal::has_set_remote_layer_addrs_v<BaseT>) {
+          base().SetRemoteLayerAddrs(
+              /*uuid=*/0,
+              remote_descriptors.empty()
+                  ? std::vector<::tpu_sync::rpc::PoolHostAddrsProto>{}
+                  : remote_descriptors[0].layer_host_addrs);
+        }
+        absl::Cleanup clear_remote_addrs = [&]() {
+          if constexpr (internal::has_set_remote_layer_addrs_v<BaseT>) {
+            base().ClearRemoteLayerAddrs(/*uuid=*/0);
+          }
+        };
         std::string peer =
             remote_descriptors.empty() ? "" : remote_descriptors[0].endpoint;
         ABSL_ASSIGN_OR_RETURN(auto res,

@@ -1851,7 +1851,8 @@ TEST(KVCacheManagerTest, MultiSliceOffloadAndRecallContentValidity) {
         absl::flat_hash_map<std::string, std::string>{
             {"tp_rank", absl::StrCat(r)}, {"tp_size", absl::StrCat(kTpSize)}});
     w.mapper = std::make_unique<backends::storage::PosixPathMapper>(
-        scratch_dir, "test_model", /*tp_size=*/kTpSize, /*tp_rank=*/r);
+        scratch_dir, "test_model",
+        backends::ParallelismConfig{.tp_size = kTpSize, .tp_rank = r});
 
     w.pjrt_buffers.resize(kNumLayers);
     w.layer_handles.resize(kNumLayers);
@@ -2109,24 +2110,120 @@ class RegisterKVBackendsTopologyTest : public ::testing::Test {
   std::string scratch_dir_;
 };
 
-// Regression: tp_size left at its default (-1) used to be stringified into the
-// backend properties and LOG(FATAL) in PosixKVBackend.
-TEST_F(RegisterKVBackendsTopologyTest, DefaultsTpSizeToOne) {
+// An invalid storage config aborts the worker: registering nothing would leave
+// it running without storage, and every lookup would silently miss.
+class RegisterKVBackendsTopologyDeathTest
+    : public RegisterKVBackendsTopologyTest {
+ protected:
+  void SetUp() override {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    RegisterKVBackendsTopologyTest::SetUp();
+  }
+};
+
+// A rank without a size dies (tp_size is no longer defaulted to 1).
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnTpRankWithoutTpSize) {
   auto manager = MakeManager();
-  manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/0, /*tp_size=*/-1)});
+  EXPECT_DEATH(
+      manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/0, /*tp_size=*/-1)}),
+      "received topology: pp=undeclared pcp=undeclared tp=undeclared/r0.*"
+      "tp_rank 0 was given without tp_size");
+}
+
+// With no axis declared every worker would write the same shard files.
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesWhenNoAxisDeclared) {
+  auto manager = MakeManager();
+  EXPECT_DEATH(manager->RegisterKVBackends(
+                   {PosixConfig(/*tp_rank=*/-1, /*tp_size=*/-1)}),
+               "received topology: pp=undeclared pcp=undeclared tp=undeclared.*"
+               "declares no parallelism axis");
+}
+
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnUnsupportedBackendType) {
+  auto manager = MakeManager();
+  BackendConfig cfg = PosixConfig(/*tp_rank=*/0, /*tp_size=*/1);
+  cfg.type = "gcs";
+  EXPECT_DEATH(manager->RegisterKVBackends({cfg}),
+               "unsupported secondary backend type 'gcs'.*"
+               "received topology: pp=undeclared pcp=undeclared tp=1/r0");
+}
+
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnPcpRankOutOfRange) {
+  auto manager = MakeManager();
+  BackendConfig cfg = PosixConfig(/*tp_rank=*/0, /*tp_size=*/1);
+  cfg.parallelism.pcp_size = 8;
+  cfg.parallelism.pcp_rank = 8;
+  EXPECT_DEATH(manager->RegisterKVBackends({cfg}),
+               "received topology: pp=undeclared pcp=8/r8 tp=1/r0.*"
+               "pcp_rank must be in .0, 8. for pcp_size 8; got 8");
+}
+
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnPcpRankWithoutPcpSize) {
+  auto manager = MakeManager();
+  BackendConfig cfg = PosixConfig(/*tp_rank=*/0, /*tp_size=*/1);
+  cfg.parallelism.pcp_rank = 3;
+  EXPECT_DEATH(manager->RegisterKVBackends({cfg}),
+               "pcp_rank 3 was given without pcp_size");
+}
+
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnZeroPcpSize) {
+  auto manager = MakeManager();
+  BackendConfig cfg = PosixConfig(/*tp_rank=*/0, /*tp_size=*/1);
+  cfg.parallelism.pcp_size = 0;
+  cfg.parallelism.pcp_rank = 0;
+  EXPECT_DEATH(manager->RegisterKVBackends({cfg}),
+               "pcp_size must be >= 1, or -1 when the pcp axis is undeclared; "
+               "got 0");
+}
+
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnTpRankOutOfRange) {
+  auto manager = MakeManager();
+  EXPECT_DEATH(
+      manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/4, /*tp_size=*/4)}),
+      "tp_rank must be in .0, 4. for tp_size 4; got 4");
+}
+
+// A non-topology property error also aborts, naming the property.
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnInvalidBackendProperty) {
+  auto manager = MakeManager();
+  BackendConfig cfg = PosixConfig(/*tp_rank=*/0, /*tp_size=*/1);
+  cfg.SetProperty("storage_io_thread_pool_size", "0");
+  EXPECT_DEATH(manager->RegisterKVBackends({cfg}),
+               "received topology: pp=undeclared pcp=undeclared tp=1/r0.: "
+               "storage_io_thread_pool_size must be >= 1, got 0");
+}
+
+// A second config for an already-registered backend is ignored: the first
+// registration, and its topology, stay in place.
+TEST_F(RegisterKVBackendsTopologyTest, DuplicateRegistrationIsNoOp) {
+  auto manager = MakeManager();
+  manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/1, /*tp_size=*/4)});
+  auto first = manager->GetKVBackend("posix");
+  ASSERT_NE(first, nullptr);
+
+  manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/0, /*tp_size=*/8)});
+
+  auto backend = manager->GetKVBackend("posix");
+  EXPECT_EQ(backend, first);
+  ASSERT_NE(backend->mapper(), nullptr);
+  EXPECT_EQ(backend->mapper()->tp_size(), 4);
+  TF_ASSERT_OK_AND_ASSIGN(auto key, backend->mapper()->MapKey("block_hash"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp4_r1/"));
+}
+
+TEST_F(RegisterKVBackendsTopologyTest, AcceptsPcpAndTp) {
+  auto manager = MakeManager();
+  BackendConfig cfg = PosixConfig(/*tp_rank=*/0, /*tp_size=*/1);
+  cfg.parallelism.pcp_size = 8;
+  cfg.parallelism.pcp_rank = 3;
+  manager->RegisterKVBackends({cfg});
 
   auto backend = manager->GetKVBackend("posix");
   ASSERT_NE(backend, nullptr);
   ASSERT_NE(backend->mapper(), nullptr);
-  EXPECT_EQ(backend->mapper()->tp_size(), 1);
+  EXPECT_EQ(backend->mapper()->pcp_size(), 8);
   TF_ASSERT_OK_AND_ASSIGN(auto key, backend->mapper()->MapKey("block_hash"));
-  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp1_r0/"));
-}
-
-TEST_F(RegisterKVBackendsTopologyTest, RejectsRankOutOfRangeWithoutCrash) {
-  auto manager = MakeManager();
-  manager->RegisterKVBackends({PosixConfig(/*tp_rank=*/4, /*tp_size=*/4)});
-  EXPECT_EQ(manager->GetKVBackend("posix"), nullptr);
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/pcp8_r3_tp1_r0/"));
 }
 
 TEST_F(RegisterKVBackendsTopologyTest, IgnoresCallerTpProperties) {

@@ -29,6 +29,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -410,6 +412,67 @@ TEST(WeightSyncFourWayInteropTest, TcpFourWayClientServerMatrix) {
   old_server.Stop();
 }
 
+TEST(GrpcControlPipeClientTest, OnlyFailuresBeforeConnectingAreMarkedNotSent) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  GrpcControlPipeClient client(cfg);
+  PullStreamRequest req;
+
+  // Bound but not listening: the channel never connects, nothing was sent.
+  int bound_fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  ASSERT_EQ(bind(bound_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+            0);
+  socklen_t len = sizeof(addr);
+  getsockname(bound_fd, reinterpret_cast<sockaddr*>(&addr), &len);
+  auto refused = client.Call<PullStreamRequest, PullStreamResponse>(
+      absl::StrCat("127.0.0.1:", ntohs(addr.sin_port)), req, absl::Seconds(5));
+  close(bound_fd);
+  ASSERT_TRUE(absl::IsUnavailable(refused.status())) << refused.status();
+  EXPECT_TRUE(IsControlPipeNotSent(refused.status()));
+
+  std::atomic<bool> block{false};
+  std::unique_ptr<ControlPipeServer> server = CreateControlPipeServer(cfg);
+  server->dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
+      [&block](const ControlContext&,
+               const PullStreamRequest&) -> absl::StatusOr<PullStreamResponse> {
+        for (int i = 0; i < 1000 && block.load(); ++i) {
+          absl::SleepFor(absl::Milliseconds(10));
+        }
+        return PullStreamResponse();
+      });
+  TF_ASSERT_OK_AND_ASSIGN(int port, server->Start(0));
+  const std::string endpoint = absl::StrCat("127.0.0.1:", port);
+  ASSERT_TRUE((client.Call<PullStreamRequest, PullStreamResponse>(
+                   endpoint, req, absl::Seconds(5)))
+                  .ok());
+
+  // Delivered to a connected peer, then failed: never marked not sent.
+  block = true;
+  auto timed_out = client.Call<PullStreamRequest, PullStreamResponse>(
+      endpoint, req, absl::Milliseconds(300));
+  block = false;
+  ASSERT_TRUE(absl::IsDeadlineExceeded(timed_out.status()))
+      << timed_out.status();
+  EXPECT_FALSE(IsControlPipeNotSent(timed_out.status()));
+
+  // The peer goes away: the cached channel cannot reconnect, so later
+  // requests are not sent. One may race the disconnect and count as sent.
+  server->Stop();
+  bool saw_not_sent = false;
+  for (int i = 0; i < 50 && !saw_not_sent; ++i) {
+    auto after_stop = client.Call<PullStreamRequest, PullStreamResponse>(
+        endpoint, req, absl::Seconds(5));
+    ASSERT_FALSE(after_stop.ok());
+    saw_not_sent = absl::IsUnavailable(after_stop.status()) &&
+                   IsControlPipeNotSent(after_stop.status());
+    if (!saw_not_sent) absl::SleepFor(absl::Milliseconds(100));
+  }
+  EXPECT_TRUE(saw_not_sent);
+}
+
 TEST(GrpcControlPipeClientLruTest,
      EvictsLeastRecentlyUsedStubWhenCapacityExceeded) {
   ControlPipeConfig server_cfg;
@@ -494,6 +557,61 @@ TEST(GrpcControlPipeClientLruTest, ZeroCapacityBypassesCache) {
   ASSERT_TRUE(client.SendOneWay(ep, ack_req).ok());
   EXPECT_EQ(client.TEST_CachedStubCount(), 0u);
   EXPECT_FALSE(client.TEST_HasCachedStub(ep));
+
+  server->Stop();
+}
+
+TEST(GrpcControlPipeKeepaliveTest,
+     IdleKeepalivePingsDoNotTriggerTooManyPingsGoaway) {
+  ControlPipeConfig server_cfg;
+  server_cfg.backend_type = ControlPipeBackendType::kGrpc;
+  server_cfg.grpc_keepalive_time_ms = 20;
+  server_cfg.grpc_keepalive_timeout_ms = 5000;
+  server_cfg.grpc_min_recv_ping_interval_without_data_ms = 10;
+
+  std::unique_ptr<ControlPipeServer> server =
+      CreateControlPipeServer(server_cfg);
+  server->dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
+      [](const ControlContext& ctx,
+         const PullStreamRequest& req) -> absl::StatusOr<PullStreamResponse> {
+        if (req.uuid() == 2) {
+          // Hold the RPC in flight across several 20 ms keepalive intervals so
+          // any GOAWAY ENHANCE_YOUR_CALM ("too_many_pings") aborts this call
+          // with UNAVAILABLE.
+          absl::SleepFor(absl::Milliseconds(100));
+        }
+        PullStreamResponse resp;
+        resp.set_status(0);
+        resp.set_num_layers(static_cast<int32_t>(req.uuid()));
+        return resp;
+      });
+  TF_ASSERT_OK_AND_ASSIGN(int port, server->Start(0));
+  std::string ep = absl::StrCat("127.0.0.1:", port);
+
+  ControlPipeConfig client_cfg;
+  client_cfg.backend_type = ControlPipeBackendType::kGrpc;
+  client_cfg.grpc_keepalive_time_ms = 20;
+  client_cfg.grpc_keepalive_timeout_ms = 5000;
+  GrpcControlPipeClient client(client_cfg);
+
+  // Establish the HTTP/2 connection and warm the cached stub.
+  PullStreamRequest req1;
+  req1.set_uuid(1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      PullStreamResponse resp1,
+      (client.Call<PullStreamRequest, PullStreamResponse>(ep, req1)));
+  EXPECT_EQ(resp1.num_layers(), 1);
+
+  // Remain idle for >6 ping intervals (>2 default ping strikes) without active
+  // calls, then issue an in-flight RPC that spans multiple additional pings.
+  absl::SleepFor(absl::Milliseconds(150));
+
+  PullStreamRequest req2;
+  req2.set_uuid(2);
+  TF_ASSERT_OK_AND_ASSIGN(
+      PullStreamResponse resp2,
+      (client.Call<PullStreamRequest, PullStreamResponse>(ep, req2)));
+  EXPECT_EQ(resp2.num_layers(), 2);
 
   server->Stop();
 }

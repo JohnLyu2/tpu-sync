@@ -15,12 +15,15 @@
 """Real-TPU tests for shared memory DMA mapping and object tensor transfers.
 
 These exercise KVCacheManager.experimental_map_shared_memory plus the
-object-tensor H2D/D2H overloads against a live PJRT client.
+object-tensor H2D/D2H overloads against a live PJRT client, including pages
+that span several device blocks.
 
-test_object_tensor_bandwidth additionally measures throughput. Its threshold is
-deliberately loose: it only catches a silent fall-off to staged pageable copies,
-an order of magnitude below DMA speed. It is not a regression gate, and
-scheduling jitter must not flake it.
+test_object_tensor_bandwidth additionally measures throughput, and
+test_multi_block_page_bandwidth compares one DMA per multi-block page against
+one DMA per device block for the same bytes. Their threshold is deliberately
+loose: it only catches a silent fall-off to staged pageable copies, an order of
+magnitude below DMA speed. It is not a regression gate, and scheduling jitter
+must not flake it.
 """
 
 import os
@@ -50,7 +53,10 @@ _PERF_LAYERS = flags.DEFINE_integer(
     "perf_layers", 8, "Layers (device buffers) for the bandwidth test."
 )
 _PERF_BLOCKS = flags.DEFINE_integer(
-    "perf_blocks", 8, "Blocks per h2d/d2h call in the bandwidth test."
+    "perf_blocks",
+    8,
+    "Blocks per h2d/d2h call in the bandwidth tests; pages in "
+    "test_multi_block_page_bandwidth.",
 )
 _PERF_BLOCK_MIB = flags.DEFINE_integer(
     "perf_block_mib", 4, "MiB per block per layer in the bandwidth test."
@@ -67,6 +73,12 @@ _MIN_GBPS = flags.DEFINE_float(
     "Fail below this bandwidth (GB/s, decimal). Loose on purpose: it catches a "
     "fall-off to staged pageable copies, not a drift regression.",
 )
+
+# test_multi_block_page_bandwidth mirrors a connector whose block spans
+# several device blocks: 512 KiB device blocks grouped into 2 MiB pages.
+_PAGE_DEVICE_BLOCKS = 4
+# float32, so one device block is 512 * 256 * 4 bytes == 512 KiB.
+_PAGE_TEST_BLOCK_SHAPE = (512, 256)
 
 
 class SharedMemoryDmaTest(absltest.TestCase):
@@ -122,6 +134,16 @@ class SharedMemoryDmaTest(absltest.TestCase):
       if i >= _PERF_WARMUP.value:
         times.append(elapsed)
     return statistics.median(times)
+
+  def _bench_object_transfers(self, manager, block_ids, tensors):
+    """Returns median (h2d_s, d2h_s) for one call over all of `tensors`."""
+    h2d_s = self._bench(
+        lambda: manager.experimental_h2d(block_ids, tensors, 0).wait()
+    )
+    d2h_s = self._bench(
+        lambda: manager.experimental_d2h(block_ids, tensors, 0).wait()
+    )
+    return h2d_s, d2h_s
 
   def test_h2d_d2h_roundtrip_through_mapped_pool(self):
     manager = self._make_manager()
@@ -240,6 +262,80 @@ class SharedMemoryDmaTest(absltest.TestCase):
       self.assertFalse(manager.experimental_is_shared_memory_mapped)
     del backing
 
+  def test_multi_block_page_roundtrip(self):
+    manager = self._make_manager()
+    # Let the zero fill of the device KV caches land before reading them.
+    torch.accelerator.synchronize()
+    block_nbytes = manager._impl.slice_byte_size  # pylint: disable=protected-access
+    # _NUM_BLOCKS device blocks per layer, so two-block pages leave two pages.
+    page_nbytes = 2 * block_nbytes
+    page_shape = (_NUM_RANKS, _NUM_LAYERS, page_nbytes)
+    block_shape = (_NUM_RANKS, _NUM_LAYERS, block_nbytes)
+    page_obj_nbytes = _NUM_RANKS * _NUM_LAYERS * page_nbytes
+    block_obj_nbytes = _NUM_RANKS * _NUM_LAYERS * block_nbytes
+
+    # A source and a destination page, then two one-block objects for reading
+    # device blocks back individually. All of them live inside the pool.
+    backing, pad, pool_addr, pool_size = self._alloc_pool(
+        2 * page_obj_nbytes + 2 * block_obj_nbytes
+    )
+    backing.zero_()
+    start = pad
+    src = backing[start : start + page_obj_nbytes].view(page_shape)
+    start += page_obj_nbytes
+    dst = backing[start : start + page_obj_nbytes].view(page_shape)
+    start += page_obj_nbytes
+    first = backing[start : start + block_obj_nbytes].view(block_shape)
+    start += block_obj_nbytes
+    second = backing[start : start + block_obj_nbytes].view(block_shape)
+
+    # The page's first device block is 0x11 and its second 0x22, so the
+    # readback can tell where each half landed.
+    src[0, :, :block_nbytes].fill_(0x11)
+    src[0, :, block_nbytes:].fill_(0x22)
+
+    manager.experimental_map_shared_memory(
+        pool_addr, pool_size, page_nbytes=page_nbytes
+    )
+    try:
+      # Page 1 is device blocks 2 and 3.
+      manager.experimental_h2d([1], [src], 0).wait()
+      manager.experimental_d2h([1], [dst], 0).wait()
+      self.assertTrue(
+          torch.equal(dst[0], src[0]),
+          "page 1 did not round-trip through the device",
+      )
+
+      # The mapping pins the page size, so a one-block object is refused
+      # instead of block id 1 silently meaning device block 1.
+      with self.assertRaisesRegex(ValueError, "does not match"):
+        manager.experimental_h2d([1], [first], 0)
+    finally:
+      manager.experimental_unmap_shared_memory()
+
+    # Re-map with the default one-block page and read device blocks 1 to 3
+    # back one at a time.
+    manager.experimental_map_shared_memory(pool_addr, pool_size)
+    try:
+      manager.experimental_d2h([2, 3], [first, second], 0).wait()
+      self.assertTrue(
+          torch.all(first[0] == 0x11).item(),
+          "device block 2 does not hold the page's first half",
+      )
+      self.assertTrue(
+          torch.all(second[0] == 0x22).item(),
+          "device block 3 does not hold the page's second half",
+      )
+      manager.experimental_d2h([1], [first], 0).wait()
+      self.assertEqual(
+          torch.count_nonzero(first[0]).item(),
+          0,
+          "device block 1, below page 1, was written",
+      )
+    finally:
+      manager.experimental_unmap_shared_memory()
+    del backing
+
   def test_object_tensor_bandwidth(self):
     num_layers = _PERF_LAYERS.value
     num_blocks = _PERF_BLOCKS.value
@@ -277,12 +373,7 @@ class SharedMemoryDmaTest(absltest.TestCase):
 
     manager.experimental_map_shared_memory(pool_addr, pool_size)
     try:
-      h2d_s = self._bench(
-          lambda: manager.experimental_h2d(block_ids, tensors, 0).wait()
-      )
-      d2h_s = self._bench(
-          lambda: manager.experimental_d2h(block_ids, tensors, 0).wait()
-      )
+      h2d_s, d2h_s = self._bench_object_transfers(manager, block_ids, tensors)
     finally:
       manager.experimental_unmap_shared_memory()
 
@@ -304,6 +395,82 @@ class SharedMemoryDmaTest(absltest.TestCase):
 
     self.assertGreater(rates["H2D"], _MIN_GBPS.value)
     self.assertGreater(rates["D2H"], _MIN_GBPS.value)
+    del backing
+
+  def test_multi_block_page_bandwidth(self):
+    num_layers = _PERF_LAYERS.value
+    num_pages = _PERF_BLOCKS.value
+    kv_caches = [
+        torch.zeros(
+            (num_pages * _PAGE_DEVICE_BLOCKS,) + _PAGE_TEST_BLOCK_SHAPE,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        for _ in range(num_layers)
+    ]
+    torch.accelerator.synchronize()
+    # Staging slots are unused by object transfers; keep them minimal.
+    manager = KVCacheManager(
+        kv_caches=kv_caches,
+        node_id=0,
+        local_control_port=0,
+        max_blocks=1,
+        num_slots=1,
+    )
+    block_nbytes = manager._impl.slice_byte_size  # pylint: disable=protected-access
+    page_nbytes = _PAGE_DEVICE_BLOCKS * block_nbytes
+    payload_bytes = num_pages * num_layers * page_nbytes
+    backing, pad, pool_addr, pool_size = self._alloc_pool(payload_bytes)
+
+    print(
+        f"[multi-block page perf] layers={num_layers} pages={num_pages} "
+        f"page={page_nbytes / (1024.0 * 1024.0):.3f} MiB "
+        f"device_block={block_nbytes / 1024.0:.0f} KiB "
+        f"payload={payload_bytes / (1024.0 * 1024.0):.1f} MiB "
+        f"iters={_PERF_ITERS.value}"
+    )
+    # Both cases move the same bytes between the same pool and device range;
+    # only the transfer unit differs. Each object is [1, num_layers, unit] and
+    # object i holds unit i of every layer, so the device-block case needs
+    # _PAGE_DEVICE_BLOCKS times as many block ids and DMAs.
+    rates = {}
+    for name, unit_nbytes, mapped_page_nbytes in (
+        ("page", page_nbytes, page_nbytes),
+        ("device_block", block_nbytes, None),
+    ):
+      obj_nbytes = num_layers * unit_nbytes
+      tensors = [
+          backing[pad + i * obj_nbytes : pad + (i + 1) * obj_nbytes].view(
+              1, num_layers, unit_nbytes
+          )
+          for i in range(payload_bytes // obj_nbytes)
+      ]
+      manager.experimental_map_shared_memory(
+          pool_addr, pool_size, page_nbytes=mapped_page_nbytes
+      )
+      try:
+        h2d_s, d2h_s = self._bench_object_transfers(
+            manager, list(range(len(tensors))), tensors
+        )
+      finally:
+        manager.experimental_unmap_shared_memory()
+      for direction, seconds in (("H2D", h2d_s), ("D2H", d2h_s)):
+        gbps = payload_bytes / seconds / 1e9
+        gibps = payload_bytes / seconds / (1024.0**3)
+        rates[f"{name} {direction}"] = gbps
+        print(
+            f"[multi-block page perf] {name} ids={len(tensors)} {direction} "
+            f"median {seconds * 1e3:.2f} ms -> {gbps:.1f} GB/s "
+            f"({gibps:.1f} GiB/s)"
+        )
+
+    print(
+        "[multi-block page perf] page/device_block "
+        f"H2D {rates['page H2D'] / rates['device_block H2D']:.2f}x "
+        f"D2H {rates['page D2H'] / rates['device_block D2H']:.2f}x"
+    )
+    for case, gbps in rates.items():
+      self.assertGreater(gbps, _MIN_GBPS.value, case)
     del backing
 
 

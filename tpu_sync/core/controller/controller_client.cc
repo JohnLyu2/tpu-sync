@@ -57,11 +57,7 @@ absl::Status RaidenControllerClient::RegisterWorker(
   request.set_raiden_worker_endpoint(std::string(raiden_worker_endpoint));
   request.set_node_id(node_id);
   for (const auto& ep : raiden_transfer_endpoints) {
-    auto* desc = request.add_raiden_transfer_endpoints();
-    desc->set_endpoint(ep.endpoint);
-    for (int64_t shard : ep.shards) {
-      desc->add_shards(shard);
-    }
+    *request.add_raiden_transfer_endpoints() = ep.ToProto();
   }
   for (uint64_t bytes : block_array_bytes) {
     request.add_block_array_bytes(static_cast<int64_t>(bytes));

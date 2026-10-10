@@ -21,7 +21,6 @@
 #include <deque>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <string>
 #include <thread>  // NOLINT
 #include <vector>
@@ -32,7 +31,6 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
-#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -41,19 +39,17 @@ namespace tpu_raiden {
 namespace transport {
 namespace lib {
 
-// Returns true if source IP binding is enabled via environment variable
-// TPU_RAIDEN_ENABLE_SOURCE_IP_BIND.
-bool SourceBindEnabled();
-
-// Source address for stream `i`, or "" to let the kernel choose by route.
-std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i);
-
 // TCP Socket implementation of TransportAdapter.
 class SocketTransportAdapter : public TransportAdapter {
  public:
+  // |numa_node| >= 0 pins the send workers to that node; -1 (default) leaves
+  // them unpinned.
   explicit SocketTransportAdapter(RawBufferTransport* raw_transport,
-                                  int parallelism = 1);
+                                  int parallelism = 1, int numa_node = -1);
   ~SocketTransportAdapter() override;
+
+  // NUMA node the send workers are pinned to, or -1.
+  int numa_node() const { return numa_node_; }
 
   absl::StatusOr<Handle> Post(
       absl::Span<const std::string> peers, absl::Span<const Request> requests,
@@ -63,18 +59,39 @@ class SocketTransportAdapter : public TransportAdapter {
 
   absl::StatusOr<Status> Poll(Handle handle) override;
 
+  static constexpr int kDefaultMaxSocketWorkers = 64;
+
   struct Config {
-    std::optional<absl::Duration> handshake_ack_read_timeout = std::nullopt;
-    std::optional<absl::Duration> final_ack_read_timeout = std::nullopt;
+    int handshake_ack_read_timeout_ms = -1;
+    int final_ack_read_timeout_ms = -1;
+    int payload_read_timeout_ms = -1;
+    int handshake_write_timeout_ms = -1;
+    int payload_write_timeout_ms = -1;
+    int max_socket_workers = kDefaultMaxSocketWorkers;
   };
 
   const Config& config() const { return config_; }
 
-  std::optional<absl::Duration> handshake_ack_read_timeout() const {
-    return config_.handshake_ack_read_timeout;
+  int handshake_ack_read_timeout_ms() const {
+    return config_.handshake_ack_read_timeout_ms;
   }
-  std::optional<absl::Duration> final_ack_read_timeout() const {
-    return config_.final_ack_read_timeout;
+  int final_ack_read_timeout_ms() const {
+    return config_.final_ack_read_timeout_ms;
+  }
+  int payload_read_timeout_ms() const {
+    return config_.payload_read_timeout_ms;
+  }
+  int handshake_write_timeout_ms() const {
+    return config_.handshake_write_timeout_ms;
+  }
+  int payload_write_timeout_ms() const {
+    return config_.payload_write_timeout_ms;
+  }
+  int max_socket_workers() const { return config_.max_socket_workers; }
+
+  size_t worker_count() const {
+    absl::MutexLock lock(scheduler_mu_);
+    return socket_workers_.size();
   }
 
  private:
@@ -119,14 +136,24 @@ class SocketTransportAdapter : public TransportAdapter {
  private:
   RawBufferTransport* const raw_transport_;
   const int parallelism_;
+  const int numa_node_;
+  // Candidate source addresses for outbound streams (used only when source
+  // binding is enabled): the local IPs on `numa_node_`, or every local IP
+  // when unpinned or when no local IP is on that node.
+  const std::vector<std::string> source_ips_;
   const Config config_;
 
-  absl::Mutex scheduler_mu_;
+  mutable absl::Mutex scheduler_mu_;
   absl::CondVar scheduler_cv_;
   absl::flat_hash_map<std::string, PeerQueue> peer_queues_
       ABSL_GUARDED_BY(scheduler_mu_);
   std::vector<std::string> active_peers_ ABSL_GUARDED_BY(scheduler_mu_);
   size_t rr_index_ ABSL_GUARDED_BY(scheduler_mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<std::atomic<bool>>>
+      session_failed_by_uuid_ ABSL_GUARDED_BY(scheduler_mu_);
+  std::deque<uint64_t> uuid_lru_order_ ABSL_GUARDED_BY(scheduler_mu_);
+  static constexpr size_t kMaxTrackedUuids = 1024;
+
   // TODO(swasthi): Guard scheduler_stopping_ with scheduler_mu_ instead of
   // atomic.
   std::atomic<bool> scheduler_stopping_;

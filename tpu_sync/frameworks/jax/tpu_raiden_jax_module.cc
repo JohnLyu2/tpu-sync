@@ -107,7 +107,15 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def_rw("tp_rank",
               &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_rank)
       .def_rw("tp_size",
-              &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_size);
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_size)
+      .def_rw("pcp_rank",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pcp_rank)
+      .def_rw("pcp_size",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pcp_size)
+      .def_rw("pp_rank",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pp_rank)
+      .def_rw("pp_size",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::pp_size);
 
   nb::class_<tpu_raiden::kv_cache::BackendConfig>(m, "BackendConfig")
       .def(nb::init<>())

@@ -188,7 +188,7 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:buffer_utils",
-        "//tpu_sync/core:kv_cache_manager_with_transfer",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
@@ -254,9 +254,9 @@ nanobind_extension(
     visibility = ["//visibility:public"],
     deps = [
         ":pool_layout_nanobind",
-        "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:block_transport",
         "@com_google_absl//absl/status",
@@ -432,7 +432,7 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:buffer_utils",
-        "//tpu_sync/core:kv_cache_manager_with_transfer",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
@@ -519,29 +519,6 @@ cc_library(
 )
 
 cc_test(
-    name = "weight_synchronizer_wrapper_test",
-    srcs = ["weight_synchronizer_wrapper_test.cc"],
-    copts = [
-        "-std=c++20",
-        "-DWITHOUT_PYTHON",
-        "-fexceptions",
-    ],
-    features = ["-use_header_modules"],
-    tags = ["nobuilder"],
-    deps = [
-        ":weight_synchronizer_torch_core_lib",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/rpc:raiden_service_cc_proto",
-        "//tpu_sync/weight_sync:weight_synchronizer_base",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@xla//xla/tsl/platform:test",
-        "@xla//xla/tsl/platform:test_main",
-    ],
-)
-
-cc_test(
     name = "kv_cache_manager_test",
     srcs = ["kv_cache_manager_test.cc"],
     copts = [
@@ -555,6 +532,7 @@ cc_test(
         "//tpu_sync/core/controller:controller_service",
         "//tpu_sync/core/controller:test_util",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
         "@torch_tpu//shims/torch",

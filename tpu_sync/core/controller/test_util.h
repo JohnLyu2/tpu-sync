@@ -23,6 +23,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -211,22 +212,36 @@ struct MockTransferManager {
     return nullptr;
   }
 
+  // Mirrors KVCacheManagerBase::RegisterKVBackends: an empty type and an
+  // already-registered backend are skipped; an unsupported type, an invalid
+  // topology, or a config with no declared axis aborts the process.
   void RegisterKVBackends(
       absl::Span<const kv_cache::BackendConfig> backend_configs) {
     for (const auto& cfg : backend_configs) {
+      if (cfg.type.empty()) continue;
       if (!absl::EqualsIgnoreCase(
               cfg.type, kv_cache::backends::storage::kPosixBackendName)) {
-        continue;
+        LOG(FATAL) << "[MockTransferManager] unsupported secondary backend "
+                      "type '"
+                   << cfg.type << "'";
       }
-      if (cfg.parallelism.tp_rank < 0) continue;
       const std::string canonical_name =
           std::string(kv_cache::backends::storage::kPosixBackendName);
       if (GetKVBackend(canonical_name) != nullptr) continue;
       kv_cache::BackendConfig resolved = cfg;
-      kv_cache::ApplyParallelismToProperties(
-          {cfg.parallelism.tp_size > 0 ? cfg.parallelism.tp_size : 1,
-           cfg.parallelism.tp_rank},
-          &resolved);
+      kv_cache::ApplyParallelismToProperties(cfg.parallelism, &resolved);
+      if (absl::Status status =
+              kv_cache::backends::storage::PosixBackendOptions::FromProperties(
+                  resolved.properties)
+                  .status();
+          !status.ok()) {
+        LOG(FATAL) << "[MockTransferManager] invalid " << cfg.type
+                   << " backend config: " << status.message();
+      }
+      if (!kv_cache::HasDeclaredAxis(cfg.parallelism)) {
+        LOG(FATAL) << "[MockTransferManager] " << cfg.type
+                   << " backend config declares no parallelism axis";
+      }
       auto backend =
           std::make_shared<kv_cache::backends::storage::PosixKVBackend>(
               canonical_name, resolved.properties);
