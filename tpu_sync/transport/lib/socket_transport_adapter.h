@@ -139,7 +139,9 @@ class SocketTransportAdapter : public TransportAdapter {
   const int numa_node_;
   // Candidate source addresses for outbound streams (used only when source
   // binding is enabled): the local IPs on `numa_node_`, or every local IP
-  // when unpinned or when no local IP is on that node.
+  // when unpinned or when no local IP is on that node. Per peer, candidates
+  // are further filtered to those the kernel routes to that peer through
+  // their own NIC.
   const std::vector<std::string> source_ips_;
   const Config config_;
 
