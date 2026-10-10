@@ -19,7 +19,10 @@ conventions: `../AGENTS.md`.
 - `loose-ends/parked.md` is the only backlog.
 - Version stamps: every note names the tpu-sync commit its claims were read at.
   Notes dated before 2026-10-06 are at `01ffa3d`; the line-shift table to
-  `50b0774` is in `journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md`.
+  `50b0774` is in `journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md`;
+  notes dated 2026-10-06..09 are at `50b0774`; since 2026-10-10 the pin is
+  `1fa06d1` and the session/manager sources live under `tpu_sync/kv_cache/`
+  (`journal/2026-10/2026-10-10-upstream-1fa06d1-sync.md`).
 - Markers as in the skill: `[FACT]` source-grounded or Lean-proved (`durable/`);
   `[EMP]` reproducible result with a "Verified against" stamp (`empirical/`);
   `[OBS YYYY-MM-DD]` and `[HYP]` (`journal/YYYY-MM/`); `[OPEN]` with a parked
