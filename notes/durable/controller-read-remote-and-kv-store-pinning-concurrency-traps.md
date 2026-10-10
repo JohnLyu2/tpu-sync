@@ -44,7 +44,7 @@ R-D `WriteRemote` landing blocks at the deadline (`DeadlineLoop` defers them);
 R-E local `Load` eviction mid-copy (pinned before `Load`); R-F Fetch-source
 unpin before the pull ends.
 
-Settled in the transfer-path model (`verification/findings/README.md` §"Observations on the prefill-to-decode path" and `prefill_decode_tests.md` §"Executable trace witnesses"): an
+Settled in the transfer-path model (`verification/findings/README.md` §"Observations on the prefill-to-decode path" and the `trace_*` docstrings in `Receive.lean` / `ReceivePoll.lean`): an
 `ExecuteLayerH2d` early return leaking an op (`EndRecvOpLocked` runs on that
 path; `Recv.trace_finish_between_locks`); a second `FinishLocked` from
 `CompleteReadWithDetails` / `.pollReady`

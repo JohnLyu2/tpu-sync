@@ -10,16 +10,21 @@ audit. Restructured (verbatim moves, no rewrites except the `Modules` table):
 
 | Was in `prefill_decode.md` | Now |
 |---|---|
-| §"Executable trace witnesses (`trace_*`) & bounded searches", §"Test suite correspondence" (52 tests) | `verification/docs/transfer/prefill_decode_tests.md` (29 KB). Canonical copy of each trace/test fact is still the theorem docstring in the Lean module. |
+| §"Executable trace witnesses (`trace_*`) & bounded searches", §"Test suite correspondence" (52 tests) | **Deleted** (first moved to a `prefill_decode_tests.md`, then dropped the same day on the user's "delete what is not helpful" call). Every row duplicated a `trace_*` docstring or a `#guard` line; the nine test attributions and three notes that existed only in the table (`FailedSendWithoutWorkSettlesImmediately`, `FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm`, `ExpiredSendKeepsItsStagingUntilTheCopyEnds`, `SendSessionImplementsTransferSessionInterface`, `FailureCannotOverrideAnEarlierSuccess`, `StatusIsFrozenOnceSessionIsDrainingOrDone`, `ZeroLayerSessionCompletesAndReleasesStagingWithoutHang`, `OutOfOrderLayersSettleAfterEveryH2d`, the `run_all.sh` E2E, the `CompleteH2h` no-witness note, the `MockMetricsBackend` note, the issue-#888 comment range) were folded into the owning docstrings in `Send.lean`, `PipelineChecks.lean`, `PeerIsolation.lean` first. "Is test X modelled" is now `grep -rn X TpuSyncVerify`. |
 | §"C++ observations (non-bugs at `50b0774`)" | `verification/findings/README.md` §"Observations on the prefill-to-decode path (non-bugs at `50b0774`)", before §"Fix validation". |
 | §"Upstream re-checks" | `verification/docs/upstream_rechecks.md` (corpus-wide; README §"Maintenance after an upstream sync" now points there). |
 | §"Modules" (4-column table + composition paragraph, 5.3 KB) | Condensed to a 3-column map (2.5 KB); the long per-module description lives in each module's header docstring. |
 
+Also: README §Status table cut from 11 long rows to 9 short ones (the long
+property lists duplicated `prefill_decode.md` §Verified properties);
+`proposal.md` marked as a frozen planning document (not re-pinned on syncs);
+the 2026-10-09 audit row in `upstream_rechecks.md` reduced to its outcome (the
+narrative is `sessions.md` 2026-10-09).
+
 Result: hot file 34 KB / 149 lines (routing index, modules map, shipping vs.
 design alternatives, properties → theorems, boundaries, assumptions, mutants,
 "Where the rest lives"). `tools/repin_citations.py` already globs `docs/**/*.md`,
-so the new files are re-pinned automatically; `DEFAULTS` gained
-`prefill_decode_tests.md` (unqualified `.cc` = `recv.cc`).
+so `upstream_rechecks.md` is re-pinned automatically.
 
 [HYP] A further cut would be the ~45 `bt.cc`/test line citations inside the
 routing index; they are the most rot-prone. Not done: the index is the one
@@ -39,6 +44,5 @@ name the old section titles; they are dated and were left as written.
 
 ## Related
 - `verification/docs/transfer/prefill_decode.md`
-- `verification/docs/transfer/prefill_decode_tests.md`
 - `verification/docs/upstream_rechecks.md`
 - `verification/findings/README.md` §Observations
