@@ -5,9 +5,9 @@ subsystem under `TpuSyncVerify/Transfer/`. All `file:line` citations in the
 Lean modules and in this document are to tpu-sync **`50b0774`**.
 
 This file is the short map: routing from C++ to the owning Lean module, what is
-proved, the model boundaries, the assumptions and the mutants. The long tail
-(every trace witness, bounded search and test correspondence) is in
-[prefill_decode_tests.md](prefill_decode_tests.md); see §"Where the rest lives".
+proved, the model boundaries, the assumptions and the mutants. Each `trace_*`
+theorem's docstring names the C++/Python test it replays (52 upstream tests:
+46 C++, 6 end-to-end) with `file:line`; there is no separate test table.
 
 ## C++ to Lean routing index
 
@@ -141,7 +141,7 @@ Each mutant removes a specific C++ guard or ordering constraint and yields a
 
 | Content | File |
 |---|---|
-| every `trace_*` witness, the `#guard` bounded searches, and the C++/Python test → Lean correspondence (52 tests) | [prefill_decode_tests.md](prefill_decode_tests.md); canonical per-theorem docstrings in the Lean modules |
+| `trace_*` witnesses and the tests they replay; `#guard` bounded searches | the theorem docstrings and `#guard` lines in the Lean modules (`grep -rn "theorem trace_\|#guard" TpuSyncVerify/Transfer`) — the test name is in the docstring, so `grep -rn <TestName> TpuSyncVerify` answers "is test X modelled" |
 | C++ observations that are not bugs (dead `SendAck` path, `failed_recving_` naming, redundant `done_` guards, poll-vs-callback metrics window, flat push-failure status) | [findings/README.md](../../findings/README.md) §"Observations on the prefill-to-decode path" |
 | upstream syncs and citation re-audits | [docs/upstream_rechecks.md](../upstream_rechecks.md) |
 | bug-hunt findings F1–F5 with reproducers and patches | [findings/README.md](../../findings/README.md) |

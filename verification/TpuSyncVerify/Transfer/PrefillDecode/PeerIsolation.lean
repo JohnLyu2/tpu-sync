@@ -686,8 +686,9 @@ theorem reachable_quota_admits_healthy {cfg : Config} {s : State} {maxPerPeer : 
 
 /-! ## Concrete traces and bounded model checks (`ControlHandshakeTest`) -/
 
-/-- Issue #888 background (`kv_cache_manager_with_transfer_control_test.cc:841-846`):
-on `Backend.tcpBlocking` (`poolSize = 2, numSlots = 4`), two `StartRead` calls
+/-- Issue #888 background (`kv_cache_manager_with_transfer_control_test.cc:834-847`,
+a design comment, not a test: the TCP backend still runs the blocking call on
+`push_pool_` and is being retired rather than fixed): on `Backend.tcpBlocking` (`poolSize = 2, numSlots = 4`), two `StartRead` calls
 to `Peer.sick` dispatch and hold both worker threads (`freeWorkers = 0`). A
 third `StartRead` to `Peer.healthy` acquires a staging slot (`freeSlots = 1`),
 but `.dispatchPull 2` is blocked (`none`) until one of the `.sick` handshakes

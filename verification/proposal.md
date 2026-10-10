@@ -2,7 +2,9 @@
 
 *Status (2026-10-06): the prefill-to-decode case study is complete — results in
 [README.md](README.md) and [docs/transfer/prefill_decode.md](docs/transfer/prefill_decode.md);
-the defects found on the controller path are in [findings/](findings/README.md).*
+the defects found on the controller path are in [findings/](findings/README.md).
+This is the planning document, kept as written; C++ identifiers in it are as of
+`50b0774` and are not re-pinned on later upstream syncs.*
 
 This project develops an AI-assisted verification workflow for TPU Sync,
 beginning with transfer safety in its **prefill-to-decode transfer path** for

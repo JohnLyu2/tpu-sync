@@ -80,9 +80,8 @@ DEFAULTS = {
     # any `send` paragraph must be checked by hand in the report.
     "TpuSyncVerify/Transfer/Session.lean": RECV,
     "TpuSyncVerify/Transfer/PrefillDecode/Send.lean": SEND,
-    # prefill_decode*.md: rows about `Send.*` theorems cite send.cc — check.
+    # prefill_decode.md: rows about `Send.*` theorems cite send.cc — check.
     "docs/transfer/prefill_decode.md": RECV,
-    "docs/transfer/prefill_decode_tests.md": RECV,
 }
 
 # File assumed by a bare `:N` citation when no explicit citation precedes it

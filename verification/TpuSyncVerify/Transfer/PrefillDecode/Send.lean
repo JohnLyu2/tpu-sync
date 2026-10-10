@@ -989,7 +989,11 @@ fires on the idle send it settles at once (`hasStaging = false`), publishes
 failure (`some false`), and the model also checks that any late `.beginPull`
 (`ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected`,
 `kv_cache_manager_with_transfer_control_test.cc:308-330`) or `.start` is
-rejected. -/
+rejected. The `[.cancel, .publish]` conjunct is also
+`SendLifecycleTest.FailedSendWithoutWorkSettlesImmediately`
+(`kv_cache_manager_with_transfer_send_drain_test.cc:405-415`: a synthetic send
+with `in_flight = 0` failed via `Decide(failed = true)` settles, releases staging
+and is reported in `failed_recving` at once). -/
 theorem trace_never_pulled :
     ((sys 2).run []).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (false, true, none) ∧
@@ -1015,7 +1019,9 @@ theorem trace_duplicate_pull_rejected :
 `hooks::kKvCacheManagerPullSpawn`): if `ValidateAndBeginPull` (`.beginPull`)
 succeeds but spawning the `StartPush` thread fails, `counter_cleanup` calls
 `session->Finish(InternalError)` (`.cancel`), which settles the session at once,
-releases staging, reports failure, and blocks any late `.start`. -/
+releases staging, reports failure, and blocks any late `.start`
+(`TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm`,
+`transfer_send_session_test.cc:266-293`). -/
 theorem trace_pull_spawn_failure_cleanup :
     ((sys 1).run [.beginPull, .cancel, .publish]).map
       (fun s => (s.pullStarted, s.started, s.life.done, s.life.hasStaging, s.published)) =
@@ -1024,7 +1030,11 @@ theorem trace_pull_spawn_failure_cleanup :
   decide
 
 /-- The deadline fires while a copy runs: the send drains, keeps its staging,
-issues nothing more, and settles when the copy's `OnReady` ends the op. -/
+issues nothing more, and settles when the copy's `OnReady` ends the op
+(`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`,
+`kv_cache_manager_with_transfer_send_drain_test.cc:306-330`;
+`TransferSendSessionTest.SendSessionImplementsTransferSessionInterface`,
+`transfer_send_session_test.cc:156-186`, `Finish(error)` with a D2H in flight). -/
 theorem trace_deadline_during_copy :
     ((sys 2).run [.beginPull, .start, .d2hBegin, .d2hIssue true, .cancel]).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
@@ -1034,7 +1044,10 @@ theorem trace_deadline_during_copy :
   decide
 
 /-- A push fails: the session drains, the layer still waiting in the chain is
-dropped by `h2hIssue`'s re-check, and the send is published as failed. -/
+dropped by `h2hIssue`'s re-check, and the send is published as failed. No C++
+test fails an H2H push: `FakeSendBase::CompleteH2h(i, error)`
+(`transfer_send_session_test.cc:84-91`) accepts an error status but every caller
+passes success. -/
 theorem trace_push_fails :
     ((sys 2).run
       [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
@@ -1045,7 +1058,10 @@ theorem trace_push_fails :
 
 /-- Correspondence note (1): the OK finish happens in the last push callback
 while a D2H `OnReady` may still be outstanding; a `Finish(error)` in that
-window is ignored. -/
+window is ignored (`SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess`,
+`kv_cache_manager_with_transfer_send_drain_test.cc:437-449`;
+`TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone`,
+`transfer_send_session_test.cc:433-463`). -/
 theorem trace_cancel_after_ok_finish :
     ((sys 1).run
       [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady, .wake true, .h2hIssue, .sendNext,
@@ -1053,7 +1069,9 @@ theorem trace_cancel_after_ok_finish :
       (fun s => (s.life.statusOk, s.published)) = some (true, some true) := by
   decide
 
-/-- A zero-layer send finishes OK inside `StartPush`. -/
+/-- A zero-layer send finishes OK inside `StartPush`
+(`TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang`,
+`transfer_send_session_test.cc:391-410`). -/
 theorem trace_zero_layers :
     ((sys 0).run [.beginPull, .start, .publish]).map (fun s => s.published) = some (some true) := by
   decide

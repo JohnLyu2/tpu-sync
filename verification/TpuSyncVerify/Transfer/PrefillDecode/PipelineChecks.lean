@@ -39,7 +39,12 @@ HBM (`KVCacheManagerWithTransferTest.LocalOrchestratedTransfer` /
 `kv_cache_manager_with_transfer_test.cc:111-290, 440-594, 596-676`, and
 `test_e2e_transfer_polling` / `test_parallel_pull` in
 `tpu_sync/api/jax/kv_cache_manager_transfer_test.py:102-185, 451-531` and
-`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:147-174, 285-311`). -/
+`tpu_sync/api/torch/kv_cache_manager_transfer_test.py:147-174, 285-311`). Only
+`LocalOrchestratedTransfer` installs a `MockMetricsBackend` and expects the
+transfer-duration histogram exactly once (`:196-199`), an implicit,
+timing-dependent witness that the last H2D callback normally beats the poll
+(`ReceivePoll.lean` proves `Recv.trace_poll_skips_metrics` for the interleaving
+where `pollReady` wins the pre-callback window). -/
 theorem trace_normal :
     ((sys 1).run (producer ++ consumer)).map
       (fun s => (s.send.published, s.recv.published, s.decodeHbm)) =
@@ -66,7 +71,9 @@ def consumer2 : List Ev :=
 
 /-- Layers complete out of order at every stage; publication still finds the
 right data in the right slots (`test_e2e_transfer_polling` / `test_parallel_pull`
-with `num_layers = 2` in `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py`).
+with `num_layers = 2` in `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py`;
+on the session side `RecvDrainTest.OutOfOrderLayersSettleAfterEveryH2d`,
+`kv_cache_manager_with_transfer_send_drain_test.cc:557-576`).
 Verifies out-of-order layer completion end-to-end inside the model. -/
 theorem trace_layers_out_of_order :
     ((sys 2).run (producer2 ++ consumer2)).map
@@ -188,7 +195,10 @@ theorem trace_shutdown_unblocks_pending_pull :
 /-- Multi-request trace: request $R_0$ starts, cancels mid-flight, drains,
 publishes failed outcomes, and hands off all four shared memory pools;
 `.nextRequest 0` recycles the pools to request $R_1$, which completes a full
-transfer and publishes `done_recving` with `decodeHbm = [.kv 0]`. -/
+transfer and publishes `done_recving` with `decodeHbm = [.kv 0]`. Together with
+`trace_overlapped_requests` this is the model's replay of the single-host
+disaggregated serving E2E (`examples/single_host_disagg/run_all.sh`): a stream
+of requests recycling HBM and host staging across prompts. -/
 theorem trace_multi_request :
     ((multiSys 1).run
       (([.send .beginPull, .send .start, .send .d2hBegin, .send .cancel, .recv .cancel,
