@@ -1426,29 +1426,63 @@ theorem trace_cancel_between_batch_queue_and_issue :
   decide
 
 /-- Receiver plan identity/pool validation (`ValidatePlan`,
-`reshard_receive_session.cc:88-140`, tested at
-`reshard_receive_session_test.cc:166-198`): rejects `isSender = true` (`:93-95`)
-and empty `transfer_pool_indices` (`ranks = []`, `:137-139`). -/
+`reshard_receive_session.cc:88-224`, tested at
+`reshard_receive_session_test.cc:166-225, 257-276`, and
+`DeviceOnlyRejectionAtPublicEntryPoints` at
+`kv_cache_manager_with_transfer_pool_reshard_test.cc:238-254`):
+- Rejects `enableHostStaging = false` (`reshard_receive_session.cc:103-107`,
+  `kv_cache_manager_with_transfer_pool_reshard_test.cc:238-254`),
+- Rejects `isSender = true` (`:93-95`) or empty `ranks` (`:137-139`),
+- Rejects out-of-range, duplicate, or dtype-mismatched pool indices (`:142-167`,
+  `reshard_receive_session_test.cc:200-225`), and
+- Rejects destination `blockId ≥ numBlocks` (`:236-243`,
+  `reshard_receive_session_test.cc:257-276`). -/
 def validPlan (isSender : Bool) (ranks : List Nat) : Bool :=
   !isSender && !ranks.isEmpty
 
+def validPlanPoolsAndBlocks (enableHostStaging : Bool) (numPools numBlocks : Nat)
+    (poolIndices : List Nat) (dtypeMatches : Bool) (dstBlockIds : List Nat) : Bool :=
+  enableHostStaging &&
+  !poolIndices.isEmpty &&
+  dtypeMatches &&
+  decide poolIndices.Nodup &&
+  poolIndices.all (fun p => decide (p < numPools)) &&
+  !dstBlockIds.isEmpty &&
+  dstBlockIds.all (fun b => decide (b < numBlocks))
+
 /-- Replay of `ReshardReceiveSessionTest.AcceptsCanonicalPlanOnExplicitPools`
 (`reshard_receive_session_test.cc:137-145`), `AcceptsImplicitPools` (`:147-154`),
-`RejectsMissingIdentityAndPoolFields` (`:166-198`, `is_sender() == true` at
-`:173-175` and empty `transfer_pool_indices` at `:177-179`),
-`HasNoTagPolicy` (`:156-164`), and `GroupScopesDestinationBlocks` (`:405-439`):
-1. `is_sender = true` (`:173-175`) or an empty pool schedule (`ranks = []`,
-   `:177-179`) is rejected (`validPlan` is `false`).
-2. A canonical 1-pool plan (`ranks = [0]`, `:137-154`) accepts the incoming push,
-   executes H2D, releases its staging lease, unregisters the active plan, and
-   publishes `done_recving`.
-3. A 2-group plan (`ranks = [0, 0]`, `:156-164, 405-439`) where group 0 and
-   group 1 receive independent pool streams (`onPoolReceived 0`,
-   `onPoolReceived 1`) settles only after both pools complete their H2D copies. -/
+`HasNoTagPolicy` (`:156-164`), `RejectsMissingIdentityAndPoolFields` (`:166-198`),
+`RejectsOutOfRangeDuplicateAndDtypeMismatch` (`:200-225`),
+`RejectsBlockIdsOutsideDeclaredPool` (`:257-276`),
+`GroupScopesDestinationBlocks` (`:405-439`), and
+`PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints`
+(`kv_cache_manager_with_transfer_pool_reshard_test.cc:238-254`):
+1. `DeviceOnlyRejectionAtPublicEntryPoints` (`:238-254`): `enableHostStaging = false`
+   is rejected (`false`).
+2. `RejectsMissingIdentityAndPoolFields` (`:166-198`): `is_sender = true`
+   (`:173-175`) or empty `transfer_pool_indices` (`ranks = []`, `:177-179`) is
+   rejected.
+3. `RejectsOutOfRangeDuplicateAndDtypeMismatch` (`:200-225`): out-of-range pool
+   index `[99]` on a 2-pool manager (`:202-207`), duplicate pool indices `[0, 0]`
+   (`:209-215`), or dtype mismatch (`dtypeMatches = false`, `:217-224`) is
+   rejected.
+4. `RejectsBlockIdsOutsideDeclaredPool` (`:257-276`): destination block `[16]`
+   on a 16-block pool (`0..15`) is rejected (`false`), whereas `[1, 2]` is
+   accepted (`true`).
+5. A canonical 1-pool plan (`ranks = [0]`, `:137-154`) and a 2-group plan
+   (`ranks = [0, 0]`, `:156-164, 405-439`) execute H2D, release staging leases,
+   unregister the active plan, and publish `done_recving`. -/
 theorem trace_reshard_receive_session_test_parity :
+    validPlanPoolsAndBlocks false 2 16 [0] true [1] = false ∧
     validPlan true [0] = false ∧
     validPlan false [] = false ∧
     validPlan false [0] = true ∧
+    validPlanPoolsAndBlocks true 2 16 [99] true [1] = false ∧
+    validPlanPoolsAndBlocks true 2 16 [0, 0] true [1] = false ∧
+    validPlanPoolsAndBlocks true 2 16 [0] false [1] = false ∧
+    validPlanPoolsAndBlocks true 2 16 [0] true [16] = false ∧
+    validPlanPoolsAndBlocks true 2 16 [0] true [1, 2] = true ∧
     ((sys [0]).run
       [.pushBegin, .onPoolReceived 0, .pushEnd true,
        .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true, .publish]).map

@@ -766,5 +766,82 @@ theorem trace_r7_single_stage_votes_retire_multi_owner_claim :
       some (true, none, [], []) := by
   decide
 
+/-! ## Part V — Wall-Clock TTL Expiration (`PurgeExpired*`) and Observation R8 -/
+
+/-- `RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`
+(`tpu_sync/kv_cache/reshard/request_block_registry.cc:61-69`):
+erases `request_blocks_` entries whose `registration.expires_at <= now` (set to
+`t_reg + ttl_s_` at `Register`, `:263`). -/
+def RegGen.purgeExpiredRequestBlocks (s : RegGen) : RegGen :=
+  { s with registeredUnits := [] }
+
+/-- `RequestBlockRegistry::PurgeExpiredLifecycleLocked`
+(`tpu_sync/kv_cache/reshard/request_block_registry.cc:71-96`):
+erases `claimed_`, `cancelled_`, `completed_units_`, `claimed_owners_`, and
+`claimed_units_` entries whose lifecycle `expires_at <= now`. -/
+def RegGen.purgeExpiredLifecycle (s : RegGen) : RegGen :=
+  { s with
+    claimedUnits := none
+    claimOwners := []
+    completedUnits := []
+    cancelled := false }
+
+/-- Combined TTL purge when `now` advances past both `registration.expires_at`
+and lifecycle `expires_at` (`request_block_registry.cc:61-96`,
+`reshard_service_test.cc:980-984, 1011-1019`). -/
+def RegGen.purgeExpiredAll (s : RegGen) : RegGen :=
+  s.purgeExpiredRequestBlocks.purgeExpiredLifecycle
+
+theorem purgeExpiredAll_inv (s : RegGen) : Inv s.purgeExpiredAll where
+  claimConsistent := ⟨rfl, by intro units h; cases h⟩
+  tombstoneClean := by intro h; cases h
+  retiredClean := by intro _; exact ⟨rfl, rfl, rfl⟩
+  partialVotes := by intro expected h; cases h
+
+/-- Replay of `ReshardStackTest.TtlPurgesExpiredRegistrations`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1011-1019`) and the TTL
+tombstone lapse in `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`
+(`:980-984`):
+1. `TtlPurgesExpiredRegistrations` (`:1011-1019`): unit `0` registers, `now_`
+   advances past the 600 s TTL (`purgeExpiredAll`), and a subsequent
+   `lookupAndClaim 101 [0]` fails (`none`, `"Missing producer block registration"`).
+2. `RequestBlockStatusProbeTracksLifecycle` (`:980-984`): after
+   `cancelIfUnclaimed` records a `.cancelled` tombstone, advancing `now_` past
+   the TTL (`purgeExpiredAll`) purges the tombstone so `status` reads as
+   `.unknown`. -/
+theorem trace_ttl_purges_expired_registrations_and_tombstones :
+    ((RegGen.sys.run [.register 0 true]).map
+      (fun s =>
+        let s_exp := s.purgeExpiredAll
+        (s_exp.status, RegGen.step s_exp (.lookupAndClaim 101 [0]))) =
+      some (.unknown, none)) ∧
+    ((RegGen.sys.run [.register 0 true, .cancelIfUnclaimed]).map
+      (fun s => (s.status, s.purgeExpiredAll.status)) =
+      some (.cancelled, .unknown)) := by
+  decide
+
+/-- **Observation R8 (`request_block_registry.cc:61-69, 263, 473`)**:
+`Register` at time `t_0` sets `registration.expires_at = t_0 + ttl_s_` on
+`request_blocks_[(req_id, unit)]` (`:263`), whereas `LookupAndClaim` at time
+`t_1 > t_0` sets `claimed_[(req_id, uuid)] = t_1 + ttl_s_` (`:473`) **without**
+refreshing `registration.expires_at` on the claimed `request_blocks_` rows.
+In the window `[t_0 + ttl_s_, t_1 + ttl_s_)`, `PurgeExpiredRequestBlocksLocked`
+(`:61-69`) erases `request_blocks_[(req_id, unit)]` while `claimed_` is still
+active (`s_split = s.purgeExpiredRequestBlocks`):
+1. `s_split.status` still reports `.claimed` (`claimedUnits = some [0]`), but
+   `s_split.registeredUnits = []` (violating `ClaimOwnersConsistent`), and
+2. A second pipelined stage calling `lookupAndClaim 102 [0]` in that window fails
+   (`none`) with `"Missing producer block registration"` (`:463-468`). -/
+theorem trace_r8_split_ttl_purges_request_blocks_while_claim_active :
+    ((RegGen.sys.run [.register 0 true, .lookupAndClaim 101 [0]]).map
+      (fun s =>
+        let s_split := s.purgeExpiredRequestBlocks
+        ( s_split.status
+        , s_split.claimedUnits
+        , s_split.registeredUnits
+        , (RegGen.step s_split (.lookupAndClaim 102 [0])).isNone )) =
+      some (.claimed, some [0], [], true)) := by
+  decide
+
 end TpuSyncVerify.Transfer.Reshard.Registry
 

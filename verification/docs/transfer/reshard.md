@@ -348,13 +348,16 @@ and unclaimed cancellation tombstones (`cancelled_`):
      a `complete` step for `unit ∈ expected` retires the generation via
      `RetireLocked` (`:98-116, 358-368`) if and only if every `u ∈ expected` has
      voted in `completedUnits`.
-* **Traces, Observation R7, and mutants.** Six `decide` traces replaying
+* **Traces, Observations R7 & R8, and mutants.** Eight `decide` traces replaying
   `reshard_service_test.cc` registry tests (`trace_registry_multi_owner_and_voting`,
   `trace_partial_vote_does_not_retire` for `reshard_service_test.cc:986-1009`,
   `trace_tombstone_blocks_late_register_and_claim` for `:890-918`,
   `trace_request_block_status_probe_lifecycle` for `:920-984`,
-  `trace_pipelined_stages_claim_and_abandon` for `:1235-1318`, and
-  `trace_r7_single_stage_votes_retire_multi_owner_claim`) and two mutants
+  `trace_pipelined_stages_claim_and_abandon` for `:1235-1318`,
+  `trace_ttl_purges_expired_registrations_and_tombstones` for `:980-984, 1011-1019`,
+  `trace_r7_single_stage_votes_retire_multi_owner_claim`, and
+  `trace_r8_split_ttl_purges_request_blocks_while_claim_active`) plus
+  `purgeExpiredAll_inv` and two mutants
   (`mutant_premature_complete_retires_while_peer_active`,
   `mutant_unconditional_abandon_exposes_sibling_owner_to_cancel`).
 
@@ -521,3 +524,18 @@ hardware-free C++ reproduction test before being promoted to `findings/`.
   even when a second pipelined `claim_owner` is still registered. Furthermore,
   `AbandonClaim` (`:503-507`) does not clear `completed_units_`. Witnessed by
   `trace_r7_single_stage_votes_retire_multi_owner_claim` in `Registry.lean`.
+* **R8 [HYP / Code audit — Stage 4 `Registry.lean`] Split TTL expiration between
+  `request_blocks_` and `claimed_` purges registered blocks while a claim is
+  still active.** `RequestBlockRegistry::Register` (`request_block_registry.cc:263`)
+  sets `registration.expires_at = t_0 + ttl_s_` on `request_blocks_[(req_id, unit)]`,
+  whereas `LookupAndClaim` at time $t_1 > t_0$ sets
+  `claimed_[(req_id, uuid)] = t_1 + ttl_s_` (`:473`) **without** refreshing
+  `registration.expires_at` on the claimed `request_blocks_` entries (and
+  `CancelIfUnclaimed` at `:384` calls `PurgeExpiredLifecycleLocked` without
+  `PurgeExpiredRequestBlocksLocked`). In the window $[t_0 + \text{ttl}, t_1 + \text{ttl})$,
+  `PurgeExpiredRequestBlocksLocked` (`:61-69`) erases `request_blocks_[(req_id, unit)]`
+  while `claimed_[(req_id, uuid)]` is still active, violating
+  `ClaimOwnersConsistent` (`∀ u ∈ claimedUnits, (lookupUnit u).isSome`) and
+  causing a second pipelined stage calling `LookupAndClaim` in that window to
+  fail with `"Missing producer block registration"` (`:463-468`). Witnessed by
+  `trace_r8_split_ttl_purges_request_blocks_while_claim_active` in `Registry.lean`.
