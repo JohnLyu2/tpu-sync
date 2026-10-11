@@ -1262,10 +1262,68 @@ theorem reachable_can_settle {ns : List Nat} {pol : UnregisterPolicy} {s : Send}
 /-! ## Replay and bounded search
 
 Concrete traces, checked by `decide`, covering multi-pool multi-peer slot
-counting (`CountPoolReshardSendSlots` in `slots.cc:27-51`), external deadline
+counting (`CountPoolReshardSendSlots` in `slots.cc:27-51`),
+`ReshardSendSessionTest` and `PoolReshardSendTest` parity
+(`reshard_send_session_test.cc:118-244`,
+`kv_cache_manager_with_transfer_pool_reshard_test.cc:269-292`), external deadline
 or cancellation unregistration in `EndOp()` (`.cc:402-430`), and the contrast
 between `UnregisterPolicy.shipping` and `UnregisterPolicy.onSettle` when one
 pool fails while a sibling pool is still in flight. -/
+
+/-- Sender source-span validation (`ValidateRangeInPool`,
+`reshard_receive_session.cc:32-77`, invoked by `ReshardSendSession::Create` at
+`.cc:78-115`):
+- If `tokenStride = 0` or `tokenLive = 0` (flat pool), requires `0 < size` and
+  `offset + size ≤ liveBytes`.
+- If `0 < tokenStride` and `0 < tokenLive` (packed token-strided pool in aliased
+  storage, `.cc:55-76`), requires `0 < size`, `offset + size ≤ blockStride`,
+  `offset / tokenStride = (offset + size - 1) / tokenStride` (cannot cross a
+  token boundary), and `(offset % tokenStride) + size ≤ tokenLive` (must lie
+  within the token's live sub-region). -/
+def validSenderSpan (blockStride liveBytes tokenStride tokenLive offset size : Nat) : Bool :=
+  if size = 0 then false
+  else if tokenStride = 0 ∨ tokenLive = 0 then
+    decide (offset + size ≤ liveBytes)
+  else
+    decide (offset + size ≤ blockStride) &&
+    decide (offset / tokenStride = (offset + size - 1) / tokenStride) &&
+    decide (offset % tokenStride + size ≤ tokenLive)
+
+/-- Replay of `ReshardSendSessionTest` (`reshard_send_session_test.cc:118-244`)
+and `PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront`
+(`kv_cache_manager_with_transfer_pool_reshard_test.cc:269-292`):
+1. `SenderWithNoBytesForAnyTransferredPoolRefusedUpFront`
+   (`kv_cache_manager_with_transfer_pool_reshard_test.cc:269-292`) and
+   `RejectsMissingIdentityAndPoolFields` (`reshard_send_session_test.cc:137-169`):
+   when `CountPoolReshardSendSlots` is `0` (`ns = []` or `ns = [0]`, because the
+   sender's only schedule entry targets a non-transferred pool group),
+   `validSchedule` rejects the session up front (`validSchedule [0] = false`,
+   `.cc:132-135`).
+2. `RejectsOverflowingSenderSpan` (`reshard_send_session_test.cc:171-185`):
+   `offset = 64, size = 64` overflows `liveBytes = 96` (`64 + 64 > 96`).
+3. `RejectsSenderSpanBetweenPackedTokenRegionsInAliasedStorage`
+   (`reshard_send_session_test.cc:187-221`): on a token-strided pool
+   (`blockStride = 256, liveBytes = 128, tokenStride = 64, tokenLive = 32`),
+   span `[16, 48)` (`offset = 16, size = 32`) straddles into the non-live gap
+   `[32, 64)` and is rejected (`false`), whereas `[64, 96)` (`offset = 64,
+   size = 32`, token 1's live region) is accepted (`true`).
+4. `AcceptsCanonicalPlanOnExplicitPools` (`reshard_send_session_test.cc:118-126`),
+   `AcceptsImplicitPools` (`:128-135`), and `IgnoresReceiverCoverageGap`
+   (`:223-244`): a 1-pool, 1-peer sender schedule (`ns = [1]`) is accepted
+   (`validSchedule [1] = true`) and completes D2H + push to settle with
+   `published = some true`. -/
+theorem trace_reshard_send_session_test_parity :
+    validSchedule [] = false ∧
+    validSchedule [0] = false ∧
+    validSenderSpan 128 96 0 0 64 64 = false ∧
+    validSenderSpan 256 128 64 32 16 32 = false ∧
+    validSenderSpan 256 128 64 32 64 32 = true ∧
+    validSchedule [1] = true ∧
+    ((sys [1]).run
+      [.d2hIssue 0 true, .execFinish, .d2hDone 0 true, .pushDone 0 true, .publish]).map
+      (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
+      some (true, false, true, some true) := by
+  decide
 
 /-- Two active pools with peer counts `[2, 1]` (`CountPoolReshardSendSlots = 3`,
 e.g. an attention group pushing to 2 peers and a state group pushing to 1 peer,

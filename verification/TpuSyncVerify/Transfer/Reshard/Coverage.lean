@@ -478,4 +478,69 @@ theorem mutant_mismatched_expected_pushes_rejected :
     validateExpectedPushes 2 [0] entries 2 = true := by
   decide
 
+/-- Group destination-extent prefix validation from `ValidateReceiverCoverage`
+(`reshard_receive_session.cc:226-263`):
+every non-last destination block must cover the full `liveBytes` (`extent == liveBytes`),
+and the final destination block must satisfy `0 < extent ≤ liveBytes`. -/
+def validGroupExtents (liveBytes : Nat) : List Nat → Bool
+  | [] => false
+  | [last] => decide (0 < last ∧ last ≤ liveBytes)
+  | e :: rest => decide (e = liveBytes) && validGroupExtents liveBytes rest
+
+/-- `KVCacheManagerBase::ExpectedPushSenders`
+(`tpu_sync/kv_cache/kv_cache_manager_base.cc:3219-3247`):
+returns `some schedules.length` when the active plan is a receiver plan
+(`!isSender`) with non-empty `shard_push_schedules`, and `none` for sender plans,
+bare plans, or after `UnregisterActivePlan`. -/
+def expectedPushSenders (isSender : Bool) (schedules : List (Nat × List ScheduleEntry)) :
+    Option Nat :=
+  if isSender || schedules.isEmpty then none
+  else some schedules.length
+
+/-- Replay of `ReshardReceiveSessionTest` coverage and push-count unit tests
+(`tpu_sync/kv_cache/reshard_receive_session_test.cc:227-403`):
+1. `ChecksEveryPoolSpanAndDestinationZeroCover` (`:227-255`, zero intervals `[]`
+   on extent `16` rejected at `:248-254`).
+2. `RejectsCoverageGap` (`:278-289`, extent `48` with `[0, 16)` and `[32, 48)`).
+3. `RejectsCoverageOverlap` (`:291-302`, extent `24` with `[0, 16)` and `[8, 24)`).
+4. `RejectsShortCoverage` (`:304-314`, extent `24` with `[0, 16)`).
+5. `RejectsNonPrefixExtents` (`:316-330`, `liveBytes = 64`: `[32, 64]` has a
+   partially filled non-last block; `[80]` exceeds `liveBytes`; `[64, 32]` is a
+   valid prefix).
+6. `RejectsMissingExtents` (`:332-341`, extent `0`).
+7. `RejectsMissingParallelism` (`:343-352`, `parallelism = 0`).
+8. `RejectsExpectedPushMismatch` (`:354-363`, 1 schedule entry with
+   `expected_pushes = 2`).
+9. `RejectsWriteBeyondDeclaredLiveTail` (`:365-403`, extent `64` with logical
+   intervals `[0, 32)` and `[64, 96)` writing beyond the 64-byte live tail). -/
+theorem trace_reshard_receive_coverage_test_parity :
+    let e1 : List ScheduleEntry := [⟨0, 3, 1, ⟨0, 16⟩⟩]
+    validBlockCoverage 16 [] = false ∧
+    validBlockCoverage 48 [⟨0, 16⟩, ⟨32, 48⟩] = false ∧
+    validBlockCoverage 24 [⟨0, 16⟩, ⟨8, 24⟩] = false ∧
+    validBlockCoverage 24 [⟨0, 16⟩] = false ∧
+    validGroupExtents 64 [32, 64] = false ∧
+    validGroupExtents 64 [80] = false ∧
+    validGroupExtents 64 [64, 32] = true ∧
+    validBlockCoverage 0 [⟨0, 16⟩] = false ∧
+    validateExpectedPushes 0 [0] e1 1 = false ∧
+    validateExpectedPushes 2 [0] e1 2 = false ∧
+    validateExpectedPushes 2 [0] e1 1 = true ∧
+    validBlockCoverage 64 [⟨0, 32⟩, ⟨64, 96⟩] = false := by
+  decide
+
+/-- Replay of `ExpectedPushSendersTest.CountsReceiverPlanSchedules`
+(`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc:189-236`):
+- Receiver plan (`isSender = false`) with 2 source schedules (`ranks 4 and 5`)
+  reports `some 2` (`:194-205`).
+- Sender plan (`isSender = true`) reports `none` (`:211-222`).
+- Bare plan (`schedules = []`) reports `none` (`:225-234`). -/
+theorem trace_expected_push_senders_test_parity :
+    let sched4 : List ScheduleEntry := [⟨4, 0, 1, ⟨0, 16⟩⟩]
+    let sched5 : List ScheduleEntry := [⟨5, 0, 2, ⟨0, 16⟩⟩]
+    expectedPushSenders false [(4, sched4), (5, sched5)] = some 2 ∧
+    expectedPushSenders true [(0, sched4)] = none ∧
+    expectedPushSenders false [] = none := by
+  decide
+
 end TpuSyncVerify.Transfer.Reshard.Coverage

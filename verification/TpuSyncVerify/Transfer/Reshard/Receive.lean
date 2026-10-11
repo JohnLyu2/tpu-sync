@@ -1352,8 +1352,10 @@ theorem reachable_can_settle {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
 Concrete traces, checked by `decide`, covering rank-wave ordering when a
 higher-rank pool arrives over the network before a lower-rank pool, batch H2D
 launch across same-rank pools, cancellation between the two locks of
-`ExecuteEligiblePoolH2ds`, duration metric recording (`FinishPoolReshardRecv*`
-in `kv_cache_manager_with_transfer_pool_reshard_test.cc:561-621`), and the R1
+`ExecuteEligiblePoolH2ds`, `ReshardReceiveSessionTest` plan/execution scenarios
+(`reshard_receive_session_test.cc:137-198, 405-439`), duration metric recording
+(`FinishPoolReshardRecv*` in
+`kv_cache_manager_with_transfer_pool_reshard_test.cc:294-334`), and the R1
 comparison between `PushEndPolicy.shipping` and `PushEndPolicy.finishOnError`. -/
 
 /-- Two pools with order ranks `[0, 1]` (FA at rank 0, state class at rank 1 on
@@ -1423,11 +1425,50 @@ theorem trace_cancel_between_batch_queue_and_issue :
       some (true, false, true, false, some false) := by
   decide
 
+/-- Receiver plan identity/pool validation (`ValidatePlan`,
+`reshard_receive_session.cc:88-140`, tested at
+`reshard_receive_session_test.cc:166-198`): rejects `isSender = true` (`:93-95`)
+and empty `transfer_pool_indices` (`ranks = []`, `:137-139`). -/
+def validPlan (isSender : Bool) (ranks : List Nat) : Bool :=
+  !isSender && !ranks.isEmpty
+
+/-- Replay of `ReshardReceiveSessionTest.AcceptsCanonicalPlanOnExplicitPools`
+(`reshard_receive_session_test.cc:137-145`), `AcceptsImplicitPools` (`:147-154`),
+`RejectsMissingIdentityAndPoolFields` (`:166-198`, `is_sender() == true` at
+`:173-175` and empty `transfer_pool_indices` at `:177-179`),
+`HasNoTagPolicy` (`:156-164`), and `GroupScopesDestinationBlocks` (`:405-439`):
+1. `is_sender = true` (`:173-175`) or an empty pool schedule (`ranks = []`,
+   `:177-179`) is rejected (`validPlan` is `false`).
+2. A canonical 1-pool plan (`ranks = [0]`, `:137-154`) accepts the incoming push,
+   executes H2D, releases its staging lease, unregisters the active plan, and
+   publishes `done_recving`.
+3. A 2-group plan (`ranks = [0, 0]`, `:156-164, 405-439`) where group 0 and
+   group 1 receive independent pool streams (`onPoolReceived 0`,
+   `onPoolReceived 1`) settles only after both pools complete their H2D copies. -/
+theorem trace_reshard_receive_session_test_parity :
+    validPlan true [0] = false ∧
+    validPlan false [] = false ∧
+    validPlan false [0] = true ∧
+    ((sys [0]).run
+      [.pushBegin, .onPoolReceived 0, .pushEnd true,
+       .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true, .publish]).map
+      (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
+      some (true, false, true, some true) ∧
+    ((sys [0, 0]).run
+      [.pushBegin, .onPoolReceived 0, .pushEnd true,
+       .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true,
+       .pushBegin, .onPoolReceived 1, .pushEnd true,
+       .h2dIssue 1 true, .h2dReady 1, .h2dDone 1 true, .publish]).map
+      (fun r => (r.pools.map Pool.stage, r.life.done, r.life.hasStaging,
+                 r.planUnregistered, r.published)) =
+      some ([.completed, .completed], true, false, true, some true) := by
+  decide
+
 /-- `FinishPoolReshardRecvRecordsDurationMetric` and
 `FinishPoolReshardRecvDoesNotRecordMetricOnFailure`
-(`kv_cache_manager_with_transfer_pool_reshard_test.cc:561-621`): duration is
-recorded when the final pool's H2D completes OK, and is not recorded when a
-pool's H2D fails. -/
+(`kv_cache_manager_with_transfer_pool_reshard_test.cc:294-334`): duration is
+recorded when the final pool's H2D completes OK (`:294-314`), and is not
+recorded when a pool's H2D fails (`:316-334`). -/
 theorem trace_duration_metric_on_success_and_failure :
     let s := sys [0]
     ((s.run [.onPoolReceived 0, .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true, .publish]).map

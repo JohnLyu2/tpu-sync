@@ -603,11 +603,12 @@ theorem complete_retires_iff_all_claimed_voted {s s' : RegGen} {expected : List 
     simp only [Bool.not_eq_true] at hnot_all
     simp [hnot_ret, hnot_all]
 
-/-! ## Part IV — Concrete `decide` Traces and Mutants -/
+/-! ## Part IV — Concrete `decide` Traces (`reshard_service_test.cc` Parity) and Mutants -/
 
 /-- Happy-path 2-unit producer registration, multi-owner pipelined claim,
 single-owner abandon (claim survives), and 2-unit completion voting that retires
-only on the second vote (`request_block_registry.cc:260-509`). -/
+only on the second vote (`request_block_registry.cc:260-509`,
+`reshard_service_test.cc:986-1009, 1235-1289`). -/
 def registryHappyTrace : List Ev :=
   [ .register 0 true
   , .register 1 true
@@ -623,25 +624,89 @@ theorem trace_registry_multi_owner_and_voting :
       some (.unknown, none, [], true) := by
   decide
 
-/-- After the first of two claimed units votes (`complete 0`), the generation is
-still `.claimed` and `retired = false`. -/
+/-- Replay of `ReshardStackTest.CompletionVotesRetireAfterClaim`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:986-1009`):
+After the first of two claimed units votes (`complete 0`, `:1003-1005`), the
+generation is still `.claimed` and `retired = false` (`"0"` rows retired); when
+the second unit votes (`complete 1`, `:1006-1008`), `RetireLocked` fires
+(`retired = true`, `registeredUnits = []`, `"2"` rows retired). -/
 theorem trace_partial_vote_does_not_retire :
     (RegGen.sys.run (registryHappyTrace.take 6)).map
       (fun s => (s.status, s.claimedUnits, s.completedUnits, s.retired)) =
       some (.claimed, some [0, 1], [0], false) := by
   decide
 
-/-- `CancelIfUnclaimed` before claim records a `.cancelled` tombstone and blocks
-any late producer `register` or `lookupAndClaim`
-(`request_block_registry.cc:276-280, 385-404, 448-452`). -/
+/-- Replay of `ReshardStackTest.CancelTombstoneBlocksLateRegistration`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:890-918`) and
+`request_block_registry.cc:276-280, 385-404, 448-452`:
+1. Cancelling an unclaimed generation before any producer registers (`:893-903`)
+   or after partial registration (`:961-967`) records a `.cancelled` tombstone.
+2. Any late producer `register` (`:904-917`) or `lookupAndClaim` (`:1314-1317`)
+   against the cancelled `(req_id, uuid)` is rejected (`none`). -/
 theorem trace_tombstone_blocks_late_register_and_claim :
-    (RegGen.sys.run [.register 0 true, .cancelIfUnclaimed]).map
+    ((RegGen.sys.run [.cancelIfUnclaimed]).map
+      (fun s => (s.status, RegGen.step s (.register 0 true))) =
+      some (.cancelled, none)) ∧
+    ((RegGen.sys.run [.register 0 true, .cancelIfUnclaimed]).map
       (fun s =>
         ( s.status
         , s.registeredUnits
         , RegGen.step s (.register 1 true)
         , RegGen.step s (.lookupAndClaim 101 [0]) )) =
-      some (.cancelled, [], none, none) := by
+      some (.cancelled, [], none, none)) := by
+  decide
+
+/-- Replay of `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:920-984`):
+1. Never registered (`RegGen.init`, `:952-954`) reads as `.unknown`.
+2. Registered and unclaimed (`[.register 0 true]`, `:956-959`) reads as
+   `.registered`.
+3. Release-only cancel (`[.register 0 true, .cancelIfUnclaimed]`, `:961-967`)
+   erases the row and reads as `.cancelled`.
+4. Claimed registration (`[.register 0 true, .register 1 true,
+   .lookupAndClaim 101 [0, 1]]`, `:969-978`) reads as `.claimed` and refuses
+   cancellation (staying `.claimed` with `cancelled = false`). -/
+theorem trace_request_block_status_probe_lifecycle :
+    RegGen.init.status = .unknown ∧
+    (RegGen.sys.run [.register 0 true]).map RegGen.status = some .registered ∧
+    (RegGen.sys.run [.register 0 true, .cancelIfUnclaimed]).map RegGen.status =
+      some .cancelled ∧
+    (RegGen.sys.run
+      [.register 0 true, .register 1 true, .lookupAndClaim 101 [0, 1],
+       .cancelIfUnclaimed]).map
+      (fun s => (s.status, s.cancelled)) = some (.claimed, false) := by
+  decide
+
+/-- Replay of `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1235-1260`),
+`AbandonedStageLeavesTheSiblingClaimInPlace` (`:1262-1289`), and
+`AbandoningTheLastStageFreesTheClaim` (`:1291-1318`):
+1. Stage 0 (`100`) and Stage 1 (`101`) share one request claim on `[0, 1]`; when
+   Stage 1 abandons its claim (`abandonClaim 101`, `:1267-1283`), Stage 0's
+   claim remains in place (`status = .claimed`, `cancelIfUnclaimed` refused with
+   `cancelled = false`), and Stage 1 can rejoin (`lookupAndClaim 101 [0, 1]`,
+   `:1284-1288`).
+2. When both Stage 0 (`100`) and Stage 1 (`101`) abandon their claims
+   (`:1296-1307`), the last stage leaving frees the claim (`status = .registered`),
+   allowing `cancelIfUnclaimed` to succeed (`status = .cancelled`) and blocking
+   a late Stage 0 retry (`:1308-1318`). -/
+theorem trace_pipelined_stages_claim_and_abandon :
+    ((RegGen.sys.run
+      [ .register 0 true, .register 1 true
+      , .lookupAndClaim 100 [0, 1], .lookupAndClaim 101 [0, 1]
+      , .abandonClaim 101, .cancelIfUnclaimed
+      , .lookupAndClaim 101 [0, 1] ]).map
+      (fun s => (s.status, s.cancelled, s.claimOwners)) =
+      some (.claimed, false, [100, 101])) ∧
+    ((RegGen.sys.run
+      [ .register 0 true, .register 1 true
+      , .lookupAndClaim 100 [0, 1], .abandonClaim 100
+      , .lookupAndClaim 101 [0, 1], .abandonClaim 101 ]).map
+      (fun s =>
+        ( s.status
+        , (RegGen.step s .cancelIfUnclaimed).map
+            (fun s_canc => (s_canc.status, RegGen.step s_canc (.lookupAndClaim 100 [0, 1]))) )) =
+      some (.registered, some (.cancelled, none))) := by
   decide
 
 /-- Mutant 1: If `Complete` retired on the *first* unit vote instead of checking

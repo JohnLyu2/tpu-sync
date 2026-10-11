@@ -1204,6 +1204,98 @@ theorem trace_shared_storage_pools_share_lease :
       some (true, 1, some 0, some 1) := by
   decide
 
+/-- Bounded vs. full-mirror storage configuration
+(`KVCacheManagerBase::ConfigurePoolStaging`,
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2008-2065`):
+allocates a bounded arena of `blocksPerLease * leases` slots (`some numSlots`)
+if and only if `0 < blocksPerLease`, `0 < leases`, all pools sharing the
+storage have equal `block_stride_bytes` (`stridesEqual`), and
+`blocksPerLease * leases < maxPoolBlocks`; otherwise falls back to full-mirror
+identity addressing (`none`). -/
+def configureStorageBounded (blocksPerLease leases maxPoolBlocks : Nat)
+    (stridesEqual : Bool) : Option Nat :=
+  let numSlots := blocksPerLease * leases
+  if 0 < blocksPerLease && 0 < leases && stridesEqual && numSlots < maxPoolBlocks then
+    some numSlots
+  else
+    none
+
+/-- Reported staging capacity (`PoolHostBaseAddrs`,
+`tpu_sync/kv_cache/kv_cache_manager_base.cc:2505-2529`,
+`tpu_sync/kv_cache/pool_staging_test.cc:489-521`):
+returns `numSlots` when the pool's storage is bounded and `maxPoolBlocks` on a
+full-mirror storage. -/
+def poolStagingCapacity (maxPoolBlocks : Nat) (boundedSlots : Option Nat) : Nat :=
+  boundedSlots.getD maxPoolBlocks
+
+/-- Remote address (`raddr`) resolution on sender `GetBlockChunks` vs. receiver
+`PoolBlockHostBase` (`tpu_sync/kv_cache/kv_cache_manager_base.cc:2512-2529, 3260-3296`,
+`tpu_sync/kv_cache/pool_staging_test.cc:306-484`):
+- On full-mirror storage (`arena = none`), `dstBlock < numBlocks` resolves to
+  `some (baseAddr + dstBlock * stride + dstOffset)` (identity slot).
+- On bounded storage (`arena = some a`), `dstBlock` is translated through
+  `a.resolveBlockSlot uuid dstBlock` (`slot * stride + dstOffset`), returning
+  `none` if `uuid` has no lease for `dstBlock`. -/
+def resolveRemoteAddr (baseAddr stride numBlocks : Nat) (arena : Option Arena)
+    (uuid dstBlock dstOffset : Nat) : Option Nat :=
+  if dstBlock ≥ numBlocks then none
+  else
+    match arena with
+    | none => some (baseAddr + dstBlock * stride + dstOffset)
+    | some a =>
+      (a.resolveBlockSlot uuid dstBlock).map (fun slot => baseAddr + slot * stride + dstOffset)
+
+/-- Replay of `TEST(PoolStagingTest, FallsBackToFullMirrorWithoutHintsOrLeases)`
+(`tpu_sync/kv_cache/pool_staging_test.cc:212-235`) and
+`TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch)`
+(`tpu_sync/kv_cache/pool_staging_test.cc:240-301`):
+1. Zero hints (`blocks = 0, leases = 0, maxBlocks = 16`, `:212-222`) or zero
+   leases (`blocks = 2, leases = 0, maxBlocks = 16`, `:224-234`) falls back to
+   full mirror (`none`).
+2. Small pool (`blocks = 2, leases = 2, maxBlocks = 3`, `4 ≥ 3`, `:240-251`)
+   falls back to full mirror (`none`).
+3. Shared storage with matching strides (`blocks = 3, leases = 1, maxBlocks = 64`,
+   `:252-279`) configures a bounded arena of `some 3` slots.
+4. Shared storage with mismatched strides (`stridesEqual = false`, `:281-301`)
+   falls back to full mirror (`none`). -/
+theorem trace_fallback_to_full_mirror_and_stride_mismatch :
+    configureStorageBounded 0 0 16 true = none ∧
+    configureStorageBounded 2 0 16 true = none ∧
+    configureStorageBounded 2 2 3 true = none ∧
+    configureStorageBounded 3 1 64 true = some 3 ∧
+    configureStorageBounded 2 2 64 false = none := by
+  decide
+
+/-- Replay of `TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer)`
+(`tpu_sync/kv_cache/pool_staging_test.cc:306-416`),
+`TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot)`
+(`tpu_sync/kv_cache/pool_staging_test.cc:419-484`), and
+`TEST(PoolStagingTest, PoolHostBaseAddrs)`
+(`tpu_sync/kv_cache/pool_staging_test.cc:489-521`):
+1. Full-mirror receiver (`baseAddr = 10000, stride = 64, numBlocks = 8`,
+   `:306-416`): `(dstBlock = 3, dstOffset = 0)` resolves to `10000 + 3 * 64 = 10192`,
+   `(dstBlock = 3, dstOffset = 32)` to `10224`, and `(dstBlock = 5, dstOffset = 16)`
+   to `10336`.
+2. Bounded receiver (`baseAddr = 20000, stride = 64, numBlocks = 64, numSlots = 2`,
+   `:419-484`): `uuid = 99` leases `[7, 42]` (mapped to slots `0` and `1`), so
+   `(dstBlock = 42, dstOffset = 32)` resolves to `20000 + 1 * 64 + 32 = 20096`
+   (using slot `1`, not `42 * 64`), while unleased `dstBlock = 10` (`:472-483`)
+   resolves to `none`.
+3. `PoolHostBaseAddrs` (`:489-521`): full-mirror pool reports `num_blocks = 8`,
+   while bounded pool (`2 * 2 = 4 < 64`) reports `num_blocks = 4`. -/
+theorem trace_sender_raddr_and_pool_host_base_addrs :
+    resolveRemoteAddr 10000 64 8 none 77 3 0 = some 10192 ∧
+    resolveRemoteAddr 10000 64 8 none 77 3 32 = some 10224 ∧
+    resolveRemoteAddr 10000 64 8 none 77 5 16 = some 10336 ∧
+    (((Arena.init 2).acquireLease 99 [7, 42]).map
+      (fun a =>
+        ( resolveRemoteAddr 20000 64 64 (some a) 99 42 32
+        , resolveRemoteAddr 20000 64 64 (some a) 99 10 0 )) =
+      some (some 20096, none)) ∧
+    poolStagingCapacity 8 (configureStorageBounded 0 0 8 true) = 8 ∧
+    poolStagingCapacity 64 (configureStorageBounded 2 2 64 true) = 4 := by
+  decide
+
 /-- End-to-end trace under `RegistrationPolicy.reserveBeforeLease` showing two
 sessions (`uuid = 7` and `uuid = 8`) arming, leasing disjoint slots, settling,
 and recycling slots while preserving `ActiveSessionsHoldLeases`. -/

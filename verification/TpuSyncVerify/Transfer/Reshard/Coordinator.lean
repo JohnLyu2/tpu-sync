@@ -1046,8 +1046,12 @@ theorem trace_r2_hardened_policy_cleans_up_both_r2a_and_r2b :
       some (.aborted, [(false, false), (false, false)], none, [])) := by
   exact ⟨rfl, rfl⟩
 
-/-- Happy-path 2x2 reshard execution trace (`reshard_coordinator.cc:415-545`):
-both producers register, coordinator claims the plan, both receivers arm,
+/-- Happy-path 2x2 multicast reshard execution trace
+(`reshard_coordinator.cc:415-545`,
+`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1022-1092`,
+`ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce`):
+both producers (`[0, 1]`) register, coordinator claims the plan, both
+destinations (`[10, 11]`) arm concurrently before either sender is dispatched,
 both senders push and vote `Complete`, both receivers complete and release their
 staging leases, and `RequestBlockRegistry` retires the generation. -/
 def coordinatorHappyTrace : List Ev :=
@@ -1062,6 +1066,20 @@ def coordinatorHappyTrace : List Ev :=
   , .finishSendBarrier ]
 
 theorem trace_coordinator_happy_path :
+    ((CoordState.sys .shipping [0, 1] [10] 101).run
+      [ .registerProducer 0
+      , .registerProducer 1
+      , .startPlan true
+      , .armDstResult 10 true
+      , .finishArmBarrier
+      , .sendSrcResult 0 true
+      , .sendSrcResult 1 true
+      , .finishSendBarrier ]).map
+      (fun s =>
+        ( s.phase
+        , s.dstStates.map (fun d => (d.unit, d.completed, d.sessionArmed, d.stagingLeaseHeld))
+        , s.reg.retired )) =
+      some (.succeeded, [(10, true, false, false)], true) ∧
     ((CoordState.sys .shipping [0, 1] [10, 11] 101).run coordinatorHappyTrace).map
       (fun s =>
         ( s.phase
@@ -1070,7 +1088,37 @@ theorem trace_coordinator_happy_path :
         , s.reg.claimedUnits
         , s.reg.registeredUnits )) =
       some (.succeeded, [(10, true, false, false), (11, true, false, false)], true, none, []) := by
-  rfl
+  exact ⟨rfl, rfl⟩
+
+/-- Replay of `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:634-708`),
+`MissingRegistrationKeepsContractString` (`:860-870`), and
+`ArmFailureAbandonsClaimAndSkipsSenders` (`:872-888`):
+1. `MissingRegistrationKeepsContractString` (`:860-870`): starting a plan when
+   `src_unit 0` has not registered in `RequestBlockRegistry` is rejected (`none`).
+2. `ArmFailureAbandonsClaimAndSkipsSenders` (`:872-888`): on a 1-source (`[0]`),
+   1-destination (`[10]`) plan, when `dst_unit 10` refuses its arm
+   (`armDstResult 10 false`, `finishArmBarrier`), the coordinator aborts without
+   contacting any sender (`sendResults = []`), abandons its registry claim
+   (`s.reg.claimedUnits = none`, `s.reg.status = .registered`), and a fresh
+   coordination claim (`RegGen.step s.reg (.lookupAndClaim 102 [0])`) succeeds
+   (`:882-888`). -/
+theorem trace_arm_failure_abandons_claim_and_skips_senders :
+    (CoordState.sys .shipping [0] [10] 101).run [.startPlan true] = none ∧
+    (((CoordState.sys .shipping [0] [10] 101).run
+      [ .registerProducer 0
+      , .startPlan true
+      , .armDstResult 10 false
+      , .finishArmBarrier ]).map
+      (fun s =>
+        ( s.phase
+        , s.sendResults
+        , s.reg.claimedUnits
+        , s.reg.status
+        , (RegGen.step s.reg (.lookupAndClaim 102 [0])).map
+            (fun r => r.claimedUnits) )) =
+      some (.aborted, [], none, .registered, some (some [0]))) := by
+  exact ⟨rfl, rfl⟩
 
 /-- Mutant: If Stage 2 dispatched senders without waiting for the Stage 1 join
 barrier (`reshard_coordinator.cc:457-463`), a sender push arriving before
