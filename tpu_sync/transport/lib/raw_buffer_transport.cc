@@ -49,6 +49,7 @@
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
@@ -845,6 +846,30 @@ absl::Status RawBufferTransport::PullBuffer(
   return ProcessSocketBufferPull(peer, req);
 }
 
+std::string RawBufferTransport::SourceIpForPeer(absl::string_view peer) const {
+  if (!SourceBindEnabled()) return "";
+  std::vector<std::string> routable;
+  for (const std::string& local_ip : local_ips_) {
+    const absl::StatusOr<bool> routes = SourceIpRoutesToPeer(local_ip, peer);
+    if (!routes.ok()) {
+      LOG_FIRST_N(WARNING, 8)
+          << "Skipping source IP " << local_ip << " for peer " << peer
+          << ": route lookup failed: " << routes.status();
+      continue;
+    }
+    if (*routes) routable.push_back(local_ip);
+  }
+  if (routable.empty()) {
+    LOG_FIRST_N(WARNING, 8)
+        << "No source IP in [" << absl::StrJoin(local_ips_, ", ")
+        << "] routes to peer " << peer
+        << " through its own NIC; letting the kernel pick the source";
+    return "";
+  }
+  const size_t idx = source_ip_rr_.fetch_add(1, std::memory_order_relaxed);
+  return routable[idx % routable.size()];
+}
+
 absl::Status RawBufferTransport::ProcessSocketBufferPull(
     absl::string_view peer, const Request& request) {
   if (peer.empty()) {
@@ -869,7 +894,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
     return status;
   }
 
-  auto conn_or = BorrowConnection(peer, bound_ip_);
+  const std::string source_ip = SourceIpForPeer(peer);
+  auto conn_or = BorrowConnection(peer, source_ip);
   if (!conn_or.ok()) {
     RecordWeightSyncFailure(store_, conn_or.status(),
                             metric_labels::kDirectionPull);
@@ -878,7 +904,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
   const int fd = *conn_or;
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
-      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
+      [&] { ReturnConnection(ok_to_pool, fd, peer, source_ip); });
 
   ChunkHeader header = {};
   header.version = 1;
@@ -1045,7 +1071,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
     return status;
   }
 
-  auto conn_or = BorrowConnection(peer, bound_ip_);
+  const std::string source_ip = SourceIpForPeer(peer);
+  auto conn_or = BorrowConnection(peer, source_ip);
   if (!conn_or.ok()) {
     RecordWeightSyncFailure(store_, conn_or.status(),
                             metric_labels::kDirectionPush);
@@ -1054,7 +1081,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
   const int fd = *conn_or;
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
-      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
+      [&] { ReturnConnection(ok_to_pool, fd, peer, source_ip); });
 
   ChunkHeader header = {};
   header.version = 1;
@@ -1360,7 +1387,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
     return absl::OkStatus();
   }
 
-  auto conn_or = BorrowConnection(peer, bound_ip_);
+  const std::string source_ip = SourceIpForPeer(peer);
+  auto conn_or = BorrowConnection(peer, source_ip);
   if (!conn_or.ok()) {
     RecordWeightSyncFailure(store_, conn_or.status(),
                             metric_labels::kDirectionPush);
@@ -1369,7 +1397,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
   const int fd = *conn_or;
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
-      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
+      [&] { ReturnConnection(ok_to_pool, fd, peer, source_ip); });
 
   const size_t batch_size = requests.size();
   const uint64_t uuid = requests.front().uuid;

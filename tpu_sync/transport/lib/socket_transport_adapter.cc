@@ -39,7 +39,6 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -207,30 +206,6 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
     on_complete(status);
   }
   return status;
-}
-
-// Whether to pin the client-side source address of outbound data connections.
-//
-// Binding a source IP only steers egress onto a particular NIC when the host
-// has a policy routing rule for that address (`ip rule from <src> ...`). That
-// setup exists on multi-NIC deployments where peer addresses are not covered
-// by specific routes and would otherwise all leave via the control-plane NIC.
-//
-// Without such a rule the kernel still routes by destination, so the bound
-// address disagrees with the interface the packet leaves on, and cloud
-// anti-spoofing filters drop it. bind() itself succeeds and only the data path
-// breaks, so the failure surfaces as a hang rather than an error. A source is
-// therefore only bound when the kernel's own route lookup confirms that the
-// source's NIC is the egress for that peer (SourceIpRoutesToPeer). Binding
-// stays opt-in (TPU_RAIDEN_ENABLE_SOURCE_IP_BIND) because the policy routing
-// that makes it useful is a property of the host.
-bool SourceBindEnabled() {
-  const char* v = std::getenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
-  if (v == nullptr) return false;
-  absl::string_view sv(v);
-  return sv == "1" || absl::EqualsIgnoreCase(sv, "true") ||
-         absl::EqualsIgnoreCase(sv, "yes") ||
-         absl::EqualsIgnoreCase(sv, "on");
 }
 
 // Candidates in `source_ips` (order preserved) that the kernel would route to

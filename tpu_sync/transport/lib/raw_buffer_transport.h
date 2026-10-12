@@ -92,8 +92,9 @@ class RawBufferTransport final {
   // Return the TCP listening socket port.
   int local_port() const { return local_port_; }
 
-  // Return the bound IP address.
-  // It is the first IP in `local_ips` if provided, otherwise "127.0.0.1".
+  // Primary local IP: the first entry of `local_ips`, or "127.0.0.1" when none
+  // was given. Used for advertisement and metric labels; outbound connections
+  // do not bind to it (see SourceIpForPeer).
   const std::string& bound_ip() const { return bound_ip_; }
 
   // Return the local IP addresses.
@@ -168,6 +169,13 @@ class RawBufferTransport final {
   absl::Status ProcessSocketBufferBatchPush(absl::string_view peer,
                                             absl::Span<const Request> requests);
 
+  // Client-side source address for an outbound connection to `peer`, or ""
+  // to let the kernel choose by route. Non-empty only when source binding
+  // is enabled (SourceBindEnabled), round-robining across the entries of
+  // `local_ips_` that route to `peer` through their own NIC
+  // (SourceIpRoutesToPeer).
+  std::string SourceIpForPeer(absl::string_view peer) const;
+
   // Processes a single peer request from the given `client_fd`. These requests
   // are those sent by `PullBuffer`, `PushBuffer`, `PushBuffers` calls.
   absl::Status ProcessPeerRequest(int client_fd);
@@ -193,6 +201,7 @@ class RawBufferTransport final {
   const bool pin_recv_threads_to_nic_numa_;
   std::atomic<int> server_fd_;  // owned by listener_thread_
   std::atomic<bool> stopping_;
+  mutable std::atomic<size_t> source_ip_rr_{0};
 
   // The active_client_fds do not own the sockets it contains. It is only used
   // to shutdown the sockets, thus unblocking the connection workers. Each

@@ -559,6 +559,14 @@ size_t SourceIpRouteCacheSizeForTesting() {
   return cache.routes.size();
 }
 
+bool SourceBindEnabled() {
+  const char* v = std::getenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
+  if (v == nullptr) return false;
+  const absl::string_view sv(v);
+  return sv == "1" || absl::EqualsIgnoreCase(sv, "true") ||
+         absl::EqualsIgnoreCase(sv, "yes") || absl::EqualsIgnoreCase(sv, "on");
+}
+
 namespace {
 std::string SockAddrToEndpoint(int fd, int (*get_fn)(int, struct sockaddr*,
                                                      socklen_t*)) {
