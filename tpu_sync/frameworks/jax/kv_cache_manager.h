@@ -282,8 +282,12 @@ class KVCacheManager {
   KVCacheManager& operator=(KVCacheManager&&) = default;
 
 #ifndef WITHOUT_PYTHON
-  // JAX sharded constructor E2E (cache-only by default)
-  KVCacheManager(
+  // Creates a cache-only manager over the sharded jax.Arrays in
+  // |device_arrays| (one entry per layer) and, when
+  // |raiden_controller_address| is set, starts the worker gRPC server on
+  // |raiden_worker_port|. Returns Internal if unpacking the arrays, building
+  // the NUMA-aware manager, or starting the gRPC server fails.
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
       nanobind::list device_arrays,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
@@ -293,10 +297,12 @@ class KVCacheManager {
       std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
       bool enable_shm = false);
 
-  // New transfer-enabled constructor (flat list of arrays, single shard per
-  // layer). enable_shm opts this manager's host buffers into the shared-memory
-  // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
-  KVCacheManager(
+  // Creates a transfer-enabled manager over the flat list of per-layer
+  // arrays in |kv_caches| (single shard per layer). |enable_shm| opts this
+  // manager's host buffers into the shared-memory segments named by
+  // RAIDEN_SHM_KEY; without it the env var is ignored. Failure modes as for
+  // the cache-only Create().
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> CreateWithNodeId(
       nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
       int64_t max_blocks, int64_t num_slots, double timeout_s,
       bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port = 0,
@@ -526,6 +532,13 @@ class KVCacheManager {
   }
 
  private:
+#ifndef WITHOUT_PYTHON
+  // Used by Create(); adopts an already constructed |numa_manager|. The gRPC
+  // server is started separately by the factory.
+  explicit KVCacheManager(
+      std::unique_ptr<NumaAwareKVCacheManager> numa_manager);
+#endif
+
   void StartGrpcServer(
       int raiden_worker_port,
       std::optional<std::string> raiden_controller_address = std::nullopt,

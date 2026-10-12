@@ -253,10 +253,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // =========================================================================
   auto manager_cls = nb::class_<KVCacheManager>(m, "KVCacheManager");
   manager_cls
-      .def(nb::init<const std::vector<std::vector<at::Tensor>>&,
-                    std::optional<int>, std::optional<int>, bool, int, int,
-                    std::optional<std::string>, std::optional<std::string>,
-                    int64_t, bool>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(KVCacheManager::Create)),
            nb::arg("device_tensors"), nb::arg("local_port") = nb::none(),
            nb::arg("host_blocks_to_allocate") = nb::none(),
            nb::arg("unsafe_skip_buffer_lock") = false,
@@ -264,10 +261,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("raiden_controller_address") = nb::none(),
            nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0,
            nb::arg("enable_shm") = false)
-      .def(nb::init<const std::vector<at::Tensor>&, int64_t, int64_t, int64_t,
-                    int64_t, double, bool, int, std::optional<int>, int,
-                    std::optional<std::string>, std::optional<std::string>,
-                    bool>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(KVCacheManager::CreateWithNodeId)),
            nb::arg("kv_caches"), nb::arg("node_id"),
            nb::arg("local_control_port"), nb::arg("max_blocks"),
            nb::arg("num_slots"), nb::arg("timeout_s") = 120.0,

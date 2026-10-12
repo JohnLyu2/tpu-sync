@@ -34,6 +34,7 @@
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -1023,28 +1024,51 @@ NumaAwareKVCacheManager::GetKVBackend(absl::string_view backend_name) const {
 
 #ifndef WITHOUT_PYTHON
 KVCacheManager::KVCacheManager(
+    std::unique_ptr<NumaAwareKVCacheManager> numa_manager)
+    : numa_manager_(std::move(numa_manager)) {}
+
+absl::StatusOr<std::unique_ptr<KVCacheManager>> KVCacheManager::Create(
     nb::list device_arrays, std::optional<int> local_port,
     std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
     int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, int64_t node_id, bool enable_shm)
-    : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
-          std::move(device_arrays), local_port, host_blocks_to_allocate,
-          unsafe_skip_buffer_lock, parallelism, node_id, enable_shm)) {
-  StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
+    std::optional<std::string> worker_id, int64_t node_id, bool enable_shm) {
+  try {
+    auto manager = absl::WrapUnique(
+        new KVCacheManager(std::make_unique<NumaAwareKVCacheManager>(
+            std::move(device_arrays), local_port, host_blocks_to_allocate,
+            unsafe_skip_buffer_lock, parallelism, node_id, enable_shm)));
+    manager->StartGrpcServer(raiden_worker_port,
+                             std::move(raiden_controller_address),
+                             std::move(worker_id));
+    return manager;
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("KVCacheManager::Create failed: ", e.what()));
+  }
 }
 
-KVCacheManager::KVCacheManager(
+absl::StatusOr<std::unique_ptr<KVCacheManager>>
+KVCacheManager::CreateWithNodeId(
     nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, bool enable_shm)
-    : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
-          std::move(kv_caches), node_id, local_control_port, max_blocks,
-          num_slots, timeout_s, unsafe_skip_buffer_lock, parallelism,
-          enable_shm)) {
-  StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
+    std::optional<std::string> worker_id, bool enable_shm) {
+  try {
+    auto manager = absl::WrapUnique(
+        new KVCacheManager(std::make_unique<NumaAwareKVCacheManager>(
+            std::move(kv_caches), node_id, local_control_port, max_blocks,
+            num_slots, timeout_s, unsafe_skip_buffer_lock, parallelism,
+            enable_shm)));
+    manager->StartGrpcServer(raiden_worker_port,
+                             std::move(raiden_controller_address),
+                             std::move(worker_id));
+    return manager;
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("KVCacheManager::CreateWithNodeId failed: ", e.what()));
+  }
 }
 #endif
 

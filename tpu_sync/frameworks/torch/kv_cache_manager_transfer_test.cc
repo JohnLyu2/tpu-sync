@@ -63,12 +63,14 @@ TEST_F(KVCacheManagerTransferTest, Basic) {
   std::vector<at::Tensor> kv_caches = {tensor};
 
   // Construct KVCacheManager with transfer enabled
-  KVCacheManager engine(kv_caches, /*node_id=*/0,
-                        /*local_control_port=*/0, /*max_blocks=*/2,
-                        /*num_slots=*/2, /*timeout_s=*/10.0,
-                        /*unsafe_skip_buffer_lock=*/true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> engine,
+                          KVCacheManager::CreateWithNodeId(
+                              kv_caches, /*node_id=*/0,
+                              /*local_control_port=*/0, /*max_blocks=*/2,
+                              /*num_slots=*/2, /*timeout_s=*/10.0,
+                              /*unsafe_skip_buffer_lock=*/true));
 
-  EXPECT_EQ(engine.kv_caches().size(), 1);
+  EXPECT_EQ(engine->kv_caches().size(), 1);
 }
 
 }  // namespace

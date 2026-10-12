@@ -158,7 +158,12 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
 
 class KVCacheManager {
  public:
-  KVCacheManager(
+  // Creates a cache-only manager over |device_tensors| (outer index = layer,
+  // inner index = shard) and, when |raiden_controller_address| is set, starts
+  // the worker gRPC server on |raiden_worker_port|. Returns Internal if
+  // unpacking the tensors, building the TorchKVCacheManager, or starting the
+  // gRPC server fails.
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
@@ -178,7 +183,12 @@ class KVCacheManager {
       std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
       bool enable_shm = false);
 
-  KVCacheManager(
+  // Creates a transfer-enabled manager over the flat list of per-layer
+  // tensors in |kv_caches| (single shard per layer). |enable_shm| opts this
+  // manager's host buffers into the shared-memory segments named by
+  // RAIDEN_SHM_KEY; without it the env var is ignored. Failure modes as for
+  // the cache-only Create().
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> CreateWithNodeId(
       const std::vector<at::Tensor>& kv_caches, int64_t node_id,
       int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
       double timeout_s = 120.0, bool unsafe_skip_buffer_lock = true,
@@ -503,6 +513,10 @@ class KVCacheManager {
   }
 
  private:
+  // Used by Create(); adopts an already constructed |torch_manager|. The gRPC
+  // server is started separately by the factory.
+  explicit KVCacheManager(std::unique_ptr<TorchKVCacheManager> torch_manager);
+
   void StartGrpcServer(
       int raiden_worker_port,
       std::optional<std::string> raiden_controller_address = std::nullopt,
