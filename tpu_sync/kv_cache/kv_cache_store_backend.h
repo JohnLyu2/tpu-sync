@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +27,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
@@ -38,6 +40,7 @@ namespace kv_cache {
 // header, so including it back would be circular.
 class KVCacheStoreServer;
 class BlockTracker;
+class WriteRemoteCancel;
 
 enum class BlockStatus {
   INIT,
@@ -244,6 +247,24 @@ class KVCacheStoreBackend {
   // testing/diagnostics).
   virtual std::vector<std::string> GetEvictCandidateKeys() const { return {}; }
 
+  // Every hash with a host-resident copy, pinned entries included, eviction
+  // candidates excluded. One-shot inventory snapshot for republishing to the
+  // global registry after a registration lapse; not an enumeration to build
+  // logic on -- entries may be evicted the moment the lock drops.
+  virtual std::vector<std::string> SnapshotHostResidentHashes() const {
+    return {};
+  }
+
+  // Pins the subset of `block_hashes` that is still host-resident and returns
+  // those hashes with their current host block ids, all under one lock
+  // acquisition. Unlike Pin(), absent or candidate hashes are skipped rather
+  // than failing the batch: callers feed this from a stale snapshot, and a
+  // hash evicted since the snapshot must be dropped, not resurrected. The
+  // caller Release()s the returned hashes.
+  virtual std::vector<std::pair<std::string, int32_t>> PinPresentHostResident(
+      absl::Span<const std::string> block_hashes) {
+    return {};
+  }
 
   // --- Remote write (WriteRemote) ------------------------------------------
   //
@@ -295,6 +316,48 @@ class KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes) {
     return tsl::Future<>(absl::UnimplementedError(
         "Backend does not implement UnregisterBlocksAsync."));
+  }
+
+  // --- Remote write, source side ------------------------------------------
+
+  // What the destination decided, before any bytes have moved.
+  struct RemoteWriteAck {
+    // Identifies the accepted operation. Zero when the destination answered
+    // from what it already holds and started no transfer.
+    uint64_t operation_id = 0;
+    // Every offered hash was already there. A success; nothing to transfer.
+    bool all_exist = false;
+    // Set when the destination held some but not all hashes. A failure; the
+    // caller decides what to re-offer.
+    std::vector<std::string> existing_hashes;
+    // The deadline the destination armed, clamped to its own cap. The source
+    // must protect the blocks at least this long.
+    absl::Duration granted_deadline;
+    // Ends the open call early; ~KVCacheStore uses it for abandoned offers.
+    std::shared_ptr<WriteRemoteCancel> cancel;
+  };
+
+  // Offers `block_hashes` to `dst_raiden_id` and blocks until the ack (not
+  // the bytes). `requested_deadline` is how long the destination may hold
+  // its landing blocks; `hold_window` is the call's deadline. The tracker's
+  // transfer status is updated when the operation completes or settles.
+  virtual absl::StatusOr<RemoteWriteAck> BeginWriteRemote(
+      const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
+      absl::Span<const int32_t> src_host_block_ids,
+      absl::Duration requested_deadline, absl::Duration hold_window,
+      BlockTracker* absl_nonnull save_tracker) {
+    CHECK(save_tracker != nullptr);
+    return absl::FailedPreconditionError(
+        "A remote save requires a HostOffloadBackend at tier 0");
+  }
+
+  // Composes the KVTransferSpec from the workers currently registered with
+  // the RaidenController and registers it with the global registry
+  // (first-wins, idempotent; see global_registry.proto).
+  virtual absl::Status RegisterKVTransferSpecFromWorkers() {
+    return absl::FailedPreconditionError(
+        "registering the KVTransferSpec requires a HostOffloadBackend at "
+        "tier 0");
   }
 
   // The peer-facing KVCacheStoreService server this backend hosts, if any.

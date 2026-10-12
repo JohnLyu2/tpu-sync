@@ -111,7 +111,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // candidates excluded. One-shot inventory snapshot for republishing to the
   // global registry after a registration lapse; not an enumeration to build
   // logic on -- entries may be evicted the moment the lock drops.
-  std::vector<std::string> SnapshotHostResidentHashes() const;
+  std::vector<std::string> SnapshotHostResidentHashes() const override;
 
   // Pins the subset of `block_hashes` that is still host-resident and returns
   // those hashes with their current host block ids, all under one lock
@@ -120,7 +120,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // hash evicted since the snapshot must be dropped, not resurrected. The
   // caller Release()s the returned hashes.
   std::vector<std::pair<std::string, int32_t>> PinPresentHostResident(
-      absl::Span<const std::string> block_hashes);
+      absl::Span<const std::string> block_hashes) override;
 
   // --- Global Memory Pooling & RPC Methods ---
   // The peer-facing server this backend hosts, or nullptr until StartServer()
@@ -170,23 +170,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // call and updates save_tracker. PollWriteRemoteAsync is recovery for a
   // source that lost that call. KVCacheStore owns the pins.
 
-  // What the destination decided, before any bytes have moved.
-  struct RemoteWriteAck {
-    // Identifies the accepted operation. Zero when the destination answered
-    // from what it already holds and started no transfer.
-    uint64_t operation_id = 0;
-    // Every offered hash was already there. A success; nothing to transfer.
-    bool all_exist = false;
-    // Set when the destination held some but not all hashes. A failure; the
-    // caller decides what to re-offer.
-    std::vector<std::string> existing_hashes;
-    // The deadline the destination armed, clamped to its own cap. The source
-    // must protect the blocks at least this long.
-    absl::Duration granted_deadline;
-    // Ends the open call early; ~KVCacheStore uses it for abandoned offers.
-    std::shared_ptr<WriteRemoteCancel> cancel;
-  };
-
   // Offers `block_hashes` to `dst_raiden_id` and blocks until the ack (not
   // the bytes). `requested_deadline` is how long the destination may hold
   // its landing blocks; `hold_window` is the call's deadline. The tracker's
@@ -195,7 +178,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> src_host_block_ids,
       absl::Duration requested_deadline, absl::Duration hold_window,
-      BlockTracker* absl_nonnull save_tracker);
+      BlockTracker* absl_nonnull save_tracker) override;
 
   // Asks the destination what became of an accepted offer; recovery for a
   // source that lost its stream. `wait_ms > 0` asks it to hold the answer
@@ -213,7 +196,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // the RaidenController and registers it with the global registry
   // (first-wins, idempotent; see global_registry.proto). FailedPrecondition
   // without a controller or without a global registry.
-  absl::Status RegisterKVTransferSpecFromWorkers();
+  absl::Status RegisterKVTransferSpecFromWorkers() override;
 
  private:
   friend class HostOffloadBackendTest;

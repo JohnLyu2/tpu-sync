@@ -52,11 +52,11 @@
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
-#include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
 #include "tpu_sync/kv_cache/store_monitor.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -413,14 +413,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
       !backend_configs[0].global_registry_address.empty() ||
       !global_registry_address.empty();
   if (expected_worker_count > 0 && tier0_has_registry) {
-    auto* host_backend =
-        dynamic_cast<HostOffloadBackend*>(store->backend().get());
-    if (host_backend == nullptr) {
-      return absl::FailedPreconditionError(
-          "registering the KVTransferSpec requires a HostOffloadBackend at "
-          "tier 0");
-    }
-    ABSL_RETURN_IF_ERROR(host_backend->RegisterKVTransferSpecFromWorkers());
+    ABSL_RETURN_IF_ERROR(store->backend()->RegisterKVTransferSpecFromWorkers());
   }
 
   if (monitor_config.enable) {
@@ -2005,7 +1998,7 @@ bool KVCacheStore::SweepOnce() {
 }
 
 bool KVCacheStore::RepublishOnce() {
-  auto* host_backend = dynamic_cast<HostOffloadBackend*>(backend().get());
+  KVCacheStoreBackend* host_backend = backend().get();
   if (host_backend == nullptr) {
     return false;
   }
@@ -2207,7 +2200,7 @@ absl::Status KVCacheStore::SaveRemote(
         "The save destination is this store; there is nothing to transfer");
   }
 
-  auto* backend = dynamic_cast<HostOffloadBackend*>(this->backend().get());
+  KVCacheStoreBackend* backend = this->backend().get();
   if (backend == nullptr) {
     return absl::FailedPreconditionError(
         "A remote save requires a HostOffloadBackend at tier 0");
