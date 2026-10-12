@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -34,6 +35,7 @@
 
 #ifndef WITHOUT_PYTHON
 #include "ATen/core/TensorBody.h"
+#include "csrc/api/tensor_buffer.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
 #endif
 
@@ -42,21 +44,39 @@ namespace torch {
 
 #ifndef WITHOUT_PYTHON
 WeightSynchronizer::WeightSynchronizer(
+    std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
+    bool unsafe_skip_buffer_lock,
+    std::vector<torch_tpu::TensorBufferHandle> buffer_refs)
+    : base_(std::move(base)),
+      unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
+      buffer_refs_(std::move(buffer_refs)) {}
+
+absl::StatusOr<std::unique_ptr<WeightSynchronizer>> WeightSynchronizer::Create(
     const std::vector<std::vector<at::Tensor>>& device_tensors,
     std::optional<int> local_port, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
     bool unsafe_skip_buffer_lock, bool auto_h2d,
-    std::optional<std::vector<int64_t>> global_shard_indices)
-    : unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock) {
-  UnpackedTensors unpacked =
-      UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock);
-  buffer_refs_ = std::move(unpacked.refs);
-  base_ = std::make_unique<weight_sync::WeightSynchronizerBase>(
-      unpacked.buffers, local_port, /*external_host_ptrs=*/std::nullopt,
-      unsafe_skip_buffer_lock, parallelism, listener_port, std::move(bind_ip),
-      /*layer_names=*/std::vector<std::string>{}, auto_h2d);
-  if (global_shard_indices.has_value()) {
-    base_->SetGlobalShardIndices(*std::move(global_shard_indices));
+    std::optional<std::vector<int64_t>> global_shard_indices) {
+  try {
+    UnpackedTensors unpacked =
+        UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock);
+    if (unpacked.buffers.empty()) {
+      return absl::InvalidArgumentError(
+          "WeightSynchronizer::Create: device_tensors yielded no layer "
+          "buffers");
+    }
+    auto base = std::make_unique<weight_sync::WeightSynchronizerBase>(
+        unpacked.buffers, local_port, /*external_host_ptrs=*/std::nullopt,
+        unsafe_skip_buffer_lock, parallelism, listener_port, std::move(bind_ip),
+        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+    if (global_shard_indices.has_value()) {
+      base->SetGlobalShardIndices(*std::move(global_shard_indices));
+    }
+    return absl::WrapUnique(new WeightSynchronizer(
+        std::move(base), unsafe_skip_buffer_lock, std::move(unpacked.refs)));
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("WeightSynchronizer::Create failed: ", e.what()));
   }
 }
 

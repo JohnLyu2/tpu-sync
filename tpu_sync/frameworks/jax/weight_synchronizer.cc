@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
@@ -41,19 +42,35 @@ namespace jax {
 
 #ifndef WITHOUT_PYTHON
 WeightSynchronizer::WeightSynchronizer(
+    std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
+    bool unsafe_skip_buffer_lock)
+    : base_(std::move(base)),
+      unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock) {}
+
+absl::StatusOr<std::unique_ptr<WeightSynchronizer>> WeightSynchronizer::Create(
     nanobind::list jax_arrays, std::optional<int> local_port, int parallelism,
     bool unsafe_skip_buffer_lock, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, bool auto_h2d,
-    std::optional<std::vector<int64_t>> global_shard_indices)
-    : unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock) {
-  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers =
-      tpu_raiden::jax::UnpackJaxArrays(jax_arrays, unsafe_skip_buffer_lock);
-  base_ = std::make_unique<weight_sync::WeightSynchronizerBase>(
-      layer_buffers, local_port, /*external_host_ptrs=*/std::nullopt,
-      unsafe_skip_buffer_lock, parallelism, listener_port, std::move(bind_ip),
-      /*layer_names=*/std::vector<std::string>{}, auto_h2d);
-  if (global_shard_indices.has_value()) {
-    base_->SetGlobalShardIndices(*std::move(global_shard_indices));
+    std::optional<std::vector<int64_t>> global_shard_indices) {
+  try {
+    std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers =
+        tpu_raiden::jax::UnpackJaxArrays(jax_arrays, unsafe_skip_buffer_lock);
+    if (layer_buffers.empty()) {
+      return absl::InvalidArgumentError(
+          "WeightSynchronizer::Create: jax_arrays yielded no layer buffers");
+    }
+    auto base = std::make_unique<weight_sync::WeightSynchronizerBase>(
+        layer_buffers, local_port, /*external_host_ptrs=*/std::nullopt,
+        unsafe_skip_buffer_lock, parallelism, listener_port, std::move(bind_ip),
+        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+    if (global_shard_indices.has_value()) {
+      base->SetGlobalShardIndices(*std::move(global_shard_indices));
+    }
+    return absl::WrapUnique(
+        new WeightSynchronizer(std::move(base), unsafe_skip_buffer_lock));
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("WeightSynchronizer::Create failed: ", e.what()));
   }
 }
 

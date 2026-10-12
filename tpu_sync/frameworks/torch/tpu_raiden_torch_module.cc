@@ -35,6 +35,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "xla/pjrt/status_casters.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/fault_injection/fault_injection_bindings.h"
@@ -669,10 +670,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // 3. Bind WeightSynchronizer
   // =========================================================================
   nb::class_<WeightSynchronizer>(m, "WeightSynchronizer")
-      .def(nb::init<const std::vector<std::vector<at::Tensor>>&,
-                    std::optional<int>, int, std::optional<int>,
-                    std::optional<std::string>, bool, bool,
-                    std::optional<std::vector<int64_t>>>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(WeightSynchronizer::Create)),
            nb::arg("device_tensors"), nb::arg("local_port") = nb::none(),
            nb::arg("parallelism") = 1, nb::arg("listener_port") = nb::none(),
            nb::arg("bind_ip") = nb::none(),
@@ -753,9 +751,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::arg("device_tensors"), nb::call_guard<nb::gil_scoped_release>())
       .def(
           "unbind_weights",
-          [](WeightSynchronizer& self) {
-            self.UnbindWeights();
-          },
+          [](WeightSynchronizer& self) { self.UnbindWeights(); },
           nb::call_guard<nb::gil_scoped_release>())
 
       .def(

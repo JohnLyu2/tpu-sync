@@ -53,7 +53,13 @@ class WeightSynchronizer {
   WeightSynchronizer& operator=(WeightSynchronizer&&) = default;
 
 #ifndef WITHOUT_PYTHON
-  WeightSynchronizer(
+  // Creates a synchronizer bound to |device_tensors| (outer index = layer,
+  // inner index = shard) and keeps their TPU buffer handles alive. Returns
+  // InvalidArgument if |device_tensors| yields no layer buffers and Internal
+  // if unpacking the tensors or constructing the underlying
+  // WeightSynchronizerBase throws. |global_shard_indices|, when set, overrides
+  // the default identity local->global shard mapping.
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizer>> Create(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
@@ -139,6 +145,14 @@ class WeightSynchronizer {
       double test_only_simulated_ingress_gbps = 0.0);
 
  private:
+#ifndef WITHOUT_PYTHON
+  // Used by Create(); adopts an already constructed |base| and the
+  // |buffer_refs| that pin the bound device tensors.
+  WeightSynchronizer(std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
+                     bool unsafe_skip_buffer_lock,
+                     std::vector<torch_tpu::TensorBufferHandle> buffer_refs);
+#endif
+
   std::unique_ptr<weight_sync::WeightSynchronizerBase> base_;
 #ifndef WITHOUT_PYTHON
   bool unsafe_skip_buffer_lock_ = true;
