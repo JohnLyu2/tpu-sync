@@ -434,8 +434,8 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
   }
   for (const auto& [storage_idx, ids] : dst_ids_by_storage) {
     std::vector<int64_t> id_list(ids.begin(), ids.end());
-    absl::Status lease_status = staging_allocator_->AcquirePoolStagingLease(
-        uuid_, storage_idx, id_list);
+    absl::Status lease_status = base_->AcquirePoolStagingLease(
+        uuid_, storage_idx, id_list, base_->pool_staging_lease_timeout());
     if (!lease_status.ok()) {
       return lease_status;
     }
@@ -446,7 +446,7 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
 void ReshardReceiveSession::ReleaseStagingLocked() {
   if (staging_released_) return;
   staging_released_ = true;
-  staging_allocator_->ReleasePoolStagingLeases(uuid_);
+  base_->ReleasePoolStagingLeases(uuid_);
 }
 
 void ReshardReceiveSession::ReleaseStaging() {

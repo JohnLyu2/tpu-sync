@@ -15,18 +15,22 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_STAGING_ARENA_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_STAGING_ARENA_H_
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/kv_cache/logical_block_manager.h"
 
 namespace tpu_raiden {
 
@@ -267,6 +271,110 @@ class StagingArena {
   std::deque<size_t> free_slots_ ABSL_GUARDED_BY(mu_);
   std::vector<bool> in_use_ ABSL_GUARDED_BY(mu_);
 };
+
+// Encapsulates host staging block allocation and release (both fixed slots
+// and on-demand dynamic host blocks) behind an RAII |Allocation| handle that
+// can be transferred into session classes.
+//
+// Fixed slots: `num_slots` slots of `max_blocks` host blocks each are
+// allocated and locked in |host_block_manager| up front; `Acquire()` hands
+// out whole slots.
+// Dynamic staging (`dynamic_host_staging`): no slots are reserved; each
+// `Acquire(num_blocks)` locks exactly |num_blocks| blocks in
+// |host_block_manager| and releases them on `Allocation` destruction.
+//
+// Thread-safe. |host_block_manager| must outlive the allocator; it may be
+// null, in which case only empty (`num_blocks <= 0`) acquisitions succeed.
+class StagingBlockAllocator {
+ public:
+  // RAII handle owning either a fixed staging slot or a set of dynamically
+  // allocated locked host blocks. Releases the resource automatically upon
+  // destruction or Reset().
+  class Allocation {
+   public:
+    Allocation() = default;
+    Allocation(std::nullptr_t) {}  // NOLINT(runtime/explicit)
+    Allocation(StagingBlockAllocator* allocator, int64_t slot_idx,
+               std::vector<int> block_ids);
+    Allocation(StagingBlockAllocator* allocator,
+               std::vector<int> dynamic_blocks);
+    Allocation(Allocation&& other) noexcept;
+    Allocation& operator=(Allocation&& other) noexcept;
+    Allocation(const Allocation&) = delete;
+    Allocation& operator=(const Allocation&) = delete;
+    ~Allocation();
+
+    // Releases any held slot or dynamic host blocks back to the allocator.
+    // Safe to call multiple times.
+    void Reset();
+
+    bool empty() const { return slot_idx_ < 0 && block_ids_.empty(); }
+    explicit operator bool() const { return !empty(); }
+    bool is_dynamic() const { return slot_idx_ < 0 && !block_ids_.empty(); }
+    int64_t slot_idx() const { return slot_idx_; }
+    absl::Span<const int> block_ids() const { return block_ids_; }
+
+   private:
+    StagingBlockAllocator* allocator_ = nullptr;
+    int64_t slot_idx_ = -1;
+    std::vector<int> block_ids_;
+  };
+
+  // Creates an allocator over |host_block_manager|. With |num_slots| and
+  // |max_blocks| both positive and fixed staging, reserves the slot pool
+  // eagerly and fails with `kFailedPrecondition` when |host_block_manager|
+  // lacks `num_slots * max_blocks` free blocks. |dynamic_host_staging|
+  // defaults to the `TPU_RAIDEN_DYNAMIC_HOST_STAGING=1` environment switch.
+  static absl::StatusOr<std::unique_ptr<StagingBlockAllocator>> Create(
+      kv_cache::LogicalBlockManager* host_block_manager, int64_t num_slots,
+      int64_t max_blocks,
+      std::optional<bool> dynamic_host_staging = std::nullopt);
+  ~StagingBlockAllocator();
+  StagingBlockAllocator(const StagingBlockAllocator&) = delete;
+  StagingBlockAllocator& operator=(const StagingBlockAllocator&) = delete;
+
+  // Acquires staging for |num_blocks| blocks: a fixed slot when
+  // !dynamic_host_staging_, or |num_blocks| locked dynamic host blocks when
+  // dynamic_host_staging_ is enabled. Returns an error if staging capacity is
+  // currently unavailable.
+  absl::StatusOr<Allocation> Acquire(int64_t num_blocks);
+
+  // Waits until |deadline| to acquire staging for |num_blocks| blocks. Returns
+  // an error if |num_blocks| exceeds capacity(), if Shutdown() is called, or if
+  // |deadline| expires before staging capacity becomes available.
+  absl::StatusOr<Allocation> AcquireWithTimeout(
+      int64_t num_blocks, std::chrono::steady_clock::time_point deadline);
+
+  // Signals shutdown to wake any threads waiting in AcquireWithTimeout().
+  void Shutdown();
+
+  size_t num_free_slots() const;
+  absl::Span<const int> slot_blocks(int64_t slot_idx) const;
+  int64_t num_slots() const { return num_slots_; }
+  int64_t max_blocks() const { return max_blocks_; }
+  int64_t capacity() const;
+  bool dynamic_host_staging() const { return dynamic_host_staging_; }
+
+ private:
+  StagingBlockAllocator(kv_cache::LogicalBlockManager* host_block_manager,
+                        int64_t num_slots, int64_t max_blocks,
+                        bool dynamic_host_staging);
+  absl::Status InitializeSlotPool();
+  absl::StatusOr<Allocation> AcquireLocked(int64_t num_blocks)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ReleaseSlot(int64_t slot_idx);
+  void ReleaseDynamicBlocks(absl::Span<const int> blocks);
+
+  mutable absl::Mutex mu_;
+  kv_cache::LogicalBlockManager* const host_block_manager_ = nullptr;
+  bool shutting_down_ ABSL_GUARDED_BY(mu_) = false;
+  const int64_t num_slots_ = 0;
+  const int64_t max_blocks_ = 0;
+  const bool dynamic_host_staging_ = false;
+  std::deque<int64_t> free_slots_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::vector<int>> slot_blocks_;
+};
+using StagingAllocation = StagingBlockAllocator::Allocation;
 
 }  // namespace tpu_raiden
 

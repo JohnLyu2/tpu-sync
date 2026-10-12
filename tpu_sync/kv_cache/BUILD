@@ -343,6 +343,7 @@ cc_library(
         "//tpu_sync/core:raiden_manager_base",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:staging_arena",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/core:tsl_platform_headers",
         "//tpu_sync/core:utils",

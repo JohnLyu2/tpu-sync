@@ -14,15 +14,26 @@
 
 #include "tpu_sync/core/staging_arena.h"
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/kv_cache/logical_block_manager.h"
 
 namespace tpu_raiden {
 
@@ -331,6 +342,248 @@ size_t StagingArena::in_use_count() const {
 size_t StagingArena::available_count() const {
   absl::MutexLock lock(mu_);
   return free_slots_.size();
+}
+
+// ---------------------------------------------------------------------------
+// StagingBlockAllocator
+// ---------------------------------------------------------------------------
+
+StagingBlockAllocator::Allocation::Allocation(StagingBlockAllocator* allocator,
+                                              int64_t slot_idx,
+                                              std::vector<int> block_ids)
+    : allocator_(allocator),
+      slot_idx_(slot_idx),
+      block_ids_(std::move(block_ids)) {}
+
+StagingBlockAllocator::Allocation::Allocation(StagingBlockAllocator* allocator,
+                                              std::vector<int> dynamic_blocks)
+    : allocator_(allocator), block_ids_(std::move(dynamic_blocks)) {}
+
+StagingBlockAllocator::Allocation::Allocation(Allocation&& other) noexcept
+    : allocator_(other.allocator_),
+      slot_idx_(other.slot_idx_),
+      block_ids_(std::move(other.block_ids_)) {
+  other.allocator_ = nullptr;
+  other.slot_idx_ = -1;
+  other.block_ids_.clear();
+}
+
+StagingBlockAllocator::Allocation& StagingBlockAllocator::Allocation::operator=(
+    Allocation&& other) noexcept {
+  if (this != &other) {
+    Reset();
+    allocator_ = other.allocator_;
+    slot_idx_ = other.slot_idx_;
+    block_ids_ = std::move(other.block_ids_);
+    other.allocator_ = nullptr;
+    other.slot_idx_ = -1;
+    other.block_ids_.clear();
+  }
+  return *this;
+}
+
+StagingBlockAllocator::Allocation::~Allocation() { Reset(); }
+
+void StagingBlockAllocator::Allocation::Reset() {
+  if (allocator_ != nullptr) {
+    if (slot_idx_ >= 0) {
+      allocator_->ReleaseSlot(slot_idx_);
+    } else if (!block_ids_.empty()) {
+      allocator_->ReleaseDynamicBlocks(block_ids_);
+    }
+  }
+  allocator_ = nullptr;
+  slot_idx_ = -1;
+  block_ids_.clear();
+}
+
+absl::StatusOr<std::unique_ptr<StagingBlockAllocator>>
+StagingBlockAllocator::Create(kv_cache::LogicalBlockManager* host_block_manager,
+                              int64_t num_slots, int64_t max_blocks,
+                              std::optional<bool> dynamic_host_staging) {
+  const char* raw_env = std::getenv("TPU_RAIDEN_DYNAMIC_HOST_STAGING");
+  const bool use_dynamic_staging = dynamic_host_staging.value_or(
+      raw_env != nullptr && std::string(raw_env) == "1");
+  std::unique_ptr<StagingBlockAllocator> allocator(new StagingBlockAllocator(
+      host_block_manager, num_slots, max_blocks, use_dynamic_staging));
+  if (num_slots > 0 && max_blocks > 0) {
+    ABSL_RETURN_IF_ERROR(allocator->InitializeSlotPool());
+  }
+  return allocator;
+}
+
+StagingBlockAllocator::StagingBlockAllocator(
+    kv_cache::LogicalBlockManager* host_block_manager, int64_t num_slots,
+    int64_t max_blocks, bool dynamic_host_staging)
+    : host_block_manager_(host_block_manager),
+      num_slots_(num_slots),
+      max_blocks_(max_blocks),
+      dynamic_host_staging_(dynamic_host_staging) {}
+
+StagingBlockAllocator::~StagingBlockAllocator() {
+  {
+    absl::MutexLock lock(mu_);
+    shutting_down_ = true;
+  }
+  if (host_block_manager_ != nullptr && !slot_blocks_.empty()) {
+    std::vector<int> blocks_to_unlock;
+    blocks_to_unlock.reserve(slot_blocks_.size() * max_blocks_);
+    for (const std::vector<int>& blocks : slot_blocks_) {
+      blocks_to_unlock.insert(blocks_to_unlock.end(), blocks.begin(),
+                              blocks.end());
+    }
+    (void)host_block_manager_->Unlock(blocks_to_unlock);
+  }
+}
+
+absl::Status StagingBlockAllocator::InitializeSlotPool() {
+  absl::MutexLock lock(mu_);
+  free_slots_.clear();
+  slot_blocks_.clear();
+  if (dynamic_host_staging_ || num_slots_ <= 0) {
+    return absl::OkStatus();
+  }
+  if (host_block_manager_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "Host block manager is null; cannot initialize staging slot pool");
+  }
+  if (host_block_manager_->num_free_blocks() < num_slots_ * max_blocks_) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Insufficient free host blocks to initialize slot pool. Required: ",
+        num_slots_ * max_blocks_,
+        ", Available: ", host_block_manager_->num_free_blocks()));
+  }
+  slot_blocks_.reserve(num_slots_);
+  for (int64_t i = 0; i < num_slots_; ++i) {
+    ABSL_ASSIGN_OR_RETURN(
+        std::vector<int> allocated_ids,
+        host_block_manager_->Allocate(max_blocks_, /*lock=*/true));
+    if (allocated_ids.size() != max_blocks_) {
+      return absl::InternalError(absl::StrCat(
+          "Slot pool allocation returned incorrect number of blocks: ",
+          allocated_ids.size(), ", expected: ", max_blocks_));
+    }
+    slot_blocks_.push_back(std::move(allocated_ids));
+    free_slots_.push_back(i);
+  }
+  return absl::OkStatus();
+}
+
+void StagingBlockAllocator::Shutdown() {
+  absl::MutexLock lock(mu_);
+  shutting_down_ = true;
+}
+
+absl::StatusOr<StagingBlockAllocator::Allocation>
+StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
+  if (num_blocks <= 0) {
+    return Allocation();
+  }
+  // The injected status is kInternal, which callers treat as non-retryable, so
+  // this exercises the fail-fast abort path rather than the staging retry loop.
+  ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kStagingAllocatorAcquire));
+  const int64_t cap = capacity();
+  if (num_blocks > cap) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Requested ", num_blocks, " blocks exceeds ",
+                     dynamic_host_staging_ ? "the host staging pool capacity ("
+                                           : "a staging slot capacity (",
+                     cap, ")"));
+  }
+  if (!dynamic_host_staging_) {
+    if (free_slots_.empty()) {
+      return absl::ResourceExhaustedError("No free staging slots available");
+    }
+    int64_t slot_idx = free_slots_.front();
+    free_slots_.pop_front();
+    return Allocation(this, slot_idx, slot_blocks_[slot_idx]);
+  }
+  if (host_block_manager_ == nullptr) {
+    return absl::FailedPreconditionError("Host block manager is null");
+  }
+  // Lock the pages so the pool's LRU cannot evict staging that is mid-flight.
+  // An allocation miss is only reported back; this helper neither retries
+  // nor logs. The producer retries it until its deadline, the consumer
+  // fails it at once, and each logs its own verdict.
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated,
+                        host_block_manager_->Allocate(
+                            static_cast<int>(num_blocks), /*lock=*/true));
+  return Allocation(this, std::move(allocated));
+}
+
+absl::StatusOr<StagingBlockAllocator::Allocation>
+StagingBlockAllocator::Acquire(int64_t num_blocks) {
+  absl::MutexLock lock(mu_);
+  return AcquireLocked(num_blocks);
+}
+
+absl::StatusOr<StagingBlockAllocator::Allocation>
+StagingBlockAllocator::AcquireWithTimeout(
+    int64_t num_blocks, std::chrono::steady_clock::time_point deadline) {
+  absl::MutexLock lock(mu_);
+  if (shutting_down_) {
+    return absl::CancelledError("StagingBlockAllocator is shutting down");
+  }
+  absl::StatusOr<Allocation> acquired = AcquireLocked(num_blocks);
+  if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
+    return acquired;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) {
+    return acquired;
+  }
+  auto can_proceed = [&]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+    if (shutting_down_) return true;
+    if (!dynamic_host_staging_) return !free_slots_.empty();
+    return host_block_manager_ != nullptr &&
+           host_block_manager_->num_free_blocks() >=
+               static_cast<size_t>(num_blocks);
+  };
+  const auto remaining_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
+          .count();
+  mu_.AwaitWithTimeout(absl::Condition(&can_proceed),
+                       absl::Nanoseconds(remaining_ns));
+  if (shutting_down_) {
+    return absl::CancelledError("StagingBlockAllocator is shutting down");
+  }
+  return AcquireLocked(num_blocks);
+}
+
+size_t StagingBlockAllocator::num_free_slots() const {
+  absl::MutexLock lock(mu_);
+  return free_slots_.size();
+}
+
+absl::Span<const int> StagingBlockAllocator::slot_blocks(
+    int64_t slot_idx) const {
+  return slot_blocks_[slot_idx];
+}
+
+int64_t StagingBlockAllocator::capacity() const {
+  if (dynamic_host_staging_) {
+    return host_block_manager_ != nullptr ? host_block_manager_->total_blocks()
+                                          : 0;
+  }
+  return max_blocks_;
+}
+
+void StagingBlockAllocator::ReleaseSlot(int64_t slot_idx) {
+  absl::MutexLock lock(mu_);
+  if (slot_idx < 0 || slot_idx >= num_slots_) {
+    return;
+  }
+  free_slots_.push_back(slot_idx);
+}
+
+void StagingBlockAllocator::ReleaseDynamicBlocks(absl::Span<const int> blocks) {
+  if (blocks.empty() || host_block_manager_ == nullptr) {
+    return;
+  }
+  absl::MutexLock lock(mu_);
+  std::vector<int> block_vec(blocks.begin(), blocks.end());
+  (void)host_block_manager_->Unlock(block_vec);
+  (void)host_block_manager_->Deallocate(block_vec);
 }
 
 }  // namespace tpu_raiden

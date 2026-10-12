@@ -219,8 +219,9 @@ absl::Status ReshardSendSession::ExecutePush(
     // full-mirror storages). Released in SettleLocked.
     if (const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);
         pool_spec != nullptr) {
-      absl::Status lease_status = staging_allocator_->AcquirePoolStagingLease(
-          uuid_, pool_spec->storage_index, pool_src_block_ids);
+      absl::Status lease_status = base_->AcquirePoolStagingLease(
+          uuid_, pool_spec->storage_index, pool_src_block_ids,
+          base_->pool_staging_lease_timeout());
       if (!lease_status.ok()) {
         RecordPushCompletion(manager, lease_status);
         EndOp();
@@ -432,7 +433,7 @@ void ReshardSendSession::EndOp() {
 void ReshardSendSession::ReleaseLeasesLocked() {
   if (leases_released_) return;
   leases_released_ = true;
-  staging_allocator_->ReleasePoolStagingLeases(uuid_);
+  base_->ReleasePoolStagingLeases(uuid_);
 }
 
 void ReshardSendSession::SettleLocked() {

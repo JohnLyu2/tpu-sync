@@ -149,7 +149,7 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   base.SetManualD2h(true);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
       &base, allocator.get(), "req1", /*uuid=*/42, /*block_ids=*/{0, 1},
@@ -181,7 +181,7 @@ TEST(TransferSendSessionTest,
      FinishingOneSendSessionDoesNotShutdownSharedStagingAllocator) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   // Session 1 completes a full send push and retires.
@@ -214,7 +214,7 @@ TEST(TransferSendSessionTest,
      CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/2);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/1, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   // Exhaust the only staging slot.
@@ -259,7 +259,7 @@ TEST(TransferSendSessionTest,
      FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
@@ -290,7 +290,7 @@ TEST(TransferSendSessionTest,
   base.SetManualD2h(true);
   base.SetManualH2h(true);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/1, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
@@ -349,7 +349,7 @@ TEST(TransferSendSessionTest,
   base.SetManualD2h(true);
   base.SetManualH2h(true);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/1, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
@@ -384,7 +384,7 @@ TEST(TransferSendSessionTest,
      ZeroLayerSessionCompletesAndReleasesStagingWithoutHang) {
   FakeSendBase base(/*num_layers=*/0, /*host_blocks=*/4);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
@@ -405,7 +405,7 @@ TEST(TransferSendSessionTest,
      InvalidStartPushArgumentsFailSessionImmediatelyWithoutHang) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
@@ -426,7 +426,7 @@ TEST(TransferSendSessionTest, StatusIsFrozenOnceSessionIsDrainingOrDone) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   base.SetManualD2h(true);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
@@ -458,7 +458,7 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   base.SetManualD2h(true);
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(

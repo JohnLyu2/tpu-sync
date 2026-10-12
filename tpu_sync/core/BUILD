@@ -125,10 +125,16 @@ cc_library(
     deps = [
         ":host_memory_allocator",
         ":xla_pjrt_headers",
+        "//tpu_sync/fault_injection:hooks",
+        "//tpu_sync/kv_cache:logical_block_manager",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -144,10 +150,14 @@ cc_test(
     deps = [
         ":host_memory_allocator",
         ":staging_arena",
+        ":tsl_platform_headers",
         ":xla_pjrt_headers",
+        "//tpu_sync/kv_cache:logical_block_manager",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",
     ],
 )

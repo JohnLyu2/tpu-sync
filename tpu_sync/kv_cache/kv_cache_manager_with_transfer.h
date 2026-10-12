@@ -19,7 +19,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,6 +37,7 @@
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
@@ -95,102 +95,14 @@ struct CopyPlan {
   bool RequiresHostReorder() const { return !host_dst_to_src.empty(); }
 };
 
-// Encapsulates host staging block allocation and release (both fixed slots
-// and on-demand dynamic host blocks) behind an RAII |Allocation| handle that
-// can be transferred into session classes.
-class StagingBlockAllocator {
- public:
-  // RAII handle owning either a fixed staging slot or a set of dynamically
-  // allocated locked host blocks. Releases the resource automatically upon
-  // destruction or Reset().
-  class Allocation {
-   public:
-    Allocation() = default;
-    Allocation(std::nullptr_t) {}  // NOLINT(runtime/explicit)
-    Allocation(StagingBlockAllocator* allocator, int64_t slot_idx,
-               std::vector<int> block_ids);
-    Allocation(StagingBlockAllocator* allocator,
-               std::vector<int> dynamic_blocks);
-    Allocation(Allocation&& other) noexcept;
-    Allocation& operator=(Allocation&& other) noexcept;
-    Allocation(const Allocation&) = delete;
-    Allocation& operator=(const Allocation&) = delete;
-    ~Allocation();
-
-    // Releases any held slot or dynamic host blocks back to the allocator.
-    // Safe to call multiple times.
-    void Reset();
-
-    bool empty() const { return slot_idx_ < 0 && block_ids_.empty(); }
-    explicit operator bool() const { return !empty(); }
-    bool is_dynamic() const { return slot_idx_ < 0 && !block_ids_.empty(); }
-    int64_t slot_idx() const { return slot_idx_; }
-    absl::Span<const int> block_ids() const { return block_ids_; }
-
-   private:
-    StagingBlockAllocator* allocator_ = nullptr;
-    int64_t slot_idx_ = -1;
-    std::vector<int> block_ids_;
-  };
-
-  static std::unique_ptr<StagingBlockAllocator> Create(
-      kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
-      std::optional<bool> dynamic_host_staging = std::nullopt);
-  ~StagingBlockAllocator();
-  StagingBlockAllocator(const StagingBlockAllocator&) = delete;
-  StagingBlockAllocator& operator=(const StagingBlockAllocator&) = delete;
-
-  // Acquires staging for |num_blocks| blocks: a fixed slot when
-  // !dynamic_host_staging_, or |num_blocks| locked dynamic host blocks when
-  // dynamic_host_staging_ is enabled. Returns an error if staging capacity is
-  // currently unavailable.
-  absl::StatusOr<Allocation> Acquire(int64_t num_blocks);
-
-  // Waits until |deadline| to acquire staging for |num_blocks| blocks. Returns
-  // an error if |num_blocks| exceeds capacity(), if Shutdown() is called, or if
-  // |deadline| expires before staging capacity becomes available.
-  absl::StatusOr<Allocation> AcquireWithTimeout(
-      int64_t num_blocks, std::chrono::steady_clock::time_point deadline);
-
-  // Signals shutdown to wake any threads waiting in AcquireWithTimeout().
-  void Shutdown();
-
-  // Leases bounded pool staging arena slots for |uuid| on |storage_index| for
-  // |device_block_ids| via |base_|.
-  absl::Status AcquirePoolStagingLease(
-      uint64_t uuid, size_t storage_index,
-      absl::Span<const int64_t> device_block_ids);
-
-  // Releases all bounded pool staging leases held by |uuid|.
-  void ReleasePoolStagingLeases(uint64_t uuid);
-
-  size_t num_free_slots() const;
-  absl::Span<const int> slot_blocks(int64_t slot_idx) const;
-  int64_t num_slots() const { return num_slots_; }
-  int64_t max_blocks() const { return max_blocks_; }
-  int64_t capacity() const;
-  bool dynamic_host_staging() const { return dynamic_host_staging_; }
-
- private:
-  StagingBlockAllocator(kv_cache::KVCacheManagerBase* base, int64_t num_slots,
-                        int64_t max_blocks, bool dynamic_host_staging);
-  absl::Status Initialize();
-  absl::Status InitializeSlotPool();
-  absl::StatusOr<Allocation> AcquireLocked(int64_t num_blocks)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void ReleaseSlot(int64_t slot_idx);
-  void ReleaseDynamicBlocks(absl::Span<const int> blocks);
-
-  mutable absl::Mutex mu_;
-  kv_cache::KVCacheManagerBase* const base_ = nullptr;
-  bool shutting_down_ ABSL_GUARDED_BY(mu_) = false;
-  const int64_t num_slots_ = 0;
-  const int64_t max_blocks_ = 0;
-  const bool dynamic_host_staging_ = false;
-  std::deque<int64_t> free_slots_ ABSL_GUARDED_BY(mu_);
-  std::vector<std::vector<int>> slot_blocks_;
-};
-using StagingAllocation = StagingBlockAllocator::Allocation;
+// Builds a `StagingBlockAllocator` over |base|'s host block manager. When
+// |num_slots| and |max_blocks| are both positive, also registers the slot
+// layout with |base| via `ConfigureHostStagingSlots()` so `HostSpan()` can
+// address the slots. Throws `std::runtime_error` if the slot pool cannot be
+// reserved (mirrors the constructor contract of `KVCacheManagerWithTransfer`).
+std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
+    kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
+    std::optional<bool> dynamic_host_staging = std::nullopt);
 
 class KVCacheManagerWithTransfer {
  public:
