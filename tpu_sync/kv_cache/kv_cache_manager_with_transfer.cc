@@ -703,9 +703,6 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
       std::shared_ptr<ReshardReceiveSession> recv_session,
       ReshardReceiveSession::Create(base_.get(), staging_allocator_.get(), plan,
                                     chip_block_ids, DeadlineFromNow()));
-
-  ABSL_RETURN_IF_ERROR(
-      base_->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false));
   {
     absl::MutexLock lock(mu_);
     active_pool_reshard_recvs_[plan.uuid()] = std::move(recv_session);

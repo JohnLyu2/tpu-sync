@@ -425,6 +425,7 @@ cc_test(
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
