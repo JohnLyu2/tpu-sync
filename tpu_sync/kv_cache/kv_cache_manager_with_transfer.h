@@ -176,6 +176,11 @@ class KVCacheManagerWithTransfer {
   kv_cache::KVCacheManagerBase* base() { return base_.get(); }
   const kv_cache::KVCacheManagerBase* base() const { return base_.get(); }
 
+  // Registers `block_ids` to be served when a consumer pulls `uuid`. Returns
+  // `uuid`, or 0 when there is nothing to send (`block_ids` is empty, or the
+  // consumer has already acknowledged the transfer). Throws
+  // `std::invalid_argument` if `block_ids` contains duplicate block IDs, and
+  // `std::runtime_error` if `uuid` already has an active registered read.
   virtual int64_t NotifyForRead(
       const std::string& req_id, uint64_t uuid,
       const std::vector<int64_t>& block_ids,

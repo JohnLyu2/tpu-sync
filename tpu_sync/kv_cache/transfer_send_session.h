@@ -150,10 +150,18 @@ class TransferSendSession
                       std::chrono::steady_clock::time_point deadline,
                       std::chrono::steady_clock::time_point register_start);
 
-  // Populates |registered_block_ids_| and |registered_block_set_| from
-  // |block_ids|. Returns the first duplicate block ID if any duplicate is
-  // present, or std::nullopt when all IDs are unique.
-  std::optional<int64_t> PopulateRegisteredBlocks(
+  // Describes a block ID that appears more than once in a single registration,
+  // along with the indices of its first two occurrences.
+  struct DuplicateBlock {
+    int64_t block_id;
+    size_t first_index;
+    size_t duplicate_index;
+  };
+
+  // Populates `registered_block_ids_` and `registered_block_set_` from
+  // `block_ids`. Returns the first duplicate block ID and its indices if any
+  // duplicate is present, or `std::nullopt` when all IDs are unique.
+  std::optional<DuplicateBlock> PopulateRegisteredBlocks(
       absl::Span<const int64_t> block_ids);
   void ValidateRequestedBlocksLocked(
       const std::vector<int64_t>& requested_block_ids) const

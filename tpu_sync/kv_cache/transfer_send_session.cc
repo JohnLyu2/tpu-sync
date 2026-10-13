@@ -70,12 +70,14 @@ TransferSendSession::Create(
   auto session = std::shared_ptr<TransferSendSession>(
       new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
                               deadline, register_start));
-  std::optional<int64_t> duplicate_block =
+  std::optional<DuplicateBlock> duplicate_block =
       session->PopulateRegisteredBlocks(block_ids);
   if (duplicate_block.has_value()) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "NotifyForRead rejected duplicate block ", *duplicate_block,
-        " for req_id=", session->req_id(), ", uuid=", uuid));
+        "NotifyForRead rejected duplicate block ", duplicate_block->block_id,
+        " for req_id=", session->req_id(), ", uuid=", uuid, ": positions ",
+        duplicate_block->first_index, " and ", duplicate_block->duplicate_index,
+        " of ", block_ids.size(), " blocks"));
   }
   return session;
 }
@@ -92,19 +94,24 @@ TransferSendSession::TransferSendSession(
       deadline_(deadline),
       register_start_(register_start) {}
 
-std::optional<int64_t> TransferSendSession::PopulateRegisteredBlocks(
+std::optional<TransferSendSession::DuplicateBlock>
+TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {
   absl::MutexLock lock(mu_);
   registered_num_blocks_ = static_cast<int64_t>(block_ids.size());
   registered_block_ids_.assign(block_ids.begin(), block_ids.end());
   registered_block_set_.clear();
-  std::optional<int64_t> duplicate_block;
-  for (int64_t block_id : block_ids) {
-    if (!registered_block_set_.insert(block_id).second) {
-      duplicate_block = block_id;
-    }
+  for (size_t i = 0; i < block_ids.size(); ++i) {
+    if (registered_block_set_.insert(block_ids[i]).second) continue;
+    size_t first_index = 0;
+    while (block_ids[first_index] != block_ids[i]) ++first_index;
+    return DuplicateBlock{
+        .block_id = block_ids[i],
+        .first_index = first_index,
+        .duplicate_index = i,
+    };
   }
-  return duplicate_block;
+  return std::nullopt;
 }
 
 void TransferSendSession::ValidateRequestedBlocksLocked(
