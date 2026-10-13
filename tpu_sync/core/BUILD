@@ -246,6 +246,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":tpu_utils",
+        ":xla_compat",
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/container:node_hash_map",
@@ -344,8 +345,10 @@ cc_library(
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
+        # buildcleaner: keep
         "//third_party/jax:raiden_jax_version",
     ],
 )
@@ -774,9 +777,13 @@ cc_test(
         ":host_memory_allocator",
         ":tpu_pjrt_manager",
         ":utils",
+        ":xla_compat",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings:str_format",
+        "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
         "@xla//xla/tsl/platform:test_main",
