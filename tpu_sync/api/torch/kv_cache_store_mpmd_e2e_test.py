@@ -153,8 +153,12 @@ def prepare_tpu_environment(world_size: int) -> None:
   os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
       [f"localhost:{p}" for p in ports]
   )
-  if "TORCH_TPU_TOPOLOGY" not in os.environ:
-    os.environ["TORCH_TPU_TOPOLOGY"] = get_tpu_topology(world_size)
+  # Reset per call, like the addresses above. Cases with different world
+  # sizes run in one process (4-rank cases sort before 8-rank ones), so a
+  # topology left behind by an earlier case describes the wrong number of
+  # HALs and the runtime rejects the address count ("Expected 4 worker
+  # addresses, got 8").
+  os.environ["TORCH_TPU_TOPOLOGY"] = get_tpu_topology(world_size)
 
 def worker_launch_cmd() -> list[str]:
   """The command prefix that re-enters this file as a worker rank.
