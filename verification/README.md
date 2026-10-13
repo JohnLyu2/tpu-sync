@@ -48,7 +48,10 @@ availability gap on that path (F5, no per-peer staging admission at
 `StartRead`) confirmed with the owners' own parked test and fixed by
 `findings/per_peer_staging_admission.patch`; four confirmed defects in the
 controller / KV-cache-store path, written up in
-[findings/](findings/README.md). F4 was fixed upstream in `72255dd`; the others are open as of `1fa06d1`.
+[findings/](findings/README.md), F4 fixed upstream in `72255dd` (PR #1105); and one
+memory-aliasing defect on the pool-reshard receive path (F6, a rejected duplicate
+`PoolReshardRegisterRecv` frees the active session's staging lease), filed
+2026-10-13 with a fix in preparation. The rest are open as of `1fa06d1`.
 
 ## Building
 

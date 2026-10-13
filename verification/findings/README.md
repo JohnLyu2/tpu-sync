@@ -61,8 +61,9 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
 | F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash | CONFIRMED (test) | only via the `ReadRemote` API (no in-tree caller) |
 | F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shape A; proved in Lean for shapes A and B | same |
 | F3 | Data race on `RemoteReadState::lease_id` | CONFIRMED (read) | same |
-| F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) at `50b0774`; **FIXED upstream** in `72255dd` | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
+| F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) at `50b0774`; **FIXED upstream** by PR #1105 = `72255dd` (2026-10-07) | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
 | F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix: `per_peer_staging_admission.patch`) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
+| F6 | `PoolReshardRegisterRecv`: a rejected duplicate (or racing) registration for an active `uuid` destroys a session object whose destructor releases the **active** session's host-staging lease ([filed](filed_bugs.md#2-poolreshardregisterrecv-duplicate-registration-frees-the-active-sessions-staging-lease-f6)) | CONFIRMED (read); reproduced by the reporter on a bounded-staging receiver, fix with regression tests in preparation | yes: any pool-reshard receiver with bounded host staging (`RegisterPools(..., staging_leases > 0)`), on a duplicate or concurrent register for the same `uuid` |
 
 ---
 
@@ -194,7 +195,8 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
 - **Status:** **CONFIRMED (test)** at `50b0774`, both halves; **FIXED upstream
   in `72255dd`** (2026-10-07, "Validate all workers before dispatching in
   `RaidenController::TransferBuffers` and release auto-allocated staging on
-  error", the shape proposed in PR #1105). At `1fa06d1` every worker is matched
+  error" = [PR #1105](https://github.com/google/tpu-sync/pull/1105), merged
+  via copybara). At `1fa06d1` every worker is matched
   (`raiden_controller.cc:702-740`) before staging is auto-allocated
   (`:772-784`) and before any request is built (`:787-803`; a build failure
   frees the staging at `:798`); dispatch starts at `:805` and has no early
@@ -250,8 +252,8 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
     not established.
 - **Fix:** the cleaner shape — resolve and match every worker *before*
   allocating or dispatching anything
-  ([google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105)) — is
-  what landed upstream as `72255dd`. The earlier `candidate_fixes.patch` hunk
+  ([google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105)) —
+  landed upstream as `72255dd` (the PR's copybara merge). The earlier `candidate_fixes.patch` hunk
   (route every error return through a helper that frees the staging after
   joining already-dispatched futures) was dropped from the patch on 2026-10-10.
 
@@ -369,6 +371,84 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
   a constructor / Python parameter. A self-sizing share (cap derived from the
   number of peers currently holding staging) is a natural follow-up and would
   need its own proof.
+
+---
+
+## F6. `PoolReshardRegisterRecv`: duplicate registration frees the active session's staging lease
+
+- **Status:** **CONFIRMED (read)** at `1fa06d1`; reproduced by the reporter
+  on a bounded-staging receiver (`RegisterPools(..., staging_leases=2)`),
+  output not pasted here. Found during the Lean formalization of the pool
+  reshard receive path. Filed upstream 2026-10-13 ([write-up](filed_bugs.md#2-poolreshardregisterrecv-duplicate-registration-frees-the-active-sessions-staging-lease-f6));
+  fix with regression tests to follow.
+- **Where:** two layers disagree about who owns a staging lease.
+  1. The per-storage lease table is keyed by `uuid` only, not by session
+     instance: `KVCacheManagerBase::AcquirePoolStagingLease`
+     (`kv_cache_manager_base.cc:2086-2143`) is idempotent per `uuid` — it
+     returns `OK` when `pool_staging_[s].leases[uuid]` already covers the
+     requested blocks (`:2095-2113`) — and `ReleasePoolStagingLeases(uuid)`
+     (`:2145-2161`) unconditionally erases `leases[uuid]` and returns all of
+     its slots to `free_slots` (`:2150-2156`). `StagingBlockAllocator`
+     forwards both (`kv_cache_manager_with_transfer.cc:1261-1275`).
+  2. `ReshardReceiveSession` is a per-call heap object that acquires staging
+     *before* `uuid` uniqueness is enforced. `PoolReshardRegisterRecv`
+     (`kv_cache_manager_with_transfer.cc:642-677`) checks
+     `active_pool_reshard_recvs_` under `mu_` (`:649-663`), but that table
+     only holds sessions whose registration already completed (`:672-675`).
+     `mu_` is released while `ReshardReceiveSession::Create`
+     (`reshard_receive_session.cc:351-377`) constructs the object (`:372-374`)
+     and calls `AcquireStagingLeases` (`:375` → `:407-444`), which sets
+     `staging_released_ = false` (`:419`) and leases per storage (`:437-438`,
+     possibly blocking on `staging_cv_` for free slots,
+     `kv_cache_manager_base.cc:2121-2130`) — all before
+     `RegisterActivePlanDirect(uuid)` claims the `uuid` in `active_plans_`
+     (`kv_cache_manager_with_transfer.cc:670-671`).
+     (`ReshardSendSession::Create` does it the other way round and claims the
+     `uuid` first, `reshard_send_session.cc:138-139`.)
+- **Sequence** (two `PoolReshardRegisterRecv` calls for the same `uuid = U`
+  overlapping in that window, or one call for a `U` already in
+  `active_plans_`):
+  1. Session S1 acquires `leases[U]`, `staging_released_ = false`.
+  2. Session S2, a distinct object for the same `U`, also passes `Create`:
+     `AcquirePoolStagingLease(U)` finds `leases[U]` populated and returns
+     `OK`; S2 sets `staging_released_ = false`.
+  3. S2 is rejected: `RegisterActivePlanDirect(U)` returns `ALREADY_EXISTS`.
+  4. S2 goes out of scope: `~ReshardReceiveSession` → `ReleaseStaging()`
+     (`reshard_receive_session.h:67`, `.cc:446-455`) →
+     `ReleasePoolStagingLeases(U)` erases `leases[U]` and frees S1's slots
+     while S1 is still active.
+- **Impact:**
+  - the active session fails: incoming pushes for `U` can no longer resolve
+    their host staging buffer (`GetBlockChunks(uuid = U)` returns no chunks);
+  - **silent host-buffer aliasing:** `U`'s physical slots are back in
+    `free_slots`, so the next transfer `U2` is leased the same host memory
+    while `U` is still active, with no error raised.
+- **Reachability:** production path, every bounded-staging pool-reshard
+  receiver. Trigger: a duplicate `PoolReshardRegisterRecv` (coordinator retry)
+  for an active `uuid`, or two concurrent registrations for the same `uuid`
+  while both wait on staging slots — one returns `OK`, the loser returns
+  `ALREADY_EXISTS` and its destructor erases the winner's lease.
+- **Reporter's observations** (bounded receiver with `staging_leases=2`):
+  with `uuid=4001` holding a lease and registered in `active_plans_`, a
+  rejected `PoolReshardRegisterRecv(4001)` moves `free_slots` from 1 back to
+  2, `GetBlockChunks(uuid=4001)` returns 0 chunks, and a following
+  `PoolReshardRegisterRecv(4002)` receives the same physical slot pointer as
+  `4001`; with two threads calling `PoolReshardRegisterRecv(4001)`
+  concurrently while waiting on slots, one returns `OK`, one
+  `ALREADY_EXISTS`, and `free_slots` becomes 2 with `GetBlockChunks(4001)`
+  empty.
+- **Fix (proposed, in preparation):** claim the `uuid` via
+  `RegisterActivePlanDirect` in `ReshardReceiveSession::Create` before
+  constructing the session and acquiring staging, rolling back with
+  `UnregisterActivePlanDirect` if `AcquireStagingLeases` fails — the order
+  `ReshardSendSession::Create` already uses.
+- **Lean:** the pool-reshard path is outside the prefill-to-decode model
+  (`docs/transfer/prefill_decode.md` §Boundaries, row 1); `Transfer/Session.lean`
+  covers only the per-session settle protocol, whose `hasStaging` token is
+  per *instance* — exactly the property the shared `uuid`-keyed lease table
+  breaks. A `UuidTable`-style model of `active_plans_` + `pool_staging_`
+  would make this a one-step counterexample (`registerRecv` of a live uuid
+  followed by the loser's `release`); not written.
 
 ---
 
@@ -508,7 +588,7 @@ clone reset. Results, verbatim:
   allocator, the test is still `DISABLED_`, and no issue or PR proposes a
   per-peer cap.
 - 2026-10-10: upstream `1fa06d1` (38 commits past `50b0774`). **F4 fixed
-  upstream** by `72255dd` (2026-10-07; the PR #1105 shape, three new tests);
+  upstream** by `72255dd` (2026-10-07; PR #1105 merged via copybara, three new tests);
   its hunk dropped from `candidate_fixes.patch`. F1, F2, F3, F5 unchanged
   (`kv_cache_store.cc` F1 regions moved +6 since `50b0774`; `ReadRemote` region of
   `raiden_controller.cc` moved +35, byte-identical; `StartRead` admission and
@@ -516,3 +596,10 @@ clone reset. Results, verbatim:
   still disabled). Sessions and manager moved to `tpu_sync/kv_cache/`
   (`5afe1ef`); `per_peer_staging_admission.patch` re-based onto the new paths,
   all three patches apply cleanly. Tests not re-run.
+- 2026-10-13: F6 added (pool-reshard receiver: a rejected duplicate
+  `PoolReshardRegisterRecv` destroys a session whose destructor releases the
+  active session's `uuid`-keyed staging lease), read-confirmed at `1fa06d1`
+  and reproduced by the reporter; filed upstream, fix with regression tests
+  to follow. Upstream `main` checked 10 commits past `1fa06d1`: no fix yet;
+  `fc8cff9` moves `StagingBlockAllocator` to `tpu_sync/core/staging_arena.h`
+  (re-pin note for the next sync).
