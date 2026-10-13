@@ -20,17 +20,21 @@
 #include <cstdint>
 #include <future>  // NOLINT(build/c++11)
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
@@ -93,11 +97,8 @@ class TransferReceiveSession
 
   absl::Status AwaitForDone() override;
 
-  // When Done() became true. Meaningless before then.
-  std::chrono::steady_clock::time_point CompletedAt() const {
-    absl::MutexLock lock(mu_);
-    return completed_at_;
-  }
+  // Returns transfer completion and failure details. Only valid after Done().
+  TransferDetails Details() const;
 
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
@@ -228,7 +229,16 @@ class TransferReceiveSession
       std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishLocked(const absl::Status& status = absl::OkStatus())
+  // Transitions the session into draining/completed state. If |status| is
+  // non-OK and this is the first failure, records |status| and attributes the
+  // failure to |phase| (or infers the current phase via CurrentPhaseLocked()
+  // if |phase| is omitted).
+  void FinishLocked(const absl::Status& status = absl::OkStatus(),
+                    std::optional<absl::string_view> phase = std::nullopt)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Returns the earliest execution phase of this receive still in progress,
+  // as named in TransferDetails::phase.
+  absl::string_view CurrentPhaseLocked() const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
@@ -269,6 +279,14 @@ class TransferReceiveSession
   bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
+  // The transfer phase in which the receive failed; populated when `status_` is
+  // set to a non-OK status.
+  absl::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
+  // True while a pulled receive is waiting for the producer to accept its pull
+  // request.
+  bool handshake_pending_ ABSL_GUARDED_BY(mu_) = false;
+  // The producer control endpoint to which a pulled receive sent its request.
+  std::string peer_endpoint_ ABSL_GUARDED_BY(mu_);
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);

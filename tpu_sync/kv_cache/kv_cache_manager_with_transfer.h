@@ -31,6 +31,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/control_plane_backend.h"
@@ -61,7 +62,22 @@ struct TransferDetails {
   // When the transfer completed, in steady_clock nanoseconds: CLOCK_MONOTONIC,
   // the clock of Python's time.perf_counter_ns().
   std::optional<int64_t> completed_ns;
+  // Duration from transfer registration until settlement, in nanoseconds.
+  std::optional<int64_t> elapsed_ns;
+  // Comma-separated remote peer endpoints.
+  std::optional<std::string> peer;
+  // Canonical absl::StatusCode name (e.g. "DEADLINE_EXCEEDED") and error
+  // message when the transfer failed; unset if it succeeded.
+  std::optional<std::string> code;
+  std::optional<std::string> reason;
+  // Execution phase in which a failed transfer failed: "await_pull", "staging",
+  // "d2h", or "push" for a send; "connect", "receive", or "h2d" for a receive.
+  std::optional<std::string> phase;
 };
+
+// Populates `TransferDetails` with the status code and error message if
+// |status| is non-OK, or returns an empty `TransferDetails` on success.
+TransferDetails DetailsFromStatus(const absl::Status& status);
 
 // Result of CompleteReadWithDetails(): transfers settled since the previous
 // poll.
@@ -69,8 +85,9 @@ struct CompleteReadResult {
   std::vector<std::string> sent;
   std::vector<std::string> received;
   std::vector<std::string> failed;
-  // Details of settled transfers, by req_id. Only transfer send and receive
-  // sessions record details; other settled req_ids have no entry.
+  // Details of settled transfers, by req_id: recorded for every failed transfer
+  // and for every settled transfer send or receive session. Other settled
+  // req_ids have no entry.
   absl::flat_hash_map<std::string, TransferDetails> details;
 };
 

@@ -637,6 +637,14 @@ NB_MODULE(_tpu_raiden_torch, m) {
                nb::gil_scoped_release release;
                return self.CompleteReadWithDetails();
              }();
+             // Error messages may contain raw bytes from a remote peer. Because
+             // completion reports have already been drained, escape invalid
+             // UTF-8 sequences rather than raising UnicodeDecodeError.
+             auto to_py_str = [](const std::string& str) {
+               return nb::steal<nb::str>(PyUnicode_DecodeUTF8(
+                   str.data(), static_cast<Py_ssize_t>(str.size()),
+                   "backslashreplace"));
+             };
              // {req_id: {field: value}}, with unset fields omitted, so a new
              // TransferDetails field needs only one more line here.
              nb::dict details;
@@ -644,6 +652,21 @@ NB_MODULE(_tpu_raiden_torch, m) {
                nb::dict fields;
                if (detail.completed_ns.has_value()) {
                  fields["completed_ns"] = *detail.completed_ns;
+               }
+               if (detail.elapsed_ns.has_value()) {
+                 fields["elapsed_ns"] = *detail.elapsed_ns;
+               }
+               if (detail.peer.has_value()) {
+                 fields["peer"] = to_py_str(*detail.peer);
+               }
+               if (detail.code.has_value()) {
+                 fields["code"] = to_py_str(*detail.code);
+               }
+               if (detail.reason.has_value()) {
+                 fields["reason"] = to_py_str(*detail.reason);
+               }
+               if (detail.phase.has_value()) {
+                 fields["phase"] = to_py_str(*detail.phase);
                }
                details[nb::str(req_id.data(), req_id.size())] = fields;
              }

@@ -22,16 +22,18 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
@@ -75,11 +77,9 @@ class TransferSendSession
 
   absl::Status AwaitForDone() override;
 
-  // When Done() became true. Meaningless before then.
-  std::chrono::steady_clock::time_point CompletedAt() const {
-    absl::MutexLock lock(mu_);
-    return completed_at_;
-  }
+  // Returns summary metadata and failure diagnostics for this send session.
+  // Only meaningful after `Done()` returns true.
+  TransferDetails Details() const;
 
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
@@ -160,7 +160,15 @@ class TransferSendSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseStagingBlocks();
   void ReleaseStagingBlocksLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishLocked(const absl::Status& status = absl::OkStatus())
+  // Marks the session as draining with `status`. If `status` is not OK,
+  // attributes the failure to `phase` if provided, or else to the earliest
+  // step still running (see `CurrentPhaseLocked()`).
+  void FinishLocked(const absl::Status& status = absl::OkStatus(),
+                    std::optional<absl::string_view> phase = std::nullopt)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Returns the earliest step of this send still running, as named in
+  // `TransferDetails::phase`.
+  absl::string_view CurrentPhaseLocked() const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status AcquireStagingWithRetry(int64_t num_blocks);
@@ -181,6 +189,9 @@ class TransferSendSession
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);
+  // The transfer phase in which the send failed; populated when `status_` is
+  // set to a non-OK status.
+  absl::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.
@@ -191,6 +202,7 @@ class TransferSendSession
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
+  // The consumer's data endpoints, populated once `StartPush` serves its pull.
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);

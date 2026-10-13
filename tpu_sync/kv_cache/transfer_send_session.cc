@@ -33,16 +33,29 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
+
+namespace {
+
+// The steps of a send, as named in `TransferDetails::phase`.
+constexpr absl::string_view kAwaitPullPhase = "await_pull";
+constexpr absl::string_view kStagingPhase = "staging";
+constexpr absl::string_view kD2hPhase = "d2h";
+constexpr absl::string_view kPushPhase = "push";
+
+}  // namespace
 
 absl::StatusOr<std::shared_ptr<TransferSendSession>>
 TransferSendSession::Create(
@@ -164,9 +177,13 @@ void TransferSendSession::ReleaseStagingBlocks() {
   ReleaseStagingBlocksLocked();
 }
 
-void TransferSendSession::FinishLocked(const absl::Status& status) {
+void TransferSendSession::FinishLocked(const absl::Status& status,
+                                       std::optional<absl::string_view> phase) {
   if (draining_ || done_) return;
   status_ = status;
+  if (!status.ok()) {
+    failed_phase_ = phase.has_value() ? *phase : CurrentPhaseLocked();
+  }
   draining_ = true;
   if (in_flight_ == 0) {
     ReleaseStagingBlocksLocked();
@@ -184,6 +201,34 @@ absl::Status TransferSendSession::AwaitForDone() {
   absl::MutexLock lock(mu_);
   mu_.Await(absl::Condition(&done_));
   return status_;
+}
+
+TransferDetails TransferSendSession::Details() const {
+  absl::MutexLock lock(mu_);
+  TransferDetails details = DetailsFromStatus(status_);
+  details.completed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             completed_at_.time_since_epoch())
+                             .count();
+  details.elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           completed_at_ - register_start_)
+                           .count();
+  if (!remote_data_endpoints_.empty()) {
+    details.peer = absl::StrJoin(remote_data_endpoints_, ",");
+  }
+  if (!status_.ok()) {
+    details.phase = std::string(failed_phase_);
+  }
+  return details;
+}
+
+absl::string_view TransferSendSession::CurrentPhaseLocked() const {
+  if (remote_data_endpoints_.empty()) return kAwaitPullPhase;
+  if (staging_.empty()) return kStagingPhase;
+  if (d2h_layer_futures_.size() < base_->num_layers()) return kD2hPhase;
+  for (const raiden::PjRtCopyFuture& future : d2h_layer_futures_) {
+    if (!future.IsReady()) return kD2hPhase;
+  }
+  return kPushPhase;
 }
 
 void TransferSendSession::EndSendOpLocked() {
@@ -284,6 +329,10 @@ void TransferSendSession::StartPush(
         absl::StrCat("Invalid StartPush arguments for uuid=", uuid_)));
     return;
   }
+  {
+    absl::MutexLock lock(mu_);
+    remote_data_endpoints_ = remote_data_endpoints;
+  }
 
   absl::Status acquire_status =
       AcquireStagingWithRetry(static_cast<int64_t>(src_block_ids.size()));
@@ -307,7 +356,6 @@ void TransferSendSession::StartPush(
     host_block_ids.assign(blocks.begin(),
                           blocks.begin() + src_block_ids.size());
     d2h_layer_futures_.reserve(total_layers);
-    remote_data_endpoints_ = remote_data_endpoints;
     src_ints_.assign(host_block_ids.begin(), host_block_ids.end());
     dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
   }
@@ -393,7 +441,8 @@ void TransferSendSession::SendNextLayer(size_t l) {
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
-      self->Finish(status_or.status());
+      absl::MutexLock lock(self->mu_);
+      self->FinishLocked(status_or.status(), kD2hPhase);
       return;
     }
     {
@@ -431,7 +480,8 @@ void TransferSendSession::SendNextLayer(size_t l) {
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();
-              self->Finish(push_res.status());
+              absl::MutexLock lock(self->mu_);
+              self->FinishLocked(push_res.status(), kPushPhase);
               return;
             }
 

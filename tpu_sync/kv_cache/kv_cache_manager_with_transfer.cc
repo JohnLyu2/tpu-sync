@@ -33,7 +33,6 @@
 #include <utility>
 #include <vector>
 
-#include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -43,6 +42,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -53,6 +53,7 @@
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/reshard_receive_session.h"
@@ -113,13 +114,38 @@ double DurationMs(std::chrono::steady_clock::time_point start,
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-int64_t SteadyNs(std::chrono::steady_clock::time_point t) {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             t.time_since_epoch())
-      .count();
+// Formats a single-line summary of why transfer |req_id| failed for logging.
+std::string DescribeFailure(absl::string_view req_id,
+                            const TransferDetails& details) {
+  std::string line = absl::StrCat("Transfer failed: req_id=", req_id);
+  if (details.code.has_value()) {
+    absl::StrAppend(&line, " code=", *details.code);
+  }
+  if (details.phase.has_value()) {
+    absl::StrAppend(&line, " phase=", *details.phase);
+  }
+  if (details.peer.has_value()) {
+    absl::StrAppend(&line, " peer=", *details.peer);
+  }
+  if (details.elapsed_ns.has_value()) {
+    absl::StrAppend(&line, " elapsed_ms=", *details.elapsed_ns / 1e6);
+  }
+  if (details.reason.has_value()) {
+    absl::StrAppend(&line, " reason=", *details.reason);
+  }
+  return line;
 }
 
 }  // namespace
+
+TransferDetails DetailsFromStatus(const absl::Status& status) {
+  TransferDetails details;
+  if (!status.ok()) {
+    details.code = absl::StatusCodeToString(status.code());
+    details.reason = std::string(status.message());
+  }
+  return details;
+}
 
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
@@ -482,6 +508,7 @@ absl::Status KVCacheManagerWithTransfer::EmplaceRecvSessionLocked(
   if (existing != active_recv_sessions_.end() && existing->second->Done()) {
     (!existing->second->GetStatus().ok() ? failed_recving_ : done_recving_)
         .insert(existing->second->req_id());
+    transfer_details_[existing->second->req_id()] = existing->second->Details();
     active_recv_sessions_.erase(existing);
   }
   // try_emplace leaves session untouched on a duplicate. Callers rely on that
@@ -618,6 +645,10 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
       if (existing->second->Done()) {
         (!existing->second->GetStatus().ok() ? failed_recving_ : done_sending_)
             .insert(existing->second->req_id());
+        if (!existing->second->GetStatus().ok()) {
+          transfer_details_[existing->second->req_id()] =
+              DetailsFromStatus(existing->second->GetStatus());
+        }
         active_pool_reshard_sends_.erase(existing);
       } else {
         return absl::AlreadyExistsError(absl::StrCat(
@@ -654,6 +685,10 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
         (!existing_reshard->second->GetStatus().ok() ? failed_recving_
                                                      : done_recving_)
             .insert(existing_reshard->second->req_id());
+        if (!existing_reshard->second->GetStatus().ok()) {
+          transfer_details_[existing_reshard->second->req_id()] =
+              DetailsFromStatus(existing_reshard->second->GetStatus());
+        }
         active_pool_reshard_recvs_.erase(existing_reshard);
       } else {
         return absl::AlreadyExistsError(absl::StrCat(
@@ -849,6 +884,8 @@ void KVCacheManagerWithTransfer::StartRead(
       if (incumbent->second->Done()) {
         (!incumbent->second->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(incumbent->second->req_id());
+        transfer_details_[incumbent->second->req_id()] =
+            incumbent->second->Details();
         active_recv_sessions_.erase(incumbent);
       } else {
         LOG(ERROR) << "StartRead rejected duplicate uuid=" << uuid
@@ -857,6 +894,10 @@ void KVCacheManagerWithTransfer::StartRead(
         // remains responsible for producing this request's one terminal report.
         if (incumbent->second->req_id() != req_id) {
           failed_recving_.insert(req_id);
+          transfer_details_[req_id] =
+              DetailsFromStatus(absl::AlreadyExistsError(absl::StrCat(
+                  "StartRead rejected duplicate uuid=", uuid,
+                  ", already receiving req_id=", incumbent->second->req_id())));
         }
         return;
       }
@@ -869,6 +910,7 @@ void KVCacheManagerWithTransfer::StartRead(
                                        effective_deadline);
     if (!created.ok()) {
       failed_recving_.insert(req_id);
+      transfer_details_[req_id] = DetailsFromStatus(created.status());
       return;
     }
     session = *std::move(created);
@@ -877,6 +919,7 @@ void KVCacheManagerWithTransfer::StartRead(
     if (!inserted.ok()) {
       session->ReleaseStaging();
       failed_recving_.insert(req_id);
+      transfer_details_[req_id] = DetailsFromStatus(inserted);
       LOG(ERROR) << "StartRead failed to register req_id=" << req_id
                  << ", uuid=" << uuid << ": " << inserted.message();
       return;
@@ -928,8 +971,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
       if (session->Done()) {
         const bool failed = !session->GetStatus().ok();
         (failed ? failed_recving_ : done_sending_).insert(session->req_id());
-        transfer_details_[session->req_id()].completed_ns =
-            SteadyNs(session->CompletedAt());
+        transfer_details_[session->req_id()] = session->Details();
         if (failed) {
           settled_plans.emplace_back(uuid, 0);
         }
@@ -950,6 +992,8 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
         const bool failed = !session->GetStatus().ok();
         (failed ? failed_recving_ : done_sending_).insert(session->req_id());
         if (failed) {
+          transfer_details_[session->req_id()] =
+              DetailsFromStatus(session->GetStatus());
           settled_plans.emplace_back(it->first, 0);
         }
         active_pool_reshard_sends_.erase(it++);
@@ -983,8 +1027,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
       if (session->Done()) {
         (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(session->req_id());
-        transfer_details_[session->req_id()].completed_ns =
-            SteadyNs(session->CompletedAt());
+        transfer_details_[session->req_id()] = session->Details();
         uint64_t generation = 0;
         if (session->TakePendingUnregister(&generation)) {
           settled_plans.emplace_back(uuid, generation);
@@ -1012,6 +1055,10 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
       if (session->Done()) {
         (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(session->req_id());
+        if (!session->GetStatus().ok()) {
+          transfer_details_[session->req_id()] =
+              DetailsFromStatus(session->GetStatus());
+        }
         uint64_t generation = 0;
         if (session->TakePendingUnregister(&generation)) {
           settled_plans.emplace_back(uuid, generation);
@@ -1036,6 +1083,12 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
     // A settled (completed or timed-out) pool-reshard sender/receiver may
     // still hold bounded-staging arena slots.
     base_->ReleasePoolStagingLeases(uuid);
+  }
+  for (const std::string& req_id : completions.failed) {
+    auto details_it = completions.details.find(req_id);
+    LOG(WARNING) << DescribeFailure(
+        req_id, details_it != completions.details.end() ? details_it->second
+                                                        : TransferDetails{});
   }
   return completions;
 }
