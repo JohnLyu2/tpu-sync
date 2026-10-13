@@ -15,6 +15,7 @@
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -41,6 +42,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -93,6 +95,41 @@ bool SlicesAreDirectIOAligned(absl::Span<const HostBufferDescriptor> slices) {
   return true;
 }
 
+// --- Temporary file naming ---
+
+namespace {
+
+// Drawn once per process from OS entropy. A forked child inherits it, which
+// is why callers also mix in getpid().
+uint64_t ProcessTempNonce() {
+  static const uint64_t nonce = [] {
+    absl::BitGen gen;
+    return absl::Uniform<uint64_t>(gen);
+  }();
+  return nonce;
+}
+
+// "<prefix><pid>_<nonce>_<seq>", unique across processes and hosts. The
+// counter is stricter than a thread id (those get recycled once a thread
+// exits) and keeps successive calls from one thread apart.
+std::string UniqueSuffix(absl::string_view prefix) {
+  static std::atomic<uint64_t> seq{0};
+  return absl::StrCat(prefix, getpid(), "_",
+                      absl::Hex(ProcessTempNonce(), absl::kZeroPad16), "_",
+                      seq.fetch_add(1, std::memory_order_relaxed));
+}
+
+}  // namespace
+
+std::string MakeTempPath(absl::string_view final_path) {
+  // Same directory as the final path: rename(2) is only atomic within a
+  // filesystem, and staying in the leaf directory also keeps the temp file
+  // out of any other directory's listings.
+  const absl::string_view dir = PosixPathMapper::GetParentDir(final_path);
+  return absl::StrCat(dir.empty() ? absl::string_view(".") : dir, "/",
+                      UniqueSuffix(".tmp_"));
+}
+
 // --- PosixKVBackend Implementation ---
 
 PosixKVBackend::PosixKVBackend(
@@ -127,14 +164,14 @@ PosixKVBackend::PosixKVBackend(
 }
 
 bool PosixKVBackend::ProbeDirectIO(absl::string_view dir) {
-  static std::atomic<uint64_t> probe_seq{0};
+  // Same uniqueness scheme as write temp files: several hosts may probe one
+  // shared directory at the same time.
   std::string probe_path =
-      absl::StrCat(dir, "/.o_direct_probe_", getpid(), "_",
-                   probe_seq.fetch_add(1, std::memory_order_relaxed));
+      absl::StrCat(dir, "/", UniqueSuffix(".o_direct_probe_"));
   std::error_code ec;
   fs::create_directories(std::string(dir), ec);
 
-  int fd = open(probe_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+  int fd = open(probe_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_DIRECT, 0644);
   if (fd < 0) {
     LOG(WARNING) << "PosixKVBackend: O_DIRECT probe open failed on '" << dir
                  << "' (errno: " << errno << " - " << strerror(errno) << ")";
@@ -204,15 +241,13 @@ void PosixKVBackend::WriteAsync(const BlockKey& key,
     // the final path, which is a permanent phantom hit that fails every
     // future recall with DataLossError.
     //
-    // The suffix keeps the temp file in the SAME directory as the final
-    // path, because rename(2) is only atomic within a filesystem. The
-    // pid distinguishes processes; the counter distinguishes threads and
-    // successive writes within one process, which is stricter than a
-    // thread id (those get recycled once a thread exits).
-    static std::atomic<uint64_t> tmp_seq{0};
-    const std::string tmp_path =
-        absl::StrCat(key.resolved_key, ".tmp_", getpid(), "_",
-                     tmp_seq.fetch_add(1, std::memory_order_relaxed));
+    // The temp name (see MakeTempPath) stays in the final file's directory
+    // and is unique across hosts: engines on different hosts sharing one
+    // storage directory can have equal pids and counters, and with a
+    // pid+counter name they would open the same temp file, interleave their
+    // writes, and fail or corrupt the publish. It does not embed the hash,
+    // so its length is independent of the key.
+    const std::string tmp_path = MakeTempPath(key.resolved_key);
 
     // With direct_io there is no buffered fallback: a misaligned buffer fails
     // the operation before any file is created.
@@ -224,8 +259,10 @@ void PosixKVBackend::WriteAsync(const BlockKey& key,
             DirectIOAlignment(), " bytes for O_DIRECT")));
       return;
     }
+    // O_EXCL: the temp name is unique by construction, so an existing file
+    // there is another writer's. Fail rather than share its inode.
     const int open_flags =
-        O_WRONLY | O_CREAT | O_TRUNC | (direct_io_supported ? O_DIRECT : 0);
+        O_WRONLY | O_CREAT | O_EXCL | (direct_io_supported ? O_DIRECT : 0);
 
     int fd = open(tmp_path.c_str(), open_flags, 0644);
     if (fd < 0 && errno == ENOENT) {
@@ -596,6 +633,15 @@ absl::StatusOr<PosixBackendOptions> PosixBackendOptions::FromProperties(
   };
   str("root_dir", &options.root_dir);
   str("model_name", &options.model_name);
+  // The sanitized model name is one directory component. Sanitizing only
+  // replaces characters, so an over-long name would otherwise fail every
+  // write with ENAMETOOLONG once the directory is created.
+  if (const size_t len = SanitizeModelName(options.model_name).size();
+      len > NAME_MAX) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("model_name sanitizes to ", len,
+                     " characters; the limit is ", NAME_MAX, " (NAME_MAX)"));
+  }
   ParallelismConfig parallelism;
   int64_t capacity = 0;
   int64_t batch = options.lookup_batch_size;

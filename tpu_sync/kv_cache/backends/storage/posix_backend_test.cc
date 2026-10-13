@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <limits.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <thread>  // NOLINT(build/c++11)
@@ -45,6 +46,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
@@ -1243,6 +1245,185 @@ TEST_F(PosixBackendTest, PosixKVBackendWriteRejectsNonZeroOffset) {
   // deterministic: the pool thread is free to finish before the main thread
   // gets that far, so the notification check could pass by luck.
   EXPECT_NE(callback_thread, caller_thread);
+}
+
+// ---------------------------------------------------------------------------
+// Temp-file naming: bounded length and uniqueness across hosts.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Runs one WriteAsync of `data` to `key` and returns its status.
+absl::Status WriteBlock(PosixKVBackend& backend, const BlockKey& key,
+                        absl::Span<const uint8_t> data) {
+  // HostBufferDescriptor::ptr is void*; WriteAsync only reads through it.
+  HostBufferDescriptor src{.ptr = const_cast<uint8_t*>(data.data()),
+                           .size = data.size()};
+  absl::Notification done;
+  absl::Status status;
+  backend.WriteAsync(key, {src}, data.size(), [&](absl::Status s) {
+    status = s;
+    done.Notify();
+  });
+  done.WaitForNotification();
+  return status;
+}
+
+// Names under `dir` that contain `marker`.
+std::vector<std::string> EntriesContaining(const fs::path& dir,
+                                           absl::string_view marker) {
+  std::vector<std::string> found;
+  if (!fs::exists(dir)) return found;
+  for (const auto& entry : fs::directory_iterator(dir)) {
+    const std::string name = entry.path().filename().string();
+    if (absl::StrContains(name, marker)) found.push_back(name);
+  }
+  return found;
+}
+
+}  // namespace
+
+TEST(MakeTempPathTest, SameDirectoryShortAndMarked) {
+  // A final name at the hash cap is 254 characters; the temp name must not
+  // grow with it, or it crosses NAME_MAX.
+  const std::string final_path = absl::StrCat(
+      "/some/root/model/tp1_r0/abc/de/", std::string(2 * kMaxBlockHashBytes, 'f'),
+      ".bin");
+  ASSERT_EQ(fs::path(final_path).filename().string().size(), NAME_MAX - 1);
+
+  const std::string tmp = MakeTempPath(final_path);
+  EXPECT_EQ(fs::path(tmp).parent_path(), fs::path(final_path).parent_path());
+  const std::string base = fs::path(tmp).filename().string();
+  EXPECT_TRUE(absl::StartsWith(base, ".tmp_")) << base;
+  EXPECT_LT(base.size(), 60) << base;
+  // "<pid>_<16 hex nonce>_<seq>" after the marker.
+  const std::vector<std::string> parts =
+      absl::StrSplit(absl::StripPrefix(base, ".tmp_"), '_');
+  ASSERT_EQ(parts.size(), 3) << base;
+  EXPECT_EQ(parts[0], absl::StrCat(getpid()));
+  EXPECT_EQ(parts[1].size(), 16) << base;
+}
+
+TEST(MakeTempPathTest, UniqueAcrossThreads) {
+  constexpr int kThreads = 8;
+  constexpr int kPerThread = 10000;
+  std::vector<std::vector<std::string>> per_thread(kThreads);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      per_thread[t].reserve(kPerThread);
+      for (int i = 0; i < kPerThread; ++i) {
+        per_thread[t].push_back(MakeTempPath("/r/m/a/b/c.bin"));
+      }
+    });
+  }
+  for (auto& th : threads) th.join();
+  std::vector<std::string> all;
+  for (auto& v : per_thread) all.insert(all.end(), v.begin(), v.end());
+  std::sort(all.begin(), all.end());
+  EXPECT_EQ(std::adjacent_find(all.begin(), all.end()), all.end())
+      << "duplicate temp path";
+}
+
+// The temp name is unique by construction, so a file already at that name
+// belongs to another writer. O_EXCL makes the open fail instead of sharing
+// (and truncating) that writer's inode, and the foreign file is left alone.
+TEST_F(PosixBackendTest, PosixKVBackendTempOpenEexistIsReportedAndFileKept) {
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_eexist",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockKey key,
+      mapper.MapKey("block_eexist", {.parallelism = {.tp_rank = 0}}));
+
+  // Predict the name WriteAsync will draw next: same pid and nonce, and the
+  // process-wide counter advances by one per call. Nothing else in this test
+  // calls MakeTempPath between here and the write.
+  const std::string probe = MakeTempPath(key.resolved_key);
+  const size_t sep = probe.rfind('_');
+  ASSERT_NE(sep, std::string::npos);
+  uint64_t seq = 0;
+  ASSERT_TRUE(absl::SimpleAtoi(probe.substr(sep + 1), &seq));
+  const std::string next_tmp = absl::StrCat(probe.substr(0, sep + 1), seq + 1);
+  CreateFile(next_tmp);
+  const uintmax_t foreign_size = fs::file_size(next_tmp);
+
+  const std::vector<uint8_t> data(1024, 0x77);
+  EXPECT_THAT(WriteBlock(backend, key, data),
+              StatusIs(absl::StatusCode::kAlreadyExists,
+                       HasSubstr("Failed to open file for write")));
+  EXPECT_FALSE(fs::exists(key.resolved_key));
+  ASSERT_TRUE(fs::exists(next_tmp)) << "foreign temp file was removed";
+  EXPECT_EQ(fs::file_size(next_tmp), foreign_size)
+      << "foreign temp file was truncated";
+}
+
+// Several writers racing on one key -- the situation two replicas sharing a
+// directory are in -- each publish a complete file by rename; the last rename
+// wins and every writer reports success.
+TEST_F(PosixBackendTest, PosixKVBackendConcurrentSameKeyWritesLastRenameWins) {
+  PosixKVBackend backend("posix_disk", {});
+  PosixPathMapper mapper(scratch_dir_, "model_race",
+                         ParallelismConfig{.tp_size = 1, .tp_rank = 0});
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockKey key,
+      mapper.MapKey("block_race", {.parallelism = {.tp_rank = 0}}));
+
+  constexpr int kWriters = 16;
+  std::vector<uint8_t> data(64 * 1024, 0xC3);
+  absl::Mutex mu;
+  std::vector<absl::Status> statuses;  // Guarded by mu.
+  absl::Notification all_done;
+  for (int i = 0; i < kWriters; ++i) {
+    HostBufferDescriptor src{.ptr = data.data(), .size = data.size()};
+    backend.WriteAsync(key, {src}, data.size(), [&](absl::Status s) {
+      absl::MutexLock lock(mu);
+      statuses.push_back(s);
+      if (statuses.size() == kWriters) all_done.Notify();
+    });
+  }
+  all_done.WaitForNotification();
+  {
+    absl::MutexLock lock(mu);
+    for (const absl::Status& s : statuses) ABSL_EXPECT_OK(s);
+  }
+
+  ASSERT_TRUE(fs::exists(key.resolved_key));
+  EXPECT_EQ(fs::file_size(key.resolved_key), data.size());
+  std::vector<uint8_t> read_back(data.size(), 0);
+  HostBufferDescriptor dst{.ptr = read_back.data(), .size = read_back.size()};
+  absl::Notification read_done;
+  absl::Status read_status;
+  backend.ReadAsync(key, {dst}, data.size(), [&](absl::Status s) {
+    read_status = s;
+    read_done.Notify();
+  });
+  read_done.WaitForNotification();
+  ABSL_ASSERT_OK(read_status);
+  EXPECT_EQ(read_back, data);
+  EXPECT_THAT(EntriesContaining(fs::path(key.resolved_key).parent_path(),
+                                ".tmp_"),
+              ::testing::IsEmpty());
+}
+
+// Sanitizing only replaces characters; a model name that is still longer
+// than NAME_MAX afterwards would make every write fail with ENAMETOOLONG, so
+// it is refused when the backend is configured.
+TEST_F(PosixBackendTest, PosixBackendOptions_RejectsOverlongModelName) {
+  EXPECT_THAT(PosixBackendOptions::FromProperties(
+                  {{"model_name", std::string(NAME_MAX + 1, 'm')}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("model_name sanitizes to 256")));
+  // Sanitization does not shorten: 300 '/' become 300 '_'.
+  EXPECT_THAT(PosixBackendOptions::FromProperties(
+                  {{"model_name", std::string(300, '/')}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("the limit is 255")));
+  // Exactly NAME_MAX is fine.
+  TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                          PosixBackendOptions::FromProperties(
+                              {{"model_name", std::string(NAME_MAX, 'm')}}));
+  EXPECT_EQ(opts.model_name.size(), NAME_MAX);
 }
 
 TEST_F(PosixBackendTest, PosixKVBackendPreadPrematureEOFReturnsDataLossError) {
