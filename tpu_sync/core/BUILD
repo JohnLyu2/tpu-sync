@@ -826,6 +826,9 @@ cc_test(
     deps = [
         ":tpu_pjrt_manager",
         ":tpu_utils",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/log:scoped_mock_log",
+        "@com_google_absl//absl/strings:string_view",
         "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/tsl/platform:logging",
         "@xla//xla/tsl/platform:statusor",
