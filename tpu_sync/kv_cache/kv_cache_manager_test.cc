@@ -84,6 +84,7 @@ class TestKVCacheManager : public KVCacheManagerBase {
     major_dim_size_ = major_dim_size;
   }
 
+  using KVCacheManagerBase::buffer_holds_;
   using KVCacheManagerBase::layers_;
   using KVCacheManagerBase::UpdateAllocatedOccupancyMetric;
 };
@@ -2239,6 +2240,133 @@ TEST_F(RegisterKVBackendsTopologyTest, IgnoresCallerTpProperties) {
   EXPECT_EQ(backend->mapper()->tp_size(), 4);
   TF_ASSERT_OK_AND_ASSIGN(auto key, backend->mapper()->MapKey("block_hash"));
   EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp4_r1/"));
+}
+
+TEST(KVCacheManagerTest, FailedDmaTransferInH2dAndD2hIsReportedAsError) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+
+  // Underlying PJRT buffer only holds 1 block (128 bytes), while the manager
+  // metadata allows 2 blocks (256 bytes). Copying block 1 therefore passes
+  // manager validation and fails inside the PJRT raw DMA transfer future.
+  std::vector<uint8_t> init_data(128, 0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client->BufferFromHostBuffer(
+                            init_data.data(), xla::U8, {1, 128},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::RaidenBufferHandle handle,
+      raiden::RaidenBufferHandle::Acquire(pjrt_buffer.get()));
+
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.buffer_holds_[0].holds[0] = std::move(handle);
+  manager.SetLayerPhysicalSizeForTest(/*layer_idx=*/0, /*physical_size=*/256,
+                                      /*major_dim_size=*/2);
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_future,
+                          manager.H2d({0}, {1}, {1}));
+  EXPECT_FALSE(h2d_future.Await().ok());
+  EXPECT_FALSE(h2d_future.PollError().ok());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_future,
+                          manager.D2h({1}, {0}, {1}));
+  EXPECT_FALSE(d2h_future.Await().ok());
+  EXPECT_FALSE(d2h_future.PollError().ok());
+
+  // Shared-memory external object block transfers (HiCache path).
+  const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  void* pool = nullptr;
+  ASSERT_EQ(posix_memalign(&pool, page_size, page_size), 0);
+  auto free_pool = absl::MakeCleanup([pool]() { free(pool); });
+  std::memset(pool, 0x33, page_size);
+  auto* pool_bytes = static_cast<uint8_t*>(pool);
+
+  manager.SetSharedMemoryMappedForTest(pool, page_size);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture ext_h2d_future,
+      manager.CopyExternalObjectBlocks(/*block_ids=*/{1},
+                                       /*host_block_bases=*/{pool_bytes},
+                                       /*num_ranks=*/1, /*page_nbytes=*/128,
+                                       /*rank_id=*/0, /*is_h2d=*/true,
+                                       /*keep_alive=*/nullptr));
+  EXPECT_FALSE(ext_h2d_future.Await().ok());
+  EXPECT_FALSE(ext_h2d_future.PollError().ok());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture ext_d2h_future,
+      manager.CopyExternalObjectBlocks(/*block_ids=*/{1},
+                                       /*host_block_bases=*/{pool_bytes},
+                                       /*num_ranks=*/1, /*page_nbytes=*/128,
+                                       /*rank_id=*/0, /*is_h2d=*/false,
+                                       /*keep_alive=*/nullptr));
+  EXPECT_FALSE(ext_d2h_future.Await().ok());
+  EXPECT_FALSE(ext_d2h_future.PollError().ok());
+
+  manager.ResetSharedMemoryMappedForTest();
+}
+
+TEST(KVCacheManagerTest,
+     FailedDmaTransferInAsyncDispatchH2dAndD2hIsReportedAsError) {
+  setenv("RAIDEN_ENABLE_ASYNC_DISPATCH", "1", 1);
+  auto cleanup =
+      absl::MakeCleanup([]() { unsetenv("RAIDEN_ENABLE_ASYNC_DISPATCH"); });
+
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+
+  std::vector<uint8_t> init_data(128, 0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client->BufferFromHostBuffer(
+                            init_data.data(), xla::U8, {1, 128},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::RaidenBufferHandle handle,
+      raiden::RaidenBufferHandle::Acquire(pjrt_buffer.get()));
+
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.buffer_holds_[0].holds[0] = std::move(handle);
+  manager.SetLayerPhysicalSizeForTest(/*layer_idx=*/0, /*physical_size=*/256,
+                                      /*major_dim_size=*/2);
+
+  // 1. DMA failure inside the PJRT copy future (WorkerLoop OnReady error path).
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_dma_err,
+                          manager.H2d({0}, {1}, {1}));
+  EXPECT_FALSE(h2d_dma_err.Await().ok());
+  EXPECT_FALSE(h2d_dma_err.PollError().ok());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_dma_err,
+                          manager.D2h({1}, {0}, {1}));
+  EXPECT_FALSE(d2h_dma_err.Await().ok());
+  EXPECT_FALSE(d2h_dma_err.PollError().ok());
+
+  // 2. Synchronous dispatch failure on the worker thread (WorkerLoop
+  // !future.ok() path, e.g. out-of-range block index 5).
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_sync_err,
+                          manager.H2d({0}, {5}, {1}));
+  EXPECT_FALSE(h2d_sync_err.Await().ok());
+  EXPECT_FALSE(h2d_sync_err.PollError().ok());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_sync_err,
+                          manager.D2h({5}, {0}, {1}));
+  EXPECT_FALSE(d2h_sync_err.Await().ok());
+  EXPECT_FALSE(d2h_sync_err.PollError().ok());
 }
 
 }  // namespace

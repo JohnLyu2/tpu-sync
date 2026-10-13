@@ -376,7 +376,6 @@ cc_library(
         "@com_google_absl//absl/types:span",
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
-        "@xla//xla/tsl/concurrency:async_value",
         "//tpu_sync/common:trace",
         "//tpu_sync/transport:block_transport_delegate",
     ],
