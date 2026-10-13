@@ -59,6 +59,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api:transport_metrics",
+        "@peregrine//peregrine/src/api:transport_types",
     ],
 )
 
@@ -84,6 +85,45 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api:transport_metrics",
+    ],
+)
+
+cc_library(
+    name = "peregrine_transport_adapter",
+    srcs = ["peregrine_transport_adapter.cc"],
+    hdrs = ["peregrine_transport_adapter.h"],
+    deps = [
+        ":transport_adapter",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:transport",
+        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_test(
+    name = "peregrine_transport_adapter_test",
+    srcs = ["peregrine_transport_adapter_test.cc"],
+    deps = [
+        ":peregrine_transport_adapter",
+        ":transport_adapter",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api:transport",
+        "@peregrine//peregrine/src/api:transport_metrics",
+        "@peregrine//peregrine/src/api:transport_types",
+        "@peregrine//peregrine/src/api:transport_util",
     ],
 )
 

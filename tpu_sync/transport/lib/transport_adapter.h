@@ -26,6 +26,7 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/transport_metrics.h"
+#include "peregrine/src/api/transport_types.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -81,13 +82,8 @@ struct Request {
   BlockReceivedCallback on_block_received = nullptr;
 };
 
-// Transport operation status.
-enum class Status : int {
-  kNotFound = 2,
-  kInProgress = 1,
-  kSuccess = 0,
-  kFailure = -1,
-};
+// Transport operation status, shared with Peregrine.
+using Status = ::peregrine::Status;
 
 // Callback invoked when a transport Post operation completes.
 using CompletionCallback =
