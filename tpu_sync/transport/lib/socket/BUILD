@@ -16,6 +16,10 @@ load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
+_PSP_DEPS = []
+
+_PSP_DEFINES = []
+
 # Helper library providing PSP-TCP socket allocation, acceptance, and connect.
 cc_library(
     name = "tcp_psp_helper",
@@ -26,6 +30,7 @@ cc_library(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    local_defines = _PSP_DEFINES,
     deps = [
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/flags:flag",
@@ -34,7 +39,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
-    ],
+    ] + _PSP_DEPS,
 )
 
 cc_test(
