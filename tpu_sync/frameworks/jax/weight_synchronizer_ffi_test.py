@@ -79,7 +79,7 @@ class WeightSynchronizerFfiTest(parameterized.TestCase):
     jax.block_until_ready(meta)
 
     meta_np = np.asarray(meta)
-    self.assertEqual(meta_np.shape, (self.num_devices, 6))
+    self.assertEqual(meta_np.shape, (self.num_devices, 10))
     for rank in range(self.num_devices):
       self.assertGreater(int(meta_np[rank, 4]), 0)
       self.assertGreater(int(meta_np[rank, 5]), 0)
@@ -227,8 +227,8 @@ class WeightSynchronizerFfiTest(parameterized.TestCase):
         listener_port=0,
         num_shards=self.num_devices,
     )
-    meta_np = np.asarray(meta).reshape(-1, 6)
-    self.assertEqual(meta_np.shape, (self.num_devices, 6))
+    meta_np = np.asarray(meta).reshape(-1, 10)
+    self.assertEqual(meta_np.shape, (self.num_devices, 10))
     for row in meta_np:
       self.assertGreater(int(row[4]), 0)
       self.assertGreater(int(row[5]), 0)

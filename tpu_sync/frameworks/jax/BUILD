@@ -470,6 +470,7 @@ cc_test(
     features = ["-use_header_modules"],
     deps = [
         ":weight_synchronizer_ffi_mock",
+        "//tpu_sync/core:tpu_utils",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -641,7 +642,6 @@ py_library(
         ":jax_test_utils",
         "@jax//jax",
         "@jax//jax/experimental:compute_on",
-        "@jax//jax/experimental:xla_metadata",
         "@pypi//numpy",
     ],
 )

@@ -37,6 +37,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -86,6 +87,104 @@ void ClearSharedWsMap() {
   }
 }
 
+namespace {
+
+bool IsVirtualInterface(absl::string_view name) {
+  return name == "lo" || absl::StartsWith(name, "docker") ||
+         absl::StartsWith(name, "cilium") || absl::StartsWith(name, "lxc") ||
+         absl::StartsWith(name, "veth") || absl::StartsWith(name, "br-") ||
+         absl::StartsWith(name, "virbr") || absl::StartsWith(name, "cni") ||
+         absl::StartsWith(name, "flannel");
+}
+
+std::string ProbeDefaultRouteIp() {
+  struct sockaddr_in dst4{};
+  dst4.sin_family = AF_INET;
+  dst4.sin_port = htons(80);
+  if (inet_pton(AF_INET, "8.8.8.8", &dst4.sin_addr) == 1) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+      struct sockaddr_in local4{};
+      socklen_t len = sizeof(local4);
+      char buf[INET_ADDRSTRLEN] = {0};
+      const bool ok =
+          connect(fd, reinterpret_cast<const struct sockaddr*>(&dst4),
+                  sizeof(dst4)) == 0 &&
+          getsockname(fd, reinterpret_cast<struct sockaddr*>(&local4), &len) ==
+              0 &&
+          inet_ntop(AF_INET, &local4.sin_addr, buf, sizeof(buf)) != nullptr;
+      close(fd);
+      if (ok && buf[0] != '\0' && std::string(buf) != "0.0.0.0" &&
+          !absl::StartsWith(buf, "127.")) {
+        return std::string(buf);
+      }
+    }
+  }
+  struct sockaddr_in6 dst6{};
+  dst6.sin6_family = AF_INET6;
+  dst6.sin6_port = htons(80);
+  if (inet_pton(AF_INET6, "2001:4860:4860::8888", &dst6.sin6_addr) == 1) {
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+      struct sockaddr_in6 local6{};
+      socklen_t len = sizeof(local6);
+      char buf[INET6_ADDRSTRLEN] = {0};
+      const bool ok =
+          connect(fd, reinterpret_cast<const struct sockaddr*>(&dst6),
+                  sizeof(dst6)) == 0 &&
+          getsockname(fd, reinterpret_cast<struct sockaddr*>(&local6), &len) ==
+              0 &&
+          inet_ntop(AF_INET6, &local6.sin6_addr, buf, sizeof(buf)) != nullptr;
+      close(fd);
+      if (ok && buf[0] != '\0' && std::string(buf) != "::" &&
+          std::string(buf) != "::1") {
+        return std::string(buf);
+      }
+    }
+  }
+  return "";
+}
+
+}  // namespace
+
+std::string ResolveControlPlaneIp(absl::Span<const HostNicAddress> host_nics,
+                                  absl::string_view fallback_ip,
+                                  bool use_default_route_probe) {
+  if (use_default_route_probe) {
+    std::string route_ip = ProbeDefaultRouteIp();
+    if (!route_ip.empty()) {
+      return route_ip;
+    }
+  }
+  for (const auto& nic : host_nics) {
+    if (nic.interface_name == "eth0" && !nic.ip_address.empty()) {
+      return nic.ip_address;
+    }
+  }
+  for (const auto& nic : host_nics) {
+    if (nic.classification == NicClassification::kControlPlane &&
+        !IsVirtualInterface(nic.interface_name) && !nic.ip_address.empty()) {
+      return nic.ip_address;
+    }
+  }
+  return std::string(fallback_ip);
+}
+
+void PackIpToInt32s(absl::string_view ip_str, int32_t* dst) {
+  uint8_t ipv6[16] = {0};
+  const std::string ip(ip_str);
+  if (absl::StrContains(ip, ".")) {
+    struct in_addr ipv4{};
+    inet_pton(AF_INET, ip.c_str(), &ipv4);
+    ipv6[10] = 0xff;
+    ipv6[11] = 0xff;
+    std::memcpy(ipv6 + 12, &ipv4.s_addr, 4);
+  } else {
+    inet_pton(AF_INET6, ip.c_str(), ipv6);
+  }
+  std::memcpy(dst, ipv6, 16);
+}
+
 // Retains and returns a thread-safe singleton instance of
 // `WeightSynchronizerBase` for a given listener port across multiple devices on
 // the same physical host. In multi-device/multi-host JAX topologies (`pjit`),
@@ -106,6 +205,7 @@ static WeightSynchronizerBase* GetSharedWs(
                                           : -(submanager_idx + 1000));
   auto& ws = (*ws_map)[key];
   if (ws == nullptr) {
+    const size_t local_submanager_idx = ws_map->size() - 1;
     std::optional<int> opt_listener_port =
         (listener_port >= 0)
             ? std::make_optional(
@@ -124,10 +224,9 @@ static WeightSynchronizerBase* GetSharedWs(
       }
     }
     std::optional<std::string> sub_bind_ip = std::nullopt;
-    if (submanager_idx < static_cast<int>(data_nics.size())) {
-      sub_bind_ip = data_nics[submanager_idx].ip_address;
-    } else if (!data_nics.empty()) {
-      sub_bind_ip = data_nics[submanager_idx % data_nics.size()].ip_address;
+    if (!data_nics.empty()) {
+      sub_bind_ip =
+          data_nics[local_submanager_idx % data_nics.size()].ip_address;
     }
 
     ws = new WeightSynchronizerBase(
@@ -301,26 +400,20 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
   int32_t port = port_opt.value();
 
   std::string ip_str = g_weight_synchronizers[shard_idx]->local_ip();
-  uint8_t ipv6[16] = {0};
-  if (absl::StrContains(ip_str, ".")) {
-    struct in_addr ipv4;
-    inet_pton(AF_INET, ip_str.c_str(), &ipv4);
-    ipv6[10] = 0xff;
-    ipv6[11] = 0xff;
-    std::memcpy(ipv6 + 12, &ipv4.s_addr, 4);
-  } else {
-    inet_pton(AF_INET6, ip_str.c_str(), ipv6);
-  }
-
   if (out->element_count() < 5) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
                            "Output buffer too small for IPv6 and port.");
   }
   int32_t* out_ptr = reinterpret_cast<int32_t*>(out->untyped_data());
-  std::memcpy(out_ptr, ipv6, 16);
+  PackIpToInt32s(ip_str, out_ptr);
   out_ptr[4] = port;
   if (out->element_count() >= 6) {
     out_ptr[5] = g_weight_synchronizers[shard_idx]->listener_port().value_or(0);
+  }
+  if (out->element_count() >= 10) {
+    std::string ctrl_ip =
+        ResolveControlPlaneIp(GetLocalHostNicAddresses(), ip_str);
+    PackIpToInt32s(ctrl_ip, out_ptr + 6);
   }
 
   return xla::ffi::Error::Success();
@@ -419,26 +512,20 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
   int32_t port = port_opt.value();
 
   std::string ip_str = g_weight_synchronizers[shard_idx]->local_ip();
-  uint8_t ipv6[16] = {0};
-  if (absl::StrContains(ip_str, ".")) {
-    struct in_addr ipv4;
-    inet_pton(AF_INET, ip_str.c_str(), &ipv4);
-    ipv6[10] = 0xff;
-    ipv6[11] = 0xff;
-    std::memcpy(ipv6 + 12, &ipv4.s_addr, 4);
-  } else {
-    inet_pton(AF_INET6, ip_str.c_str(), ipv6);
-  }
-
   if (out->element_count() < 5) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
                            "Output buffer too small for IPv6 and port.");
   }
   int32_t* out_ptr = reinterpret_cast<int32_t*>(out->untyped_data());
-  std::memcpy(out_ptr, ipv6, 16);
+  PackIpToInt32s(ip_str, out_ptr);
   out_ptr[4] = port;
   if (out->element_count() >= 6) {
     out_ptr[5] = g_weight_synchronizers[shard_idx]->listener_port().value_or(0);
+  }
+  if (out->element_count() >= 10) {
+    std::string ctrl_ip =
+        ResolveControlPlaneIp(GetLocalHostNicAddresses(), ip_str);
+    PackIpToInt32s(ctrl_ip, out_ptr + 6);
   }
 
   // --- D2H Part (Loop through all passed layers) ---

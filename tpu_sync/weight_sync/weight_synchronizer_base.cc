@@ -60,9 +60,11 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
@@ -268,11 +270,14 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
-    bool auto_h2d)
+    bool auto_h2d, std::vector<int> numa_nodes,
+    std::vector<HostNicAddress> host_nics,
+    std::vector<transport::ShardInfo> shards)
     : tpu_raiden::RaidenManagerBase(
           num_layers, num_shards,
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
-          parallelism, bind_ip),
+          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics),
+          std::move(shards)),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),
@@ -366,21 +371,26 @@ bool WeightSynchronizerBase::is_listener_active() const {
 
 std::vector<RaidenTransferEndpoint>
 WeightSynchronizerBase::get_local_endpoints() const {
-  std::vector<int64_t> shards;
-  if (!global_shard_indices_.empty()) {
-    shards = global_shard_indices_;
-  } else {
-    shards.reserve(num_shards_);
-    for (size_t i = 0; i < num_shards_; ++i) {
-      shards.push_back(static_cast<int64_t>(i));
-    }
-  }
-  const std::string ip = local_ip();
   const int port = local_port().value_or(0);
-  std::string ep = absl::StrContains(ip, ':')
-                       ? absl::StrCat("[", ip, "]:", port)
-                       : absl::StrCat(ip, ":", port);
-  return {RaidenTransferEndpoint{ep, std::move(shards)}};
+  std::vector<RaidenTransferEndpoint> eps;
+  for (const std::string& ip : local_ips()) {
+    std::string ep = absl::StrContains(ip, ':')
+                         ? absl::StrCat("[", ip, "]:", port)
+                         : absl::StrCat(ip, ":", port);
+    std::vector<int64_t> local_shards = shards_for_local_ip(ip);
+    std::vector<int64_t> shards;
+    shards.reserve(local_shards.size());
+    for (int64_t local_sh : local_shards) {
+      if (local_sh >= 0 &&
+          static_cast<size_t>(local_sh) < global_shard_indices_.size()) {
+        shards.push_back(global_shard_indices_[local_sh]);
+      } else {
+        shards.push_back(local_sh);
+      }
+    }
+    eps.push_back(RaidenTransferEndpoint{std::move(ep), std::move(shards)});
+  }
+  return eps;
 }
 
 WeightSynchronizerBase::~WeightSynchronizerBase() {

@@ -191,7 +191,7 @@ def _resolve_local_ip() -> str:
 
 
 def _unpack_ip(row: np.ndarray) -> str:
-  """Unpacks an IPv4 or IPv6 address from a 6-int32 FFI info row."""
+  """Unpacks an IPv4 or IPv6 address from a 6- or 10-int32 FFI info row."""
   raw_bytes = b"".join(
       int(x).to_bytes(4, byteorder="little", signed=True) for x in row[:4]
   )
@@ -199,6 +199,13 @@ def _unpack_ip(row: np.ndarray) -> str:
     return str(ipaddress.IPv4Address(raw_bytes[12:16]))
   addr_str = str(ipaddress.IPv6Address(raw_bytes))
   return f"[{addr_str}]" if ":" in addr_str else addr_str
+
+
+def _unpack_control_ip(row: np.ndarray) -> str:
+  """Unpacks the control-plane IP from row[6:10], falling back to row[:4]."""
+  if len(row) >= 10 and any(int(x) != 0 for x in row[6:10]):
+    return _unpack_ip(row[6:10])
+  return _unpack_ip(row)
 
 
 def _ping_port(addr: str) -> bool:
@@ -432,13 +439,17 @@ def run_source() -> None:
   )
   jax.block_until_ready(src_ws_info)
 
-  gathered_ws_info = np.asarray(jax.device_get(src_ws_info)).reshape(-1, 6)
+  info_cols = int(src_ws_info.shape[-1])
+  gathered_ws_info = np.asarray(jax.device_get(src_ws_info)).reshape(
+      -1, info_cols
+  )
   ips: list[str] = []
   listeners: list[str] = []
   for row in gathered_ws_info:
     ip = _unpack_ip(row)
+    ctrl_ip = _unpack_control_ip(row)
     ips.append(f"{ip}:{row[4]}")
-    listeners.append(f"{ip}:{row[5]}")
+    listeners.append(f"{ctrl_ip}:{row[5]}")
 
   unique_listeners: list[str] = []
   for listener in listeners:

@@ -44,10 +44,13 @@
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -3326,6 +3329,42 @@ TEST_F(WeightSynchronizerTest,
       EXPECT_EQ(dst2_ptr[b], expected) << "dest2 layer " << l << " byte " << b;
     }
   }
+}
+
+TEST_F(WeightSynchronizerTest,
+       GetLocalEndpointsReturnsPerNumaDataNicEndpointsWithGlobalShardIndices) {
+  // RaidenManagerBase binds wildcard [::] when local_ips_ has >1 entries, so
+  // any IP strings in HostNicAddress are preserved in local_ips() without
+  // per-IP bind.
+  std::vector<HostNicAddress> nics = {
+      {"eth0", "10.11.3.60", 0, NicClassification::kDataPlane},
+      {"eth1", "10.35.3.60", 0, NicClassification::kControlPlane},
+      {"eth2", "10.34.3.60", 1, NicClassification::kDataPlane},
+  };
+  std::vector<transport::ShardInfo> shards = {
+      {/*local_index=*/0, /*global_index=*/8, /*numa_node=*/0},
+      {/*local_index=*/1, /*global_index=*/9, /*numa_node=*/0},
+      {/*local_index=*/2, /*global_index=*/10, /*numa_node=*/1},
+      {/*local_index=*/3, /*global_index=*/11, /*numa_node=*/1},
+  };
+
+  auto ws = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/1, /*num_shards=*/4, std::vector<size_t>{slice_byte_size_},
+      /*local_port=*/0,
+      /*host_blocks_to_allocate=*/1, /*parallelism=*/1,
+      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false,
+      /*numa_nodes=*/std::vector<int>{0, 1}, nics, shards);
+  ws->SetGlobalShardIndices({8, 9, 10, 11});
+
+  ASSERT_TRUE(ws->local_port().has_value());
+  const int port = *ws->local_port();
+  std::vector<RaidenTransferEndpoint> endpoints = ws->get_local_endpoints();
+  ASSERT_EQ(endpoints.size(), 2u);
+  EXPECT_EQ(endpoints[0].endpoint, absl::StrCat("10.11.3.60:", port));
+  EXPECT_THAT(endpoints[0].shards, ::testing::ElementsAre(8, 9));
+  EXPECT_EQ(endpoints[1].endpoint, absl::StrCat("10.34.3.60:", port));
+  EXPECT_THAT(endpoints[1].shards, ::testing::ElementsAre(10, 11));
 }
 
 }  // namespace

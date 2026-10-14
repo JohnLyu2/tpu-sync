@@ -42,7 +42,9 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_sync {
@@ -122,7 +124,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       int parallelism = 1, std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      std::vector<int> numa_nodes = {},
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
+      std::vector<transport::ShardInfo> shards = {});
 
   std::optional<int> listener_port() const;
   bool is_listener_active() const;

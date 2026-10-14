@@ -14,6 +14,9 @@
 
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -27,6 +30,7 @@
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/tsl/platform/test.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
@@ -921,8 +925,93 @@ TEST_F(WeightSynchronizerFfiTest,
   store.SetBackends({});
 }
 
+std::string UnpackIpFromInt32s(const int32_t* words) {
+  uint8_t raw[16];
+  std::memcpy(raw, words, 16);
+  bool is_v4_mapped = (raw[10] == 0xff && raw[11] == 0xff);
+  for (int i = 0; i < 10; ++i) {
+    if (raw[i] != 0) is_v4_mapped = false;
+  }
+  char buf[INET6_ADDRSTRLEN] = {0};
+  if (is_v4_mapped) {
+    inet_ntop(AF_INET, raw + 12, buf, sizeof(buf));
+  } else {
+    inet_ntop(AF_INET6, raw, buf, sizeof(buf));
+  }
+  return std::string(buf);
+}
+
+TEST_F(WeightSynchronizerFfiTest,
+       ResolveControlPlaneIpPrefersEth0WhenClassifiedAsDataPlane) {
+  // Simulates TPU_RAIDEN_DATA_NICS="eth0,eth2" where eth0 (10.11.3.60) and
+  // eth2 (10.34.3.60) are classified as kDataPlane while eth1 (10.35.3.60) and
+  // docker0 (172.17.0.1) are classified as kControlPlane.
+  // Even for the NUMA-1 submanager whose data IP is 10.34.3.60 (eth2),
+  // ResolveControlPlaneIp must return eth0's IP (10.11.3.60) so cpu-np
+  // orchestrators can reach the listener.
+  std::vector<HostNicAddress> nics = {
+      {"docker0", "172.17.0.1", -1, NicClassification::kControlPlane},
+      {"eth0", "10.11.3.60", 0, NicClassification::kDataPlane},
+      {"eth1", "10.35.3.60", 0, NicClassification::kControlPlane},
+      {"eth2", "10.34.3.60", 1, NicClassification::kDataPlane},
+  };
+  EXPECT_EQ(ResolveControlPlaneIp(nics, /*fallback_ip=*/"10.34.3.60",
+                                  /*use_default_route_probe=*/false),
+            "10.11.3.60");
+}
+
+TEST_F(WeightSynchronizerFfiTest,
+       ResolveControlPlaneIpSkipsVirtualNicsAndFallsBackToPhysicalControlNic) {
+  std::vector<HostNicAddress> nics = {
+      {"lo", "127.0.0.1", -1, NicClassification::kControlPlane},
+      {"docker0", "172.17.0.1", -1, NicClassification::kControlPlane},
+      {"cilium_host", "10.0.1.1", -1, NicClassification::kControlPlane},
+      {"enp0s1", "10.11.5.10", 0, NicClassification::kControlPlane},
+      {"enp129s0", "10.34.5.10", 1, NicClassification::kDataPlane},
+  };
+  EXPECT_EQ(ResolveControlPlaneIp(nics, /*fallback_ip=*/"10.34.5.10",
+                                  /*use_default_route_probe=*/false),
+            "10.11.5.10");
+
+  std::vector<HostNicAddress> only_virtual = {
+      {"docker0", "172.17.0.1", -1, NicClassification::kControlPlane},
+  };
+  EXPECT_EQ(ResolveControlPlaneIp(only_virtual, /*fallback_ip=*/"10.34.5.10",
+                                  /*use_default_route_probe=*/false),
+            "10.34.5.10");
+}
+
+TEST_P(WeightSynchronizerFfiParamTest,
+       TenElementOutputBufferPopulatesControlPlaneIp) {
+  int32_t shard_idx = 0;
+  FfiBufferFixture shard_idx_fixture(XLA_FFI_DataType_S32, &shard_idx, {1});
+  std::vector<int32_t> anchor(256, 7);
+  FfiBufferFixture anchor_fixture(XLA_FFI_DataType_S32, anchor.data(), {256});
+  int32_t slice_byte_size = 1024;
+  FfiBufferFixture sizes_fixture(XLA_FFI_DataType_S32, &slice_byte_size, {1});
+
+  std::vector<int32_t> out_data(10, 0);
+  FfiBufferFixture out_fixture(XLA_FFI_DataType_S32, out_data.data(), {10});
+  xla::ffi::Result<xla::ffi::AnyBuffer> out = out_fixture.AsAnyBuffer();
+
+  xla::ffi::Error err =
+      CallInit(anchor_fixture.AsAnyBuffer(), shard_idx_fixture.AsAnyBuffer(),
+               sizes_fixture.AsAnyBuffer(), /*local_port=*/0, /*parallelism=*/1,
+               /*num_layers=*/1, out, /*listener_port=*/0, /*num_shards=*/1);
+  ASSERT_TRUE(err.success()) << err.message();
+
+  EXPECT_GT(out_data[4], 0);
+  EXPECT_GT(out_data[5], 0);
+  std::string data_ip = UnpackIpFromInt32s(out_data.data());
+  std::string ctrl_ip = UnpackIpFromInt32s(out_data.data() + 6);
+  EXPECT_FALSE(data_ip.empty());
+  EXPECT_FALSE(ctrl_ip.empty());
+  EXPECT_NE(ctrl_ip, "0.0.0.0");
+}
+
 INSTANTIATE_TEST_SUITE_P(FfiTypeTests, WeightSynchronizerFfiParamTest,
-                         ::testing::Values(FfiType::kInit, FfiType::kInitAndD2h));
+                         ::testing::Values(FfiType::kInit,
+                                           FfiType::kInitAndD2h));
 
 }  // namespace
 }  // namespace weight_sync

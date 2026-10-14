@@ -210,7 +210,7 @@ def init_weight_synchronizer(
   )
   def _local_init(s_idx, sizes, *anchors):
     axis_names = mesh.axis_names
-    out_dim = 6 if listener_port >= 0 else 5
+    out_dim = 10 if listener_port >= 0 else 5
     out_shape = tuple([1] * len(axis_names)) + (out_dim,)
     ffi_args = (
         (anchors[0], s_idx, sizes, *anchors[1:])
@@ -289,8 +289,8 @@ def init_weight_synchronizer_and_d2h(
     host_subgrid: Optional host subgrid shape for shard decomposition.
 
   Returns:
-    A sharded 1D int32 array containing synchronization metadata (`out_dim=6` if
-    `listener_port >= 0`).
+    A sharded 1D int32 array containing synchronization metadata (`out_dim=10`
+    if `listener_port >= 0`).
   """
   if num_shards is None:
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
@@ -310,7 +310,7 @@ def init_weight_synchronizer_and_d2h(
   )
   def _local_init_and_d2h(s_idx, sizes, *anchors):
     axis_names = mesh.axis_names
-    out_dim = 6 if listener_port >= 0 else 5
+    out_dim = 10 if listener_port >= 0 else 5
     out_shape = tuple([1] * len(axis_names)) + (out_dim,)
     return jax.ffi.ffi_call(
         ffi_name,
