@@ -145,14 +145,6 @@ class KVCacheStoreBackend {
                              absl::Span<const RaidenBlockId> slices,
                              BlockTracker* absl_nonnull load_tracker) = 0;
 
-  virtual tsl::Future<> Load(const RaidenId& remote_id,
-                             absl::Span<const std::string> block_hashes,
-                             absl::Span<const int32_t> device_block_ids,
-                             BlockTracker* absl_nonnull load_tracker) {
-    return Load(remote_id, block_hashes, device_block_ids, /*slices=*/{},
-                load_tracker);
-  }
-
   // Asynchronously saves KV cache blocks from device (HBM) to host DRAM.
   // The tracker's transfer status is updated when the operation completes or
   // settles.
