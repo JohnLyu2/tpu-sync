@@ -614,37 +614,6 @@ absl::StatusOr<size_t> HostOffloadBackend::RecoverFromLocalManifest() {
   return recoverable.size();
 }
 
-bool HostOffloadBackend::ValidateAndPinHostBlocks(
-    absl::Span<const int> host_block_ids) {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> keys_to_pin;
-  keys_to_pin.reserve(host_block_ids.size());
-  for (int host_id : host_block_ids) {
-    bool found = false;
-    for (const auto& [key, it] : lru_cache_.map()) {
-      if (it->value.host_block_id == host_id &&
-          (it->value.status == BlockStatus::HOST ||
-           it->value.status == BlockStatus::HOST_AND_HBM)) {
-        keys_to_pin.push_back(key);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      return false;
-    }
-  }
-  for (size_t i = 0; i < keys_to_pin.size(); ++i) {
-    if (!lru_cache_.Pin(keys_to_pin[i])) {
-      for (size_t j = 0; j < i; ++j) {
-        lru_cache_.Unpin(keys_to_pin[j]);
-      }
-      return false;
-    }
-  }
-  return true;
-}
-
 std::vector<std::string> HostOffloadBackend::GetEvictableKeys(size_t count) {
   absl::MutexLock lock(mutex_);
   return lru_cache_.GetEvictableKeys(count);

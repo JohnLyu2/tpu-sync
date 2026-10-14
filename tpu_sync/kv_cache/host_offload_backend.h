@@ -97,8 +97,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   absl::StatusOr<size_t> RecoverFromLocalManifest() override;
 
-  bool ValidateAndPinHostBlocks(absl::Span<const int> host_block_ids) override;
-
   std::vector<std::string> GetEvictableKeys(size_t count) override;
 
   std::vector<int> Evict(

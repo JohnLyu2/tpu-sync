@@ -224,12 +224,6 @@ class KVCacheStoreBackend {
   // Default implementation returns 0 (no recovery).
   virtual absl::StatusOr<size_t> RecoverFromLocalManifest() { return 0; }
 
-  // Validates host DRAM block IDs and pins them in local memory.
-  // Default implementation returns false.
-  virtual bool ValidateAndPinHostBlocks(absl::Span<const int> host_block_ids) {
-    return false;
-  }
-
   // Retrieves evictable keys from the backend.
   virtual std::vector<std::string> GetEvictableKeys(size_t count) { return {}; }
 
