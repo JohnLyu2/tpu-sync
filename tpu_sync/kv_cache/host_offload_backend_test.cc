@@ -891,34 +891,6 @@ TEST(HostOffloadBackendTest, LoadLocalNonHostBlockError) {
               absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
-TEST(HostOffloadBackendTest, StoreServerOverride) {
-  RaidenId local_node_id{"override_job", "0", "cache", 0};
-  ::tpu_sync::rpc::RaidenIdProto local_unit;
-  local_unit.set_job_name(local_node_id.job_name);
-  local_unit.set_job_replica_id(local_node_id.job_replica_id);
-  local_unit.set_data_name(local_node_id.data_name);
-  local_unit.set_data_replica_idx(local_node_id.data_replica_idx);
-
-  TF_ASSERT_OK_AND_ASSIGN(
-      auto controller,
-      controller::RaidenController::Create(local_unit, /*num_blocks=*/100,
-                                           /*num_shards=*/1,
-                                           /*shard_size_bytes=*/1024,
-                                           /*raiden_controller_address=*/""));
-
-  BackendConfig config;
-  config.type = "HostOffloadBackend";
-  config.capacity = 100;
-  TF_ASSERT_OK_AND_ASSIGN(auto backend_base,
-                          HostOffloadBackend::Create(config, controller.get()));
-  auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
-  ASSERT_NE(backend, nullptr);
-  EXPECT_EQ(backend->store_server(), nullptr);
-  ABSL_ASSERT_OK(backend->StartServer("127.0.0.1"));
-  EXPECT_NE(backend->store_server(), nullptr);
-  backend->store_server()->Shutdown();
-}
-
 // --- Remote write backend primitives ---------------------------------------
 
 namespace {

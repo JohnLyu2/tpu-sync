@@ -40,7 +40,6 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
-#include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 
@@ -119,18 +118,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes) override;
 
   // --- Global Memory Pooling & RPC Methods ---
-  // The peer-facing server this backend hosts, or nullptr until StartServer()
-  // succeeds -- with no registry, no server is started anywhere. Once started,
-  // the owning KVCacheStore adopts THIS server instead of standing up a second
-  // one: a node must never serve peers from two ports.
-  KVCacheStoreServer* store_server() const override;
-
-  // Starts this backend's own server bound to `server_address`, which must be
-  // non-empty and non-wildcard. Not called from
-  // Create() -- starting + publishing a server is exclusively
-  // KVCacheStore::EnsureStoreServerAndRegister's job.
-  absl::Status StartServer(absl::string_view server_address);
-
   // Loads KV cache blocks from local host DRAM (if `remote_id` is empty or
   // matches this backend's id) or from the specified peer. See KVCacheStoreBackend
   // for the argument contract.
@@ -260,7 +247,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_
       ABSL_GUARDED_BY(mutex_);
-  std::unique_ptr<KVCacheStoreServer> server_ ABSL_GUARDED_BY(mutex_);
   absl::flat_hash_map<RaidenId, std::shared_ptr<KVCacheStoreClient>,
                       RaidenIdHash>
       store_clients_ ABSL_GUARDED_BY(mutex_);

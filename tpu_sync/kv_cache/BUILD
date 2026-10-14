@@ -695,7 +695,6 @@ cc_library(
         ":kv_cache_store_backend",
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
-        ":kv_cache_store_server",
         ":lru_cache",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:buffer",
