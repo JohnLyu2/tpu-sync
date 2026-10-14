@@ -702,11 +702,6 @@ HostOffloadBackend::PinPresentHostResident(
   return pinned;
 }
 
-std::vector<std::string> HostOffloadBackend::GetEvictCandidateKeys() const {
-  absl::MutexLock lock(mutex_);
-  return lru_cache_.GetEvictCandidateKeys();
-}
-
 KVCacheStoreServer* HostOffloadBackend::store_server() const {
   absl::MutexLock lock(mutex_);
   return server_.get();

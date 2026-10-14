@@ -104,6 +104,24 @@ int use_private_controller_servers = []() {
 namespace tpu_raiden {
 namespace kv_cache {
 
+class HostOffloadBackendTest {
+ public:
+  // Tests construct backends directly; production code goes through
+  // HostOffloadBackend::Create.
+  class Backend : public HostOffloadBackend {
+   public:
+    template <typename... Args>
+    explicit Backend(Args&&... args)
+        : HostOffloadBackend(std::forward<Args>(args)...) {}
+  };
+
+  static std::vector<std::string> GetEvictCandidateKeys(
+      const HostOffloadBackend& backend) {
+    absl::MutexLock lock(backend.mutex_);
+    return backend.lru_cache_.GetEvictCandidateKeys();
+  }
+};
+
 class KVCacheStoreTest {
  public:
   static size_t Evict(KVCacheStore& store,
@@ -118,7 +136,9 @@ class KVCacheStoreTest {
 
   static std::vector<std::string> GetEvictCandidateKeys(
       const KVCacheStore& store) {
-    return store.backend() ? store.backend()->GetEvictCandidateKeys()
+    return store.backend() ? HostOffloadBackendTest::GetEvictCandidateKeys(
+                                 *static_cast<const HostOffloadBackend*>(
+                                     store.backend().get()))
                            : std::vector<std::string>{};
   }
 
@@ -152,18 +172,6 @@ class KVCacheStoreTest {
                                                            int needed) {
     return store.AllocateBlockIds(needed);
   }
-};
-
-class HostOffloadBackendTest {
- public:
-  // Tests construct backends directly; production code goes through
-  // HostOffloadBackend::Create.
-  class Backend : public HostOffloadBackend {
-   public:
-    template <typename... Args>
-    explicit Backend(Args&&... args)
-        : HostOffloadBackend(std::forward<Args>(args)...) {}
-  };
 };
 
 // Direct-construction shorthand for the backend fixtures below.

@@ -28,6 +28,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -64,6 +65,12 @@ class HostOffloadBackendTest {
   static absl::StatusOr<KVTransferSpecConfig> ComposeKVTransferSpec(
       absl::Span<const core::controller::WorkerRegistration> workers) {
     return HostOffloadBackend::ComposeKVTransferSpec(workers);
+  }
+
+  static std::vector<std::string> GetEvictCandidateKeys(
+      const HostOffloadBackend& backend) {
+    absl::MutexLock lock(backend.mutex_);
+    return backend.lru_cache_.GetEvictCandidateKeys();
   }
 };
 
@@ -142,7 +149,7 @@ TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
   // an eviction candidate: still holding its host block, but on its way out.
   backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
                  /*on_host=*/true);
-  ASSERT_THAT(backend.GetEvictCandidateKeys(),
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("h1"));
 
   EXPECT_THAT(backend.SnapshotHostResidentHashes(),
