@@ -46,6 +46,7 @@
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
@@ -55,16 +56,13 @@ xla::Future<> ReturnFuture(const absl::Status& status) {
   return xla::Future<>(status);
 }
 
-RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
-                                     size_t slice_byte_size,
-                                     std::optional<int> local_port,
-                                     int parallelism,
-                                     std::optional<std::string> bind_ip,
-                                     std::vector<int> numa_nodes,
-                                     std::vector<HostNicAddress> host_nics,
-                                     std::vector<transport::ShardInfo> shards)
+RaidenManagerBase::RaidenManagerBase(
+    size_t num_layers, std::vector<transport::ShardInfo> shards,
+    size_t slice_byte_size, std::optional<int> local_port, int parallelism,
+    std::optional<std::string> bind_ip, std::vector<int> numa_nodes,
+    std::vector<HostNicAddress> host_nics)
     : num_layers_(num_layers),
-      num_shards_(num_shards),
+      num_shards_(shards.size()),
       slice_byte_size_(slice_byte_size),
       parallelism_(parallelism),
       shards_(std::move(shards)),
@@ -72,13 +70,8 @@ RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
       bind_ip_cfg_(std::move(bind_ip)) {
   shard_factor_ = 1;
   (void)telemetry::RaidenMetricStore::GetGlobalMetricStore();
-  if (!shards_.empty() && shards_.size() != num_shards_) {
-    LOG(WARNING) << "shards has " << shards_.size()
-                 << " entries but num_shards=" << num_shards_
-                 << "; ignoring per-shard placement";
-    shards_.clear();
-  }
-  const bool has_shard_placement = !shards_.empty();
+  const bool has_shard_placement = absl::c_any_of(
+      shards_, [](const transport::ShardInfo& s) { return s.numa_node >= 0; });
   if (numa_nodes.empty()) {
     // Derive the distinct node list from the per-shard placement so the two
     // inputs stay interchangeable.
@@ -115,7 +108,6 @@ RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
   if (!has_shard_placement) {
     // No placement supplied: every shard sits on the assigned node (or is
     // unknown) with an unknown global index.
-    shards_.resize(num_shards_);
     for (size_t sh = 0; sh < num_shards_; ++sh) {
       shards_[sh].numa_node = assigned_numa_node_.value_or(-1);
     }

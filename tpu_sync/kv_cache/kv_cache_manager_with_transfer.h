@@ -144,7 +144,6 @@ class KVCacheManagerWithTransfer {
       int parallelism, HostBufferAllocator host_allocator, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
-      std::optional<int> assigned_numa_node = std::nullopt,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   // Metadata-based constructor for a heterogeneous registration:

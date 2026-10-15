@@ -50,21 +50,21 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   using LayerInfoBase = ::tpu_raiden::LayerInfoBase;
   using StagingArena = ::tpu_raiden::StagingArena;
 
-  // |numa_nodes| lists the distinct NUMA nodes of the incoming buffers (the
-  // first one becomes `assigned_numa_node()`). |shards|, when non-empty,
-  // describes every local shard (one entry per shard, in shard order; see
-  // `transport::ShardInfo`, `raiden::DetectShards()`), and its NUMA nodes
-  // drive per-shard NIC selection (`local_ips()` then spans the data NICs of
-  // every shard's NUMA node, see `local_ips_for_shard()` /
-  // `shards_for_local_ip()`). When empty, every shard is attributed to
-  // `assigned_numa_node()` and NIC selection is the single-node behaviour.
+  // |shards| describes every local shard (one entry per shard, in shard order;
+  // see `transport::ShardInfo`, `raiden::DetectShards()`), so `num_shards()`
+  // equals `shards.size()`. Its NUMA nodes drive per-shard NIC selection
+  // (`local_ips()` then spans the data NICs of every shard's NUMA node, see
+  // `local_ips_for_shard()` / `shards_for_local_ip()`). |numa_nodes| lists the
+  // distinct NUMA nodes of the incoming buffers (the first one becomes
+  // `assigned_numa_node()`); when no shard in |shards| carries a NUMA node
+  // (`numa_node >= 0`), every shard is attributed to `assigned_numa_node()`
+  // and NIC selection uses the single-node behaviour.
   RaidenManagerBase(
-      size_t num_layers, size_t num_shards, size_t slice_byte_size,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<std::string> bind_ip = std::nullopt,
+      size_t num_layers, std::vector<transport::ShardInfo> shards,
+      size_t slice_byte_size, std::optional<int> local_port = std::nullopt,
+      int parallelism = 1, std::optional<std::string> bind_ip = std::nullopt,
       std::vector<int> numa_nodes = {},
-      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
-      std::vector<transport::ShardInfo> shards = {});
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses());
 
   ~RaidenManagerBase() override;
 

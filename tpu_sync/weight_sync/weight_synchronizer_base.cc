@@ -81,6 +81,17 @@ namespace weight_sync {
 
 namespace {
 static std::atomic<size_t> global_allocated_host_dram_bytes_{0};
+
+std::vector<transport::ShardInfo> BuildDefaultShards(size_t num_shards) {
+  std::vector<transport::ShardInfo> shards;
+  shards.reserve(num_shards);
+  for (size_t sh = 0; sh < num_shards; ++sh) {
+    shards.push_back({.local_index = static_cast<int>(sh),
+                      .global_index = static_cast<int64_t>(sh),
+                      .numa_node = -1});
+  }
+  return shards;
+}
 }  // namespace
 
 WeightSynchronizerBase::WeightSynchronizerBase(
@@ -89,13 +100,11 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
     bool auto_h2d)
     : tpu_raiden::RaidenManagerBase(
-          layer_buffers.size(),
-          layer_buffers.empty() ? 0 : layer_buffers[0].size(),
+          layer_buffers.size(), raiden::DetectShards(layer_buffers),
           layer_buffers.empty() ? 0
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip,
-          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses(),
-          raiden::DetectShards(layer_buffers)),
+          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses()),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),
@@ -252,10 +261,11 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     std::vector<int> numa_nodes, std::vector<HostNicAddress> host_nics,
     std::vector<transport::ShardInfo> shards)
     : tpu_raiden::RaidenManagerBase(
-          num_layers, num_shards,
+          num_layers,
+          shards.size() == num_shards ? std::move(shards)
+                                      : BuildDefaultShards(num_shards),
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
-          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics),
-          std::move(shards)),
+          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics)),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),

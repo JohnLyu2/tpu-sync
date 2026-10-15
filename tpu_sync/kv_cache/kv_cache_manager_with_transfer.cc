@@ -313,8 +313,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
     int parallelism, HostBufferAllocator host_allocator, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::optional<int> assigned_numa_node,
-    std::shared_ptr<MetricsCollector> metrics_collector)
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerWithTransfer(
           std::make_unique<kv_cache::KVCacheManagerBase>(
               layer_buffers, local_port,
@@ -325,8 +324,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
                                   : std::nullopt,
               dimensions,
               physical_size > 0 ? std::make_optional(physical_size)
-                                : std::nullopt,
-              assigned_numa_node),
+                                : std::nullopt),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
           std::move(metrics_collector)) {}
 
