@@ -312,6 +312,7 @@ cc_library(
 cc_library(
     name = "kv_cache_manager_with_transfer",
     srcs = [
+        "data_connection_policy.cc",
         "kv_cache_manager_with_transfer.cc",
         "reshard_receive_session.cc",
         "reshard_send_session.cc",
@@ -319,6 +320,7 @@ cc_library(
         "transfer_send_session.cc",
     ],
     hdrs = [
+        "data_connection_policy.h",
         "kv_cache_manager_with_transfer.h",
         "reshard_receive_session.h",
         "reshard_send_session.h",
@@ -472,9 +474,35 @@ cc_test(
         ":kv_cache_manager_base",
         ":kv_cache_manager_with_transfer",
         ":pool_layout",
+        "//tpu_sync/core:staging_arena",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport:block_transport",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "data_connection_policy_test",
+    size = "small",
+    srcs = ["data_connection_policy_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":kv_cache_manager_with_transfer",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -495,10 +523,12 @@ cc_test(
         ":kv_cache_manager_base",
         ":kv_cache_manager_with_transfer",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/transport:block_transport",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",
