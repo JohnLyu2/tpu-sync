@@ -74,6 +74,7 @@ cc_library(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/status:status_macros",
     ],
 )
 
@@ -482,6 +483,7 @@ cc_library(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/status:status_macros",
     ],
 )
 
@@ -517,6 +519,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",

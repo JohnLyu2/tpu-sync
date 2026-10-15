@@ -707,11 +707,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
              double test_only_simulated_ingress_gbps) {
-            return WeightSynchronizer::test_only_create_cpu_instance(
-                num_layers, num_shards, slice_byte_size, local_port,
-                parallelism, listener_port, bind_ip, auto_h2d,
-                global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+            return xla::ValueOrThrow(
+                WeightSynchronizer::test_only_create_cpu_instance(
+                    num_layers, num_shards, slice_byte_size, local_port,
+                    parallelism, listener_port, bind_ip, auto_h2d,
+                    global_shard_indices, test_only_simulated_egress_gbps,
+                    test_only_simulated_ingress_gbps));
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
@@ -730,11 +731,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
              double test_only_simulated_ingress_gbps) {
-            return WeightSynchronizer::test_only_create_cpu_instance(
-                num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-                parallelism, listener_port, bind_ip, auto_h2d,
-                global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+            return xla::ValueOrThrow(
+                WeightSynchronizer::test_only_create_cpu_instance(
+                    num_layers, num_shards, std::move(slice_byte_sizes),
+                    local_port, parallelism, listener_port, bind_ip, auto_h2d,
+                    global_shard_indices, test_only_simulated_egress_gbps,
+                    test_only_simulated_ingress_gbps));
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),

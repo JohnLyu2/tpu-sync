@@ -24,7 +24,6 @@
 #include <iterator>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,7 +37,9 @@
 #include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -84,11 +85,9 @@ static std::atomic<size_t> global_allocated_host_dram_bytes_{0};
 
 WeightSynchronizerBase::WeightSynchronizerBase(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
-    std::optional<int> local_port,
-    std::optional<std::vector<const uint8_t*>> external_host_ptrs,
-    bool unsafe_skip_buffer_lock, int parallelism,
-    std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    std::vector<std::string> layer_names, bool auto_h2d)
+    std::optional<int> local_port, int parallelism,
+    std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
+    bool auto_h2d)
     : tpu_raiden::RaidenManagerBase(
           layer_buffers.size(),
           layer_buffers.empty() ? 0 : layer_buffers[0].size(),
@@ -110,9 +109,14 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   } else {
     layer_names_ = std::move(layer_names);
   }
+}
 
+absl::Status WeightSynchronizerBase::InitDeviceBuffers(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+    const std::optional<std::vector<const uint8_t*>>& external_host_ptrs,
+    std::optional<int> listener_port) {
   if (num_layers_ == 0 || num_shards_ == 0) {
-    return;
+    return absl::OkStatus();
   }
 
   const auto& first_handle = layer_buffers[0][0];
@@ -149,8 +153,11 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     const auto& dst_buffers = layer_buffers[layer_idx];
     if (dst_buffers.size() != num_shards_) {
-      throw std::runtime_error(
-          "Number of shards mismatch across layers during weight sync init");
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Number of shards mismatch across layers during weight sync init: "
+          "layer ",
+          layer_idx, " has ", dst_buffers.size(), " shards, expected ",
+          num_shards_));
     }
 
     LayerInfoBase layer_info;
@@ -169,11 +176,13 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           shard_info.device_size +
           absl::GetFlag(FLAGS_raiden_weight_sync_host_buffer_scratchpad_size);
       if (external_host_ptrs.has_value()) {
-        if (shard_idx < external_host_ptrs->size()) {
-          shard_info.host_ptr = (*external_host_ptrs)[shard_idx];
-        } else {
-          throw std::invalid_argument("External host pointers size mismatch");
+        if (shard_idx >= external_host_ptrs->size()) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("External host pointers size mismatch: got ",
+                           external_host_ptrs->size(), " pointers for ",
+                           num_layers_ * num_shards_, " shards"));
         }
+        shard_info.host_ptr = (*external_host_ptrs)[shard_idx];
         shard_info.host_size = alloc_size;
         shard_idx++;
       } else {
@@ -190,8 +199,10 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           if (shard_info.host_ptr == nullptr) {
             void* ptr = nullptr;
             if (posix_memalign(&ptr, 64, alloc_size) != 0) {
-              throw std::runtime_error(
-                  "Failed to allocate host weights buffer");
+              return absl::ResourceExhaustedError(
+                  absl::StrCat("Failed to allocate ", alloc_size,
+                               " byte host weights buffer for layer ",
+                               layer_idx, " shard ", i));
             }
             std::memset(ptr, 0, alloc_size);
             shard_info.owned_host_buffer =
@@ -229,6 +240,86 @@ WeightSynchronizerBase::WeightSynchronizerBase(
                    host_allocator ? MakeHostBufferAllocator(host_allocator)
                                   : MakeDefaultHostBufferAllocator());
 
+  FinishInit(listener_port);
+  return absl::OkStatus();
+}
+
+WeightSynchronizerBase::WeightSynchronizerBase(
+    size_t num_layers, size_t num_shards,
+    const std::vector<size_t>& slice_byte_sizes, std::optional<int> local_port,
+    int parallelism, std::optional<std::string> bind_ip,
+    std::vector<std::string> layer_names, bool auto_h2d,
+    std::vector<int> numa_nodes, std::vector<HostNicAddress> host_nics,
+    std::vector<transport::ShardInfo> shards)
+    : tpu_raiden::RaidenManagerBase(
+          num_layers, num_shards,
+          slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
+          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics),
+          std::move(shards)),
+      auto_h2d_(auto_h2d),
+      push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max(parallelism_, 4))),
+      shard_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
+          std::max<size_t>(num_shards_, 1))) {
+  if (layer_names.empty()) {
+    layer_names_.reserve(num_layers_);
+    for (size_t i = 0; i < num_layers_; ++i) {
+      layer_names_.push_back(absl::StrCat("weights_", i));
+    }
+  } else {
+    layer_names_ = std::move(layer_names);
+  }
+}
+
+absl::Status WeightSynchronizerBase::InitHostBuffers(
+    const std::vector<size_t>& slice_byte_sizes,
+    std::optional<int> listener_port) {
+  physical_size_ = slice_byte_size_;
+  shard_factor_ = 1;
+  major_dim_size_ = 1;
+
+  std::vector<LayerInfoBase> layers;
+  layers.reserve(num_layers_);
+  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+    size_t current_slice_byte_size = (layer_idx < slice_byte_sizes.size())
+                                         ? slice_byte_sizes[layer_idx]
+                                         : slice_byte_size_;
+    LayerInfoBase layer_info;
+    layer_info.shards.reserve(num_shards_);
+
+    for (size_t i = 0; i < num_shards_; ++i) {
+      ShardBufferInfoBase shard_info;
+      shard_info.device_size = current_slice_byte_size;
+
+      size_t alloc_size =
+          current_slice_byte_size +
+          absl::GetFlag(FLAGS_raiden_weight_sync_host_buffer_scratchpad_size);
+      void* ptr = nullptr;
+      if (alloc_size > 0) {
+        if (posix_memalign(&ptr, 64, alloc_size) != 0) {
+          return absl::ResourceExhaustedError(absl::StrCat(
+              "Failed to allocate ", alloc_size,
+              " byte host weights buffer for layer ", layer_idx, " shard ", i));
+        }
+        std::memset(ptr, 0, alloc_size);
+      }
+      shard_info.owned_host_buffer =
+          std::unique_ptr<uint8_t[], void (*)(void*)>(
+              static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
+      shard_info.host_ptr = shard_info.owned_host_buffer.get();
+      shard_info.host_size = alloc_size;
+
+      layer_info.shards.push_back(std::move(shard_info));
+    }
+    layers.push_back(std::move(layer_info));
+  }
+  layers_ = StagingArena(std::move(layers), MakeDefaultHostBufferAllocator());
+
+  FinishInit(listener_port);
+  return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::FinishInit(std::optional<int> listener_port) {
   if (listener_port) {
     listener_ =
         std::make_unique<WeightSynchronizerListener>(this, *listener_port);
@@ -254,106 +345,50 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
 }
 
-WeightSynchronizerBase::WeightSynchronizerBase(
+absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>>
+WeightSynchronizerBase::Create(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+    std::optional<int> local_port,
+    std::optional<std::vector<const uint8_t*>> external_host_ptrs,
+    bool unsafe_skip_buffer_lock, int parallelism,
+    std::optional<int> listener_port, std::optional<std::string> bind_ip,
+    std::vector<std::string> layer_names, bool auto_h2d) {
+  auto ws = absl::WrapUnique(new WeightSynchronizerBase(
+      layer_buffers, local_port, parallelism, std::move(bind_ip),
+      std::move(layer_names), auto_h2d));
+  ABSL_RETURN_IF_ERROR(
+      ws->InitDeviceBuffers(layer_buffers, external_host_ptrs, listener_port));
+  return ws;
+}
+
+absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>>
+WeightSynchronizerBase::Create(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
-    bool auto_h2d)
-    : WeightSynchronizerBase(num_layers, num_shards,
-                             std::vector<size_t>(num_layers, slice_byte_size),
-                             local_port, host_blocks_to_allocate, parallelism,
-                             listener_port, bind_ip, std::move(layer_names),
-                             auto_h2d) {}
+    bool auto_h2d) {
+  return Create(num_layers, num_shards,
+                std::vector<size_t>(num_layers, slice_byte_size), local_port,
+                host_blocks_to_allocate, parallelism, listener_port,
+                std::move(bind_ip), std::move(layer_names), auto_h2d);
+}
 
-WeightSynchronizerBase::WeightSynchronizerBase(
+absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>>
+WeightSynchronizerBase::Create(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
     bool auto_h2d, std::vector<int> numa_nodes,
     std::vector<HostNicAddress> host_nics,
-    std::vector<transport::ShardInfo> shards)
-    : tpu_raiden::RaidenManagerBase(
-          num_layers, num_shards,
-          slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
-          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics),
-          std::move(shards)),
-      auto_h2d_(auto_h2d),
-      push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
-          std::max(parallelism_, 4))),
-      shard_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
-          std::max<size_t>(num_shards_, 1))) {
-  if (layer_names.empty()) {
-    layer_names_.reserve(num_layers_);
-    for (size_t i = 0; i < num_layers_; ++i) {
-      layer_names_.push_back(absl::StrCat("weights_", i));
-    }
-  } else {
-    layer_names_ = std::move(layer_names);
-  }
-  physical_size_ = slice_byte_size_;
-  shard_factor_ = 1;
-  major_dim_size_ = 1;
-
-  std::vector<LayerInfoBase> layers;
-  layers.reserve(num_layers_);
-  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    size_t current_slice_byte_size = (layer_idx < slice_byte_sizes.size())
-                                         ? slice_byte_sizes[layer_idx]
-                                         : slice_byte_size_;
-    LayerInfoBase layer_info;
-    layer_info.shards.reserve(num_shards_);
-
-    for (size_t i = 0; i < num_shards_; ++i) {
-      ShardBufferInfoBase shard_info;
-      shard_info.device_size = current_slice_byte_size;
-
-      size_t alloc_size =
-          current_slice_byte_size +
-          absl::GetFlag(FLAGS_raiden_weight_sync_host_buffer_scratchpad_size);
-      void* ptr = nullptr;
-      if (alloc_size > 0) {
-        if (posix_memalign(&ptr, 64, alloc_size) != 0) {
-          throw std::runtime_error("Failed to allocate host weights buffer");
-        }
-        std::memset(ptr, 0, alloc_size);
-      }
-      shard_info.owned_host_buffer =
-          std::unique_ptr<uint8_t[], void (*)(void*)>(
-              static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
-      shard_info.host_ptr = shard_info.owned_host_buffer.get();
-      shard_info.host_size = alloc_size;
-
-      layer_info.shards.push_back(std::move(shard_info));
-    }
-    layers.push_back(std::move(layer_info));
-  }
-  layers_ = StagingArena(std::move(layers), MakeDefaultHostBufferAllocator());
-
-  if (listener_port) {
-    listener_ =
-        std::make_unique<WeightSynchronizerListener>(this, *listener_port);
-  }
-  if (auto_h2d_) {
-    h2d_pool_ =
-        std::make_unique<tpu_raiden::NumaThreadPool>(std::max(parallelism_, 4));
-  }
-
-  tiled_scratchpads_.reserve(num_shards_);
-  for (size_t i = 0; i < num_shards_; ++i) {
-    tiled_scratchpads_.push_back(std::make_unique<ShardScratchpad>());
-  }
-
-  size_t init_host_bytes = 0;
-  for (size_t i = 0; i < layers_.size(); ++i) {
-    for (const auto& shard : layers_[i].shards) {
-      init_host_bytes += shard.host_size;
-    }
-  }
-  if (init_host_bytes > 0) {
-    UpdateAllocatedOccupancyMetric(init_host_bytes);
-  }
+    std::vector<transport::ShardInfo> shards) {
+  auto ws = absl::WrapUnique(new WeightSynchronizerBase(
+      num_layers, num_shards, slice_byte_sizes, local_port, parallelism,
+      std::move(bind_ip), std::move(layer_names), auto_h2d,
+      std::move(numa_nodes), std::move(host_nics), std::move(shards)));
+  ABSL_RETURN_IF_ERROR(ws->InitHostBuffers(slice_byte_sizes, listener_port));
+  return ws;
 }
 
 std::optional<int> WeightSynchronizerBase::listener_port() const {

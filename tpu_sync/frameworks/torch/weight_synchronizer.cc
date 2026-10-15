@@ -25,6 +25,7 @@
 
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
@@ -65,10 +66,13 @@ absl::StatusOr<std::unique_ptr<WeightSynchronizer>> WeightSynchronizer::Create(
           "WeightSynchronizer::Create: device_tensors yielded no layer "
           "buffers");
     }
-    auto base = std::make_unique<weight_sync::WeightSynchronizerBase>(
-        unpacked.buffers, local_port, /*external_host_ptrs=*/std::nullopt,
-        unsafe_skip_buffer_lock, parallelism, listener_port, std::move(bind_ip),
-        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+    ABSL_ASSIGN_OR_RETURN(
+        std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
+        weight_sync::WeightSynchronizerBase::Create(
+            unpacked.buffers, local_port, /*external_host_ptrs=*/std::nullopt,
+            unsafe_skip_buffer_lock, parallelism, listener_port,
+            std::move(bind_ip), /*layer_names=*/std::vector<std::string>{},
+            auto_h2d));
     if (global_shard_indices.has_value()) {
       base->SetGlobalShardIndices(*std::move(global_shard_indices));
     }
@@ -125,29 +129,8 @@ void WeightSynchronizer::UnbindWeights() {
 }
 
 WeightSynchronizer::WeightSynchronizer(
-    size_t num_layers, size_t num_shards, size_t slice_byte_size,
-    std::optional<int> local_port, int parallelism,
-    std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices)
-    : WeightSynchronizer(num_layers, num_shards,
-                         std::vector<size_t>(num_layers, slice_byte_size),
-                         local_port, parallelism, listener_port,
-                         std::move(bind_ip), auto_h2d,
-                         std::move(global_shard_indices)) {}
-
-WeightSynchronizer::WeightSynchronizer(
-    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
-    std::optional<int> local_port, int parallelism,
-    std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices) {
-  base_ = std::make_unique<weight_sync::WeightSynchronizerBase>(
-      num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-      /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
-      std::move(bind_ip), /*layer_names=*/std::vector<std::string>{}, auto_h2d);
-  if (global_shard_indices.has_value()) {
-    base_->SetGlobalShardIndices(*std::move(global_shard_indices));
-  }
-}
+    std::unique_ptr<weight_sync::WeightSynchronizerBase> base)
+    : base_(std::move(base)) {}
 
 WeightSynchronizer::~WeightSynchronizer() = default;
 
@@ -245,7 +228,7 @@ void WeightSynchronizer::test_only_set_bandwidth_limit(
                                  std::move(ingress_limiter));
 }
 
-std::unique_ptr<WeightSynchronizer>
+absl::StatusOr<std::unique_ptr<WeightSynchronizer>>
 WeightSynchronizer::test_only_create_cpu_instance(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, int parallelism,
@@ -260,7 +243,7 @@ WeightSynchronizer::test_only_create_cpu_instance(
       test_only_simulated_ingress_gbps);
 }
 
-std::unique_ptr<WeightSynchronizer>
+absl::StatusOr<std::unique_ptr<WeightSynchronizer>>
 WeightSynchronizer::test_only_create_cpu_instance(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, int parallelism,
@@ -268,10 +251,17 @@ WeightSynchronizer::test_only_create_cpu_instance(
     bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
     double test_only_simulated_egress_gbps,
     double test_only_simulated_ingress_gbps) {
-  auto ws = std::make_unique<WeightSynchronizer>(
-      num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-      parallelism, listener_port, std::move(bind_ip), auto_h2d,
-      std::move(global_shard_indices));
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
+      weight_sync::WeightSynchronizerBase::Create(
+          num_layers, num_shards, std::move(slice_byte_sizes), local_port,
+          /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
+          std::move(bind_ip), /*layer_names=*/std::vector<std::string>{},
+          auto_h2d));
+  if (global_shard_indices.has_value()) {
+    base->SetGlobalShardIndices(*std::move(global_shard_indices));
+  }
+  auto ws = absl::WrapUnique(new WeightSynchronizer(std::move(base)));
   if (test_only_simulated_egress_gbps > 0.0 ||
       test_only_simulated_ingress_gbps > 0.0) {
     ws->test_only_set_bandwidth_limit(test_only_simulated_egress_gbps,

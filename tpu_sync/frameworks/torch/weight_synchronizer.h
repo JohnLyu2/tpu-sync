@@ -77,21 +77,6 @@ class WeightSynchronizer {
   // D2H/H2D/push is in flight.
   void UnbindWeights();
 
-  // CPU / Mock metadata constructor for tests without PJRT TPU devices
-  WeightSynchronizer(
-      size_t num_layers, size_t num_shards, size_t slice_byte_size,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
-  WeightSynchronizer(
-      size_t num_layers, size_t num_shards,
-      std::vector<size_t> slice_byte_sizes,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
-
   ~WeightSynchronizer();
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
@@ -125,7 +110,10 @@ class WeightSynchronizer {
   void test_only_set_bandwidth_limit(double test_only_simulated_egress_gbps,
                                      double test_only_simulated_ingress_gbps);
 
-  static std::unique_ptr<WeightSynchronizer> test_only_create_cpu_instance(
+  // Creates a CPU-only (no PJRT device buffers) synchronizer for tests and
+  // remote workers; see WeightSynchronizerBase::Create for failure modes.
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizer>>
+  test_only_create_cpu_instance(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
@@ -134,7 +122,8 @@ class WeightSynchronizer {
       double test_only_simulated_egress_gbps = 0.0,
       double test_only_simulated_ingress_gbps = 0.0);
 
-  static std::unique_ptr<WeightSynchronizer> test_only_create_cpu_instance(
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizer>>
+  test_only_create_cpu_instance(
       size_t num_layers, size_t num_shards,
       std::vector<size_t> slice_byte_sizes,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
@@ -145,6 +134,10 @@ class WeightSynchronizer {
       double test_only_simulated_ingress_gbps = 0.0);
 
  private:
+  // Used by test_only_create_cpu_instance(); adopts an already constructed
+  // |base|.
+  explicit WeightSynchronizer(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase> base);
 #ifndef WITHOUT_PYTHON
   // Used by Create(); adopts an already constructed |base| and the
   // |buffer_refs| that pin the bound device tensors.

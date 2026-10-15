@@ -35,6 +35,8 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -190,7 +192,7 @@ void PackIpToInt32s(absl::string_view ip_str, int32_t* dst) {
 // the same physical host. In multi-device/multi-host JAX topologies (`pjit`),
 // multiple local ranks initialize FFI targets independently. Sharing the
 // instance avoids re-binding the same socket (`Address already in use`).
-static WeightSynchronizerBase* GetSharedWs(
+static absl::StatusOr<WeightSynchronizerBase*> GetSharedWs(
     int32_t shard_idx, int32_t listener_port, int32_t num_layers,
     int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
     int32_t local_port, int32_t num_shards, int32_t local_slot = -1,
@@ -229,10 +231,14 @@ static WeightSynchronizerBase* GetSharedWs(
           data_nics[local_submanager_idx % data_nics.size()].ip_address;
     }
 
-    ws = new WeightSynchronizerBase(
-        static_cast<size_t>(num_layers), static_cast<size_t>(num_shards),
-        slice_byte_sizes, opt_local_port, std::nullopt, parallelism,
-        opt_listener_port, sub_bind_ip);
+    // Shared instances are intentionally never freed (see ClearSharedWsMap).
+    ABSL_ASSIGN_OR_RETURN(
+        std::unique_ptr<WeightSynchronizerBase> created,
+        WeightSynchronizerBase::Create(
+            static_cast<size_t>(num_layers), static_cast<size_t>(num_shards),
+            slice_byte_sizes, opt_local_port, std::nullopt, parallelism,
+            opt_listener_port, sub_bind_ip));
+    ws = created.release();
   }
   auto& slot_map = (*ws_shard_to_slot_map)[ws];
   size_t assigned_slot;
@@ -351,9 +357,15 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
         << ", Submanager: " << submanager_idx
         << ", Global Shard: " << global_shard_idx;
 
-    g_weight_synchronizers[shard_idx] = GetSharedWs(
+    absl::StatusOr<WeightSynchronizerBase*> shared_ws = GetSharedWs(
         shard_idx, listener_port, num_layers, parallelism, slice_byte_sizes,
         local_port, num_shards, local_slot, submanager_idx, global_shard_idx);
+    if (!shared_ws.ok()) {
+      return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
+                             "Failed to create WeightSynchronizerBase: " +
+                                 std::string(shared_ws.status().message()));
+    }
+    g_weight_synchronizers[shard_idx] = *shared_ws;
 
     // Allocate the StreamExecutor Stream once per shard, and cache E2E!
     int64_t dev_id = static_cast<int64_t>(shard_idx);
@@ -465,10 +477,16 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
         << ", Submanager: " << submanager_idx
         << ", Global Shard: " << global_shard_idx;
 
-    g_weight_synchronizers[shard_idx] =
+    absl::StatusOr<WeightSynchronizerBase*> shared_ws =
         GetSharedWs(shard_idx, listener_port, num_layers, parallelism,
                     slice_byte_sizes, local_port, num_shards, local_slot_in,
                     submanager_idx, global_shard_idx);
+    if (!shared_ws.ok()) {
+      return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
+                             "Failed to create WeightSynchronizerBase: " +
+                                 std::string(shared_ws.status().message()));
+    }
+    g_weight_synchronizers[shard_idx] = *shared_ws;
 
     int64_t dev_id = static_cast<int64_t>(shard_idx);
     auto platform_or =
