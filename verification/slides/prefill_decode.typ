@@ -291,7 +291,7 @@
 
 // ---------------------------------------------------------------------------
 #slide[Modeling state: module hierarchy & layer-indexed memories][
-  The Lean formalization builds the system state in four core layers from top-level requests down to primitive session locks (plus companion modules `BlockOrdering`, `UuidTable`, `PeerIsolation`, `ReceivePoll`, and `PipelineChecks`):
+  The model builds the system state in four composable layers, from concurrent requests down to the shared session settle protocol:
 
   #v(0.3em)
   #cols(columns: (0.85fr, 1.45fr))[
@@ -316,66 +316,121 @@
   ][
     #table(
       columns: (auto, 1fr),
-      inset: (x: 8pt, y: 7pt),
-      table.header[Layer][State represented in the model],
+      inset: (x: 8pt, y: 8pt),
+      table.header[Layer][Role in the state hierarchy],
       [*`MultiRequest`*], [
-        #set list(spacing: 0.55em)
-        - `reqs : List Pipeline` (stream of concurrent requests)
-        - Cross-request buffer recycling & write-release detection
+        Stream of concurrent/overlapped transfers (`reqs : List Pipeline`) sharing HBM and host staging pools; tracks post-release writes (`wroteReleased`).
       ],
       [*`Pipeline`*], [
-        #set list(spacing: 0.55em)
-        - 5 memories of length $L$ (`List Cell` per layer)
-        - `Cell` is `.kv l` (valid layer $l$), `.blank`, or `.junk`
+        One end-to-end transfer: embeds `Send` + `Receive`, the 5 layer-indexed memories (`List Cell` of length $L$), and per-layer completion flags.
       ],
       [*`Send`* /\ *`Receive`*], [
-        #set list(spacing: 0.55em)
-        - Counters for active DMA copies, pushes, and pool tasks
-        - Tracks mutex-drop windows and completion callbacks
+        Per-session scalar counters for active DMA copies, TCP pushes, and mutex-drop windows (`TransferSendSession` / `TransferReceiveSession`).
       ],
       [*`Session`*], [
-        #set list(spacing: 0.55em)
-        - `inFlight` counter, `draining`, `done`, `statusOk`
-        - Settle gate: releases staging iff `inFlight == 0`
+        Shared settle state (`Lifecycle`): tracks `inFlight`, `draining`, `done`, and `hasStaging` (releases staging iff `draining && inFlight == 0`).
       ],
     )
   ]
 ]
 
 // ---------------------------------------------------------------------------
+#slide[Modeling state in Lean: structures & memories][
+  Each layer is a Lean `structure` embedding the layer below (`Session.lean` #sym.arrow.r `Pipeline.lean`):
+
+  #v(0.25em)
+  #show raw.where(block: true): set text(size: 11pt)
+  ```lean
+  -- One layer slot of a memory: .kv l (valid layer-l KV), .blank (unwritten wire), or .junk (stale / recycled)
+  inductive Cell | blank | kv (layer : Nat) | junk
+
+  -- Shared session settle state (Session.lean)
+  structure Lifecycle where
+    inFlight   : Nat  := 0
+    draining   : Bool := false
+    done       : Bool := false
+    hasStaging : Bool := true
+
+  -- Single-request pipeline state (Pipeline.lean)
+  structure Pipeline where
+    send : Send      recv : Recv
+    -- 5 fixed-length L memories (one slot per layer 0..L-1, updated in place)
+    prefillHbm     : List Cell  -- init: [kv 0, kv 1, ...]
+    prefillStaging : List Cell  -- init: [junk, junk, ...]
+    wire           : List Cell  -- init: [blank, blank, ...]
+    decodeStaging  : List Cell  -- init: [junk, junk, ...]
+    decodeHbm      : List Cell  -- init: [junk, junk, ...]
+    -- Per-Layer Bool flags (length L: tracks which specific layer l finished out of order)
+    landedL        : List Bool
+    h2dIssuedL     : List Bool  h2dReadyL : List Bool
+  ```
+]
+
+// ---------------------------------------------------------------------------
 #slide[Modeling actions: non-deterministic events & async steps][
-  We model concurrent C++ threads, DMA streams, and network callbacks as a non-deterministic transition system `step(state, event)` where any enabled event can fire next:
+  Concurrent C++ threads, DMA streams, and callbacks are modeled as a transition function `step(state, event)` where any enabled event can fire next:
 
   #v(0.4em)
   #table(
     columns: (1fr, 1fr),
     inset: (x: 10pt, y: 8.5pt),
-    table.header[*Concurrency in the C++ implementation*][*How the Lean state machine models it*],
+    table.header[*Concurrency in C++*][*How the Lean state machine models it*],
     [
       *Out-of-order async DMA & network:*\
-      D2H and H2D device futures resolve in arbitrary layer order; parallel TCP pushes arrive out of order.
+      D2H/H2D futures and parallel TCP pushes finish in arbitrary layer order.
     ],
     [
-      *Split `Issue` vs. `Ready` events:*\
-      Decouples dispatch from completion so transformer layers $0 dots L-1$ advance and complete independently.
+      *Split `Issue` vs. `Ready` events per layer $l$:*\
+      Separates dispatch from completion so layers $0 dots L-1$ finish in any order.
     ],
     [
-      *Fine-grained locking & thread handoffs:*\
-      Mutexes are dropped during blocking dispatches and re-acquired before updating session state.
+      *Mutex-drop windows:*\
+      Session locks are dropped during blocking DMA dispatches and re-acquired afterwards.
     ],
     [
-      *Explicit lock-gap states:*\
-      Models unlock/re-lock windows with intermediate ghost states (e.g., `ExecuteLayerH2d` lock gap).
+      *Explicit two-step transitions:*\
+      Splits lock–unlock–relock sequences (e.g. `h2dBegin l` #sym.arrow.r `h2dIssue l`) so events can interleave in the gap.
     ],
     [
-      *Cancellations, polls & buffer recycling:*\
-      Deadlines, peer disconnects, `poll_stats()`, and buffer reuse fire asynchronously across requests.
+      *Async timeouts, polls & buffer reuse:*\
+      Deadlines, `poll_stats()`, and allocator reuse happen concurrently with transfers.
     ],
     [
-      *Non-deterministic transitions:*\
-      Any active DMA, callback, cancellation, poll, or buffer-recycle step (`reclaim`, `reseat`, `recycle`) can fire next.
+      *Non-deterministic environment steps:*\
+      `cancel`, `pollReady`, `reclaim`, and `reseat` can fire whenever their guard is satisfied.
     ],
   )
+]
+
+// ---------------------------------------------------------------------------
+#slide[Modeling actions in Lean: events & `step` transitions][
+  `step : Pipeline → Ev → Option Pipeline` returns `none` when blocked by a guard, or `some s'` with the updated state:
+
+  #v(0.25em)
+  #show raw.where(block: true): set text(size: 11pt)
+  ```lean
+  -- Any enabled event can fire next (Pipeline.lean)
+  inductive Ev
+    | d2hReady (l : Nat) | h2hDone (l : Nat) (ok : Bool)
+    | land (l : Nat)     | h2dBegin (l : Nat)
+    | h2dIssue (l : Nat) (ok : Bool) | h2dReady (l : Nat)
+    | reclaim            | reseatDecodeStaging | ...
+
+  -- H2D copy for layer l finishes: copies decodeStaging[l] → decodeHbm[l]
+  def h2dReady (s : Pipeline) (l : Nat) : Option Pipeline :=
+    if s.h2dIssuedL[l]? = some true ∧ s.h2dReadyL[l]? = some false then
+      (Recv.step s.recv .h2dReady).map fun rcv =>
+        { s with recv := rcv,
+                 h2dReadyL := s.h2dReadyL.set l true,
+                 decodeHbm := s.decodeHbm.set l (s.decodeStaging.getD l .junk) }
+    else none
+
+  -- Released staging buffer is recycled by next request: resets decodeStaging to .junk
+  def reseatDecodeStaging (s : Pipeline) : Option Pipeline :=
+    if s.recv.life.hasStaging = false then
+      some { s with decodeStaging := List.replicate s.numLayers .junk }
+    else none
+  ```
 ]
 
 // ---------------------------------------------------------------------------
@@ -405,11 +460,11 @@
   ]
 
   #v(0.35em)
-  *Why any concurrency bug produces `decodeHbm[l] =` #cell-junk (steps firing in the wrong order):*
+  *How wrong step orderings automatically produce #cell-junk (or trip `wroteReleased`):*
   #set list(spacing: 0.45em)
-  - *Out-of-order copy (e.g. Step `4` before `3`):* `h2dReady l` runs before `land l`, reading initial #cell-junk from `decodeStaging[l]` into `decodeHbm[l]`.
-  - *Read-after-release (Step `5` before `4`):* Early `reseat` resets `decodeStaging[l]` to #cell-junk while H2D is in flight; `h2dReady l` then copies #cell-junk into `decodeHbm[l]`.
-  - *Write-after-release (Step `5` before `3`):* `land l` writes to `decodeStaging` after `reseat` released it; the model's `wroteReleased` check catches the late write and sets `decodeHbm[l]` to #cell-junk.
+  - *Out-of-order copy (Step `4` before `3`):* `h2dReady l` runs before `land l` and copies initial #cell-junk from `decodeStaging[l]` into `decodeHbm[l]`.
+  - *Read-after-release (Step `5` before `4`):* Early `reseat` overwrites `decodeStaging[l]` with #cell-junk while H2D is still in flight; `h2dReady l` then copies #cell-junk into `decodeHbm[l]`.
+  - *Write-after-release (Step `5` before `3`):* `land l` arrives after `reseat` released `decodeStaging`, tripping `wroteReleased` and corrupting the buffer to #cell-junk.
 ]
 
 
@@ -542,102 +597,68 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Plan & discussion][
-  #v(0.3em)
-  #let title-card(num, title) = block(
-    fill: luma(247),
-    stroke: 0.6pt + luma(220),
-    radius: 4pt,
-    inset: (x: 14pt, y: 12pt),
-    width: 100%,
-  )[
-    #text(fill: accent, weight: "medium", size: 15.5pt)[#num · #title]
-  ]
-
-  #let disc-card(num, title, body) = block(
-    fill: luma(247),
-    stroke: 0.6pt + luma(220),
-    radius: 4pt,
-    inset: (x: 14pt, y: 13pt),
-    width: 100%,
-  )[
-    #text(fill: accent, weight: "medium", size: 15.5pt)[#num · #title]
-    #v(0.5em)
-    #set text(size: 13.5pt)
-    #set par(leading: 0.55em)
-    #set list(spacing: 0.75em)
-    #body
-  ]
-
-  #stack(
-    spacing: 0.85em,
-    title-card[1][Extend the formalization: reshard, KV cache storage & lower-level transport (`RawBufferTransport`)],
-    title-card[2][Bug hunting & fixes],
-    disc-card[3][Discussion with the team: how can the Lean model help day-to-day?][
-      - *Developer understanding:* Does the state-machine view and explicit invariants help engineers build a clearer mental model of the C++ protocol?
-      - *Code changes & new features:* Can the model help the team reason about subtle refactors and design new transfer features safely?
-      - *AI-assisted coding workflows:* As we work with AI coding agents, can the Lean model serve as an executable spec and guardrail in that workflow?
-    ],
-  )
-]
-
-// ---------------------------------------------------------------------------
-#slide[Case study: per-peer staging admission at `StartRead`][
+#slide[Case study: removing the extra `IsReadyToComplete` check][
   #v(0.3em)
   #set text(size: 14pt)
   #set par(leading: 0.65em)
-  #set list(spacing: 0.8em)
+  #set list(spacing: 0.75em)
 
-  *1. The problem: one unresponsive peer starves all staging buffers*
-  - To start a KV read, the decode worker must reserve a host staging buffer *up front* and hold it until the transfer finishes draining.
-  - With first-come-first-served allocation, a single hung prefill peer ties up *all* staging buffers—causing new reads from *healthy peers* to be rejected immediately.
-
-  #v(0.4em)
-  *2. Why it matters: fleet-wide availability*
-  - Even with async gRPC handshakes and timeouts, one unresponsive prefill worker can exhaust staging memory on the decode host and block transfers from the entire prefill fleet.
+  *1. The extra check*
+  - `TransferReceiveSession` has two completion paths: the last H2D callback (like `TransferSendSession`), *plus* an external poll check `IsReadyToComplete()`.
+  - *Question:* Does the poll check ever speed up completion or cover a case the callbacks miss — and can we remove it safely?
 
   #v(0.4em)
-  *3. The solution: per-peer staging limit*
-  - Cap how many staging buffers any single remote peer can hold at once, reserving the remaining buffers in the pool for healthy peers.
-  - Re-enables and passes the team's parked `SickPeerStarvesStagingSlotsForHealthyPeer` acceptance test.
+  *2. How the Lean model helped (`ReceivePoll.lean`)*
+  - *Proved redundant for progress:* Even when `IsReadyToComplete()` fires early, the session still waits for the last in-flight callback (`in_flight_ > 0`); all safety and liveness theorems hold without it.
+  - *Found a hidden metrics bug:* When the poll wins the narrow race before the last callback runs, it sets `draining_` early and causes the callback to silently skip recording transfer metrics.
+  - *Caught the one edge case:* Proving liveness without the poll exposed `num_layers == 0` (where no callback runs), showing we only need to finish 0-layer receives at creation.
+
+  #v(0.4em)
+  *3. Result*
+  - Safely removes the poll check and its bookkeeping state while fixing the metrics race.
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Why the fix is subtle — and how the Lean model helped][
-  Even a simple "per-peer limit" has subtle interactions with memory safety, thread pools, and cancellation paths:
+#slide[Lean-backed AI agent (`raiden-lean-helper`)][
+  #v(0.3em)
+  #set text(size: 14.5pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 0.85em)
 
-  #v(0.6em)
-  #table(
-    columns: (0.95fr, 1.05fr),
-    inset: (x: 10pt, y: 11pt),
-    align: (left + horizon, left + horizon),
-    table.header[*Why the fix is tricky*][*How the Lean model helped*],
-    [
-      *1. Timeouts cannot free buffers immediately*\
-      A timed-out or cancelled read cannot free its staging buffer right away—if the peer is still sending, freeing early would corrupt memory.
-    ],
-    [
-      *Ruled out unsafe shortcuts*\
-      Showed that buffers must stay pinned until a session fully drains, proving that an *up-front per-peer limit* is the only safe fix.
-    ],
-    [
-      *2. Two shared pools must work together*\
-      Every read needs both a *handshake thread* and a *staging buffer*; fixing only one still lets a wedged peer block healthy peers.
-    ],
-    [
-      *Proved end-to-end progress*\
-      Modeled both resource pools together and proved that combining async gRPC with a per-peer buffer limit guarantees healthy reads complete.
-    ],
-    [
-      *3. Counter bugs on cancel & error paths*\
-      Reads can end via normal completion, timeout, cancel, or network error; a single missed decrement permanently locks out a peer.
-    ],
-    [
-      *Guided a leak-free C++ design*\
-      Tied the per-peer count directly to buffer ownership in the allocator (rather than session callbacks) so the count can never drift.
-    ],
+  A subagent that lets engineers and coding agents query the Lean formalization in plain English:
+
+  #v(0.2em)
+  *What it does*
+  - *Codebase & concurrency Q&A:* Explains how session lifecycles, lock windows, and buffer ownership work, backed by proved theorems and C++ citations.
+  - *"What-if" & code-change checks:* Checks whether a proposed C++ change preserves the model's invariants — or returns a concrete C++ thread-interleaving counterexample.
+
+  #v(0.3em)
+  *Benefits*
+  - *Machine-checked guarantees:* Instead of relying on ad-hoc C++ code inspection, answers and code-change checks are grounded in formal proofs and exhaustive state search across *all* concurrency schedules.
+  - *No Lean expertise needed:* Engineers get formal verification guarantees and concrete counterexample traces directly in C++ terms without needing to read or write Lean.
+]
+
+// ---------------------------------------------------------------------------
+#slide[Plan & discussion][
+  #v(1.4em)
+  #let item(num, title) = block(
+    stroke: (left: 3pt + accent),
+    inset: (left: 14pt, y: 6pt),
+  )[
+    #text(fill: accent, weight: "medium", size: 19pt)[#num · ]
+    #text(weight: "medium", size: 19pt)[#title]
+  ]
+
+  #stack(
+    spacing: 1.8em,
+    item[1][Extend the formalization: reshard, KV cache storage & lower-level transport],
+    item[2][Everyday agent use],
+    item[3][Lean model maintenance],
   )
 ]
+
+
+
 
 
 
