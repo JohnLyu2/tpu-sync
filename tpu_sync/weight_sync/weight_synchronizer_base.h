@@ -29,6 +29,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
@@ -337,6 +338,30 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
   virtual void DrainPendingH2d();
 
+  // Hooks around the device copy of a fully received transfer ("hooked H2D").
+  //
+  // TODO(justinlu): Remove these temporary hooks once H2D is invoked directly
+  // by the controller instead of automatically upon transfer receipt.
+  //
+  // With auto_h2d=false the synchronizer normally only records a transfer as
+  // complete once it has landed in host staging; nothing is written to device
+  // until an explicit H2d(). Registering either hook changes that: once a whole
+  // transfer (OnDataReceived) or every shard of a block push
+  // (OnBlockShardsReceived) has landed, the synchronizer calls the start hook,
+  // copies all layers to device and waits for the copy, calls the end hook with
+  // the copy status, and only then records the transfer as complete, so
+  // WaitForTransferCompletion() returning means device weights are updated.
+  // Hooked H2Ds are serialized across concurrently completing transfers.
+  //
+  // The start hook must return only once it is safe to overwrite device
+  // weights (e.g. no model execution in flight); the end hook is always called
+  // if the start hook was, including on failure. Hooks have no effect with
+  // auto_h2d=true and must be registered before any transfer starts.
+  void RegisterH2dStartHook(absl::AnyInvocable<void()> hook)
+      ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+  void RegisterH2dEndHook(absl::AnyInvocable<void(const absl::Status&)> hook)
+      ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+
   void ForgetPushProgress(uint64_t uuid) override;
 
  protected:
@@ -377,6 +402,20 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  private:
+  // True if RegisterH2dStartHook() or RegisterH2dEndHook() has been called.
+  bool HasH2dHooks() const ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+  // Runs the start hook, copies all layers of |uuid| to device and waits,
+  // then runs the end hook with the copy status, which is returned. Holds
+  // |h2d_hook_mu_| throughout so hooked H2Ds never overlap.
+  absl::Status HookedH2d(uint64_t uuid) ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+
+  // Guards the hooks and serializes hooked H2Ds. The destructor stops the
+  // listener and transport server (waiting for in-flight callbacks) before any
+  // member is destroyed, so a running HookedH2d() always finishes first.
+  mutable absl::Mutex h2d_hook_mu_;
+  absl::AnyInvocable<void()> h2d_start_hook_ ABSL_GUARDED_BY(h2d_hook_mu_);
+  absl::AnyInvocable<void(const absl::Status&)> h2d_end_hook_
+      ABSL_GUARDED_BY(h2d_hook_mu_);
   std::vector<int64_t> global_shard_indices_;
   std::vector<int> local_shard_indices_;
 

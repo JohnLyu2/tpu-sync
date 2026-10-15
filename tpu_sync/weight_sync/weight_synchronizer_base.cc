@@ -35,6 +35,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
@@ -1793,6 +1794,11 @@ WeightSynchronizerBase::TakeLayerFuturesWhenScheduled(uint64_t uuid) {
 }
 
 absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
+  if (!auto_h2d_ && HasH2dHooks()) {
+    // Copy to device (bracketed by the hooks) before recording completion
+    // below, so a completed transfer implies updated device weights.
+    ABSL_RETURN_IF_ERROR(HookedH2d(uuid));
+  }
   auto record_completion = [this, uuid]() {
     if (uuid > 0) {
       absl::MutexLock lock(completed_transfers_mu_);
@@ -2020,14 +2026,59 @@ bool WeightSynchronizerBase::RecordBlockPushShards(
 absl::Status WeightSynchronizerBase::OnBlockShardsReceived(
     const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
     uint64_t uuid) {
-  if (!auto_h2d_) {
+  if (!auto_h2d_ && !HasH2dHooks()) {
     return absl::OkStatus();
   }
+  // Copy to device once every shard of this push has landed. Streams that
+  // carry all shards (the default) complete immediately, i.e. one H2D per
+  // incoming push.
   if (!RecordBlockPushShards(shard_ids, uuid)) {
     return absl::OkStatus();
   }
+  if (!auto_h2d_) {
+    return HookedH2d(uuid);
+  }
   TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture h2d_future, H2d(uuid));
   return h2d_future.Await();
+}
+
+void WeightSynchronizerBase::RegisterH2dStartHook(
+    absl::AnyInvocable<void()> hook) {
+  absl::MutexLock lock(h2d_hook_mu_);
+  h2d_start_hook_ = std::move(hook);
+}
+
+void WeightSynchronizerBase::RegisterH2dEndHook(
+    absl::AnyInvocable<void(const absl::Status&)> hook) {
+  absl::MutexLock lock(h2d_hook_mu_);
+  h2d_end_hook_ = std::move(hook);
+}
+
+bool WeightSynchronizerBase::HasH2dHooks() const {
+  absl::MutexLock lock(h2d_hook_mu_);
+  return h2d_start_hook_ != nullptr || h2d_end_hook_ != nullptr;
+}
+
+absl::Status WeightSynchronizerBase::HookedH2d(uint64_t uuid) {
+  absl::MutexLock lock(h2d_hook_mu_);
+  const absl::Time start = absl::Now();
+  if (h2d_start_hook_) {
+    h2d_start_hook_();
+  }
+  const absl::Time h2d_start = absl::Now();
+  absl::Status h2d_status = [&]() -> absl::Status {
+    ABSL_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture h2d_future, H2d(uuid));
+    return h2d_future.Await();
+  }();
+  const absl::Time h2d_end = absl::Now();
+  if (h2d_end_hook_) {
+    h2d_end_hook_(h2d_status);
+  }
+  LOG(INFO) << "Hooked weight sync H2D uuid=" << uuid
+            << " status=" << h2d_status << " start_hook_ms="
+            << absl::ToDoubleMilliseconds(h2d_start - start)
+            << " h2d_ms=" << absl::ToDoubleMilliseconds(h2d_end - h2d_start);
+  return h2d_status;
 }
 
 void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
