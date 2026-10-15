@@ -163,18 +163,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Duration requested_deadline, absl::Duration hold_window,
       BlockTracker* absl_nonnull save_tracker) override;
 
-  // Asks the destination what became of an accepted offer; recovery for a
-  // source that lost its stream. `wait_ms > 0` asks it to hold the answer
-  // until the operation is terminal. Returns the raw wire response.
-  tsl::Future<proto::PollWriteRemoteResponse> PollWriteRemoteAsync(
-      const RaidenId& dst_raiden_id, uint64_t operation_id,
-      int64_t wait_ms = 0);
-
-  // Drops the cached client for `remote_id`; the next call re-resolves the
-  // peer through the registry. store_clients_ never invalidates itself, so
-  // without this a peer that restarts on a new port would stay unreachable.
-  void InvalidateStoreClient(const RaidenId& remote_id);
-
   // Composes the KVTransferSpec from the workers currently registered with
   // the RaidenController and registers it with the global registry
   // (first-wins, idempotent; see global_registry.proto). FailedPrecondition
@@ -208,6 +196,18 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   absl::StatusOr<std::shared_ptr<KVCacheStoreClient>> GetKVCacheStoreClient(
       const RaidenId& remote_id);
+
+  // Drops the cached client for `remote_id`; the next call re-resolves the
+  // peer through the registry. store_clients_ never invalidates itself, so
+  // without this a peer that restarts on a new port would stay unreachable.
+  void InvalidateStoreClient(const RaidenId& remote_id);
+
+  // Asks the destination what became of an accepted offer; recovery for a
+  // source that lost its stream. `wait_ms > 0` asks it to hold the answer
+  // until the operation is terminal. Returns the raw wire response.
+  tsl::Future<proto::PollWriteRemoteResponse> PollWriteRemoteAsync(
+      const RaidenId& dst_raiden_id, uint64_t operation_id,
+      int64_t wait_ms = 0);
 
   // Pulls blocks held by the peer `remote_id` into `device_block_ids`, in two
   // hops: a Fetch RPC that lands the bytes in host blocks allocated here, then

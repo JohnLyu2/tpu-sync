@@ -120,6 +120,11 @@ class HostOffloadBackendTest {
     absl::MutexLock lock(backend.mutex_);
     return backend.lru_cache_.GetEvictCandidateKeys();
   }
+
+  static void InvalidateStoreClient(HostOffloadBackend& backend,
+                                    const RaidenId& remote_id) {
+    backend.InvalidateStoreClient(remote_id);
+  }
 };
 
 class KVCacheStoreTest {
@@ -5147,7 +5152,7 @@ TEST_F(RemoteWriteSourceTest,
   auto backend =
       std::dynamic_pointer_cast<HostOffloadBackend>(src_store->backend());
   ASSERT_NE(backend, nullptr);
-  backend->InvalidateStoreClient(dst);
+  HostOffloadBackendTest::InvalidateStoreClient(*backend, dst);
   ABSL_ASSERT_OK(client_->UnregisterStore(dst));
 
   fake_destination_.BreakActiveStreams(::grpc::Status(
