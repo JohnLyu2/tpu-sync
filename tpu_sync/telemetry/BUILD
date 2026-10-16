@@ -72,6 +72,7 @@ cc_test(
         ":metrics_backend",
         ":mock_metrics_backend",
         ":test_util",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",

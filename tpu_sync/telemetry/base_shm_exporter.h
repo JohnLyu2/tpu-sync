@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <string>
 
+#include "absl/log/check.h"
 #include "absl/strings/string_view.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/shm/shm_collector.h"
@@ -25,13 +26,19 @@
 
 namespace tpu_raiden::telemetry {
 
+// Default rank identifier used in shared-memory segment filenames when
+// `ExporterOptions::local_rank` is unset (e.g., store-level coordinator
+// processes).
+inline constexpr absl::string_view kDefaultShmSegmentRank = "store";
+
 // Base class for multi-process shared-memory telemetry exporters.
 // Manages an underlying ShmWriter for low-overhead metric publishing and an
 // ShmCollector for multi-worker aggregation.
 //
 // Preconditions:
-// Requires valid local_rank (via options.local_rank) and shm_dir (via
-// options.shm_dir). Fails fast with CHECK if either is missing or invalid.
+// Requires valid shm_dir (via options.shm_dir) and, when options.local_rank is
+// provided, a valid non-negative integer rank string. Fails fast with CHECK if
+// shm_dir is missing or invalid, or if local_rank is provided and invalid.
 // Trailing slashes in shm_dir are stripped; the root path "/" is prohibited.
 // Note: custom_buckets is ignored by shared-memory backends in favor of fixed
 // compile-time bucket layouts (kDefaultHistogramBuckets).
@@ -53,8 +60,9 @@ class BaseShmExporter : public MetricsBackend {
   // threads. Writes directly to the memory-mapped shared segment.
   void IncrementCounter(absl::string_view name, LabelSpan labels,
                         uint64_t val) const override;
-  // Records a gauge value. Automatically attaches the "local_rank" label if not
-  // already present in caller labels.
+  // Records a gauge value. Automatically attaches the "local_rank" label for
+  // worker processes (when options.local_rank is set) unless already present in
+  // caller labels.
   void SetGauge(absl::string_view name, LabelSpan labels,
                 double val) const override;
   // Records a histogram observation. Safe for concurrent execution across
@@ -76,6 +84,7 @@ class BaseShmExporter : public MetricsBackend {
 
  private:
   MetricLabel LocalRankLabel() const {
+    DCHECK(options_.local_rank.has_value());
     return MetricLabel{metric_labels::kLocalRank, *options_.local_rank};
   }
 

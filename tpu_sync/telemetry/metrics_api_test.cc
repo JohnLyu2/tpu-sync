@@ -33,6 +33,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/match.h"
@@ -51,6 +52,7 @@ using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::IsEmpty;
+using ::testing::Not;
 using ::testing::Pair;
 using ::testing::Return;
 using ::testing::UnorderedElementsAre;
@@ -969,17 +971,48 @@ TEST_F(MetricsApiTest, InitializePrometheusWithMultiprocDirAndRankEnvironment) {
   std::filesystem::remove_all(test_dir);
 }
 
-TEST_F(MetricsApiTest, InitializeWithMultiprocDirFailsWhenLocalRankUnset) {
-  ScopedEnvironmentVariable unset_rank("LOCAL_RANK", "");
-  unsetenv("LOCAL_RANK");
-  ScopedEnvironmentVariable shm_var(kTelemetryMultiprocDirEnvVar,
-                                    testing::TempDir().c_str());
+TEST_F(MetricsApiTest, InitializeWithMultiprocDirSucceedsWhenLocalRankUnset) {
+  const std::string test_dir =
+      absl::StrCat(testing::TempDir(), "/multiproc_no_rank_", getpid());
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::create_directories(test_dir);
+  absl::Cleanup cleanup = [&] {
+    store_.SetBackends({});
+    std::filesystem::remove_all(test_dir);
+  };
 
-  absl::Status status = store_.InitializeFromBackendNames({"prometheus"});
-  EXPECT_FALSE(status.ok());
-  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
-  EXPECT_THAT(std::string(status.message()),
-              ::testing::HasSubstr("LOCAL_RANK"));
+  ScopedEnvironmentVariable unset_rank(kLocalRankEnvVar, nullptr);
+  ScopedEnvironmentVariable shm_var(kTelemetryMultiprocDirEnvVar,
+                                    test_dir.c_str());
+
+  ASSERT_OK(store_.InitializeFromBackendNames({"prometheus"}));
+  EXPECT_TRUE(store_.HasBackends());
+
+  const MetricLabel labels[] = {
+      {metric_labels::kHostIp, "10.0.0.1"},
+  };
+  store_.IncrementCounter(metric_names::kSentBytesTotal, labels, 4);
+  store_.SetGauge(metric_names::kBufferAllocatedBytes, labels, 1024.0);
+  std::string snapshot = store_.GetTextSnapshot();
+  EXPECT_THAT(
+      snapshot,
+      HasSubstr(R"(tpu_raiden_sent_bytes_total{host_ip="10.0.0.1"} 4)"));
+  EXPECT_THAT(
+      snapshot,
+      HasSubstr(
+          R"(tpu_raiden_buffer_allocated_bytes{host_ip="10.0.0.1"} 1024)"));
+  EXPECT_THAT(snapshot, Not(HasSubstr("local_rank")));
+
+  bool found_chunk = false;
+  for (const auto& entry : std::filesystem::directory_iterator(test_dir)) {
+    const std::string fn = entry.path().filename().string();
+    if (absl::StartsWith(fn, "worker_rank_store_") &&
+        absl::EndsWith(fn, "_chunk_0.mmap")) {
+      found_chunk = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_chunk);
 }
 
 TEST_F(MetricsApiTest, InitializeWithLocalRankEnvironmentVariable) {
