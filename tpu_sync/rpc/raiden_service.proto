@@ -81,7 +81,6 @@ message VariableMetadataProto {
   // holds for this variable.
   //
   // When global_shard_indices is populated:
-  // - host_subgrid (in RegisterWorkUnitRequest) is no longer necessary.
   // - mesh_axes (in RegisterWorkUnitRequest) is no longer necessary.
   // - top-level mesh_shape (in RegisterWorkUnitRequest) is no longer necessary.
   // - sharding_spec (in VariableMetadataProto) is no longer necessary.
@@ -116,9 +115,9 @@ message RegisterWorkUnitRequest {
   // Optional list of logical mesh axis names (e.g. ['fsdp', 'tp']).
   // No longer necessary when variables specify global_shard_indices.
   repeated string mesh_axes = 15;
-  // Optional ground-truth local submesh shape from JAX (mesh.local_mesh).
-  // No longer necessary when variables specify global_shard_indices.
-  repeated int64 host_subgrid = 16;
+  // Deprecated and ignored by the controller. Shard placement must be
+  // expressed via VariableMetadataProto.global_shard_indices.
+  repeated int64 host_subgrid = 16 [deprecated = true];
 }
 
 // Defines an explicit 1D linear memory push operation from a local source to a

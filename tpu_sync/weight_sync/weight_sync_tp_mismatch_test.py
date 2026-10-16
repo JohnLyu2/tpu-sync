@@ -315,11 +315,35 @@ def _build_35b_variable_protos(
   Returns:
     List of VariableMetadataProto descriptors.
   """
+  mesh_items = list(mesh_shape_dict.items())
+  total_shards = int(np.prod([size for _, size in mesh_items]))
+  phys_coords_per_shard = []
+  for j in range(total_shards):
+    rem = j
+    phys_coords = {}
+    for axis, size in reversed(mesh_items):
+      phys_coords[axis] = rem % size
+      rem //= size
+    phys_coords_per_shard.append(phys_coords)
+
   protos = []
   for idx, item in enumerate(specs):
     spec_axes = item.trainer_sharding if is_trainer else item.sampler_sharding
     var_mesh_shape = _compute_var_mesh_shape(spec_axes, mesh_shape_dict)
     layout = list(range(len(item.shape) - 1, -1, -1))
+    global_shard_indices = []
+    for phys_coords in phys_coords_per_shard:
+      slice_idx = 0
+      for dim_mesh_size, axis_spec in zip(var_mesh_shape, spec_axes):
+        coord = 0
+        if axis_spec:
+          for sub_axis in axis_spec.split(","):
+            axis_name = sub_axis.strip()
+            if not axis_name:
+              continue
+            coord = coord * mesh_shape_dict[axis_name] + phys_coords[axis_name]
+        slice_idx = slice_idx * dim_mesh_size + coord
+      global_shard_indices.append(slice_idx)
     proto = raiden_service_pb2.VariableMetadataProto(
         name=item.name,
         shape=list(item.shape),
@@ -328,6 +352,7 @@ def _build_35b_variable_protos(
         item_size=item.item_size,
         layer_idx=idx,
         sharding_spec=spec_axes,
+        global_shard_indices=global_shard_indices,
     )
     protos.append(proto)
   return protos

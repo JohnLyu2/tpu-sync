@@ -50,6 +50,7 @@ py_binary(
     srcs = ["jax_pathways_mcjax_weight_sync_benchmark_runner.py"],
     deps = [
         "//tpu_sync/api/jax:weight_synchronizer_jax_py",
+        "//tpu_sync/frameworks/jax:jax_test_utils",
         "//tpu_sync/frameworks/jax:weight_synchronizer_ffi_py",
         "//tpu_sync/rpc:raiden_controller",
         "//tpu_sync/rpc:raiden_service_py_pb2",

@@ -141,7 +141,6 @@ class JobEntity:
     # Registration metadata owned by this entity.
     self.mesh_shape: Optional[list[int]] = None
     self.mesh_axes: Optional[list[str]] = None
-    self.host_subgrid: Optional[list[int]] = None
     self.layout: Optional[list[int]] = None
     self.global_shape: Optional[list[int]] = None
     self.itemsize: Optional[int] = None
@@ -485,7 +484,6 @@ class JobEntity:
       transfer_parallelism: Optional[int],
       transfer_rank: Optional[int],
       variables: Optional[list[Any]],
-      host_subgrid: Optional[list[int]],
   ) -> bool:
     """Returns True if the given registration metadata matches this entity's topology."""
     return (
@@ -501,7 +499,6 @@ class JobEntity:
         and self.transfer_parallelism == transfer_parallelism
         and self.transfer_rank == transfer_rank
         and self.variables == variables
-        and self.host_subgrid == host_subgrid
     )
 
   def update_registration(
@@ -519,7 +516,6 @@ class JobEntity:
       transfer_parallelism: Optional[int] = None,
       transfer_rank: Optional[int] = None,
       variables: Optional[list[Any]] = None,
-      host_subgrid: Optional[list[int]] = None,
       unit: Optional[RaidenId] = None,
   ) -> None:
     """Updates host registration (`unit.job_replica_id`), shards, and endpoints."""
@@ -562,7 +558,6 @@ class JobEntity:
     self.transfer_parallelism = transfer_parallelism
     self.transfer_rank = transfer_rank
     self.variables = variables
-    self.host_subgrid = host_subgrid
     if self._on_update is not None:
       self._on_update(self)
 
@@ -585,7 +580,6 @@ class JobEntity:
     )
     reg_req.mesh_shape.extend(self.mesh_shape or ())
     reg_req.mesh_axes.extend(self.mesh_axes or ())
-    reg_req.host_subgrid.extend(self.host_subgrid or ())
     reg_req.layout.extend(self.layout or ())
     reg_req.global_shape.extend(self.global_shape or ())
     for pool in self.pool_manifest or ():

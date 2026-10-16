@@ -50,7 +50,6 @@ class _VariableMetadata:
   When global_shard_indices is provided, each entry
   corresponds to the global shard index owned by the local shard at that index.
   In this mode:
-    - host_subgrid is no longer necessary.
     - mesh_axes is no longer necessary.
     - sharding_spec is no longer necessary.
     - top-level mesh_shape is no longer necessary.

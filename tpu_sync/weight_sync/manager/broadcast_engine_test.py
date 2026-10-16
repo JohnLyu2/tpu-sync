@@ -635,7 +635,9 @@ class BroadcastEngineTest(absltest.TestCase):
     ]
     self.assertLen(relay_forward_plans, 1)
     relay_plan = relay_forward_plans[0]
-    self.assertEqual(relay_plan.uuid, 42, "Relay plan must preserve final_plan.uuid")
+    self.assertEqual(
+        relay_plan.uuid, 42, "Relay plan must preserve final_plan.uuid"
+    )
 
     # Verify both shard 0 and shard 1 are present in the relay's push schedule
     self.assertIn(relay, relay_plan.shard_push_schedules)
@@ -1395,8 +1397,6 @@ class BroadcastEngineTest(absltest.TestCase):
           }
           registered_variables = {u: [src_var] for u in src_units}
           registered_mesh_shapes = {u: [4, 1] for u in src_units}
-          registered_mesh_axes = {u: ["fsdp", "context"] for u in src_units}
-          registered_host_subgrids = {u: [1, 1] for u in src_units}
         else:
           src_unit = RaidenId("trainer", "", "weights", 0)
           src_units = [src_unit]
@@ -1412,8 +1412,6 @@ class BroadcastEngineTest(absltest.TestCase):
           }
           registered_variables = {src_unit: [src_var]}
           registered_mesh_shapes = {src_unit: [4, 1]}
-          registered_mesh_axes = {src_unit: ["fsdp", "context"]}
-          registered_host_subgrids = {src_unit: [1, 1]}
 
         registered_shards.update(dst_shards)
         dst_metadata = []
@@ -1431,7 +1429,6 @@ class BroadcastEngineTest(absltest.TestCase):
           meta.shards.extend(dst_shards[u])
           meta.mesh_shape.extend([1, 1])
           meta.mesh_axes.extend(["tp", "tp_wo"])
-          meta.host_subgrid.extend([1, 1])
           vp = meta.variables.add()
           vp.name = dst_var.name
           vp.shape.extend(dst_var.shape)
@@ -1450,8 +1447,6 @@ class BroadcastEngineTest(absltest.TestCase):
             registered_variables=registered_variables,
             registered_global_shapes={},
             registered_mesh_shapes=registered_mesh_shapes,
-            registered_mesh_axes=registered_mesh_axes,
-            registered_host_subgrids=registered_host_subgrids,
             registered_layouts={},
             registered_itemsizes={},
             registered_shards=registered_shards,

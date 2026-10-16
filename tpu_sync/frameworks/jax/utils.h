@@ -16,9 +16,7 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FRAMEWORKS_JAX_UTILS_H_
 
 #include <cstddef>
-#include <exception>
 #include <stdexcept>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -29,6 +27,9 @@
 namespace tpu_raiden {
 namespace jax {
 
+// Extracts per-layer shard buffers in `addressable_shards` natural order. This
+// is the order the Python wrapper uses to derive
+// VariableMetadataProto.global_shard_indices, so no reordering is applied.
 inline std::vector<std::vector<raiden::RaidenBufferHandle>> UnpackJaxArrays(
     const nanobind::list& jax_arrays, bool unsafe_skip_buffer_lock = false) {
   size_t num_layers = nanobind::len(jax_arrays);
@@ -48,31 +49,6 @@ inline std::vector<std::vector<raiden::RaidenBufferHandle>> UnpackJaxArrays(
     if (shard_buffers.size() != num_shards) {
       throw std::runtime_error(
           "Number of shards mismatch across layers during unpack");
-    }
-
-    try {
-      nanobind::object utils_mod = nanobind::module_::import_(
-          "tpu_sync.frameworks.jax.utils");
-      nanobind::object get_permutation_fn =
-          utils_mod.attr("get_shard_sorting_permutation");
-      nanobind::list permutation =
-          nanobind::cast<nanobind::list>(get_permutation_fn(dst));
-
-      if (nanobind::len(permutation) > 0) {
-        std::vector<raiden::RaidenBufferHandle> sorted_shard_buffers;
-        sorted_shard_buffers.reserve(num_shards);
-        for (size_t i = 0; i < num_shards; ++i) {
-          size_t src_idx = nanobind::cast<size_t>(permutation[i]);
-          if (src_idx >= shard_buffers.size()) {
-            throw std::runtime_error("Permutation index out of bounds");
-          }
-          sorted_shard_buffers.push_back(std::move(shard_buffers[src_idx]));
-        }
-        shard_buffers = std::move(sorted_shard_buffers);
-      }
-    } catch (const std::exception& e) {
-      throw std::runtime_error(std::string("Failed to sort shards: ") +
-                               e.what());
     }
 
     layer_buffers.push_back(std::move(shard_buffers));

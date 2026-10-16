@@ -15,9 +15,7 @@
 """Utilities for JAX."""
 
 import contextlib
-import logging
-import math
-from typing import Tuple
+from typing import Sequence, Tuple
 
 from absl import flags
 import jax
@@ -25,8 +23,6 @@ import jax.numpy as jnp
 import numpy as np
 
 # JAX-native open-source profiler imports loaded dynamically on export
-
-from tpu_sync.rpc import raiden_controller
 
 
 flags.DEFINE_string(
@@ -38,6 +34,73 @@ flags.DEFINE_string(
 P = jax.sharding.PartitionSpec
 Mesh = jax.sharding.Mesh
 host_sharding = None
+
+
+def global_shard_indices_for_array(
+    arr: jax.Array, shard_devices: Sequence[jax.Device]
+) -> list[int]:
+  """Returns `VariableMetadataProto.global_shard_indices` for `shard_devices`.
+
+  For each device, returns the row-major flat index of the slice it holds in
+  the variable's partition grid `mesh_shape = arr.shape // shard_shape`, which
+  is the grid the controller enumerates when it builds transfer plans.
+
+  Order contract: `shard_devices[k]` must be the device behind the work unit's
+  shard k, i.e. the k-th entry of the `shards` list registered with the
+  controller. For a McJAX multi-controller unit that is
+  `[s.device for s in arr.addressable_shards]`; for a single-controller
+  Pathways unit it is the per-listener device group taken in
+  `mesh.devices.flat` order. Replicated devices legitimately share an index.
+
+  Args:
+    arr: A sharded array whose `sharding` exposes `shard_shape` and
+      `devices_indices_map` (e.g. NamedSharding).
+    shard_devices: Devices in work-unit shard order.
+
+  Returns:
+    One flat partition-grid index per entry of `shard_devices`.
+
+  Raises:
+    ValueError: If the shard shape does not tile `arr.shape` evenly, a device
+      is not part of `arr.sharding`, or a device's slice start is not aligned
+      to the tile size.
+  """
+  global_shape = tuple(arr.shape)
+  shard_shape = tuple(arr.sharding.shard_shape(global_shape))
+  for dim, (dim_size, tile) in enumerate(zip(global_shape, shard_shape)):
+    if tile <= 0 or dim_size % tile != 0:
+      raise ValueError(
+          f'shard shape {shard_shape} does not tile array shape'
+          f' {global_shape} evenly at dim {dim}'
+      )
+  partitions_per_dim = [
+      dim_size // tile for dim_size, tile in zip(global_shape, shard_shape)
+  ]
+  device_to_slice = arr.sharding.devices_indices_map(global_shape)
+
+  indices = []
+  for device in shard_devices:
+    if device not in device_to_slice:
+      raise ValueError(
+          f'device {device} is not part of the sharding of array with shape'
+          f' {global_shape} (sharding device ids:'
+          f' {sorted(d.id for d in device_to_slice)})'
+      )
+    slice_tuple = device_to_slice[device]
+    flat_index = 0
+    for dim, (dim_slice, tile, partitions) in enumerate(
+        zip(slice_tuple, shard_shape, partitions_per_dim)
+    ):
+      start = 0 if dim_slice.start is None else dim_slice.start
+      if start % tile != 0 or start // tile >= partitions:
+        raise ValueError(
+            f'device {device} holds slice {slice_tuple} of array shape'
+            f' {global_shape}, which is not tile-aligned at dim {dim}'
+            f' (tile={tile}, partitions={partitions})'
+        )
+      flat_index = flat_index * partitions + start // tile
+    indices.append(flat_index)
+  return indices
 
 
 def get_local_shape(
@@ -179,224 +242,3 @@ def create_single_layer_kv_cache(
 
   sharded_allocate = jax.jit(_allocate, out_shardings=cache_sharding)
   return sharded_allocate()
-
-
-compute_host_subgrid = raiden_controller.compute_host_subgrid
-
-
-def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
-  """Computes the permutation to sort JAX shards for Raiden Controller."""
-  if len(arr.addressable_shards) <= 1:
-    return []
-  sharding = arr.sharding
-  if not isinstance(sharding, jax.sharding.NamedSharding):
-    return []
-
-  # Inline get_sharding_metadata logic
-  shape = arr.shape
-  layout = list(range(len(shape) - 1, -1, -1))
-  local_shard_shape = sharding.shard_shape(shape)
-  logical_mesh_shape = [g // l for g, l in zip(shape, local_shard_shape)]
-
-  mesh = sharding.mesh
-  spec = sharding.spec
-  major_to_minor = list(reversed(layout))
-
-  # 2. Compute controller's expected global indices
-  num_shards = len(arr.addressable_shards)
-  num_physical_hosts = jax.process_count()
-  replica_id = jax.process_index()
-
-  phys_mesh = [logical_mesh_shape[d] for d in major_to_minor]
-
-  use_spec_mapping = bool(spec is not None and mesh is not None)
-  if use_spec_mapping:
-    # Use physical mesh mapping (matching raiden_controller.py use_spec_mapping)
-    physical_mesh_shape = list(mesh.devices.shape)
-    devices_per_host = num_shards
-    local_subgrid = None
-    try:
-      if (
-          hasattr(mesh, "local_mesh")
-          and mesh.local_mesh is not None
-          and hasattr(mesh.local_mesh, "devices")
-      ):
-        local_subgrid = list(mesh.local_mesh.devices.shape)
-    except (AttributeError, ValueError, TypeError):
-      local_subgrid = None
-
-    if (
-        local_subgrid is not None
-        and len(local_subgrid) == len(physical_mesh_shape)
-        and math.prod(local_subgrid) == devices_per_host
-        and all(p % s == 0 for p, s in zip(physical_mesh_shape, local_subgrid))
-    ):
-      host_subgrid = local_subgrid
-      host_grid = [p // s for p, s in zip(physical_mesh_shape, host_subgrid)]
-    else:
-      host_subgrid, host_grid = compute_host_subgrid(
-          physical_mesh_shape, devices_per_host
-      )
-
-    host_coords = []
-    temp_h = replica_id
-    for size in reversed(host_grid):
-      host_coords.append(temp_h % size if size > 0 else 0)
-      temp_h //= size if size > 0 else 1
-    host_coords.reverse()
-
-    controller_global_indices = []
-    for j in range(num_shards):
-      local_coords = []
-      temp_l = j
-      for size in reversed(host_subgrid):
-        local_coords.append(temp_l % size if size > 0 else 0)
-        temp_l //= size if size > 0 else 1
-      local_coords.reverse()
-
-      phys_coords = [
-          h * s + l for h, s, l in zip(host_coords, host_subgrid, local_coords)
-      ]
-
-      tensor_coords = []
-      tensor_shape = []
-      for axis in spec:
-        if axis is None:
-          tensor_coords.append(0)
-          tensor_shape.append(1)
-        elif isinstance(axis, str):
-          tensor_coords.append(phys_coords[mesh.axis_names.index(axis)])
-          tensor_shape.append(mesh.shape[axis])
-        else:
-          sub_coord = 0
-          sub_size = 1
-          for ax in axis:
-            ax_idx = mesh.axis_names.index(ax)
-            sub_coord = (
-                sub_coord * mesh.devices.shape[ax_idx] + phys_coords[ax_idx]
-            )
-            sub_size *= mesh.shape[ax]
-          tensor_coords.append(sub_coord)
-          tensor_shape.append(sub_size)
-
-      global_idx = 0
-      stride = 1
-      for val, size in zip(reversed(tensor_coords), reversed(tensor_shape)):
-        global_idx += val * stride
-        stride *= size
-      controller_global_indices.append(global_idx)
-  else:
-    # Legacy mapping fallback
-    host_axis_logical = None
-    for d, size in enumerate(logical_mesh_shape):
-      if size == num_physical_hosts:
-        host_axis_logical = d
-        break
-    non_host_axes = [
-        d for d in range(len(logical_mesh_shape)) if d != host_axis_logical
-    ]
-
-    controller_global_indices = []
-    for j in range(num_shards):
-      local_coords = {}
-      temp = j
-      for d in reversed(non_host_axes):
-        size = logical_mesh_shape[d]
-        local_coords[d] = temp % size
-        temp = temp // size
-
-      full_coords = [0] * len(logical_mesh_shape)
-      for d in range(len(logical_mesh_shape)):
-        if d == host_axis_logical:
-          full_coords[d] = replica_id
-        else:
-          full_coords[d] = local_coords.get(d, 0)
-
-      tensor_coords = [full_coords[m_axis] for m_axis in major_to_minor]
-
-      global_idx = 0
-      stride = 1
-      for val, size in zip(reversed(tensor_coords), reversed(phys_mesh)):
-        global_idx += val * stride
-        stride *= size
-      controller_global_indices.append(global_idx)
-
-  # 3. Compute ACTUAL JAX global shard indices
-  jax_shard_global_indices = []
-  for shard in arr.addressable_shards:
-    device = shard.device
-    coords = np.argwhere(mesh.devices == device)
-    if coords.size == 0:
-      logging.warning("Device %s not found in mesh.", device)
-      return []
-    m_coords = coords[0]
-    full_coords = list(m_coords)
-
-    # Map array dimensions to mesh axes using spec
-    tensor_coords = []
-    tensor_shape = []
-    for axis in spec:
-      if axis is None:
-        tensor_coords.append(0)
-        tensor_shape.append(1)
-      elif isinstance(axis, str):
-        tensor_coords.append(full_coords[mesh.axis_names.index(axis)])
-        tensor_shape.append(mesh.shape[axis])
-      else:
-        sub_coord = 0
-        sub_size = 1
-        for ax in axis:
-          ax_idx = mesh.axis_names.index(ax)
-          sub_coord = (
-              sub_coord * mesh.devices.shape[ax_idx] + full_coords[ax_idx]
-          )
-          sub_size *= mesh.shape[ax]
-        tensor_coords.append(sub_coord)
-        tensor_shape.append(sub_size)
-
-    # Compute flat index (row-major)
-    global_idx = 0
-    stride = 1
-    for val, size in zip(reversed(tensor_coords), reversed(tensor_shape)):
-      global_idx += val * stride
-      stride *= size
-    jax_shard_global_indices.append(global_idx)
-
-  # 4. Construct permutation matching controller slots to addressable shards
-  perm = []
-  used_indices = set()
-  for j, expected_g in enumerate(controller_global_indices):
-    occurrence = controller_global_indices[:j].count(expected_g)
-    matched_idx = None
-    curr_occ = 0
-    for idx, actual_g in enumerate(jax_shard_global_indices):
-      if actual_g == expected_g:
-        if curr_occ == occurrence:
-          matched_idx = idx
-          break
-        curr_occ += 1
-    if matched_idx is None or matched_idx in used_indices:
-      logging.warning(
-          "Strict bijection failed for shard sorting: cannot map controller"
-          " slot %d (expected global index %d) to an unused JAX shard."
-          " JAX shards: %s, Controller expected: %s. Returning empty permutation."
-          " (Use global_shard_indices for non-standard mesh partitionings).",
-          j, expected_g, jax_shard_global_indices, controller_global_indices,
-      )
-      return []
-    perm.append(matched_idx)
-    used_indices.add(matched_idx)
-
-  if len(perm) != len(arr.addressable_shards) or len(used_indices) != len(
-      arr.addressable_shards
-  ):
-    logging.warning(
-        "Strict bijection failed: perm %s does not cover all %d addressable"
-        " shards. Returning empty permutation.",
-        perm, len(arr.addressable_shards),
-    )
-    return []
-
-  if perm == list(range(len(arr.addressable_shards))):
-    return []
-  return perm

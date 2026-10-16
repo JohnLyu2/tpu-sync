@@ -23,7 +23,7 @@ import ipaddress
 import os
 import socket
 import time
-from typing import Any, Optional
+from typing import Any
 
 from absl import app
 from absl import flags
@@ -35,6 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.api.jax import weight_synchronizer
+from tpu_sync.frameworks.jax import utils
 from tpu_sync.frameworks.jax import weight_synchronizer_ffi as raiden_ffi
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
@@ -222,32 +223,6 @@ def _ping_port(addr: str) -> bool:
     return False
 
 
-def _compute_global_shard_index(
-    slice_tuple: Optional[tuple[slice, ...]],
-    global_shape: abc.Sequence[int],
-    sharding_shape: abc.Sequence[int],
-) -> int:
-  """Computes canonical row-major global shard index matching nd_slice_math."""
-  if not slice_tuple:
-    return 0
-  global_idx = 0
-  stride = 1
-  for sl, g_dim, m_dim in zip(
-      reversed(slice_tuple), reversed(global_shape), reversed(sharding_shape)
-  ):
-    if m_dim > 1:
-      tile_size = g_dim // m_dim
-      start = (
-          sl.start
-          if isinstance(sl, slice) and sl.start is not None
-          else (sl if isinstance(sl, int) else 0)
-      )
-      coord = start // tile_size if tile_size > 0 else 0
-      global_idx += coord * stride
-      stride *= m_dim
-  return global_idx
-
-
 def _make_variable_tensor(
     shape: tuple[int, ...],
     sharding: jax.sharding.NamedSharding,
@@ -413,9 +388,6 @@ def run_source() -> None:
           src_mesh, jax.sharding.PartitionSpec(*src_mesh.axis_names)
       ),
   )
-  source_host_subgrid, _ = raiden_controller.compute_host_subgrid(
-      src_mesh_shape, devices_per_unit
-  )
 
   p_values = (
       [int(x) for x in FLAGS.parallelism_list]
@@ -435,7 +407,6 @@ def run_source() -> None:
       num_layers=len(src_vars),
       listener_port=0,
       num_shards=devices_per_unit,
-      host_subgrid=source_host_subgrid,
   )
   jax.block_until_ready(src_ws_info)
 
@@ -484,13 +455,9 @@ def run_source() -> None:
       local_shard_shape = sharding.shard_shape(var_shape)
       sharding_shape = [g // l for g, l in zip(var_shape, local_shard_shape)]
       layout = tuple(range(len(var_shape) - 1, -1, -1))
-      device_to_slice = sharding.devices_indices_map(var_shape)
-      global_shard_indices = [
-          _compute_global_shard_index(
-              device_to_slice.get(dev), var_shape, sharding_shape
-          )
-          for dev in task_devices
-      ]
+      global_shard_indices = utils.global_shard_indices_for_array(
+          arr, task_devices
+      )
       task_var_protos.append(
           raiden_service_pb2.VariableMetadataProto(
               name=f"var_{var_idx}",
@@ -667,13 +634,10 @@ def run_destination() -> None:
     local_shard_shape = sharding.shard_shape(var_shape)
     sharding_shape = [g // l for g, l in zip(var_shape, local_shard_shape)]
     layout = tuple(range(len(var_shape) - 1, -1, -1))
-    device_to_slice = sharding.devices_indices_map(var_shape)
-    dest_global_shard_indices = [
-        _compute_global_shard_index(
-            device_to_slice.get(s.device), var_shape, sharding_shape
-        )
-        for s in arr.addressable_shards
-    ]
+    # WeightSynchronizer shard k is arr.addressable_shards[k].
+    dest_global_shard_indices = utils.global_shard_indices_for_array(
+        arr, [s.device for s in arr.addressable_shards]
+    )
     variable_protos.append(
         raiden_service_pb2.VariableMetadataProto(
             name=f"var_{var_idx}",

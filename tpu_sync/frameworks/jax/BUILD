@@ -643,7 +643,6 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         ":_weight_synchronizer_ffi",
-        ":jax_test_utils",
         "@jax//jax",
         "@jax//jax/experimental:compute_on",
         "@pypi//numpy",
@@ -676,7 +675,6 @@ py_library(
     srcs = ["utils.py"],
     visibility = ["//visibility:public"],
     deps = [
-        "//tpu_sync/rpc:raiden_controller",
         "@com_google_absl_py//absl/flags",
         "@jax//jax",
         "@pypi//numpy",
@@ -791,6 +789,7 @@ py_test(
         "requires-viperlite:8",
     ],
     deps = [
+        ":jax_test_utils",
         ":resharding_planner",
         ":weight_synchronizer_ffi_py",
         "//tpu_sync/api/jax:weight_synchronizer_jax_py",
