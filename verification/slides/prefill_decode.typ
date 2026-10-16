@@ -471,7 +471,7 @@
 
 // ---------------------------------------------------------------------------
 #slide[Validating the model: translating unit tests to Lean][
-  To check that the Lean model faithfully captures the production C++ behavior (without over-constraining valid runs), we replay all 56 `tpu-sync` unit and E2E tests inside the model before proving general theorems:
+  To check that the Lean model faithfully captures the production C++ behavior (without over-constraining valid runs), we replay all 64 `tpu-sync` unit and E2E tests inside the model before proving general theorems:
 
   #v(0.25em)
   #let pill(title, sub) = block(
@@ -485,7 +485,7 @@
   #grid(
     columns: (1fr, auto, 1fr, auto, 1fr),
     column-gutter: 0.6em,
-    pill[1 · Production test][Tests *one* fixed schedule in C++ or Python (`56` tests total)],
+    pill[1 · Production test][Tests *one* fixed schedule in C++ or Python (`64` tests total)],
     align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
     pill[2 · Lean trace (`by decide`)][Executes that exact scenario step-by-step inside the Lean model],
     align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
@@ -524,7 +524,7 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Validating the model: 56 production tests covered in Lean][
+#slide[Validating the model: 64 production tests covered in Lean][
   #v(0.15em)
   #let cat(title, count, mod, bullets) = block(
     fill: luma(247), stroke: 0.5pt + luma(222), radius: 4pt,
@@ -546,11 +546,11 @@
     columns: (1fr, 1fr),
     column-gutter: 0.9em,
     row-gutter: 0.65em,
-    cat[1 · Session drain & leases][27 C++][`Send` / `Receive`][
+    cat[1 · Session drain & leases][33 C++][`Send` / `Receive`][
       - Mid-copy failures & deadlines wait for all in-flight DMA copies
       - Incoming TCP push leases pin host staging; first `Finish` wins
     ],
-    cat[2 · Control handshake][6 C++][`Send` / `Pipeline`][
+    cat[2 · Control handshake][8 C++][`Send` / `Pipeline`][
       - Pulls arriving ahead of `NotifyForRead` wait and succeed once registered
       - Rejects duplicate or unregistered pulls; shutdown unblocks waiters
     ],
@@ -619,7 +619,7 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Lean-backed AI agent (`raiden-lean-helper`)][
+#slide[Lean-backed AI agent (`tpu-sync-lean-helper`)][
   #v(0.3em)
   #set text(size: 14.5pt)
   #set par(leading: 0.65em)

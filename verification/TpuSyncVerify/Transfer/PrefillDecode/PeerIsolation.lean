@@ -7,27 +7,27 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 Models a decode consumer (`KVCacheManagerWithTransfer`) pulling KV caches from
 multiple prefill producers concurrently (`Peer.sick` vs. `Peer.healthy`) across
 the two finite consumer resources shared by `StartRead`
-(`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:812-908`,
-`tpu_sync/kv_cache/transfer_receive_session.cc:215-261, 495-563`,
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc:685-1090`,
-tpu-sync `1fa06d1`):
+(`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:844-948`,
+`tpu_sync/kv_cache/transfer_receive_session.cc:208-254, 514-590`,
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc:687-1151`,
+tpu-sync `0ac16d1`):
 
 1. **Host staging slots (`StagingBlockAllocator`, capacity `numSlots`):**
    `StartRead` calls `TransferReceiveSession::Create → AllocateStagingForLoad`
-   (`mgr.cc:865-873`, `recv.cc:230-242`) **before** contacting the producer,
+   (`mgr.cc:903-912`, `recv.cc:223-235`) **before** contacting the producer,
    because `PullStreamRequestSpec` sends the allocated host block IDs
-   (`dst_block_ids`) to the producer (`recv.cc:504`). The session starts at
+   (`dst_block_ids`) to the producer (`recv.cc:523`). The session starts at
    `Recv.initLoad numLayers` (`inFlight = 1, pullPending = true, hasStaging = true`)
    and holds its staging slot until `Lifecycle.settleLocked`
    (`FinishLocked` / `EndRecvOpLocked` → `ReleaseStagingLocked` →
-   `StagingBlockAllocator::ReleaseSlot`, `recv.cc:354-356, 369-373, 393-397`,
-   `mgr.cc:1296-1302`) sets `hasStaging = false` when
+   `StagingBlockAllocator::ReleaseSlot`, `recv.cc:348-350, 365-369, 412-416`,
+   `arena.cc:571-577`) sets `hasStaging = false` when
    `draining = true ∧ inFlight = 0`. If no staging slot can
    be acquired, `StartRead` immediately records the request in
-   `failed_recving_` (`mgr.cc:871`).
+   `failed_recving_` (`mgr.cc:909`).
 
 2. **Outbound handshake worker pool (`push_pool_`, capacity `poolSize`):**
-   `ExecutePullRequest` (`recv.cc:549-562`) schedules a task on `push_pool_` to
+   `ExecutePullRequest` (`recv.cc:576-589`) schedules a task on `push_pool_` to
    call `control_backend_->SendPullRequest`:
    - On `Backend.tcpBlocking` (`TcpControlPlaneBackend::SendPullRequestBlocking`,
      `SendPullRequest` → `SendPullRequestBlocking`,
@@ -63,15 +63,16 @@ tpu-sync `1fa06d1`):
 
 3. **Staging-slot starvation counterexample & per-peer quota fix
    (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`,
-   `kv_cache_manager_with_transfer_control_test.cc:1031-1090`):**
+   `kv_cache_manager_with_transfer_control_test.cc:1103-1151` (rationale comment `:1092-1102`)):**
    - Under the shipping `SlotPolicy.unboundedPerPeer`, `numSlots` wedged reads
      to `Peer.sick` exhaust `freeSlots = 0` (even if their session deadlines
      expire via `.cancel`, since `inFlight = 1` keeps their staging pinned until
      `pullReply false`). A subsequent `StartRead` to `Peer.healthy` fails slot
      allocation immediately (`trace_sick_peer_starves_staging_slots`, plus the
      bounded model check counterexample).
-   - Under `SlotPolicy.perPeerQuota maxPerPeer`
-     (`kv_cache_manager_with_transfer_control_test.cc:1039-1041`), `Peer.sick` can
+   - Under `SlotPolicy.perPeerQuota maxPerPeer` (the per-peer admission the
+     comment at `kv_cache_manager_with_transfer_control_test.cc:1100-1102` calls
+     for; no such policy exists in C++ at `0ac16d1`), `Peer.sick` can
      hold at most `maxPerPeer` slots (`reachable_sick_staging_le_quota`). Thus
      whenever `maxPerPeer < numSlots` and `Peer.healthy` has fewer than
      `min maxPerPeer (numSlots - maxPerPeer)` sessions holding staging (in particular,
@@ -95,14 +96,14 @@ inductive Peer where
   | healthy
   deriving Repr, DecidableEq
 
-/-- Control-plane handshake backend (`transfer_receive_session.cc:546-562`). -/
+/-- Control-plane handshake backend (`transfer_receive_session.cc:573-589`). -/
 inductive Backend where
   | tcpBlocking
   | grpcAsync
   deriving Repr, DecidableEq
 
-/-- Host staging slot admission policy at `StartRead` (`mgr.cc:865-873`,
-`transfer_receive_session.cc:230-242`). -/
+/-- Host staging slot admission policy at `StartRead` (`mgr.cc:903-912`,
+`transfer_receive_session.cc:223-235`). -/
 inductive SlotPolicy where
   | unboundedPerPeer
   | perPeerQuota (maxPerPeer : Nat)
@@ -154,7 +155,7 @@ structure State where
   freeWorkers : Nat
   sessions : List Entry := []
   /-- Whether a `StartRead` to `Peer.healthy` failed staging allocation up front
-  and was dropped into `failed_recving_` (`mgr.cc:871`). -/
+  and was dropped into `failed_recving_` (`mgr.cc:909`). -/
   rejectedHealthy : Bool := false
   /-- Whether a `StartRead` to `Peer.sick` failed staging allocation up front. -/
   rejectedSick : Bool := false
@@ -187,10 +188,10 @@ def allowedForPeer (p : Peer) (e : Recv.Ev) : Bool :=
     | _ => true
 
 inductive Ev where
-  /-- `StartRead` for target `peer` (`mgr.cc:812-908`). -/
+  /-- `StartRead` for target `peer` (`mgr.cc:844-948`). -/
   | startRead (peer : Peer)
   /-- `push_pool_` worker dispatches `SendPullRequest` for session `idx`
-  (`recv.cc:549-562`). -/
+  (`recv.cc:576-589`). -/
   | dispatchPull (idx : Nat)
   /-- Session `idx` takes a `Recv.Ev` step `e` (`Receive.lean`). -/
   | sessStep (idx : Nat) (e : Recv.Ev)
@@ -689,7 +690,7 @@ theorem reachable_quota_admits_healthy {cfg : Config} {s : State} {maxPerPeer : 
 
 /-! ## Concrete traces and bounded model checks (`ControlHandshakeTest`) -/
 
-/-- Issue #888 background (`kv_cache_manager_with_transfer_control_test.cc:835-848`,
+/-- Issue #888 background (`kv_cache_manager_with_transfer_control_test.cc:896-909`,
 a design comment, not a test: the TCP backend still runs the blocking call on
 `push_pool_` and is being retired rather than fixed): on `Backend.tcpBlocking` (`poolSize = 2, numSlots = 4`), two `StartRead` calls
 to `Peer.sick` dispatch and hold both worker threads (`freeWorkers = 0`). A
@@ -713,7 +714,7 @@ theorem trace_tcp_sick_peer_blocks_healthy :
   decide
 
 /-- `ControlHandshakeTest.GrpcSickPeerDoesNotDelayHandshakeToHealthyPeer`
-(`kv_cache_manager_with_transfer_control_test.cc:925-965`):
+(`kv_cache_manager_with_transfer_control_test.cc:986-1026`):
 on `Backend.grpcAsync` (`poolSize = 4, numSlots = 8`), `kPoolSize = 4`
 handshakes to `Peer.sick` are outstanding on the wire (`pullDispatched = true,
 pullPending = true`). A 5th `StartRead` to `Peer.healthy` immediately dispatches
@@ -746,7 +747,7 @@ theorem trace_grpc_sick_peer_does_not_delay_healthy :
   decide
 
 /-- `ControlHandshakeTest.GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains`
-(`kv_cache_manager_with_transfer_control_test.cc:972-1029`):
+(`kv_cache_manager_with_transfer_control_test.cc:1033-1090`):
 `kSickReads = 5 > kPoolSize = 4` wedged reads to `Peer.sick` plus
 `kHealthyReads = 3` reads to `Peer.healthy` within `numSlots = 8`: all 3 healthy
 reads dispatch their handshakes at once (the test asserts prompt contact only;
@@ -779,7 +780,7 @@ theorem trace_grpc_healthy_progresses_under_backlog :
   decide
 
 /-- `ControlHandshakeTest.ConsumerGivesUpOnProducerThatNeverAnswers`
-(`kv_cache_manager_with_transfer_control_test.cc:685-717`, which runs on the
+(`kv_cache_manager_with_transfer_control_test.cc:687-719`, which runs on the
 TCP backend with `kPoolSize + 1` reads and `num_layers = 0`; this trace models
 only its second half on `grpcAsync` with one layer): stalled reads to
 `Peer.sick` give up when their handshake timeout (`pullReply false`) fires,
@@ -802,7 +803,7 @@ theorem trace_consumer_gives_up_and_drains :
   decide
 
 /-- `ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`
-(`kv_cache_manager_with_transfer_control_test.cc:1031-1090`):
+(`kv_cache_manager_with_transfer_control_test.cc:1103-1151` (rationale comment `:1092-1102`)):
 under the shipping `SlotPolicy.unboundedPerPeer`, once `numSlots` reads to
 `Peer.sick` are outstanding (even if their session deadlines `.cancel` have
 already fired, since `inFlight = 1` keeps their staging slots pinned until
@@ -821,8 +822,9 @@ theorem trace_sick_peer_starves_staging_slots :
       some (0, true, 2) := by
   decide
 
-/-- Under `SlotPolicy.perPeerQuota 1` (`maxPerPeer = 1 < numSlots = 2`,
-`kv_cache_manager_with_transfer_control_test.cc:1039-1041`), the second
+/-- Under `SlotPolicy.perPeerQuota 1` (`maxPerPeer = 1 < numSlots = 2`; the
+per-peer admission that `kv_cache_manager_with_transfer_control_test.cc:1100-1102`
+calls for, not present in C++ at `0ac16d1`), the second
 `StartRead` to `Peer.sick` is refused by the per-peer
 quota, leaving a staging slot free so `Peer.healthy` is admitted and completes
 its transfer to `published = some true` with `rejectedHealthy = false`. -/

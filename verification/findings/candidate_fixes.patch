@@ -21,10 +21,10 @@ index 7bd3750..8816a4c 100644
  
    // ---- Phase 3: Commit -- release and read the verdict. -------------------
 diff --git a/tpu_sync/kv_cache/kv_cache_store.cc b/tpu_sync/kv_cache/kv_cache_store.cc
-index 2613254..f68f1ac 100644
+index 8e5324d..21efe83 100644
 --- a/tpu_sync/kv_cache/kv_cache_store.cc
 +++ b/tpu_sync/kv_cache/kv_cache_store.cc
-@@ -1672,8 +1672,16 @@ void KVCacheStore::RegisterReadRemoteHooks() {
+@@ -1615,8 +1615,16 @@ void KVCacheStore::RegisterReadRemoteHooks() {
  absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
      absl::Span<const std::string> block_hashes) {
    absl::MutexLock lock(mutex_);
@@ -42,7 +42,7 @@ index 2613254..f68f1ac 100644
      return absl::NotFoundError(
          absl::StrCat("BLOCK_HASH_NOT_FOUND: ", block_hashes[slices.size()]));
    }
-@@ -1684,6 +1692,7 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
+@@ -1627,6 +1635,7 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
      const auto& existing = slices[i].second;
      if (existing.status != BlockStatus::HOST &&
          existing.status != BlockStatus::HOST_AND_HBM) {
@@ -50,7 +50,7 @@ index 2613254..f68f1ac 100644
        return absl::FailedPreconditionError(absl::StrCat(
            "Block not resident in host DRAM (status=",
            static_cast<int>(existing.status), "): ", block_hashes[i]));
-@@ -1691,10 +1700,6 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
+@@ -1634,10 +1643,6 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
      src_host_block_ids.push_back(existing.host_block_id);
    }
  

@@ -68,6 +68,8 @@ ALIASES = {
     "mgr.h": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h",
     "bt.cc": "tpu_sync/transport/block_transport.cc",
     "bt.h": "tpu_sync/transport/block_transport.h",
+    "arena.cc": "tpu_sync/core/staging_arena.cc",
+    "arena.h": "tpu_sync/core/staging_arena.h",
     "send_drain_test.cc":
         "tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc",
     "control_test.cc":

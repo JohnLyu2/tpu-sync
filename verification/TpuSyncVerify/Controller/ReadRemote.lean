@@ -5,7 +5,7 @@ import TpuSyncVerify.Common.ModelCheck
 # `ReadRemote`: destination-side settle protocol
 
 The destination half of `RaidenController::ReadRemote`
-(`tpu_sync/core/controller/raiden_controller.cc`, tpu-sync `1fa06d1`) as a
+(`tpu_sync/core/controller/raiden_controller.cc`, tpu-sync `0ac16d1`) as a
 finite transition system, checked exhaustively. Seven booleans, every event
 fires at most once, so `ModelCheck.check` visits the *whole* reachable state
 space: `.safe` here is a verification result, not a bounded one.
@@ -53,7 +53,7 @@ to refill.
 
 `Impl` selects the implementation of the acquire callback and the deadline:
 
-* `shipping` — the code at `1fa06d1`: nothing checks `settled` before
+* `shipping` — the code at `0ac16d1`: nothing checks `settled` before
   `TransferBuffers`, and the deadline settles regardless of an in-flight pull;
 * `checkSettledBeforePull` — the naive fix: skip the pull if already settled
   (`findings/candidate_fixes.patch` does this);

@@ -12,7 +12,7 @@ still running; bounded searches on the one- and two-layer instances; and
 mutants that show the memory model is sensitive to the guards the proof rests
 on, including the per-layer ones.
 
-Citations are to tpu-sync `1fa06d1`;
+Citations are to tpu-sync `0ac16d1`;
 abbreviations as in `Pipeline.lean`.
 -/
 
@@ -73,7 +73,7 @@ def consumer2 : List Ev :=
 right data in the right slots (`test_e2e_transfer_polling` / `test_parallel_pull`
 with `num_layers = 2` in `tpu_sync/api/{jax,torch}/kv_cache_manager_transfer_test.py`;
 on the session side `RecvLifecycleTest.OutOfOrderLayersSettleAfterEveryH2d`,
-`kv_cache_manager_with_transfer_send_drain_test.cc:562-581`).
+`kv_cache_manager_with_transfer_send_drain_test.cc:704-723`).
 Verifies out-of-order layer completion end-to-end inside the model. -/
 theorem trace_layers_out_of_order :
     ((sys 2).run (producer2 ++ consumer2)).map
@@ -130,7 +130,7 @@ theorem trace_aborted_issue_cannot_ready :
 
 /-- `ControlHandshakeTest.RegisteredPullIsAcknowledged` and
 `DuplicatePullIsRejectedBeforeAcknowledgement`
-(`kv_cache_manager_with_transfer_control_test.cc:282-292, 368-380`):
+(`kv_cache_manager_with_transfer_control_test.cc:284-294, 370-382`):
 a registered offer is claimed by `.send .beginPull` and acknowledged by
 `.recv (.pullReply true)`, whereas a duplicate `.send .beginPull` is rejected
 even before the pull acknowledgement is delivered. -/
@@ -142,8 +142,8 @@ theorem trace_registered_and_duplicate_pull :
   decide
 
 /-- `ControlHandshakeTest.PullWithoutRegistrationIsRejected`
-(`kv_cache_manager_with_transfer_control_test.cc:294-307`; compare
-`PullAfterRegistrationDeadlineIsRejected` at `:309-331`, where a registered
+(`kv_cache_manager_with_transfer_control_test.cc:296-309`; compare
+`PullAfterRegistrationDeadlineIsRejected` at `:311-333`, where a registered
 offer's `deadline_ <= now` is rejected inside `ValidateAndBeginPull`, modelled
 by `Send.trace_never_pulled`):
 when `NotifyForRead` never registers the offer (`sysUnregistered 1`), neither
@@ -162,7 +162,7 @@ theorem trace_unregistered_pull_rejected :
   decide
 
 /-- `ControlHandshakeTest.PullAheadOfRegistrationIsAcknowledgedOnceRegistered`
-(`kv_cache_manager_with_transfer_control_test.cc:333-352`):
+(`kv_cache_manager_with_transfer_control_test.cc:335-354`):
 `HandlePullStream` arrives before `NotifyForRead` and waits in
 `cv_.WaitWithTimeout` (`.pullWait`); once `NotifyForRead` registers the offer
 (`.notifyForRead`), `ValidateAndBeginPull` claims the session (as in the C++
@@ -178,7 +178,7 @@ theorem trace_pull_ahead_of_registration :
   decide
 
 /-- `ControlHandshakeTest.ShutdownUnblocksPendingPull`
-(`kv_cache_manager_with_transfer_control_test.cc:556-574`):
+(`kv_cache_manager_with_transfer_control_test.cc:558-576`):
 while `HandlePullStream` is waiting in `cv_.WaitWithTimeout` for an unregistered
 offer (`.pullWait`), producer shutdown wakes the wait and fails the pending pull
 (`.recv (.pullReply false)`); the Lean trace also cancels and publishes both

@@ -4,7 +4,9 @@ Code references below are against [`google/tpu-sync` @ `50b0774`](https://github
 for bug 1 and [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tree/1fa06d1f44345369f4327079828ec6c4989d6694) for bug 2.
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
-`50b0774` and are not re-pinned on upstream syncs. Status updates go in
+the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2) and are not
+re-pinned on upstream syncs; the only edits are the italic *Update* sentences and
+one internal tooling word replaced by "with the fix". Status updates go in
 [README.md](README.md) (§Summary, §History).
 
 ---
@@ -32,7 +34,7 @@ The broadcast overload of [`RaidenController::TransferBuffers`](https://github.c
 - It is only deallocated after all workers are dispatched and complete ([raiden_controller.cc:780-790](https://github.com/google/tpu-sync/blob/50b0774/tpu_sync/core/controller/raiden_controller.cc#L780-L790)).
 - The early returns at [L673](https://github.com/google/tpu-sync/blob/50b0774/tpu_sync/core/controller/raiden_controller.cc#L673), [L722](https://github.com/google/tpu-sync/blob/50b0774/tpu_sync/core/controller/raiden_controller.cc#L722), [L737](https://github.com/google/tpu-sync/blob/50b0774/tpu_sync/core/controller/raiden_controller.cc#L737), [L768](https://github.com/google/tpu-sync/blob/50b0774/tpu_sync/core/controller/raiden_controller.cc#L768) and [L776](https://github.com/google/tpu-sync/blob/50b0774/tpu_sync/core/controller/raiden_controller.cc#L776) leave the blocks allocated and locked.
 
-Both problems are confirmed by unit tests, which will be added in the CL (they fail without the fix).
+Both problems are confirmed by unit tests, which will be added with the fix (they fail without it).
 
 **Proposed fix (covers both problems):**
 1. Do all checks first: worker matching and client availability.
@@ -76,4 +78,4 @@ By contrast, [`ReshardSendSession::Create`](https://github.com/google/tpu-sync/b
 - If `uuid=4001` holds a staging lease and is registered in `active_plans_`, a rejected `PoolReshardRegisterRecv(4001)` causes `free_slots` to go from 1 back to 2, `GetBlockChunks(uuid=4001)` to return 0 chunks, and a subsequent `PoolReshardRegisterRecv(4002)` to receive the same physical slot pointer as `4001`.
 - If two threads call `PoolReshardRegisterRecv(4001)` concurrently while waiting on staging slots, one returns `OK` and one returns `ALREADY_EXISTS`, and the loser's destructor erases the winner's lease (`free_slots` becomes 2, `GetBlockChunks(uuid=4001)` returns 0 chunks).
 
-**Fix.** Claim `uuid` via `RegisterActivePlanDirect` in `ReshardReceiveSession::Create` before constructing the session and acquiring staging, rolling back with `UnregisterActivePlanDirect` if `AcquireStagingLeases` fails. Change with regression tests to follow.
+**Fix.** Claim `uuid` via `RegisterActivePlanDirect` in `ReshardReceiveSession::Create` before constructing the session and acquiring staging, rolling back with `UnregisterActivePlanDirect` if `AcquireStagingLeases` fails. Change with regression tests to follow. *Update 2026-10-16: landed upstream as `8653373` (2026-10-13) with three regression tests; see README.md §F6.*

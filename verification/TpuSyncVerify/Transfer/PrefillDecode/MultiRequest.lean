@@ -3,6 +3,9 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 /-!
 # Multi-request system and top-level properties across requests
 
+Citations are to tpu-sync `0ac16d1`; the C++ names below are those of
+`Pipeline.lean`, which this module composes.
+
 Multiple requests $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run
 concurrently and recycle the four memories (`prefillHbm`, `prefillStaging`,
 `decodeStaging`, `decodeHbm`) across two ownership boundaries:
