@@ -146,6 +146,16 @@ namespace {
     return alloc;
   };
 }
+
+// Returns a MetricsCollector when ENABLE_RAIDEN_METRICS=true, else nullptr.
+std::shared_ptr<MetricsCollector> MetricsCollectorFromEnv() {
+  const char* enable_metrics_env = std::getenv("ENABLE_RAIDEN_METRICS");
+  if (enable_metrics_env != nullptr &&
+      std::strcmp(enable_metrics_env, "true") == 0) {
+    return std::make_shared<MetricsCollector>();
+  }
+  return nullptr;
+}
 }  // namespace
 
 #ifndef WITHOUT_PYTHON
@@ -191,11 +201,7 @@ NumaAwareKVCacheManager::NumaAwareKVCacheManager(
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm)
     : device_arrays_(std::move(cache.device_arrays)) {
-  const char* enable_metrics_env = std::getenv("ENABLE_RAIDEN_METRICS");
-  if (enable_metrics_env != nullptr &&
-      std::strcmp(enable_metrics_env, "true") == 0) {
-    metrics_collector_ = std::make_shared<MetricsCollector>();
-  }
+  metrics_collector_ = MetricsCollectorFromEnv();
   InitSubManagers(cache.layer_buffers, std::nullopt, std::nullopt,
                   unsafe_skip_buffer_lock, parallelism, node_id,
                   local_control_port, max_blocks, num_slots, timeout_s,
@@ -213,6 +219,20 @@ NumaAwareKVCacheManager::NumaAwareKVCacheManager(
   InitSubManagers(layer_buffers, local_port, host_blocks_to_allocate,
                   unsafe_skip_buffer_lock, parallelism, node_id, -1, 0, 0,
                   120.0, enable_shm);
+}
+
+NumaAwareKVCacheManager::NumaAwareKVCacheManager(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+    int64_t node_id, int64_t local_control_port, int64_t max_blocks,
+    int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
+    int parallelism, bool enable_shm) {
+  metrics_collector_ = MetricsCollectorFromEnv();
+  auto layer_buffers =
+      ::tpu_raiden::UnpackLayers(device_buffers, unsafe_skip_buffer_lock);
+  InitSubManagers(layer_buffers, std::nullopt, std::nullopt,
+                  unsafe_skip_buffer_lock, parallelism, node_id,
+                  local_control_port, max_blocks, num_slots, timeout_s,
+                  enable_shm);
 }
 
 NumaAwareKVCacheManager::NumaAwareKVCacheManager(
@@ -1081,6 +1101,19 @@ KVCacheManager::KVCacheManager(
     : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
           device_buffers, local_port, host_blocks_to_allocate,
           unsafe_skip_buffer_lock, parallelism, node_id)) {
+  StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
+}
+
+KVCacheManager::KVCacheManager(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+    int64_t node_id, int64_t local_control_port, int64_t max_blocks,
+    int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
+    int parallelism, int raiden_worker_port,
+    std::optional<std::string> raiden_controller_address,
+    std::optional<std::string> worker_id)
+    : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
+          device_buffers, node_id, local_control_port, max_blocks, num_slots,
+          timeout_s, unsafe_skip_buffer_lock, parallelism)) {
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 

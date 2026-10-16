@@ -89,6 +89,18 @@ class NumaAwareKVCacheManager {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int64_t node_id = 0, bool enable_shm = false);
 
+  // Raw PjRtBuffer transfer-enabled constructor: the counterpart of the
+  // nanobind `kv_caches` constructor above for callers that hold
+  // `xla::PjRtBuffer*` directly. |device_buffers| is laid out
+  // [layer][shard]. Starts the control server on |local_control_port| (0 for
+  // ephemeral) and reserves |num_slots| host staging slots of |max_blocks|
+  // blocks each, which StartRead/NotifyForRead require.
+  NumaAwareKVCacheManager(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      int64_t node_id, int64_t local_control_port, int64_t max_blocks,
+      int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
+      int parallelism, bool enable_shm = false);
+
   // FFI metadata constructor (cache-only by default)
   NumaAwareKVCacheManager(size_t num_layers, size_t num_shards,
                           size_t slice_byte_size, std::optional<int> local_port,
@@ -320,6 +332,18 @@ class KVCacheManager {
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
+
+  // Raw PjRtBuffer transfer-enabled constructor (control server + host
+  // staging slots, see the NumaAwareKVCacheManager counterpart). Starts the
+  // worker gRPC server when |raiden_controller_address| is set, as the other
+  // constructors do.
+  KVCacheManager(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      int64_t node_id, int64_t local_control_port, int64_t max_blocks,
+      int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
+      int parallelism, int raiden_worker_port = 0,
+      std::optional<std::string> raiden_controller_address = std::nullopt,
+      std::optional<std::string> worker_id = std::nullopt);
 
   // FFI metadata constructor (cache-only by default)
   KVCacheManager(
