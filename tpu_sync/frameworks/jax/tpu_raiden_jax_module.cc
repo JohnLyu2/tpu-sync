@@ -129,9 +129,8 @@ NB_MODULE(_tpu_raiden_jax, m) {
   // 1. Bind KVCacheManager
   // =========================================================================
   nb::class_<tpu_raiden::kv_cache::jax::KVCacheManager>(m, "KVCacheManager")
-      .def(nb::init<nb::list, std::optional<int>, std::optional<int>, bool, int,
-                    int, std::optional<std::string>, std::optional<std::string>,
-                    int64_t, bool>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(
+               tpu_raiden::kv_cache::jax::KVCacheManager::Create)),
            nb::arg("device_arrays"), nb::arg("local_port") = nb::none(),
            nb::arg("host_blocks_to_allocate") = nb::none(),
            nb::arg("unsafe_skip_buffer_lock") = false,
@@ -139,9 +138,8 @@ NB_MODULE(_tpu_raiden_jax, m) {
            nb::arg("raiden_controller_address") = nb::none(),
            nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0,
            nb::arg("enable_shm") = false)
-      .def(nb::init<nanobind::list, int64_t, int64_t, int64_t, int64_t, double,
-                    bool, int, int, std::optional<std::string>,
-                    std::optional<std::string>, bool>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(
+               tpu_raiden::kv_cache::jax::KVCacheManager::CreateWithNodeId)),
            nb::arg("kv_caches"), nb::arg("node_id") = 0,
            nb::arg("local_control_port"), nb::arg("max_blocks"),
            nb::arg("num_slots"), nb::arg("timeout_s") = 120.0,
@@ -338,9 +336,7 @@ NB_MODULE(_tpu_raiden_jax, m) {
   // 2. Bind WeightSynchronizer
   // =========================================================================
   nb::class_<WeightSynchronizer>(m, "WeightSynchronizer")
-      .def(nb::init<nb::list, std::optional<int>, int, bool, std::optional<int>,
-                    std::optional<std::string>, bool,
-                    std::optional<std::vector<int64_t>>>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(WeightSynchronizer::Create)),
            nb::arg("jax_arrays"), nb::arg("local_port") = nb::none(),
            nb::arg("parallelism") = 1,
            nb::arg("unsafe_skip_buffer_lock") = false,
@@ -362,11 +358,12 @@ NB_MODULE(_tpu_raiden_jax, m) {
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
              double test_only_simulated_ingress_gbps) {
-            return WeightSynchronizer::test_only_create_cpu_instance(
-                num_layers, num_shards, slice_byte_size, local_port,
-                parallelism, listener_port, bind_ip, auto_h2d,
-                global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+            return xla::ValueOrThrow(
+                WeightSynchronizer::test_only_create_cpu_instance(
+                    num_layers, num_shards, slice_byte_size, local_port,
+                    parallelism, listener_port, bind_ip, auto_h2d,
+                    global_shard_indices, test_only_simulated_egress_gbps,
+                    test_only_simulated_ingress_gbps));
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
@@ -386,11 +383,12 @@ NB_MODULE(_tpu_raiden_jax, m) {
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
              double test_only_simulated_ingress_gbps) {
-            return WeightSynchronizer::test_only_create_cpu_instance(
-                num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-                parallelism, listener_port, bind_ip, auto_h2d,
-                global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+            return xla::ValueOrThrow(
+                WeightSynchronizer::test_only_create_cpu_instance(
+                    num_layers, num_shards, std::move(slice_byte_sizes),
+                    local_port, parallelism, listener_port, bind_ip, auto_h2d,
+                    global_shard_indices, test_only_simulated_egress_gbps,
+                    test_only_simulated_ingress_gbps));
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),

@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -30,11 +31,14 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_format.h"
+#include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
 #include "tpu_sync/core/utils.h"
+#include "tpu_sync/core/xla_compat.h"
 
 namespace tpu_raiden {
 namespace {
@@ -619,6 +623,62 @@ TEST(HostMemoryAllocatorTest, WarnAboutOrphanShmSegmentsReportsUnattached) {
       WarnAboutOrphanShmSegments(shm_key, {own});
   ASSERT_EQ(reported.size(), 1u);
   EXPECT_EQ(reported[0], leftover.substr(1));
+}
+
+TEST(HostMemoryAllocatorTest, PjRtClientCompatAndDmaUnmapOnReset) {
+  EXPECT_EQ(raiden::PjRtClientPlatformName(nullptr), "");
+  EXPECT_FALSE(raiden::PjRtClientSupportsDma(nullptr));
+  EXPECT_EQ(raiden::PjRtClientDmaMap(nullptr, nullptr, 4096).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(raiden::PjRtClientDmaUnmap(nullptr, nullptr).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  TF_ASSERT_OK_AND_ASSIGN(TpuPjrtManager * manager,
+                          TpuPjrtManager::GetDefault());
+  xla::PjRtClient* client = manager->client();
+  ASSERT_NE(client, nullptr);
+
+  EXPECT_FALSE(raiden::PjRtClientPlatformName(client).empty());
+  EXPECT_NE(raiden::PjRtClientPlatformName(client), "cpu");
+  EXPECT_TRUE(raiden::PjRtClientSupportsDma(client));
+
+  constexpr size_t kPageSize = 4096;
+  void* raw_ptr = mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(raw_ptr, MAP_FAILED);
+  auto unmap_raw =
+      absl::MakeCleanup([raw_ptr]() { munmap(raw_ptr, kPageSize); });
+  ABSL_EXPECT_OK(raiden::PjRtClientDmaMap(client, raw_ptr, kPageSize));
+  ABSL_EXPECT_OK(raiden::PjRtClientDmaUnmap(client, raw_ptr));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto allocator, HostMemoryAllocator::Create(client));
+  for (size_t size : {size_t{4096}, size_t{65536}, size_t{1048576}}) {
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(size));
+    ASSERT_NE(alloc.ptr, nullptr);
+    EXPECT_EQ(alloc.size, size);
+    ASSERT_NE(alloc.owner, nullptr);
+    std::memset(alloc.ptr, 0x5A, size);
+    alloc.owner.reset();
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> cpu_client,
+                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  ASSERT_NE(cpu_client, nullptr);
+  EXPECT_FALSE(raiden::PjRtClientSupportsDma(cpu_client.get()));
+  EXPECT_EQ(raiden::PjRtClientPlatformName(cpu_client.get()), "");
+  EXPECT_EQ(
+      raiden::PjRtClientDmaMap(cpu_client.get(), raw_ptr, kPageSize).code(),
+      absl::StatusCode::kUnimplemented);
+  EXPECT_EQ(raiden::PjRtClientDmaUnmap(cpu_client.get(), raw_ptr).code(),
+            absl::StatusCode::kUnimplemented);
+  TF_ASSERT_OK_AND_ASSIGN(auto cpu_allocator,
+                          HostMemoryAllocator::Create(cpu_client.get()));
+  ASSERT_NE(cpu_allocator, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation cpu_alloc,
+                          cpu_allocator->Allocate(kPageSize));
+  ASSERT_NE(cpu_alloc.ptr, nullptr);
+  EXPECT_EQ(cpu_alloc.size, kPageSize);
 }
 
 }  // namespace

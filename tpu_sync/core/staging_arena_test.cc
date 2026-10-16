@@ -14,9 +14,11 @@
 
 #include "tpu_sync/core/staging_arena.h"
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -25,8 +27,13 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/kv_cache/logical_block_manager.h"
 
 namespace tpu_raiden {
 namespace {
@@ -294,6 +301,221 @@ TEST(StagingArenaTest, ConstructFromMovedVectorAndAccessByLayerIndex) {
   EXPECT_NE((*a3)->shards[0].host_ptr, arena[0].shards[0].host_ptr);
   EXPECT_EQ((*a3)->shards[0].host_size, 1024);
   EXPECT_EQ((*a3)->shards[0].device_size, 1024);
+}
+
+// ---------------------------------------------------------------------------
+// StagingBlockAllocator
+// ---------------------------------------------------------------------------
+
+TEST(StagingBlockAllocatorTest, FixedSlotsReserveAndLockBlocksUpFront) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/3,
+                                    /*dynamic_host_staging=*/false));
+  EXPECT_FALSE(allocator->dynamic_host_staging());
+  EXPECT_EQ(allocator->num_slots(), 2);
+  EXPECT_EQ(allocator->max_blocks(), 3);
+  EXPECT_EQ(allocator->capacity(), 3);
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+  // 2 slots * 3 blocks are allocated and locked in the host pool.
+  EXPECT_EQ(blocks.num_free_blocks(), 2);
+  EXPECT_EQ(blocks.num_locked_blocks(), 6);
+  EXPECT_EQ(allocator->slot_blocks(0).size(), 3);
+  EXPECT_EQ(allocator->slot_blocks(1).size(), 3);
+
+  // Destroying the allocator unlocks (but does not deallocate) the slots.
+  allocator.reset();
+  EXPECT_EQ(blocks.num_locked_blocks(), 0);
+  EXPECT_EQ(blocks.num_allocated_blocks(), 6);
+}
+
+TEST(StagingBlockAllocatorTest, FixedSlotAcquireReleaseAndFifoReuse) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/4);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/false));
+
+  // num_blocks <= 0 yields an empty allocation without consuming a slot.
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation none, allocator->Acquire(0));
+  EXPECT_TRUE(none.empty());
+  EXPECT_FALSE(none);
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a0, allocator->Acquire(1));
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a1, allocator->Acquire(2));
+  EXPECT_TRUE(a0);
+  EXPECT_FALSE(a0.is_dynamic());
+  EXPECT_EQ(a0.slot_idx(), 0);
+  EXPECT_EQ(a1.slot_idx(), 1);
+  // A partial request still hands out the whole slot.
+  EXPECT_EQ(a0.block_ids().size(), 2);
+  EXPECT_THAT(a0.block_ids(),
+              ::testing::ElementsAreArray(allocator->slot_blocks(0)));
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+  EXPECT_THAT(allocator->Acquire(1),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+
+  // Slots are reused in release order (FIFO).
+  a1.Reset();
+  EXPECT_TRUE(a1.empty());
+  a0.Reset();
+  a0.Reset();  // idempotent
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation first, allocator->Acquire(1));
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation second, allocator->Acquire(1));
+  EXPECT_EQ(first.slot_idx(), 1);
+  EXPECT_EQ(second.slot_idx(), 0);
+
+  // Move semantics transfer ownership; the destination's slot is released.
+  StagingAllocation moved = std::move(first);
+  EXPECT_TRUE(first.empty());  // NOLINT(bugprone-use-after-move)
+  EXPECT_EQ(moved.slot_idx(), 1);
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+  second = std::move(moved);
+  EXPECT_EQ(second.slot_idx(), 1);
+  EXPECT_EQ(allocator->num_free_slots(), 1);
+}
+
+TEST(StagingBlockAllocatorTest, RequestExceedingSlotCapacityIsRejected) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/4);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/false));
+  EXPECT_THAT(allocator->Acquire(3),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      allocator->AcquireWithTimeout(
+          3, std::chrono::steady_clock::now() + std::chrono::seconds(1)),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(allocator->num_free_slots(), 1);
+}
+
+TEST(StagingBlockAllocatorTest, AcquireWithTimeoutExpiresThenWakesOnRelease) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/1,
+                                    /*dynamic_host_staging=*/false));
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation held, allocator->Acquire(1));
+
+  EXPECT_THAT(
+      allocator->AcquireWithTimeout(
+          1, std::chrono::steady_clock::now() + std::chrono::milliseconds(20)),
+      StatusIs(absl::StatusCode::kResourceExhausted));
+
+  absl::Notification waiting;
+  absl::StatusOr<StagingAllocation> acquired;
+  std::thread waiter([&] {
+    waiting.Notify();
+    acquired = allocator->AcquireWithTimeout(
+        1, std::chrono::steady_clock::now() + std::chrono::seconds(10));
+  });
+  waiting.WaitForNotification();
+  absl::SleepFor(absl::Milliseconds(20));
+  held.Reset();
+  waiter.join();
+  ABSL_ASSERT_OK(acquired);
+  EXPECT_EQ(acquired->slot_idx(), 0);
+}
+
+TEST(StagingBlockAllocatorTest, ShutdownWakesWaitersAndCancelsTimedAcquires) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/1,
+                                    /*dynamic_host_staging=*/false));
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation held, allocator->Acquire(1));
+
+  absl::Notification waiting;
+  absl::StatusOr<StagingAllocation> acquired;
+  std::thread waiter([&] {
+    waiting.Notify();
+    acquired = allocator->AcquireWithTimeout(
+        1, std::chrono::steady_clock::now() + std::chrono::seconds(10));
+  });
+  waiting.WaitForNotification();
+  absl::SleepFor(absl::Milliseconds(20));
+  allocator->Shutdown();
+  waiter.join();
+  EXPECT_THAT(acquired, StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_THAT(
+      allocator->AcquireWithTimeout(
+          1, std::chrono::steady_clock::now() + std::chrono::seconds(1)),
+      StatusIs(absl::StatusCode::kCancelled));
+
+  // Held slots can still be returned after shutdown.
+  held.Reset();
+  EXPECT_EQ(allocator->num_free_slots(), 1);
+}
+
+TEST(StagingBlockAllocatorTest, DynamicStagingLocksAndReleasesHostBlocks) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/4);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/true));
+  EXPECT_TRUE(allocator->dynamic_host_staging());
+  // No slot pool is reserved; capacity is the whole host pool.
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+  EXPECT_EQ(allocator->capacity(), 4);
+  EXPECT_EQ(blocks.num_allocated_blocks(), 0);
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a, allocator->Acquire(3));
+  EXPECT_TRUE(a.is_dynamic());
+  EXPECT_EQ(a.slot_idx(), -1);
+  EXPECT_EQ(a.block_ids().size(), 3);
+  EXPECT_EQ(blocks.num_locked_blocks(), 3);
+  for (int block_id : a.block_ids()) {
+    EXPECT_TRUE(blocks.IsLocked(block_id));
+  }
+
+  // Only one unlocked block remains, so a 2-block request is exhausted.
+  EXPECT_THAT(allocator->Acquire(2),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  EXPECT_THAT(allocator->Acquire(5),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  // Release unlocks and deallocates the blocks.
+  a.Reset();
+  EXPECT_EQ(blocks.num_locked_blocks(), 0);
+  EXPECT_EQ(blocks.num_allocated_blocks(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation b, allocator->Acquire(4));
+  EXPECT_EQ(b.block_ids().size(), 4);
+}
+
+TEST(StagingBlockAllocatorTest, CreateFailsWithoutEnoughHostBlocks) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/3);
+  EXPECT_THAT(
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/false),
+      StatusIs(absl::StatusCode::kFailedPrecondition));
+  // Nothing was reserved.
+  EXPECT_EQ(blocks.num_allocated_blocks(), 0);
+}
+
+TEST(StagingBlockAllocatorTest, NullHostBlockManager) {
+  // Without a slot pool a null manager is accepted: this is the
+  // "no shards" configuration where staging is never used.
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(/*host_block_manager=*/nullptr,
+                                    /*num_slots=*/0, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/false));
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+  EXPECT_EQ(allocator->capacity(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation none, allocator->Acquire(0));
+  EXPECT_TRUE(none.empty());
+  EXPECT_THAT(allocator->Acquire(1),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+
+  // Requesting a slot pool over a null manager fails at creation.
+  EXPECT_THAT(StagingBlockAllocator::Create(/*host_block_manager=*/nullptr,
+                                            /*num_slots=*/1, /*max_blocks=*/1,
+                                            /*dynamic_host_staging=*/false),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
 }  // namespace

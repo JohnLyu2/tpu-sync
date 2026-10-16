@@ -60,19 +60,21 @@ cc_library(
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
-        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/status:status_macros",
     ],
 )
 
@@ -178,6 +180,7 @@ cc_library(
     deps = [
         ":torch_utils",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -237,6 +240,7 @@ nanobind_extension(
         "@com_google_absl//absl/strings:string_view",
         "@nanobind",
         "@torch_tpu//shims/torch:aten_headers",
+        "@xla//xla/pjrt:status_casters",
     ],
 )
 
@@ -422,6 +426,7 @@ cc_library(
     deps = [
         ":torch_utils_mock",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -463,11 +468,13 @@ cc_library(
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
         "//tpu_sync/core:numa_thread_pool",
@@ -475,8 +482,8 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
-        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/status:status_macros",
     ],
 )
 
@@ -505,16 +512,18 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
-        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api/v1:rate_limiter",
     ],
 )
 
@@ -600,6 +609,7 @@ py_test(
     main = "kv_cache_manager_test.py",
     tags = [
         "cpu:8",
+        "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
         "requires-net:external",

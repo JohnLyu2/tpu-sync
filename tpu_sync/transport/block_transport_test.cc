@@ -54,7 +54,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -72,6 +72,7 @@ namespace transport {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::peregrine::v1::ReadExact;
 using ::testing::Each;
 using ::testing::Eq;
 using ::testing::HasSubstr;
@@ -510,6 +511,50 @@ TEST_P(BlockTransportTest, PushAndPullCorrectness) {
   // Verify pull parity
   EXPECT_EQ(delegate2.data()[0], 0xAB);
   EXPECT_EQ(delegate2.data()[size - 1], 0xAB);
+}
+
+TEST_P(BlockTransportTest, CloseIdleConnectionsDropsPooledPushSockets) {
+  size_t size = 1024;
+  MockDelegate delegate1(size);
+  MockDelegate delegate2(size);
+  std::memset(delegate1.data(), 0xCD, size);
+  std::memset(delegate2.data(), 0x00, size);
+
+  BlockTransport transport1(&delegate1, 0);
+  BlockTransport transport2(&delegate2, 0);
+  BindControlChannels(&transport1, &delegate1, &transport2, &delegate2);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const std::string peer = absl::StrCat("localhost:", transport2.local_port());
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 0u);
+
+  // A completed push leaves its stream's socket idle in the pool.
+  auto push_res = transport1
+                      .AsyncPush({peer}, /*src_block_ids=*/{0},
+                                 /*dst_block_ids=*/{}, /*parallelism=*/1,
+                                 MajorOrder::kLayerMajor, /*uuid=*/31,
+                                 /*layer_idx=*/-1)
+                      .Await();
+  ASSERT_TRUE(push_res.ok()) << push_res.status().message();
+  EXPECT_EQ(delegate2.data()[0], 0xCD);
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 1u);
+
+  // Releasing the peer closes it; nothing is left for a later borrow.
+  EXPECT_EQ(transport1.CloseIdleConnections(peer), 1u);
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 0u);
+  EXPECT_EQ(transport1.CloseIdleConnections(peer), 0u);
+
+  // The next push dials afresh and still lands.
+  std::memset(delegate2.data(), 0x00, size);
+  push_res = transport1
+                 .AsyncPush({peer}, /*src_block_ids=*/{0},
+                            /*dst_block_ids=*/{}, /*parallelism=*/1,
+                            MajorOrder::kLayerMajor, /*uuid=*/32,
+                            /*layer_idx=*/-1)
+                 .Await();
+  ASSERT_TRUE(push_res.ok()) << push_res.status().message();
+  EXPECT_EQ(delegate2.data()[0], 0xCD);
+  EXPECT_EQ(delegate2.data()[size - 1], 0xCD);
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 1u);
 }
 
 // Resolves chunks inside the block array named by `layer_idx`, so a test can
@@ -2072,7 +2117,7 @@ TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
             static_cast<ssize_t>(s_header.size()));
 
   uint8_t ack = 0;
-  EXPECT_THAT(::peregrine::ReadExact(fd, &ack, 1, /*timeout_ms=*/2000),
+  EXPECT_THAT(ReadExact(fd, &ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
@@ -2114,8 +2159,7 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
             static_cast<ssize_t>(s_ids.size()));
 
   uint8_t handshake_ack = 0;
-  ABSL_ASSERT_OK(
-      ::peregrine::ReadExact(fd, &handshake_ack, 1, /*timeout_ms=*/2000));
+  ABSL_ASSERT_OK(ReadExact(fd, &handshake_ack, 1, /*timeout_ms=*/2000));
   EXPECT_EQ(handshake_ack, 1);
 
   // Send the 4-byte chunk size (64 bytes) and only 16 bytes of payload, then
@@ -2129,7 +2173,7 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
       16);
 
   uint8_t final_ack = 0;
-  EXPECT_THAT(::peregrine::ReadExact(fd, &final_ack, 1, /*timeout_ms=*/2000),
+  EXPECT_THAT(ReadExact(fd, &final_ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());

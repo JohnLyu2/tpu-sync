@@ -21,12 +21,14 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -63,10 +65,13 @@ int ConnectToListenerPort(int port) {
 }
 
 TEST(WeightSynchronizerListenerTest, PushWeightsCommandSuccess) {
-  WeightSynchronizerBase engine(
-      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  WeightSynchronizerBase& engine = *engine_ptr;
 
   WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
   ASSERT_GT(listener.listener_port(), 0);
@@ -75,10 +80,13 @@ TEST(WeightSynchronizerListenerTest, PushWeightsCommandSuccess) {
   int sock = ConnectToListenerPort(listener.listener_port());
   ASSERT_GE(sock, 0);
 
-  WeightSynchronizerBase dst_engine(
-      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dst_engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  WeightSynchronizerBase& dst_engine = *dst_engine_ptr;
   ASSERT_TRUE(dst_engine.local_port().has_value());
 
   ControlRequest req;
@@ -109,10 +117,13 @@ TEST(WeightSynchronizerListenerTest, PushWeightsCommandSuccess) {
 }
 
 TEST(WeightSynchronizerListenerTest, ShutdownCommandStopsService) {
-  WeightSynchronizerBase engine(
-      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  WeightSynchronizerBase& engine = *engine_ptr;
 
   WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
   EXPECT_TRUE(listener.is_active());
@@ -148,10 +159,13 @@ TEST(WeightSynchronizerListenerTest, ShutdownCommandStopsService) {
 }
 
 TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
-  WeightSynchronizerBase src_engine(
-      /*num_layers=*/1, /*num_shards=*/4, /*slice_byte_size=*/16,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> src_engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/4, /*slice_byte_size=*/16,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  WeightSynchronizerBase& src_engine = *src_engine_ptr;
 
   WeightSynchronizerListener listener(&src_engine,
                                       /*listener_port=*/0);
@@ -160,10 +174,13 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
   int sock = ConnectToListenerPort(listener.listener_port());
   ASSERT_GE(sock, 0);
 
-  WeightSynchronizerBase dst_engine(
-      /*num_layers=*/1, /*num_shards=*/4, /*slice_byte_size=*/16,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/1, /*listener_port=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dst_engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/4, /*slice_byte_size=*/16,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+          /*parallelism=*/1, /*listener_port=*/0));
+  WeightSynchronizerBase& dst_engine = *dst_engine_ptr;
   ASSERT_TRUE(dst_engine.local_port().has_value());
   ASSERT_TRUE(dst_engine.listener_port().has_value());
   std::string dst_peer =
@@ -294,10 +311,13 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
 
 TEST(WeightSynchronizerListenerTest,
      ExecuteControlRequestBroadcastRoundDestinationsLogging) {
-  WeightSynchronizerBase engine(
-      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  WeightSynchronizerBase& engine = *engine_ptr;
 
   ControlRequest req;
   req.set_command(ControlRequest::COMMAND_START_TRANSFER);
@@ -349,10 +369,13 @@ TEST(WeightSynchronizerListenerTest,
 
 TEST(WeightSynchronizerListenerTest,
      ReceiverStartTransferRejectsMissingLayerChunkCounts) {
-  WeightSynchronizerBase engine(
-      /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  WeightSynchronizerBase& engine = *engine_ptr;
 
   ControlRequest req;
   req.set_command(ControlRequest::COMMAND_START_TRANSFER);
@@ -370,10 +393,13 @@ TEST(WeightSynchronizerListenerTest,
 
 TEST(WeightSynchronizerListenerTest,
      ReceiverStartTransferRejectsLayerChunkCountsNotSummingToTotal) {
-  WeightSynchronizerBase engine(
-      /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  WeightSynchronizerBase& engine = *engine_ptr;
 
   ControlRequest req;
   req.set_command(ControlRequest::COMMAND_START_TRANSFER);

@@ -46,6 +46,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -434,9 +435,19 @@ std::vector<DataNicAllowlistEntry> ParseDataNicAllowlist() {
       absl::StripAsciiWhitespace(env_data_nics).empty()) {
     return entries;
   }
+  absl::string_view value = absl::StripAsciiWhitespace(env_data_nics);
+  // Accept a single enclosing "{...}" or "[...]" around the whole list: other
+  // TPU/NCCL NIC-list settings use brace syntax, and a quoted "{eth0,eth2}"
+  // reaches us literally (bash does not expand braces inside quotes).
+  if ((absl::StartsWith(value, "{") && absl::EndsWith(value, "}")) ||
+      (absl::StartsWith(value, "[") && absl::EndsWith(value, "]"))) {
+    value.remove_prefix(1);
+    value.remove_suffix(1);
+    value = absl::StripAsciiWhitespace(value);
+  }
   int idx = 0;
   for (absl::string_view raw_token :
-       absl::StrSplit(env_data_nics, ',', absl::SkipWhitespace())) {
+       absl::StrSplit(value, ',', absl::SkipWhitespace())) {
     absl::string_view token = absl::StripAsciiWhitespace(raw_token);
     if (token.empty()) continue;
     DataNicAllowlistEntry entry;
@@ -653,6 +664,30 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
               << ", BDF: " << (bdf.empty() ? "None" : bdf) << ", MTU: " << mtu
               << ", NUMA: " << nic.numa_node << ", Classification: "
               << ClassificationToString(nic.classification);
+  }
+  // A non-empty allowlist is authoritative, so an entry that matches nothing
+  // (typo, wrong host, unexpected syntax) silently demotes every NIC to
+  // control plane. Name each unmatched entry so the operator can see why.
+  if (!allowlist.empty()) {
+    std::vector<absl::string_view> discovered_names;
+    discovered_names.reserve(nics.size());
+    for (const HostNicAddress& nic : nics) {
+      discovered_names.push_back(nic.interface_name);
+    }
+    const std::string discovered_joined = absl::StrJoin(discovered_names, ",");
+    for (const DataNicAllowlistEntry& entry : allowlist) {
+      const bool matched =
+          std::any_of(nics.begin(), nics.end(), [&](const HostNicAddress& nic) {
+            return nic.interface_name == entry.name_or_bdf ||
+                   GetInterfaceBdf(nic.interface_name, sysfs_root) ==
+                       entry.name_or_bdf;
+          });
+      if (!matched) {
+        LOG(WARNING) << "TPU_RAIDEN_DATA_NICS entry \"" << entry.name_or_bdf
+                     << "\" matches no local interface; discovered: ["
+                     << discovered_joined << "]";
+      }
+    }
   }
   // Warn once per discovery pass (not per interface) when nothing qualified as
   // a data rail, so the operator gets an actionable message instead of a

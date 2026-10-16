@@ -174,10 +174,10 @@ absl::Status RaidenMetricStore::InitializeFromBackendNames(
       };
       if (exporter_options.shm_dir) {
         if (!exporter_options.local_rank) {
-          return absl::FailedPreconditionError(
-              "LOCAL_RANK environment variable must be set when multi-process "
-              "directory (TPU_RAIDEN_TELEMETRY_MULTIPROC_DIR) is configured "
-              "for the prometheus backend.");
+          LOG_FIRST_N(INFO, 1) << kLocalRankEnvVar << " is not set while "
+                               << kTelemetryMultiprocDirEnvVar
+                               << " is set; PrometheusShmExporter will omit "
+                                  "the local_rank label.";
         }
         new_backends.push_back(
             std::make_unique<PrometheusShmExporter>(

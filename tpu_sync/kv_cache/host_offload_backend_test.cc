@@ -28,6 +28,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -64,6 +65,12 @@ class HostOffloadBackendTest {
   static absl::StatusOr<KVTransferSpecConfig> ComposeKVTransferSpec(
       absl::Span<const core::controller::WorkerRegistration> workers) {
     return HostOffloadBackend::ComposeKVTransferSpec(workers);
+  }
+
+  static std::vector<std::string> GetEvictCandidateKeys(
+      const HostOffloadBackend& backend) {
+    absl::MutexLock lock(backend.mutex_);
+    return backend.lru_cache_.GetEvictCandidateKeys();
   }
 };
 
@@ -142,7 +149,7 @@ TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
   // an eviction candidate: still holding its host block, but on its way out.
   backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
                  /*on_host=*/true);
-  ASSERT_THAT(backend.GetEvictCandidateKeys(),
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("h1"));
 
   EXPECT_THAT(backend.SnapshotHostResidentHashes(),
@@ -882,34 +889,6 @@ TEST(HostOffloadBackendTest, LoadLocalNonHostBlockError) {
       backend->Load(RaidenId{}, {"remote_hash"}, {5}, /*slices=*/{}, &tracker3);
   EXPECT_THAT(load_future.Await(),
               absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
-}
-
-TEST(HostOffloadBackendTest, StoreServerOverride) {
-  RaidenId local_node_id{"override_job", "0", "cache", 0};
-  ::tpu_sync::rpc::RaidenIdProto local_unit;
-  local_unit.set_job_name(local_node_id.job_name);
-  local_unit.set_job_replica_id(local_node_id.job_replica_id);
-  local_unit.set_data_name(local_node_id.data_name);
-  local_unit.set_data_replica_idx(local_node_id.data_replica_idx);
-
-  TF_ASSERT_OK_AND_ASSIGN(
-      auto controller,
-      controller::RaidenController::Create(local_unit, /*num_blocks=*/100,
-                                           /*num_shards=*/1,
-                                           /*shard_size_bytes=*/1024,
-                                           /*raiden_controller_address=*/""));
-
-  BackendConfig config;
-  config.type = "HostOffloadBackend";
-  config.capacity = 100;
-  TF_ASSERT_OK_AND_ASSIGN(auto backend_base,
-                          HostOffloadBackend::Create(config, controller.get()));
-  auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
-  ASSERT_NE(backend, nullptr);
-  EXPECT_EQ(backend->store_server(), nullptr);
-  ABSL_ASSERT_OK(backend->StartServer("127.0.0.1"));
-  EXPECT_NE(backend->store_server(), nullptr);
-  backend->store_server()->Shutdown();
 }
 
 // --- Remote write backend primitives ---------------------------------------

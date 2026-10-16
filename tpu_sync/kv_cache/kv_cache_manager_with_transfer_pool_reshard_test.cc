@@ -24,12 +24,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -54,9 +56,10 @@ struct PoolReshardRecvTestPeer {
 
 namespace {
 
+using ::absl_testing::StatusIs;
 using ::testing::_;
-using ::testing::Ge;
 using ::testing::Contains;
+using ::testing::Ge;
 using ::testing::IsEmpty;
 using ::tpu_sync::rpc::MEMORY_TYPE_DRAM;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
@@ -96,7 +99,7 @@ class TestManager : public KVCacheManagerWithTransfer {
   // Stages plans in per-transfer host blocks, as
   // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does for device-attached managers.
   void EnableDemandStaging() {
-    staging_allocator_ = StagingBlockAllocator::Create(
+    staging_allocator_ = CreateStagingBlockAllocator(
         base_.get(), staging_allocator_->num_slots(),
         staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
   }
@@ -155,6 +158,36 @@ StartTransferRequest ValidPlan(
   entry->set_src_stride_bytes(0);
   entry->set_dst_stride_bytes(0);
   entry->set_count(1);
+  return plan;
+}
+
+// A receiver plan for `uuid` landing `dst_blocks` on pool 0 in one group:
+// every block but the last is covered in full, the last one gets ValidPlan's
+// 16-byte head slice.
+StartTransferRequest MultiBlockPlan(int64_t uuid,
+                                    const std::vector<int64_t>& dst_blocks) {
+  StartTransferRequest plan = ValidPlan(uuid);
+  auto* group = plan.mutable_pool_groups(0);
+  group->clear_dst_device_block_ids();
+  group->clear_dst_expected_extent_bytes();
+  auto* schedule = &(*plan.mutable_shard_push_schedules())[0];
+  schedule->clear_entries();
+  for (size_t i = 0; i < dst_blocks.size(); ++i) {
+    const int64_t bytes = i + 1 == dst_blocks.size() ? 16 : 128;
+    group->add_dst_device_block_ids(dst_blocks[i]);
+    group->add_dst_expected_extent_bytes(bytes);
+    auto* entry = schedule->add_entries();
+    entry->set_dst_peer("127.0.0.1:1");
+    entry->set_dst_shard_idx(0);
+    entry->set_src_block_id(static_cast<int32_t>(i));
+    entry->set_dst_block_id(static_cast<int32_t>(dst_blocks[i]));
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(bytes);
+    entry->set_src_stride_bytes(0);
+    entry->set_dst_stride_bytes(0);
+    entry->set_count(1);
+  }
   return plan;
 }
 
@@ -556,6 +589,178 @@ TEST(DemandStagingTest, DemandStagedReceiverPlanUnregistersWhenItSettles) {
             absl::StatusCode::kNotFound);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
   EXPECT_EQ(pool->num_locked_blocks(), 0);
+}
+
+// Declares storage 0 device-backed so RegisterPools configures bounded staging
+// without TPU hardware.
+class DeviceBackedTestBase : public kv_cache::KVCacheManagerBase {
+ public:
+  DeviceBackedTestBase(size_t slice_byte_size, int host_blocks,
+                       size_t physical_size)
+      : KVCacheManagerBase(/*num_layers=*/1, /*num_shards=*/1, slice_byte_size,
+                           /*local_port=*/std::nullopt,
+                           std::make_optional(host_blocks)) {
+    buffer_holds_.resize(1);
+    buffer_holds_[0].holds.resize(1);
+    buffer_holds_[0].physical_size = physical_size;
+    major_dim_size_ = 1;
+    layers_[0].shards[0].device_size = physical_size;
+  }
+};
+
+class BoundedPoolTestManager : public KVCacheManagerWithTransfer {
+ public:
+  BoundedPoolTestManager(size_t slice_byte_size, int host_blocks,
+                         size_t physical_size)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<DeviceBackedTestBase>(slice_byte_size, host_blocks,
+                                                   physical_size),
+            /*node_id=*/0, /*local_control_port=*/-1, /*max_blocks=*/0,
+            /*num_slots=*/0, /*timeout_s=*/30.0) {}
+
+  using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
+};
+
+TEST(PoolStagingRecvRegistrationTest,
+     DuplicatePoolRecvRegistrationKeepsOriginalStagingLease) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
+  ASSERT_TRUE(manager.base()->PoolStorageStagingBounded(0));
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+
+  const StartTransferRequest plan_a = ValidPlan(/*uuid=*/4001);
+  ABSL_ASSERT_OK(
+      manager.PoolReshardRegisterRecv(plan_a, std::vector<int64_t>{0}));
+
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+  const auto chunks_a_before = manager.base()->GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{0},
+      /*total_bytes=*/64, /*uuid=*/4001, /*sender_node_id=*/0);
+  ASSERT_EQ(chunks_a_before.size(), 1u);
+  const uint8_t* slot_a_ptr = chunks_a_before[0].ptr;
+  ASSERT_NE(slot_a_ptr, nullptr);
+
+  // The duplicate registration is refused and must not release 4001's lease.
+  const absl::Status duplicate =
+      manager.PoolReshardRegisterRecv(plan_a, std::vector<int64_t>{0});
+  EXPECT_THAT(duplicate, StatusIs(absl::StatusCode::kAlreadyExists));
+
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+  const auto chunks_a_after = manager.base()->GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{0},
+      /*total_bytes=*/64, /*uuid=*/4001, /*sender_node_id=*/0);
+  EXPECT_EQ(chunks_a_after.size(), 1u);
+
+  // The next transfer must get the other free slot, not alias 4001's slot.
+  StartTransferRequest plan_b = ValidPlan(/*uuid=*/4002);
+  plan_b.mutable_pool_groups(0)->set_dst_device_block_ids(0, 5);
+  (*plan_b.mutable_shard_push_schedules())[0]
+      .mutable_entries(0)
+      ->set_dst_block_id(5);
+  ABSL_ASSERT_OK(
+      manager.PoolReshardRegisterRecv(plan_b, std::vector<int64_t>{5}));
+  const auto chunks_b = manager.base()->GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{5},
+      /*total_bytes=*/64, /*uuid=*/4002, /*sender_node_id=*/0);
+  ASSERT_EQ(chunks_b.size(), 1u);
+  EXPECT_NE(chunks_b[0].ptr, slot_a_ptr);
+}
+
+TEST(PoolStagingRecvRegistrationTest,
+     ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
+  ASSERT_TRUE(manager.base()->PoolStorageStagingBounded(0));
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+
+  for (int i = 0; i < 2; ++i) {
+    const uint64_t blocker_uuid = 3998 + i;
+    const int64_t blocker_block = 14 + i;
+    StartTransferRequest blocker = ValidPlan(blocker_uuid);
+    blocker.mutable_pool_groups(0)->set_dst_device_block_ids(0, blocker_block);
+    (*blocker.mutable_shard_push_schedules())[0]
+        .mutable_entries(0)
+        ->set_dst_block_id(blocker_block);
+    ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
+        blocker, std::vector<int64_t>{blocker_block}));
+  }
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 0);
+
+  const StartTransferRequest plan_a = ValidPlan(/*uuid=*/4001);
+  absl::Status status_1;
+  absl::Status status_2;
+  std::thread t1([&]() {
+    status_1 = manager.PoolReshardRegisterRecv(plan_a, std::vector<int64_t>{0});
+  });
+  std::thread t2([&]() {
+    status_2 = manager.PoolReshardRegisterRecv(plan_a, std::vector<int64_t>{0});
+  });
+
+  absl::SleepFor(absl::Milliseconds(50));
+  ABSL_ASSERT_OK(manager.UnregisterActivePlan(3998));
+  ABSL_ASSERT_OK(manager.UnregisterActivePlan(3999));
+
+  t1.join();
+  t2.join();
+
+  const bool t1_won = status_1.ok();
+  const bool t2_won = status_2.ok();
+  ASSERT_NE(t1_won, t2_won)
+      << "status_1=" << status_1 << " status_2=" << status_2;
+  const absl::Status& loser_status = t1_won ? status_2 : status_1;
+  EXPECT_THAT(loser_status, StatusIs(absl::StatusCode::kAlreadyExists));
+
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+  const auto chunks_a = manager.base()->GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{0},
+      /*total_bytes=*/64, /*uuid=*/4001, /*sender_node_id=*/0);
+  EXPECT_EQ(chunks_a.size(), 1u);
+}
+
+TEST(PoolStagingRecvRegistrationTest,
+     StagingAcquireFailureReleasesUuidClaim) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
+  ASSERT_TRUE(manager.base()->PoolStorageStagingBounded(0));
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+
+  // Three distinct destination blocks on a two-slot arena: Create claims the
+  // uuid, then AcquireStagingLeases fails outright (no wait) and must roll the
+  // claim back without touching the arena.
+  const std::vector<int64_t> too_many_blocks = {0, 1, 2};
+  const StartTransferRequest oversized = MultiBlockPlan(/*uuid=*/4001,
+                                                        too_many_blocks);
+  EXPECT_THAT(manager.PoolReshardRegisterRecv(oversized, too_many_blocks),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  EXPECT_FALSE(manager.base()->HasActivePlan(4001));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+
+  // The uuid is free again: a plan that fits registers normally.
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/4001),
+                                                 std::vector<int64_t>{0}));
+  EXPECT_TRUE(manager.base()->HasActivePlan(4001));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
 }
 
 }  // namespace

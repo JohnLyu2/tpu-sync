@@ -16,7 +16,6 @@
 
 import collections
 import math
-import sys
 import threading
 from typing import Any, Mapping, Optional, Sequence
 
@@ -62,112 +61,22 @@ def to_physical(logical_shape, logical_mesh_shape, minor_to_major):
   return physical_shape, physical_mesh_shape
 
 
-def compute_host_subgrid(
-    physical_mesh_shape: Sequence[int],
-    devices_per_host: int,
-) -> tuple[list[int], list[int]]:
-  """Computes (host_subgrid, host_grid) for a physical TPU mesh shape and devices per host.
-
-  Args:
-    physical_mesh_shape: The shape of the physical mesh.
-    devices_per_host: The number of devices assigned to each host process.
-
-  Returns:
-    A tuple of (host_subgrid, host_grid) where:
-      - math.prod(host_subgrid) == devices_per_host (or total devices if fewer)
-      - host_grid[i] = physical_mesh_shape[i] // host_subgrid[i]
-  """
-  num_dims = len(physical_mesh_shape)
-  if num_dims == 0 or devices_per_host <= 0:
-    return [], []
-
-  total_devices = math.prod(physical_mesh_shape)
-  if total_devices <= devices_per_host:
-    subgrid = list(physical_mesh_shape)
-    grid = [1] * num_dims
-    return subgrid, grid
-
-  if num_dims == 1:
-    subgrid = [devices_per_host]
-    grid = [physical_mesh_shape[0] // devices_per_host]
-    return subgrid, grid
-
-  candidates: list[list[int]] = []
-
-  def find_factors(dim_idx: int, rem_k: int, current: list[int]):
-    if dim_idx == num_dims - 1:
-      if physical_mesh_shape[dim_idx] % rem_k == 0:
-        candidates.append(current + [rem_k])
-      return
-    p_dim = physical_mesh_shape[dim_idx]
-    divisors = [
-        d for d in range(1, int(math.isqrt(rem_k)) + 1) if rem_k % d == 0
-    ]
-    all_divisors = sorted(set(divisors + [rem_k // d for d in divisors]))
-    for d in all_divisors:
-      if p_dim % d == 0:
-        find_factors(dim_idx + 1, rem_k // d, current + [d])
-
-  find_factors(0, devices_per_host, [])
-  if not candidates:
-    subgrid = [1] * num_dims
-    subgrid[-1] = min(devices_per_host, physical_mesh_shape[-1])
-    grid = [
-        p // s if s > 0 else 1 for p, s in zip(physical_mesh_shape, subgrid)
-    ]
-    return subgrid, grid
-
-  def score(s: list[int]):
-    h = [p // si for p, si in zip(physical_mesh_shape, s)]
-    h_monotonic_violations = sum(
-        1 for i in range(len(h) - 1) if h[i] < h[i + 1]
-    )
-    s_monotonic_violations = sum(
-        1 for i in range(len(s) - 1) if s[i] > s[i + 1]
-    )
-    return (
-        h_monotonic_violations,
-        s_monotonic_violations,
-        max(s),
-        max(h),
-        tuple(-x for x in reversed(s)),
-    )
-
-  candidates.sort(key=score)
-  chosen_subgrid = candidates[0]
-  chosen_grid = [
-      p // s if s > 0 else 1
-      for p, s in zip(physical_mesh_shape, chosen_subgrid)
-  ]
-  return chosen_subgrid, chosen_grid
-
-
 def _get_global_indices(
     unit: RaidenId,
     shards: list[str],
     logical_mesh_shape: list[int],
     layout: list[int],
     num_physical_hosts: int,
-    sharding_spec: Optional[list[str]] = None,
-    mesh_axes: Optional[list[str]] = None,
-    physical_mesh_shape: Optional[list[int]] = None,
-    host_subgrid: Optional[list[int]] = None,
     global_shard_indices: Optional[list[int]] = None,
 ) -> list[tuple[int, int]]:
   """Maps local shard indices to global slice indices, handling replication.
 
-  When global_shard_indices is provided, this function
-  bypasses all mesh geometry, subgrid calculation, and coordinate mapping,
-  directly returning the 1:1 mapping between local shards and their declared
-  global slice indices.
-
-  Note: When global_shard_indices is used:
-    - host_subgrid is no longer necessary.
-    - mesh_axes is no longer necessary.
-    - sharding_spec is no longer necessary.
-    - physical_mesh_shape is no longer necessary.
-    - num_physical_hosts, layout, and logical_mesh_shape are not used for index
-      calculation.
+  When global_shard_indices is provided, this function bypasses all mesh
+  geometry and coordinate mapping, directly returning the 1:1 mapping between
+  local shards and their declared global slice indices. Otherwise the legacy
+  host-axis mapping is used: the logical mesh axis whose size equals
+  num_physical_hosts is indexed by the unit's job_replica_id and the remaining
+  axes are enumerated in row-major order.
 
   Args:
     unit: The RaidenId of the work unit.
@@ -175,10 +84,6 @@ def _get_global_indices(
     logical_mesh_shape: Logical device mesh dimensions.
     layout: Shard dimension permutation mapping.
     num_physical_hosts: Total physical host count.
-    sharding_spec: Optional axis names for sharding dimensions.
-    mesh_axes: Optional named mesh axis labels.
-    physical_mesh_shape: Physical topology shape.
-    host_subgrid: Host device coordinate subgrid bounding box.
     global_shard_indices: Explicit vector of global shard indices.
 
   Returns:
@@ -219,132 +124,43 @@ def _get_global_indices(
       host_axis_logical = d
       break
 
-  use_spec_mapping = bool(sharding_spec and mesh_axes and physical_mesh_shape)
+  if host_axis_logical is None:
+    logging.warning(
+        "No logical mesh axis of size num_physical_hosts=%d for %s. Falling"
+        " back to legacy mapping.",
+        num_physical_hosts,
+        unit,
+    )
 
-  if use_spec_mapping:
-    devices_per_host = num_shards
-    if (
-        host_subgrid is not None
-        and len(host_subgrid) == len(physical_mesh_shape)
-        and math.prod(host_subgrid) == devices_per_host
-        and all(p % s == 0 for p, s in zip(physical_mesh_shape, host_subgrid))
-    ):
-      subgrid = list(host_subgrid)
-      grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
-    else:
-      logging.warning(
-          "host_subgrid not provided or invalid in _get_global_indices; falling"
-          " back to compute_host_subgrid. This fallback is deprecated."
-      )
-      rc_mod = sys.modules.get(
-          "tpu_sync.rpc.raiden_controller"
-      )
-      subgrid_fn = getattr(rc_mod, "compute_host_subgrid", compute_host_subgrid)
-      subgrid, grid = subgrid_fn(physical_mesh_shape, devices_per_host)
-    host_subgrid, host_grid = subgrid, grid
+  non_host_axes = [
+      d for d in range(len(logical_mesh_shape)) if d != host_axis_logical
+  ]
 
-    host_coords = []
-    temp_h = replica_id
-    for size in reversed(host_grid):
-      host_coords.append(temp_h % size if size > 0 else 0)
-      temp_h //= size if size > 0 else 1
-    host_coords.reverse()
+  indices = []
+  for j in range(num_shards):
+    local_coords = {}
+    temp = j
+    for d in reversed(non_host_axes):
+      size = logical_mesh_shape[d]
+      local_coords[d] = temp % size
+      temp = temp // size
 
-    indices = []
-    for j in range(num_shards):
-      local_coords = []
-      temp_l = j
-      for size in reversed(host_subgrid):
-        local_coords.append(temp_l % size if size > 0 else 0)
-        temp_l //= size if size > 0 else 1
-      local_coords.reverse()
+    full_coords = [0] * len(logical_mesh_shape)
+    for d in range(len(logical_mesh_shape)):
+      if d == host_axis_logical:
+        full_coords[d] = replica_id
+      else:
+        full_coords[d] = local_coords[d]
 
-      phys_coords = [
-          h * s + l for h, s, l in zip(host_coords, host_subgrid, local_coords)
-      ]
+    tensor_coords = [full_coords[m_axis] for m_axis in major_to_minor]
 
-      # Map physical coordinates to tensor dimensions using sharding_spec
-      tensor_coords = []
-      for axis_name in sharding_spec:
-        if not axis_name:
-          tensor_coords.append(0)
-        elif "," in axis_name:
-          sub_axes = [a.strip() for a in axis_name.split(",") if a.strip()]
-          coord = 0
-          for sub_a in sub_axes:
-            try:
-              phys_axis_idx = mesh_axes.index(sub_a)
-              sub_size = physical_mesh_shape[phys_axis_idx]
-              coord = coord * sub_size + phys_coords[phys_axis_idx]
-            except ValueError:
-              logging.warning(
-                  "Sub-spec axis %s not found in mesh axes %s", sub_a, mesh_axes
-              )
-          tensor_coords.append(coord)
-        else:
-          try:
-            phys_axis_idx = mesh_axes.index(axis_name)
-            tensor_coords.append(phys_coords[phys_axis_idx])
-          except ValueError:
-            logging.warning(
-                "Spec axis %s not found in mesh axes %s", axis_name, mesh_axes
-            )
-            tensor_coords.append(0)
-
-      # Compute flat index in logical_mesh_shape (row-major)
-      if len(tensor_coords) < len(logical_mesh_shape):
-        tensor_coords = tensor_coords + [0] * (
-            len(logical_mesh_shape) - len(tensor_coords)
-        )
-      global_idx = 0
-      stride = 1
-      for val, size in zip(
-          reversed(tensor_coords), reversed(logical_mesh_shape)
-      ):
-        global_idx += val * stride
-        stride *= size
-      indices.append((j, global_idx))
-
-    return indices
-
-  else:
-    if host_axis_logical is None:
-      logging.warning(
-          "host_axis_logical is None and sharding_spec, mesh_axes, or"
-          " physical_mesh_shape is missing for %s. Falling back to legacy"
-          " mapping.",
-          unit,
-      )
-
-    non_host_axes = [
-        d for d in range(len(logical_mesh_shape)) if d != host_axis_logical
-    ]
-
-    indices = []
-    for j in range(num_shards):
-      local_coords = {}
-      temp = j
-      for d in reversed(non_host_axes):
-        size = logical_mesh_shape[d]
-        local_coords[d] = temp % size
-        temp = temp // size
-
-      full_coords = [0] * len(logical_mesh_shape)
-      for d in range(len(logical_mesh_shape)):
-        if d == host_axis_logical:
-          full_coords[d] = replica_id
-        else:
-          full_coords[d] = local_coords[d]
-
-      tensor_coords = [full_coords[m_axis] for m_axis in major_to_minor]
-
-      global_idx = 0
-      stride = 1
-      for val, size in zip(reversed(tensor_coords), reversed(phys_mesh)):
-        global_idx += val * stride
-        stride *= size
-      indices.append((j, global_idx))
-    return indices
+    global_idx = 0
+    stride = 1
+    for val, size in zip(reversed(tensor_coords), reversed(phys_mesh)):
+      global_idx += val * stride
+      stride *= size
+    indices.append((j, global_idx))
+  return indices
 
 
 get_global_indices = _get_global_indices
@@ -785,8 +601,6 @@ class ReshardPlanner:
       registered_variables: Mapping[RaidenId, list[Any]],
       registered_global_shapes: Mapping[RaidenId, list[int]],
       registered_mesh_shapes: Mapping[RaidenId, list[int]],
-      registered_mesh_axes: Mapping[RaidenId, list[str]],
-      registered_host_subgrids: Mapping[RaidenId, list[int]],
       registered_layouts: Mapping[RaidenId, list[int]],
       registered_itemsizes: Mapping[RaidenId, int],
       registered_shards: Mapping[RaidenId, list[str]],
@@ -1134,9 +948,6 @@ class ReshardPlanner:
               for u in registered_shards
               if u.job_name == s_unit.job_name
           }
-          s_phys_mesh = registered_mesh_shapes.get(s_unit)
-          s_mesh_axes = registered_mesh_axes.get(s_unit)
-          s_host_subgrid = registered_host_subgrids.get(s_unit)
         num_src_hosts = max(
             1,
             len(s_job_reps),
@@ -1165,10 +976,6 @@ class ReshardPlanner:
               list(s_var.mesh_shape),
               list(s_var.layout),
               num_src_hosts,
-              sharding_spec=list(s_var.sharding_spec),
-              mesh_axes=s_mesh_axes,
-              physical_mesh_shape=s_phys_mesh,
-              host_subgrid=s_host_subgrid,
               global_shard_indices=s_global_shard_indices,
           )
           s_ranked_indices = []
@@ -1182,18 +989,14 @@ class ReshardPlanner:
               s_ranked_indices.append((l_s_idx, g_s_idx, rank))
           src_indices_cache[s_cache_key] = s_ranked_indices
 
-      # Pre-index destination metadata, signatures, and variables for O(1)
-      # lookups.
-      dst_meta_info = {}
+      # Pre-index destination shard lists and job replicas for O(1) lookups.
+      dst_shards_by_unit = {}
       dst_job_replicas_by_job = {}
       for meta in dst_metadata:
         m_unit = _raiden_id_from_proto(meta.unit)
-        if m_unit not in dst_meta_info:
-          dst_meta_info[m_unit] = (
-              list(meta.shards) if meta.shards else ["127.0.0.1:8000"],
-              list(meta.mesh_shape) if meta.mesh_shape else None,
-              list(meta.mesh_axes) if meta.mesh_axes else None,
-              list(meta.host_subgrid) if meta.host_subgrid else None,
+        if m_unit not in dst_shards_by_unit:
+          dst_shards_by_unit[m_unit] = (
+              list(meta.shards) if meta.shards else ["127.0.0.1:8000"]
           )
         dst_job_replicas_by_job.setdefault(meta.unit.job_name, set()).add(
             meta.unit.job_replica_id
@@ -1211,12 +1014,12 @@ class ReshardPlanner:
       eq_sig_to_class_idx: dict[tuple[Any, ...], int] = {}
       expected_num_key_parts: Optional[int] = None
       for d_u in dst_units:
-        if d_u not in dst_meta_info:
+        if d_u not in dst_shards_by_unit:
           raise ValueError(
-              f"Destination unit {d_u} is missing from dst_meta_info"
+              f"Destination unit {d_u} is missing from dst_metadata"
           )
         d_vars = dst_vars_by_unit.get(d_u, [])
-        d_shards, d_phys_mesh, d_mesh_axes, d_host_subgrid = dst_meta_info[d_u]
+        d_shards = dst_shards_by_unit[d_u]
         num_d_phys_hosts = max(
             1, len(dst_job_replicas_by_job.get(d_u.job_name, set()))
         )
@@ -1252,10 +1055,6 @@ class ReshardPlanner:
                 list(d_var.mesh_shape),
                 list(d_var.layout),
                 num_d_phys_hosts,
-                sharding_spec=list(d_var.sharding_spec),
-                mesh_axes=d_mesh_axes,
-                physical_mesh_shape=d_phys_mesh,
-                host_subgrid=d_host_subgrid,
                 global_shard_indices=d_global_shard_indices,
             )
             dst_indices_cache[cache_key] = d_indices
@@ -1289,7 +1088,7 @@ class ReshardPlanner:
       max_eq_class_len = max((len(c) for c in dst_eq_classes), default=0)
       if len(dst_eq_classes) > 1 and max_eq_class_len > 0:
         num_dst_hosts_per_replica = sum(
-            _count_hosts_for_shards(dst_meta_info[c[0]][0])
+            _count_hosts_for_shards(dst_shards_by_unit[c[0]])
             for c in dst_eq_classes
             if c
         )
@@ -1340,9 +1139,6 @@ class ReshardPlanner:
               for u in registered_shards
               if u.job_name == src_unit.job_name
           }
-          src_phys_mesh_shape = registered_mesh_shapes.get(src_unit)
-          src_mesh_axes = registered_mesh_axes.get(src_unit)
-          src_host_subgrid = registered_host_subgrids.get(src_unit)
         num_src_physical_hosts = max(
             1,
             len(src_job_replicas),
@@ -1453,10 +1249,6 @@ class ReshardPlanner:
                 list(src_var.mesh_shape),
                 list(src_var.layout),
                 num_src_physical_hosts,
-                sharding_spec=list(src_var.sharding_spec),
-                mesh_axes=src_mesh_axes,
-                physical_mesh_shape=src_phys_mesh_shape,
-                host_subgrid=src_host_subgrid,
                 global_shard_indices=src_global_shard_indices,
             )
             src_ranked_indices = [
@@ -1484,19 +1276,7 @@ class ReshardPlanner:
               if not d_nd_slices:
                 continue
 
-              meta_tuple = dst_meta_info.get(dst_unit)
-              if meta_tuple:
-                (
-                    dst_shards,
-                    dst_phys_mesh_shape,
-                    dst_mesh_axes,
-                    dst_host_subgrid,
-                ) = meta_tuple
-              else:
-                dst_shards = ["127.0.0.1:8000"]
-                dst_phys_mesh_shape = None
-                dst_mesh_axes = None
-                dst_host_subgrid = None
+              dst_shards = dst_shards_by_unit[dst_unit]
 
               d_sig = dst_sig_by_unit_and_name[dst_unit][var_name]
               cache_key = (dst_unit, d_sig)
@@ -1520,10 +1300,6 @@ class ReshardPlanner:
                     list(dst_var.mesh_shape),
                     list(dst_var.layout),
                     num_dst_physical_hosts,
-                    sharding_spec=list(dst_var.sharding_spec),
-                    mesh_axes=dst_mesh_axes,
-                    physical_mesh_shape=dst_phys_mesh_shape,
-                    host_subgrid=dst_host_subgrid,
                     global_shard_indices=dst_global_shard_indices,
                 )
                 dst_indices_cache[cache_key] = dst_indices

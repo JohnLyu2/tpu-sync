@@ -593,12 +593,6 @@ class KVCacheStore {
   absl::Status EnsureStoreServerAndRegister(
       tpu_raiden::controller::RaidenController* controller);
 
-  // Shuts down every server hosted by one of backends_, skipping
-  // `already_shut` (the adopted server, when this store had one). Called from
-  // the destructor body, where raiden_controller_ is still alive: a running
-  // service holds it in a pointer it cannot re-seat.
-  void ShutdownBackendStoreServers(KVCacheStoreServer* already_shut);
-
   // One bounded step of the evict sweep: checks the free-block watermarks
   // and demotes at most one batch of cold blocks to a placement target (or
   // drops the batch locally when no target will take it). Returns true when

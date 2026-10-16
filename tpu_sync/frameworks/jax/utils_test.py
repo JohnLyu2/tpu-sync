@@ -14,8 +14,8 @@
 
 """Unit tests for JAX utils."""
 
+import dataclasses
 import os
-from unittest import mock
 
 from absl.testing import absltest
 import jax
@@ -24,265 +24,147 @@ import numpy as np
 
 from tpu_sync.frameworks.jax import utils
 
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+
+P = jax.sharding.PartitionSpec
 
 
-class UtilsTest(absltest.TestCase):
+class GlobalShardIndicesForArrayTest(absltest.TestCase):
 
   def setUp(self):
     super().setUp()
-    try:
-      self.devices = jax.devices("tpu")
-    except RuntimeError:
-      self.devices = jax.devices("cpu")
-    self.mesh_2d = jax.sharding.Mesh(
-        np.array(self.devices[:4]).reshape(2, 2), ("x", "y")
+    devices = jax.devices("cpu")
+    self.assertLen(devices, 4)
+    self.mesh = jax.sharding.Mesh(np.array(devices).reshape(2, 2), ("x", "y"))
+    self.mesh_flat_devices = list(self.mesh.devices.flat)
+
+  def _put(self, spec: P) -> jax.Array:
+    return jax.device_put(
+        jnp.arange(64, dtype=jnp.float32).reshape(8, 8),
+        jax.sharding.NamedSharding(self.mesh, spec),
     )
 
-  def test_compute_host_subgrid(self):
-    # 1D meshes
-    self.assertEqual(utils.compute_host_subgrid([16], 4)[0], [4])
-    self.assertEqual(utils.compute_host_subgrid([16], 8)[0], [8])
-    self.assertEqual(utils.compute_host_subgrid([8], 2)[0], [2])
-
-    # 2D meshes
-    self.assertEqual(utils.compute_host_subgrid([4, 4], 4)[0], [2, 2])
-    self.assertEqual(utils.compute_host_subgrid([4, 8], 4)[0], [1, 4])
-    self.assertEqual(utils.compute_host_subgrid([2, 8], 4)[0], [1, 4])
-    self.assertEqual(utils.compute_host_subgrid([2, 8], 8)[0], [1, 8])
-    self.assertEqual(utils.compute_host_subgrid([8, 8], 2)[0], [1, 2])
-    self.assertEqual(utils.compute_host_subgrid([16, 4], 2)[0], [1, 2])
-    self.assertEqual(utils.compute_host_subgrid([8, 2], 4)[0], [2, 2])
-    self.assertEqual(utils.compute_host_subgrid([2, 4], 8)[0], [2, 4])
-
-    # 3D meshes
-    self.assertEqual(utils.compute_host_subgrid([4, 4, 4], 4)[0], [1, 2, 2])
-    self.assertEqual(utils.compute_host_subgrid([2, 4, 4], 4)[0], [1, 2, 2])
-    self.assertEqual(utils.compute_host_subgrid([2, 4, 8], 8)[0], [1, 2, 4])
-    self.assertEqual(utils.compute_host_subgrid([4, 4, 4], 8)[0], [2, 2, 2])
-
-    # 4D meshes
+  def test_fully_sharded_2d_enumerates_grid_row_major(self):
+    arr = self._put(P("x", "y"))
     self.assertEqual(
-        utils.compute_host_subgrid([2, 2, 4, 4], 4)[0], [1, 1, 2, 2]
+        utils.global_shard_indices_for_array(arr, self.mesh_flat_devices),
+        [0, 1, 2, 3],
     )
+
+  def test_transposed_spec_follows_tensor_dims_not_mesh_dims(self):
+    arr = self._put(P("y", "x"))
+    # mesh (x, y) flat order is (0,0), (0,1), (1,0), (1,1); tensor dim 0 is
+    # partitioned by y and dim 1 by x, so the slice index is y * 2 + x.
     self.assertEqual(
-        utils.compute_host_subgrid([2, 2, 4, 4], 8)[0], [1, 1, 2, 4]
+        utils.global_shard_indices_for_array(arr, self.mesh_flat_devices),
+        [0, 2, 1, 3],
     )
+
+  def test_replicated_minor_axis_shares_index(self):
+    arr = self._put(P("x", None))
     self.assertEqual(
-        utils.compute_host_subgrid([2, 2, 2, 4], 4)[0], [1, 1, 1, 4]
+        utils.global_shard_indices_for_array(arr, self.mesh_flat_devices),
+        [0, 0, 1, 1],
     )
+
+  def test_replicated_major_axis_shares_index(self):
+    arr = self._put(P("y", None))
     self.assertEqual(
-        utils.compute_host_subgrid([4, 4, 4, 4], 4)[0], [1, 1, 2, 2]
+        utils.global_shard_indices_for_array(arr, self.mesh_flat_devices),
+        [0, 1, 0, 1],
     )
+
+  def test_dim1_only_sharding(self):
+    arr = self._put(P(None, "x"))
     self.assertEqual(
-        utils.compute_host_subgrid([4, 4, 4, 4], 8)[0], [1, 2, 2, 2]
+        utils.global_shard_indices_for_array(arr, self.mesh_flat_devices),
+        [0, 0, 1, 1],
     )
 
-    subgrid, grid = utils.compute_host_subgrid([4, 4], 4)
-    self.assertEqual(subgrid, [2, 2])
-    self.assertEqual(grid, [2, 2])
-
-    subgrid, grid = utils.compute_host_subgrid([2, 4, 4], 4)
-    self.assertEqual(subgrid, [1, 2, 2])
-    self.assertEqual(grid, [2, 2, 2])
-
-  def test_get_shard_sorting_permutation_aligned_2d(self):
-    sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
-    )
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-    perm = utils.get_shard_sorting_permutation(arr)
-    self.assertEqual(perm, [])
-
-  def test_get_shard_sorting_permutation_transposed_2d(self):
-    sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("y", "x")
-    )
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-    perm = utils.get_shard_sorting_permutation(arr)
-    self.assertEqual(perm, [])
-
-  def test_get_shard_sorting_permutation_replicated(self):
-    sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x")
-    )
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-    perm = utils.get_shard_sorting_permutation(arr)
-    self.assertEqual(perm, [])
-
-    sharding_empty = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec()
-    )
-    arr_empty = jax.device_put(jnp.zeros((8, 8)), sharding_empty)
-    perm_empty = utils.get_shard_sorting_permutation(arr_empty)
-    self.assertEqual(perm_empty, [])
-
-  def test_get_shard_sorting_permutation_single_shard(self):
-    single_device = self.devices[0]
-    sharding = jax.sharding.SingleDeviceSharding(single_device)
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-    perm = utils.get_shard_sorting_permutation(arr)
-    self.assertEqual(perm, [])
-
-  def test_strict_bijection_failure_returns_empty(self):
-    sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
-    )
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-
-    mock_arr = mock.MagicMock()
-    mock_arr.shape = arr.shape
-    mock_arr.sharding = arr.sharding
-    mock_arr.addressable_shards = [
-        arr.addressable_shards[0],
-        arr.addressable_shards[0],
-        arr.addressable_shards[2],
-        arr.addressable_shards[3],
-    ]
-    perm = utils.get_shard_sorting_permutation(mock_arr)
-    self.assertEqual(perm, [])
-
-  def test_non_contiguous_subgrid_4x4x4_mesh_permutation(self):
-    mock_devices = np.empty((4, 4, 4), dtype=object)
-    for i in range(4):
-      for j in range(4):
-        for k in range(4):
-          mock_devices[i, j, k] = mock.MagicMock(spec=jax.Device)
-
-    mesh_3d = jax.sharding.Mesh(mock_devices, ("x", "y", "z"))
-    sharding_3d = jax.sharding.NamedSharding(
-        mesh_3d, jax.sharding.PartitionSpec("x", "y", "z")
+  def test_fully_replicated_all_zero(self):
+    arr = self._put(P())
+    self.assertEqual(
+        utils.global_shard_indices_for_array(arr, self.mesh_flat_devices),
+        [0, 0, 0, 0],
     )
 
-    # Host 0 chips in 1x2x2 subgrid: (0,0,0)->0, (0,0,1)->1, (0,1,0)->4, (0,1,1)->5
-    host0_devices = [
-        mock_devices[0, 0, 0],
-        mock_devices[0, 0, 1],
-        mock_devices[0, 1, 0],
-        mock_devices[0, 1, 1],
-    ]
-    host0_shards = [mock.MagicMock(device=d) for d in host0_devices]
+  def test_follows_shard_devices_order_not_mesh_order(self):
+    arr = self._put(P("x", "y"))
+    reversed_devices = list(reversed(self.mesh_flat_devices))
+    self.assertEqual(
+        utils.global_shard_indices_for_array(arr, reversed_devices),
+        [3, 2, 1, 0],
+    )
 
-    mock_arr0 = mock.MagicMock()
-    mock_arr0.shape = (16, 16, 16)
-    mock_arr0.sharding = sharding_3d
-    mock_arr0.addressable_shards = host0_shards
-
-    mock_local_mesh = mock.MagicMock()
-    mock_local_mesh.devices.shape = (1, 2, 2)
-    with mock.patch.object(
-        jax, "process_index", return_value=0
-    ), mock.patch.object(
-        jax, "process_count", return_value=16
-    ), mock.patch.object(
-        jax.sharding.Mesh,
-        "local_mesh",
-        new_callable=mock.PropertyMock,
-        return_value=mock_local_mesh,
-    ), mock.patch.object(
-        utils,
-        "compute_host_subgrid",
-        side_effect=AssertionError(
-            "compute_host_subgrid should not be called!"
+  def test_subset_of_devices(self):
+    arr = self._put(P("x", "y"))
+    self.assertEqual(
+        utils.global_shard_indices_for_array(
+            arr, [self.mesh_flat_devices[3], self.mesh_flat_devices[1]]
         ),
-    ):
-      perm0 = utils.get_shard_sorting_permutation(mock_arr0)
-      self.assertEqual(perm0, [])
-
-    # Permuted addressable shards: should compute the exact correcting permutation
-    permuted_shards = [
-        host0_shards[1],
-        host0_shards[0],
-        host0_shards[3],
-        host0_shards[2],
-    ]
-    mock_arr0.addressable_shards = permuted_shards
-    with mock.patch.object(
-        jax, "process_index", return_value=0
-    ), mock.patch.object(
-        jax, "process_count", return_value=16
-    ), mock.patch.object(
-        jax.sharding.Mesh,
-        "local_mesh",
-        new_callable=mock.PropertyMock,
-        return_value=mock_local_mesh,
-    ), mock.patch.object(
-        utils,
-        "compute_host_subgrid",
-        side_effect=AssertionError(
-            "compute_host_subgrid should not be called!"
-        ),
-    ):
-      perm_reordered = utils.get_shard_sorting_permutation(mock_arr0)
-      self.assertEqual(perm_reordered, [1, 0, 3, 2])
-
-  def test_get_shard_sorting_permutation_4x4_mesh_4_hosts(self):
-    mock_devices = np.empty((4, 4), dtype=object)
-    for i in range(4):
-      for j in range(4):
-        mock_devices[i, j] = mock.MagicMock(spec=jax.Device)
-
-    mesh_2d = jax.sharding.Mesh(mock_devices, ("fsdp", "tp"))
-    sharding = jax.sharding.NamedSharding(
-        mesh_2d, jax.sharding.PartitionSpec("fsdp", "tp")
+        [3, 1],
     )
 
-    host_subgrid_devices = {
-        0: [
-            mock_devices[0, 0],
-            mock_devices[0, 1],
-            mock_devices[1, 0],
-            mock_devices[1, 1],
-        ],
-        1: [
-            mock_devices[0, 2],
-            mock_devices[0, 3],
-            mock_devices[1, 2],
-            mock_devices[1, 3],
-        ],
-        2: [
-            mock_devices[2, 0],
-            mock_devices[2, 1],
-            mock_devices[3, 0],
-            mock_devices[3, 1],
-        ],
-        3: [
-            mock_devices[2, 2],
-            mock_devices[2, 3],
-            mock_devices[3, 2],
-            mock_devices[3, 3],
-        ],
-    }
+  def test_device_outside_sharding_raises(self):
+    sub_mesh = jax.sharding.Mesh(
+        np.array(self.mesh_flat_devices[:2]).reshape(1, 2), ("x", "y")
+    )
+    arr = jax.device_put(
+        jnp.zeros((8, 8), dtype=jnp.float32),
+        jax.sharding.NamedSharding(sub_mesh, P("x", "y")),
+    )
+    with self.assertRaisesRegex(ValueError, "is not part of the sharding"):
+      utils.global_shard_indices_for_array(arr, [self.mesh_flat_devices[3]])
 
-    mock_local_mesh = mock.MagicMock()
-    mock_local_mesh.devices.shape = (2, 2)
-    for host_idx in range(4):
-      host_devices = host_subgrid_devices[host_idx]
-      host_shards = [mock.MagicMock(device=d) for d in host_devices]
+  def test_ragged_partition_raises(self):
+    # JAX rejects uneven NamedShardings up front, so use a duck-typed sharding
+    # that claims a 3-row tile over an 8-row array.
+    device = self.mesh_flat_devices[0]
+    arr = _FakeArray(
+        shape=(8, 8),
+        sharding=_FakeSharding(
+            shard_shape_value=(3, 8),
+            device_map={device: (slice(0, 3), slice(0, 8))},
+        ),
+    )
+    with self.assertRaisesRegex(ValueError, "does not tile array shape"):
+      utils.global_shard_indices_for_array(arr, [device])
 
-      mock_arr = mock.MagicMock()
-      mock_arr.shape = (8, 8)
-      mock_arr.sharding = sharding
-      mock_arr.addressable_shards = host_shards
+  def test_misaligned_slice_start_raises(self):
+    device = self.mesh_flat_devices[0]
+    arr = _FakeArray(
+        shape=(8, 8),
+        sharding=_FakeSharding(
+            shard_shape_value=(4, 8),
+            device_map={device: (slice(2, 6), slice(0, 8))},
+        ),
+    )
+    with self.assertRaisesRegex(ValueError, "not tile-aligned at dim 0"):
+      utils.global_shard_indices_for_array(arr, [device])
 
-      with mock.patch.object(
-          jax, "process_index", return_value=host_idx
-      ), mock.patch.object(
-          jax, "process_count", return_value=4
-      ), mock.patch.object(
-          jax.sharding.Mesh,
-          "local_mesh",
-          new_callable=mock.PropertyMock,
-          return_value=mock_local_mesh,
-      ), mock.patch.object(
-          utils,
-          "compute_host_subgrid",
-          side_effect=AssertionError(
-              "compute_host_subgrid should not be called!"
-          ),
-      ):
-        perm = utils.get_shard_sorting_permutation(mock_arr)
-        self.assertEqual(perm, [])
+
+@dataclasses.dataclass(frozen=True)
+class _FakeSharding:
+  """Duck-typed sharding exposing only what the helper reads."""
+
+  shard_shape_value: tuple[int, ...]
+  device_map: dict[jax.Device, tuple[slice, ...]]
+
+  def shard_shape(self, global_shape: tuple[int, ...]) -> tuple[int, ...]:
+    del global_shape
+    return self.shard_shape_value
+
+  def devices_indices_map(
+      self, global_shape: tuple[int, ...]
+  ) -> dict[jax.Device, tuple[slice, ...]]:
+    del global_shape
+    return self.device_map
+
+
+@dataclasses.dataclass(frozen=True)
+class _FakeArray:
+  shape: tuple[int, ...]
+  sharding: _FakeSharding
 
 
 if __name__ == "__main__":

@@ -59,6 +59,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api:transport_metrics",
+        "@peregrine//peregrine/src/api:transport_types",
     ],
 )
 
@@ -88,6 +89,43 @@ cc_test(
 )
 
 cc_library(
+    name = "peregrine_transport_adapter",
+    srcs = ["peregrine_transport_adapter.cc"],
+    hdrs = ["peregrine_transport_adapter.h"],
+    deps = [
+        ":transport_adapter",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:transport",
+        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_test(
+    name = "peregrine_transport_adapter_test",
+    srcs = ["peregrine_transport_adapter_test.cc"],
+    deps = [
+        ":peregrine_transport_adapter",
+        ":transport_adapter",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api:transport",
+        "@peregrine//peregrine/src/api:transport_types",
+        "@peregrine//peregrine/src/api:transport_util",
+    ],
+)
+
+cc_library(
     name = "socket_transport_adapter",
     srcs = ["socket_transport_adapter.cc"],
     hdrs = ["socket_transport_adapter.h"],
@@ -106,6 +144,7 @@ cc_library(
         "//tpu_sync/telemetry:label_util",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/transport/lib/socket:util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -119,7 +158,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 
@@ -139,6 +178,7 @@ cc_test(
         ":transport_adapter",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/status",
@@ -150,7 +190,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 
@@ -219,29 +259,6 @@ cc_test(
 )
 
 cc_library(
-    name = "test_only_rate_limiter",
-    srcs = ["test_only_rate_limiter.cc"],
-    hdrs = ["test_only_rate_limiter.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-    ],
-)
-
-cc_test(
-    name = "test_only_rate_limiter_test",
-    srcs = ["test_only_rate_limiter_test.cc"],
-    deps = [
-        ":test_only_rate_limiter",
-        "@com_google_absl//absl/time",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-cc_library(
     name = "raw_buffer_transport",
     srcs = ["raw_buffer_transport.cc"],
     hdrs = ["raw_buffer_transport.h"],
@@ -255,7 +272,6 @@ cc_library(
         ":chunk_serializer",
         ":histogram",
         ":raw_buffer_transport_delegate",
-        ":test_only_rate_limiter",
         ":transport_adapter",
         "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/core:numa_thread_pool",
@@ -286,7 +302,8 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:rate_limiter",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 
@@ -298,6 +315,7 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    local_defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_TESTING_MACROS"],
     deps = [
         ":chunk",
         ":chunk_serializer",
@@ -320,14 +338,16 @@ cc_test(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 

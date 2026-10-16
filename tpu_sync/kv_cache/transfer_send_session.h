@@ -22,16 +22,19 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
+#include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
@@ -52,6 +55,8 @@ class TransferSendSession
     : public TransferSession,
       public std::enable_shared_from_this<TransferSendSession> {
  public:
+  // Resolves the data connection policy (TPU_RAIDEN_DATA_CONN_REUSE) and
+  // creates a send session for |block_ids|.
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator,
@@ -75,11 +80,9 @@ class TransferSendSession
 
   absl::Status AwaitForDone() override;
 
-  // When Done() became true. Meaningless before then.
-  std::chrono::steady_clock::time_point CompletedAt() const {
-    absl::MutexLock lock(mu_);
-    return completed_at_;
-  }
+  // Returns summary metadata and failure diagnostics for this send session.
+  // Only meaningful after `Done()` returns true.
+  TransferDetails Details() const;
 
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
@@ -109,6 +112,8 @@ class TransferSendSession
 
   // Counts one finished copy or push; marks the send done and releases its
   // staging resources if it was draining and waiting for this operation.
+  // Under kPerTransfer that last operation first closes the idle data
+  // connections to the consumer's endpoints.
   void EndSendOp();
 
   // Stages producer device blocks into host staging and executes the
@@ -148,19 +153,36 @@ class TransferSendSession
                       StagingBlockAllocator* staging_allocator,
                       std::string req_id, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
-                      std::chrono::steady_clock::time_point register_start);
+                      std::chrono::steady_clock::time_point register_start,
+                      DataConnectionReuse data_connection_reuse);
 
-  // Populates |registered_block_ids_| and |registered_block_set_| from
-  // |block_ids|. Returns the first duplicate block ID if any duplicate is
-  // present, or std::nullopt when all IDs are unique.
-  std::optional<int64_t> PopulateRegisteredBlocks(
+  // Describes a block ID that appears more than once in a single registration,
+  // along with the indices of its first two occurrences.
+  struct DuplicateBlock {
+    int64_t block_id;
+    size_t first_index;
+    size_t duplicate_index;
+  };
+
+  // Populates `registered_block_ids_` and `registered_block_set_` from
+  // `block_ids`. Returns the first duplicate block ID and its indices if any
+  // duplicate is present, or `std::nullopt` when all IDs are unique.
+  std::optional<DuplicateBlock> PopulateRegisteredBlocks(
       absl::Span<const int64_t> block_ids);
   void ValidateRequestedBlocksLocked(
       const std::vector<int64_t>& requested_block_ids) const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseStagingBlocks();
   void ReleaseStagingBlocksLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishLocked(const absl::Status& status = absl::OkStatus())
+  // Marks the session as draining with `status`. If `status` is not OK,
+  // attributes the failure to `phase` if provided, or else to the earliest
+  // step still running (see `CurrentPhaseLocked()`).
+  void FinishLocked(const absl::Status& status = absl::OkStatus(),
+                    std::optional<absl::string_view> phase = std::nullopt)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Returns the earliest step of this send still running, as named in
+  // `TransferDetails::phase`.
+  absl::string_view CurrentPhaseLocked() const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status AcquireStagingWithRetry(int64_t num_blocks);
@@ -173,6 +195,8 @@ class TransferSendSession
   const uint64_t uuid_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point register_start_;
+  // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
+  const DataConnectionReuse data_connection_reuse_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   int64_t num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t registered_num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
@@ -181,6 +205,9 @@ class TransferSendSession
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);
+  // The transfer phase in which the send failed; populated when `status_` is
+  // set to a non-OK status.
+  absl::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.
@@ -189,8 +216,11 @@ class TransferSendSession
   // waits for its in-flight work before it is reported.
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
+  // The last op already closed the idle data connections (kPerTransfer).
+  bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
+  // The consumer's data endpoints, populated once `StartPush` serves its pull.
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);

@@ -60,8 +60,20 @@ inline constexpr size_t kDefaultLookupBatchSize = 32;
 inline constexpr size_t kHashDirL1Width = 3;
 inline constexpr size_t kHashDirL2Width = 2;
 // Hex encoding doubles the length, and the ".bin" suffix costs 4 more
-// characters: 2*125 + 4 == 254 <= NAME_MAX (255).
+// characters: 2*125 + 4 == 254 <= NAME_MAX (255). Temp files are named
+// independently of the hash (see MakeTempPath), so this is the only
+// length budget a block hash has to fit.
 inline constexpr size_t kMaxBlockHashBytes = 125;
+
+// Returns a unique path for a temporary file in the same directory as
+// `final_path`: "<dir>/.tmp_<pid>_<nonce>_<seq>". <nonce> is a 64-bit value
+// drawn once per process from OS entropy, so names are unique across hosts
+// and PID namespaces that share one filesystem (e.g. pods writing to one
+// Lustre directory), where pid and a counter alone repeat. <pid> still
+// distinguishes a forked child, which inherits the nonce; <seq> distinguishes
+// successive calls within a process. The name does not embed the final
+// file's basename, so its length (< 60 characters) is independent of the key.
+std::string MakeTempPath(absl::string_view final_path);
 
 // Typed, validated view of a POSIX backend's configuration. Every POSIX knob
 // lives here; `FromProperties` is the single parse-and-validate point.

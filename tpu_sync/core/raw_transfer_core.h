@@ -36,7 +36,6 @@
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/ref_count.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/xla_compat.h"
@@ -79,7 +78,6 @@ inline absl::Status PjrtErrorToStatusLocal(const PJRT_Api* c_api,
   c_api->PJRT_Error_Destroy(&da);
   return absl::InternalError(msg);
 }
-
 
 inline int64_t GetMajorSliceByteSize(const xla::Shape& shape) {
   if (shape.dimensions_size() == 0) return 0;
@@ -453,7 +451,7 @@ struct PjRtCopyFuture {
         ra.is_ready = false;
         PJRT_Error* rerr = b->c_api->PJRT_Event_IsReady(&ra);
         if (rerr) {
-          status = PjrtErrorToStatusLocal(b->c_api, rerr);
+          status.Update(PjrtErrorToStatusLocal(b->c_api, rerr));
           continue;
         }
         if (!ra.is_ready) continue;  // pending: no error to report yet
@@ -462,12 +460,13 @@ struct PjRtCopyFuture {
         ee.extension_start = nullptr;
         ee.event = e;
         PJRT_Error* eerr = b->c_api->PJRT_Event_Error(&ee);
-        if (eerr) status = PjrtErrorToStatusLocal(b->c_api, eerr);
+        if (eerr) status.Update(PjrtErrorToStatusLocal(b->c_api, eerr));
       }
     }
     if (future.IsValid() && future.IsReady()) {
-      tsl::AsyncValue* av = future.async_value();
-      if (av && av->IsError()) status = av->GetError();
+      // IsReady() is true, so Await() returns the stored status immediately
+      // without blocking.
+      status.Update(future.Await());
     }
     return status;
   }
@@ -549,7 +548,7 @@ struct PjRtCopyFuture {
         aw.event = e;
         PJRT_Error* err = b->c_api->PJRT_Event_Await(&aw);
         if (err) {
-          status = PjrtErrorToStatusLocal(b->c_api, err);
+          status.Update(PjrtErrorToStatusLocal(b->c_api, err));
           continue;
         }
         PJRT_Event_Error_Args ee;
@@ -557,16 +556,11 @@ struct PjRtCopyFuture {
         ee.extension_start = nullptr;
         ee.event = e;
         PJRT_Error* eerr = b->c_api->PJRT_Event_Error(&ee);
-        if (eerr) status = PjrtErrorToStatusLocal(b->c_api, eerr);
+        if (eerr) status.Update(PjrtErrorToStatusLocal(b->c_api, eerr));
       }
     }
     if (future.IsValid()) {
-      future.BlockUntilReady(
-          static_cast<void (*)(tsl::AsyncValue*)>(tsl::BlockUntilReady));
-      tsl::AsyncValue* av = future.async_value();
-      if (av->IsError()) {
-        status = av->GetError();
-      }
+      status.Update(future.Await());
     }
     return status;
   }

@@ -50,7 +50,6 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
-#include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
@@ -105,17 +104,12 @@ HostOffloadBackend::HostOffloadBackend(
 HostOffloadBackend::~HostOffloadBackend() { Shutdown(); }
 
 void HostOffloadBackend::Shutdown() {
-  {
-    // Completions hold lifetime_->mu in shared (ReaderMutexLock) mode so
-    // concurrent Save/Load continuations do not serialize against each other;
-    // taking the exclusive WriterMutexLock here waits for all in-flight
-    // completions to finish before KVCacheStore destroys its borrowed objects.
-    absl::WriterMutexLock lock(lifetime_->mu);
-    lifetime_->is_alive = false;
-  }
-  if (KVCacheStoreServer* server = store_server(); server != nullptr) {
-    server->Shutdown();
-  }
+  // Completions hold lifetime_->mu in shared (ReaderMutexLock) mode so
+  // concurrent Save/Load continuations do not serialize against each other;
+  // taking the exclusive WriterMutexLock here waits for all in-flight
+  // completions to finish before KVCacheStore destroys its borrowed objects.
+  absl::WriterMutexLock lock(lifetime_->mu);
+  lifetime_->is_alive = false;
 }
 
 absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
@@ -132,10 +126,6 @@ absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
     registry_client = std::make_shared<
         ::tpu_raiden::kv_cache::global_registry::GlobalRegistryClient>(channel);
   }
-  // Server start + publish is exclusively
-  // KVCacheStore::EnsureStoreServerAndRegister's job -- starting one here
-  // would race it and could bind before the owning store has decided whether
-  // a registry exists at all.
   auto backend = std::shared_ptr<HostOffloadBackend>(new HostOffloadBackend(
       config.capacity, config.metadata, config.raiden_id, controller,
       std::move(registry_client), config.kv_pool_group));
@@ -144,23 +134,6 @@ absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
         backend->RegisterKVTransferSpec(*config.kv_transfer_spec));
   }
   return backend;
-}
-
-absl::Status HostOffloadBackend::StartServer(absl::string_view server_address) {
-  if (server_address.empty() || server_address == "[::]" ||
-      server_address == "::" || server_address == "0.0.0.0" ||
-      server_address == "0:0:0:0:0:0:0:0") {
-    return absl::InvalidArgumentError(
-        "server_address must be a non-empty, non-wildcard host; it is not "
-        "derived from the controller address.");
-  }
-
-  absl::MutexLock lock(mutex_);
-  if (!server_) {
-    server_ = KVCacheStoreServer::Create();
-  }
-
-  return server_->StartServer(this, raiden_controller_, server_address);
 }
 
 absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
@@ -614,37 +587,6 @@ absl::StatusOr<size_t> HostOffloadBackend::RecoverFromLocalManifest() {
   return recoverable.size();
 }
 
-bool HostOffloadBackend::ValidateAndPinHostBlocks(
-    absl::Span<const int> host_block_ids) {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> keys_to_pin;
-  keys_to_pin.reserve(host_block_ids.size());
-  for (int host_id : host_block_ids) {
-    bool found = false;
-    for (const auto& [key, it] : lru_cache_.map()) {
-      if (it->value.host_block_id == host_id &&
-          (it->value.status == BlockStatus::HOST ||
-           it->value.status == BlockStatus::HOST_AND_HBM)) {
-        keys_to_pin.push_back(key);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      return false;
-    }
-  }
-  for (size_t i = 0; i < keys_to_pin.size(); ++i) {
-    if (!lru_cache_.Pin(keys_to_pin[i])) {
-      for (size_t j = 0; j < i; ++j) {
-        lru_cache_.Unpin(keys_to_pin[j]);
-      }
-      return false;
-    }
-  }
-  return true;
-}
-
 std::vector<std::string> HostOffloadBackend::GetEvictableKeys(size_t count) {
   absl::MutexLock lock(mutex_);
   return lru_cache_.GetEvictableKeys(count);
@@ -731,16 +673,6 @@ HostOffloadBackend::PinPresentHostResident(
     }
   }
   return pinned;
-}
-
-std::vector<std::string> HostOffloadBackend::GetEvictCandidateKeys() const {
-  absl::MutexLock lock(mutex_);
-  return lru_cache_.GetEvictCandidateKeys();
-}
-
-KVCacheStoreServer* HostOffloadBackend::store_server() const {
-  absl::MutexLock lock(mutex_);
-  return server_.get();
 }
 
 absl::StatusOr<std::shared_ptr<KVCacheStoreClient>>

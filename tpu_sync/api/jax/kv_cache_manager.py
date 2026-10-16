@@ -135,6 +135,10 @@ class KVCacheManager:
     Returns:
       True if a transfer is indeed needed; False if there is nothing to be
       transferred.
+
+    Raises:
+      ValueError: If `block_ids` contains duplicate block IDs.
+      RuntimeError: If `uuid` already has an active registered read.
     """
     return bool(self._impl.notify_for_read(req_id, uuid, block_ids))
 

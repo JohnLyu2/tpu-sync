@@ -31,18 +31,33 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
+
+namespace {
+
+// The steps of a send, as named in `TransferDetails::phase`.
+constexpr absl::string_view kAwaitPullPhase = "await_pull";
+constexpr absl::string_view kStagingPhase = "staging";
+constexpr absl::string_view kD2hPhase = "d2h";
+constexpr absl::string_view kPushPhase = "push";
+
+}  // namespace
 
 absl::StatusOr<std::shared_ptr<TransferSendSession>>
 TransferSendSession::Create(
@@ -54,15 +69,19 @@ TransferSendSession::Create(
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
+  ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
+                        ResolveDataConnectionReuse());
   auto session = std::shared_ptr<TransferSendSession>(
       new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
-                              deadline, register_start));
-  std::optional<int64_t> duplicate_block =
+                              deadline, register_start, data_connection_reuse));
+  std::optional<DuplicateBlock> duplicate_block =
       session->PopulateRegisteredBlocks(block_ids);
   if (duplicate_block.has_value()) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "NotifyForRead rejected duplicate block ", *duplicate_block,
-        " for req_id=", session->req_id(), ", uuid=", uuid));
+        "NotifyForRead rejected duplicate block ", duplicate_block->block_id,
+        " for req_id=", session->req_id(), ", uuid=", uuid, ": positions ",
+        duplicate_block->first_index, " and ", duplicate_block->duplicate_index,
+        " of ", block_ids.size(), " blocks"));
   }
   return session;
 }
@@ -71,27 +90,34 @@ TransferSendSession::TransferSendSession(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::steady_clock::time_point register_start)
+    std::chrono::steady_clock::time_point register_start,
+    DataConnectionReuse data_connection_reuse)
     : base_(base),
       staging_allocator_(staging_allocator),
       req_id_(std::move(req_id)),
       uuid_(uuid),
       deadline_(deadline),
-      register_start_(register_start) {}
+      register_start_(register_start),
+      data_connection_reuse_(data_connection_reuse) {}
 
-std::optional<int64_t> TransferSendSession::PopulateRegisteredBlocks(
+std::optional<TransferSendSession::DuplicateBlock>
+TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {
   absl::MutexLock lock(mu_);
   registered_num_blocks_ = static_cast<int64_t>(block_ids.size());
   registered_block_ids_.assign(block_ids.begin(), block_ids.end());
   registered_block_set_.clear();
-  std::optional<int64_t> duplicate_block;
-  for (int64_t block_id : block_ids) {
-    if (!registered_block_set_.insert(block_id).second) {
-      duplicate_block = block_id;
-    }
+  for (size_t i = 0; i < block_ids.size(); ++i) {
+    if (registered_block_set_.insert(block_ids[i]).second) continue;
+    size_t first_index = 0;
+    while (block_ids[first_index] != block_ids[i]) ++first_index;
+    return DuplicateBlock{
+        .block_id = block_ids[i],
+        .first_index = first_index,
+        .duplicate_index = i,
+    };
   }
-  return duplicate_block;
+  return std::nullopt;
 }
 
 void TransferSendSession::ValidateRequestedBlocksLocked(
@@ -164,9 +190,13 @@ void TransferSendSession::ReleaseStagingBlocks() {
   ReleaseStagingBlocksLocked();
 }
 
-void TransferSendSession::FinishLocked(const absl::Status& status) {
+void TransferSendSession::FinishLocked(const absl::Status& status,
+                                       std::optional<absl::string_view> phase) {
   if (draining_ || done_) return;
   status_ = status;
+  if (!status.ok()) {
+    failed_phase_ = phase.has_value() ? *phase : CurrentPhaseLocked();
+  }
   draining_ = true;
   if (in_flight_ == 0) {
     ReleaseStagingBlocksLocked();
@@ -176,6 +206,12 @@ void TransferSendSession::FinishLocked(const absl::Status& status) {
 }
 
 void TransferSendSession::Finish(const absl::Status& status) {
+  // Settling here, with no op in flight, means no push was ever issued:
+  // pushes start in SendNextLayer's push_pool task, each stays counted until
+  // its completion has run, and the completion of the last layer calls
+  // Finish() while still counted (a failed copy or push finishes under its
+  // own op). A send that pushed therefore settles in EndSendOp, which
+  // releases its data connections first.
   absl::MutexLock lock(mu_);
   FinishLocked(status);
 }
@@ -184,6 +220,34 @@ absl::Status TransferSendSession::AwaitForDone() {
   absl::MutexLock lock(mu_);
   mu_.Await(absl::Condition(&done_));
   return status_;
+}
+
+TransferDetails TransferSendSession::Details() const {
+  absl::MutexLock lock(mu_);
+  TransferDetails details = DetailsFromStatus(status_);
+  details.completed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             completed_at_.time_since_epoch())
+                             .count();
+  details.elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           completed_at_ - register_start_)
+                           .count();
+  if (!remote_data_endpoints_.empty()) {
+    details.peer = absl::StrJoin(remote_data_endpoints_, ",");
+  }
+  if (!status_.ok()) {
+    details.phase = std::string(failed_phase_);
+  }
+  return details;
+}
+
+absl::string_view TransferSendSession::CurrentPhaseLocked() const {
+  if (remote_data_endpoints_.empty()) return kAwaitPullPhase;
+  if (staging_.empty()) return kStagingPhase;
+  if (d2h_layer_futures_.size() < base_->num_layers()) return kD2hPhase;
+  for (const raiden::PjRtCopyFuture& future : d2h_layer_futures_) {
+    if (!future.IsReady()) return kD2hPhase;
+  }
+  return kPushPhase;
 }
 
 void TransferSendSession::EndSendOpLocked() {
@@ -196,8 +260,32 @@ void TransferSendSession::EndSendOpLocked() {
 }
 
 void TransferSendSession::EndSendOp() {
-  absl::MutexLock lock(mu_);
-  EndSendOpLocked();
+  // Under kPerTransfer the last op of a draining send closes the idle data
+  // connections to the consumer's endpoints before it is counted out: every
+  // push has returned its socket by now, and done_ cannot be set meanwhile,
+  // so ~KVCacheManagerWithTransfer is still parked in AwaitForDone() and
+  // |base_| and its transport are alive. transport_server() cannot contend on
+  // server_init_mu_ either: every StopTransportServer() call is in a
+  // destructor that runs only after that wait. The check and the decrement
+  // share a critical section so a Finish() that starts draining in between
+  // cannot settle the send unreleased.
+  while (true) {
+    std::vector<std::string> peers;
+    {
+      absl::MutexLock lock(mu_);
+      const bool release_due =
+          data_connection_reuse_ == DataConnectionReuse::kPerTransfer &&
+          in_flight_ == 1 && draining_ && !done_ && !connections_released_ &&
+          !remote_data_endpoints_.empty();
+      if (!release_due) {
+        EndSendOpLocked();
+        return;
+      }
+      connections_released_ = true;
+      peers = remote_data_endpoints_;
+    }
+    ReleaseDataConnectionsAfterSend(base_->transport_server(), peers, uuid_);
+  }
 }
 
 CopySpec TransferSendSession::BuildCoalescedCopySpec(
@@ -284,6 +372,10 @@ void TransferSendSession::StartPush(
         absl::StrCat("Invalid StartPush arguments for uuid=", uuid_)));
     return;
   }
+  {
+    absl::MutexLock lock(mu_);
+    remote_data_endpoints_ = remote_data_endpoints;
+  }
 
   absl::Status acquire_status =
       AcquireStagingWithRetry(static_cast<int64_t>(src_block_ids.size()));
@@ -307,7 +399,6 @@ void TransferSendSession::StartPush(
     host_block_ids.assign(blocks.begin(),
                           blocks.begin() + src_block_ids.size());
     d2h_layer_futures_.reserve(total_layers);
-    remote_data_endpoints_ = remote_data_endpoints;
     src_ints_.assign(host_block_ids.begin(), host_block_ids.end());
     dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
   }
@@ -393,7 +484,8 @@ void TransferSendSession::SendNextLayer(size_t l) {
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
-      self->Finish(status_or.status());
+      absl::MutexLock lock(self->mu_);
+      self->FinishLocked(status_or.status(), kD2hPhase);
       return;
     }
     {
@@ -431,7 +523,8 @@ void TransferSendSession::SendNextLayer(size_t l) {
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();
-              self->Finish(push_res.status());
+              absl::MutexLock lock(self->mu_);
+              self->FinishLocked(push_res.status(), kPushPhase);
               return;
             }
 

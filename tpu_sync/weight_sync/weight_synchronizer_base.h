@@ -29,12 +29,14 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
@@ -42,8 +44,9 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -93,8 +96,13 @@ class WeightSynchronizerListener;
 
 class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
  public:
-  // Symmetrical core constructor wrapping raw PJRT buffers directly E2E
-  WeightSynchronizerBase(
+  // Creates a synchronizer wrapping the raw PJRT buffers in |layer_buffers|
+  // (outer index = layer, inner index = shard) and allocates (or, when
+  // |external_host_ptrs| is set, adopts) one host staging buffer per shard.
+  // Returns InvalidArgument if the layers disagree on shard count or
+  // |external_host_ptrs| has fewer entries than shards, and ResourceExhausted
+  // if a host staging buffer cannot be allocated.
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> Create(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       std::optional<int> local_port = std::nullopt,
       std::optional<std::vector<const uint8_t*>> external_host_ptrs =
@@ -104,8 +112,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<std::string> bind_ip = std::nullopt,
       std::vector<std::string> layer_names = {}, bool auto_h2d = false);
 
-  // CPU-only constructor for remote workers and mock E2E testing
-  WeightSynchronizerBase(
+  // Creates a CPU-only synchronizer (no device buffers) for remote workers and
+  // mock E2E testing, with |slice_byte_size| bytes per layer. Returns
+  // ResourceExhausted if a host staging buffer cannot be allocated.
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> Create(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
@@ -113,16 +123,19 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<std::string> bind_ip = std::nullopt,
       std::vector<std::string> layer_names = {}, bool auto_h2d = false);
 
-  // CPU-only constructor for remote workers and mock E2E testing supporting
-  // heterogeneous slice sizes and custom layer names.
-  WeightSynchronizerBase(
+  // As above, with heterogeneous per-layer |slice_byte_sizes| and custom
+  // |layer_names|.
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> Create(
       size_t num_layers, size_t num_shards,
       std::vector<size_t> slice_byte_sizes,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       int parallelism = 1, std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      std::vector<int> numa_nodes = {},
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
+      std::vector<transport::ShardInfo> shards = {});
 
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
@@ -294,8 +307,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
   void SetTestOnlyRateLimiters(
-      std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
-      std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress);
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress);
 
   void SetPipelineGroupSize(std::optional<size_t> group_size) {
     pipeline_group_size_override_ = group_size;
@@ -332,9 +345,67 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
   virtual void DrainPendingH2d();
 
+  // Hooks around the device copy of a fully received transfer ("hooked H2D").
+  //
+  // TODO(justinlu): Remove these temporary hooks once H2D is invoked directly
+  // by the controller instead of automatically upon transfer receipt.
+  //
+  // With auto_h2d=false the synchronizer normally only records a transfer as
+  // complete once it has landed in host staging; nothing is written to device
+  // until an explicit H2d(). Registering either hook changes that: once a whole
+  // transfer (OnDataReceived) or every shard of a block push
+  // (OnBlockShardsReceived) has landed, the synchronizer calls the start hook,
+  // copies all layers to device and waits for the copy, calls the end hook with
+  // the copy status, and only then records the transfer as complete, so
+  // WaitForTransferCompletion() returning means device weights are updated.
+  // Hooked H2Ds are serialized across concurrently completing transfers.
+  //
+  // The start hook must return only once it is safe to overwrite device
+  // weights (e.g. no model execution in flight); the end hook is always called
+  // if the start hook was, including on failure. Hooks have no effect with
+  // auto_h2d=true and must be registered before any transfer starts.
+  void RegisterH2dStartHook(absl::AnyInvocable<void()> hook)
+      ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+  void RegisterH2dEndHook(absl::AnyInvocable<void(const absl::Status&)> hook)
+      ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+
   void ForgetPushProgress(uint64_t uuid) override;
 
  protected:
+  // Two-phase construction for Create() and subclasses: the constructors only
+  // initialize the base class, thread pools and layer names and never fail;
+  // the matching Init*() allocates host staging buffers and starts the
+  // listener. An instance whose Init*() failed must be destroyed, not used.
+  //
+  // Device-buffer variant; follow with InitDeviceBuffers().
+  WeightSynchronizerBase(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+      std::optional<int> local_port, int parallelism,
+      std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
+      bool auto_h2d);
+  // CPU-only variant; follow with InitHostBuffers().
+  WeightSynchronizerBase(
+      size_t num_layers, size_t num_shards,
+      const std::vector<size_t>& slice_byte_sizes,
+      std::optional<int> local_port, int parallelism,
+      std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
+      bool auto_h2d, std::vector<int> numa_nodes = {},
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
+      std::vector<transport::ShardInfo> shards = {});
+
+  // Takes PJRT holds on |layer_buffers| and sets up one host staging buffer
+  // per shard, adopting |external_host_ptrs| when provided. Starts the
+  // listener on |listener_port| when set.
+  absl::Status InitDeviceBuffers(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+      const std::optional<std::vector<const uint8_t*>>& external_host_ptrs,
+      std::optional<int> listener_port);
+  // Allocates one host staging buffer per shard sized by |slice_byte_sizes|
+  // (falling back to slice_byte_size() for missing entries). Starts the
+  // listener on |listener_port| when set.
+  absl::Status InitHostBuffers(const std::vector<size_t>& slice_byte_sizes,
+                               std::optional<int> listener_port);
+
   // Records the shards of one block-push stream for |uuid| and returns true
   // once the shards reported so far reach num_shards(), i.e. the host buffers
   // of |uuid| are complete and may be copied to device. Subclasses that
@@ -372,6 +443,25 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  private:
+  // Shared tail of InitDeviceBuffers()/InitHostBuffers(): starts the listener
+  // on |listener_port| when set, creates the auto-H2D pool and per-shard
+  // scratchpads, and records the initial host-buffer occupancy metric.
+  void FinishInit(std::optional<int> listener_port);
+
+  // True if RegisterH2dStartHook() or RegisterH2dEndHook() has been called.
+  bool HasH2dHooks() const ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+  // Runs the start hook, copies all layers of |uuid| to device and waits,
+  // then runs the end hook with the copy status, which is returned. Holds
+  // |h2d_hook_mu_| throughout so hooked H2Ds never overlap.
+  absl::Status HookedH2d(uint64_t uuid) ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+
+  // Guards the hooks and serializes hooked H2Ds. The destructor stops the
+  // listener and transport server (waiting for in-flight callbacks) before any
+  // member is destroyed, so a running HookedH2d() always finishes first.
+  mutable absl::Mutex h2d_hook_mu_;
+  absl::AnyInvocable<void()> h2d_start_hook_ ABSL_GUARDED_BY(h2d_hook_mu_);
+  absl::AnyInvocable<void(const absl::Status&)> h2d_end_hook_
+      ABSL_GUARDED_BY(h2d_hook_mu_);
   std::vector<int64_t> global_shard_indices_;
   std::vector<int> local_shard_indices_;
 

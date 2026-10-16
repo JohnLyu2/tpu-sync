@@ -64,10 +64,24 @@ class SettledTransfer:
     req_id: The transfer's request ID.
     completed_ns: When the transfer completed, in time.perf_counter_ns()
       nanoseconds; None if not recorded.
+    elapsed_ns: Duration from transfer registration until settlement, in
+      nanoseconds; None if not recorded.
+    peer: Comma-separated remote peer endpoints; None if not known.
+    code: Canonical status code name for a failed transfer (e.g.
+      "DEADLINE_EXCEEDED" or "UNAVAILABLE"); None if it succeeded.
+    reason: Error message for a failed transfer; None if it succeeded.
+    phase: Execution phase where a failed transfer failed ("await_pull",
+      "staging", "d2h", or "push" for a send; "connect", "receive", or "h2d" for
+      a receive); None if it succeeded or the phase was not recorded.
   """
 
   req_id: str
   completed_ns: Optional[int] = None
+  elapsed_ns: Optional[int] = None
+  peer: Optional[str] = None
+  code: Optional[str] = None
+  reason: Optional[str] = None
+  phase: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -482,6 +496,10 @@ class KVCacheManager:
     Returns:
       True if a transfer is indeed needed; False if there is nothing to be
       transferred.
+
+    Raises:
+      ValueError: If `block_ids` contains duplicate block IDs.
+      RuntimeError: If `uuid` already has an active registered read.
     """
     return bool(self._impl.notify_for_read(req_id, uuid, block_ids))
 

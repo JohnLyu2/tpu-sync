@@ -35,6 +35,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "xla/pjrt/status_casters.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/fault_injection/fault_injection_bindings.h"
@@ -252,10 +253,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // =========================================================================
   auto manager_cls = nb::class_<KVCacheManager>(m, "KVCacheManager");
   manager_cls
-      .def(nb::init<const std::vector<std::vector<at::Tensor>>&,
-                    std::optional<int>, std::optional<int>, bool, int, int,
-                    std::optional<std::string>, std::optional<std::string>,
-                    int64_t, bool>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(KVCacheManager::Create)),
            nb::arg("device_tensors"), nb::arg("local_port") = nb::none(),
            nb::arg("host_blocks_to_allocate") = nb::none(),
            nb::arg("unsafe_skip_buffer_lock") = false,
@@ -263,10 +261,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("raiden_controller_address") = nb::none(),
            nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0,
            nb::arg("enable_shm") = false)
-      .def(nb::init<const std::vector<at::Tensor>&, int64_t, int64_t, int64_t,
-                    int64_t, double, bool, int, std::optional<int>, int,
-                    std::optional<std::string>, std::optional<std::string>,
-                    bool>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(KVCacheManager::CreateWithNodeId)),
            nb::arg("kv_caches"), nb::arg("node_id"),
            nb::arg("local_control_port"), nb::arg("max_blocks"),
            nb::arg("num_slots"), nb::arg("timeout_s") = 120.0,
@@ -642,6 +637,14 @@ NB_MODULE(_tpu_raiden_torch, m) {
                nb::gil_scoped_release release;
                return self.CompleteReadWithDetails();
              }();
+             // Error messages may contain raw bytes from a remote peer. Because
+             // completion reports have already been drained, escape invalid
+             // UTF-8 sequences rather than raising UnicodeDecodeError.
+             auto to_py_str = [](const std::string& str) {
+               return nb::steal<nb::str>(PyUnicode_DecodeUTF8(
+                   str.data(), static_cast<Py_ssize_t>(str.size()),
+                   "backslashreplace"));
+             };
              // {req_id: {field: value}}, with unset fields omitted, so a new
              // TransferDetails field needs only one more line here.
              nb::dict details;
@@ -649,6 +652,21 @@ NB_MODULE(_tpu_raiden_torch, m) {
                nb::dict fields;
                if (detail.completed_ns.has_value()) {
                  fields["completed_ns"] = *detail.completed_ns;
+               }
+               if (detail.elapsed_ns.has_value()) {
+                 fields["elapsed_ns"] = *detail.elapsed_ns;
+               }
+               if (detail.peer.has_value()) {
+                 fields["peer"] = to_py_str(*detail.peer);
+               }
+               if (detail.code.has_value()) {
+                 fields["code"] = to_py_str(*detail.code);
+               }
+               if (detail.reason.has_value()) {
+                 fields["reason"] = to_py_str(*detail.reason);
+               }
+               if (detail.phase.has_value()) {
+                 fields["phase"] = to_py_str(*detail.phase);
                }
                details[nb::str(req_id.data(), req_id.size())] = fields;
              }
@@ -669,10 +687,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // 3. Bind WeightSynchronizer
   // =========================================================================
   nb::class_<WeightSynchronizer>(m, "WeightSynchronizer")
-      .def(nb::init<const std::vector<std::vector<at::Tensor>>&,
-                    std::optional<int>, int, std::optional<int>,
-                    std::optional<std::string>, bool, bool,
-                    std::optional<std::vector<int64_t>>>(),
+      .def(nb::new_(xla::ValueOrThrowWrapper(WeightSynchronizer::Create)),
            nb::arg("device_tensors"), nb::arg("local_port") = nb::none(),
            nb::arg("parallelism") = 1, nb::arg("listener_port") = nb::none(),
            nb::arg("bind_ip") = nb::none(),
@@ -692,11 +707,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
              double test_only_simulated_ingress_gbps) {
-            return WeightSynchronizer::test_only_create_cpu_instance(
-                num_layers, num_shards, slice_byte_size, local_port,
-                parallelism, listener_port, bind_ip, auto_h2d,
-                global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+            return xla::ValueOrThrow(
+                WeightSynchronizer::test_only_create_cpu_instance(
+                    num_layers, num_shards, slice_byte_size, local_port,
+                    parallelism, listener_port, bind_ip, auto_h2d,
+                    global_shard_indices, test_only_simulated_egress_gbps,
+                    test_only_simulated_ingress_gbps));
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
@@ -715,11 +731,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
              double test_only_simulated_ingress_gbps) {
-            return WeightSynchronizer::test_only_create_cpu_instance(
-                num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-                parallelism, listener_port, bind_ip, auto_h2d,
-                global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+            return xla::ValueOrThrow(
+                WeightSynchronizer::test_only_create_cpu_instance(
+                    num_layers, num_shards, std::move(slice_byte_sizes),
+                    local_port, parallelism, listener_port, bind_ip, auto_h2d,
+                    global_shard_indices, test_only_simulated_egress_gbps,
+                    test_only_simulated_ingress_gbps));
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
@@ -753,9 +770,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::arg("device_tensors"), nb::call_guard<nb::gil_scoped_release>())
       .def(
           "unbind_weights",
-          [](WeightSynchronizer& self) {
-            self.UnbindWeights();
-          },
+          [](WeightSynchronizer& self) { self.UnbindWeights(); },
           nb::call_guard<nb::gil_scoped_release>())
 
       .def(

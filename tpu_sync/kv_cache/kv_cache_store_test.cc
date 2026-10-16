@@ -104,6 +104,29 @@ int use_private_controller_servers = []() {
 namespace tpu_raiden {
 namespace kv_cache {
 
+class HostOffloadBackendTest {
+ public:
+  // Tests construct backends directly; production code goes through
+  // HostOffloadBackend::Create.
+  class Backend : public HostOffloadBackend {
+   public:
+    template <typename... Args>
+    explicit Backend(Args&&... args)
+        : HostOffloadBackend(std::forward<Args>(args)...) {}
+  };
+
+  static std::vector<std::string> GetEvictCandidateKeys(
+      const HostOffloadBackend& backend) {
+    absl::MutexLock lock(backend.mutex_);
+    return backend.lru_cache_.GetEvictCandidateKeys();
+  }
+
+  static void InvalidateStoreClient(HostOffloadBackend& backend,
+                                    const RaidenId& remote_id) {
+    backend.InvalidateStoreClient(remote_id);
+  }
+};
+
 class KVCacheStoreTest {
  public:
   static size_t Evict(KVCacheStore& store,
@@ -118,7 +141,9 @@ class KVCacheStoreTest {
 
   static std::vector<std::string> GetEvictCandidateKeys(
       const KVCacheStore& store) {
-    return store.backend() ? store.backend()->GetEvictCandidateKeys()
+    return store.backend() ? HostOffloadBackendTest::GetEvictCandidateKeys(
+                                 *static_cast<const HostOffloadBackend*>(
+                                     store.backend().get()))
                            : std::vector<std::string>{};
   }
 
@@ -152,18 +177,6 @@ class KVCacheStoreTest {
                                                            int needed) {
     return store.AllocateBlockIds(needed);
   }
-};
-
-class HostOffloadBackendTest {
- public:
-  // Tests construct backends directly; production code goes through
-  // HostOffloadBackend::Create.
-  class Backend : public HostOffloadBackend {
-   public:
-    template <typename... Args>
-    explicit Backend(Args&&... args)
-        : HostOffloadBackend(std::forward<Args>(args)...) {}
-  };
 };
 
 // Direct-construction shorthand for the backend fixtures below.
@@ -3961,34 +3974,6 @@ TEST_F(StoreDiscoveryTest, AdoptsAndPublishesTheBackendsServer) {
   EXPECT_EQ(resolved->store_server_address(), store.store_server_address());
 }
 
-// A backend that already hosts a KVCacheStoreServer (because something started
-// one on it explicitly before store construction) is adopted by the store
-// rather than standing up a second server.
-TEST_F(StoreDiscoveryTest, AdoptsTheBackendsServerRatherThanOwningASecond) {
-  RaidenId rid{"disco_job_adopt", "0", "kv_cache", 0};
-
-  // Nothing starts a backend's server implicitly: the only way a backend can
-  // already host one by the time the store wires up is a caller starting it
-  // explicitly beforehand, as here.
-  // The bootstrap controller only needs to be non-null for StartServer to
-  // succeed; the store below wires its own controller in afterward.
-  auto bootstrap_controller = MakeRecoveryController(rid, /*num_blocks=*/16);
-  auto backend = std::make_shared<TestHostOffloadBackend>(
-      /*capacity=*/16, std::nullopt, rid, bootstrap_controller.get());
-  ABSL_ASSERT_OK(backend->StartServer("127.0.0.1"));
-  ASSERT_NE(backend->store_server(), nullptr);
-
-  KVCacheStore store(std::vector<std::shared_ptr<KVCacheStoreBackend>>{backend},
-                     rid,
-                     /*num_shards=*/1, /*shard_size_bytes=*/512,
-                     /*store_server_ip=*/"127.0.0.1",
-                     /*raiden_controller_port=*/0, registry_address_);
-
-  ASSERT_NE(store.store_server(), nullptr);
-  ASSERT_FALSE(store.backends().empty());
-  EXPECT_EQ(store.store_server(), store.backends()[0]->store_server());
-}
-
 // The controller is addressed from the same ip, with its port either chosen by
 // gRPC (0) or taken verbatim.
 TEST_F(StoreDiscoveryTest, ControllerAddressComposedFromIpAndPort) {
@@ -4266,66 +4251,6 @@ TEST_F(StoreDiscoveryTest, CapacityConstructedStoreJoinsTheGlobalTier) {
   ASSERT_EQ(result->size(), 1);
   EXPECT_EQ((*result)[0].second.raiden_id, peer);
   EXPECT_EQ((*result)[0].second.status, BlockStatus::REMOTE);
-}
-
-// A backend's server can be started AFTER the store was constructed -- which
-// is too late for the store's adoption pass to have seen it -- and with no
-// registry the store never adopts one at all. That server holds the store's
-// RaidenController in a pointer it cannot re-seat, so leaving it running past
-// the store's destructor gives a live service dereferencing a freed
-// controller. Waiting for ~HostOffloadBackend is not enough: backends_ holds
-// shared_ptrs, so a caller that keeps its own reference outlives the store,
-// which is exactly what this test does.
-//
-// GetGrpcPort() going to 0 is Shutdown()'s observable effect, so this fails
-// deterministically without a sanitizer.
-TEST_F(StoreDiscoveryTest, DestructorShutsDownABackendStartedServer) {
-  RaidenId rid{"disco_job_h1", "0", "kv_cache", 0};
-  std::shared_ptr<KVCacheStoreBackend> backend_ref;
-  {
-    KVCacheStore store(/*capacity=*/16, /*global_registry_address=*/"", rid,
-                       /*num_shards=*/1, /*shard_size_bytes=*/512,
-                       /*store_server_ip=*/"127.0.0.1",
-                       /*raiden_controller_port=*/0);
-    // No registry, so the store owns and adopts nothing.
-    ASSERT_EQ(store.store_server(), nullptr);
-
-    backend_ref = store.backend();
-    auto* backend = dynamic_cast<HostOffloadBackend*>(backend_ref.get());
-    ASSERT_NE(backend, nullptr);
-    ABSL_ASSERT_OK(backend->StartServer("127.0.0.1"));
-    ASSERT_NE(backend->store_server(), nullptr);
-    ASSERT_GT(backend->store_server()->GetGrpcPort(), 0);
-  }
-
-  auto* backend = dynamic_cast<HostOffloadBackend*>(backend_ref.get());
-  ASSERT_NE(backend->store_server(), nullptr);
-  EXPECT_EQ(backend->store_server()->GetGrpcPort(), 0)
-      << "the store's destructor left a backend-hosted server running, still "
-         "holding the controller it just destroyed";
-}
-
-// Same sweep, but with a registry, so the store DID adopt the backend's
-// server. Covers the de-duplication: the adopted server is shut once, not
-// twice.
-TEST_F(StoreDiscoveryTest, DestructorSweepSkipsTheAdoptedServer) {
-  RaidenId rid{"disco_job_h1_adopt", "0", "kv_cache", 0};
-  auto bootstrap_controller = MakeRecoveryController(rid, /*num_blocks=*/16);
-  auto backend = std::make_shared<TestHostOffloadBackend>(
-      /*capacity=*/16, std::nullopt, rid, bootstrap_controller.get());
-  ABSL_ASSERT_OK(backend->StartServer("127.0.0.1"));
-  ASSERT_GT(backend->store_server()->GetGrpcPort(), 0);
-
-  {
-    KVCacheStore store(
-        std::vector<std::shared_ptr<KVCacheStoreBackend>>{backend}, rid,
-        /*num_shards=*/1, /*shard_size_bytes=*/512,
-        /*store_server_ip=*/"127.0.0.1",
-        /*raiden_controller_port=*/0, registry_address_);
-    ASSERT_EQ(store.store_server(), backend->store_server());
-  }
-
-  EXPECT_EQ(backend->store_server()->GetGrpcPort(), 0);
 }
 
 // store_clients_ caches one client per peer and nothing ever erased it, so a
@@ -5227,7 +5152,7 @@ TEST_F(RemoteWriteSourceTest,
   auto backend =
       std::dynamic_pointer_cast<HostOffloadBackend>(src_store->backend());
   ASSERT_NE(backend, nullptr);
-  backend->InvalidateStoreClient(dst);
+  HostOffloadBackendTest::InvalidateStoreClient(*backend, dst);
   ABSL_ASSERT_OK(client_->UnregisterStore(dst));
 
   fake_destination_.BreakActiveStreams(::grpc::Status(

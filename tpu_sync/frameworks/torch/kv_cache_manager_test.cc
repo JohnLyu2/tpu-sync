@@ -87,9 +87,12 @@ TEST_F(KVCacheManagerTorchTest, ConstructorSucceedsWithMocks) {
   std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
 
   // Construct KVCacheManager (should use mocks internally)
-  KVCacheManager manager(device_tensors,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager_ptr,
+      KVCacheManager::Create(device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8));
+  KVCacheManager& manager = *manager_ptr;
 
   EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
 }
@@ -195,20 +198,21 @@ TEST_F(KVCacheManagerTorchTest,
   std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
 
   // Construct KVCacheManager with local_control_port=50051 (> 0).
-  KVCacheManager mgr(
-      {tensor}, /*node_id=*/0,
-      /*local_control_port=*/50051,
-      /*max_blocks=*/8, /*num_slots=*/8,
-      /*timeout_s=*/120.0, /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt,
-      /*raiden_worker_port=*/0,
-      raiden_controller_address,
-      "torch_worker_ctrl");
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::CreateWithNodeId(
+                              {tensor}, /*node_id=*/0,
+                              /*local_control_port=*/50051,
+                              /*max_blocks=*/8, /*num_slots=*/8,
+                              /*timeout_s=*/120.0,
+                              /*unsafe_skip_buffer_lock=*/true,
+                              /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                              /*raiden_worker_port=*/0,
+                              raiden_controller_address, "torch_worker_ctrl"));
 
   // Verify that get_local_endpoints() returns the CONTROL port (50051)
   // while get_local_data_endpoints() returns the DATA transport port.
-  auto local_control_eps = mgr.torch_manager()->get_local_endpoints();
-  auto local_data_eps = mgr.torch_manager()->get_local_data_endpoints();
+  auto local_control_eps = mgr->torch_manager()->get_local_endpoints();
+  auto local_data_eps = mgr->torch_manager()->get_local_data_endpoints();
 
   ASSERT_FALSE(local_control_eps.empty());
   ASSERT_FALSE(local_data_eps.empty());
@@ -248,9 +252,12 @@ TEST_F(KVCacheManagerTorchTest, MapSharedMemoryValidation) {
   RegisterMockTensor(tensor, pjrt_buffer.get());
   std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
 
-  KVCacheManager manager(device_tensors,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager_ptr,
+      KVCacheManager::Create(device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8));
+  KVCacheManager& manager = *manager_ptr;
 
   EXPECT_FALSE(manager.is_shared_memory_mapped());
 
@@ -344,9 +351,12 @@ TEST_F(KVCacheManagerTorchTest, H2dD2hWithObjectTensorsValidation) {
   RegisterMockTensor(tensor, pjrt_buffer.get());
   std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
 
-  KVCacheManager manager(device_tensors,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager_ptr,
+      KVCacheManager::Create(device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8));
+  KVCacheManager& manager = *manager_ptr;
 
   const int64_t page_nbytes = manager.slice_byte_size();
   EXPECT_EQ(page_nbytes, 1024 * sizeof(float));
@@ -431,9 +441,12 @@ TEST_F(KVCacheManagerTorchTest, H2dD2hWithObjectTensorsEndToEnd) {
   RegisterMockTensor(tensor, pjrt_buffer.get());
   std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
 
-  KVCacheManager manager(device_tensors,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager_ptr,
+      KVCacheManager::Create(device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8));
+  KVCacheManager& manager = *manager_ptr;
 
   const int64_t page_nbytes = manager.slice_byte_size();
 
@@ -542,9 +555,12 @@ TEST_F(KVCacheManagerTorchTest, H2dD2hWithMultiSlicePages) {
     device_tensors.push_back({tensor});
   }
 
-  KVCacheManager manager(device_tensors,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager_ptr,
+      KVCacheManager::Create(device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8));
+  KVCacheManager& manager = *manager_ptr;
   ASSERT_EQ(manager.num_layers(), static_cast<size_t>(kNumLayers));
 
   // 8 slices of 4096 bytes per layer, so two-slice pages leave 4 pages.
@@ -670,9 +686,12 @@ TEST_F(KVCacheManagerTorchTest, ConcurrentCopiesRacingUnmapAreSafe) {
   RegisterMockTensor(tensor, pjrt_buffer.get());
   std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
 
-  KVCacheManager manager(device_tensors,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager_ptr,
+      KVCacheManager::Create(device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8));
+  KVCacheManager& manager = *manager_ptr;
 
   const int64_t page_nbytes = manager.slice_byte_size();
   const int64_t obj_nbytes = 1 * 1 * page_nbytes;

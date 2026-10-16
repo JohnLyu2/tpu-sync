@@ -17,10 +17,13 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/stream.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi.h"
 
 namespace tpu_raiden {
@@ -28,6 +31,18 @@ namespace weight_sync {
 
 extern std::unique_ptr<stream_executor::Stream> g_streams[kMaxShards];
 void ClearSharedWsMap();
+
+// Resolves the host control-plane IP reachable from external orchestrator nodes
+// (e.g., GKE CPU nodepools). Probes the kernel default route first when
+// |use_default_route_probe| is true, then falls back to `eth0` in |host_nics|,
+// any physical `kControlPlane` NIC in |host_nics|, and finally |fallback_ip|.
+std::string ResolveControlPlaneIp(absl::Span<const HostNicAddress> host_nics,
+                                  absl::string_view fallback_ip,
+                                  bool use_default_route_probe = true);
+
+// Packs |ip_str| (IPv4 or IPv6) as a 16-byte IPv4-mapped IPv6 / IPv6 address
+// into 4 `int32_t` elements at |dst|.
+void PackIpToInt32s(absl::string_view ip_str, int32_t* dst);
 
 xla::ffi::Error TriggerWeightSynchronizerInitImpl(
     xla::ffi::AnyBuffer x, xla::ffi::AnyBuffer shard_idx_buf,

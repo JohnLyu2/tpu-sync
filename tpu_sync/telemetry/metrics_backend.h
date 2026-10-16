@@ -57,8 +57,8 @@ struct ExporterOptions {
   absl::Span<const double> custom_buckets = kDefaultHistogramBuckets;
   // Worker local rank identifier in distributed multi-rank environments. Note:
   // Fallback to the LOCAL_RANK environment variable is handled at the
-  // metrics_api initialization layer; backend constructors (such as
-  // BaseShmExporter) expect an already-resolved, valid rank string.
+  // metrics_api initialization layer; may be std::nullopt for non-worker or
+  // coordinator processes that do not set LOCAL_RANK.
   std::optional<std::string> local_rank;
   // Absolute path of the directory for POSIX shared-memory segments used for
   // inter-worker telemetry aggregation via BaseShmExporter and its derived

@@ -40,6 +40,7 @@
 #include "tpu_sync/core/pool_reshard_send_slots.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/utils.h"
+#include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -97,6 +98,8 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
+  ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
+                        ResolveDataConnectionReuse());
   ABSL_RETURN_IF_ERROR(ValidatePlan(*base, plan, src_block_ids));
   // Device-only executor: without device attachments there are no bytes this
   // path could legitimately move; host-only managers fail closed with no
@@ -142,7 +145,9 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
   const uint64_t uuid = plan.uuid();
   return std::shared_ptr<ReshardSendSession>(new ReshardSendSession(
       base, staging_allocator, std::move(req_id), uuid, parallelism,
-      remaining_pool_peer_pushes, deadline, std::move(plan)));
+      remaining_pool_peer_pushes, deadline, std::move(plan),
+      std::vector<std::string>(peers.begin(), peers.end()),
+      data_connection_reuse));
 }
 
 ReshardSendSession::ReshardSendSession(
@@ -150,7 +155,9 @@ ReshardSendSession::ReshardSendSession(
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     int parallelism, int remaining_pool_peer_pushes,
     std::chrono::steady_clock::time_point deadline,
-    ::tpu_sync::rpc::StartTransferRequest plan)
+    ::tpu_sync::rpc::StartTransferRequest plan,
+    std::vector<std::string> dst_peers,
+    DataConnectionReuse data_connection_reuse)
     : base_(base),
       staging_allocator_(staging_allocator),
       req_id_(std::move(req_id)),
@@ -158,6 +165,8 @@ ReshardSendSession::ReshardSendSession(
       parallelism_(parallelism),
       deadline_(deadline),
       plan_(std::move(plan)),
+      dst_peers_(std::move(dst_peers)),
+      data_connection_reuse_(data_connection_reuse),
       remaining_pool_peer_pushes_(remaining_pool_peer_pushes) {}
 
 ReshardSendSession::~ReshardSendSession() {
@@ -219,8 +228,9 @@ absl::Status ReshardSendSession::ExecutePush(
     // full-mirror storages). Released in SettleLocked.
     if (const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);
         pool_spec != nullptr) {
-      absl::Status lease_status = staging_allocator_->AcquirePoolStagingLease(
-          uuid_, pool_spec->storage_index, pool_src_block_ids);
+      absl::Status lease_status = base_->AcquirePoolStagingLease(
+          uuid_, pool_spec->storage_index, pool_src_block_ids,
+          base_->pool_staging_lease_timeout());
       if (!lease_status.ok()) {
         RecordPushCompletion(manager, lease_status);
         EndOp();
@@ -388,6 +398,12 @@ void ReshardSendSession::Finish(const absl::Status& status) {
   }
   if (done_ || finalizing_) return;
   finalizing_ = true;
+  // Settling here, with no op in flight, means no push was ever issued:
+  // ExecutePush holds an op while it schedules, StartPoolPush counts every
+  // push before issuing it, and each push stays counted until its completion
+  // has run RecordPushCompletion, which starts finalizing on the first
+  // failure or the last scheduled success. A send that pushed therefore
+  // settles in EndOp, which releases its data connections first.
   if (in_flight_ == 0) {
     SettleLocked();
   }
@@ -422,17 +438,39 @@ void ReshardSendSession::EndOp() {
                  << " on settle: " << unregister;
     }
   }
-  absl::MutexLock lock(mu_);
-  --in_flight_;
-  if (finalizing_ && in_flight_ == 0 && !done_) {
-    SettleLocked();
+  // Likewise, under kPerTransfer the last op closes the idle data connections
+  // to |dst_peers_| before it is counted out: every push has returned its
+  // socket by now, and ~KVCacheManagerWithTransfer is still parked in
+  // AwaitForDone(), so the manager, |base_| and its transport are alive.
+  // transport_server() cannot contend on server_init_mu_ either: every
+  // StopTransportServer() call is in a destructor that runs only after that
+  // wait. The check and the decrement share a critical section so a Finish()
+  // that starts finalizing in between cannot settle the send unreleased.
+  while (true) {
+    {
+      absl::MutexLock lock(mu_);
+      const bool release_due =
+          data_connection_reuse_ == DataConnectionReuse::kPerTransfer &&
+          in_flight_ == 1 && finalizing_ && !done_ && !connections_released_ &&
+          manager_ != nullptr && !manager_->IsShuttingDown();
+      if (!release_due) {
+        --in_flight_;
+        if (finalizing_ && in_flight_ == 0 && !done_) {
+          SettleLocked();
+        }
+        return;
+      }
+      connections_released_ = true;
+    }
+    ReleaseDataConnectionsAfterSend(base_->transport_server(), dst_peers_,
+                                    uuid_);
   }
 }
 
 void ReshardSendSession::ReleaseLeasesLocked() {
   if (leases_released_) return;
   leases_released_ = true;
-  staging_allocator_->ReleasePoolStagingLeases(uuid_);
+  base_->ReleasePoolStagingLeases(uuid_);
 }
 
 void ReshardSendSession::SettleLocked() {

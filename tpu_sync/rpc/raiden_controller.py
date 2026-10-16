@@ -63,7 +63,6 @@ WorkerRpcClient = job_entity.WorkerRpcClient
 
 ReshardPlanner = reshard_planner.ReshardPlanner
 _get_global_indices = reshard_planner.get_global_indices
-compute_host_subgrid = reshard_planner.compute_host_subgrid
 generate_strided_copy_chunks = reshard_planner.generate_strided_copy_chunks
 generate_strided_copy_chunks_tile_aware = (
     reshard_planner.generate_strided_copy_chunks_tile_aware
@@ -184,7 +183,6 @@ class RaidenController:
     )
     self._registered_variables: dict[RaidenId, list[Any]] = {}
     self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
-    self._registered_host_subgrids: dict[RaidenId, list[int]] = {}
     self._planner = ReshardPlanner()
 
   @property
@@ -428,7 +426,6 @@ class RaidenController:
       transfer_rank: Optional[int] = None,
       variables: Optional[Sequence[Any]] = None,
       mesh_axes: Optional[Sequence[str]] = None,
-      host_subgrid: Optional[Sequence[int]] = None,
   ) -> None:
     """Registers physical worker shard Data addresses and metadata on `unit`'s JobEntity."""
     has_metadata = (
@@ -517,7 +514,6 @@ class RaidenController:
     )
     new_transfer_rank = transfer_rank if has_reshard_metadata else None
     new_variables = list(variables) if variables is not None else None
-    new_host_subgrid = list(host_subgrid) if host_subgrid is not None else None
 
     with self._lock:
       old_shards = self._registered_shards.get(unit)
@@ -538,7 +534,6 @@ class RaidenController:
           == new_transfer_parallelism
           and self._registered_transfer_ranks.get(unit) == new_transfer_rank
           and self._registered_variables.get(unit) == new_variables
-          and self._registered_host_subgrids.get(unit) == new_host_subgrid
       )
       is_idempotent = (
           is_topology_identical
@@ -579,7 +574,6 @@ class RaidenController:
           transfer_parallelism=new_transfer_parallelism,
           transfer_rank=new_transfer_rank,
           variables=new_variables,
-          host_subgrid=new_host_subgrid,
           unit=unit,
       )
 
@@ -597,7 +591,6 @@ class RaidenController:
           self._registered_transfer_parallelism,
           self._registered_transfer_ranks,
           self._registered_variables,
-          self._registered_host_subgrids,
       ):
         registry.pop(unit, None)
       if new_mesh_shape is not None:
@@ -618,8 +611,6 @@ class RaidenController:
         self._registered_transfer_ranks[unit] = new_transfer_rank
       if new_variables is not None:
         self._registered_variables[unit] = new_variables
-      if new_host_subgrid is not None:
-        self._registered_host_subgrids[unit] = new_host_subgrid
 
       keys_to_clear = []
       for k, cached_sched in self._plan_cache.items():
@@ -770,8 +761,6 @@ class RaidenController:
         registered_variables=self._registered_variables,
         registered_global_shapes=self._registered_global_shapes,
         registered_mesh_shapes=self._registered_mesh_shapes,
-        registered_mesh_axes=self._registered_mesh_axes,
-        registered_host_subgrids=self._registered_host_subgrids,
         registered_layouts=self._registered_layouts,
         registered_itemsizes=self._registered_itemsizes,
         registered_shards=self._registered_shards,
@@ -811,7 +800,6 @@ class RaidenController:
     )
     reg_req.mesh_shape.extend(self._registered_mesh_shapes.get(unit, ()))
     reg_req.mesh_axes.extend(self._registered_mesh_axes.get(unit, ()))
-    reg_req.host_subgrid.extend(self._registered_host_subgrids.get(unit, ()))
     reg_req.layout.extend(self._registered_layouts.get(unit, ()))
     reg_req.global_shape.extend(self._registered_global_shapes.get(unit, ()))
     for pool in self._registered_pool_manifests.get(unit, ()):

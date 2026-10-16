@@ -133,8 +133,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<std::string> bind_ip = std::nullopt,
       std::optional<size_t> logical_slice_byte_size = std::nullopt,
       std::vector<int64_t> logical_dimensions = {},
-      std::optional<size_t> logical_physical_size = std::nullopt,
-      std::optional<int> assigned_numa_node_override = std::nullopt);
+      std::optional<size_t> logical_physical_size = std::nullopt);
 
   // Standard CPU-only constructor for remote workers E2E.
   KVCacheManagerBase(size_t num_layers, size_t num_shards,

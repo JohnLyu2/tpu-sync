@@ -50,9 +50,6 @@ microbenchmarks here.
 
 import os
 import sys
-
-sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_LAZY)
-
 import time
 from absl import app
 from absl import flags
@@ -66,8 +63,14 @@ from tpu_sync.api.torch import kv_cache_manager
 from tpu_sync.api.torch import torch_tpu_common_loader
 from tpu_sync.rpc import coordination_helper
 
-# Register the TPU device backend with PyTorch c10 dispatcher.
+# Register the TPU device backend with PyTorch c10 dispatcher, then load the
+# Raiden Torch extension before any TPU device work, the same order the
+# torch image's build-time import check uses. Do not load it with
+# RTLD_GLOBAL (the JAX runner needs that, Torch does not): it statically links
+# LLVM, and a global load clashes with libtpu's LLVM ("Option ... registered
+# more than once").
 torch_tpu_common_loader.load_torch_tpu_common()
+kv_cache_manager._torch_impl()  # pylint: disable=protected-access
 if not hasattr(torch, 'tpu'):
   import torch_tpu._loader as _torch_tpu_loader  # pytype: disable=import-error
 

@@ -52,11 +52,11 @@
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
-#include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
 #include "tpu_sync/kv_cache/store_monitor.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -413,14 +413,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
       !backend_configs[0].global_registry_address.empty() ||
       !global_registry_address.empty();
   if (expected_worker_count > 0 && tier0_has_registry) {
-    auto* host_backend =
-        dynamic_cast<HostOffloadBackend*>(store->backend().get());
-    if (host_backend == nullptr) {
-      return absl::FailedPreconditionError(
-          "registering the KVTransferSpec requires a HostOffloadBackend at "
-          "tier 0");
-    }
-    ABSL_RETURN_IF_ERROR(host_backend->RegisterKVTransferSpecFromWorkers());
+    ABSL_RETURN_IF_ERROR(store->backend()->RegisterKVTransferSpecFromWorkers());
   }
 
   if (monitor_config.enable) {
@@ -779,38 +772,24 @@ absl::Status KVCacheStore::EnsureStoreServerAndRegister(
   }
 
   // The global registry decides whether the P2P plane exists at all. No
-  // registry client, no server -- not adopted from a backend, not owned by
-  // this store. (store_server_ip_ is never empty here: validation
-  // makes it mandatory.)
+  // registry client, no server. (store_server_ip_ is never empty here:
+  // validation makes it mandatory.)
   if (registry_client_ == nullptr) {
     return absl::OkStatus();
   }
 
-  // Reuse a backend's server if one exists, so a node never serves peers from
-  // two ports. Otherwise this store owns one -- every store must be reachable,
-  // not just those configured with a backend that happens to host a server.
-  KVCacheStoreBackend* serving_backend = nullptr;
-  for (auto& backend : backends_) {
-    if (backend != nullptr && backend->store_server() != nullptr) {
-      store_server_ = backend->store_server();
-      serving_backend = backend.get();
-      break;
-    }
+  // Unreachable: ValidateBackends rejects a store with no tier-0 backend at
+  // construction. Kept as a last line of defence, and as an ERROR rather
+  // than the warning-and-carry-on it used to be -- returning OK here left a
+  // store that has a registry configured but never publishes itself, which
+  // reads to every peer as "that node does not exist".
+  if (backends_.empty() || backends_[0] == nullptr) {
+    return absl::FailedPreconditionError(
+        "KVCacheStore has no tier-0 backend; cannot serve or publish.");
   }
-  if (store_server_ == nullptr) {
-    // Unreachable: ValidateBackends rejects a store with no tier-0 backend at
-    // construction. Kept as a last line of defence, and as an ERROR rather
-    // than the warning-and-carry-on it used to be -- returning OK here left a
-    // store that has a registry configured but never publishes itself, which
-    // reads to every peer as "that node does not exist".
-    if (backends_.empty() || backends_[0] == nullptr) {
-      return absl::FailedPreconditionError(
-          "KVCacheStore has no tier-0 backend; cannot serve or publish.");
-    }
-    owned_store_server_ = KVCacheStoreServer::Create();
-    store_server_ = owned_store_server_.get();
-    serving_backend = backends_[0].get();
-  }
+  owned_store_server_ = KVCacheStoreServer::Create();
+  store_server_ = owned_store_server_.get();
+  KVCacheStoreBackend* serving_backend = backends_[0].get();
 
   // store_server_ip_ is mandatory; the port is always gRPC's choice.
   const std::string bind_address = absl::StrCat(store_server_ip_, ":0");
@@ -861,21 +840,6 @@ absl::Status KVCacheStore::EnsureStoreServerAndRegister(
   return absl::OkStatus();
 }
 
-void KVCacheStore::ShutdownBackendStoreServers(
-    KVCacheStoreServer* already_shut) {
-  for (auto& backend : backends_) {
-    if (backend == nullptr) {
-      continue;
-    }
-    KVCacheStoreServer* server = backend->store_server();
-    // Shutdown() is idempotent, but skipping the adopted server says why
-    // rather than leaving the reader to check.
-    if (server != nullptr && server != already_shut) {
-      server->Shutdown();
-    }
-  }
-}
-
 KVCacheStore::~KVCacheStore() {
   {
     absl::MutexLock lock(lifetime_->mu);
@@ -908,29 +872,8 @@ KVCacheStore::~KVCacheStore() {
   if (store_server_ != nullptr) {
     // Shutdown() drains in-flight handlers, so no RPC is mid-flight past this
     // point.
-    //
-    // We shut the server down even when a backend owns it, because the service
-    // holds OUR RaidenController in pointers it cannot re-seat -- once we go,
-    // it can only answer RPCs with a dangling controller. The consequence is
-    // that sharing one backend between two KVCacheStores is not supported: the
-    // first store to be destroyed takes the shared server with it.
-    KVCacheStoreServer* already_shut = store_server_;
     store_server_->Shutdown();
     store_server_ = nullptr;
-
-    // Fall through to the sweep below with this one excluded.
-    ShutdownBackendStoreServers(already_shut);
-  } else {
-    // store_server_ is null whenever this store has no registry (see
-    // EnsureStoreServerAndRegister), but a backend's server can still be
-    // running: StartServer is public, and a caller may start one AFTER
-    // construction, which is too late for the adoption above to see it. That
-    // server holds OUR controller in a pointer it cannot re-seat, and
-    // raiden_controller_ is about to be destroyed, so it has to be stopped
-    // here -- in the destructor BODY, while the controller is still alive.
-    // Relying on ~HostOffloadBackend is not enough: backends_ holds
-    // shared_ptrs, so a caller keeping its own reference outlives this store.
-    ShutdownBackendStoreServers(/*already_shut=*/nullptr);
   }
 
   for (const auto& backend : backends_) {
@@ -2005,7 +1948,7 @@ bool KVCacheStore::SweepOnce() {
 }
 
 bool KVCacheStore::RepublishOnce() {
-  auto* host_backend = dynamic_cast<HostOffloadBackend*>(backend().get());
+  KVCacheStoreBackend* host_backend = backend().get();
   if (host_backend == nullptr) {
     return false;
   }
@@ -2207,7 +2150,7 @@ absl::Status KVCacheStore::SaveRemote(
         "The save destination is this store; there is nothing to transfer");
   }
 
-  auto* backend = dynamic_cast<HostOffloadBackend*>(this->backend().get());
+  KVCacheStoreBackend* backend = this->backend().get();
   if (backend == nullptr) {
     return absl::FailedPreconditionError(
         "A remote save requires a HostOffloadBackend at tier 0");
