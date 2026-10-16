@@ -2,7 +2,7 @@
 
 `TpuSyncVerify/Controller/ReadRemote.lean` models the destination half of
 `RaidenController::ReadRemote` (`tpu_sync/core/controller/raiden_controller.cc`,
-tpu-sync `1fa06d1`). It is the model behind finding **F2** in
+tpu-sync `0ac16d1`). It is the model behind finding **F2** in
 `findings/README.md`: a remote read can keep DMA-ing into the caller's
 destination blocks after the caller has been told the read failed.
 
@@ -73,8 +73,8 @@ the bug-hunt repro in `findings/raiden_controller_bughunt_test.cc` map to
 
 | | |
 |---|---|
-| Citations | `1fa06d1` (the `ReadRemote` region of `raiden_controller.cc` moved +35 lines since `50b0774`, otherwise byte-identical) |
-| Tests in `findings/` | last run on `d16701e`; not re-run at `1fa06d1` |
-| Patches in `findings/` | apply clean at `1fa06d1` |
-| Upstream fix | none for F2 as of `1fa06d1` (2026-10-10); F4 fixed in `72255dd` |
+| Citations | `0ac16d1` (the `ReadRemote` region of `raiden_controller.cc` is unchanged since `1fa06d1`) |
+| Tests in `findings/` | last run on `d16701e`; not re-run at `0ac16d1` |
+| Patches in `findings/` | `build_targets.patch`, `candidate_fixes.patch` apply clean at `0ac16d1` |
+| Upstream fix | none for F2 as of `0ac16d1` (2026-10-16); F4 fixed in `72255dd`, F6 in `8653373` |
 

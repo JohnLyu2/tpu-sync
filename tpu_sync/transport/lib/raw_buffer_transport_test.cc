@@ -14,7 +14,11 @@
 
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -40,7 +44,9 @@
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
@@ -51,7 +57,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -69,6 +75,9 @@
 
 namespace tpu_raiden::transport::lib {
 namespace {
+
+using ::peregrine::v1::ReadExact;
+using ::peregrine::v1::WriteExact;
 
 class ScopedEnvVar {
  public:
@@ -585,13 +594,12 @@ TEST_P(RawBufferTransportTest, RejectsWrappingAndOutOfBoundsPushAndPull) {
     header.uuid = 42;
 
     const auto s_header = SerializeChunkHeader(header);
-    ASSERT_OK(
-        ::peregrine::WriteExact(client_fd, s_header.data(), s_header.size()));
+    ASSERT_OK(WriteExact(client_fd, s_header.data(), s_header.size()));
 
     // Server should reject destination out of bounds and close socket without
     // reading/writing payload or sending ACK=1.
     uint8_t ack = 0;
-    const auto read_res = ::peregrine::ReadExact(client_fd, &ack, 1);
+    const auto read_res = ReadExact(client_fd, &ack, 1);
     EXPECT_FALSE(read_res.ok());
     close(client_fd);
   }
@@ -612,14 +620,12 @@ TEST_P(RawBufferTransportTest, RejectsWrappingAndOutOfBoundsPushAndPull) {
     header.uuid = 43;
 
     const auto s_header = SerializeChunkHeader(header);
-    ASSERT_OK(
-        ::peregrine::WriteExact(client_fd, s_header.data(), s_header.size()));
+    ASSERT_OK(WriteExact(client_fd, s_header.data(), s_header.size()));
 
     // Server should reject source out of bounds and close socket without
     // sending data.
     std::vector<uint8_t> dummy(kWrapSize);
-    const auto read_res =
-        ::peregrine::ReadExact(client_fd, dummy.data(), dummy.size());
+    const auto read_res = ReadExact(client_fd, dummy.data(), dummy.size());
     EXPECT_FALSE(read_res.ok());
     close(client_fd);
   }
@@ -681,6 +687,56 @@ TEST_P(ConnPoolTest, MultiIpPoolingIsolation) {
   pool.Return(/*ok=*/true, fd4, addr, "127.0.0.2");
 
   // Close the pool.
+  pool.Close();
+}
+
+TEST_P(ConnPoolTest, CloseIdleClosesOnlyThatPeersIdleConnections) {
+  RawMockDelegate src(1024);
+  RawBufferTransport listener_a(&src, 0);
+  RawBufferTransport listener_b(&src, 0);
+  auto channel_a = StartControlServer(&listener_a);
+  auto channel_b = StartControlServer(&listener_b);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  ConnPool pool;
+  const std::string peer_a = GetIpPort(listener_a);
+  const std::string peer_b = GetIpPort(listener_b);
+  const bool require_psp = absl::GetFlag(FLAGS_require_psp_tcp);
+
+  // Two idle connections to A under two local IPs (two pool keys that both
+  // end in "->A") and one to B.
+  const auto a1 = pool.Borrow(peer_a, "127.0.0.1", require_psp, channel_a);
+  ABSL_ASSERT_OK(a1) << a1.status().message();
+  const auto a2 = pool.Borrow(peer_a, "127.0.0.2", require_psp, channel_a);
+  ABSL_ASSERT_OK(a2) << a2.status().message();
+  const auto b1 = pool.Borrow(peer_b, "127.0.0.1", require_psp, channel_b);
+  ABSL_ASSERT_OK(b1) << b1.status().message();
+  pool.Return(/*ok=*/true, *a1, peer_a, "127.0.0.1");
+  pool.Return(/*ok=*/true, *a2, peer_a, "127.0.0.2");
+  pool.Return(/*ok=*/true, *b1, peer_b, "127.0.0.1");
+  EXPECT_EQ(pool.IdleCount(peer_a), 2u);
+  EXPECT_EQ(pool.IdleCount(peer_b), 1u);
+
+  // A borrowed connection is not idle: it survives the close.
+  const auto a3 = pool.Borrow(peer_a, "127.0.0.1", require_psp, channel_a);
+  ABSL_ASSERT_OK(a3) << a3.status().message();
+  EXPECT_EQ(*a3, *a1);
+  EXPECT_EQ(pool.IdleCount(peer_a), 1u);
+
+  EXPECT_EQ(pool.CloseIdle(peer_a), 1u);
+  EXPECT_EQ(pool.IdleCount(peer_a), 0u);
+  EXPECT_EQ(pool.IdleCount(peer_b), 1u);
+  EXPECT_GE(fcntl(*a3, F_GETFD), 0);
+  EXPECT_EQ(pool.CloseIdle(peer_a), 0u);
+
+  // The survivor pools again on return, and the next borrow reuses it.
+  pool.Return(/*ok=*/true, *a3, peer_a, "127.0.0.1");
+  EXPECT_EQ(pool.IdleCount(peer_a), 1u);
+  const auto a4 = pool.Borrow(peer_a, "127.0.0.1", require_psp, channel_a);
+  ABSL_ASSERT_OK(a4) << a4.status().message();
+  EXPECT_EQ(*a4, *a3);
+  pool.Return(/*ok=*/true, *a4, peer_a, "127.0.0.1");
+
   pool.Close();
 }
 
@@ -1715,6 +1771,269 @@ TEST(RawBufferTransportEnvTest, PinRecvThreadToNicNumaDoesNotAffectTransfer) {
       *BuildBufferRequest(kBufferId, kDstShardIdx, /*offset_bytes=*/0,
                           src.data(), kSize, /*uuid=*/0, kOpBufferPush)));
   EXPECT_THAT(dst.DataSpan(), Pointwise(Eq(), src.DataSpan()));
+}
+
+// Peer address of the connected socket `fd`, as reported by getpeername().
+std::string GetPeerIp(int fd) {
+  struct sockaddr_storage addr;
+  socklen_t addr_len = sizeof(addr);
+  if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addr_len) !=
+      0) {
+    return "";
+  }
+  char ip_str[INET6_ADDRSTRLEN] = {0};
+  if (addr.ss_family == AF_INET) {
+    auto* sin = reinterpret_cast<struct sockaddr_in*>(&addr);
+    inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+  } else if (addr.ss_family == AF_INET6) {
+    auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(&addr);
+    inet_ntop(AF_INET6, &sin6->sin6_addr, ip_str, sizeof(ip_str));
+  }
+  return std::string(ip_str);
+}
+
+// Minimal IPv4 loopback server speaking the kOpBufferPush, kOpBufferPushBatched
+// and kOpBufferPull wire protocols, recording the address each accepted
+// connection arrived from. A server-side RawBufferTransport cannot observe
+// this: its `custom_request_handler` (the only hook that sees the accepted fd)
+// is never reached for these opcodes. The client under test still runs the
+// real PushBuffers / ProcessSocketBufferPush / PullBuffer path.
+class PeerIpRecordingServer {
+ public:
+  explicit PeerIpRecordingServer(std::vector<uint8_t> pull_payload)
+      : pull_payload_(std::move(pull_payload)) {
+    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK_GE(listen_fd_, 0);
+    struct sockaddr_in sa = {};
+    sa.sin_family = AF_INET;
+    sa.sin_port = 0;
+    CHECK_EQ(inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr), 1);
+    CHECK_EQ(
+        bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)),
+        0);
+    CHECK_EQ(listen(listen_fd_, 16), 0);
+    socklen_t len = sizeof(sa);
+    CHECK_EQ(
+        getsockname(listen_fd_, reinterpret_cast<struct sockaddr*>(&sa), &len),
+        0);
+    port_ = ntohs(sa.sin_port);
+    thread_ = std::thread(&PeerIpRecordingServer::Serve, this);
+  }
+
+  ~PeerIpRecordingServer() {
+    shutdown(listen_fd_, SHUT_RDWR);
+    thread_.join();
+    {
+      absl::MutexLock lock(mu_);
+      for (const int fd : client_fds_) {
+        shutdown(fd, SHUT_RDWR);
+      }
+    }
+    for (std::thread& t : client_threads_) {
+      if (t.joinable()) t.join();
+    }
+    close(listen_fd_);
+  }
+
+  std::string address() const { return absl::StrCat("127.0.0.1:", port_); }
+
+  std::vector<std::string> peer_ips() const {
+    absl::MutexLock lock(mu_);
+    return peer_ips_;
+  }
+
+  std::vector<uint8_t> received() const {
+    absl::MutexLock lock(mu_);
+    return received_;
+  }
+
+ private:
+  void Serve() {
+    while (true) {
+      const int fd = accept(listen_fd_, nullptr, nullptr);
+      if (fd < 0) return;
+      {
+        absl::MutexLock lock(mu_);
+        peer_ips_.push_back(GetPeerIp(fd));
+        client_fds_.push_back(fd);
+      }
+      client_threads_.emplace_back([this, fd]() {
+        // Serve requests until the client closes the (pooled) connection.
+        while (ServeOneRequest(fd).ok()) {
+        }
+        close(fd);
+      });
+    }
+  }
+
+  absl::Status ServeOneRequest(int fd) {
+    char header_buf[kChunkHeaderSize];
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, header_buf, sizeof(header_buf)));
+    ABSL_ASSIGN_OR_RETURN(const ChunkHeader header,
+                          DeserializeChunkHeader(header_buf));
+    switch (header.op) {
+      case kOpBufferPush:
+        return ReadPayloadAndAck(fd, header.count_or_size);
+      case kOpBufferPushBatched: {
+        std::vector<char> metadata(header.count_or_size * header.metadata_size);
+        ABSL_RETURN_IF_ERROR(ReadExact(fd, metadata.data(), metadata.size()));
+        size_t total_bytes = 0;
+        for (uint32_t i = 0; i < header.count_or_size; ++i) {
+          ABSL_ASSIGN_OR_RETURN(
+              const ChunkMetadata meta,
+              DeserializeChunkMetadata(
+                  absl::MakeConstSpan(
+                      metadata.data() + i * header.metadata_size,
+                      header.metadata_size),
+                  header.version));
+          total_bytes += static_cast<size_t>(meta.size_bytes) * meta.count;
+        }
+        return ReadPayloadAndAck(fd, total_bytes);
+      }
+      case kOpBufferPull:
+        CHECK_LE(header.count_or_size, pull_payload_.size());
+        return WriteExact(fd, pull_payload_.data(), header.count_or_size);
+      default:
+        return absl::UnimplementedError(
+            absl::StrCat("unexpected op ", header.op));
+    }
+  }
+
+  absl::Status ReadPayloadAndAck(int fd, size_t size_bytes) {
+    std::vector<uint8_t> payload(size_bytes);
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, payload.data(), payload.size()));
+    {
+      absl::MutexLock lock(mu_);
+      received_.insert(received_.end(), payload.begin(), payload.end());
+    }
+    const uint8_t ack = 1;
+    return WriteExact(fd, &ack, 1);
+  }
+
+  const std::vector<uint8_t> pull_payload_;
+  int listen_fd_ = -1;
+  int port_ = 0;
+  std::thread thread_;
+  std::vector<std::thread> client_threads_;
+  mutable absl::Mutex mu_;
+  std::vector<int> client_fds_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::string> peer_ips_ ABSL_GUARDED_BY(mu_);
+  std::vector<uint8_t> received_ ABSL_GUARDED_BY(mu_);
+};
+
+std::vector<BufferPushTask> MakeSinglePushTask(absl::string_view peer,
+                                               const std::vector<uint8_t>& p) {
+  return {{.peer = std::string(peer),
+           .buffer_id = kBufferId,
+           .dst_shard_idx = kDstShardIdx,
+           .dst_offset_bytes = 0,
+           .data_ptr = p.data(),
+           .size_bytes = p.size()}};
+}
+
+TEST(RawBufferTransportSourceBindTest,
+     OutboundConnectionsDoNotBindWhenSourceBindDisabled) {
+  ScopedEnvVar env(/*name=*/"TPU_RAIDEN_ENABLE_SOURCE_IP_BIND",
+                   /*value=*/nullptr);
+  PeerIpRecordingServer server(/*pull_payload=*/{});
+
+  // Before SourceIpForPeer, the client bound every outbound connection to
+  // local_ips[0] regardless of the opt-in, so the server would have observed
+  // 127.0.0.2 here.
+  RawMockDelegate client_delegate(16);
+  RawBufferTransport client(&client_delegate, kLocalPort,
+                            /*local_ips=*/{"127.0.0.2"});
+  const std::vector<uint8_t> payload = {1, 2, 3, 4};
+
+  ASSERT_OK(client.PushBuffers(MakeSinglePushTask(server.address(), payload),
+                               /*parallelism=*/1, /*uuid=*/0));
+
+  EXPECT_THAT(server.received(), ElementsAre(1, 2, 3, 4));
+  EXPECT_THAT(server.peer_ips(),
+              ElementsAre(::testing::HasSubstr("127.0.0.1")));
+}
+
+TEST(RawBufferTransportSourceBindTest,
+     OutboundConnectionsBindFirstLocalIpThatRoutesToPeer) {
+  ScopedEnvVar env(/*name=*/"TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", /*value=*/"1");
+  PeerIpRecordingServer server(/*pull_payload=*/{});
+
+  // 192.0.2.1 (TEST-NET-1) is not a local address, so the old local_ips[0]
+  // choice would have been unbindable; 127.0.0.5 routes to the loopback peer.
+  RawMockDelegate client_delegate(16);
+  RawBufferTransport client(&client_delegate, kLocalPort,
+                            /*local_ips=*/{"192.0.2.1", "127.0.0.5"});
+  EXPECT_EQ(client.bound_ip(), "192.0.2.1");
+  const std::vector<uint8_t> payload = {5, 6, 7, 8};
+
+  ASSERT_OK(client.PushBuffers(MakeSinglePushTask(server.address(), payload),
+                               /*parallelism=*/1, /*uuid=*/0));
+
+  EXPECT_THAT(server.received(), ElementsAre(5, 6, 7, 8));
+  EXPECT_THAT(server.peer_ips(),
+              ElementsAre(::testing::HasSubstr("127.0.0.5")));
+}
+
+TEST(RawBufferTransportSourceBindTest,
+     OutboundConnectionsFallBackToKernelWhenNoLocalIpRoutesToPeer) {
+  ScopedEnvVar env(/*name=*/"TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", /*value=*/"1");
+  PeerIpRecordingServer server(/*pull_payload=*/{});
+
+  RawMockDelegate client_delegate(16);
+  RawBufferTransport client(&client_delegate, kLocalPort,
+                            /*local_ips=*/{"192.0.2.1"});
+  const std::vector<uint8_t> payload = {9, 10, 11, 12};
+
+  ASSERT_OK(client.ProcessSocketBufferPush(
+      server.address(),
+      *BuildBufferRequest(kBufferId, kDstShardIdx, /*offset_bytes=*/0,
+                          payload.data(), payload.size(), /*uuid=*/0,
+                          kOpBufferPush)));
+
+  EXPECT_THAT(server.received(), ElementsAre(9, 10, 11, 12));
+  EXPECT_THAT(server.peer_ips(),
+              ElementsAre(::testing::HasSubstr("127.0.0.1")));
+}
+
+TEST(RawBufferTransportSourceBindTest, PullBindsFirstLocalIpThatRoutesToPeer) {
+  ScopedEnvVar env(/*name=*/"TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", /*value=*/"1");
+  PeerIpRecordingServer server(/*pull_payload=*/{13, 14, 15, 16});
+
+  RawMockDelegate client_delegate(4);
+  RawBufferTransport client(&client_delegate, kLocalPort,
+                            /*local_ips=*/{"192.0.2.1", "127.0.0.5"});
+
+  ASSERT_OK(client.PullBuffer(server.address(), kBufferId, kSrcShardIdx,
+                              /*src_offset_bytes=*/0, kDstShardIdx,
+                              /*dst_offset_bytes=*/0, /*size_bytes=*/4));
+
+  EXPECT_THAT(client_delegate.DataSpan(), ElementsAre(13, 14, 15, 16));
+  EXPECT_THAT(server.peer_ips(),
+              ElementsAre(::testing::HasSubstr("127.0.0.5")));
+}
+
+TEST(RawBufferTransportSourceBindTest,
+     OutboundConnectionsRoundRobinAcrossAllRoutableLocalIps) {
+  ScopedEnvVar env(/*name=*/"TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", /*value=*/"1");
+  PeerIpRecordingServer server(/*pull_payload=*/{});
+
+  RawMockDelegate client_delegate(16);
+  RawBufferTransport client(
+      &client_delegate, kLocalPort,
+      /*local_ips=*/{"192.0.2.1", "127.0.0.5", "127.0.0.6"});
+  const std::vector<uint8_t> first_payload = {1, 2, 3, 4};
+  const std::vector<uint8_t> second_payload = {5, 6, 7, 8};
+
+  ASSERT_OK(
+      client.PushBuffers(MakeSinglePushTask(server.address(), first_payload),
+                         /*parallelism=*/1, /*uuid=*/0));
+  ASSERT_OK(
+      client.PushBuffers(MakeSinglePushTask(server.address(), second_payload),
+                         /*parallelism=*/1, /*uuid=*/1));
+
+  EXPECT_THAT(server.peer_ips(), ::testing::UnorderedElementsAre(
+                                     ::testing::HasSubstr("127.0.0.5"),
+                                     ::testing::HasSubstr("127.0.0.6")));
 }
 
 }  // namespace

@@ -33,6 +33,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
@@ -369,10 +370,22 @@ ReshardReceiveSession::Create(
     return absl::InvalidArgumentError(
         "pool reshard receiver requires dst_mem_type=HBM");
   }
+  // Claim the uuid before any session object exists: a duplicate or racing
+  // registration must fail here, with nothing to destroy, rather than build a
+  // second session whose destructor would release the first one's lease.
+  ABSL_RETURN_IF_ERROR(
+      base->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false));
   auto session =
       std::shared_ptr<ReshardReceiveSession>(new ReshardReceiveSession(
           base, staging_allocator, plan.uuid(), plan, chip_blocks, deadline));
-  TF_RETURN_IF_ERROR(session->AcquireStagingLeases(plan));
+  if (absl::Status status = session->AcquireStagingLeases(plan); !status.ok()) {
+    // Release the (possibly partial) lease while the uuid is still claimed.
+    // Unregistering first would open a window in which a new registration of
+    // the same uuid adopts this lease and then loses it to our destructor.
+    session->ReleaseStaging();
+    base->UnregisterActivePlanDirect(plan.uuid()).IgnoreError();
+    return status;
+  }
   return session;
 }
 
@@ -416,7 +429,6 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
   std::map<size_t, std::set<int64_t>> dst_ids_by_storage;
   {
     absl::MutexLock lock(mu_);
-    staging_released_ = false;
     for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
       const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
       const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);
@@ -431,11 +443,14 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
       dst_ids_by_storage[pool_spec->storage_index].insert(ids.begin(),
                                                           ids.end());
     }
+    if (!dst_ids_by_storage.empty()) {
+      staging_released_ = false;
+    }
   }
   for (const auto& [storage_idx, ids] : dst_ids_by_storage) {
     std::vector<int64_t> id_list(ids.begin(), ids.end());
-    absl::Status lease_status = staging_allocator_->AcquirePoolStagingLease(
-        uuid_, storage_idx, id_list);
+    absl::Status lease_status = base_->AcquirePoolStagingLease(
+        uuid_, storage_idx, id_list, base_->pool_staging_lease_timeout());
     if (!lease_status.ok()) {
       return lease_status;
     }
@@ -446,7 +461,7 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
 void ReshardReceiveSession::ReleaseStagingLocked() {
   if (staging_released_) return;
   staging_released_ = true;
-  staging_allocator_->ReleasePoolStagingLeases(uuid_);
+  base_->ReleasePoolStagingLeases(uuid_);
 }
 
 void ReshardReceiveSession::ReleaseStaging() {

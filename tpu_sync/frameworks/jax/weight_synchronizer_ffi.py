@@ -14,7 +14,7 @@
 
 """JAX bindings for WeightSynchronizer FFI, enabling host/device weight synchronization."""
 
-import math
+import collections
 import os
 
 import jax
@@ -24,7 +24,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
-from tpu_sync.frameworks.jax import utils
 
 _DIRECT_DEVICE_BUFFER_ENV = "RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER"
 
@@ -51,24 +50,96 @@ def _use_direct_device_buffer() -> bool:
   return val in ("1", "true", "yes", "on")
 
 
+def _derive_host_slots(
+    devices: np.ndarray, num_shards: int
+) -> tuple[np.ndarray, np.ndarray]:
+  """Derives per-device (host_idx, local_slot) for the FFI synchronizer layout.
+
+  `host_idx` selects the WeightSynchronizer instance (submanager) a device
+  joins and `local_slot` is its buffer slot inside that instance, which must
+  have exactly `num_shards` slots. The grouping is defined by one of two
+  explicit rules keyed on the process topology of `devices`:
+
+  * Multi-process mesh (more than one distinct `process_index`, e.g. McJAX):
+    `host_idx` is the device's `process_index` and `local_slot` is the rank of
+    the device among the devices of that process in flat row-major order.
+    Every process must own exactly `num_shards` devices.
+  * Single-process mesh (all `process_index` equal, e.g. single-controller
+    Pathways): synchronizers are contiguous runs of `num_shards` devices in
+    flat row-major order, i.e. flat index `f` maps to
+    `host_idx = f // num_shards`, `local_slot = f % num_shards`. The device
+    count must be a multiple of `num_shards`.
+
+  Args:
+    devices: N-D array of devices exposing `process_index` (e.g. mesh.devices).
+    num_shards: Number of devices per synchronizer instance.
+
+  Returns:
+    A tuple (host_indices, local_slots) of int32 arrays shaped like `devices`.
+
+  Raises:
+    ValueError: If `num_shards` is not positive or the device topology does not
+      satisfy the rule selected above.
+  """
+  if num_shards <= 0:
+    raise ValueError(f"num_shards must be positive, got {num_shards}")
+  process_indices = [int(dev.process_index) for dev in devices.flat]
+  num_devices = len(process_indices)
+  host_indices = np.empty(num_devices, dtype=np.int32)
+  local_slots = np.empty(num_devices, dtype=np.int32)
+
+  if len(set(process_indices)) > 1:
+    devices_per_process = collections.Counter(process_indices)
+    for process_index, count in sorted(devices_per_process.items()):
+      if count != num_shards:
+        raise ValueError(
+            f"process_index {process_index} owns {count} mesh devices but"
+            f" num_shards={num_shards}; every process must own exactly"
+            " num_shards devices."
+        )
+    next_slot_by_process = {p: 0 for p in devices_per_process}
+    for flat_idx, process_index in enumerate(process_indices):
+      host_indices[flat_idx] = process_index
+      local_slots[flat_idx] = next_slot_by_process[process_index]
+      next_slot_by_process[process_index] += 1
+  else:
+    if num_devices % num_shards != 0:
+      raise ValueError(
+          f"Single-process mesh has {num_devices} devices, which is not a"
+          f" multiple of num_shards={num_shards}."
+      )
+    # Contiguous-run contract: this arithmetic *defines* the documented
+    # grouping for single-process meshes; it does not infer a hidden layout.
+    for flat_idx in range(num_devices):
+      host_indices[flat_idx] = flat_idx // num_shards
+      local_slots[flat_idx] = flat_idx % num_shards
+
+  return (
+      host_indices.reshape(devices.shape),
+      local_slots.reshape(devices.shape),
+  )
+
+
 def _prepare_shard_info(
     shard_idx: jax.Array,
     mesh: jax.sharding.Mesh,
     num_shards: int,
-    host_subgrid: list[int] | None = None,
 ) -> jax.Array:
-  """Packs [shard_idx, local_slot, host_idx] for FFI custom call.
+  """Packs [shard_idx, local_slot, host_idx, global_mesh_idx] for the FFI call.
 
   If shard_idx is already packed (trailing dimension >= 3), returns shard_idx.
-  Otherwise, computes local_slot and host_idx based on the mesh physical layout
-  and host subgrid decomposition, and returns a sharded array with shape
-  `mesh.devices.shape + (3,)` and PartitionSpec(*mesh.axis_names, None).
+  Otherwise derives local_slot and host_idx from the mesh's process topology
+  (see `_derive_host_slots`) and returns a sharded array with shape
+  `mesh.devices.shape + (4,)` and PartitionSpec(*mesh.axis_names, None).
+
+  `num_shards` is the number of devices per synchronizer; callers needing a
+  non-contiguous grouping must pass a pre-packed `shard_idx` (trailing
+  dim >= 3), which is already supported.
 
   Args:
     shard_idx: Shard index array.
     mesh: JAX device mesh.
-    num_shards: Number of local shards (devices per host).
-    host_subgrid: Optional host subgrid shape for shard decomposition.
+    num_shards: Number of devices per synchronizer instance.
 
   Returns:
     A sharded array containing packed shard information.
@@ -76,55 +147,7 @@ def _prepare_shard_info(
   if shard_idx.ndim > len(mesh.axis_names) and shard_idx.shape[-1] >= 3:
     return shard_idx
 
-  physical_mesh_shape = list(mesh.devices.shape)
-  devices_per_host = num_shards
-  local_subgrid = None
-  try:
-    if (
-        hasattr(mesh, "local_mesh")
-        and mesh.local_mesh is not None
-        and hasattr(mesh.local_mesh, "devices")
-    ):
-      local_subgrid = list(mesh.local_mesh.devices.shape)
-  except (AttributeError, ValueError, TypeError):
-    local_subgrid = None
-
-  if (
-      host_subgrid is not None
-      and len(host_subgrid) == len(physical_mesh_shape)
-      and math.prod(host_subgrid) == devices_per_host
-      and all(p % s == 0 for p, s in zip(physical_mesh_shape, host_subgrid))
-  ):
-    subgrid = list(host_subgrid)
-    grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
-  elif (
-      local_subgrid is not None
-      and len(local_subgrid) == len(physical_mesh_shape)
-      and math.prod(local_subgrid) == devices_per_host
-      and all(p % s == 0 for p, s in zip(physical_mesh_shape, local_subgrid))
-  ):
-    subgrid = local_subgrid
-    grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
-  else:
-    subgrid, grid = utils.compute_host_subgrid(
-        physical_mesh_shape, devices_per_host
-    )
-  host_subgrid, host_grid = subgrid, grid
-
-  local_slots_np = np.zeros(mesh.devices.shape, dtype=np.int32)
-  host_indices_np = np.zeros(mesh.devices.shape, dtype=np.int32)
-
-  for coord in np.ndindex(*mesh.devices.shape):
-    h_idx = 0
-    for c, s, g in zip(coord, host_subgrid, host_grid):
-      h = c // s if s > 0 else 0
-      h_idx = h_idx * g + h
-    l_slot = 0
-    for c, s in zip(coord, host_subgrid):
-      l = c % s if s > 0 else 0
-      l_slot = l_slot * s + l
-    local_slots_np[coord] = l_slot
-    host_indices_np[coord] = h_idx
+  host_indices_np, local_slots_np = _derive_host_slots(mesh.devices, num_shards)
 
   spec = jax.sharding.PartitionSpec(*mesh.axis_names)
   sharding = jax.sharding.NamedSharding(mesh, spec)
@@ -143,8 +166,8 @@ def _prepare_shard_info(
       jnp.array(global_mesh_indices_np, dtype=jnp.int32), sharding
   )
 
-  if shard_idx.shape != tuple(physical_mesh_shape):
-    shard_idx = shard_idx.reshape(tuple(physical_mesh_shape))
+  if shard_idx.shape != mesh.devices.shape:
+    shard_idx = shard_idx.reshape(mesh.devices.shape)
 
   return jnp.stack(
       [shard_idx, local_slots, host_indices, global_mesh_indices], axis=-1
@@ -161,7 +184,6 @@ def init_weight_synchronizer(
     num_layers: int = 1,
     listener_port: int = -1,
     num_shards: int | None = None,
-    host_subgrid: list[int] | None = None,
 ) -> jax.Array:
   """Registers and executes init_weight_synchronizer FFI custom call on each device rank.
 
@@ -178,9 +200,10 @@ def init_weight_synchronizer(
     num_layers: Total number of network layers or synchronization iterations.
     listener_port: Optional pre-assigned listener port to share across ranks
       (`-1` to initialize new).
-    num_shards: Number of local shards (devices per host). If None, calculated
-      from mesh.
-    host_subgrid: Optional host subgrid shape for shard decomposition.
+    num_shards: Number of devices per synchronizer instance. If None, calculated
+      as mesh devices per process. Device-to-synchronizer grouping follows
+      `_prepare_shard_info`; callers needing a non-contiguous grouping must pass
+      a pre-packed `shard_idx` (trailing dim >= 3), which is already supported.
 
   Returns:
     A sharded 1D int32 array containing synchronization metadata (`out_dim=6` if
@@ -195,9 +218,7 @@ def init_weight_synchronizer(
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
     num_shards = mesh.devices.size // num_processes
 
-  shard_info = _prepare_shard_info(
-      shard_idx, mesh, num_shards, host_subgrid=host_subgrid
-  )
+  shard_info = _prepare_shard_info(shard_idx, mesh, num_shards)
   use_direct = _use_direct_device_buffer()
   ffi_name = (
       "raiden_weight_synchronizer_create"
@@ -210,7 +231,7 @@ def init_weight_synchronizer(
   )
   def _local_init(s_idx, sizes, *anchors):
     axis_names = mesh.axis_names
-    out_dim = 6 if listener_port >= 0 else 5
+    out_dim = 10 if listener_port >= 0 else 5
     out_shape = tuple([1] * len(axis_names)) + (out_dim,)
     ffi_args = (
         (anchors[0], s_idx, sizes, *anchors[1:])
@@ -268,7 +289,6 @@ def init_weight_synchronizer_and_d2h(
     num_layers: int = 1,
     listener_port: int = -1,
     num_shards: int | None = None,
-    host_subgrid: list[int] | None = None,
 ) -> jax.Array:
   """Registers and executes init_weight_synchronizer_and_d2h FFI custom call on each device rank.
 
@@ -284,21 +304,20 @@ def init_weight_synchronizer_and_d2h(
     num_layers: Total number of network layers or synchronization iterations.
     listener_port: Optional pre-assigned listener port to share across ranks
       (`-1` to initialize new).
-    num_shards: Number of local shards (devices per host). If None, calculated
-      from mesh.
-    host_subgrid: Optional host subgrid shape for shard decomposition.
+    num_shards: Number of devices per synchronizer instance. If None, calculated
+      as mesh devices per process. Device-to-synchronizer grouping follows
+      `_prepare_shard_info`; callers needing a non-contiguous grouping must pass
+      a pre-packed `shard_idx` (trailing dim >= 3), which is already supported.
 
   Returns:
-    A sharded 1D int32 array containing synchronization metadata (`out_dim=6` if
-    `listener_port >= 0`).
+    A sharded 1D int32 array containing synchronization metadata (`out_dim=10`
+    if `listener_port >= 0`).
   """
   if num_shards is None:
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
     num_shards = mesh.devices.size // num_processes
 
-  shard_info = _prepare_shard_info(
-      shard_idx, mesh, num_shards, host_subgrid=host_subgrid
-  )
+  shard_info = _prepare_shard_info(shard_idx, mesh, num_shards)
   ffi_name = (
       "raiden_weight_synchronizer_create_and_d2h"
       if _use_direct_device_buffer()
@@ -310,7 +329,7 @@ def init_weight_synchronizer_and_d2h(
   )
   def _local_init_and_d2h(s_idx, sizes, *anchors):
     axis_names = mesh.axis_names
-    out_dim = 6 if listener_port >= 0 else 5
+    out_dim = 10 if listener_port >= 0 else 5
     out_shape = tuple([1] * len(axis_names)) + (out_dim,)
     return jax.ffi.ffi_call(
         ffi_name,

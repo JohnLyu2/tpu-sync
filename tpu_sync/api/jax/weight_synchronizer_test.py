@@ -23,9 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.api.jax import weight_synchronizer
-from tpu_sync.frameworks.jax import utils
 from tpu_sync.rpc import raiden_service_pb2
-
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
@@ -78,11 +76,15 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
         bind_ip="127.0.0.1",
     )
     ws_dest1 = WeightSynchronizer(
-        jax_arrays=dst1_arrs, local_port=0, unsafe_skip_buffer_lock=True,
+        jax_arrays=dst1_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
         bind_ip="127.0.0.1",
     )
     ws_dest2 = WeightSynchronizer(
-        jax_arrays=dst2_arrs, local_port=0, unsafe_skip_buffer_lock=True,
+        jax_arrays=dst2_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
         bind_ip="127.0.0.1",
     )
 
@@ -642,45 +644,6 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(m_reset["total_h2h_time_ms"], 0.0)
     self.assertEqual(m_reset["total_h2h_bandwidth_gbps"], 0.0)
     self.assertEqual(m_reset["push_resharded_call_count"], 0)
-
-
-class ShardSortingUtilTest(absltest.TestCase):
-
-  def setUp(self):
-    super().setUp()
-    try:
-      self.devices = jax.devices("tpu")
-    except RuntimeError:
-      self.devices = jax.devices("cpu")
-    self.mesh_2d = jax.sharding.Mesh(
-        np.array(self.devices[:4]).reshape(2, 2), ("x", "y")
-    )
-
-  def test_aligned_sharding_permutation(self):
-    sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
-    )
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-    perm = utils.get_shard_sorting_permutation(arr)
-    self.assertEqual(perm, [])
-
-  def test_transposed_sharding_permutation(self):
-    sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("y", "x")
-    )
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-    perm = utils.get_shard_sorting_permutation(arr)
-    # No permutation is needed because JAX device order matches the
-    # controller's physical mapping order for this transposed sharding.
-    self.assertEqual(perm, [])
-
-  def test_replicated_sharding_permutation(self):
-    sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x")
-    )
-    arr = jax.device_put(jnp.zeros((8, 8)), sharding)
-    perm = utils.get_shard_sorting_permutation(arr)
-    self.assertEqual(perm, [])
 
 
 if __name__ == "__main__":

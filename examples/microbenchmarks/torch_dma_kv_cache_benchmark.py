@@ -30,7 +30,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_tpu
 
-from google3.pyglib.contrib.g3_multiprocessing import g3_multiprocessing
 from tpu_sync.api.torch import kv_cache_manager
 
 SUPPORTED_DTYPES = {
@@ -51,6 +50,8 @@ flags.DEFINE_integer("benchmark_runs", 10, "Number of benchmark runs")
 
 
 def log_telemetry(
+    telemetry_log_path: str,
+    locality: str,
     test_name: str,
     dtype: torch.dtype,
     num_layers: int,
@@ -58,7 +59,21 @@ def log_telemetry(
     d2h_times: list[float],
     h2d_times: list[float],
 ) -> None:
-  """Records benchmark telemetry stats to a JSONL file."""
+  """Appends benchmark telemetry stats to the JSONL file at telemetry_log_path.
+
+  Takes its settings as arguments rather than reading FLAGS: it runs inside
+  mp.spawn workers, where absl flags are not parsed in open-source builds.
+
+  Args:
+    telemetry_log_path: JSONL file to append the record to.
+    locality: Locality label recorded with the stats.
+    test_name: Name of the benchmark case.
+    dtype: Element type of the transferred KV cache.
+    num_layers: Number of KV cache layers transferred per iteration.
+    shape: Global shape of one layer.
+    d2h_times: Per-iteration device-to-host times, in seconds.
+    h2d_times: Per-iteration host-to-device times, in seconds.
+  """
   if not d2h_times or not h2d_times:
     return
 
@@ -67,7 +82,7 @@ def log_telemetry(
 
   record = {
       "test_name": test_name,
-      "locality": FLAGS.locality,
+      "locality": locality,
       "dtype": SUPPORTED_DTYPES.get(dtype, str(dtype)),
       "num_layers": int(num_layers),
       "shape": [int(s) for s in shape],
@@ -84,11 +99,11 @@ def log_telemetry(
       "timestamp": float(time.time()),
   }
 
-  log_dir = os.path.dirname(FLAGS.telemetry_log_path)
+  log_dir = os.path.dirname(telemetry_log_path)
   if log_dir:
     os.makedirs(log_dir, exist_ok=True)
 
-  with open(FLAGS.telemetry_log_path, "a") as f:
+  with open(telemetry_log_path, "a") as f:
     f.write(json.dumps(record) + "\n")
 
 
@@ -316,10 +331,8 @@ def _report_results(
     shape: Sequence[int],
     d2h_times: list[float],
     h2d_times: list[float],
-    test_name: str,
-    use_telemetry: bool = False,
 ) -> None:
-  """Calculates aggregate cluster bandwidth and prints/logs benchmark results."""
+  """Calculates aggregate cluster bandwidth and prints benchmark results."""
   element_size = torch.tensor([], dtype=dtype).element_size()
   total_bytes = np.prod(shape) * element_size * num_layers
 
@@ -351,9 +364,6 @@ def _report_results(
     sys.stderr.write(line + "\n")
   sys.stderr.flush()
 
-  if use_telemetry:
-    log_telemetry(test_name, dtype, num_layers, shape, d2h_times, h2d_times)
-
 
 def _mpmd_benchmark_worker(
     rank: int,
@@ -381,9 +391,6 @@ def _mpmd_benchmark_worker(
   os.environ["GROUP_RANK"] = "0"
   os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
 
-  FLAGS.locality = locality
-  FLAGS.telemetry_log_path = telemetry_log_path
-
   dist.init_process_group(
       backend="gloo",
       init_method=f"tcp://127.0.0.1:{master_port}",
@@ -407,14 +414,17 @@ def _mpmd_benchmark_worker(
     )
     if rank == 0:
       _report_results(
-          "KVCacheManager",
+          "KVCacheManager", dtype, num_layers, shape, mgr_d2h, mgr_h2d
+      )
+      log_telemetry(
+          telemetry_log_path,
+          locality,
+          test_name,
           dtype,
           num_layers,
           shape,
           mgr_d2h,
           mgr_h2d,
-          test_name,
-          use_telemetry=True,
       )
 
     # Branch 2: PyTorch Pinned Host Baseline
@@ -423,13 +433,7 @@ def _mpmd_benchmark_worker(
     )
     if rank == 0:
       _report_results(
-          "PyTorch Pinned",
-          dtype,
-          num_layers,
-          shape,
-          pin_d2h,
-          pin_h2d,
-          test_name,
+          "PyTorch Pinned", dtype, num_layers, shape, pin_d2h, pin_h2d
       )
 
     # Branch 3: PyTorch Standard Host Baseline
@@ -438,13 +442,7 @@ def _mpmd_benchmark_worker(
     )
     if rank == 0:
       _report_results(
-          "PyTorch Standard",
-          dtype,
-          num_layers,
-          shape,
-          std_d2h,
-          std_h2d,
-          test_name,
+          "PyTorch Standard", dtype, num_layers, shape, std_d2h, std_h2d
       )
 
   finally:

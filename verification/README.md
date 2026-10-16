@@ -29,8 +29,8 @@ verification/
 
 ## Status
 
-All citations (models, `docs/`, `findings/`) are to tpu-sync `1fa06d1`
-(upstream `main` as merged into this fork on 2026-10-10); `findings/filed_bugs.md`
+All citations (models, `docs/`, `findings/`) are to tpu-sync `0ac16d1`
+(upstream `main` as merged into this fork on 2026-10-16); `findings/filed_bugs.md`
 and `proposal.md` are frozen at the commit they name.
 
 | Model | Proved | Doc |
@@ -49,12 +49,15 @@ and `proposal.md` are frozen at the commit they name.
 | `Controller/ReadRemote` | `NoWriteAfterRelease`: counterexamples on shipping code, deferred-settle fix safe by exhaustive search | [read_remote.md](docs/controller/read_remote.md) |
 
 Outcome so far: no data-correctness or safety bugs in the prefill-to-decode
-transfer path at `1fa06d1` (non-bug observations in [findings/](findings/README.md) §Observations); one owner-acknowledged
+transfer path at `0ac16d1` (non-bug observations in [findings/](findings/README.md) §Observations); one owner-acknowledged
 availability gap on that path (F5, no per-peer staging admission at
 `StartRead`) confirmed with the owners' own parked test and fixed by
-`findings/per_peer_staging_admission.patch`; four confirmed defects in the
+a per-peer admission patch (validated on `50b0774`, retired 2026-10-16 when the allocator moved); four confirmed defects in the
 controller / KV-cache-store path, written up in
-[findings/](findings/README.md). F4 was fixed upstream in `72255dd`; the others are open as of `1fa06d1`.
+[findings/](findings/README.md), F4 fixed upstream in `72255dd` (PR #1105); and one
+memory-aliasing defect on the pool-reshard receive path (F6, a rejected duplicate
+`PoolReshardRegisterRecv` frees the active session's staging lease), filed
+2026-10-13 and fixed upstream the same day in `8653373`. F1, F2, F3 and F5 are open as of `0ac16d1`.
 
 ## Building
 
@@ -87,6 +90,6 @@ Read every `CHECK` line (the range overlaps edited code — re-read it and fix b
 hand), then grep for citation lists that wrap onto a second line and for bare
 backticked ranges after a comma (the script does not follow either). Update the
 commit sentence in each module preamble, in this file, in `docs/*/*.md` and in
-`findings/README.md` / `findings/filed_bugs.md`; re-run `git apply --check` on
-the three patches in `findings/`; run `lake build`; add a row to
+`findings/README.md` (`findings/filed_bugs.md` and `proposal.md` are frozen); re-run `git apply --check` on
+the two patches in `findings/`; run `lake build`; add a row to
 [docs/upstream_rechecks.md](docs/upstream_rechecks.md).

@@ -21,7 +21,9 @@
 #include <cstddef>
 #include <memory>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/raw_buffer.h"
@@ -34,6 +36,7 @@
 
 namespace xla {
 class PjRtBuffer;
+class PjRtClient;
 }  // namespace xla
 
 namespace raiden {
@@ -95,6 +98,21 @@ absl::StatusOr<PJRT_RawBuffer*> CreateCApiRawAlias(
 // if unsupported. If out_c_api is provided, populates the PJRT_Api pointer.
 const PJRT_RawBuffer_Extension* GetRawBufferExtension(
     const xla::PjRtBuffer* buffer, const PJRT_Api** out_c_api = nullptr);
+
+// C-API-only PjRtClient helpers that dispatch strictly through the PJRT_Api C
+// function table on xla::PjRtCApiClient with no C++ virtual fallback on
+// xla::PjRtClient, avoiding vtable layout skew across XLA builds.
+absl::string_view PjRtClientPlatformName(const xla::PjRtClient* client);
+
+// Returns true iff `client` is a non-null `xla::PjRtCApiClient` whose C-API
+// platform name is not "cpu". Non-C-API clients (e.g. `TfrtCpuClient` in unit
+// tests) are treated as not DMA-capable by design so that no virtual
+// `xla::PjRtClient` dispatch ever happens across potentially skewed XLA
+// vtables.
+bool PjRtClientSupportsDma(const xla::PjRtClient* client);
+
+absl::Status PjRtClientDmaMap(xla::PjRtClient* client, void* data, size_t size);
+absl::Status PjRtClientDmaUnmap(xla::PjRtClient* client, void* data);
 
 }  // namespace raiden
 

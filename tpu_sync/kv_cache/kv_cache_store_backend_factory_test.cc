@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -23,16 +24,19 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/nullability.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -48,9 +52,18 @@ using ::absl_testing::StatusIs;
 class CustomTestBackend : public KVCacheStoreBackend {
  public:
   std::string name() const override { return "CustomTestBackend"; }
-  absl::StatusOr<BlockSliceList> Lookup(absl::Span<const std::string>,
-                                        const LookupOptions&) override {
-    return BlockSliceList{};
+  absl::StatusOr<BlockSliceList> Lookup(absl::Span<const std::string> hashes,
+                                        const LookupOptions& options) override {
+    BlockSliceList result;
+    for (const auto& h : hashes) {
+      auto it = entries_.find(h);
+      if (it == entries_.end()) break;
+      if (options.pin_found) {
+        ++pin_counts_[h];
+      }
+      result.push_back({h, it->second});
+    }
+    return result;
   }
   tsl::Future<> Load(const RaidenId& remote_id,
                      absl::Span<const std::string> block_hashes,
@@ -60,24 +73,53 @@ class CustomTestBackend : public KVCacheStoreBackend {
     CHECK(load_tracker != nullptr);
     return tsl::Future<>(absl::UnimplementedError("Load is not supported."));
   }
-  std::pair<bool, BlockSliceList> Insert(absl::Span<const std::string>,
-                                         absl::Span<const RaidenBlockId>,
+  std::pair<bool, BlockSliceList> Insert(absl::Span<const std::string> hashes,
+                                         absl::Span<const RaidenBlockId> slices,
                                          bool) override {
+    for (size_t i = 0; i < hashes.size() && i < slices.size(); ++i) {
+      entries_[hashes[i]] = slices[i];
+    }
     return {true, {}};
   }
-  bool InsertAndLock(absl::Span<const std::string>,
-                     absl::Span<const RaidenBlockId>, bool) override {
+  bool InsertAndLock(absl::Span<const std::string> hashes,
+                     absl::Span<const RaidenBlockId> slices, bool) override {
+    for (size_t i = 0; i < hashes.size() && i < slices.size(); ++i) {
+      entries_[hashes[i]] = slices[i];
+      ++pin_counts_[hashes[i]];
+    }
     return true;
   }
   size_t ReleaseAndDelete(absl::Span<const std::string>) override { return 0; }
   void Delete(absl::Span<const std::string>,
               absl::Span<const RaidenBlockId>) override {}
-  bool Pin(absl::Span<const std::string>) override { return true; }
-  void Release(absl::Span<const std::string>) override {}
-  int GetPinCount(const std::string&) const override { return 0; }
+  bool Pin(absl::Span<const std::string> hashes) override {
+    for (const auto& h : hashes) {
+      if (!entries_.contains(h)) return false;
+    }
+    for (const auto& h : hashes) {
+      ++pin_counts_[h];
+    }
+    return true;
+  }
+  void Release(absl::Span<const std::string> hashes) override {
+    for (const auto& h : hashes) {
+      auto it = pin_counts_.find(h);
+      if (it != pin_counts_.end() && it->second > 0) {
+        --it->second;
+      }
+    }
+  }
+  int GetPinCount(const std::string& hash) const override {
+    auto it = pin_counts_.find(hash);
+    return it != pin_counts_.end() ? it->second : 0;
+  }
   size_t GetCapacity() const override { return 100; }
-  size_t GetSize() const override { return 0; }
-  size_t GetAvailableSpace() const override { return 100; }
+  size_t GetSize() const override { return entries_.size(); }
+  size_t GetAvailableSpace() const override { return 100 - entries_.size(); }
+
+ private:
+  absl::flat_hash_map<std::string, RaidenBlockId> entries_;
+  absl::flat_hash_map<std::string, int> pin_counts_;
 };
 
 REGISTER_KV_CACHE_STORE_BACKEND(
@@ -195,6 +237,63 @@ TEST(KVCacheStoreBackendFactoryTest, KVCacheStoreCreateIntegration) {
   ASSERT_NE(store, nullptr);
   EXPECT_EQ(store->capacity(), 200);
   EXPECT_EQ(store->backend()->name(), "HostOffloadBackend");
+}
+
+TEST(KVCacheStoreBackendFactoryTest, CustomBackendDefaultHostOffloadHooks) {
+  BackendConfig config;
+  config.type = "custom_test_backend";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto backend,
+                          KVCacheStoreBackendFactory::Create(config));
+  EXPECT_EQ(backend->name(), "CustomTestBackend");
+  EXPECT_TRUE(backend->SnapshotHostResidentHashes().empty());
+  EXPECT_TRUE(backend->PinPresentHostResident({"h1"}).empty());
+
+  BlockTracker save_tracker;
+  EXPECT_THAT(
+      backend->BeginWriteRemote(RaidenId{"dst", "0", "kv", 0}, {"h1"}, {0},
+                                absl::Seconds(25), absl::Seconds(30),
+                                &save_tracker),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               testing::HasSubstr(
+                   "A remote save requires a HostOffloadBackend at tier 0")));
+  EXPECT_THAT(
+      backend->RegisterKVTransferSpecFromWorkers(),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               testing::HasSubstr("registering the KVTransferSpec requires a "
+                                  "HostOffloadBackend at tier 0")));
+}
+
+TEST(KVCacheStoreBackendFactoryTest,
+     KVCacheStoreSaveRemoteWithCustomTier0BackendFailsPrecondition) {
+  const RaidenId src_id{"src_job", "0", "kv", 0};
+  const RaidenId dst_id{"dst_job", "0", "kv", 0};
+  BackendConfig config;
+  config.type = "custom_test_backend";
+  config.capacity = 100;
+  config.raiden_id = src_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto store,
+      KVCacheStore::Create(config, /*capacity=*/0,
+                           /*global_registry_address=*/"", src_id,
+                           /*num_shards=*/1, /*shard_size_bytes=*/512,
+                           /*store_server_ip=*/"127.0.0.1"));
+  ASSERT_NE(store, nullptr);
+  EXPECT_EQ(store->backend()->name(), "CustomTestBackend");
+
+  ABSL_ASSERT_OK(store->Insert(
+      {"h1"}, {RaidenBlockId(src_id, /*host_id=*/0, BlockStatus::HOST)},
+      /*on_host=*/true));
+  EXPECT_EQ(store->GetPinCount("h1"), 1);
+
+  EXPECT_THAT(
+      store->Save({"h1"}, dst_id),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               testing::HasSubstr(
+                   "A remote save requires a HostOffloadBackend at tier 0")));
+  EXPECT_EQ(store->GetPinCount("h1"), 1);
+  EXPECT_EQ(store->InFlightRemoteWritesCountForTesting(), 0);
 }
 
 TEST(ApplyParallelismToPropertiesTest, SetsTopologyProperties) {

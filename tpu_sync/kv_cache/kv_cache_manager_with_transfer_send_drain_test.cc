@@ -34,7 +34,10 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/log_severity.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
+#include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -45,6 +48,8 @@
 #include "absl/time/time.h"
 #include "xla/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
@@ -53,10 +58,12 @@
 namespace tpu_raiden {
 namespace {
 
+using ::testing::_;
 using ::testing::AllOf;
 using ::testing::Contains;
 using ::testing::ElementsAre;
 using ::testing::Ge;
+using ::testing::HasSubstr;
 using ::testing::IsEmpty;
 using ::testing::Le;
 using ::testing::Optional;
@@ -132,6 +139,12 @@ class TestManager : public KVCacheManagerWithTransfer {
     absl::MutexLock lock(mu_);
     auto it = send_sessions_.find(uuid);
     return it != send_sessions_.end() && !it->second->Done();
+  }
+
+  bool send_draining(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = send_sessions_.find(uuid);
+    return it != send_sessions_.end() && it->second->IsDraining();
   }
 
  private:
@@ -371,7 +384,8 @@ TEST(SendLifecycleTest, DuplicateRegistrationCannotReplaceLiveOffer) {
                                    std::chrono::steady_clock::now() -
                                        std::chrono::milliseconds(1)),
             0);
-  EXPECT_EQ(producer.NotifyForRead("replacement", /*uuid=*/10, {0}), 0);
+  EXPECT_THROW(producer.NotifyForRead("replacement", /*uuid=*/10, {0}),
+               std::runtime_error);
   EXPECT_TRUE(producer.has_send(10));
 
   Reports reports = producer.CompleteReadRaw();
@@ -387,7 +401,18 @@ TEST(SendLifecycleTest, DuplicateRegistrationCannotReplaceLiveOffer) {
 TEST(SendLifecycleTest, DuplicateBlocksAreRejectedAtRegistration) {
   TestManager producer(/*num_layers=*/1);
 
-  EXPECT_EQ(producer.NotifyForRead("req", /*uuid=*/15, {0, 0}), 0);
+  // Returning 0 would be indistinguishable from "nothing to send"; the caller
+  // must receive an exception identifying the duplicate block and its indices.
+  std::string error_message;
+  try {
+    producer.NotifyForRead("req", /*uuid=*/15, {5, 9, 5});
+    FAIL() << "a duplicate block must be rejected";
+  } catch (const std::invalid_argument& e) {
+    error_message = e.what();
+  }
+  EXPECT_THAT(error_message, HasSubstr("duplicate block 5"));
+  EXPECT_THAT(error_message, HasSubstr("req_id=req, uuid=15"));
+  EXPECT_THAT(error_message, HasSubstr("positions 0 and 2 of 3 blocks"));
   EXPECT_FALSE(producer.has_send(15));
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());
@@ -485,6 +510,92 @@ TEST(SendLifecycleTest, DetailsReportWhenTheSendCompleted) {
   EXPECT_THAT(producer.CompleteReadWithDetails().details, IsEmpty());
 }
 
+TEST(SendLifecycleTest, DetailsSayAnUnpulledSendTimedOutAwaitingItsPull) {
+  TestManager producer(/*num_layers=*/1);
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/17, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kWarning, _,
+                       HasSubstr("Transfer failed: req_id=req "
+                                 "code=DEADLINE_EXCEEDED phase=await_pull")));
+  log.StartCapturingLogs();
+
+  CompleteReadResult completions = producer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "DEADLINE_EXCEEDED");
+  EXPECT_EQ(details.reason, "Send session timed out");
+  EXPECT_EQ(details.phase, "await_pull");
+  EXPECT_EQ(details.peer, std::nullopt);
+  EXPECT_THAT(details.elapsed_ns, Optional(Ge(0)));
+}
+
+TEST(SendDrainTest, DetailsSayAnExpiredSendWasStillCopying) {
+  TestManager producer(/*num_layers=*/1);
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/18, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
+  producer.ServePull(18);
+  ASSERT_THAT(producer.CompleteReadWithDetails().failed, IsEmpty());
+
+  producer.FinishCopy(0, absl::OkStatus());
+  CompleteReadResult completions = producer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "DEADLINE_EXCEEDED");
+  EXPECT_EQ(details.phase, "d2h");
+  EXPECT_EQ(details.peer, "127.0.0.1:1");
+}
+
+TEST(SendDrainTest, DetailsCarryTheErrorOfAFailedCopy) {
+  TestManager producer(/*num_layers=*/1);
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/19, {0}), 0);
+  producer.ServePull(19);
+  producer.FinishCopy(0, absl::InternalError("copy failed"));
+
+  CompleteReadResult completions = producer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "INTERNAL");
+  EXPECT_EQ(details.reason, "copy failed");
+  EXPECT_EQ(details.phase, "d2h");
+}
+
+TEST(SendDrainTest, DetailsSayAFailedPushFailedInPushWhileCopiesRun) {
+  GetFaultInjector().Reset();
+  absl::Cleanup reset_faults = [] { GetFaultInjector().Reset(); };
+  FaultInjectionRule failed_push;
+  failed_push.hook = std::string(hooks::kRaidenManagerBaseH2hWrite);
+  failed_push.probability = 1.0;
+  ABSL_ASSERT_OK(GetFaultInjector().Install({failed_push}));
+  TestManager producer(/*num_layers=*/2, /*timeout_s=*/5.0);
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/27, {0}), 0);
+  producer.ServePull(27);
+  ASSERT_EQ(producer.copies_issued(), 2);
+
+  // Layer 0's push fails on a push worker while layer 1 is still copying.
+  producer.FinishCopy(0, absl::OkStatus());
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (!producer.send_draining(27) && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  ASSERT_TRUE(producer.send_draining(27));
+  producer.FinishCopy(1, absl::OkStatus());
+  CompleteReadResult completions = producer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "INTERNAL");
+  EXPECT_THAT(details.reason, Optional(HasSubstr("injected fault")));
+  EXPECT_EQ(details.phase, "push");
+}
+
 TEST(RecvLifecycleTest, NetworkCompletionWaitsForH2d) {
   RecvTestManager consumer(/*num_layers=*/1);
   consumer.AddRecv("req", /*uuid=*/20);
@@ -520,6 +631,37 @@ TEST(RecvLifecycleTest, DetailsReportWhenTheLastH2dLanded) {
   EXPECT_THAT(completions.received, ElementsAre("req"));
   EXPECT_THAT(completions.details["req"].completed_ns,
               Optional(AllOf(Ge(before), Le(completed))));
+}
+
+TEST(RecvLifecycleTest, DetailsSayAReceiveTimedOutWaitingForData) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
+  consumer.AddRecv(
+      "req", /*uuid=*/28, /*blocks_per_layer=*/1,
+      std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "DEADLINE_EXCEEDED");
+  EXPECT_EQ(details.reason, "Receive session timed out");
+  EXPECT_EQ(details.phase, "receive");
+}
+
+TEST(RecvLifecycleTest, DetailsSayAFailedUploadFailedInH2dWhileDataArrives) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/29);
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/29));
+  consumer.FinishCopy(0, absl::InternalError("copy failed"));
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "INTERNAL");
+  EXPECT_EQ(details.reason, "copy failed");
+  EXPECT_EQ(details.phase, "h2d");
+  EXPECT_EQ(details.peer, std::nullopt);
 }
 
 TEST(RecvLifecycleTest, InvalidReadShapeDoesNotLeakStaging) {

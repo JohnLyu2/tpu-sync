@@ -254,7 +254,6 @@ class RaidenControllerServer:
                 reg.transfer_rank if pool_manifest is not None else None
             )
             variables = list(reg.variables) if reg.variables else None
-            host_subgrid = list(reg.host_subgrid) if reg.host_subgrid else None
 
             self._controller.register_work_unit(
                 unit,
@@ -271,7 +270,6 @@ class RaidenControllerServer:
                 transfer_rank=transfer_rank,
                 variables=variables,
                 mesh_axes=mesh_axes,
-                host_subgrid=host_subgrid,
             )
             raiden_resp.success = True
           elif (
@@ -467,7 +465,6 @@ class RaidenControllerClientFacade:
       transfer_rank: Optional[int] = None,
       variables: Optional[Sequence[Any]] = None,
       mesh_axes: Optional[Sequence[str]] = None,
-      host_subgrid: Optional[Sequence[int]] = None,
   ) -> None:
     """Sends remote RPC to register a physical worker entity with the central RaidenControllerServer."""
     reg_req = self._raiden_proto_module.RegisterWorkUnitRequest(
@@ -503,8 +500,6 @@ class RaidenControllerClientFacade:
         )
     if mesh_axes is not None:
       reg_req.mesh_axes.extend(mesh_axes)
-    if host_subgrid is not None:
-      reg_req.host_subgrid.extend(host_subgrid)
 
     req = self._raiden_proto_module.ControlRequest(
         command=self._raiden_proto_module.ControlRequest.COMMAND_REGISTER_WORK_UNIT,

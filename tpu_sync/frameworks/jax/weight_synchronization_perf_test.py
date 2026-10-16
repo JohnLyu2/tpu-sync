@@ -30,6 +30,7 @@ import numpy as np
 
 from tpu_sync.api.jax import weight_synchronizer
 from tpu_sync.frameworks.jax import resharding_planner
+from tpu_sync.frameworks.jax import utils
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
 
@@ -155,6 +156,11 @@ class WeightSynchronizationPerfTest(parameterized.TestCase):
           else:
             spec_axes.append(",".join(axis))
 
+      # WeightSynchronizer shard j is arr.addressable_shards[j].
+      global_shard_indices = utils.global_shard_indices_for_array(
+          arr, [shard.device for shard in arr.addressable_shards]
+      )
+
       protos.append(
           raiden_service_pb2.VariableMetadataProto(
               name=name,
@@ -164,6 +170,7 @@ class WeightSynchronizationPerfTest(parameterized.TestCase):
               item_size=arr.dtype.itemsize,
               layer_idx=idx,
               sharding_spec=spec_axes,
+              global_shard_indices=global_shard_indices,
           )
       )
     return protos

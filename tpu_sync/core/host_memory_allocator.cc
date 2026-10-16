@@ -40,6 +40,7 @@
 #include "absl/strings/strip.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/core/xla_compat.h"
 
 namespace tpu_raiden {
 namespace {
@@ -138,7 +139,7 @@ ScopedShmLock::~ScopedShmLock() {
 
 absl::StatusOr<std::unique_ptr<HostMemoryAllocator>>
 HostMemoryAllocator::Create(xla::PjRtClient* pjrt_client) {
-  if (pjrt_client != nullptr && pjrt_client->platform_name() != "cpu") {
+  if (raiden::PjRtClientSupportsDma(pjrt_client)) {
     return XlaHostMemoryAllocator::Create(pjrt_client);
   }
   return std::unique_ptr<HostMemoryAllocator>(
@@ -204,7 +205,7 @@ absl::StatusOr<HostBufferAllocation> XlaHostMemoryAllocator::Allocate(
         absl::StrCat("mmap failed for size: ", aligned_size));
   }
 
-  auto status = client_->DmaMap(ptr, aligned_size);
+  auto status = raiden::PjRtClientDmaMap(client_, ptr, aligned_size);
   if (!status.ok()) {
     munmap(ptr, aligned_size);
     return absl::InternalError(
@@ -217,7 +218,7 @@ absl::StatusOr<HostBufferAllocation> XlaHostMemoryAllocator::Allocate(
 
   xla::PjRtClient* client = client_;
   alloc.owner = std::shared_ptr<void>(ptr, [client, aligned_size](void* p) {
-    (void)client->DmaUnmap(p);
+    (void)raiden::PjRtClientDmaUnmap(client, p);
     munmap(p, aligned_size);
   });
 
@@ -323,7 +324,7 @@ SharedMemoryHostMemoryAllocator::~SharedMemoryHostMemoryAllocator() {
   for (auto& [name, segment] : segments_) {
     for (PayloadRegion& region : segment.regions) {
       if (region.dma_mapped && client_ != nullptr) {
-        (void)client_->DmaUnmap(region.ptr);
+        (void)raiden::PjRtClientDmaUnmap(client_, region.ptr);
       }
       munmap(region.ptr, region.size_bytes);
     }
@@ -617,11 +618,11 @@ SharedMemoryHostMemoryAllocator::AllocateDmaMapped(size_t size_bytes) {
   if (!region_or.ok()) return region_or.status();
   PayloadRegion* region = *region_or;
 
-  if (!region->dma_mapped && client_ != nullptr &&
-      client_->platform_name() != "cpu") {
+  if (!region->dma_mapped && raiden::PjRtClientSupportsDma(client_)) {
     VLOG(1) << "[SHM_ALLOCATOR] Registering shared memory region with PjRt "
                "DMA engine...";
-    auto status = client_->DmaMap(region->ptr, region->size_bytes);
+    auto status =
+        raiden::PjRtClientDmaMap(client_, region->ptr, region->size_bytes);
     if (!status.ok()) {
       return absl::InternalError(absl::StrCat(
           "DmaMap failed on shared memory region: ", status.message()));

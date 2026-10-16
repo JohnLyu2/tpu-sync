@@ -25,9 +25,10 @@
   // identifiers must stay legible from the back of the room.
   show raw: set text(font: "DejaVu Sans Mono")
   show raw.where(block: false): set text(size: 1.05em)
+  show raw.where(block: true): set text(size: 12pt)
   show raw.where(block: true): it => block(
     width: 100%, fill: codebg, inset: 9pt, radius: 3pt,
-    text(size: 12pt, it),
+    it,
   )
   show heading.where(level: 1): it => block(below: 0.8em)[
     #set text(size: 23pt, weight: "medium", fill: accent)

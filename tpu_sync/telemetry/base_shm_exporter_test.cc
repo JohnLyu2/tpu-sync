@@ -74,15 +74,9 @@ class BaseShmExporterTest : public testing::Test {
   std::string test_dir_;
 };
 
-TEST_F(BaseShmExporterTest, CheckFailsWhenLocalRankMissingOrInvalid) {
+TEST_F(BaseShmExporterTest, CheckFailsWhenLocalRankInvalid) {
   ExporterOptions options;
   options.shm_dir = test_dir_;
-  options.local_rank = std::nullopt;
-
-  EXPECT_DEATH((BaseShmExporter(options)), "local_rank");
-
-  options.local_rank = "";
-  EXPECT_DEATH((BaseShmExporter(options)), "local_rank");
 
   options.local_rank = "-1";
   EXPECT_DEATH((BaseShmExporter(options)), "local_rank");
@@ -92,6 +86,75 @@ TEST_F(BaseShmExporterTest, CheckFailsWhenLocalRankMissingOrInvalid) {
 
   options.local_rank = "abc";
   EXPECT_DEATH((BaseShmExporter(options)), "local_rank");
+}
+
+TEST_F(BaseShmExporterTest, AllowsMissingLocalRankForStoreProcess) {
+  ExporterOptions options;
+  options.shm_dir = test_dir_;
+  options.local_rank = std::nullopt;
+
+  BaseShmExporter exporter(options);
+  EXPECT_EQ(exporter.options().local_rank, std::nullopt);
+  EXPECT_TRUE(HasWorkerSegment(
+      test_dir_, absl::StrCat(kShmFilePrefix, kDefaultShmSegmentRank, "_")));
+
+  constexpr std::array<MetricLabel, 1> labels = {
+      MetricLabel{metric_labels::kHostIp, "10.0.0.1"},
+  };
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, labels, 5);
+  exporter.SetGauge(metric_names::kBufferAllocatedBytes, labels, 512.0);
+  exporter.SetGauge(metric_names::kBufferAllocatedBytes, {}, 1024.0);
+  AggregatedMetrics metrics = exporter.CollectMetrics();
+  EXPECT_EQ(metrics.counters[metric_names::kSentBytesTotal]["host_ip=10.0.0.1"],
+            5);
+  EXPECT_DOUBLE_EQ(
+      metrics.gauges[metric_names::kBufferAllocatedBytes]["host_ip=10.0.0.1"],
+      512.0);
+  EXPECT_DOUBLE_EQ(metrics.gauges[metric_names::kBufferAllocatedBytes][""],
+                   1024.0);
+}
+
+TEST_F(BaseShmExporterTest, TreatsEmptyLocalRankAsUnset) {
+  ExporterOptions options;
+  options.shm_dir = test_dir_;
+  options.local_rank = "";
+
+  BaseShmExporter exporter(options);
+  EXPECT_EQ(exporter.options().local_rank, std::nullopt);
+  EXPECT_TRUE(HasWorkerSegment(
+      test_dir_, absl::StrCat(kShmFilePrefix, kDefaultShmSegmentRank, "_")));
+}
+
+TEST_F(BaseShmExporterTest, AggregatesStoreAndWorkerMetricsInSharedDirectory) {
+  BaseShmExporter store_exporter(ExporterOptions{
+      .local_rank = std::nullopt,
+      .shm_dir = test_dir_,
+  });
+  BaseShmExporter worker_exporter(ExporterOptions{
+      .local_rank = "0",
+      .shm_dir = test_dir_,
+  });
+
+  store_exporter.SetGauge(metric_names::kBufferAllocatedBytes, {}, 4096.0);
+  worker_exporter.SetGauge(metric_names::kBufferAllocatedBytes, {}, 1024.0);
+
+  EXPECT_TRUE(HasWorkerSegment(
+      test_dir_, absl::StrCat(kShmFilePrefix, kDefaultShmSegmentRank, "_")));
+  EXPECT_TRUE(HasWorkerSegment(test_dir_, absl::StrCat(kShmFilePrefix, "0_")));
+
+  AggregatedMetrics store_metrics = store_exporter.CollectMetrics();
+  EXPECT_DOUBLE_EQ(
+      store_metrics.gauges[metric_names::kBufferAllocatedBytes][""], 4096.0);
+  EXPECT_DOUBLE_EQ(
+      store_metrics.gauges[metric_names::kBufferAllocatedBytes]["local_rank=0"],
+      1024.0);
+
+  AggregatedMetrics worker_metrics = worker_exporter.CollectMetrics();
+  EXPECT_DOUBLE_EQ(
+      worker_metrics.gauges[metric_names::kBufferAllocatedBytes][""], 4096.0);
+  EXPECT_DOUBLE_EQ(worker_metrics.gauges[metric_names::kBufferAllocatedBytes]
+                                        ["local_rank=0"],
+                   1024.0);
 }
 
 TEST_F(BaseShmExporterTest, NormalizesAndCanonicalizesOptions) {

@@ -89,6 +89,18 @@ class NumaAwareKVCacheManager {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int64_t node_id = 0, bool enable_shm = false);
 
+  // Raw PjRtBuffer transfer-enabled constructor: the counterpart of the
+  // nanobind `kv_caches` constructor above for callers that hold
+  // `xla::PjRtBuffer*` directly. |device_buffers| is laid out
+  // [layer][shard]. Starts the control server on |local_control_port| (0 for
+  // ephemeral) and reserves |num_slots| host staging slots of |max_blocks|
+  // blocks each, which StartRead/NotifyForRead require.
+  NumaAwareKVCacheManager(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      int64_t node_id, int64_t local_control_port, int64_t max_blocks,
+      int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
+      int parallelism, bool enable_shm = false);
+
   // FFI metadata constructor (cache-only by default)
   NumaAwareKVCacheManager(size_t num_layers, size_t num_shards,
                           size_t slice_byte_size, std::optional<int> local_port,
@@ -282,8 +294,12 @@ class KVCacheManager {
   KVCacheManager& operator=(KVCacheManager&&) = default;
 
 #ifndef WITHOUT_PYTHON
-  // JAX sharded constructor E2E (cache-only by default)
-  KVCacheManager(
+  // Creates a cache-only manager over the sharded jax.Arrays in
+  // |device_arrays| (one entry per layer) and, when
+  // |raiden_controller_address| is set, starts the worker gRPC server on
+  // |raiden_worker_port|. Returns Internal if unpacking the arrays, building
+  // the NUMA-aware manager, or starting the gRPC server fails.
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
       nanobind::list device_arrays,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
@@ -293,10 +309,12 @@ class KVCacheManager {
       std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
       bool enable_shm = false);
 
-  // New transfer-enabled constructor (flat list of arrays, single shard per
-  // layer). enable_shm opts this manager's host buffers into the shared-memory
-  // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
-  KVCacheManager(
+  // Creates a transfer-enabled manager over the flat list of per-layer
+  // arrays in |kv_caches| (single shard per layer). |enable_shm| opts this
+  // manager's host buffers into the shared-memory segments named by
+  // RAIDEN_SHM_KEY; without it the env var is ignored. Failure modes as for
+  // the cache-only Create().
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> CreateWithNodeId(
       nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
       int64_t max_blocks, int64_t num_slots, double timeout_s,
       bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port = 0,
@@ -305,6 +323,9 @@ class KVCacheManager {
       bool enable_shm = false);
 #endif
 
+  // TODO(justinlu): Convert the remaining constructors to factory methods, make
+  // the constructors private, and avoid try/catch/throw statements in favor of
+  // absl::Status/absl::StatusOr error propagation.
   // Raw PjRtBuffer constructor
   KVCacheManager(
       const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
@@ -314,6 +335,18 @@ class KVCacheManager {
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
+
+  // Creates a transfer-enabled manager over raw PjRtBuffer pointers in
+  // |device_buffers| ([layer][device], control server + host staging slots;
+  // see the NumaAwareKVCacheManager counterpart). Starts the worker gRPC
+  // server when |raiden_controller_address| is set.
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> CreateFromPjRtBuffers(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      int64_t node_id, int64_t local_control_port, int64_t max_blocks,
+      int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
+      int parallelism, int raiden_worker_port = 0,
+      std::optional<std::string> raiden_controller_address = std::nullopt,
+      std::optional<std::string> worker_id = std::nullopt);
 
   // FFI metadata constructor (cache-only by default)
   KVCacheManager(
@@ -526,6 +559,12 @@ class KVCacheManager {
   }
 
  private:
+  // Used by Create(), CreateWithNodeId(), and CreateFromPjRtBuffers(); adopts
+  // an already constructed |numa_manager|. The gRPC server is started
+  // separately by the factory.
+  explicit KVCacheManager(
+      std::unique_ptr<NumaAwareKVCacheManager> numa_manager);
+
   void StartGrpcServer(
       int raiden_worker_port,
       std::optional<std::string> raiden_controller_address = std::nullopt,

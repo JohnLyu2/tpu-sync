@@ -37,6 +37,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/common/detached_thread_group.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -45,7 +46,6 @@
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
@@ -92,8 +92,9 @@ class RawBufferTransport final {
   // Return the TCP listening socket port.
   int local_port() const { return local_port_; }
 
-  // Return the bound IP address.
-  // It is the first IP in `local_ips` if provided, otherwise "127.0.0.1".
+  // Primary local IP: the first entry of `local_ips`, or "127.0.0.1" when none
+  // was given. Used for advertisement and metric labels; outbound connections
+  // do not bind to it (see SourceIpForPeer).
   const std::string& bound_ip() const { return bound_ip_; }
 
   // Return the local IP addresses.
@@ -114,6 +115,17 @@ class RawBufferTransport final {
   void ReturnConnection(bool ok_to_pool, int fd, absl::string_view peer,
                         absl::string_view local_ip = "") {
     conn_pool_.Return(ok_to_pool, fd, peer, local_ip);
+  }
+
+  // Closes the idle pooled connections to `peer` under any local IP; borrowed
+  // connections are unaffected. See ConnPool::CloseIdle.
+  size_t CloseIdleConnections(absl::string_view peer) {
+    return conn_pool_.CloseIdle(peer);
+  }
+
+  // Idle pooled connections to `peer`, for tests and diagnostics.
+  size_t IdleConnectionCount(absl::string_view peer) const {
+    return conn_pool_.IdleCount(peer);
   }
 
   // Synchronously pulls a buffer identified by `buffer_id` from the remote
@@ -156,8 +168,9 @@ class RawBufferTransport final {
                                              absl::string_view client_key,
                                              absl::string_view peer_target);
 
-  void SetTestOnlyRateLimiters(std::shared_ptr<TestOnlyRateLimiter> egress,
-                               std::shared_ptr<TestOnlyRateLimiter> ingress);
+  void SetTestOnlyRateLimiters(
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress);
 
  private:
   // Pulls a buffer request from `peer` over a borrowed TCP connection.
@@ -167,6 +180,13 @@ class RawBufferTransport final {
   // Pushes buffer requests to `peer` over a borrowed TCP connection.
   absl::Status ProcessSocketBufferBatchPush(absl::string_view peer,
                                             absl::Span<const Request> requests);
+
+  // Client-side source address for an outbound connection to `peer`, or ""
+  // to let the kernel choose by route. Non-empty only when source binding
+  // is enabled (SourceBindEnabled), round-robining across the entries of
+  // `local_ips_` that route to `peer` through their own NIC
+  // (SourceIpRoutesToPeer).
+  std::string SourceIpForPeer(absl::string_view peer) const;
 
   // Processes a single peer request from the given `client_fd`. These requests
   // are those sent by `PullBuffer`, `PushBuffer`, `PushBuffers` calls.
@@ -193,6 +213,7 @@ class RawBufferTransport final {
   const bool pin_recv_threads_to_nic_numa_;
   std::atomic<int> server_fd_;  // owned by listener_thread_
   std::atomic<bool> stopping_;
+  mutable std::atomic<size_t> source_ip_rr_{0};
 
   // The active_client_fds do not own the sockets it contains. It is only used
   // to shutdown the sockets, thus unblocking the connection workers. Each
@@ -221,12 +242,14 @@ class RawBufferTransport final {
   // Note: Google3's libc++ does not implement the C++20
   // std::atomic<std::shared_ptr<T>> specialization, and atomic raw pointers
   // allow lock-free relaxed loads on the socket hot path.
-  std::shared_ptr<TestOnlyRateLimiter> test_only_egress_rate_limiter_ = nullptr;
-  std::shared_ptr<TestOnlyRateLimiter> test_only_ingress_rate_limiter_ =
-      nullptr;
-  std::atomic<TestOnlyRateLimiter*> test_only_egress_rate_limiter_raw_{nullptr};
-  std::atomic<TestOnlyRateLimiter*> test_only_ingress_rate_limiter_raw_{
-      nullptr};
+  std::shared_ptr<peregrine::v1::TestOnlyRateLimiter>
+      test_only_egress_rate_limiter_ = nullptr;
+  std::shared_ptr<peregrine::v1::TestOnlyRateLimiter>
+      test_only_ingress_rate_limiter_ = nullptr;
+  std::atomic<peregrine::v1::TestOnlyRateLimiter*>
+      test_only_egress_rate_limiter_raw_{nullptr};
+  std::atomic<peregrine::v1::TestOnlyRateLimiter*>
+      test_only_ingress_rate_limiter_raw_{nullptr};
 
   std::thread listener_thread_;
   telemetry::RaidenMetricStore* store_ = nullptr;

@@ -55,8 +55,12 @@ class ReshardReceiveSession
     : public TransferSession,
       public std::enable_shared_from_this<ReshardReceiveSession> {
  public:
-  // Creates and initializes a consumer pool-reshard receive session for |plan|,
-  // acquiring bounded pool staging leases per storage via |staging_allocator|.
+  // Creates and initializes a consumer pool-reshard receive session for |plan|.
+  // Claims |plan.uuid()| in |base|'s active plans (ALREADY_EXISTS if it is
+  // taken) and only then acquires bounded pool staging leases per storage via
+  // |staging_allocator|; a lease failure releases the claim again. Callers
+  // must not register the plan themselves. The claim is dropped by
+  // UnregisterActivePlan / UnregisterSettledPlan, not by this object.
   static absl::StatusOr<std::shared_ptr<ReshardReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator,

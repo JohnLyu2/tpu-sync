@@ -108,7 +108,7 @@ Every module ends with evidence that the proof is not vacuous:
   counterexample.
 
 `decide` on traces of ~20 events is instant; BFS at fuel 10 on the pipeline
-is a few seconds. Keep `#guard`s under ~5 s so `lake build` stays quick.
+is a few seconds. Keep `#guard`s under ~5 s (one documented exception in `PipelineChecks.lean`, ~7 s) so `lake build` stays quick.
 
 ## Naming
 

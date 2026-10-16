@@ -27,6 +27,9 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/log_severity.h"
+#include "absl/log/scoped_mock_log.h"
+#include "absl/strings/string_view.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/statusor.h"
@@ -489,6 +492,156 @@ TEST(TpuUtilsTest, GetLocalHostNicAddresses_AuthoritativeAllowlistAndDocker) {
       [](const HostNicAddress& n) { return n.interface_name == "eth1"; });
   ASSERT_NE(it5_eth1, nics5.end());
   EXPECT_EQ(it5_eth1->classification, NicClassification::kControlPlane);
+
+  fs::remove_all(sysfs);
+}
+
+TEST(TpuUtilsTest, GetLocalHostNicAddresses_AllowlistBraceSyntax) {
+  namespace fs = std::filesystem;
+  fs::path sysfs = fs::path(testing::TempDir()) / "mock_sysfs_brace_syntax";
+  fs::remove_all(sysfs);
+
+  // eth0: no BDF. eth1/eth2: PCI BDFs with sysfs numa_node=-1 so the allowlist
+  // position (or an explicit :N suffix) decides their NUMA node.
+  fs::create_directories(sysfs / "class/net/eth0");
+  fs::create_directories(sysfs / "class/net/eth1");
+  fs::create_directories(sysfs / "class/net/eth2");
+  fs::create_directories(sysfs / "devices/system/node/node0");
+  fs::create_directories(sysfs / "devices/system/node/node1");
+  fs::create_directories(sysfs / "devices/pci0000:00/0000:00:01.0");
+  fs::create_directories(sysfs / "devices/pci0000:00/0000:00:02.0");
+  fs::create_directory_symlink("../../../devices/pci0000:00/0000:00:01.0",
+                               sysfs / "class/net/eth1/device");
+  fs::create_directory_symlink("../../../devices/pci0000:00/0000:00:02.0",
+                               sysfs / "class/net/eth2/device");
+  {
+    std::ofstream(sysfs / "devices/pci0000:00/0000:00:01.0/numa_node")
+        << "-1\n";
+  }
+  {
+    std::ofstream(sysfs / "devices/pci0000:00/0000:00:02.0/numa_node")
+        << "-1\n";
+  }
+  {
+    std::ofstream(sysfs / "class/net/eth0/mtu") << "1500\n";
+  }
+  {
+    std::ofstream(sysfs / "class/net/eth1/mtu") << "1460\n";
+  }
+  {
+    std::ofstream(sysfs / "class/net/eth2/mtu") << "1460\n";
+  }
+
+  sockaddr_in addr_eth2 = CreateSockAddr("10.0.0.3");
+  sockaddr_in addr_eth1 = CreateSockAddr("10.0.0.2");
+  sockaddr_in addr_eth0 = CreateSockAddr("10.0.0.1");
+  ifaddrs ifa_eth2 = {nullptr, const_cast<char*>("eth2"),
+                      0,       reinterpret_cast<sockaddr*>(&addr_eth2),
+                      nullptr, {nullptr},
+                      nullptr};
+  ifaddrs ifa_eth1 = {&ifa_eth2, const_cast<char*>("eth1"),
+                      0,         reinterpret_cast<sockaddr*>(&addr_eth1),
+                      nullptr,   {nullptr},
+                      nullptr};
+  ifaddrs ifa_eth0 = {&ifa_eth1, const_cast<char*>("eth0"),
+                      0,         reinterpret_cast<sockaddr*>(&addr_eth0),
+                      nullptr,   {nullptr},
+                      nullptr};
+
+  auto discover = [&](const char* allowlist) {
+    setenv("TPU_RAIDEN_DATA_NICS", allowlist, 1);
+    auto nics =
+        internal::GetLocalHostNicAddressesInternal(&ifa_eth0, sysfs.string());
+    unsetenv("TPU_RAIDEN_DATA_NICS");
+    return nics;
+  };
+  auto find_nic = [](const std::vector<HostNicAddress>& nics,
+                     absl::string_view name) {
+    auto it = std::find_if(
+        nics.begin(), nics.end(),
+        [&](const HostNicAddress& n) { return n.interface_name == name; });
+    EXPECT_NE(it, nics.end()) << "missing interface " << name;
+    return it;
+  };
+
+  // 1. Curly braces around the whole list are stripped; the entries inside
+  // behave exactly like a plain comma-separated allowlist.
+  {
+    auto nics = discover("{eth1,eth2}");
+    ASSERT_EQ(nics.size(), 3);
+    EXPECT_EQ(find_nic(nics, "eth0")->classification,
+              NicClassification::kControlPlane);
+    EXPECT_EQ(find_nic(nics, "eth1")->classification,
+              NicClassification::kDataPlane);
+    EXPECT_EQ(find_nic(nics, "eth2")->classification,
+              NicClassification::kDataPlane);
+  }
+
+  // 2. Square brackets with interior whitespace are accepted the same way.
+  {
+    auto nics = discover("[ eth1 , eth2 ]");
+    ASSERT_EQ(nics.size(), 3);
+    EXPECT_EQ(find_nic(nics, "eth0")->classification,
+              NicClassification::kControlPlane);
+    EXPECT_EQ(find_nic(nics, "eth1")->classification,
+              NicClassification::kDataPlane);
+    EXPECT_EQ(find_nic(nics, "eth2")->classification,
+              NicClassification::kDataPlane);
+  }
+
+  // 3. The explicit name:numa suffix still works inside braces and overrides
+  // the positional index (which would give eth1 -> 0, eth2 -> 1).
+  {
+    auto nics = discover("{eth1:1,eth2:0}");
+    ASSERT_EQ(nics.size(), 3);
+    auto it_eth1 = find_nic(nics, "eth1");
+    EXPECT_EQ(it_eth1->classification, NicClassification::kDataPlane);
+    EXPECT_EQ(it_eth1->numa_node, 1);
+    auto it_eth2 = find_nic(nics, "eth2");
+    EXPECT_EQ(it_eth2->classification, NicClassification::kDataPlane);
+    EXPECT_EQ(it_eth2->numa_node, 0);
+  }
+
+  // 4. An unbalanced brace is NOT guessed at: the token "{eth1" is matched
+  // literally, matches nothing, and the authoritative allowlist demotes every
+  // interface to control plane.
+  {
+    auto nics = discover("{eth1");
+    ASSERT_EQ(nics.size(), 3);
+    EXPECT_EQ(find_nic(nics, "eth0")->classification,
+              NicClassification::kControlPlane);
+    EXPECT_EQ(find_nic(nics, "eth1")->classification,
+              NicClassification::kControlPlane);
+    EXPECT_EQ(find_nic(nics, "eth2")->classification,
+              NicClassification::kControlPlane);
+  }
+
+  // 5. Each allowlist entry that matches no discovered interface is named in
+  // a warning; a fully matched allowlist emits no such warning.
+  {
+    absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+    EXPECT_CALL(
+        log,
+        Log(absl::LogSeverity::kWarning, testing::_,
+            testing::AllOf(testing::HasSubstr("\"eth9\""),
+                           testing::HasSubstr("matches no local interface"),
+                           testing::HasSubstr("discovered: [eth0,eth1,eth2]"))))
+        .Times(1);
+    log.StartCapturingLogs();
+    auto nics = discover("{eth0,eth9}");
+    EXPECT_EQ(find_nic(nics, "eth0")->classification,
+              NicClassification::kDataPlane);
+  }
+  {
+    absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+    EXPECT_CALL(log, Log(absl::LogSeverity::kWarning, testing::_,
+                         testing::HasSubstr("matches no local interface")))
+        .Times(0);
+    log.StartCapturingLogs();
+    auto nics = discover("{eth1,eth2}");
+    EXPECT_EQ(find_nic(nics, "eth1")->classification,
+              NicClassification::kDataPlane);
+  }
 
   fs::remove_all(sysfs);
 }

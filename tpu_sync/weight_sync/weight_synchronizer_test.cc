@@ -30,12 +30,14 @@
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -44,11 +46,13 @@
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
@@ -75,18 +79,21 @@ class WeightSynchronizerTest : public ::testing::Test {
 TEST_F(WeightSynchronizerTest, PushWeightsCorrectnessE2e) {
   // 1. Instantiate three independent CPU-only synchronizers locally E2E!
   // ws_source represents the active RL Trainer
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers_, num_shards_, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers_, num_shards_, slice_byte_size_,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   // ws_dest1 and ws_dest2 represent inference server peers
-  auto ws_dest1 = std::make_unique<WeightSynchronizerBase>(
-      num_layers_, num_shards_, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest1,
+                          WeightSynchronizerBase::Create(
+                              num_layers_, num_shards_, slice_byte_size_,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
-  auto ws_dest2 = std::make_unique<WeightSynchronizerBase>(
-      num_layers_, num_shards_, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest2,
+                          WeightSynchronizerBase::Create(
+                              num_layers_, num_shards_, slice_byte_size_,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest1->local_port().has_value());
@@ -141,13 +148,15 @@ TEST_F(WeightSynchronizerTest, PushWeightsHeterogeneousCorrectness) {
   size_t num_shards = 1;
   std::vector<size_t> slice_byte_sizes = {16384, 32768};
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_sizes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_sizes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_sizes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_sizes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -189,11 +198,12 @@ TEST_F(WeightSynchronizerTest, CustomLayerNamesInitialization) {
   std::vector<size_t> slice_byte_sizes = {16384, 32768};
   std::vector<std::string> custom_names = {"my_layer_0", "my_layer_1"};
 
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_sizes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt,
-      /*bind_ip=*/std::nullopt, custom_names);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_sizes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+                              /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                              /*bind_ip=*/std::nullopt, custom_names));
 
   EXPECT_EQ(ws->layer_names().size(), 2);
   EXPECT_EQ(ws->layer_names()[0], "my_layer_0");
@@ -205,12 +215,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedExactBoundary) {
   size_t num_shards = 1;
   size_t slice_byte_size = 16384;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -252,15 +264,18 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcast) {
   size_t num_shards = 1;
   size_t slice_byte_size = 16384;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest1 = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest2 = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest1,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest2,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest1->local_port().has_value());
@@ -316,15 +331,18 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcastStrided) {
   size_t num_shards = 1;
   size_t slice_byte_size = 16384;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest1 = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest2 = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest1,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest2,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest1->local_port().has_value());
@@ -385,12 +403,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsResharded3DStridedSuccess) {
   // 3D strided layout: outer_counts = [2, 3], inner count = 4, size = 16
   constexpr size_t slice_byte_size = 8192;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -464,12 +484,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedStridedSuccess) {
   constexpr size_t total_payload = count * slice_size;
   constexpr size_t dst_buffer_size = (count - 1) * dst_stride + slice_size;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, total_payload,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, dst_buffer_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, total_payload,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, dst_buffer_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -528,12 +550,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedZeroBytes) {
   size_t num_shards = 1;
   size_t slice_byte_size = 16384;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -573,12 +597,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedOutOfBoundsError) {
   size_t num_shards = 1;
   size_t slice_byte_size = 1024;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -609,12 +635,14 @@ TEST_F(WeightSynchronizerTest,
   size_t num_shards = 1;
   size_t slice_byte_size = 1024;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -659,12 +687,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedInvalidLayerIndexError) {
   size_t num_shards = 1;
   size_t slice_byte_size = 1024;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -694,9 +724,10 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedEmptySchedule) {
   size_t num_shards = 1;
   size_t slice_byte_size = 1024;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   tpu_sync::rpc::StartTransferRequest request;
   request.set_skip_d2h(true);
@@ -713,16 +744,18 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedFallbackByNameSuccess) {
   std::vector<size_t> slice_byte_sizes = {16384, 16384};
   std::vector<std::string> custom_names = {"layer_A", "layer_B"};
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_sizes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt,
-      /*bind_ip=*/std::nullopt, custom_names);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_sizes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt,
-      /*bind_ip=*/std::nullopt, custom_names);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_sizes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+                              /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                              /*bind_ip=*/std::nullopt, custom_names));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_sizes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+                              /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                              /*bind_ip=*/std::nullopt, custom_names));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -772,16 +805,18 @@ TEST_F(WeightSynchronizerTest,
   std::vector<size_t> slice_byte_sizes = {16384, 16384};
   std::vector<std::string> custom_names = {"layer_A", "layer_B"};
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_sizes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt,
-      /*bind_ip=*/std::nullopt, custom_names);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_sizes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/1, /*listener_port=*/std::nullopt,
-      /*bind_ip=*/std::nullopt, custom_names);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_sizes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+                              /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                              /*bind_ip=*/std::nullopt, custom_names));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_sizes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+                              /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                              /*bind_ip=*/std::nullopt, custom_names));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -856,10 +891,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedSkipD2h) {
   std::vector<std::vector<raiden::RaidenBufferHandle>> dest_buffers = {
       {dest_handle_or.value()}};
 
-  auto ws_source =
-      std::make_unique<WeightSynchronizerBase>(src_buffers, /*local_port=*/0);
-  auto ws_dest =
-      std::make_unique<WeightSynchronizerBase>(dest_buffers, /*local_port=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_source,
+      WeightSynchronizerBase::Create(src_buffers, /*local_port=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_dest,
+      WeightSynchronizerBase::Create(dest_buffers, /*local_port=*/0));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -914,12 +951,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
   size_t num_shards = 2;
   size_t slice_byte_size = 1024;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -1144,10 +1183,12 @@ TEST_F(WeightSynchronizerTest, BindWeights) {
       {new_dest_handle_or.value()}};
 
   // 3. Create synchronizers (declared after buffers, so destroyed before them)
-  auto ws_source =
-      std::make_unique<WeightSynchronizerBase>(src_buffers, /*local_port=*/0);
-  auto ws_dest =
-      std::make_unique<WeightSynchronizerBase>(dest_buffers, /*local_port=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_source,
+      WeightSynchronizerBase::Create(src_buffers, /*local_port=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_dest,
+      WeightSynchronizerBase::Create(dest_buffers, /*local_port=*/0));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -1212,9 +1253,10 @@ TEST_F(WeightSynchronizerTest, BindWeights) {
 // CPU-only instances never bind device buffers and must keep their legacy
 // no-op D2h/H2d behavior; UnbindWeights() must not be required to use them.
 TEST_F(WeightSynchronizerTest, CpuOnlyInstanceD2hH2dRemainNoOp) {
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      num_layers_, num_shards_, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                          WeightSynchronizerBase::Create(
+                              num_layers_, num_shards_, slice_byte_size_,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   auto d2h_or = ws->D2h();
   ASSERT_TRUE(d2h_or.ok()) << d2h_or.status().message();
@@ -1261,10 +1303,14 @@ TEST_F(WeightSynchronizerTest, UnbindWeightsFailsTransfersUntilRebound) {
     return std::vector<std::vector<raiden::RaidenBufferHandle>>{{h.value()}};
   };
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      acquire(src_pjrt_buffer.get()), /*local_port=*/0);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      acquire(dest_pjrt_buffer.get()), /*local_port=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_source,
+      WeightSynchronizerBase::Create(acquire(src_pjrt_buffer.get()),
+                                     /*local_port=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_dest,
+      WeightSynchronizerBase::Create(acquire(dest_pjrt_buffer.get()),
+                                     /*local_port=*/0));
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
@@ -1382,9 +1428,10 @@ TEST_F(WeightSynchronizerTest, TilingSkipScenarios) {
       std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {
           {handle_or.value()}};
 
-      auto ws =
-          std::make_unique<WeightSynchronizerBase>(buffers, /*local_port=*/0);
-      return WSWrapper{std::move(pjrt_buffer), std::move(ws)};
+      absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> ws =
+          WeightSynchronizerBase::Create(buffers, /*local_port=*/0);
+      EXPECT_TRUE(ws.ok()) << ws.status().message();
+      return WSWrapper{std::move(pjrt_buffer), *std::move(ws)};
     }
   } runner{client.get(), memory_space};
 
@@ -1486,9 +1533,10 @@ TEST_F(WeightSynchronizerTest, TilingActiveByDefault) {
       std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {
           {handle_or.value()}};
 
-      auto ws =
-          std::make_unique<WeightSynchronizerBase>(buffers, /*local_port=*/0);
-      return WSWrapper{std::move(pjrt_buffer), std::move(ws)};
+      absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> ws =
+          WeightSynchronizerBase::Create(buffers, /*local_port=*/0);
+      EXPECT_TRUE(ws.ok()) << ws.status().message();
+      return WSWrapper{std::move(pjrt_buffer), *std::move(ws)};
     }
   } runner{client.get(), memory_space};
 
@@ -1569,8 +1617,9 @@ TEST_F(WeightSynchronizerTest, H2dTilesAllShardsAndLayersConcurrently) {
       pjrt_buffers[l].push_back(std::move(pjrt_buffer));
     }
   }
-  auto ws =
-      std::make_unique<WeightSynchronizerBase>(layer_buffers, /*local_port=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(layer_buffers, /*local_port=*/0));
 
   auto value_at = [](int l, int s, int i) {
     return static_cast<float>(1000 * l + 100 * s + i);
@@ -1655,9 +1704,10 @@ TEST_F(WeightSynchronizerTest, LazyTiledBufferAllocationSavesMemory) {
       std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {
           {handle_or.value()}};
 
-      auto ws =
-          std::make_unique<WeightSynchronizerBase>(buffers, /*local_port=*/0);
-      return WSWrapper{std::move(pjrt_buffer), std::move(ws)};
+      absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> ws =
+          WeightSynchronizerBase::Create(buffers, /*local_port=*/0);
+      EXPECT_TRUE(ws.ok()) << ws.status().message();
+      return WSWrapper{std::move(pjrt_buffer), *std::move(ws)};
     }
   } runner{client.get(), memory_space};
 
@@ -1751,9 +1801,10 @@ TEST_F(WeightSynchronizerTest, OneDimensionalTiledTensorH2dAndD2hRoundtrip) {
       std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {
           {handle_or.value()}};
 
-      auto ws =
-          std::make_unique<WeightSynchronizerBase>(buffers, /*local_port=*/0);
-      return WSWrapper{std::move(pjrt_buffer), std::move(ws)};
+      absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> ws =
+          WeightSynchronizerBase::Create(buffers, /*local_port=*/0);
+      EXPECT_TRUE(ws.ok()) << ws.status().message();
+      return WSWrapper{std::move(pjrt_buffer), *std::move(ws)};
     }
   } runner{client.get(), memory_space};
 
@@ -1833,11 +1884,13 @@ TEST_F(WeightSynchronizerTest, DeferredH2dTilesHostBufferOnDataReceived) {
       xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
   std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
 
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
-      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
-      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+          /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+          /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false));
 
   float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
   for (int i = 0; i < 64; ++i) {
@@ -1894,11 +1947,13 @@ TEST_F(WeightSynchronizerTest, H2dTracksPerLayerHostLayout) {
       xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
   std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
 
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
-      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
-      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+          /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+          /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false));
 
   float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
   for (int i = 0; i < 64; ++i) {
@@ -2002,11 +2057,13 @@ TEST_F(WeightSynchronizerTest, DeferredReceiverKeepsHostBufferLogical) {
         xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
     std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
 
-    auto ws = std::make_unique<WeightSynchronizerBase>(
-        buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
-        /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
-        /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
-        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> ws,
+        WeightSynchronizerBase::Create(
+            buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+            /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+            /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+            /*layer_names=*/std::vector<std::string>{}, auto_h2d));
 
     float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
     for (int i = 0; i < 64; ++i) {
@@ -2077,11 +2134,13 @@ TEST_F(WeightSynchronizerTest, AutoH2dWaitsForEveryShardOfBlockPush) {
   std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {
       shard_handles};
 
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
-      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
-      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+          /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+          /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/true));
   for (int sh = 0; sh < kShards; ++sh) {
     float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, sh));
     for (int i = 0; i < 64; ++i) {
@@ -2114,12 +2173,14 @@ TEST_F(WeightSynchronizerTest, AutoH2dWaitsForEveryShardOfBlockPush) {
 }
 
 TEST_F(WeightSynchronizerTest, DrainPendingH2dDrainsActivePendingFutures) {
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      /*num_layers=*/2, /*num_shards=*/1, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
-      /*layer_names=*/std::vector<std::string>{"layer_0", "layer_1"},
-      /*auto_h2d=*/true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/2, /*num_shards=*/1, slice_byte_size_,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+          /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{"layer_0", "layer_1"},
+          /*auto_h2d=*/true));
 
   uint64_t uuid = 54321;
   EXPECT_TRUE(ws->OnLayerDataReceived(0, uuid).ok());
@@ -2133,13 +2194,15 @@ TEST_F(WeightSynchronizerTest, DrainPendingH2dDrainsActivePendingFutures) {
 }
 
 TEST_F(WeightSynchronizerTest, OnDataReceivedWaitsForAllExpectedLayers) {
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      /*num_layers=*/3, /*num_shards=*/1, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
-      /*layer_names=*/
-      std::vector<std::string>{"layer_0", "layer_1", "layer_2"},
-      /*auto_h2d=*/true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/3, /*num_shards=*/1, slice_byte_size_,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+          /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/
+          std::vector<std::string>{"layer_0", "layer_1", "layer_2"},
+          /*auto_h2d=*/true));
 
   const uint64_t uuid = 65432;
   // Layer 2 has a zero count and never fires OnLayerDataReceived.
@@ -2195,11 +2258,13 @@ TEST_F(WeightSynchronizerTest, H2dWaitsForArmedInPlaceTiling) {
       xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
   std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
 
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
-      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
-      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+          /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+          /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false));
 
   float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
   for (int i = 0; i < 64; ++i) {
@@ -2277,11 +2342,13 @@ TEST_F(WeightSynchronizerTest, DrainPendingH2dReleasesArmedLayers) {
         xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
     std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
 
-    auto ws = std::make_unique<WeightSynchronizerBase>(
-        buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
-        /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
-        /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
-        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> ws,
+        WeightSynchronizerBase::Create(
+            buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+            /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+            /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+            /*layer_names=*/std::vector<std::string>{}, auto_h2d));
 
     // The controller arms the receiver (START_TRANSFER with is_sender=false),
     // but no chunk ever lands, so OnLayerDataReceived/OnDataReceived never run.
@@ -2371,11 +2438,13 @@ TEST_F(WeightSynchronizerTest, PreTiledReceiverCopiesHostBufferAsIs) {
         xla::PrimitiveType::F32, {8, 8}, {1, 0}, {xla::Tile({4, 4})});
     std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {{*handle}};
 
-    auto ws = std::make_unique<WeightSynchronizerBase>(
-        buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
-        /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
-        /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
-        /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> ws,
+        WeightSynchronizerBase::Create(
+            buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+            /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+            /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+            /*layer_names=*/std::vector<std::string>{}, auto_h2d));
 
     // The bytes as relayed: already in device layout.
     float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
@@ -2414,12 +2483,14 @@ TEST_F(WeightSynchronizerTest, PreTiledReceiverCopiesHostBufferAsIs) {
 // pipeline stage. Re-arming must not discard the readiness of layers that have
 // already arrived, or a later H2d would wait for them forever.
 TEST_F(WeightSynchronizerTest, ReArmKeepsReceivedLayersReady) {
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      /*num_layers=*/2, /*num_shards=*/1, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
-      /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
-      /*layer_names=*/std::vector<std::string>{"layer_0", "layer_1"},
-      /*auto_h2d=*/false);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/2, /*num_shards=*/1, slice_byte_size_,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+          /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{"layer_0", "layer_1"},
+          /*auto_h2d=*/false));
 
   constexpr uint64_t kUuid = 883;
   tpu_sync::rpc::StartTransferRequest req;
@@ -2444,12 +2515,14 @@ TEST_F(WeightSynchronizerTest, ReArmKeepsReceivedLayersReady) {
 // only after the layer's in-place tiling has finished.
 TEST_F(WeightSynchronizerTest, PreTiledPushSendsWholeShardAfterTiling) {
   constexpr size_t kSliceBytes = 16384;
-  auto ws_seed = std::make_unique<WeightSynchronizerBase>(
-      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_relay = std::make_unique<WeightSynchronizerBase>(
-      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_seed,
+                          WeightSynchronizerBase::Create(
+                              /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_relay,
+                          WeightSynchronizerBase::Create(
+                              /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
   ASSERT_TRUE(ws_relay->local_port().has_value());
   const std::string relay_peer =
       absl::StrCat("localhost:", *ws_relay->local_port());
@@ -2507,9 +2580,10 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   const size_t num_layers = 2;
   const size_t num_shards = 4;
   const size_t slice_size = 1024;
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   // Configure non-contiguous global shards, e.g., NUMA node 0 managing shards
   // {0, 2, 4, 6}
@@ -2571,9 +2645,10 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
   const size_t num_layers = 2;
   const size_t num_shards = 4;
   const size_t slice_size = 1024;
-  auto ws = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   // Configure non-contiguous global shards, e.g., Host 1 managing global shards
   // {2, 3, 6, 7} with local slots {0, 1, 2, 3}.
@@ -2618,12 +2693,14 @@ TEST_F(WeightSynchronizerTest,
   const size_t num_shards = 4;
   const size_t slice_byte_size = 256;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -2683,12 +2760,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedLocalShardIndicesFallback) {
   const size_t num_shards = 4;
   const size_t slice_byte_size = 256;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -2750,12 +2829,14 @@ TEST_F(WeightSynchronizerTest,
   const size_t num_shards = 1;
   const size_t slice_byte_size = 256;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -2800,12 +2881,14 @@ TEST_F(WeightSynchronizerTest,
   const size_t num_shards = 4;
   const size_t slice_byte_size = 256;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -2869,12 +2952,14 @@ TEST_F(WeightSynchronizerTest,
   const size_t num_shards = 4;
   const size_t slice_byte_size = 256;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -2940,12 +3025,14 @@ TEST_F(WeightSynchronizerTest,
   // Source host is Worker 1 (owning cluster shards 4..7), but initialized with
   // default 0-based local/global shard indices {0, 1, 2, 3} (e.g. PyTorch or
   // default JAX WeightSynchronizer).
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_source->local_port().has_value());
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -3010,12 +3097,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMetricsAccumulateAndReset) {
   size_t num_shards = 1;
   size_t slice_byte_size = 4096;
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = absl::StrCat("127.0.0.1:", *ws_dest->local_port());
@@ -3077,12 +3166,14 @@ TEST_F(WeightSynchronizerTest,
   size_t num_shards = 1;
   size_t slice_byte_size = 500000;  // 500 KB
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers, num_shards, slice_byte_size,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers, num_shards, slice_byte_size,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = absl::StrCat("127.0.0.1:", *ws_dest->local_port());
@@ -3090,7 +3181,7 @@ TEST_F(WeightSynchronizerTest,
   // Configure a simulated rate limiter of 10 MB/s (~50 ms per 500KB push)
   // to guarantee substantial concurrency overlap.
   auto egress_limiter =
-      std::make_shared<transport::lib::TestOnlyRateLimiter>(10000000);
+      std::make_shared<peregrine::v1::TestOnlyRateLimiter>(10'000'000);
   ws_source->SetTestOnlyRateLimiters(egress_limiter, /*ingress=*/nullptr);
 
   auto make_request = [&](uint64_t uuid) {
@@ -3154,12 +3245,14 @@ TEST_F(WeightSynchronizerTest, TelemetryRecordsOccupancyAndPushMetrics) {
   ASSERT_OK(telemetry::RaidenMetricStore::GetGlobalMetricStore()
                 .InitializeFromBackendNames({"buffered"}));
 
-  auto ws_source = std::make_unique<WeightSynchronizerBase>(
-      num_layers_, num_shards_, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
-      num_layers_, num_shards_, slice_byte_size_,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                          WeightSynchronizerBase::Create(
+                              num_layers_, num_shards_, slice_byte_size_,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
+                          WeightSynchronizerBase::Create(
+                              num_layers_, num_shards_, slice_byte_size_,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   // Buffer allocation gauge should be recorded
   auto samples = telemetry::RaidenMetricStore::GetGlobalMetricStore()
@@ -3252,16 +3345,19 @@ TEST_F(WeightSynchronizerTest,
     src_buffers.push_back({handle_or.value()});
   }
 
-  auto ws_source =
-      std::make_unique<WeightSynchronizerBase>(src_buffers, /*local_port=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_source,
+      WeightSynchronizerBase::Create(src_buffers, /*local_port=*/0));
   ws_source->SetPipelineGroupSize(1);
 
-  auto ws_dest1 = std::make_unique<WeightSynchronizerBase>(
-      kNumLayers, /*num_shards=*/1, kSliceByteSize,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
-  auto ws_dest2 = std::make_unique<WeightSynchronizerBase>(
-      kNumLayers, /*num_shards=*/1, kSliceByteSize,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest1,
+                          WeightSynchronizerBase::Create(
+                              kNumLayers, /*num_shards=*/1, kSliceByteSize,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest2,
+                          WeightSynchronizerBase::Create(
+                              kNumLayers, /*num_shards=*/1, kSliceByteSize,
+                              /*local_port=*/0, /*host_blocks_to_allocate=*/1));
   ASSERT_TRUE(ws_dest1->local_port().has_value());
   ASSERT_TRUE(ws_dest2->local_port().has_value());
   std::string dest1_peer = absl::StrCat("127.0.0.1:", *ws_dest1->local_port());
@@ -3326,6 +3422,44 @@ TEST_F(WeightSynchronizerTest,
       EXPECT_EQ(dst2_ptr[b], expected) << "dest2 layer " << l << " byte " << b;
     }
   }
+}
+
+TEST_F(WeightSynchronizerTest,
+       GetLocalEndpointsReturnsPerNumaDataNicEndpointsWithGlobalShardIndices) {
+  // RaidenManagerBase binds wildcard [::] when local_ips_ has >1 entries, so
+  // any IP strings in HostNicAddress are preserved in local_ips() without
+  // per-IP bind.
+  std::vector<HostNicAddress> nics = {
+      {"eth0", "10.11.3.60", 0, NicClassification::kDataPlane},
+      {"eth1", "10.35.3.60", 0, NicClassification::kControlPlane},
+      {"eth2", "10.34.3.60", 1, NicClassification::kDataPlane},
+  };
+  std::vector<transport::ShardInfo> shards = {
+      {/*local_index=*/0, /*global_index=*/8, /*numa_node=*/0},
+      {/*local_index=*/1, /*global_index=*/9, /*numa_node=*/0},
+      {/*local_index=*/2, /*global_index=*/10, /*numa_node=*/1},
+      {/*local_index=*/3, /*global_index=*/11, /*numa_node=*/1},
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto ws,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/4,
+          std::vector<size_t>{slice_byte_size_}, /*local_port=*/0,
+          /*host_blocks_to_allocate=*/1, /*parallelism=*/1,
+          /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false,
+          /*numa_nodes=*/std::vector<int>{0, 1}, nics, shards));
+  ws->SetGlobalShardIndices({8, 9, 10, 11});
+
+  ASSERT_TRUE(ws->local_port().has_value());
+  const int port = *ws->local_port();
+  std::vector<RaidenTransferEndpoint> endpoints = ws->get_local_endpoints();
+  ASSERT_EQ(endpoints.size(), 2u);
+  EXPECT_EQ(endpoints[0].endpoint, absl::StrCat("10.11.3.60:", port));
+  EXPECT_THAT(endpoints[0].shards, ::testing::ElementsAre(8, 9));
+  EXPECT_EQ(endpoints[1].endpoint, absl::StrCat("10.34.3.60:", port));
+  EXPECT_THAT(endpoints[1].shards, ::testing::ElementsAre(10, 11));
 }
 
 }  // namespace

@@ -1,7 +1,7 @@
 # Bug-hunt findings
 
 Defects found while modelling tpu-sync, with the evidence for each. Line
-numbers are for tpu-sync `1fa06d1` unless a block of test output says
+numbers are for tpu-sync `0ac16d1` unless a block of test output says
 otherwise; the F1–F4 tests were run on `b68161a` and re-run on `d16701e`, the
 F5 tests on `50b0774`.
 
@@ -39,7 +39,6 @@ here.
 | `kv_cache_store_pin_race_test.cc` | F1 |
 | `build_targets.patch` | `cc_test` targets for the two files above |
 | `candidate_fixes.patch` | fixes for F1 and F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`); see "Fix validation" |
-| `per_peer_staging_admission.patch` | fix for F5 (per-peer staging admission at `StartRead`), the owners' parked acceptance test re-enabled, two allocator unit tests; see "F5" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 
 To run F1–F4: copy the two `.cc` files next to the code they test
@@ -47,12 +46,10 @@ To run F1–F4: copy the two `.cc` files next to the code they test
 verification/findings/build_targets.patch`, then
 `bazel test //tpu_sync/core/controller:raiden_controller_bughunt_test
 //tpu_sync/kv_cache:kv_cache_store_pin_race_test`. F5 needs no repro file:
-its test is already in the tree as `DISABLED_`; `git apply
-verification/findings/per_peer_staging_admission.patch` re-enables it, then
-`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
-//tpu_sync/kv_cache:transfer_send_session_test`. All three patches apply cleanly
-at `1fa06d1` (the F5 patch and its tests moved with the sources to
-`tpu_sync/kv_cache/`).
+its test is already in the tree as `DISABLED_`
+(`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
+--test_arg=--gtest_also_run_disabled_tests`); the fix patch that re-enabled it
+was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 
 ## Summary
 
@@ -61,8 +58,9 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
 | F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash | CONFIRMED (test) | only via the `ReadRemote` API (no in-tree caller) |
 | F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shape A; proved in Lean for shapes A and B | same |
 | F3 | Data race on `RemoteReadState::lease_id` | CONFIRMED (read) | same |
-| F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) at `50b0774`; **FIXED upstream** in `72255dd` | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
-| F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix: `per_peer_staging_admission.patch`) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
+| F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `50b0774`; **FIXED upstream** by PR #1105 = `72255dd` (2026-10-07) | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
+| F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix designed and validated on `50b0774`, patch retired 2026-10-16) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
+| F6 | `PoolReshardRegisterRecv`: a rejected duplicate (or racing) registration for an active `uuid` destroys a session object whose destructor releases the **active** session's host-staging lease ([filed](filed_bugs.md#2-poolreshardregisterrecv-duplicate-registration-frees-the-active-sessions-staging-lease-f6)) | CONFIRMED (read) at `1fa06d1`; reproduced by the reporter; **FIXED upstream** in `8653373` (2026-10-13) | yes: any pool-reshard receiver with bounded host staging (`RegisterPools(..., staging_leases > 0)`), on a duplicate or concurrent register for the same `uuid` |
 
 ---
 
@@ -81,18 +79,18 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
   ValidateAndPinHostBlocks returned host block 5 but h0 now lives at 9; the returned block holds hash 'other'. The pin protects block 9, not the block the reader will pull.
   [  FAILED  ] KVCacheStorePinRaceTest.EvictAndReinsertBetweenLookupAndPinReturnsStaleHostBlockId (10 ms)
   ```
-- **Where:** `tpu_sync/kv_cache/kv_cache_store.cc:1672-1700`
+- **Where:** `tpu_sync/kv_cache/kv_cache_store.cc:1615-1642`
   (`KVCacheStore::ValidateAndPinHostBlocks`).
 - **Defect:** The function calls `backend()->Lookup(hashes)` with default
-  options (`:1675`; `pin_found = false` by default,
+  options (`:1618`; `pin_found = false` by default,
   `kv_cache_store_backend.h:104`), copies `host_block_id`, and only then calls
-  `backend()->Pin(hashes)` (`kv_cache_store.cc:1694`). The backend mutex is
+  `backend()->Pin(hashes)` (`kv_cache_store.cc:1637`). The backend mutex is
   released between the two calls. The only lock held across them is
   `KVCacheStore::mutex_`, and neither of the following takes it:
-  - `KVCacheStore::Evict` (`:1857`). The comment at `:1861-1863` says "We do
+  - `KVCacheStore::Evict` (`:1800`). The comment at `:1804-1806` says "We do
     not hold store mutex_". It is called from `SweepOnce` and
     `AllocateBlockIds`.
-  - `KVCacheStore::Insert` (`:1065`).
+  - `KVCacheStore::Insert` (`:1008`).
 - **Bad interleaving:**
   1. T1 runs `Lookup(h)` and gets host block 5.
   2. T2 evicts `h`; block 5 goes back to the pool.
@@ -111,7 +109,7 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
     from the LRU)" (`kv_cache_store.h:388-389`).
 - **Reachability:**
   - The source side runs whenever a peer calls `AcquireReadLease` on this
-    controller; the hook is registered at `kv_cache_store.cc:1659-1669`.
+    controller; the hook is registered at `kv_cache_store.cc:1602-1612`.
   - The only initiator of that RPC in this tree is
     `RaidenController::ReadRemote`, which has **no production C++ caller**.
     `KVCacheStore::Load`'s remote branch uses `backend()->Load`. So in this
@@ -191,10 +189,11 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
 
 ## F4. `TransferBuffers` leaks auto-allocated staging blocks on every early error
 
-- **Status:** **CONFIRMED (test)** at `50b0774`, both halves; **FIXED upstream
+- **Status:** **CONFIRMED (test)** on `b68161a` / `d16701e` (code unchanged through `50b0774`), both halves; **FIXED upstream
   in `72255dd`** (2026-10-07, "Validate all workers before dispatching in
   `RaidenController::TransferBuffers` and release auto-allocated staging on
-  error", the shape proposed in PR #1105). At `1fa06d1` every worker is matched
+  error" = [PR #1105](https://github.com/google/tpu-sync/pull/1105), merged
+  via copybara). At `0ac16d1` (unchanged since `1fa06d1`) every worker is matched
   (`raiden_controller.cc:702-740`) before staging is auto-allocated
   (`:772-784`) and before any request is built (`:787-803`; a build failure
   frees the staging at `:798`); dispatch starts at `:805` and has no early
@@ -232,8 +231,8 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
     cross-node transfer that touches *local HBM* with no staging supplied.
     The production callers of the broadcast overload never do that: Fetch
     (`kv_cache_store_service.cc:525`, DRAM → remote DRAM), WriteRemote
-    (`:773`, remote DRAM → DRAM), `host_offload_backend.cc:1219`, `:1311`
-    (local DRAM → HBM), `:1393` (local HBM → DRAM). No Python binding or
+    (`:773`, remote DRAM → DRAM), `host_offload_backend.cc:1151`, `:1243`
+    (local DRAM → HBM), `:1325` (local HBM → DRAM). No Python binding or
     vllm-torchtpu code calls `TransferBuffers` directly.
   - **Orphaned-copy half: reachable from production.** Fetch and WriteRemote
     pass remote worker endpoints, so they go through the node_id matching
@@ -243,15 +242,15 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
     error, unpins its source blocks (`unpin_cleanup`,
     `kv_cache_store_service.cc:473`) and fails the RPC; the client's
     `LoadRemoteBlocks` frees `dst_host_block_ids`
-    (`host_offload_backend.cc:1182-1193`). Meanwhile the dispatched worker
+    (`host_offload_backend.cc:1114-1125`). Meanwhile the dispatched worker
     copy may still be reading the source and writing the destination.
   - **Trigger:** the two sides disagree about which node_ids exist
     (config/topology mismatch). How likely that is in real deployments is
     not established.
 - **Fix:** the cleaner shape — resolve and match every worker *before*
   allocating or dispatching anything
-  ([google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105)) — is
-  what landed upstream as `72255dd`. The earlier `candidate_fixes.patch` hunk
+  ([google/tpu-sync#1105](https://github.com/google/tpu-sync/pull/1105)) —
+  landed upstream as `72255dd` (the PR's copybara merge). The earlier `candidate_fixes.patch` hunk
   (route every error return through a helper that frees the staging after
   joining already-dispatched futures) was dropped from the patch on 2026-10-10.
 
@@ -265,13 +264,13 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
   `50b0774` with `--gtest_also_run_disabled_tests`, verbatim:
   ```
   [ RUN      ] ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer
-  E0000 00:00:1791391218.831497      12 transfer_receive_session.cc:233] StartRead: cannot stage 1 blocks for req_id=healthy0 (dynamic=false, free_host_blocks=0, free_slots=0, max_blocks=8)
-  tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc:1065: Failure
+  E0000 00:00:1791391218.831497      12 transfer_receive_session.cc:226] StartRead: cannot stage 1 blocks for req_id=healthy0 (dynamic=false, free_host_blocks=0, free_slots=0, max_blocks=8)
+  tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc:1126: Failure
   Value of: consumer.has_recv(900)
     Actual: false
   Expected: true
   the read to the healthy peer was rejected outright because an unresponsive peer holds all 8 staging slots; no request to a healthy producer can even be attempted while another producer is wedged
-  tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc:1076: Failure
+  tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc:1137: Failure
   Value of: failed_recving
   Expected: doesn't contain any element that is equal to "healthy0"
     Actual: { "healthy0" }, whose element #0 matches
@@ -281,11 +280,12 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
 - **Where:** `KVCacheManagerWithTransfer::StartRead` →
   `TransferReceiveSession::Create` → `AllocateStagingForLoad` →
   `StagingBlockAllocator::Acquire`, non-blocking and first-come-first-served
-  (`kv_cache_manager_with_transfer.cc:865-873`,
-  `transfer_receive_session.cc:215-242`,
-  `kv_cache_manager_with_transfer.cc:1202-1203`).
+  (`kv_cache_manager_with_transfer.cc:903-912`,
+  `transfer_receive_session.cc:208-235`,
+  `tpu_sync/core/staging_arena.cc:514-518`, slot pop `:494-499`; the allocator moved
+  there from `kv_cache_manager_with_transfer.cc` in `fc8cff9`).
   - The slot is taken *before* the handshake because the pull request
-    carries the allocated host block ids (`transfer_receive_session.cc:504`);
+    carries the allocated host block ids (`transfer_receive_session.cc:523`);
     lazy allocation after the peer answers is not an option.
   - It is released only in `FinishLocked()` / `EndRecvOpLocked()` via
     `ReleaseStagingLocked()` once no copy or push is in flight
@@ -293,7 +293,7 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
     cancelling a read to a dead peer does not return its slot before the
     deadline.
   - On `ResourceExhausted`, `StartRead` puts the request in `failed_recving_`
-    and returns (`kv_cache_manager_with_transfer.cc:870-872`). No queueing: the
+    and returns (`kv_cache_manager_with_transfer.cc:908-911`). No queueing: the
     read is rejected, not delayed.
   - Nothing bounds how many slots one peer may hold. The September changes
     bound how *long*: control-plane deadline (`430089c`, PR #1010, the
@@ -316,7 +316,11 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
   cap `c` reserves `numSlots − c` slots for everyone else. It does not share
   fairly among many peers, it does not queue, and `c = numSlots` guarantees
   nothing (which is why the default is a no-op).
-- **Fix in `per_peer_staging_admission.patch`:** `StagingBlockAllocator`
+- **Fix (proposed; the patch `per_peer_staging_admission.patch` was validated on
+  `50b0774`, re-based onto `1fa06d1`, and retired on 2026-10-16 when upstream
+  moved `StagingBlockAllocator` to `tpu_sync/core/staging_arena.{h,cc}` in
+  `fc8cff9` — the design and the proof stand, the diff is in the git history at
+  tag `upstream-main-2026-10-10`):** `StagingBlockAllocator`
   keeps a count of live allocations per peer key.
   `Acquire(num_blocks, peer_key)` refuses with `kResourceExhausted` once the
   peer already holds `max_staged_reads_per_peer` allocations, even while
@@ -342,9 +346,9 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
   ```
   [ RUN      ] ControlHandshakeTest.SickPeerStarvesStagingSlotsForHealthyPeer
   I0000 00:00:1791391420.582191      12 kv_cache_manager_with_transfer.cc:1132] StagingBlockAllocator: capping staged reads per peer at 7 (num_slots=8)
-  E0000 00:00:1791391420.583945      12 transfer_receive_session.cc:235] StartRead: cannot stage 1 blocks for req_id=sick7 from peer=127.0.0.1:46081: Peer 127.0.0.1:46081 already holds 7 staged reads (cap 7); refusing to stage more (dynamic=false, free_host_blocks=0, free_slots=1, held_by_peer=7, max_blocks=8)
-  I0000 00:00:1791391420.584110      12 kv_cache_manager_with_transfer.cc:826] StartRead (initiate): req_id=healthy0, uuid=900, numa=-1
-  I0000 00:00:1791391420.584206      12 transfer_receive_session.cc:517] StartRead (connecting): req_id=healthy0, uuid=900, numa=-1
+  E0000 00:00:1791391420.583945      12 transfer_receive_session.cc:228] StartRead: cannot stage 1 blocks for req_id=sick7 from peer=127.0.0.1:46081: Peer 127.0.0.1:46081 already holds 7 staged reads (cap 7); refusing to stage more (dynamic=false, free_host_blocks=0, free_slots=1, held_by_peer=7, max_blocks=8)
+  I0000 00:00:1791391420.584110      12 kv_cache_manager_with_transfer.cc:858] StartRead (initiate): req_id=healthy0, uuid=900, numa=-1
+  I0000 00:00:1791391420.584206      12 transfer_receive_session.cc:537] StartRead (connecting): req_id=healthy0, uuid=900, numa=-1
   [       OK ] ControlHandshakeTest.SickPeerStarvesStagingSlotsForHealthyPeer (48 ms)
   ```
   The full targets (the two that carry the new tests plus every other
@@ -369,6 +373,94 @@ at `1fa06d1` (the F5 patch and its tests moved with the sources to
   a constructor / Python parameter. A self-sizing share (cap derived from the
   number of peers currently holding staging) is a natural follow-up and would
   need its own proof.
+
+---
+
+## F6. `PoolReshardRegisterRecv`: duplicate registration frees the active session's staging lease
+
+- **Status:** **CONFIRMED (read)** at `1fa06d1`; reproduced by the reporter
+  on a bounded-staging receiver (`RegisterPools(..., staging_leases=2)`),
+  output not pasted here. Found during the Lean formalization of the pool
+  reshard receive path. Filed upstream 2026-10-13 ([write-up](filed_bugs.md#2-poolreshardregisterrecv-duplicate-registration-frees-the-active-sessions-staging-lease-f6));
+  **FIXED upstream in `8653373`** (2026-10-13): `ReshardReceiveSession::Create`
+  now claims the `uuid` with `RegisterActivePlanDirect` before constructing the
+  session and acquiring staging, and rolls the claim back with
+  `UnregisterActivePlanDirect` when `AcquireStagingLeases` fails
+  (`reshard_receive_session.cc:376-388` at `0ac16d1`); the pool-lease
+  forwarders left `StagingBlockAllocator`. Three regression tests:
+  `PoolStagingRecvRegistrationTest.DuplicatePoolRecvRegistrationKeepsOriginalStagingLease`,
+  `…ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease`,
+  `…StagingAcquireFailureReleasesUuidClaim` in
+  `kv_cache_manager_with_transfer_pool_reshard_test.cc`. The description
+  below is of the unfixed code at `1fa06d1`.
+- **Where (at `1fa06d1`, before the fix):** two layers disagree about who owns a staging lease.
+  1. The per-storage lease table is keyed by `uuid` only, not by session
+     instance: `KVCacheManagerBase::AcquirePoolStagingLease`
+     (`kv_cache_manager_base.cc:2086-2143`) is idempotent per `uuid` — it
+     returns `OK` when `pool_staging_[s].leases[uuid]` already covers the
+     requested blocks (`:2095-2113`) — and `ReleasePoolStagingLeases(uuid)`
+     (`:2145-2161`) unconditionally erases `leases[uuid]` and returns all of
+     its slots to `free_slots` (`:2150-2156`). `StagingBlockAllocator`
+     forwards both (`kv_cache_manager_with_transfer.cc:1261-1275`).
+  2. `ReshardReceiveSession` is a per-call heap object that acquires staging
+     *before* `uuid` uniqueness is enforced. `PoolReshardRegisterRecv`
+     (`kv_cache_manager_with_transfer.cc:642-677`) checks
+     `active_pool_reshard_recvs_` under `mu_` (`:649-663`), but that table
+     only holds sessions whose registration already completed (`:672-675`).
+     `mu_` is released while `ReshardReceiveSession::Create`
+     (`reshard_receive_session.cc:351-377`) constructs the object (`:372-374`)
+     and calls `AcquireStagingLeases` (`:375` → `:407-444`), which sets
+     `staging_released_ = false` (`:419`) and leases per storage (`:437-438`,
+     possibly blocking on `staging_cv_` for free slots,
+     `kv_cache_manager_base.cc:2121-2130`) — all before
+     `RegisterActivePlanDirect(uuid)` claims the `uuid` in `active_plans_`
+     (`kv_cache_manager_with_transfer.cc:670-671`).
+     (`ReshardSendSession::Create` does it the other way round and claims the
+     `uuid` first, `reshard_send_session.cc:138-139`.)
+- **Sequence** (two `PoolReshardRegisterRecv` calls for the same `uuid = U`
+  overlapping in that window, or one call for a `U` already in
+  `active_plans_`):
+  1. Session S1 acquires `leases[U]`, `staging_released_ = false`.
+  2. Session S2, a distinct object for the same `U`, also passes `Create`:
+     `AcquirePoolStagingLease(U)` finds `leases[U]` populated and returns
+     `OK`; S2 sets `staging_released_ = false`.
+  3. S2 is rejected: `RegisterActivePlanDirect(U)` returns `ALREADY_EXISTS`.
+  4. S2 goes out of scope: `~ReshardReceiveSession` → `ReleaseStaging()`
+     (`reshard_receive_session.h:71`, `.cc:446-455`) →
+     `ReleasePoolStagingLeases(U)` erases `leases[U]` and frees S1's slots
+     while S1 is still active.
+- **Impact:**
+  - the active session fails: incoming pushes for `U` can no longer resolve
+    their host staging buffer (`GetBlockChunks(uuid = U)` returns no chunks);
+  - **silent host-buffer aliasing:** `U`'s physical slots are back in
+    `free_slots`, so the next transfer `U2` is leased the same host memory
+    while `U` is still active, with no error raised.
+- **Reachability:** production path, every bounded-staging pool-reshard
+  receiver. Trigger: a duplicate `PoolReshardRegisterRecv` (coordinator retry)
+  for an active `uuid`, or two concurrent registrations for the same `uuid`
+  while both wait on staging slots — one returns `OK`, the loser returns
+  `ALREADY_EXISTS` and its destructor erases the winner's lease.
+- **Reporter's observations** (bounded receiver with `staging_leases=2`):
+  with `uuid=4001` holding a lease and registered in `active_plans_`, a
+  rejected `PoolReshardRegisterRecv(4001)` moves `free_slots` from 1 back to
+  2, `GetBlockChunks(uuid=4001)` returns 0 chunks, and a following
+  `PoolReshardRegisterRecv(4002)` receives the same physical slot pointer as
+  `4001`; with two threads calling `PoolReshardRegisterRecv(4001)`
+  concurrently while waiting on slots, one returns `OK`, one
+  `ALREADY_EXISTS`, and `free_slots` becomes 2 with `GetBlockChunks(4001)`
+  empty.
+- **Fix (proposed, in preparation):** claim the `uuid` via
+  `RegisterActivePlanDirect` in `ReshardReceiveSession::Create` before
+  constructing the session and acquiring staging, rolling back with
+  `UnregisterActivePlanDirect` if `AcquireStagingLeases` fails — the order
+  `ReshardSendSession::Create` already uses.
+- **Lean:** the pool-reshard path is outside the prefill-to-decode model
+  (`docs/transfer/prefill_decode.md` §Boundaries, row 1); `Transfer/Session.lean`
+  covers only the per-session settle protocol, whose `hasStaging` token is
+  per *instance* — exactly the property the shared `uuid`-keyed lease table
+  breaks. A `UuidTable`-style model of `active_plans_` + `pool_staging_`
+  would make this a one-step counterexample (`registerRecv` of a live uuid
+  followed by the loser's `release`); not written.
 
 ---
 
@@ -415,7 +507,7 @@ rather than a design choice.
 ### R-E. Local `KVCacheStore::Load` reads host blocks that could be evicted mid-copy: REFUTED (read)
 
 Both `Load` overloads require that the caller already holds a pin on every
-hash; eviction skips pinned entries (`host_offload_backend.cc:665, 813`,
+hash; eviction skips pinned entries (`host_offload_backend.cc:607, 745`,
 `lru_cache.h:258-294`).
 
 ### R-F. Fetch-source (production remote load) unpins before the pull finishes: REFUTED (read)
@@ -429,7 +521,7 @@ after `transfer_future.Await()` returns (`:473`, `:525`).
 - `KVCacheStoreClient::Fetch` sets no RPC deadline
   (`kv_cache_store_client.cc:61-125`). If the RPC fails with a transport error
   while the source's workers are still writing, `LoadRemoteBlocks` frees
-  `dst_host_block_ids` immediately (`host_offload_backend.cc:1182-1193`). Same
+  `dst_host_block_ids` immediately (`host_offload_backend.cc:1114-1125`). Same
   shape as F2 but in the production path. Whether in-flight source DMA can
   outlive a failed Fetch RPC depends on worker and transport teardown, not
   established. **PLAUSIBLE.**
@@ -438,7 +530,7 @@ after `transfer_future.Await()` returns (`:473`, `:525`).
   destroyed first among the members that matter, so this is probably safe.
   Not verified.
 
-## Observations on the prefill-to-decode path (non-bugs at `1fa06d1`)
+## Observations on the prefill-to-decode path (non-bugs at `0ac16d1`)
 
 Behaviours that looked like defects during the prefill-to-decode model work and
 turned out to be intended, dead, or proved unreachable. Kept here so they are not
@@ -448,16 +540,17 @@ as in the Lean preambles: `recv.cc` = `tpu_sync/kv_cache/transfer_receive_sessio
 `mgr.cc` = `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`,
 `bt.cc` = `tpu_sync/transport/block_transport.cc`.
 
-| Observation | Where (`1fa06d1`) | Note |
+| Observation | Where (`0ac16d1`) | Note |
 |---|---|---|
-| client-side `SendAck` has no non-test caller; the server-side `OnAck → HandleAck → AckSend → Finish()` handler is wired but never triggered in-repo | `grpc_control_plane_backend.cc:373`, `tcp_control_plane_backend.cc:662`; `mgr.cc:1376-1378, 1553-1556, 1619-1630` | dead path; excluded (`Send` A5) |
-| a failed **send** is reported in `failed_recving_` | `mgr.cc:929-930` | naming/semantics quirk visible through `poll_stats()` |
-| first `Finish` wins on the send side; a later cancel is ignored | `send.cc:167-176` | intended; `trace_cancel_after_ok_finish` |
-| `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:431-437` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:699-705, 719-729`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlockShardsReceived` (`RecordNetworkCompleteLocked`) are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll (design alternative `stepM false` in `ReceivePoll.lean`) keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). |
-| `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:189-196` vs `recv.cc:388-391` | underflow proved unreachable (`NoUnderflow`) |
-| `LOG(DFATAL) "H2D callback for retired receive"` is unreachable | `recv.cc:691-693` | proved (`NoRetiredCallback`) |
-| `done_` is redundant in six lifecycle guards | `recv.cc:369, 393, 578, 622, 648`, `recv.h:118` (send side: `send.cc:168, 191, 238, 252, 299`) | `done → draining` and `done → in_flight_ == 0` are `Lifecycle.Consistent`, which every model keeps in its invariant (`Inv.life`); the guards without `done_` are the same functions on consistent states (`finishLocked'_eq`, `endOpLocked'_eq`, `beginOp'_eq`, `Consistent.done_or_draining`). Defensive code, not a bug. The two `LOG(DFATAL)` branches (`recv.cc:388-391`, `691-693`) are assertions — unreachable by `Accounted` / `NoRetiredCallback` — and stay. `Session.lean` |
-| a failed incoming push reaches the session as a flat `InternalError("Incoming push failed")` | `bt.cc:509-516` → `mgr.cc:241-244` (`4efb0dd`) | the actual cause (read timeout, size mismatch, `OnLayerReceived` error) is only in the transport log, so `failed_recving` cannot tell them apart. Observability, not correctness; the model does not distinguish error statuses. |
+| client-side `SendAck` has no non-test caller; the server-side `OnAck → HandleAck → AckSend → Finish()` handler is wired but never triggered in-repo | `grpc_control_plane_backend.cc:373`, `tcp_control_plane_backend.cc:662`; `mgr.cc:1181-1183, 1358-1361, 1424-1435` | dead path; excluded (`Send` A5) |
+| a failed **send** is reported in `failed_recving_` | `mgr.cc:969-970` | naming/semantics quirk visible through `poll_stats()` |
+| first `Finish` wins on the send side; a later cancel is ignored | `send.cc:193-206` | intended; `trace_cancel_after_ok_finish` |
+| `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:450-456` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:726-732, 746-756`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlockShardsReceived` (`RecordNetworkCompleteLocked`) are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll (design alternative `stepM false` in `ReceivePoll.lean`) keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). |
+| `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:253-260` vs `recv.cc:407-410` | underflow proved unreachable (`NoUnderflow`) |
+| `LOG(DFATAL) "H2D callback for retired receive"` is unreachable | `recv.cc:718-720` | proved (`NoRetiredCallback`) |
+| `done_` is redundant in six lifecycle guards | `recv.cc:365, 412, 605, 649, 675`, `recv.h:119` (send side: `send.cc:195, 255, 326, 340, 391`) | `done → draining` and `done → in_flight_ == 0` are `Lifecycle.Consistent`, which every model keeps in its invariant (`Inv.life`); the guards without `done_` are the same functions on consistent states (`finishLocked'_eq`, `endOpLocked'_eq`, `beginOp'_eq`, `Consistent.done_or_draining`). Defensive code, not a bug. The two `LOG(DFATAL)` branches (`recv.cc:407-410`, `718-720`) are assertions — unreachable by `Accounted` / `NoRetiredCallback` — and stay. `Session.lean` |
+| a failed incoming push reaches the session as a flat `InternalError("Incoming push failed")` | `bt.cc:509-516` → `mgr.cc:267-270` | the actual cause (read timeout, size mismatch, `OnLayerReceived` error) is only in the transport log, so `failed_recving` cannot tell them apart. Observability, not correctness; the model does not distinguish error statuses. |
+| `TransferSendSession::EndSendOp` drops `mu_` inside the last op of a draining send under `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer` | `send.cc:262-289` (window `:284-287`) | closes idle data connections before `EndSendOpLocked`; `in_flight_ == 1`, `draining_`, `!done_` are fixed across the window (no new op, `FinishLocked` returns early, the poll sees `Done() == false`), so the model's atomic `endOp` is exact and only `done_` is delayed. Default `pooled` never enters the branch. `Send.lean` A7. |
 
 ---
 
@@ -508,7 +601,7 @@ clone reset. Results, verbatim:
   allocator, the test is still `DISABLED_`, and no issue or PR proposes a
   per-peer cap.
 - 2026-10-10: upstream `1fa06d1` (38 commits past `50b0774`). **F4 fixed
-  upstream** by `72255dd` (2026-10-07; the PR #1105 shape, three new tests);
+  upstream** by `72255dd` (2026-10-07; PR #1105 merged via copybara, three new tests);
   its hunk dropped from `candidate_fixes.patch`. F1, F2, F3, F5 unchanged
   (`kv_cache_store.cc` F1 regions moved +6 since `50b0774`; `ReadRemote` region of
   `raiden_controller.cc` moved +35, byte-identical; `StartRead` admission and
@@ -516,3 +609,21 @@ clone reset. Results, verbatim:
   still disabled). Sessions and manager moved to `tpu_sync/kv_cache/`
   (`5afe1ef`); `per_peer_staging_admission.patch` re-based onto the new paths,
   all three patches apply cleanly. Tests not re-run.
+- 2026-10-13: F6 added (pool-reshard receiver: a rejected duplicate
+  `PoolReshardRegisterRecv` destroys a session whose destructor releases the
+  active session's `uuid`-keyed staging lease), read-confirmed at `1fa06d1`
+  and reproduced by the reporter; filed upstream, fix with regression tests
+  to follow. Upstream `main` checked 10 commits past `1fa06d1`: no fix yet;
+  `fc8cff9` moves `StagingBlockAllocator` to `tpu_sync/core/staging_arena.h`
+  (re-pin note for the next sync).
+- 2026-10-16: upstream `0ac16d1` (48 commits past `1fa06d1`). **F6 fixed
+  upstream** by `8653373` (2026-10-13, three regression tests). F1, F2, F3
+  unchanged (`raiden_controller.cc` and the `kv_cache_store.cc` F1 regions
+  untouched). F5 still open (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`
+  at `control_test.cc:1103-1151`, still disabled); `StagingBlockAllocator`
+  moved to `tpu_sync/core/staging_arena.{h,cc}` (`fc8cff9`), so
+  `per_peer_staging_admission.patch` no longer applies and was retired rather
+  than re-based (decision: keep the proof and the write-up). `NotifyForRead`
+  now throws on an invalid registration instead of returning 0 (`80e2c52`);
+  `TransferDetails` reports the failed phase (`5a73483`). Two patches remain
+  and apply cleanly. Tests not re-run.

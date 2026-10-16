@@ -131,11 +131,8 @@ class ReshardPlannerTest(absltest.TestCase):
       src_vars_by_unit: dict[RaidenId, list[controller_types.VariableMetadata]],
       dst_vars_by_unit: dict[RaidenId, list[controller_types.VariableMetadata]],
       src_phys_mesh: list[int],
-      src_mesh_axes: list[str],
-      src_host_subgrid: list[int],
       dst_phys_mesh: list[int],
       dst_mesh_axes: list[str],
-      dst_host_subgrid: list[int],
       broadcast_host_ratio: float = 0.0,
   ) -> dict[str, Any]:
     lock = threading.Lock()
@@ -145,8 +142,6 @@ class ReshardPlannerTest(absltest.TestCase):
     entities = {}
     registered_shards = {}
     registered_mesh_shapes = {}
-    registered_mesh_axes = {}
-    registered_host_subgrids = {}
     worker_endpoints = {}
 
     for i, u in enumerate(src_units):
@@ -154,8 +149,6 @@ class ReshardPlannerTest(absltest.TestCase):
       registered_shards[u] = shards
       entities[u] = job_entity.JobEntity(unit=u, shards=shards)
       registered_mesh_shapes[u] = src_phys_mesh
-      registered_mesh_axes[u] = src_mesh_axes
-      registered_host_subgrids[u] = src_host_subgrid
       worker_endpoints[u] = f"10.0.0.{i + 1}:9000"
 
     dst_metadata = []
@@ -174,7 +167,6 @@ class ReshardPlannerTest(absltest.TestCase):
       meta.shards.extend(shards)
       meta.mesh_shape.extend(dst_phys_mesh)
       meta.mesh_axes.extend(dst_mesh_axes)
-      meta.host_subgrid.extend(dst_host_subgrid)
       u_vars = dst_vars_by_unit[u]
       proto_vars = proto_vars_cache.get(id(u_vars))
       if proto_vars is None:
@@ -203,8 +195,6 @@ class ReshardPlannerTest(absltest.TestCase):
         registered_variables=src_vars_by_unit,
         registered_global_shapes={},
         registered_mesh_shapes=registered_mesh_shapes,
-        registered_mesh_axes=registered_mesh_axes,
-        registered_host_subgrids=registered_host_subgrids,
         registered_layouts={},
         registered_itemsizes={},
         registered_shards=registered_shards,
@@ -219,21 +209,15 @@ class ReshardPlannerTest(absltest.TestCase):
       src_vars_by_unit: dict[RaidenId, list[controller_types.VariableMetadata]],
       dst_vars_by_unit: dict[RaidenId, list[controller_types.VariableMetadata]],
       src_phys_mesh: list[int],
-      src_mesh_axes: list[str],
-      src_host_subgrid: list[int],
       dst_phys_mesh: list[int],
       dst_mesh_axes: list[str],
-      dst_host_subgrid: list[int],
   ) -> controller_types.CachedTransferSchedule:
     kwargs = self._build_planner_inputs(
         src_vars_by_unit=src_vars_by_unit,
         dst_vars_by_unit=dst_vars_by_unit,
         src_phys_mesh=src_phys_mesh,
-        src_mesh_axes=src_mesh_axes,
-        src_host_subgrid=src_host_subgrid,
         dst_phys_mesh=dst_phys_mesh,
         dst_mesh_axes=dst_mesh_axes,
-        dst_host_subgrid=dst_host_subgrid,
     )
     return (
         reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
@@ -262,11 +246,8 @@ class ReshardPlannerTest(absltest.TestCase):
         src_vars_by_unit={u: src_vars for u in src_units},
         dst_vars_by_unit={u: dst_vars for u in dst_units},
         src_phys_mesh=[1, 1, 4, 4, 2],
-        src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
-        src_host_subgrid=[1, 1, 1, 4, 2],
         dst_phys_mesh=[2, 8],
         dst_mesh_axes=["x", "y"],
-        dst_host_subgrid=[1, 8],
     )
 
     # Verify that computing variables individually in isolation produces identical
@@ -276,11 +257,8 @@ class ReshardPlannerTest(absltest.TestCase):
           src_vars_by_unit={u: [s_var] for u in src_units},
           dst_vars_by_unit={u: [d_var] for u in dst_units},
           src_phys_mesh=[1, 1, 4, 4, 2],
-          src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
-          src_host_subgrid=[1, 1, 1, 4, 2],
           dst_phys_mesh=[2, 8],
           dst_mesh_axes=["x", "y"],
-          dst_host_subgrid=[1, 8],
       )
       for u in src_units:
         pid = batched_schedule.variable_to_plan_id[u][v_idx]
@@ -359,11 +337,8 @@ class ReshardPlannerTest(absltest.TestCase):
             src_vars_by_unit={u: src_vars for u in src_units},
             dst_vars_by_unit={u: dst_vars for u in dst_units},
             src_phys_mesh=[1, 1, src_fsdp, 4, 2],
-            src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
-            src_host_subgrid=[1, 1, 1, 4, 2],
             dst_phys_mesh=[2, 8],
             dst_mesh_axes=["x", "y"],
-            dst_host_subgrid=[1, 8],
         )
         last_sched = [None]
         timer = timeit.Timer(_make_plan_runner(planner_kwargs, last_sched))
@@ -413,11 +388,8 @@ class ReshardPlannerTest(absltest.TestCase):
         src_vars_by_unit={u: src_vars for u in src_units},
         dst_vars_by_unit={u: dst_vars for u in dst_units},
         src_phys_mesh=[1, 1, 4, 4, 2],
-        src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
-        src_host_subgrid=[1, 1, 1, 4, 2],
         dst_phys_mesh=[2, 8],
         dst_mesh_axes=["x", "y"],
-        dst_host_subgrid=[1, 8],
     )
 
     # Latin Square property: across multiple src_units, each trainer has a destination
@@ -482,11 +454,8 @@ class ReshardPlannerTest(absltest.TestCase):
           src_vars_by_unit={u: src_vars for u in src_units},
           dst_vars_by_unit={u: dst_vars for u in dst_units},
           src_phys_mesh=[1, 1, 4, 4, 2],
-          src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
-          src_host_subgrid=[1, 1, 1, 4, 2],
           dst_phys_mesh=[2, 8],
           dst_mesh_axes=["x", "y"],
-          dst_host_subgrid=[1, 8],
       )
       sched = reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
           **planner_inputs
@@ -676,8 +645,6 @@ class ReshardPlannerTest(absltest.TestCase):
           registered_variables={},
           registered_global_shapes={},
           registered_mesh_shapes={},
-          registered_mesh_axes={},
-          registered_host_subgrids={},
           registered_layouts={},
           registered_itemsizes={},
           registered_shards={},
@@ -698,8 +665,6 @@ class ReshardPlannerTest(absltest.TestCase):
           registered_variables={},
           registered_global_shapes={},
           registered_mesh_shapes={},
-          registered_mesh_axes={},
-          registered_host_subgrids={},
           registered_layouts={},
           registered_itemsizes={},
           registered_shards={RaidenId("s", "0", "v", 0): ["10.0.0.1:8000"]},
@@ -721,8 +686,6 @@ class ReshardPlannerTest(absltest.TestCase):
           registered_variables={},
           registered_global_shapes={},
           registered_mesh_shapes={},
-          registered_mesh_axes={},
-          registered_host_subgrids={},
           registered_layouts={},
           registered_itemsizes={},
           registered_shards={RaidenId("t", "0", "v", 0): ["10.0.0.1:8000"]},
@@ -753,11 +716,8 @@ class ReshardPlannerTest(absltest.TestCase):
         src_vars_by_unit=src_vars_by_unit,
         dst_vars_by_unit=dst_vars_by_unit,
         src_phys_mesh=[1, 1, 1],
-        src_mesh_axes=["tp", "tp_wo", "tp_out"],
-        src_host_subgrid=[1, 1, 1],
         dst_phys_mesh=[1, 1, 1],
         dst_mesh_axes=["tp", "tp_wo", "tp_out"],
-        dst_host_subgrid=[1, 1, 1],
         broadcast_host_ratio=0.125,
     )
     for u in src_units:
@@ -829,11 +789,8 @@ class ReshardPlannerTest(absltest.TestCase):
         src_vars_by_unit=src_vars_by_unit,
         dst_vars_by_unit=dst_vars_by_unit,
         src_phys_mesh=[4, 4, 8],
-        src_mesh_axes=["x", "y", "z"],
-        src_host_subgrid=[2, 2, 2],
         dst_phys_mesh=[2, 2, 4],
         dst_mesh_axes=["x", "y", "z"],
-        dst_host_subgrid=[2, 2, 2],
         broadcast_host_ratio=0.25,
     )
     sched = (
@@ -897,14 +854,11 @@ class ReshardPlannerTest(absltest.TestCase):
         src_vars_by_unit={src_units[0]: v_meta},
         dst_vars_by_unit={u: v_meta for u in dst_units},
         src_phys_mesh=[1, 1],
-        src_mesh_axes=["x", "y"],
-        src_host_subgrid=[1, 1],
         dst_phys_mesh=[1, 1],
         dst_mesh_axes=["x", "y"],
-        dst_host_subgrid=[1, 1],
     )
     inputs["dst_metadata"] = inputs["dst_metadata"][:1]
-    with self.assertRaisesRegex(ValueError, "missing from dst_meta_info"):
+    with self.assertRaisesRegex(ValueError, "missing from dst_metadata"):
       reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
           **inputs
       )
@@ -952,7 +906,6 @@ class ReshardPlannerTest(absltest.TestCase):
           meta.shards.extend(shards)
           meta.mesh_shape.extend([1, 1])
           meta.mesh_axes.extend(["tp", "tp_wo"])
-          meta.host_subgrid.extend([1, 1])
           for v in dst_vars:
             vp = meta.variables.add()
             vp.name = v.name
@@ -972,10 +925,6 @@ class ReshardPlannerTest(absltest.TestCase):
             registered_variables={src_unit: src_vars},
             registered_global_shapes={},
             registered_mesh_shapes={src_unit: [1, 1, 4, 4, 2]},
-            registered_mesh_axes={
-                src_unit: ["data", "stage", "fsdp", "context", "expert"]
-            },
-            registered_host_subgrids={src_unit: [1, 1, 1, 4, 2]},
             registered_layouts={},
             registered_itemsizes={},
             registered_shards=registered_shards,
@@ -1162,11 +1111,8 @@ class ReshardPlannerTest(absltest.TestCase):
         src_vars_by_unit={u: identical_vars for u in src_units},
         dst_vars_by_unit={u: identical_vars for u in dst_units},
         src_phys_mesh=[1, 32],
-        src_mesh_axes=["data", "tp"],
-        src_host_subgrid=[1, 8],
         dst_phys_mesh=[1, 32],
         dst_mesh_axes=["data", "tp"],
-        dst_host_subgrid=[1, 8],
     )
 
     self.assertEqual(

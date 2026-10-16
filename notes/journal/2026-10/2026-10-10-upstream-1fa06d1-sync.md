@@ -94,3 +94,16 @@ a uuid after `BlockTransport` erased its `layer_progress_` entries
 (`bt.cc:764-778`). Rule for next time: after `--apply`, re-run the audit; the
 tool's `.cc`/`.h` default and the +N shifts inside rewritten functions are the
 two error sources.
+
+[OBS 2026-10-13] F6 recorded from the user's upstream bug report. The report
+cited internal line numbers at a newer internal revision; the public tree at
+`1fa06d1` has the same code at `kv_cache_manager_base.cc:2086-2161`,
+`kv_cache_manager_with_transfer.cc:642-677`, `reshard_receive_session.cc:351-444`,
+so the write-up is pinned there with GitHub permalinks. Evidence level kept at
+CONFIRMED (read) because no test output is pasted in the repo (rule in
+`findings/README.md` §Evidence levels), with "reproduced by the reporter" noted.
+`filed_bugs.md` now has two pins (bug 1 @ `50b0774`, bug 2 @ `1fa06d1`); it
+stays in the repin tool's FROZEN set. Pool reshard is outside the
+prefill-to-decode Lean model; a `UuidTable`-style model of `active_plans_` +
+`pool_staging_` would make F6 a one-step counterexample — candidate for the
+next modelling target if the reshard path is taken up.

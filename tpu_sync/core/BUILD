@@ -87,6 +87,8 @@ cc_library(
     deps = [
         ":raw_transfer_core",
         ":xla_pjrt_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_extension_hdrs",
@@ -125,10 +127,16 @@ cc_library(
     deps = [
         ":host_memory_allocator",
         ":xla_pjrt_headers",
+        "//tpu_sync/fault_injection:hooks",
+        "//tpu_sync/kv_cache:logical_block_manager",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -144,10 +152,14 @@ cc_test(
     deps = [
         ":host_memory_allocator",
         ":staging_arena",
+        ":tsl_platform_headers",
         ":xla_pjrt_headers",
+        "//tpu_sync/kv_cache:logical_block_manager",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -178,7 +190,6 @@ cc_library(
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/transport:buffer_push_task",
-        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -189,6 +200,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api/v1:rate_limiter",
     ],
     alwayslink = 1,
 )
@@ -236,6 +248,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":tpu_utils",
+        ":xla_compat",
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/container:node_hash_map",
@@ -334,8 +347,10 @@ cc_library(
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
+        # buildcleaner: keep
         "//third_party/jax:raiden_jax_version",
     ],
 )
@@ -366,7 +381,6 @@ cc_library(
         "@com_google_absl//absl/types:span",
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
-        "@xla//xla/tsl/concurrency:async_value",
         "//tpu_sync/common:trace",
         "//tpu_sync/transport:block_transport_delegate",
     ],
@@ -765,9 +779,13 @@ cc_test(
         ":host_memory_allocator",
         ":tpu_pjrt_manager",
         ":utils",
+        ":xla_compat",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings:str_format",
+        "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
         "@xla//xla/tsl/platform:test_main",
@@ -810,6 +828,9 @@ cc_test(
     deps = [
         ":tpu_pjrt_manager",
         ":tpu_utils",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/log:scoped_mock_log",
+        "@com_google_absl//absl/strings:string_view",
         "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/tsl/platform:logging",
         "@xla//xla/tsl/platform:statusor",

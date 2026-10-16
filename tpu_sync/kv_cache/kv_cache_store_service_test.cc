@@ -56,6 +56,15 @@
 namespace tpu_raiden {
 namespace kv_cache {
 
+class HostOffloadBackendTest {
+ public:
+  static std::vector<std::string> GetEvictCandidateKeys(
+      const HostOffloadBackend& backend) {
+    absl::MutexLock lock(backend.mutex_);
+    return backend.lru_cache_.GetEvictCandidateKeys();
+  }
+};
+
 namespace {
 
 using ::absl_testing::StatusIs;
@@ -1442,7 +1451,9 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
   ASSERT_TRUE(backend->InsertAndLock(
       {"newcomer"}, {RaidenBlockId(src_id, 11, BlockStatus::HOST)},
       /*on_host=*/true));
-  ASSERT_THAT(backend->GetEvictCandidateKeys(), Contains("demoted"));
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(
+                  *static_cast<HostOffloadBackend*>(backend)),
+              Contains("demoted"));
 
   KVCacheStoreServiceImpl service(backend, store.raiden_controller());
   ::grpc::ServerBuilder builder;

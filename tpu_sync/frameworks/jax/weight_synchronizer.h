@@ -45,7 +45,12 @@ class WeightSynchronizer {
   WeightSynchronizer& operator=(WeightSynchronizer&&) = default;
 
 #ifndef WITHOUT_PYTHON
-  WeightSynchronizer(
+  // Creates a synchronizer bound to the device shards of |jax_arrays| (one
+  // entry per layer). Returns InvalidArgument if |jax_arrays| yields no layer
+  // buffers and Internal if unpacking the arrays or constructing the
+  // underlying WeightSynchronizerBase throws. |global_shard_indices|, when
+  // set, overrides the default identity local->global shard mapping.
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizer>> Create(
       nanobind::list jax_arrays, std::optional<int> local_port = std::nullopt,
       int parallelism = 1, bool unsafe_skip_buffer_lock = false,
       std::optional<int> listener_port = std::nullopt,
@@ -53,21 +58,6 @@ class WeightSynchronizer {
       std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
   absl::Status BindWeights(nanobind::list jax_arrays);
 #endif
-
-  // CPU / Mock metadata constructor for tests without PJRT TPU devices
-  WeightSynchronizer(
-      size_t num_layers, size_t num_shards, size_t slice_byte_size,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
-  WeightSynchronizer(
-      size_t num_layers, size_t num_shards,
-      std::vector<size_t> slice_byte_sizes,
-      std::optional<int> local_port = std::nullopt, int parallelism = 1,
-      std::optional<int> listener_port = std::nullopt,
-      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   ~WeightSynchronizer();
 
@@ -96,7 +86,10 @@ class WeightSynchronizer {
   void test_only_set_bandwidth_limit(double test_only_simulated_egress_gbps,
                                      double test_only_simulated_ingress_gbps);
 
-  static std::unique_ptr<WeightSynchronizer> test_only_create_cpu_instance(
+  // Creates a CPU-only (no PJRT device buffers) synchronizer for tests and
+  // remote workers; see WeightSynchronizerBase::Create for failure modes.
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizer>>
+  test_only_create_cpu_instance(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
@@ -105,7 +98,8 @@ class WeightSynchronizer {
       double test_only_simulated_egress_gbps = 0.0,
       double test_only_simulated_ingress_gbps = 0.0);
 
-  static std::unique_ptr<WeightSynchronizer> test_only_create_cpu_instance(
+  static absl::StatusOr<std::unique_ptr<WeightSynchronizer>>
+  test_only_create_cpu_instance(
       size_t num_layers, size_t num_shards,
       std::vector<size_t> slice_byte_sizes,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
@@ -116,6 +110,16 @@ class WeightSynchronizer {
       double test_only_simulated_ingress_gbps = 0.0);
 
  private:
+  // Used by test_only_create_cpu_instance(); adopts an already constructed
+  // |base|.
+  explicit WeightSynchronizer(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase> base);
+#ifndef WITHOUT_PYTHON
+  // Used by Create(); adopts an already constructed |base|.
+  WeightSynchronizer(std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
+                     bool unsafe_skip_buffer_lock);
+#endif
+
   std::unique_ptr<weight_sync::WeightSynchronizerBase> base_;
 #ifndef WITHOUT_PYTHON
   bool unsafe_skip_buffer_lock_ = false;

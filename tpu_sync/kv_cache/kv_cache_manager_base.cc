@@ -403,6 +403,17 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
   return joined_future;
 }
 
+std::vector<transport::ShardInfo> BuildDefaultShards(size_t num_shards) {
+  std::vector<transport::ShardInfo> shards;
+  shards.reserve(num_shards);
+  for (size_t sh = 0; sh < num_shards; ++sh) {
+    shards.push_back({.local_index = static_cast<int>(sh),
+                      .global_index = static_cast<int64_t>(sh),
+                      .numa_node = -1});
+  }
+  return shards;
+}
+
 }  // namespace
 
 KVCacheManagerBase::KVCacheManagerBase(
@@ -412,26 +423,16 @@ KVCacheManagerBase::KVCacheManagerBase(
     HostBufferAllocator host_allocator, std::optional<std::string> bind_ip,
     std::optional<size_t> logical_slice_byte_size,
     std::vector<int64_t> logical_dimensions,
-    std::optional<size_t> logical_physical_size,
-    std::optional<int> assigned_numa_node_override)
+    std::optional<size_t> logical_physical_size)
     : RaidenManagerBase(
-          layer_buffers.size(),
-          layer_buffers.empty() ? 0 : layer_buffers[0].size(),
+          layer_buffers.size(), raiden::DetectShards(layer_buffers),
           logical_slice_byte_size.has_value()
               ? *logical_slice_byte_size
               : (layer_buffers.empty() ? 0
                                        : raiden::GetMajorSliceByteSize(
                                              layer_buffers[0][0].shape)),
           local_port, parallelism, bind_ip,
-          assigned_numa_node_override.has_value()
-              ? std::vector<int>{*assigned_numa_node_override}
-              : raiden::DetectNumaNodes(layer_buffers),
-          GetLocalHostNicAddresses(),
-          // An explicit NUMA override pins every shard to that node, so no
-          // per-shard placement is derived from the buffers.
-          assigned_numa_node_override.has_value()
-              ? std::vector<transport::ShardInfo>{}
-              : raiden::DetectShards(layer_buffers)),
+          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses()),
       host_allocator_(host_allocator) {
   if (num_layers_ == 0 || num_shards_ == 0) {
     return;
@@ -603,7 +604,7 @@ KVCacheManagerBase::KVCacheManagerBase(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, HostBufferAllocator host_allocator,
     std::optional<std::string> bind_ip)
-    : RaidenManagerBase(num_layers, num_shards,
+    : RaidenManagerBase(num_layers, BuildDefaultShards(num_shards),
                         slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0],
                         local_port, parallelism, bind_ip),
       host_allocator_(host_allocator) {

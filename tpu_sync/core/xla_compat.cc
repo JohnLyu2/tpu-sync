@@ -14,12 +14,15 @@
 
 #include "tpu_sync/core/xla_compat.h"
 
+#include <cstddef>
 #include <memory>
+#include <string>
 #include <type_traits>
 #include <utility>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "xla/pjrt/abstract_tracked_device_buffer.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
@@ -69,6 +72,55 @@ struct PaddedScopedHold {
       : hold(common_buffer->GetBufferWithHold(
             xla::CommonPjRtBuffer::ScopedHold::kUsage)) {}
 };
+
+void DestroyPjrtError(const PJRT_Api* c_api, PJRT_Error* error) {
+  if (error == nullptr || c_api == nullptr ||
+      c_api->PJRT_Error_Destroy == nullptr) {
+    return;
+  }
+  PJRT_Error_Destroy_Args destroy_args;
+  destroy_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+  destroy_args.extension_start = nullptr;
+  destroy_args.error = error;
+  c_api->PJRT_Error_Destroy(&destroy_args);
+}
+
+absl::Status ConsumePjrtError(const PJRT_Api* c_api, PJRT_Error* error) {
+  if (error == nullptr) {
+    return absl::OkStatus();
+  }
+  std::string message;
+  if (c_api != nullptr && c_api->PJRT_Error_Message != nullptr) {
+    PJRT_Error_Message_Args msg_args;
+    msg_args.struct_size = PJRT_Error_Message_Args_STRUCT_SIZE;
+    msg_args.extension_start = nullptr;
+    msg_args.error = error;
+    msg_args.message = nullptr;
+    msg_args.message_size = 0;
+    c_api->PJRT_Error_Message(&msg_args);
+    if (msg_args.message != nullptr) {
+      message.assign(msg_args.message, msg_args.message_size);
+    }
+  }
+
+  absl::StatusCode status_code = absl::StatusCode::kInternal;
+  if (c_api != nullptr && c_api->PJRT_Error_GetCode != nullptr) {
+    PJRT_Error_GetCode_Args code_args;
+    code_args.struct_size = PJRT_Error_GetCode_Args_STRUCT_SIZE;
+    code_args.extension_start = nullptr;
+    code_args.error = error;
+    code_args.code = PJRT_Error_Code_INTERNAL;
+    PJRT_Error* code_err = c_api->PJRT_Error_GetCode(&code_args);
+    if (code_err != nullptr) {
+      DestroyPjrtError(c_api, code_err);
+    } else if (code_args.code != PJRT_Error_Code_OK) {
+      status_code = static_cast<absl::StatusCode>(code_args.code);
+    }
+  }
+
+  DestroyPjrtError(c_api, error);
+  return absl::Status(status_code, message);
+}
 
 }  // namespace
 
@@ -124,6 +176,91 @@ const PJRT_RawBuffer_Extension* GetRawBufferExtension(
   if (capi_client == nullptr) return nullptr;
   return capi_client->FindExtension<PJRT_RawBuffer_Extension>(
       PJRT_Extension_Type::PJRT_Extension_Type_RawBuffer);
+}
+
+absl::string_view PjRtClientPlatformName(const xla::PjRtClient* client) {
+  const auto* capi_client = dynamic_cast<const xla::PjRtCApiClient*>(client);
+  if (capi_client == nullptr) {
+    return "";
+  }
+  const PJRT_Api* c_api = capi_client->pjrt_c_api();
+  PJRT_Client* c_client =
+      const_cast<xla::PjRtCApiClient*>(capi_client)->pjrt_c_client();
+  if (c_api == nullptr || c_api->PJRT_Client_PlatformName == nullptr ||
+      c_client == nullptr) {
+    return "";
+  }
+  PJRT_Client_PlatformName_Args args;
+  args.struct_size = PJRT_Client_PlatformName_Args_STRUCT_SIZE;
+  args.extension_start = nullptr;
+  args.client = c_client;
+  args.platform_name = nullptr;
+  args.platform_name_size = 0;
+  PJRT_Error* err = c_api->PJRT_Client_PlatformName(&args);
+  if (err != nullptr) {
+    DestroyPjrtError(c_api, err);
+    return "";
+  }
+  if (args.platform_name == nullptr) {
+    return "";
+  }
+  return absl::string_view(args.platform_name, args.platform_name_size);
+}
+
+bool PjRtClientSupportsDma(const xla::PjRtClient* client) {
+  return client != nullptr &&
+         dynamic_cast<const xla::PjRtCApiClient*>(client) != nullptr &&
+         PjRtClientPlatformName(client) != "cpu";
+}
+
+absl::Status PjRtClientDmaMap(xla::PjRtClient* client, void* data,
+                              size_t size) {
+  if (client == nullptr) {
+    return absl::InvalidArgumentError("PjRtClient is null in PjRtClientDmaMap");
+  }
+  auto* capi_client = dynamic_cast<xla::PjRtCApiClient*>(client);
+  if (capi_client == nullptr) {
+    return absl::UnimplementedError("DMA mapping requires a PJRT C-API client");
+  }
+  const PJRT_Api* c_api = capi_client->pjrt_c_api();
+  PJRT_Client* c_client = capi_client->pjrt_c_client();
+  if (c_api == nullptr || c_api->PJRT_Client_DmaMap == nullptr ||
+      c_client == nullptr) {
+    return absl::InternalError(
+        "PJRT_Client_DmaMap is unavailable on PjRtCApiClient");
+  }
+  PJRT_Client_DmaMap_Args args;
+  args.struct_size = PJRT_Client_DmaMap_Args_STRUCT_SIZE;
+  args.extension_start = nullptr;
+  args.client = c_client;
+  args.data = data;
+  args.size = size;
+  return ConsumePjrtError(c_api, c_api->PJRT_Client_DmaMap(&args));
+}
+
+absl::Status PjRtClientDmaUnmap(xla::PjRtClient* client, void* data) {
+  if (client == nullptr) {
+    return absl::InvalidArgumentError(
+        "PjRtClient is null in PjRtClientDmaUnmap");
+  }
+  auto* capi_client = dynamic_cast<xla::PjRtCApiClient*>(client);
+  if (capi_client == nullptr) {
+    return absl::UnimplementedError(
+        "DMA unmapping requires a PJRT C-API client");
+  }
+  const PJRT_Api* c_api = capi_client->pjrt_c_api();
+  PJRT_Client* c_client = capi_client->pjrt_c_client();
+  if (c_api == nullptr || c_api->PJRT_Client_DmaUnmap == nullptr ||
+      c_client == nullptr) {
+    return absl::InternalError(
+        "PJRT_Client_DmaUnmap is unavailable on PjRtCApiClient");
+  }
+  PJRT_Client_DmaUnmap_Args args;
+  args.struct_size = PJRT_Client_DmaUnmap_Args_STRUCT_SIZE;
+  args.extension_start = nullptr;
+  args.client = c_client;
+  args.data = data;
+  return ConsumePjrtError(c_api, c_api->PJRT_Client_DmaUnmap(&args));
 }
 
 }  // namespace raiden

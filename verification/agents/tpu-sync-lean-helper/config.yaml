@@ -95,7 +95,6 @@ agent_config:
                - **Assumptions & Limits**: State in plain English any boundary assumptions relied upon, any unmodelled aspects, or anything that could not be established.
     tools:
       - name: view_file
-      - name: code_search
       - name: grep_search
       - name: list_dir
       - name: find_by_name

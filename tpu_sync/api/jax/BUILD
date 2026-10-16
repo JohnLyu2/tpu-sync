@@ -98,7 +98,6 @@ py_test(
     tags = [],
     deps = [
         ":weight_synchronizer_jax_py",
-        "//tpu_sync/frameworks/jax:jax_test_utils",
         "//tpu_sync/rpc:raiden_service_py_pb2",
         "@com_google_absl_py//absl/testing:absltest",
         "@jax//jax",
