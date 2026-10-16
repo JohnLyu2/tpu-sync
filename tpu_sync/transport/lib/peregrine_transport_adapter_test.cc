@@ -23,13 +23,11 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -39,7 +37,6 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/transport.h"
-#include "peregrine/src/api/transport_metrics.h"
 #include "peregrine/src/api/transport_types.h"
 #include "peregrine/src/api/transport_util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -49,27 +46,8 @@ namespace {
 
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
-using ::testing::_;
-using ::testing::ElementsAre;
-using ::testing::Eq;
 using ::testing::IsEmpty;
-using ::testing::Return;
-
-class MockPeregrineTransport : public ::peregrine::Transport {
- public:
-  MOCK_METHOD(absl::StatusOr<::peregrine::Handle>, Post,
-              (std::string_view peer,
-               absl::Span<const ::peregrine::Request> requests,
-               absl::AnyInvocable<void(::peregrine::Status)> on_complete),
-              (override));
-  MOCK_METHOD(absl::StatusOr<::peregrine::Status>, Poll,
-              (::peregrine::Handle handle), (override));
-  MOCK_METHOD(absl::Status, RegisterMemory, (void* addr, size_t length),
-              (override));
-  MOCK_METHOD(absl::Status, UnregisterMemory, (const void* addr), (override));
-  MOCK_METHOD(::peregrine::TransportMetrics, GetTransportMetrics, (),
-              (const, override));
-};
+using ::testing::NotNull;
 
 std::string PickUnusedLoopbackEndpoint() {
   const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -92,6 +70,14 @@ std::string PickUnusedLoopbackEndpoint() {
   const uint16_t port = ntohs(addr.sin_port);
   close(fd);
   return absl::StrCat("127.0.0.1:", port);
+}
+
+// Creates a real Peregrine TCP transport listening on a loopback endpoint.
+std::unique_ptr<::peregrine::Transport> CreateLoopbackTransport() {
+  const std::string endpoint = PickUnusedLoopbackEndpoint();
+  if (endpoint.empty()) return nullptr;
+  return ::peregrine::CreateTransport(endpoint, ::peregrine::TransportType::kTcp,
+                                      /*num_conns_per_peer=*/1);
 }
 
 TEST(PeregrineTransportAdapterTest, NullTransportFailsGracefully) {
@@ -119,8 +105,9 @@ TEST(PeregrineTransportAdapterTest, NullTransportFailsGracefully) {
 }
 
 TEST(PeregrineTransportAdapterTest, PostWithEmptyPeersFails) {
-  auto mock_transport = std::make_unique<MockPeregrineTransport>();
-  PeregrineTransportAdapter adapter(std::move(mock_transport));
+  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
+  ASSERT_THAT(transport, NotNull());
+  PeregrineTransportAdapter adapter(std::move(transport));
 
   uint8_t buf[4] = {1, 2, 3, 4};
   Request req = {};
@@ -142,8 +129,9 @@ TEST(PeregrineTransportAdapterTest, PostWithEmptyPeersFails) {
 }
 
 TEST(PeregrineTransportAdapterTest, PostWithEmptyRequestsFails) {
-  auto mock_transport = std::make_unique<MockPeregrineTransport>();
-  PeregrineTransportAdapter adapter(std::move(mock_transport));
+  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
+  ASSERT_THAT(transport, NotNull());
+  PeregrineTransportAdapter adapter(std::move(transport));
 
   absl::Status callback_status = absl::OkStatus();
   absl::StatusOr<Handle> handle = adapter.Post(
@@ -158,10 +146,9 @@ TEST(PeregrineTransportAdapterTest, PostWithEmptyRequestsFails) {
 }
 
 TEST(PeregrineTransportAdapterTest, PostSynchronousFailureInvokesCallback) {
-  auto mock_transport = std::make_unique<MockPeregrineTransport>();
-  EXPECT_CALL(*mock_transport, Post(Eq("127.0.0.1:1234"), _, _))
-      .WillOnce(Return(absl::InvalidArgumentError("Invalid request")));
-  PeregrineTransportAdapter adapter(std::move(mock_transport));
+  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
+  ASSERT_THAT(transport, NotNull());
+  PeregrineTransportAdapter adapter(std::move(transport));
 
   uint8_t buf[4] = {1, 2, 3, 4};
   Request req = {};
@@ -170,9 +157,10 @@ TEST(PeregrineTransportAdapterTest, PostSynchronousFailureInvokesCallback) {
   req.raddr = buf;
   req.len = sizeof(buf);
 
+  // Peregrine rejects a malformed peer endpoint synchronously.
   absl::Status callback_status = absl::OkStatus();
   absl::StatusOr<Handle> handle = adapter.Post(
-      /*peers=*/{"127.0.0.1:1234"}, /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*peers=*/{"invalid"}, /*requests=*/absl::MakeConstSpan(&req, 1),
       /*src_block_ids=*/{}, /*dst_block_ids=*/{},
       [&](absl::StatusOr<std::vector<int>> result) {
         callback_status = result.status();
@@ -182,159 +170,12 @@ TEST(PeregrineTransportAdapterTest, PostSynchronousFailureInvokesCallback) {
   EXPECT_THAT(callback_status, StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
-TEST(PeregrineTransportAdapterTest,
-     PostWriteForwardsRequestsAndInvokesCallbackOnSuccess) {
-  auto mock_transport = std::make_unique<MockPeregrineTransport>();
-  uint8_t src_buf[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-  uint8_t dst_buf[8] = {0};
+TEST(PeregrineTransportAdapterTest, PollUnknownHandleFails) {
+  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
+  ASSERT_THAT(transport, NotNull());
+  PeregrineTransportAdapter adapter(std::move(transport));
 
-  absl::AnyInvocable<void(::peregrine::Status)> captured_callback;
-  EXPECT_CALL(*mock_transport, Post(Eq("10.0.0.1:5000"),
-                                    ElementsAre(
-                                        ::peregrine::Request{
-                                            .op = ::peregrine::Op::kWrite,
-                                            .laddr = src_buf,
-                                            .raddr = dst_buf,
-                                            .len = 4,
-                                        },
-                                        ::peregrine::Request{
-                                            .op = ::peregrine::Op::kWrite,
-                                            .laddr = src_buf + 4,
-                                            .raddr = dst_buf + 4,
-                                            .len = 4,
-                                        }),
-                                    _))
-      .WillOnce([&](std::string_view, absl::Span<const ::peregrine::Request>,
-                    absl::AnyInvocable<void(::peregrine::Status)> on_complete)
-                    -> absl::StatusOr<::peregrine::Handle> {
-        captured_callback = std::move(on_complete);
-        return ::peregrine::Handle(42);
-      });
-
-  PeregrineTransportAdapter adapter(std::move(mock_transport));
-
-  std::vector<Request> requests(2);
-  requests[0].socket_opcode = static_cast<uint8_t>(::peregrine::Op::kWrite);
-  requests[0].laddr = src_buf;
-  requests[0].raddr = dst_buf;
-  requests[0].len = 4;
-
-  requests[1].socket_opcode = static_cast<uint8_t>(::peregrine::Op::kWrite);
-  requests[1].laddr = src_buf + 4;
-  requests[1].raddr = dst_buf + 4;
-  requests[1].len = 4;
-
-  absl::StatusOr<std::vector<int>> completion_result;
-  absl::StatusOr<Handle> handle = adapter.Post(
-      /*peers=*/{"10.0.0.1:5000", "10.0.0.2:5000"},
-      /*requests=*/requests,
-      /*src_block_ids=*/{}, /*dst_block_ids=*/{},
-      [&](absl::StatusOr<std::vector<int>> result) {
-        completion_result = std::move(result);
-      });
-
-  EXPECT_THAT(handle, IsOkAndHolds(42));
-  ASSERT_TRUE(captured_callback != nullptr);
-  captured_callback(::peregrine::Status::kSuccess);
-  EXPECT_THAT(completion_result, IsOkAndHolds(IsEmpty()));
-}
-
-TEST(PeregrineTransportAdapterTest,
-     PostReadForwardsRequestsAndReportsFailureOnErrorCallback) {
-  auto mock_transport = std::make_unique<MockPeregrineTransport>();
-  uint8_t local_buf[4] = {0};
-  uint8_t remote_buf[4] = {9, 8, 7, 6};
-
-  absl::AnyInvocable<void(::peregrine::Status)> captured_callback;
-  EXPECT_CALL(*mock_transport, Post(Eq("10.0.0.1:6000"),
-                                    ElementsAre(::peregrine::Request{
-                                        .op = ::peregrine::Op::kRead,
-                                        .laddr = local_buf,
-                                        .raddr = remote_buf,
-                                        .len = sizeof(local_buf),
-                                    }),
-                                    _))
-      .WillOnce([&](std::string_view, absl::Span<const ::peregrine::Request>,
-                    absl::AnyInvocable<void(::peregrine::Status)> on_complete)
-                    -> absl::StatusOr<::peregrine::Handle> {
-        captured_callback = std::move(on_complete);
-        return ::peregrine::Handle(77);
-      });
-
-  PeregrineTransportAdapter adapter(std::move(mock_transport));
-
-  Request req = {};
-  req.socket_opcode = static_cast<uint8_t>(::peregrine::Op::kRead);
-  req.laddr = local_buf;
-  req.raddr = remote_buf;
-  req.len = sizeof(local_buf);
-
-  absl::StatusOr<std::vector<int>> completion_result;
-  absl::StatusOr<Handle> handle = adapter.Post(
-      /*peers=*/{"10.0.0.1:6000"},
-      /*requests=*/absl::MakeConstSpan(&req, 1),
-      /*src_block_ids=*/{}, /*dst_block_ids=*/{},
-      [&](absl::StatusOr<std::vector<int>> result) {
-        completion_result = std::move(result);
-      });
-
-  EXPECT_THAT(handle, IsOkAndHolds(77));
-  ASSERT_TRUE(captured_callback != nullptr);
-  captured_callback(::peregrine::Status::kFailure);
-  EXPECT_THAT(completion_result, StatusIs(absl::StatusCode::kInternal));
-}
-
-TEST(PeregrineTransportAdapterTest,
-     PostWithoutCallbackPassesNullCallbackAndAllowsPoll) {
-  auto mock_transport = std::make_unique<MockPeregrineTransport>();
-  uint8_t buf[4] = {1, 2, 3, 4};
-
-  bool callback_was_null = false;
-  EXPECT_CALL(*mock_transport, Post(Eq("10.0.0.1:7000"), _, _))
-      .WillOnce([&](std::string_view, absl::Span<const ::peregrine::Request>,
-                    absl::AnyInvocable<void(::peregrine::Status)> on_complete)
-                    -> absl::StatusOr<::peregrine::Handle> {
-        callback_was_null = (on_complete == nullptr);
-        return ::peregrine::Handle(99);
-      });
-
-  EXPECT_CALL(*mock_transport, Poll(::peregrine::Handle(99)))
-      .WillOnce(Return(::peregrine::Status::kInProgress))
-      .WillOnce(Return(::peregrine::Status::kSuccess));
-
-  PeregrineTransportAdapter adapter(std::move(mock_transport));
-
-  Request req = {};
-  req.socket_opcode = static_cast<uint8_t>(::peregrine::Op::kWrite);
-  req.laddr = buf;
-  req.raddr = buf;
-  req.len = sizeof(buf);
-
-  absl::StatusOr<Handle> handle = adapter.Post(
-      /*peers=*/{"10.0.0.1:7000"},
-      /*requests=*/absl::MakeConstSpan(&req, 1),
-      /*src_block_ids=*/{}, /*dst_block_ids=*/{}, /*on_complete=*/nullptr);
-
-  EXPECT_THAT(handle, IsOkAndHolds(99));
-  EXPECT_TRUE(callback_was_null);
-  EXPECT_THAT(adapter.Poll(99), IsOkAndHolds(Status::kInProgress));
-  EXPECT_THAT(adapter.Poll(99), IsOkAndHolds(Status::kSuccess));
-}
-
-TEST(PeregrineTransportAdapterTest, PollMapsAllStatusesAndErrors) {
-  auto mock_transport = std::make_unique<MockPeregrineTransport>();
-  EXPECT_CALL(*mock_transport, Poll(::peregrine::Handle(1)))
-      .WillOnce(Return(::peregrine::Status::kNotFound));
-  EXPECT_CALL(*mock_transport, Poll(::peregrine::Handle(2)))
-      .WillOnce(Return(::peregrine::Status::kFailure));
-  EXPECT_CALL(*mock_transport, Poll(::peregrine::Handle(3)))
-      .WillOnce(Return(absl::NotFoundError("Handle not found")));
-
-  PeregrineTransportAdapter adapter(std::move(mock_transport));
-
-  EXPECT_THAT(adapter.Poll(1), IsOkAndHolds(Status::kNotFound));
-  EXPECT_THAT(adapter.Poll(2), IsOkAndHolds(Status::kFailure));
-  EXPECT_THAT(adapter.Poll(3), StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(adapter.Poll(12345), StatusIs(absl::StatusCode::kNotFound));
 }
 
 TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {

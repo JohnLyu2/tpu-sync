@@ -110,7 +110,6 @@ cc_test(
     deps = [
         ":peregrine_transport_adapter",
         ":transport_adapter",
-        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
@@ -121,7 +120,6 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api:transport",
-        "@peregrine//peregrine/src/api:transport_metrics",
         "@peregrine//peregrine/src/api:transport_types",
         "@peregrine//peregrine/src/api:transport_util",
     ],
