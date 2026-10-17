@@ -6,13 +6,13 @@
   composed with `RequestBlockRegistry` (`TpuSyncVerify.Transfer.Reshard.Registry`).
 
   C++ source under analysis:
-  * `tpu_sync/kv_cache/reshard/reshard_coordinator.h:59-165`
-  * `tpu_sync/kv_cache/reshard/reshard_coordinator.cc:415-545`
-  * `tpu_sync/kv_cache/kv_cache_listener.cc:217-244` (`PoolReshardRegisterRecv` control-pipe handler)
-  * `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:642-677`
+  * `tpu_sync/kv_cache/reshard/reshard_coordinator.h:45-129`
+  * `tpu_sync/kv_cache/reshard/reshard_coordinator.cc:415-592`
+  * `tpu_sync/kv_cache/kv_cache_listener.cc:138-172` (`PoolReshardRegisterRecv` control-pipe handler)
+  * `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:673-709`
     (`PoolReshardRegisterRecv`: `ReshardReceiveSession::Create` + `RegisterActivePlanDirect`)
-  * `tpu_sync/kv_cache/reshard_receive_session.cc:372-377, 407-455`
-    (`AcquireStagingLeases` + `ReleaseStagingLeases`)
+  * `tpu_sync/kv_cache/reshard_receive_session.cc:373-390, 420-470`
+    (`AcquireStagingLeases` + `ReleaseStaging` / `ReleasePoolStagingLeases`)
 
   What this file proves:
   1. **Universal Protocol Guarantees (`CoordInv`, `reachable_coord_inv`)**:
@@ -51,7 +51,7 @@
      state has zero armed receiver sessions, zero held staging leases, and
      `s.reg.claimedUnits = none ∧ s.reg.claimOwners = []`.
 
-  Pinned upstream commit: `1fa06d1`
+  Pinned upstream commit: `0ac16d1`
 -/
 import TpuSyncVerify.Common.System
 import TpuSyncVerify.Transfer.Reshard.Registry
@@ -81,7 +81,7 @@ inductive CleanupPolicy where
   deriving DecidableEq, Repr
 
 /-- Lifecycle phase of `ReshardCoordinator::ExecutePoolReshard`
-(`reshard_coordinator.cc:415-545`). -/
+(`reshard_coordinator.cc:415-592`). -/
 inductive CoordPhase where
   /-- Before `ExecutePoolReshard` claims the source snapshot. -/
   | idle
@@ -89,20 +89,20 @@ inductive CoordPhase where
       claimed the source snapshot in `RequestBlockRegistry`; concurrent
       `PoolReshardRegisterRecv` RPCs to `dst_units` are in flight. -/
   | arming
-  /-- Stage 2 (`reshard_coordinator.cc:480-541`): all `dst_units` armed with
+  /-- Stage 2 (`reshard_coordinator.cc:481-544`): all `dst_units` armed with
       `arm_status.ok()`; concurrent `PoolReshardSend` RPCs to `src_units` are
       in flight. -/
   | dispatching
-  /-- Both stages completed with `absl::OkStatus()` (`reshard_coordinator.cc:545`). -/
+  /-- Both stages completed with `absl::OkStatus()` (`reshard_coordinator.cc:542-544, 591`). -/
   | succeeded
   /-- `ExecutePoolReshard` returned a non-OK `absl::Status`
       (`reshard_coordinator.cc:420-425, 458-463, 542-544`). -/
   | aborted
   deriving DecidableEq, Repr
 
-/-- Per-destination-unit receiver state (`kv_cache_listener.cc:217-244`,
-`kv_cache_manager_with_transfer.cc:642-677`,
-`reshard_receive_session.cc:372-377, 407-455`). -/
+/-- Per-destination-unit receiver state (`kv_cache_listener.cc:138-172`,
+`kv_cache_manager_with_transfer.cc:673-709`,
+`reshard_receive_session.cc:373-390, 420-470`). -/
 structure DstUnitState where
   /-- Destination unit ID (`UnitKey`). -/
   unit : Nat
@@ -110,12 +110,12 @@ structure DstUnitState where
       `active_pool_reshard_recvs_` with an armed plan in `active_plans_`. -/
   sessionArmed : Bool
   /-- True while the `PoolStagingLease` acquired by `AcquireStagingLeases`
-      (`reshard_receive_session.cc:375, 407-444`) is held. -/
+      (`reshard_receive_session.cc:381-388, 420-459`) is held. -/
   stagingLeaseHeld : Bool
   /-- Set of `src_unit` IDs whose `PoolReshardPush` has arrived. -/
   pushesReceived : List Nat
   /-- True once all `src_units` have pushed and the session has settled and
-      released its staging lease (`reshard_receive_session.cc:446-455`). -/
+      released its staging lease (`reshard_receive_session.cc:461-470`). -/
   completed : Bool
   deriving DecidableEq, Repr
 
@@ -130,8 +130,8 @@ def init (unit : Nat) : DstUnitState :=
     completed := false }
 
 /-- Arm this destination unit via `PoolReshardRegisterRecv`
-(`kv_cache_manager_with_transfer.cc:642-677`,
-`reshard_receive_session.cc:372-377`). -/
+(`kv_cache_manager_with_transfer.cc:673-709`,
+`reshard_receive_session.cc:373-390`). -/
 def arm (d : DstUnitState) : DstUnitState :=
   { d with
     sessionArmed := true
@@ -145,8 +145,8 @@ def disarm (d : DstUnitState) : DstUnitState :=
     stagingLeaseHeld := false }
 
 /-- Deliver a sender push from `srcUnit` to an armed destination unit; if all
-`srcUnits` have now contributed (`reshard_receive_session.cc:620-687`), complete
-the session and release its staging lease (`reshard_receive_session.cc:446-455`). -/
+`srcUnits` have now contributed (`reshard_receive_session.cc:585-706`), complete
+the session and release its staging lease (`reshard_receive_session.cc:461-470`). -/
 def receivePush (d : DstUnitState) (srcUnits : List Nat) (srcUnit : Nat) : DstUnitState :=
   if !d.sessionArmed then
     d
@@ -170,8 +170,8 @@ structure CoordState where
   srcUnits : List Nat
   /-- Destination unit IDs (`plan.dst_units`). -/
   dstUnits : List Nat
-  /-- Coordinator's unique `claim_owner` token (`MakePlanClaimOwner`,
-      `reshard_coordinator.cc:53-71, 417`). -/
+  /-- Coordinator's unique `claim_owner` token (`claim_counter`,
+      `reshard_coordinator.cc:417-419`). -/
   claimOwner : Nat
   /-- Current coordinator lifecycle phase. -/
   phase : CoordPhase
@@ -180,12 +180,12 @@ structure CoordState where
   /-- Completed `PoolReshardRegisterRecv` RPC results `(dstUnit, ok)` collected
       during Stage 1 (`reshard_coordinator.cc:438-457`). -/
   armResults : List (Nat × Bool)
-  /-- `true` if `!arm_status.ok()` during Stage 1 (`reshard_coordinator.cc:436, 449-451`). -/
+  /-- `true` if `!arm_status.ok()` during Stage 1 (`reshard_coordinator.cc:434, 444-452`). -/
   armFailed : Bool
   /-- Completed `PoolReshardSend` RPC results `(srcUnit, ok)` collected during
-      Stage 2 (`reshard_coordinator.cc:490-541`). -/
+      Stage 2 (`reshard_coordinator.cc:494-540`). -/
   sendResults : List (Nat × Bool)
-  /-- `true` if `!sender_status.ok()` during Stage 2 (`reshard_coordinator.cc:491, 519-522`). -/
+  /-- `true` if `!sender_status.ok()` during Stage 2 (`reshard_coordinator.cc:481, 498-536`). -/
   sendFailed : Bool
   /-- Underlying `RequestBlockRegistry` state for `(args.req_id, args.uuid)`. -/
   reg : RegGen
@@ -196,22 +196,22 @@ inductive Ev where
   /-- Producer unit registers its source blocks in `RequestBlockRegistry`
       before reshard planning (`request_block_registry.cc:260-299`). -/
   | registerProducer (srcUnit : Nat)
-  /-- `BuildPoolReshardPlan(args, claim_owner)` (`reshard_coordinator.cc:418-426`):
+  /-- `BuildPoolReshardPlan(args, claim_owner)` (`reshard_coordinator.cc:418-425`):
       claims `srcUnits` in `RequestBlockRegistry` (`LookupAndClaim`), and then
       either succeeds (`planOk = true` -> `.arming`) or fails after claiming
       (`planOk = false` -> `AbandonClaim` + `.aborted`). -/
   | startPlan (planOk : Bool)
   /-- Stage 1 worker RPC `PoolReshardRegisterRecv` finishes for `dstUnit`
-      (`reshard_coordinator.cc:439-455`). -/
+      (`reshard_coordinator.cc:438-456`). -/
   | armDstResult (dstUnit : Nat) (ok : Bool)
-  /-- Stage 1 join barrier `for (auto& t : arm_threads) t.join()` and
+  /-- Stage 1 join barrier `for (auto& t : armers) t.join()` and
       `if (!arm_status.ok())` check (`reshard_coordinator.cc:457-475`). -/
   | finishArmBarrier
   /-- Stage 2 worker RPC `PoolReshardSend` finishes for `srcUnit`
-      (`reshard_coordinator.cc:493-537`). -/
+      (`reshard_coordinator.cc:494-538`). -/
   | sendSrcResult (srcUnit : Nat) (ok : Bool)
-  /-- Stage 2 join barrier `for (auto& t : send_threads) t.join()` and
-      `if (!sender_status.ok())` check (`reshard_coordinator.cc:541-545`). -/
+  /-- Stage 2 join barrier `for (auto& t : senders) t.join()` and
+      `if (!sender_status.ok())` check (`reshard_coordinator.cc:539-544, 591`). -/
   | finishSendBarrier
   deriving DecidableEq, Repr
 
@@ -247,7 +247,7 @@ def init (srcUnits dstUnits : List Nat) (claimOwner : Nat) : CoordState :=
     reg := RegGen.init }
 
 /-- Small-step transition relation of `ReshardCoordinator::ExecutePoolReshard`
-parameterized by `CleanupPolicy` (`reshard_coordinator.cc:415-545`). -/
+parameterized by `CleanupPolicy` (`reshard_coordinator.cc:415-592`). -/
 def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState :=
   match e with
   | .registerProducer srcUnit =>
@@ -263,7 +263,7 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
       none
     else
       -- `BuildPoolReshardPlan` calls `LookupAndClaim(req_id, uuid, srcUnits, claim_owner)`
-      -- (`reshard_coordinator.cc:169-175, 418-426`).
+      -- (`reshard_coordinator.cc:418-425`, `pool_reshard_planner.cc:1024-1026`).
       match RegGen.step s.reg (.lookupAndClaim s.claimOwner s.srcUnits) with
       | none => none
       | some regClaimed =>
@@ -323,7 +323,8 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
     else if !s.srcUnits.contains srcUnit || hasResult s.sendResults srcUnit then
       none
     else if ok then
-      -- `PoolReshardSend` succeeded (`reshard_coordinator.cc:493-534`):
+      -- `PoolReshardSend` succeeded (`reshard_coordinator.cc:494-540`,
+      -- `reshard_service.cc:291-303`, `request_block_registry.cc:317-371`):
       -- pushes sub-blocks to armed `dst_units` and votes `registry_->Complete`.
       let dstStates' :=
         s.dstStates.map (fun d => d.receivePush s.srcUnits srcUnit)
@@ -337,7 +338,7 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
           sendResults := (srcUnit, true) :: s.sendResults
           reg := reg' }
     else
-      -- `!status.ok()` (`reshard_coordinator.cc:518-523`):
+      -- `!status.ok()` (`reshard_coordinator.cc:498-536`):
       -- records `sender_status = status`; does NOT call `registry_->Complete`.
       some
         { s with
@@ -348,7 +349,7 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
     if s.phase != .dispatching || !allReported s.srcUnits s.sendResults then
       none
     else if !s.sendFailed then
-      -- All senders succeeded (`reshard_coordinator.cc:542-545`).
+      -- All senders succeeded (`reshard_coordinator.cc:542-544, 591`).
       some { s with phase := .succeeded }
     else
       -- `!sender_status.ok()` (`reshard_coordinator.cc:542-544`):
@@ -538,8 +539,8 @@ def AllArmedInDispatching (s : CoordState) : Prop :=
     s.armFailed = false ∧ allReported s.dstUnits s.armResults = true
 
 /-- **Staging Lease Matches Session Armed (`LeaseMatchesSession`,
-`kv_cache_manager_with_transfer.cc:642-677`,
-`reshard_receive_session.cc:372-377, 407-455`)**:
+`kv_cache_manager_with_transfer.cc:673-709`,
+`reshard_receive_session.cc:373-390, 420-470`)**:
 For every destination unit, its `PoolStagingLease` is held if and only if its
 `ReshardReceiveSession` is currently armed. -/
 def LeaseMatchesSession (s : CoordState) : Prop :=
@@ -1047,8 +1048,8 @@ theorem trace_r2_hardened_policy_cleans_up_both_r2a_and_r2b :
   exact ⟨rfl, rfl⟩
 
 /-- Happy-path 2x2 multicast reshard execution trace
-(`reshard_coordinator.cc:415-545`,
-`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1022-1092`,
+(`reshard_coordinator.cc:415-592`,
+`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1065-1135`,
 `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce`):
 both producers (`[0, 1]`) register, coordinator claims the plan, both
 destinations (`[10, 11]`) arm concurrently before either sender is dispatched,
@@ -1091,18 +1092,18 @@ theorem trace_coordinator_happy_path :
   exact ⟨rfl, rfl⟩
 
 /-- Replay of `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:634-708`),
-`MissingRegistrationKeepsContractString` (`:860-870`), and
-`ArmFailureAbandonsClaimAndSkipsSenders` (`:872-888`):
-1. `MissingRegistrationKeepsContractString` (`:860-870`): starting a plan when
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:677-751`),
+`MissingRegistrationKeepsContractString` (`:903-913`), and
+`ArmFailureAbandonsClaimAndSkipsSenders` (`:915-931`):
+1. `MissingRegistrationKeepsContractString` (`:903-913`): starting a plan when
    `src_unit 0` has not registered in `RequestBlockRegistry` is rejected (`none`).
-2. `ArmFailureAbandonsClaimAndSkipsSenders` (`:872-888`): on a 1-source (`[0]`),
+2. `ArmFailureAbandonsClaimAndSkipsSenders` (`:915-931`): on a 1-source (`[0]`),
    1-destination (`[10]`) plan, when `dst_unit 10` refuses its arm
    (`armDstResult 10 false`, `finishArmBarrier`), the coordinator aborts without
    contacting any sender (`sendResults = []`), abandons its registry claim
    (`s.reg.claimedUnits = none`, `s.reg.status = .registered`), and a fresh
    coordination claim (`RegGen.step s.reg (.lookupAndClaim 102 [0])`) succeeds
-   (`:882-888`). -/
+   (`:925-931`). -/
 theorem trace_arm_failure_abandons_claim_and_skips_senders :
     (CoordState.sys .shipping [0] [10] 101).run [.startPlan true] = none ∧
     (((CoordState.sys .shipping [0] [10] 101).run

@@ -9,7 +9,7 @@
   registration, multi-owner planning claims, claim abandonment, per-unit
   completion voting, and unclaimed cancellation tombstones.
 
-  Pinned to upstream commit `1fa06d1`.
+  Pinned to upstream commit `0ac16d1`.
 
   ## C++ anchorage
 
@@ -55,21 +55,32 @@
      (`:388-390`), and otherwise records a tombstone in `cancelled_` while
      erasing any unclaimed `request_blocks_` and lifecycle entries (`:391-404`).
 
+  6. **TTL expiration (`PurgeExpiredRequestBlocksLocked` /
+     `PurgeExpiredLifecycleLocked`,
+     `tpu_sync/kv_cache/reshard/request_block_registry.cc:61-96`):**
+     Sweeps expired registrations, claims, and tombstones (Part V,
+     `purgeExpiredAll_inv`, and Observations R7 & R8).
+
   ## Main results
 
   - `reachable_safe` (`Inv`): proves inductively across all reachable registry
     states that:
     1. `ClaimOwnersConsistent`: `claimedUnits.isSome ↔ claimOwners ≠ []`, and
-       every claimed unit is registered in `registeredUnits` (`ClaimedUnitsRegistered`).
-    2. `TombstoneBlocksLateRegister`: when `cancelled = true`, `registeredUnits = []`
-       and `claimedUnits = none`, and any subsequent `register` or `lookupAndClaim`
+       every claimed unit is registered in `registeredUnits`.
+    2. `TombstoneClean` & `tombstone_blocks_register_and_claim`: when
+       `cancelled = true`, `registeredUnits = []`, `claimedUnits = none`, and
+       `claimOwners = []`, and any subsequent `register` or `lookupAndClaim`
        is rejected.
-    3. `ClaimedBlocksCancel`: while `claimedUnits.isSome`, `cancelIfUnclaimed`
-       cannot cancel or erase the registered producer blocks.
-    4. `NonEmptyVotedRequiresClaim`: no registered unit with `nonEmpty = true`
-       can appear in `completedUnits` before the generation has been claimed, and
-       `Complete` retires the generation only when every unit in `claimedUnits`
+    3. `claimed_blocks_register_and_cancel`: while `claimedUnits = some units`,
+       `register` is rejected and `cancelIfUnclaimed` cannot cancel or erase the
+       registered producer blocks.
+    4. `RetiredClean` & `PartialVotesNotAllVoted`: once `retired = true`,
+       `registeredUnits = []`, `claimedUnits = none`, and `claimOwners = []`;
+       while `claimedUnits = some expected`, `allVoted expected completedUnits = false`,
+       and `Complete` retires the generation only when every unit in `claimedUnits`
        has voted (`complete_retires_iff_all_claimed_voted`).
+  - `purgeExpiredAll_inv` & Observations R7 (`trace_r7_single_stage_votes_retire_multi_owner_claim`)
+    and R8 (`trace_r8_split_ttl_purges_request_blocks_while_claim_active`).
 -/
 
 import TpuSyncVerify.Common.System
@@ -608,7 +619,7 @@ theorem complete_retires_iff_all_claimed_voted {s s' : RegGen} {expected : List 
 /-- Happy-path 2-unit producer registration, multi-owner pipelined claim,
 single-owner abandon (claim survives), and 2-unit completion voting that retires
 only on the second vote (`request_block_registry.cc:260-509`,
-`reshard_service_test.cc:986-1009, 1235-1289`). -/
+`reshard_service_test.cc:1029-1052, 1278-1332`). -/
 def registryHappyTrace : List Ev :=
   [ .register 0 true
   , .register 1 true
@@ -625,10 +636,10 @@ theorem trace_registry_multi_owner_and_voting :
   decide
 
 /-- Replay of `ReshardStackTest.CompletionVotesRetireAfterClaim`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:986-1009`):
-After the first of two claimed units votes (`complete 0`, `:1003-1005`), the
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1029-1052`):
+After the first of two claimed units votes (`complete 0`, `:1046-1048`), the
 generation is still `.claimed` and `retired = false` (`"0"` rows retired); when
-the second unit votes (`complete 1`, `:1006-1008`), `RetireLocked` fires
+the second unit votes (`complete 1`, `:1049-1051`), `RetireLocked` fires
 (`retired = true`, `registeredUnits = []`, `"2"` rows retired). -/
 theorem trace_partial_vote_does_not_retire :
     (RegGen.sys.run (registryHappyTrace.take 6)).map
@@ -637,11 +648,11 @@ theorem trace_partial_vote_does_not_retire :
   decide
 
 /-- Replay of `ReshardStackTest.CancelTombstoneBlocksLateRegistration`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:890-918`) and
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:933-961`) and
 `request_block_registry.cc:276-280, 385-404, 448-452`:
-1. Cancelling an unclaimed generation before any producer registers (`:893-903`)
-   or after partial registration (`:961-967`) records a `.cancelled` tombstone.
-2. Any late producer `register` (`:904-917`) or `lookupAndClaim` (`:1314-1317`)
+1. Cancelling an unclaimed generation before any producer registers (`:936-945`)
+   or after partial registration (`:1004-1010`) records a `.cancelled` tombstone.
+2. Any late producer `register` (`:947-961`) or `lookupAndClaim` (`:1357-1361`)
    against the cancelled `(req_id, uuid)` is rejected (`none`). -/
 theorem trace_tombstone_blocks_late_register_and_claim :
     ((RegGen.sys.run [.cancelIfUnclaimed]).map
@@ -657,14 +668,14 @@ theorem trace_tombstone_blocks_late_register_and_claim :
   decide
 
 /-- Replay of `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:920-984`):
-1. Never registered (`RegGen.init`, `:952-954`) reads as `.unknown`.
-2. Registered and unclaimed (`[.register 0 true]`, `:956-959`) reads as
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:963-1027`):
+1. Never registered (`RegGen.init`, `:995-997`) reads as `.unknown`.
+2. Registered and unclaimed (`[.register 0 true]`, `:999-1002`) reads as
    `.registered`.
-3. Release-only cancel (`[.register 0 true, .cancelIfUnclaimed]`, `:961-967`)
+3. Release-only cancel (`[.register 0 true, .cancelIfUnclaimed]`, `:1004-1010`)
    erases the row and reads as `.cancelled`.
 4. Claimed registration (`[.register 0 true, .register 1 true,
-   .lookupAndClaim 101 [0, 1]]`, `:969-978`) reads as `.claimed` and refuses
+   .lookupAndClaim 101 [0, 1]]`, `:1012-1021`) reads as `.claimed` and refuses
    cancellation (staying `.claimed` with `cancelled = false`). -/
 theorem trace_request_block_status_probe_lifecycle :
     RegGen.init.status = .unknown ∧
@@ -678,18 +689,18 @@ theorem trace_request_block_status_probe_lifecycle :
   decide
 
 /-- Replay of `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1235-1260`),
-`AbandonedStageLeavesTheSiblingClaimInPlace` (`:1262-1289`), and
-`AbandoningTheLastStageFreesTheClaim` (`:1291-1318`):
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1278-1303`),
+`AbandonedStageLeavesTheSiblingClaimInPlace` (`:1305-1332`), and
+`AbandoningTheLastStageFreesTheClaim` (`:1334-1361`):
 1. Stage 0 (`100`) and Stage 1 (`101`) share one request claim on `[0, 1]`; when
-   Stage 1 abandons its claim (`abandonClaim 101`, `:1267-1283`), Stage 0's
+   Stage 1 abandons its claim (`abandonClaim 101`, `:1310-1326`), Stage 0's
    claim remains in place (`status = .claimed`, `cancelIfUnclaimed` refused with
    `cancelled = false`), and Stage 1 can rejoin (`lookupAndClaim 101 [0, 1]`,
-   `:1284-1288`).
+   `:1327-1331`).
 2. When both Stage 0 (`100`) and Stage 1 (`101`) abandon their claims
-   (`:1296-1307`), the last stage leaving frees the claim (`status = .registered`),
+   (`:1339-1350`), the last stage leaving frees the claim (`status = .registered`),
    allowing `cancelIfUnclaimed` to succeed (`status = .cancelled`) and blocking
-   a late Stage 0 retry (`:1308-1318`). -/
+   a late Stage 0 retry (`:1351-1361`). -/
 theorem trace_pipelined_stages_claim_and_abandon :
     ((RegGen.sys.run
       [ .register 0 true, .register 1 true
@@ -788,7 +799,7 @@ def RegGen.purgeExpiredLifecycle (s : RegGen) : RegGen :=
 
 /-- Combined TTL purge when `now` advances past both `registration.expires_at`
 and lifecycle `expires_at` (`request_block_registry.cc:61-96`,
-`reshard_service_test.cc:980-984, 1011-1019`). -/
+`reshard_service_test.cc:1023-1027, 1054-1062`). -/
 def RegGen.purgeExpiredAll (s : RegGen) : RegGen :=
   s.purgeExpiredRequestBlocks.purgeExpiredLifecycle
 
@@ -799,13 +810,13 @@ theorem purgeExpiredAll_inv (s : RegGen) : Inv s.purgeExpiredAll where
   partialVotes := by intro expected h; cases h
 
 /-- Replay of `ReshardStackTest.TtlPurgesExpiredRegistrations`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1011-1019`) and the TTL
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1054-1062`) and the TTL
 tombstone lapse in `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`
-(`:980-984`):
-1. `TtlPurgesExpiredRegistrations` (`:1011-1019`): unit `0` registers, `now_`
+(`:1023-1027`):
+1. `TtlPurgesExpiredRegistrations` (`:1054-1062`): unit `0` registers, `now_`
    advances past the 600 s TTL (`purgeExpiredAll`), and a subsequent
    `lookupAndClaim 101 [0]` fails (`none`, `"Missing producer block registration"`).
-2. `RequestBlockStatusProbeTracksLifecycle` (`:980-984`): after
+2. `RequestBlockStatusProbeTracksLifecycle` (`:1023-1027`): after
    `cancelIfUnclaimed` records a `.cancelled` tombstone, advancing `now_` past
    the TTL (`purgeExpiredAll`) purges the tombstone so `status` reads as
    `.unknown`. -/
