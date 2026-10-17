@@ -220,24 +220,44 @@ inline constexpr absl::string_view kSrcIp = "src_ip";
 inline constexpr absl::string_view kDstIp = "dst_ip";
 inline constexpr absl::string_view kUnknownIp = "unknown";
 inline constexpr absl::string_view kHostIp = "host_ip";
+
+inline constexpr absl::string_view kDirectionLabels[] = {kDirection};
+inline constexpr absl::string_view kSentBytesLabels[] = {kDirection, kSrcIp,
+                                                         kDstIp};
+inline constexpr absl::string_view kTransferFailuresLabels[] = {kDirection,
+                                                                kErrorCode};
+inline constexpr absl::string_view kP2pTransferTimeLabels[] = {kSrcIp, kDstIp,
+                                                               kLocalRank};
+inline constexpr absl::string_view kPcieTransferLabels[] = {kHostIp,
+                                                            kLocalRank};
+
 }  // namespace metric_labels
 
 namespace metric_metadata {
 
+using metric_labels::kDirectionLabels;
+using metric_labels::kP2pTransferTimeLabels;
+using metric_labels::kPcieTransferLabels;
+using metric_labels::kSentBytesLabels;
+using metric_labels::kTransferFailuresLabels;
+
 inline constexpr MetricMetadata kSentBytesTotal{
     .name = metric_names::kSentBytesTotal,
     .description = metric_descriptions::kSentBytesTotal,
-    .type = MetricType::kCounter};
+    .type = MetricType::kCounter,
+    .label_names = kSentBytesLabels};
 
 inline constexpr MetricMetadata kReceivedBytesTotal{
     .name = metric_names::kReceivedBytesTotal,
     .description = metric_descriptions::kReceivedBytesTotal,
-    .type = MetricType::kCounter};
+    .type = MetricType::kCounter,
+    .label_names = kDirectionLabels};
 
 inline constexpr MetricMetadata kTransferFailuresTotal{
     .name = metric_names::kTransferFailuresTotal,
     .description = metric_descriptions::kTransferFailuresTotal,
-    .type = MetricType::kCounter};
+    .type = MetricType::kCounter,
+    .label_names = kTransferFailuresLabels};
 
 inline constexpr MetricMetadata kTransferDurationMs{
     .name = metric_names::kTransferDurationMs,
@@ -247,12 +267,14 @@ inline constexpr MetricMetadata kTransferDurationMs{
 inline constexpr MetricMetadata kP2pTransferTimeMs{
     .name = metric_names::kP2pTransferTimeMs,
     .description = metric_descriptions::kP2pTransferTimeMs,
-    .type = MetricType::kHistogram};
+    .type = MetricType::kHistogram,
+    .label_names = kP2pTransferTimeLabels};
 
 inline constexpr MetricMetadata kH2dBytesTotal{
     .name = metric_names::kH2dBytesTotal,
     .description = metric_descriptions::kH2dBytesTotal,
-    .type = MetricType::kCounter};
+    .type = MetricType::kCounter,
+    .label_names = kPcieTransferLabels};
 
 inline constexpr MetricMetadata kH2dTransferTimeMs{
     .name = metric_names::kH2dTransferTimeMs,
@@ -262,12 +284,14 @@ inline constexpr MetricMetadata kH2dTransferTimeMs{
 inline constexpr MetricMetadata kH2dDmaTimeMs{
     .name = metric_names::kH2dDmaTimeMs,
     .description = metric_descriptions::kH2dDmaTimeMs,
-    .type = MetricType::kHistogram};
+    .type = MetricType::kHistogram,
+    .label_names = kPcieTransferLabels};
 
 inline constexpr MetricMetadata kD2hBytesTotal{
     .name = metric_names::kD2hBytesTotal,
     .description = metric_descriptions::kD2hBytesTotal,
-    .type = MetricType::kCounter};
+    .type = MetricType::kCounter,
+    .label_names = kPcieTransferLabels};
 
 inline constexpr MetricMetadata kD2hTransferTimeMs{
     .name = metric_names::kD2hTransferTimeMs,
@@ -277,7 +301,8 @@ inline constexpr MetricMetadata kD2hTransferTimeMs{
 inline constexpr MetricMetadata kD2hDmaTimeMs{
     .name = metric_names::kD2hDmaTimeMs,
     .description = metric_descriptions::kD2hDmaTimeMs,
-    .type = MetricType::kHistogram};
+    .type = MetricType::kHistogram,
+    .label_names = kPcieTransferLabels};
 
 inline constexpr MetricMetadata kBufferAllocatedBytes{
     .name = metric_names::kBufferAllocatedBytes,
