@@ -17,18 +17,24 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/platform_manager.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
@@ -58,6 +64,12 @@ struct FfiBufferFixture {
   xla::ffi::AnyBuffer AsAnyBuffer() { return xla::ffi::AnyBuffer(&ffi_buf); }
 };
 
+// Returns the standard-FFI instance registered for |shard_idx|.
+WeightSynchronizerBase* StandardWs(int32_t shard_idx) {
+  return WeightSynchronizerFfiManager::Default().GetSynchronizerForShard(
+      shard_idx);
+}
+
 class WeightSynchronizerFfiTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -69,16 +81,7 @@ class WeightSynchronizerFfiTest : public ::testing::Test {
 
   void TearDown() override {
     // Clean up global registry between tests
-    absl::flat_hash_set<WeightSynchronizerBase*> deleted;
-    for (size_t i = 0; i < kMaxShards; ++i) {
-      if (g_weight_synchronizers[i] != nullptr) {
-        if (deleted.insert(g_weight_synchronizers[i]).second) {
-          delete g_weight_synchronizers[i];
-        }
-        g_weight_synchronizers[i] = nullptr;
-      }
-      g_streams[i].reset();
-    }
+    WeightSynchronizerFfiManager::Default().Clear(/*delete_instances=*/true);
     ClearSharedWsMap();
   }
 };
@@ -136,7 +139,7 @@ TEST_P(WeightSynchronizerFfiParamTest, TriggerWSInitSucceeds) {
                                  local_port, parallelism, num_layers, out);
 
   EXPECT_TRUE(err.success()) << "WS Init failed: " << err.message();
-  EXPECT_NE(g_weight_synchronizers[0], nullptr);
+  EXPECT_NE(StandardWs(0), nullptr);
   EXPECT_NE(g_streams[0], nullptr);
 
   // Verify output contains some IP (can be all zeros if no external IP, but
@@ -176,7 +179,7 @@ TEST_F(WeightSynchronizerFfiTest, TriggerMultiH2DSucceeds) {
       /*listener_port=*/0, /*num_shards=*/1, out);
   ASSERT_TRUE(err.success()) << "Init failed: " << err.message();
 
-  WeightSynchronizerBase* ws = g_weight_synchronizers[shard_idx];
+  WeightSynchronizerBase* ws = StandardWs(shard_idx);
   ASSERT_NE(ws, nullptr);
 
   // 2. Populate Host Staging Buffers with dummy data
@@ -277,8 +280,8 @@ TEST_F(WeightSynchronizerFfiTest, MultiShardGetLocalSlotAndGlobalShardIndices) {
 
   // Both shards should share the exact same underlying WeightSynchronizerBase
   // instance
-  WeightSynchronizerBase* ws8 = g_weight_synchronizers[8];
-  WeightSynchronizerBase* ws9 = g_weight_synchronizers[9];
+  WeightSynchronizerBase* ws8 = StandardWs(8);
+  WeightSynchronizerBase* ws9 = StandardWs(9);
   ASSERT_NE(ws8, nullptr);
   ASSERT_EQ(ws8, ws9);
 
@@ -353,10 +356,10 @@ TEST_F(WeightSynchronizerFfiTest, MultiNumaFourShardsInitAndD2hTest) {
   }
 
   // Verify all 4 global shards share the same synchronizer instance
-  WeightSynchronizerBase* ws = g_weight_synchronizers[kBaseShard];
+  WeightSynchronizerBase* ws = StandardWs(kBaseShard);
   ASSERT_NE(ws, nullptr);
   for (int s = 1; s < kNumShards; ++s) {
-    EXPECT_EQ(g_weight_synchronizers[kBaseShard + s], ws);
+    EXPECT_EQ(StandardWs(kBaseShard + s), ws);
   }
 
   // Verify global shard indices are mapped to slots 0, 1, 2, 3
@@ -481,18 +484,18 @@ TEST_F(WeightSynchronizerFfiTest,
   }
 
   // Submanager 0 (shards 0..3)
-  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
+  WeightSynchronizerBase* ws_0 = StandardWs(0);
   ASSERT_NE(ws_0, nullptr);
   for (int s = 1; s < 4; ++s) {
-    EXPECT_EQ(g_weight_synchronizers[s], ws_0)
+    EXPECT_EQ(StandardWs(s), ws_0)
         << "Shard " << s << " should share submanager 0";
   }
 
   // Submanager 1 (shards 4..7)
-  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[4];
+  WeightSynchronizerBase* ws_1 = StandardWs(4);
   ASSERT_NE(ws_1, nullptr);
   for (int s = 5; s < 8; ++s) {
-    EXPECT_EQ(g_weight_synchronizers[s], ws_1)
+    EXPECT_EQ(StandardWs(s), ws_1)
         << "Shard " << s << " should share submanager 1";
   }
 
@@ -649,18 +652,18 @@ TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
   }
 
   // Host 0: shards 0, 1, 4, 5
-  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
+  WeightSynchronizerBase* ws_0 = StandardWs(0);
   ASSERT_NE(ws_0, nullptr);
-  EXPECT_EQ(g_weight_synchronizers[1], ws_0);
-  EXPECT_EQ(g_weight_synchronizers[4], ws_0);
-  EXPECT_EQ(g_weight_synchronizers[5], ws_0);
+  EXPECT_EQ(StandardWs(1), ws_0);
+  EXPECT_EQ(StandardWs(4), ws_0);
+  EXPECT_EQ(StandardWs(5), ws_0);
 
   // Host 1: shards 2, 3, 6, 7
-  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[2];
+  WeightSynchronizerBase* ws_1 = StandardWs(2);
   ASSERT_NE(ws_1, nullptr);
-  EXPECT_EQ(g_weight_synchronizers[3], ws_1);
-  EXPECT_EQ(g_weight_synchronizers[6], ws_1);
-  EXPECT_EQ(g_weight_synchronizers[7], ws_1);
+  EXPECT_EQ(StandardWs(3), ws_1);
+  EXPECT_EQ(StandardWs(6), ws_1);
+  EXPECT_EQ(StandardWs(7), ws_1);
 
   EXPECT_NE(ws_0, ws_1);
 
@@ -805,8 +808,8 @@ TEST_F(WeightSynchronizerFfiTest, TorusPermutedDeviceIdsInitAndD2hTest) {
                                << ": " << err.message();
   }
 
-  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
-  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[6];
+  WeightSynchronizerBase* ws_0 = StandardWs(0);
+  WeightSynchronizerBase* ws_1 = StandardWs(6);
   ASSERT_NE(ws_0, nullptr);
   ASSERT_NE(ws_1, nullptr);
   EXPECT_NE(ws_0, ws_1);
@@ -1012,6 +1015,182 @@ TEST_P(WeightSynchronizerFfiParamTest,
 INSTANTIATE_TEST_SUITE_P(FfiTypeTests, WeightSynchronizerFfiParamTest,
                          ::testing::Values(FfiType::kInit,
                                            FfiType::kInitAndD2h));
+
+TEST(FfiShardDescriptorTest, FromSpanFillsMissingTrailingFieldsWithDefaults) {
+  const std::vector<int32_t> full = {9, 1, 2, 40};
+  for (size_t len = 1; len <= full.size(); ++len) {
+    SCOPED_TRACE(len);
+    TF_ASSERT_OK_AND_ASSIGN(
+        FfiShardDescriptor desc,
+        FfiShardDescriptor::FromSpan(absl::MakeConstSpan(full.data(), len)));
+    EXPECT_EQ(desc.shard_idx, 9);
+    EXPECT_EQ(desc.local_slot, len >= 2 ? 1 : -1);
+    EXPECT_EQ(desc.submanager_idx, len >= 3 ? 2 : -1);
+    EXPECT_EQ(desc.global_shard_idx, len >= 4 ? 40 : -1);
+  }
+}
+
+TEST(FfiShardDescriptorTest, EffectiveFieldsFallBackToShardIdx) {
+  FfiShardDescriptor desc{.shard_idx = 9};
+  EXPECT_EQ(desc.effective_submanager_idx(/*num_shards=*/4), 2);
+  EXPECT_EQ(desc.effective_submanager_idx(/*num_shards=*/0), 0);
+  EXPECT_EQ(desc.effective_global_shard(), 9);
+  EXPECT_FALSE(desc.has_explicit_global());
+
+  desc.submanager_idx = 3;
+  desc.global_shard_idx = 40;
+  EXPECT_EQ(desc.effective_submanager_idx(/*num_shards=*/4), 3);
+  EXPECT_EQ(desc.effective_global_shard(), 40);
+  EXPECT_TRUE(desc.has_explicit_global());
+}
+
+TEST(FfiShardDescriptorTest, FromSpanRejectsEmptyAndOutOfBoundsShardIdx) {
+  EXPECT_THAT(FfiShardDescriptor::FromSpan({}),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+  const std::vector<int32_t> negative = {-1, 0};
+  EXPECT_THAT(FfiShardDescriptor::FromSpan(negative),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("out of bounds")));
+  const std::vector<int32_t> too_large = {static_cast<int32_t>(kMaxShards)};
+  EXPECT_THAT(FfiShardDescriptor::FromSpan(too_large),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("out of bounds")));
+}
+
+using IpBytes = std::array<uint8_t, 16>;
+
+IpBytes BytesOf(const int32_t* words) {
+  IpBytes bytes;
+  std::memcpy(bytes.data(), words, bytes.size());
+  return bytes;
+}
+
+TEST(ShardEndpointsTest, PackToSpanWritesWireLayoutForEveryWidth) {
+  struct IpCase {
+    std::string ip;
+    IpBytes bytes;
+  };
+  // IPv4 is written IPv4-mapped (::ffff:a.b.c.d); IPv6 is written verbatim; an
+  // empty IP is all zeros.
+  const IpCase v4_data = {
+      "10.1.2.3", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 1, 2, 3}};
+  const IpCase v4_ctrl = {
+      "10.9.8.7", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 9, 8, 7}};
+  const IpCase v6_data = {
+      "2001:0db8:0:0:0:0:0:1",
+      {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}};
+  const IpCase v6_ctrl = {
+      "fe80::2", {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02}};
+  const IpCase empty = {"", {}};
+  const std::vector<std::pair<IpCase, IpCase>> ip_pairs = {
+      {v4_data, v4_ctrl}, {v6_data, v6_ctrl}, {empty, empty}};
+
+  constexpr int32_t kSentinel = -7;
+  for (size_t width : {5, 6, 10}) {
+    for (const auto& [data, ctrl] : ip_pairs) {
+      SCOPED_TRACE(absl::StrCat("width=", width, " data_ip=", data.ip));
+      ShardEndpoints endpoints{.data_ip = data.ip,
+                               .data_port = 1234,
+                               .listener_port = 5678,
+                               .control_ip = ctrl.ip};
+      std::vector<int32_t> row(width, kSentinel);
+      ABSL_ASSERT_OK(endpoints.PackToSpan(absl::MakeSpan(row)));
+      EXPECT_EQ(BytesOf(row.data()), data.bytes);
+      EXPECT_EQ(row[4], 1234);
+      if (width >= 6) {
+        EXPECT_EQ(row[5], 5678);
+      }
+      if (width >= 10) {
+        EXPECT_EQ(BytesOf(row.data() + 6), ctrl.bytes);
+      }
+    }
+  }
+}
+
+TEST(ShardEndpointsTest, RejectsRowsNarrowerThanFiveInts) {
+  std::vector<int32_t> row(4, -7);
+  ShardEndpoints endpoints{.data_ip = "10.1.2.3", .data_port = 1};
+  EXPECT_THAT(endpoints.PackToSpan(absl::MakeSpan(row)),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("got 4")));
+  EXPECT_EQ(row, std::vector<int32_t>(4, -7));
+}
+
+TEST_F(WeightSynchronizerFfiTest,
+       DefaultManagerSharesInstancePerSubmanagerAndRegistersShards) {
+  WeightSynchronizerFfiManager& manager =
+      WeightSynchronizerFfiManager::Default();
+  const std::vector<size_t> sizes = {1024};
+  auto create = [&](int32_t shard_idx) {
+    return manager.GetOrCreateSynchronizer(
+        FfiShardDescriptor{.shard_idx = shard_idx}, /*listener_port=*/-1,
+        /*num_layers=*/1, /*parallelism=*/1, sizes, /*local_port=*/0,
+        /*num_shards=*/2);
+  };
+  // With num_shards = 2, shards 0 and 1 form submanager 0; shard 2 starts
+  // submanager 1.
+  TF_ASSERT_OK_AND_ASSIGN(WeightSynchronizerBase * ws0, create(0));
+  TF_ASSERT_OK_AND_ASSIGN(WeightSynchronizerBase * ws1, create(1));
+  TF_ASSERT_OK_AND_ASSIGN(WeightSynchronizerBase * ws2, create(2));
+  EXPECT_EQ(ws1, ws0);
+  EXPECT_NE(ws2, ws0);
+  EXPECT_EQ(StandardWs(0), ws0);
+  EXPECT_EQ(StandardWs(1), ws0);
+  EXPECT_EQ(StandardWs(2), ws2);
+  EXPECT_EQ(manager.GetSynchronizerForShard(-1), nullptr);
+  EXPECT_EQ(manager.GetSynchronizerForShard(kMaxShards), nullptr);
+  EXPECT_EQ(manager.GetLocalSlot(0), 0);
+  EXPECT_EQ(manager.GetLocalSlot(1), 1);
+  EXPECT_EQ(manager.GetLocalSlot(2), 0);
+
+  // ClearSharedWsMap unregisters every shard but keeps instances alive.
+  ClearSharedWsMap();
+  EXPECT_EQ(StandardWs(0), nullptr);
+  EXPECT_EQ(StandardWs(2), nullptr);
+  EXPECT_EQ(ws0->num_shards(), 2);
+  EXPECT_EQ(ws2->num_shards(), 2);
+  delete ws0;
+  delete ws2;
+}
+
+TEST_F(WeightSynchronizerFfiTest, ManagerClearWithDeleteResetsRegistration) {
+  auto manager = std::make_unique<WeightSynchronizerFfiManager>();
+  const std::vector<size_t> sizes = {1024};
+  for (int32_t shard_idx : {0, 1}) {
+    ABSL_ASSERT_OK(manager
+                       ->GetOrCreateSynchronizer(
+                           FfiShardDescriptor{.shard_idx = shard_idx},
+                           /*listener_port=*/-1, /*num_layers=*/1,
+                           /*parallelism=*/1, sizes,
+                           /*local_port=*/0, /*num_shards=*/2)
+                       .status());
+  }
+  ASSERT_NE(manager->GetSynchronizerForShard(0), nullptr);
+  EXPECT_EQ(manager->GetSynchronizerForShard(1),
+            manager->GetSynchronizerForShard(0));
+  EXPECT_FALSE(manager->HasActiveListener());
+
+  // The shared instance is deleted once even though two shards reference it.
+  manager->Clear(/*delete_instances=*/true);
+  EXPECT_EQ(manager->GetSynchronizerForShard(0), nullptr);
+  EXPECT_EQ(manager->GetSynchronizerForShard(1), nullptr);
+  std::vector<int32_t> row(10, 0);
+  EXPECT_THAT(manager->WriteShardEndpoints(0, absl::MakeSpan(row)),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+
+  // Re-registration after Clear assigns slots from scratch.
+  ABSL_ASSERT_OK(
+      manager
+          ->GetOrCreateSynchronizer(FfiShardDescriptor{.shard_idx = 1},
+                                    /*listener_port=*/0, /*num_layers=*/1,
+                                    /*parallelism=*/1, sizes, /*local_port=*/0,
+                                    /*num_shards=*/2)
+          .status());
+  EXPECT_EQ(manager->GetLocalSlot(1), 0);
+  EXPECT_TRUE(manager->HasActiveListener());
+  manager->Clear(/*delete_instances=*/true);
+  EXPECT_FALSE(manager->HasActiveListener());
+}
 
 }  // namespace
 }  // namespace weight_sync

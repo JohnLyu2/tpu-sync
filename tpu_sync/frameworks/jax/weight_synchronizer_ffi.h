@@ -24,9 +24,6 @@ class WeightSynchronizerBase;
 
 inline constexpr size_t kMaxShards = 4096;
 
-// Global registry map for distributed JAX meshes multi-device support
-extern WeightSynchronizerBase* g_weight_synchronizers[kMaxShards];
-
 }  // namespace weight_sync
 }  // namespace tpu_raiden
 

@@ -15,13 +15,26 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FRAMEWORKS_JAX_WEIGHT_SYNCHRONIZER_FFI_INTERNAL_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FRAMEWORKS_JAX_WEIGHT_SYNCHRONIZER_FFI_INTERNAL_H_
 
+#include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+// The zero-copy FFI includes the internal XLA FFI header, which defines the
+// same `xla::ffi` types as the external API header; skip the latter there.
+#ifndef TENSORFLOW_COMPILER_XLA_FFI_FFI_H_
 #include "xla/ffi/api/ffi.h"
+#endif  // TENSORFLOW_COMPILER_XLA_FFI_FFI_H_
 #include "xla/stream_executor/stream.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi.h"
@@ -44,6 +57,125 @@ std::string ResolveControlPlaneIp(absl::Span<const HostNicAddress> host_nics,
 // into 4 `int32_t` elements at |dst|.
 void PackIpToInt32s(absl::string_view ip_str, int32_t* dst);
 
+// Per-chip shard descriptor passed to the init FFIs in `shard_idx_buf`, laid
+// out as `[shard_idx, local_slot, submanager_idx, global_shard_idx]`. Only
+// `shard_idx` is required; missing trailing elements keep their defaults.
+struct FfiShardDescriptor {
+  int32_t shard_idx = 0;
+  int32_t local_slot = -1;
+  int32_t submanager_idx = -1;
+  int32_t global_shard_idx = -1;
+
+  // Parses |raw|. Fails if |raw| is empty or `shard_idx` is outside
+  // [0, kMaxShards).
+  static absl::StatusOr<FfiShardDescriptor> FromSpan(
+      absl::Span<const int32_t> raw);
+
+  // `submanager_idx` if set, else `shard_idx / num_shards` (0 if
+  // |num_shards| <= 0).
+  int32_t effective_submanager_idx(int32_t num_shards) const;
+  // `global_shard_idx` if set, else `shard_idx`.
+  int64_t effective_global_shard() const;
+  bool has_explicit_global() const { return global_shard_idx >= 0; }
+};
+
+// Per-shard endpoint row written by the init FFIs into a buffer of 5, 6, or
+// >= 10 `int32_t` elements: [0..3] packed data IP, [4] data port,
+// [5] listener port (width >= 6), [6..9] packed control-plane IP (width >= 10).
+struct ShardEndpoints {
+  std::string data_ip;
+  int32_t data_port = 0;
+  int32_t listener_port = 0;
+  std::string control_ip;
+
+  // Writes the fields that fit in |out|. Fails if |out| has fewer than 5
+  // elements.
+  absl::Status PackToSpan(absl::Span<int32_t> out) const;
+};
+
+// Owns the `WeightSynchronizerBase` instances behind one family of FFI
+// handlers, keyed by `shard_idx`. Shards of the same submanager (same listener
+// port key) share one instance, which avoids re-binding its sockets; each shard
+// is assigned a local slot within that instance. Instances are only deleted by
+// `Clear(/*delete_instances=*/true)`.
+//
+// There are two independent process-wide registries. `Default()` holds the
+// instances created by the standard FFI (`init_weight_synchronizer`, `ws_*`),
+// which copies between device memory and the instance's host staging buffers
+// with StreamExecutor (or `memcpy` without a stream). `ZeroCopy()` holds the
+// instances created by the Google-internal zero-copy FFI
+// (`raiden_weight_synchronizer_*`), which wraps the XLA device buffers as PJRT
+// raw buffers, binds them into the instance (`BindWeights`), and copies through
+// those raw buffers. Both create instances with the same parameters; they are
+// kept apart because only the zero-copy path binds device buffers and keeps
+// per-shard raw-buffer state, and because it is Copybara-stripped from the
+// open-source build.
+class WeightSynchronizerFfiManager {
+ public:
+  // Registry of the standard FFI handlers.
+  static WeightSynchronizerFfiManager& Default();
+  // Registry of the zero-copy FFI handlers.
+  static WeightSynchronizerFfiManager& ZeroCopy();
+
+  WeightSynchronizerFfiManager() = default;
+
+  WeightSynchronizerFfiManager(const WeightSynchronizerFfiManager&) = delete;
+  WeightSynchronizerFfiManager& operator=(const WeightSynchronizerFfiManager&) =
+      delete;
+
+  // Returns the instance shared by |desc|'s submanager, creating it on first
+  // use, records |desc|'s local slot and global shard index in it, and
+  // registers it for `desc.shard_idx`.
+  absl::StatusOr<WeightSynchronizerBase*> GetOrCreateSynchronizer(
+      const FfiShardDescriptor& desc, int32_t listener_port, int32_t num_layers,
+      int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
+      int32_t local_port, int32_t num_shards) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Returns the instance registered for |shard_idx|, or nullptr if none is or
+  // |shard_idx| is out of range.
+  WeightSynchronizerBase* GetSynchronizerForShard(int32_t shard_idx) const
+      ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Returns true if any registered instance has an active listener.
+  bool HasActiveListener() const ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Returns |shard_idx|'s local slot within its instance (0 if unregistered).
+  size_t GetLocalSlot(int32_t shard_idx) const ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Packs the endpoints of |shard_idx|'s instance into |out| (see
+  // `ShardEndpoints`). The control-plane IP is resolved only when |out| has
+  // room for it.
+  absl::Status WriteShardEndpoints(int32_t shard_idx,
+                                   absl::Span<int32_t> out) const;
+
+  // Records one completed multi-H2D shard. Returns true when a full round over
+  // max(1, initialized shards, |num_shards|) shards has completed.
+  bool RecordMultiH2dCompletion(size_t num_shards);
+
+  // Drops all bookkeeping and unregisters every shard. If |delete_instances|,
+  // also deletes the distinct instances that were registered to shards.
+  void Clear(bool delete_instances) ABSL_LOCKS_EXCLUDED(mu_);
+
+ private:
+  struct SlotAndGlobal {
+    size_t slot;
+    int64_t global_shard;
+    bool has_explicit_global;
+  };
+
+  mutable absl::Mutex mu_;
+  std::array<WeightSynchronizerBase*, kMaxShards> shard_table_
+      ABSL_GUARDED_BY(mu_) = {};
+  absl::flat_hash_map<int32_t, WeightSynchronizerBase*> ws_map_
+      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<WeightSynchronizerBase*,
+                      absl::flat_hash_map<int32_t, SlotAndGlobal>>
+      ws_shard_to_slot_map_ ABSL_GUARDED_BY(mu_);
+  std::atomic<size_t> initialized_shards_{0};
+  std::atomic<size_t> multi_h2d_completed_shards_{0};
+};
+
+#ifndef TENSORFLOW_COMPILER_XLA_FFI_FFI_H_
 xla::ffi::Error TriggerWeightSynchronizerInitImpl(
     xla::ffi::AnyBuffer x, xla::ffi::AnyBuffer shard_idx_buf,
     xla::ffi::AnyBuffer slice_byte_sizes_buf, int32_t local_port,
@@ -58,6 +190,7 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
 
 xla::ffi::Error TriggerMultiH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
                                     xla::ffi::RemainingRets rets);
+#endif  // TENSORFLOW_COMPILER_XLA_FFI_FFI_H_
 
 }  // namespace weight_sync
 }  // namespace tpu_raiden
