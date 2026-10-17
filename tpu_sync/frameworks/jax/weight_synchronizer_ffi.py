@@ -17,6 +17,7 @@
 import collections
 import os
 
+from absl import logging
 import jax
 from jax.experimental import compute_on
 from jax.experimental import xla_metadata
@@ -26,7 +27,6 @@ import numpy as np
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
 
 _DIRECT_DEVICE_BUFFER_ENV = "RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER"
-
 _orig_compute_on = compute_on.compute_on
 
 
@@ -120,17 +120,97 @@ def _derive_host_slots(
   )
 
 
+def _resolve_device_numa_nodes(mesh: jax.sharding.Mesh) -> np.ndarray:
+  """Returns the NUMA node (socket) of every mesh device, -1 where unknown.
+
+  The only source is the device's own `numa_node` attribute, which McJAX TPU
+  clients publish and Pathways (IFRT proxy) clients do not. Sockets are never
+  inferred from device coordinates, slot order, or PCI order. Any further
+  source for still-unknown devices belongs in this function.
+
+  Args:
+    mesh: JAX device mesh.
+
+  Returns:
+    An int32 array shaped like `mesh.devices`.
+  """
+  numa_nodes = np.full(mesh.devices.shape, -1, dtype=np.int32)
+  for idx, device in np.ndenumerate(mesh.devices):
+    numa_node = getattr(device, "numa_node", None)
+    if (
+        isinstance(numa_node, (int, np.integer))
+        and not isinstance(numa_node, bool)
+        and numa_node >= 0
+    ):
+      numa_nodes[idx] = numa_node
+  logging.info(
+      "weight_synchronizer_ffi: %d of %d mesh devices report numa_node; the"
+      " rest have an unknown socket (-1).",
+      np.count_nonzero(numa_nodes >= 0),
+      numa_nodes.size,
+  )
+  return numa_nodes
+
+
+def _derive_slot_numa_nodes(
+    numa_by_device: np.ndarray,
+    host_indices: np.ndarray,
+    local_slots: np.ndarray,
+    num_shards: int,
+) -> np.ndarray:
+  """Gives every device the sockets of all local slots of its host.
+
+  Args:
+    numa_by_device: NUMA node of each device (-1 if unknown).
+    host_indices: Host index of each device, from `_derive_host_slots`.
+    local_slots: Local slot of each device, from `_derive_host_slots`.
+    num_shards: Number of local slots per host.
+
+  Returns:
+    An int32 array of shape `host_indices.shape + (num_shards,)` whose entry
+    for a device lists, by local slot, the NUMA node of every device on that
+    device's host.
+
+  Raises:
+    ValueError: If the three input arrays differ in shape.
+  """
+  if not numa_by_device.shape == host_indices.shape == local_slots.shape:
+    raise ValueError(
+        "numa_by_device, host_indices and local_slots must have the same"
+        f" shape, got {numa_by_device.shape}, {host_indices.shape} and"
+        f" {local_slots.shape}."
+    )
+  slot_numa_by_host = collections.defaultdict(
+      lambda: np.full(num_shards, -1, dtype=np.int32)
+  )
+  for host_idx, slot, numa_node in zip(
+      host_indices.flat, local_slots.flat, numa_by_device.flat
+  ):
+    slot_numa_by_host[int(host_idx)][int(slot)] = numa_node
+  return np.stack(
+      [slot_numa_by_host[int(host_idx)] for host_idx in host_indices.flat]
+  ).reshape(host_indices.shape + (num_shards,))
+
+
 def _prepare_shard_info(
     shard_idx: jax.Array,
     mesh: jax.sharding.Mesh,
     num_shards: int,
 ) -> jax.Array:
-  """Packs [shard_idx, local_slot, host_idx, global_mesh_idx] for the FFI call.
+  """Packs the per-device shard descriptor for the init FFI calls.
+
+  The descriptor is `[shard_idx, local_slot, host_idx, global_mesh_idx,
+  numa_0, ..., numa_{num_shards-1}]`, where `numa_s` is the NUMA node of the
+  device in local slot `s` of the device's host, or -1 if unknown (see
+  `_resolve_device_numa_nodes`). The synchronizer binds the data NICs of the
+  known sockets; with every socket unknown it binds only the host's first
+  data NIC.
 
   If shard_idx is already packed (trailing dimension >= 3), returns shard_idx.
   Otherwise derives local_slot and host_idx from the mesh's process topology
   (see `_derive_host_slots`) and returns a sharded array with shape
-  `mesh.devices.shape + (4,)` and PartitionSpec(*mesh.axis_names, None).
+  `mesh.devices.shape + (4 + num_shards,)` and
+  PartitionSpec(*mesh.axis_names, None).
 
   `num_shards` is the number of devices per synchronizer; callers needing a
   non-contiguous grouping must pass a pre-packed `shard_idx` (trailing
@@ -148,6 +228,12 @@ def _prepare_shard_info(
     return shard_idx
 
   host_indices_np, local_slots_np = _derive_host_slots(mesh.devices, num_shards)
+  slot_numa_nodes_np = _derive_slot_numa_nodes(
+      _resolve_device_numa_nodes(mesh),
+      host_indices_np,
+      local_slots_np,
+      num_shards,
+  )
 
   spec = jax.sharding.PartitionSpec(*mesh.axis_names)
   sharding = jax.sharding.NamedSharding(mesh, spec)
@@ -165,12 +251,25 @@ def _prepare_shard_info(
   global_mesh_indices = jax.device_put(
       jnp.array(global_mesh_indices_np, dtype=jnp.int32), sharding
   )
+  slot_numa_nodes = jax.device_put(
+      jnp.array(slot_numa_nodes_np, dtype=jnp.int32),
+      jax.sharding.NamedSharding(
+          mesh, jax.sharding.PartitionSpec(*mesh.axis_names, None)
+      ),
+  )
 
   if shard_idx.shape != mesh.devices.shape:
     shard_idx = shard_idx.reshape(mesh.devices.shape)
 
-  return jnp.stack(
-      [shard_idx, local_slots, host_indices, global_mesh_indices], axis=-1
+  return jnp.concatenate(
+      [
+          jnp.stack(
+              [shard_idx, local_slots, host_indices, global_mesh_indices],
+              axis=-1,
+          ),
+          slot_numa_nodes,
+      ],
+      axis=-1,
   )
 
 

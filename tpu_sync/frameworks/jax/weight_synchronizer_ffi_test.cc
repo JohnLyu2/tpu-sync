@@ -28,8 +28,11 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/types/span.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
@@ -39,6 +42,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
 #include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -1012,6 +1016,42 @@ TEST_P(WeightSynchronizerFfiParamTest,
   EXPECT_NE(ctrl_ip, "0.0.0.0");
 }
 
+TEST_P(WeightSynchronizerFfiParamTest, DescriptorNumaNodesSetShardPlacement) {
+  std::vector<int32_t> anchor(256, 7);
+  FfiBufferFixture anchor_fixture(XLA_FFI_DataType_S32, anchor.data(), {256});
+  int32_t slice_byte_size = 1024;
+  FfiBufferFixture sizes_fixture(XLA_FFI_DataType_S32, &slice_byte_size, {1});
+  std::vector<int32_t> out_data(5, 0);
+  FfiBufferFixture out_fixture(XLA_FFI_DataType_S32, out_data.data(), {5});
+
+  // num_shards = 2: [shard_idx, local_slot, submanager_idx, global_shard_idx,
+  // numa_0, numa_1].
+  std::vector<int32_t> desc = {0, 0, 0, 0, 1, 0};
+  FfiBufferFixture desc_fixture(XLA_FFI_DataType_S32, desc.data(), {6});
+  xla::ffi::Error err = CallInit(
+      anchor_fixture.AsAnyBuffer(), desc_fixture.AsAnyBuffer(),
+      sizes_fixture.AsAnyBuffer(), /*local_port=*/0, /*parallelism=*/1,
+      /*num_layers=*/1, out_fixture.AsAnyBuffer(), /*listener_port=*/-1,
+      /*num_shards=*/2);
+  ASSERT_TRUE(err.success()) << err.message();
+  ASSERT_NE(StandardWs(0), nullptr);
+  EXPECT_THAT(StandardWs(0)->shards(),
+              ::testing::ElementsAre(
+                  ::testing::Field(&transport::ShardInfo::numa_node, 1),
+                  ::testing::Field(&transport::ShardInfo::numa_node, 0)));
+
+  // A NUMA list shorter than num_shards is rejected.
+  std::vector<int32_t> partial = {1, 1, 0, 1, 1};
+  FfiBufferFixture partial_fixture(XLA_FFI_DataType_S32, partial.data(), {5});
+  err = CallInit(anchor_fixture.AsAnyBuffer(), partial_fixture.AsAnyBuffer(),
+                 sizes_fixture.AsAnyBuffer(), /*local_port=*/0,
+                 /*parallelism=*/1, /*num_layers=*/1, out_fixture.AsAnyBuffer(),
+                 /*listener_port=*/-1, /*num_shards=*/2);
+  EXPECT_EQ(err.errc(), xla::ffi::ErrorCode::kInvalidArgument);
+  EXPECT_THAT(err.message(), ::testing::HasSubstr("4 + num_shards"));
+  EXPECT_EQ(StandardWs(1), nullptr);
+}
+
 INSTANTIATE_TEST_SUITE_P(FfiTypeTests, WeightSynchronizerFfiParamTest,
                          ::testing::Values(FfiType::kInit,
                                            FfiType::kInitAndD2h));
@@ -1022,12 +1062,36 @@ TEST(FfiShardDescriptorTest, FromSpanFillsMissingTrailingFieldsWithDefaults) {
     SCOPED_TRACE(len);
     TF_ASSERT_OK_AND_ASSIGN(
         FfiShardDescriptor desc,
-        FfiShardDescriptor::FromSpan(absl::MakeConstSpan(full.data(), len)));
+        FfiShardDescriptor::FromSpan(absl::MakeConstSpan(full.data(), len),
+                                     /*num_shards=*/4));
     EXPECT_EQ(desc.shard_idx, 9);
     EXPECT_EQ(desc.local_slot, len >= 2 ? 1 : -1);
     EXPECT_EQ(desc.submanager_idx, len >= 3 ? 2 : -1);
     EXPECT_EQ(desc.global_shard_idx, len >= 4 ? 40 : -1);
+    EXPECT_TRUE(desc.slot_numa_nodes.empty());
   }
+}
+
+TEST(FfiShardDescriptorTest, FromSpanParsesSlotNumaNodes) {
+  const std::vector<int32_t> raw = {5, 1, 1, 5, 0, 0, 1, -1};
+  TF_ASSERT_OK_AND_ASSIGN(FfiShardDescriptor desc,
+                          FfiShardDescriptor::FromSpan(raw, /*num_shards=*/4));
+  EXPECT_EQ(desc.global_shard_idx, 5);
+  EXPECT_THAT(desc.slot_numa_nodes, ::testing::ElementsAre(0, 0, 1, -1));
+}
+
+TEST(FfiShardDescriptorTest, FromSpanRejectsPartialOrOverlongNumaLists) {
+  for (size_t len : {5, 7, 9}) {
+    SCOPED_TRACE(len);
+    const std::vector<int32_t> raw(len, 0);
+    EXPECT_THAT(FfiShardDescriptor::FromSpan(raw, /*num_shards=*/4),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("4 + num_shards")));
+  }
+  const std::vector<int32_t> bad_node = {0, 0, 0, 0, 0, -2};
+  EXPECT_THAT(FfiShardDescriptor::FromSpan(bad_node, /*num_shards=*/2),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("NUMA node -2")));
 }
 
 TEST(FfiShardDescriptorTest, EffectiveFieldsFallBackToShardIdx) {
@@ -1045,14 +1109,14 @@ TEST(FfiShardDescriptorTest, EffectiveFieldsFallBackToShardIdx) {
 }
 
 TEST(FfiShardDescriptorTest, FromSpanRejectsEmptyAndOutOfBoundsShardIdx) {
-  EXPECT_THAT(FfiShardDescriptor::FromSpan({}),
+  EXPECT_THAT(FfiShardDescriptor::FromSpan({}, /*num_shards=*/1),
               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
   const std::vector<int32_t> negative = {-1, 0};
-  EXPECT_THAT(FfiShardDescriptor::FromSpan(negative),
+  EXPECT_THAT(FfiShardDescriptor::FromSpan(negative, /*num_shards=*/1),
               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
                                      ::testing::HasSubstr("out of bounds")));
   const std::vector<int32_t> too_large = {static_cast<int32_t>(kMaxShards)};
-  EXPECT_THAT(FfiShardDescriptor::FromSpan(too_large),
+  EXPECT_THAT(FfiShardDescriptor::FromSpan(too_large, /*num_shards=*/1),
               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
                                      ::testing::HasSubstr("out of bounds")));
 }
@@ -1190,6 +1254,99 @@ TEST_F(WeightSynchronizerFfiTest, ManagerClearWithDeleteResetsRegistration) {
   EXPECT_TRUE(manager->HasActiveListener());
   manager->Clear(/*delete_instances=*/true);
   EXPECT_FALSE(manager->HasActiveListener());
+}
+
+// Data NICs on bindable loopback addresses: card A on NUMA node 0 and card B
+// on NUMA node 1. None is a control-plane NIC.
+constexpr char kCardA[] = "127.0.0.2";
+constexpr char kCardB[] = "127.0.0.3";
+
+std::vector<HostNicAddress> TwoSocketNics() {
+  return {{"eth1", kCardA, 0, NicClassification::kDataPlane},
+          {"eth2", kCardB, 1, NicClassification::kDataPlane}};
+}
+
+// Registers every local slot of submanager |submanager_idx| with |manager|,
+// each slot passing the host's |slot_numa_nodes|, and returns the 10-int
+// endpoint row of each slot.
+absl::StatusOr<std::vector<std::vector<int32_t>>> RegisterHost(
+    WeightSynchronizerFfiManager& manager, int32_t submanager_idx,
+    const std::vector<int32_t>& slot_numa_nodes) {
+  const int32_t num_shards = static_cast<int32_t>(slot_numa_nodes.size());
+  std::vector<std::vector<int32_t>> rows;
+  for (int32_t slot = 0; slot < num_shards; ++slot) {
+    const int32_t shard_idx = submanager_idx * num_shards + slot;
+    const FfiShardDescriptor desc{.shard_idx = shard_idx,
+                                  .local_slot = slot,
+                                  .submanager_idx = submanager_idx,
+                                  .global_shard_idx = shard_idx,
+                                  .slot_numa_nodes = slot_numa_nodes};
+    ABSL_RETURN_IF_ERROR(manager
+                             .GetOrCreateSynchronizer(
+                                 desc, /*listener_port=*/-1, /*num_layers=*/1,
+                                 /*parallelism=*/1, {1024}, /*local_port=*/0,
+                                 num_shards)
+                             .status());
+    std::vector<int32_t>& row = rows.emplace_back(10, 0);
+    ABSL_RETURN_IF_ERROR(
+        manager.WriteShardEndpoints(shard_idx, absl::MakeSpan(row)));
+  }
+  return rows;
+}
+
+// Data IP (words 0..3) of every endpoint row.
+std::vector<std::string> DataIps(
+    const std::vector<std::vector<int32_t>>& rows) {
+  std::vector<std::string> ips;
+  for (const std::vector<int32_t>& row : rows) {
+    ips.push_back(UnpackIpFromInt32s(row.data()));
+  }
+  return ips;
+}
+
+TEST(WeightSynchronizerFfiManagerNumaTest, SlotsReportTheDataNicOfTheirSocket) {
+  struct Case {
+    std::vector<int32_t> slot_numa_nodes;
+    int32_t submanager_idx;
+    std::vector<std::string> expected_data_ips;
+  };
+  const std::vector<Case> cases = {
+      {{0, 0, 1, 1}, 0, {kCardA, kCardA, kCardB, kCardB}},
+      {{1, 1, 0, 0}, 0, {kCardB, kCardB, kCardA, kCardA}},
+      // Chips 4-7 of an 8-chip host whose upper half sits on socket 1.
+      {{1, 1, 1, 1}, 1, {kCardB, kCardB, kCardB, kCardB}},
+      // Unknown sockets fall back to the first data NIC.
+      {{-1, -1, -1, -1}, 0, {kCardA, kCardA, kCardA, kCardA}},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(absl::StrJoin(c.slot_numa_nodes, ","));
+    WeightSynchronizerFfiManager manager(TwoSocketNics);
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::vector<std::vector<int32_t>> rows,
+        RegisterHost(manager, c.submanager_idx, c.slot_numa_nodes));
+    EXPECT_EQ(DataIps(rows), c.expected_data_ips);
+    const WeightSynchronizerBase* ws = manager.GetSynchronizerForShard(
+        c.submanager_idx * static_cast<int32_t>(c.slot_numa_nodes.size()));
+    ASSERT_NE(ws, nullptr);
+    for (size_t slot = 0; slot < c.slot_numa_nodes.size(); ++slot) {
+      EXPECT_EQ(ws->shards()[slot].numa_node, c.slot_numa_nodes[slot]);
+    }
+    manager.Clear(/*delete_instances=*/true);
+  }
+}
+
+TEST(WeightSynchronizerFfiManagerNumaTest,
+     SlotsOnDifferentSocketsReportTheSameControlIp) {
+  // No NIC is a control-plane NIC, so the control IP falls back to an
+  // instance-wide address rather than each slot's data NIC.
+  WeightSynchronizerFfiManager manager(TwoSocketNics);
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<std::vector<int32_t>> rows,
+                          RegisterHost(manager, /*submanager_idx=*/0,
+                                       /*slot_numa_nodes=*/{0, 1}));
+  ASSERT_THAT(DataIps(rows), ::testing::ElementsAre(kCardA, kCardB));
+  EXPECT_EQ(UnpackIpFromInt32s(rows[0].data() + 6),
+            UnpackIpFromInt32s(rows[1].data() + 6));
+  manager.Clear(/*delete_instances=*/true);
 }
 
 }  // namespace

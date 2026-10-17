@@ -19,8 +19,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
@@ -58,18 +60,26 @@ std::string ResolveControlPlaneIp(absl::Span<const HostNicAddress> host_nics,
 void PackIpToInt32s(absl::string_view ip_str, int32_t* dst);
 
 // Per-chip shard descriptor passed to the init FFIs in `shard_idx_buf`, laid
-// out as `[shard_idx, local_slot, submanager_idx, global_shard_idx]`. Only
-// `shard_idx` is required; missing trailing elements keep their defaults.
+// out as `[shard_idx, local_slot, submanager_idx, global_shard_idx, numa_0,
+// ..., numa_{num_shards-1}]`. Only `shard_idx` is required; the first four
+// elements may be truncated (missing ones keep their defaults), and the NUMA
+// list is either absent or complete.
 struct FfiShardDescriptor {
   int32_t shard_idx = 0;
   int32_t local_slot = -1;
   int32_t submanager_idx = -1;
   int32_t global_shard_idx = -1;
+  // NUMA node (socket) of the device in every local slot of the submanager,
+  // indexed by local slot; -1 marks an unknown socket. Empty when the caller
+  // passed no sockets, which is equivalent to all -1: the synchronizer then
+  // binds only the host's first data NIC.
+  std::vector<int32_t> slot_numa_nodes;
 
-  // Parses |raw|. Fails if |raw| is empty or `shard_idx` is outside
-  // [0, kMaxShards).
+  // Parses |raw| for a submanager of |num_shards| slots. Fails if |raw| is
+  // empty, `shard_idx` is outside [0, kMaxShards), |raw| has more than 4 but
+  // not exactly `4 + num_shards` elements, or a NUMA node is below -1.
   static absl::StatusOr<FfiShardDescriptor> FromSpan(
-      absl::Span<const int32_t> raw);
+      absl::Span<const int32_t> raw, int32_t num_shards);
 
   // `submanager_idx` if set, else `shard_idx / num_shards` (0 if
   // |num_shards| <= 0).
@@ -117,7 +127,13 @@ class WeightSynchronizerFfiManager {
   // Registry of the zero-copy FFI handlers.
   static WeightSynchronizerFfiManager& ZeroCopy();
 
-  WeightSynchronizerFfiManager() = default;
+  // |host_nics| lists this host's NICs; it is called when an instance is
+  // created (to pick its data NICs) and when endpoints are written (to resolve
+  // the control-plane IP).
+  explicit WeightSynchronizerFfiManager(
+      std::function<std::vector<HostNicAddress>()> host_nics =
+          [] { return GetLocalHostNicAddresses(); })
+      : host_nics_(std::move(host_nics)) {}
 
   WeightSynchronizerFfiManager(const WeightSynchronizerFfiManager&) = delete;
   WeightSynchronizerFfiManager& operator=(const WeightSynchronizerFfiManager&) =
@@ -125,7 +141,12 @@ class WeightSynchronizerFfiManager {
 
   // Returns the instance shared by |desc|'s submanager, creating it on first
   // use, records |desc|'s local slot and global shard index in it, and
-  // registers it for `desc.shard_idx`.
+  // registers it for `desc.shard_idx`. A new instance gets one shard per local
+  // slot on `desc.slot_numa_nodes` and binds the data NICs of the known NUMA
+  // nodes, or only the host's first data NIC when no node is known (see
+  // `RaidenManagerBase::InitTransportServer`). Fails if
+  // `desc.slot_numa_nodes` is neither empty nor |num_shards| long
+  // (InvalidArgument).
   absl::StatusOr<WeightSynchronizerBase*> GetOrCreateSynchronizer(
       const FfiShardDescriptor& desc, int32_t listener_port, int32_t num_layers,
       int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
@@ -143,8 +164,10 @@ class WeightSynchronizerFfiManager {
   size_t GetLocalSlot(int32_t shard_idx) const ABSL_LOCKS_EXCLUDED(mu_);
 
   // Packs the endpoints of |shard_idx|'s instance into |out| (see
-  // `ShardEndpoints`). The control-plane IP is resolved only when |out| has
-  // room for it.
+  // `ShardEndpoints`). The data IP is entry `local_slot % n` of the n local
+  // IPs serving |shard_idx|'s local slot (`local_ips_for_shard`), i.e. a NIC
+  // on the slot's NUMA node when known. The control-plane IP is resolved only
+  // when |out| has room for it, and is the same for every slot of an instance.
   absl::Status WriteShardEndpoints(int32_t shard_idx,
                                    absl::Span<int32_t> out) const;
 
@@ -164,6 +187,7 @@ class WeightSynchronizerFfiManager {
   };
 
   mutable absl::Mutex mu_;
+  const std::function<std::vector<HostNicAddress>()> host_nics_;
   std::array<WeightSynchronizerBase*, kMaxShards> shard_table_
       ABSL_GUARDED_BY(mu_) = {};
   absl::flat_hash_map<int32_t, WeightSynchronizerBase*> ws_map_

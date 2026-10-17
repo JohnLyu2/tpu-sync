@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for weight_synchronizer_ffi APIs on TPU."""
+"""Unit tests for weight_synchronizer_ffi APIs.
+
+The FFI round-trip tests need TPU devices. The CPU test target sets
+`RAIDEN_FFI_TEST_ALLOW_CPU=1`, which skips them so that only the pure-Python
+helper tests run there.
+"""
 
 import collections
 import dataclasses
@@ -24,11 +29,15 @@ import jax.numpy as jnp
 import numpy as np
 from tpu_sync.frameworks.jax import weight_synchronizer_ffi
 
+_ALLOW_CPU_ENV = "RAIDEN_FFI_TEST_ALLOW_CPU"
+
 
 class WeightSynchronizerFfiTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
+    if os.environ.get(_ALLOW_CPU_ENV) == "1":
+      self.skipTest(f"FFI round trips need TPU devices ({_ALLOW_CPU_ENV}=1).")
     self.devices = jax.devices()
     self.num_devices = len(self.devices)
     self.mesh = jax.sharding.Mesh(np.array(self.devices), ("x",))
@@ -242,6 +251,14 @@ class _FakeDevice:
 
   process_index: int
   id: int
+  numa_node: int | None = None
+
+
+@dataclasses.dataclass
+class _FakeMesh:
+  """Minimal stand-in for a jax.sharding.Mesh over `_FakeDevice`s."""
+
+  devices: np.ndarray
 
 
 class DeriveHostSlotsTest(absltest.TestCase):
@@ -345,7 +362,7 @@ class DeriveHostSlotsTest(absltest.TestCase):
     ):
       weight_synchronizer_ffi._derive_host_slots(devices, num_shards=4)
 
-  def test_prepare_shard_info_packs_slot_host_and_global_mesh_columns(self):
+  def test__prepare_shard_info_packs_slot_host_and_global_mesh_columns(self):
     mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(2, 4), ("x", "y"))
     shard_idx = jax.device_put(
         jnp.arange(8, dtype=jnp.int32).reshape(2, 4),
@@ -357,7 +374,7 @@ class DeriveHostSlotsTest(absltest.TestCase):
     )
 
     packed_np = np.asarray(packed)
-    self.assertEqual(packed_np.shape, (2, 4, 4))
+    self.assertEqual(packed_np.shape, (2, 4, 8))
     self.assertTrue(
         packed.sharding.is_equivalent_to(
             jax.sharding.NamedSharding(
@@ -370,6 +387,71 @@ class DeriveHostSlotsTest(absltest.TestCase):
     self.assertEqual(packed_np[..., 1].tolist(), [[0, 1, 2, 3], [0, 1, 2, 3]])
     self.assertEqual(packed_np[..., 2].tolist(), [[0, 0, 0, 0], [1, 1, 1, 1]])
     self.assertEqual(packed_np[..., 3].tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
+    # Every device carries the sockets of its host's slots; host h is mesh row
+    # h.
+    device_numa_nodes = weight_synchronizer_ffi._resolve_device_numa_nodes(mesh)
+    for row in range(2):
+      for col in range(4):
+        self.assertEqual(
+            packed_np[row, col, 4:].tolist(), device_numa_nodes[row].tolist()
+        )
+    if jax.default_backend() == "cpu":
+      # CPU devices report no numa_node.
+      self.assertEqual(packed_np[..., 4:].tolist(), [[[-1] * 4] * 4] * 2)
+
+
+class DeviceNumaNodesTest(absltest.TestCase):
+
+  def test_resolve_reads_numa_node_attribute_and_marks_others_unknown(self):
+    devices = np.array([
+        _FakeDevice(process_index=0, id=0, numa_node=0),
+        _FakeDevice(process_index=0, id=1, numa_node=1),
+        _FakeDevice(process_index=0, id=2, numa_node=None),
+        _FakeDevice(process_index=0, id=3, numa_node=-1),
+    ]).reshape(2, 2)
+
+    numa_nodes = weight_synchronizer_ffi._resolve_device_numa_nodes(
+        _FakeMesh(devices)
+    )
+
+    self.assertEqual(numa_nodes.dtype, np.int32)
+    self.assertEqual(numa_nodes.tolist(), [[0, 1], [-1, -1]])
+
+  def test_derive_slot_numa_nodes_single_process_contiguous_hosts(self):
+    host_indices = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    local_slots = np.array([0, 1, 2, 3, 0, 1, 2, 3])
+    numa_by_device = np.array([0, 0, 1, 1, 1, 1, -1, 0])
+
+    slot_numa_nodes = weight_synchronizer_ffi._derive_slot_numa_nodes(
+        numa_by_device, host_indices, local_slots, num_shards=4
+    )
+
+    self.assertEqual(
+        slot_numa_nodes.tolist(), [[0, 0, 1, 1]] * 4 + [[1, 1, -1, 0]] * 4
+    )
+
+  def test_derive_slot_numa_nodes_multi_process_interleaved_hosts(self):
+    # Same interleaved layout as
+    # test_multi_process_mesh_uses_process_index_and_rank_within_process.
+    host_indices = np.array([[0, 1, 0, 1], [0, 1, 0, 1]])
+    local_slots = np.array([[0, 0, 1, 1], [2, 2, 3, 3]])
+    numa_by_device = np.array([[0, 1, 0, 1], [1, 0, 1, 0]])
+
+    slot_numa_nodes = weight_synchronizer_ffi._derive_slot_numa_nodes(
+        numa_by_device, host_indices, local_slots, num_shards=4
+    )
+
+    host_0, host_1 = [0, 0, 1, 1], [1, 1, 0, 0]
+    self.assertEqual(
+        slot_numa_nodes.tolist(),
+        [[host_0, host_1, host_0, host_1], [host_0, host_1, host_0, host_1]],
+    )
+
+  def test_derive_slot_numa_nodes_rejects_mismatched_shapes(self):
+    with self.assertRaisesRegex(ValueError, "must have the same shape"):
+      weight_synchronizer_ffi._derive_slot_numa_nodes(
+          np.zeros(4), np.zeros(4), np.zeros(3), num_shards=4
+      )
 
 
 if __name__ == "__main__":

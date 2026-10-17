@@ -264,6 +264,7 @@ cc_library(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -450,6 +451,7 @@ cc_library(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -480,11 +482,14 @@ cc_test(
         ":weight_synchronizer_ffi_mock",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/telemetry:metrics_api",
+        "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
         "@xla//xla/ffi/api:c_api",
@@ -651,8 +656,32 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         ":_weight_synchronizer_ffi",
+        "@com_google_absl_py//absl/logging",
         "@jax//jax",
         "@jax//jax/experimental:compute_on",
+        "@pypi//numpy",
+    ],
+)
+
+# Runs the pure-Python helper tests of weight_synchronizer_ffi_test.py on 8
+# virtual CPU devices; RAIDEN_FFI_TEST_ALLOW_CPU makes the TPU-only FFI
+# round-trip tests skip themselves. Forge caps the cpu:N reservation at 4; the
+# virtual device count does not need one core per device.
+py_test(
+    name = "weight_synchronizer_ffi_test_cpu",
+    srcs = ["weight_synchronizer_ffi_test.py"],
+    env = {
+        "JAX_NUM_CPU_DEVICES": "8",
+        "JAX_PLATFORMS": "cpu",
+        "RAIDEN_FFI_TEST_ALLOW_CPU": "1",
+    },
+    main = "weight_synchronizer_ffi_test.py",
+    tags = ["cpu:4"],
+    deps = [
+        ":weight_synchronizer_ffi_py",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@com_google_absl_py//absl/testing:parameterized",
+        "@jax//jax",
         "@pypi//numpy",
     ],
 )

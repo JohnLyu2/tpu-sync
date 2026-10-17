@@ -55,6 +55,7 @@
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -71,6 +72,7 @@ void ClearSharedWsMap() {
 
 namespace {
 
+constexpr size_t kDescriptorBaseWidth = 4;
 constexpr size_t kEndpointsMinWidth = 5;
 constexpr size_t kEndpointsListenerWidth = 6;
 constexpr size_t kEndpointsControlIpWidth = 10;
@@ -184,11 +186,12 @@ void PackIpToInt32s(absl::string_view ip_str, int32_t* dst) {
 }
 
 absl::StatusOr<FfiShardDescriptor> FfiShardDescriptor::FromSpan(
-    absl::Span<const int32_t> raw) {
+    absl::Span<const int32_t> raw, int32_t num_shards) {
   if (raw.empty()) {
     return absl::InvalidArgumentError(
         "Shard descriptor is empty; expected [shard_idx, local_slot, "
-        "submanager_idx, global_shard_idx] with at least shard_idx.");
+        "submanager_idx, global_shard_idx, numa_0..numa_{num_shards-1}] with "
+        "at least shard_idx.");
   }
   FfiShardDescriptor desc;
   desc.shard_idx = raw[0];
@@ -198,6 +201,25 @@ absl::StatusOr<FfiShardDescriptor> FfiShardDescriptor::FromSpan(
   if (desc.shard_idx < 0 || static_cast<size_t>(desc.shard_idx) >= kMaxShards) {
     return absl::InvalidArgumentError(absl::StrCat(
         "shard_idx out of bounds [0, ", kMaxShards, "): ", desc.shard_idx));
+  }
+  if (raw.size() <= kDescriptorBaseWidth) {
+    return desc;
+  }
+  if (num_shards <= 0 ||
+      raw.size() != kDescriptorBaseWidth + static_cast<size_t>(num_shards)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Shard descriptor for shard_idx ", desc.shard_idx, " has ", raw.size(),
+        " elements; expected at most ", kDescriptorBaseWidth, " or exactly ",
+        kDescriptorBaseWidth, " + num_shards (num_shards=", num_shards, ")."));
+  }
+  desc.slot_numa_nodes.assign(raw.begin() + kDescriptorBaseWidth, raw.end());
+  for (size_t slot = 0; slot < desc.slot_numa_nodes.size(); ++slot) {
+    if (desc.slot_numa_nodes[slot] < -1) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Shard descriptor for shard_idx ", desc.shard_idx, " has NUMA node ",
+          desc.slot_numa_nodes[slot], " for local slot ", slot,
+          "; expected -1 (unknown) or a node >= 0."));
+    }
   }
   return desc;
 }
@@ -254,6 +276,13 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
     return absl::InvalidArgumentError(absl::StrCat(
         "shard_idx out of bounds [0, ", kMaxShards, "): ", shard_idx));
   }
+  if (!desc.slot_numa_nodes.empty() &&
+      desc.slot_numa_nodes.size() != static_cast<size_t>(num_shards)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Shard descriptor for shard_idx ", shard_idx, " has ",
+        desc.slot_numa_nodes.size(),
+        " slot NUMA nodes; expected none or num_shards=", num_shards, "."));
+  }
   absl::MutexLock lock(mu_);
   const int32_t submanager_idx = desc.effective_submanager_idx(num_shards);
   int32_t key = (listener_port > 0)
@@ -262,7 +291,6 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
                                           : -(submanager_idx + 1000));
   auto& ws = ws_map_[key];
   if (ws == nullptr) {
-    const size_t local_submanager_idx = ws_map_.size() - 1;
     std::optional<int> opt_listener_port =
         (listener_port >= 0)
             ? std::make_optional(
@@ -273,17 +301,19 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
             ? std::make_optional(local_port + submanager_idx)
             : (local_port == 0 ? std::make_optional(0) : std::nullopt);
 
-    std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses();
-    std::vector<HostNicAddress> data_nics;
-    for (const auto& nic : host_nics) {
-      if (nic.classification == NicClassification::kDataPlane) {
-        data_nics.push_back(nic);
-      }
-    }
-    std::optional<std::string> sub_bind_ip = std::nullopt;
-    if (!data_nics.empty()) {
-      sub_bind_ip =
-          data_nics[local_submanager_idx % data_nics.size()].ip_address;
+    // One shard per local slot on its NUMA node. The core derives the distinct
+    // NUMA nodes from this placement and binds the data NICs of each; with no
+    // known node it binds only the host's first data NIC.
+    std::vector<transport::ShardInfo> shards;
+    shards.reserve(static_cast<size_t>(std::max(num_shards, 0)));
+    for (int32_t slot = 0; slot < num_shards; ++slot) {
+      shards.push_back(
+          {.local_index = slot,
+           // Global shard indices are recorded via SetGlobalShardIndices below.
+           .global_index = -1,
+           .numa_node = desc.slot_numa_nodes.empty()
+                            ? -1
+                            : desc.slot_numa_nodes[static_cast<size_t>(slot)]});
     }
 
     // Shared instances are intentionally never freed (see ClearSharedWsMap).
@@ -291,8 +321,11 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
         std::unique_ptr<WeightSynchronizerBase> created,
         WeightSynchronizerBase::Create(
             static_cast<size_t>(num_layers), static_cast<size_t>(num_shards),
-            slice_byte_sizes, opt_local_port, std::nullopt, parallelism,
-            opt_listener_port, sub_bind_ip));
+            slice_byte_sizes, opt_local_port,
+            /*host_blocks_to_allocate=*/std::nullopt, parallelism,
+            opt_listener_port, /*bind_ip=*/std::nullopt, /*layer_names=*/{},
+            /*auto_h2d=*/false, /*numa_nodes=*/{}, host_nics_(),
+            std::move(shards)));
     ws = created.release();
   }
   auto& slot_map = ws_shard_to_slot_map_[ws];
@@ -393,13 +426,21 @@ absl::Status WeightSynchronizerFfiManager::WriteShardEndpoints(
   if (!port.has_value()) {
     return absl::InternalError("WS has no local port assigned.");
   }
+  const size_t local_slot = GetLocalSlot(shard_idx);
+  const std::vector<std::string> slot_ips = ws->local_ips_for_shard(local_slot);
+  if (slot_ips.empty()) {
+    return absl::InternalError(absl::StrCat("No local IP serves shard_idx ",
+                                            shard_idx, " (local slot ",
+                                            local_slot, ")."));
+  }
   ShardEndpoints endpoints;
-  endpoints.data_ip = ws->local_ip();
+  endpoints.data_ip = slot_ips.front();
   endpoints.data_port = *port;
   endpoints.listener_port = ws->listener_port().value_or(0);
   if (out.size() >= kEndpointsControlIpWidth) {
-    endpoints.control_ip =
-        ResolveControlPlaneIp(GetLocalHostNicAddresses(), endpoints.data_ip);
+    // Falls back to the instance's bound IP (not the slot's data IP) so that
+    // every slot of one instance reports the same control-plane IP.
+    endpoints.control_ip = ResolveControlPlaneIp(host_nics_(), ws->local_ip());
   }
   return endpoints.PackToSpan(out);
 }
@@ -446,7 +487,7 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
                            "shard_idx_buf null.");
   }
   absl::StatusOr<FfiShardDescriptor> desc =
-      FfiShardDescriptor::FromSpan(Int32Span(shard_idx_buf));
+      FfiShardDescriptor::FromSpan(Int32Span(shard_idx_buf), num_shards);
   if (!desc.ok()) {
     return StatusToFfiError(desc.status());
   }
@@ -541,7 +582,7 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
                            "shard_idx_buf has null untyped data.");
   }
   absl::StatusOr<FfiShardDescriptor> desc =
-      FfiShardDescriptor::FromSpan(Int32Span(shard_idx_buf));
+      FfiShardDescriptor::FromSpan(Int32Span(shard_idx_buf), num_shards);
   if (!desc.ok()) {
     return StatusToFfiError(desc.status());
   }
