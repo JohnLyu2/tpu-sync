@@ -26,5 +26,5 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 ## Conventions
 
 - Citation baseline: stated once in `verification/README.md` §Status; every file under `verification/` names the commit it cites. Notes carry their own version stamp.
-- Fork footprint is additive-only (`AGENTS.md`, `notes/`, `verification/`); never edit upstream files, so syncs stay conflict-free.
+- Fork footprint is additive-only (`AGENTS.md`, `notes/`, `verification/`, plus the fork callout at the top of `README.md`); never edit other upstream files, so syncs stay conflict-free.
 - Commit agent-facing files (`AGENTS.md`, `notes/`) separately from `verification/` changes.
