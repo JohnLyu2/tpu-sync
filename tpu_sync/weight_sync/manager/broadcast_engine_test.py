@@ -18,6 +18,7 @@ import asyncio
 import collections
 import threading
 from typing import Any, Optional
+from unittest import mock
 
 from absl.testing import absltest
 
@@ -2229,6 +2230,149 @@ class BroadcastEngineTest(absltest.TestCase):
     # dst_1 only receives eq_idx=1's 4 blocks (2 per layer), NOT eq_idx=0's blocks!
     self.assertEqual(dst1_plans[0].expected_block_count, 4)
     self.assertEqual(dst1_plans[0].expected_layer_chunk_counts, {0: 2, 1: 2})
+
+  def test_coalesce_pipeline_groups_cached_reuses_result_across_transfers(
+      self,
+  ) -> None:
+    """Verifies planner stage groups are coalesced once per cached plan.
+
+    ReshardPlanner emits one StageBroadcastGroup per (eq_class, layer_group)
+    sharing a single canonical plan dict per eq_class. Warm transfers must
+    reuse the coalesced result (and the shared plan dicts) instead of
+    re-merging O(eq_classes x layers x src_units) dict entries per transfer.
+    """
+    src_0 = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    dst_units = [
+        RaidenId(job_name="sampler", job_replica_id=str(i), data_name="w")
+        for i in range(3)
+    ]
+    data_addresses = {src_0: ["10.0.0.1:8000"]}
+    data_addresses.update(
+        {d: [f"10.0.1.{i}:8000"] for i, d in enumerate(dst_units)}
+    )
+    num_layers = 50
+    plans_by_eq = []
+    groups_list = []
+    for eq_idx, d in enumerate(dst_units):
+      eq_plans = {
+          src_0: {
+              pid: {0: [(0, pid * 64, pid * 64, 64, 0, 0, 64, 64, 1)]}
+              for pid in range(4)
+          }
+      }
+      plans_by_eq.append(eq_plans)
+      for l_idx in range(num_layers):
+        groups_list.append(
+            controller_types.StageBroadcastGroup(
+                pool_group=eq_idx,
+                layer_group_idx=l_idx,
+                src_units=[src_0],
+                dst_units=[d],
+                stage_ordered_vars_by_unit={src_0: [(l_idx, l_idx % 4)]},
+                canonical_variable_plans=eq_plans,
+                canonical_relay_plans={},
+                data_addresses=data_addresses,
+            )
+        )
+
+    stages_a, coalesced_a = (
+        broadcast_engine.BroadcastEngine.coalesce_pipeline_groups_cached(
+            groups_list, 4, 1
+        )
+    )
+    self.assertEqual(stages_a, 1)
+    self.assertLen(coalesced_a, 1)
+    self.assertEqual(coalesced_a[0].dst_units, dst_units)
+    self.assertLen(coalesced_a[0].eq_class_groups, 3)
+    # The merged per-eq_class groups reuse the planner's shared plan dicts
+    # rather than copying them layer by layer.
+    for eq_idx, sub_g in enumerate(coalesced_a[0].eq_class_groups):
+      self.assertIs(sub_g.canonical_variable_plans, plans_by_eq[eq_idx])
+      self.assertEqual(
+          sub_g.stage_ordered_vars_by_unit[src_0],
+          [(l_idx, l_idx % 4) for l_idx in range(num_layers)],
+      )
+
+    with mock.patch.object(
+        broadcast_engine,
+        "_coalesce_pipeline_groups",
+        side_effect=AssertionError("must not re-coalesce a cached plan"),
+    ):
+      stages_b, coalesced_b = (
+          broadcast_engine.BroadcastEngine.coalesce_pipeline_groups_cached(
+              groups_list, 4, 1
+          )
+      )
+    self.assertEqual(stages_b, 1)
+    self.assertIs(coalesced_b, coalesced_a)
+
+    # A different (pipeline_target_stages, n_seed) is a separate memo entry.
+    stages_c, coalesced_c = (
+        broadcast_engine.BroadcastEngine.coalesce_pipeline_groups_cached(
+            groups_list, 4, 2
+        )
+    )
+    self.assertEqual(stages_c, 1)
+    self.assertIsNot(coalesced_c, coalesced_a)
+
+    # Two back-to-back pipeline executions over the same planner groups only
+    # coalesce once.
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+    fresh_groups = [
+        controller_types.StageBroadcastGroup(
+            pool_group=g.pool_group,
+            layer_group_idx=g.layer_group_idx,
+            src_units=list(g.src_units),
+            dst_units=list(g.dst_units),
+            stage_ordered_vars_by_unit=g.stage_ordered_vars_by_unit,
+            canonical_variable_plans=g.canonical_variable_plans,
+            canonical_relay_plans=g.canonical_relay_plans,
+            data_addresses=g.data_addresses,
+        )
+        for g in groups_list
+    ]
+    real_coalesce = broadcast_engine._coalesce_pipeline_groups
+    with mock.patch.object(
+        broadcast_engine, "_coalesce_pipeline_groups", wraps=real_coalesce
+    ) as coalesce_mock:
+      for uuid in (11, 12):
+        final_plan = raiden_controller.TransferPlan(
+            src_units=[src_0],
+            dst_units=list(dst_units),
+            plan=None,
+            shard_push_schedules={},
+            worker_data_addresses=data_addresses,
+            uuid=uuid,
+            is_weight_sync=True,
+        )
+        asyncio.run(
+            engine.execute_slice_broadcast_pipeline(
+                groups_list=fresh_groups,
+                final_plan=final_plan,
+                n_seed=1,
+                req_id=f"req_cached_{uuid}",
+                dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+                registered_shards=data_addresses,
+                pipeline_target_stages=4,
+            )
+        )
+    self.assertEqual(coalesce_mock.call_count, 1)
+    sender_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == src_0 and plan.is_sender
+    ]
+    self.assertLen(sender_plans, 2)
+    for plan in sender_plans:
+      self.assertEqual(plan.expected_block_count, num_layers * 3)
+    receiver_plans = [
+        plan for _, plan in rpc_client.invocations if not plan.is_sender
+    ]
+    self.assertLen(receiver_plans, 6)
+    for plan in receiver_plans:
+      self.assertEqual(plan.expected_block_count, num_layers)
 
 
 if __name__ == "__main__":

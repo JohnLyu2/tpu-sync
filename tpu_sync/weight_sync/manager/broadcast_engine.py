@@ -216,22 +216,34 @@ def _coalesce_pipeline_groups(
           merged_stage_ordered_vars: dict[RaidenId, list[tuple[int, int]]] = {
               u: [] for u in first.src_units
           }
-          merged_canonical_vars: dict[
-              RaidenId, dict[int, dict[int, list[Any]]]
-          ] = {u: {} for u in first.src_units}
-          merged_canonical_relays: dict[
-              int, dict[int, list[tuple[int, int, int]]]
-          ] = {}
+          for u in first.src_units:
+            u_vars = merged_stage_ordered_vars[u]
+            for g in chunk:
+              u_vars.extend(g.stage_ordered_vars_by_unit.get(u, ()))
 
-          for g in chunk:
-            for u in first.src_units:
-              merged_stage_ordered_vars[u].extend(
-                  g.stage_ordered_vars_by_unit.get(u, [])
-              )
-              merged_canonical_vars[u].update(
-                  g.canonical_variable_plans.get(u, {})
-              )
-            merged_canonical_relays.update(g.canonical_relay_plans)
+          # ReshardPlanner emits one StageBroadcastGroup per (eq_class,
+          # layer_group) but shares a single canonical plan dict per eq_class
+          # across all of its layer groups. Re-merging those identical dicts
+          # per layer group is O(layers x src_units x plan_ids) per transfer
+          # (tens of millions of dict ops for 60-layer Qwen 397B at 16+16), so
+          # reuse the shared object when every group in the chunk points at it.
+          first_vars = first.canonical_variable_plans
+          if all(g.canonical_variable_plans is first_vars for g in chunk):
+            merged_canonical_vars = first_vars
+          else:
+            merged_canonical_vars = {u: {} for u in first.src_units}
+            for g in chunk:
+              for u in first.src_units:
+                merged_canonical_vars[u].update(
+                    g.canonical_variable_plans.get(u, {})
+                )
+          first_relays = first.canonical_relay_plans
+          if all(g.canonical_relay_plans is first_relays for g in chunk):
+            merged_canonical_relays = first_relays
+          else:
+            merged_canonical_relays = {}
+            for g in chunk:
+              merged_canonical_relays.update(g.canonical_relay_plans)
 
           stage_slot = k // max_per_stage
           coalesced_stage_groups.append(
@@ -347,6 +359,77 @@ def _coalesce_pipeline_groups(
   return coalesced
 
 
+def _groups_need_multi_hop(groups_list: list[Any], n_seed: int) -> bool:
+  """Returns True if any stage group fans out to more than n_seed receivers."""
+  for g in groups_list:
+    if not g:
+      continue
+    if isinstance(g, controller_types.StageBroadcastGroup):
+      sub_groups = getattr(g, "eq_class_groups", None)
+      if sub_groups:
+        if any(len(sub.dst_units) > n_seed for sub in sub_groups):
+          return True
+      elif len(g.dst_units) > n_seed:
+        return True
+    elif len({t[0] for _, targets in g for t in targets}) > n_seed:
+      return True
+  return False
+
+
+def _coalesce_pipeline_groups_cached(
+    groups_list: list[Any],
+    pipeline_target_stages: int,
+    n_seed: int,
+) -> tuple[int, list[Any]]:
+  """Coalesces planner stage groups into pipeline stages, memoized per plan.
+
+  ReshardPlanner emits one StageBroadcastGroup per (eq_class, layer_group),
+  which is O(100k) groups for a 60-layer model at 128 destination units. The
+  coalesced result only depends on the (immutable) planner groups, n_seed and
+  pipeline_target_stages, so it is memoized on the first group's
+  `cached_hop_schedules` dict, which lives as long as the cached transfer
+  schedule. This keeps warm transfers from re-walking every planner group.
+
+  Args:
+    groups_list: Planner stage groups (StageBroadcastGroup or legacy lists).
+    pipeline_target_stages: Requested number of pipeline stages.
+    n_seed: Seed fan-out per equivalence class.
+
+  Returns:
+    (effective_target_stages, coalesced_groups_list).
+  """
+  memo: Optional[dict[Any, Any]] = None
+  memo_key = None
+  if groups_list and isinstance(
+      groups_list[0], controller_types.StageBroadcastGroup
+  ):
+    memo = getattr(groups_list[0], "cached_hop_schedules", None)
+    if memo is not None:
+      memo_key = (
+          "__coalesced_pipeline__",
+          pipeline_target_stages,
+          n_seed,
+          len(groups_list),
+          id(groups_list[-1]),
+      )
+      cached = memo.get(memo_key)
+      if cached is not None:
+        return cached
+
+  effective_target_stages = (
+      pipeline_target_stages
+      if _groups_need_multi_hop(groups_list, n_seed)
+      else 1
+  )
+  coalesced = _coalesce_pipeline_groups(
+      groups_list, target_stages=effective_target_stages, n_seed=n_seed
+  )
+  result = (effective_target_stages, coalesced)
+  if memo is not None and memo_key is not None:
+    memo[memo_key] = result
+  return result
+
+
 class _HopTask:
   """A single transfer hop in the deterministic broadcast tree."""
 
@@ -440,6 +523,9 @@ class BroadcastEngine:
       _coalesce_contiguous_relay_entries
   )
   _coalesce_pipeline_groups = staticmethod(_coalesce_pipeline_groups)
+  coalesce_pipeline_groups_cached = staticmethod(
+      _coalesce_pipeline_groups_cached
+  )
 
   def __init__(
       self,
@@ -602,23 +688,10 @@ class BroadcastEngine:
     if max_chunk_bytes <= 0:
       raise ValueError(f"max_chunk_bytes must be > 0, got {max_chunk_bytes}")
 
-    effective_target_stages = (
-        pipeline_target_stages
-        if any(
-            (
-                any(len(sub.dst_units) > n_seed for sub in g.eq_class_groups)
-                if getattr(g, "eq_class_groups", None)
-                else len(g.dst_units) > n_seed
-            )
-            if isinstance(g, controller_types.StageBroadcastGroup)
-            else len({t[0] for _, targets in g for t in targets}) > n_seed
-            for g in groups_list
-            if g
+    effective_target_stages, coalesced_groups_list = (
+        _coalesce_pipeline_groups_cached(
+            groups_list, pipeline_target_stages, n_seed
         )
-        else 1
-    )
-    coalesced_groups_list = _coalesce_pipeline_groups(
-        groups_list, target_stages=effective_target_stages, n_seed=n_seed
     )
 
     groups: list[_GroupBroadcastState] = []

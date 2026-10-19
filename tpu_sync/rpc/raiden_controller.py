@@ -679,6 +679,53 @@ class RaidenController:
         broadcast_pipeline_stages=stages,
     )
 
+  def _prepare_cached_schedule(self, schedule: _CachedTransferSchedule) -> None:
+    """Precomputes per-plan artifacts reused by every transfer of `schedule`.
+
+    Coalesces the planner's per-(eq_class, layer_group) StageBroadcastGroups
+    into pipeline stages (memoized on the groups themselves so
+    BroadcastEngine.execute_slice_broadcast_pipeline reuses the result), builds
+    the single-stage 1-hop trainer push schedules, and serializes the sender
+    push schedule protos. Doing this once here keeps all of it off the
+    per-transfer critical path.
+
+    Args:
+      schedule: Freshly computed transfer schedule to prepare in place.
+    """
+    if not schedule.computed_schedules and schedule.broadcast_groups:
+      groups_list = list(schedule.broadcast_groups.values())
+      if groups_list and isinstance(
+          groups_list[0], controller_types.StageBroadcastGroup
+      ):
+        effective_stages, coalesced_groups = (
+            BroadcastEngine.coalesce_pipeline_groups_cached(
+                groups_list,
+                self.broadcast_pipeline_stages,
+                schedule.n_seed,
+            )
+        )
+        # Only a single-stage 1-hop plan reuses precomputed trainer push
+        # schedules (`is_single_stage_1hop` in BroadcastEngine._dispatch_hop);
+        # multi-hop pipelines build per-hop schedules at dispatch time.
+        if effective_stages == 1:
+          for stage_group in coalesced_groups:
+            sg_scheds = BroadcastEngine.build_stage_trainer_push_schedules(
+                stage_group,
+                stage_group.dst_units,
+                registered_shards=self._registered_shards,
+            )
+            for s_u, sched_map in sg_scheds.items():
+              target_map = schedule.computed_schedules.setdefault(s_u, {})
+              target_map.update(sched_map)
+    raw_schedules = schedule.direct_schedules or schedule.computed_schedules
+    if raw_schedules:
+      for src_u, push_schedules in raw_schedules.items():
+        if src_u not in schedule.sender_push_schedule_protos and push_schedules:
+          src_ent = self.get_or_create_entity(src_u)
+          schedule.sender_push_schedule_protos[src_u] = (
+              src_ent.build_sender_push_schedule_protos(push_schedules)
+          )
+
   async def warmup_transfer_plan(
       self,
       src_units: list[RaidenId],
@@ -712,14 +759,7 @@ class RaidenController:
         req_id="warmup",
         uuid=str(random.randint(1, 2**63 - 1)),
     )
-    raw_schedules = schedule.direct_schedules or schedule.computed_schedules
-    if raw_schedules:
-      for src_u, push_schedules in raw_schedules.items():
-        if src_u not in schedule.sender_push_schedule_protos and push_schedules:
-          src_ent = self.get_or_create_entity(src_u)
-          schedule.sender_push_schedule_protos[src_u] = (
-              src_ent.build_sender_push_schedule_protos(push_schedules)
-          )
+    self._prepare_cached_schedule(schedule)
     with self._lock:
       self._plan_cache[cache_key] = schedule
     return schedule
@@ -1220,46 +1260,7 @@ class RaidenController:
                 req_id=req_id,
                 uuid=uuid,
             )
-            if (
-                not cached_schedule.computed_schedules
-                and cached_schedule.broadcast_groups
-            ):
-              groups_list = list(cached_schedule.broadcast_groups.values())
-              if groups_list and isinstance(
-                  groups_list[0], controller_types.StageBroadcastGroup
-              ):
-                coalesced_groups = BroadcastEngine._coalesce_pipeline_groups(
-                    groups_list,
-                    target_stages=1,
-                    n_seed=cached_schedule.n_seed,
-                )
-                for stage_group in coalesced_groups:
-                  sg_scheds = (
-                      BroadcastEngine.build_stage_trainer_push_schedules(
-                          stage_group,
-                          stage_group.dst_units,
-                          registered_shards=self._registered_shards,
-                      )
-                  )
-                  for s_u, sched_map in sg_scheds.items():
-                    target_map = cached_schedule.computed_schedules.setdefault(
-                        s_u, {}
-                    )
-                    target_map.update(sched_map)
-            raw_schedules = (
-                cached_schedule.direct_schedules
-                or cached_schedule.computed_schedules
-            )
-            if raw_schedules:
-              for src_u, push_schedules in raw_schedules.items():
-                if (
-                    src_u not in cached_schedule.sender_push_schedule_protos
-                    and push_schedules
-                ):
-                  src_ent = self.get_or_create_entity(src_u)
-                  cached_schedule.sender_push_schedule_protos[src_u] = (
-                      src_ent.build_sender_push_schedule_protos(push_schedules)
-                  )
+            self._prepare_cached_schedule(cached_schedule)
             if self.enable_plan_cache and not shard_push_schedules:
               with self._lock:
                 self._plan_cache[cache_key] = cached_schedule
