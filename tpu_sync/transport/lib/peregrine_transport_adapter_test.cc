@@ -36,9 +36,6 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "peregrine/src/api/transport.h"
-#include "peregrine/src/api/transport_types.h"
-#include "peregrine/src/api/transport_util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
@@ -47,11 +44,10 @@ namespace {
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::IsEmpty;
-using ::testing::NotNull;
 
-std::string PickUnusedLoopbackEndpoint() {
+int PickUnusedLoopbackPort() {
   const int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return "";
+  if (fd < 0) return 0;
   int reuse = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
   sockaddr_in addr = {};
@@ -60,54 +56,80 @@ std::string PickUnusedLoopbackEndpoint() {
   addr.sin_port = 0;
   if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     close(fd);
-    return "";
+    return 0;
   }
   socklen_t len = sizeof(addr);
   if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
     close(fd);
-    return "";
+    return 0;
   }
   const uint16_t port = ntohs(addr.sin_port);
   close(fd);
-  return absl::StrCat("127.0.0.1:", port);
+  return port;
 }
 
-// Creates a real Peregrine TCP transport listening on a loopback endpoint.
-std::unique_ptr<::peregrine::Transport> CreateLoopbackTransport() {
-  const std::string endpoint = PickUnusedLoopbackEndpoint();
-  if (endpoint.empty()) return nullptr;
-  return ::peregrine::CreateTransport(endpoint, ::peregrine::TransportType::kTcp,
-                                      /*num_conns_per_peer=*/1);
+// Adapter bound to 127.0.0.1 on a kernel-assigned port.
+absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> CreateAdapter(
+    int num_conns_per_peer = 1) {
+  return PeregrineTransportAdapter::Create("127.0.0.1", /*port=*/0,
+                                           num_conns_per_peer);
 }
 
-TEST(PeregrineTransportAdapterTest, NullTransportFailsGracefully) {
-  PeregrineTransportAdapter adapter(
-      std::unique_ptr<::peregrine::Transport>(nullptr));
+TEST(PeregrineTransportAdapterTest, CreateBindsKernelAssignedPort) {
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      CreateAdapter(/*num_conns_per_peer=*/4);
+  ABSL_ASSERT_OK(adapter);
+  EXPECT_GT((*adapter)->local_port(), 0);
+}
 
-  uint8_t buf[4] = {1, 2, 3, 4};
+TEST(PeregrineTransportAdapterTest, CreateBindsRequestedPort) {
+  const int port = PickUnusedLoopbackPort();
+  ASSERT_NE(port, 0);
+
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      PeregrineTransportAdapter::Create("127.0.0.1", port,
+                                        /*num_conns_per_peer=*/1);
+  ABSL_ASSERT_OK(adapter);
+  EXPECT_EQ((*adapter)->local_port(), port);
+}
+
+TEST(PeregrineTransportAdapterTest, CreateBindsIpv6Loopback) {
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      PeregrineTransportAdapter::Create("::1", /*port=*/0,
+                                        /*num_conns_per_peer=*/1);
+  if (!adapter.ok()) {
+    GTEST_SKIP() << "IPv6 loopback unavailable: " << adapter.status();
+  }
+  EXPECT_GT((*adapter)->local_port(), 0);
+}
+
+TEST(PeregrineTransportAdapterTest, ReceiverAllocatedPushIsUnimplemented) {
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      CreateAdapter();
+  ABSL_ASSERT_OK(adapter);
+
+  uint8_t buf[4] = {};
   Request req = {};
-  req.op = TransferOp::kBlockPushExplicit;
+  req.op = TransferOp::kBlockPush;
   req.laddr = buf;
   req.raddr = buf;
   req.len = sizeof(buf);
 
   absl::Status callback_status = absl::OkStatus();
-  absl::StatusOr<Handle> handle = adapter.Post(
-      /*peers=*/{"127.0.0.1:1234"}, /*requests=*/absl::MakeConstSpan(&req, 1),
+  absl::StatusOr<Handle> handle = (*adapter)->Post(
+      /*peers=*/{"127.0.0.1:1234"}, absl::MakeConstSpan(&req, 1),
       /*src_block_ids=*/{}, /*dst_block_ids=*/{},
       [&](absl::StatusOr<std::vector<int>> result) {
         callback_status = result.status();
       });
-
-  EXPECT_THAT(handle, StatusIs(absl::StatusCode::kFailedPrecondition));
-  EXPECT_THAT(callback_status, StatusIs(absl::StatusCode::kFailedPrecondition));
-  EXPECT_THAT(adapter.Poll(1), StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(handle, StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_THAT(callback_status, StatusIs(absl::StatusCode::kUnimplemented));
 }
 
 TEST(PeregrineTransportAdapterTest, PostWithEmptyPeersFails) {
-  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
-  ASSERT_THAT(transport, NotNull());
-  PeregrineTransportAdapter adapter(std::move(transport));
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      CreateAdapter();
+  ABSL_ASSERT_OK(adapter);
 
   uint8_t buf[4] = {1, 2, 3, 4};
   Request req = {};
@@ -117,7 +139,7 @@ TEST(PeregrineTransportAdapterTest, PostWithEmptyPeersFails) {
   req.len = sizeof(buf);
 
   absl::Status callback_status = absl::OkStatus();
-  absl::StatusOr<Handle> handle = adapter.Post(
+  absl::StatusOr<Handle> handle = (*adapter)->Post(
       /*peers=*/{}, /*requests=*/absl::MakeConstSpan(&req, 1),
       /*src_block_ids=*/{}, /*dst_block_ids=*/{},
       [&](absl::StatusOr<std::vector<int>> result) {
@@ -129,12 +151,12 @@ TEST(PeregrineTransportAdapterTest, PostWithEmptyPeersFails) {
 }
 
 TEST(PeregrineTransportAdapterTest, PostWithEmptyRequestsFails) {
-  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
-  ASSERT_THAT(transport, NotNull());
-  PeregrineTransportAdapter adapter(std::move(transport));
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      CreateAdapter();
+  ABSL_ASSERT_OK(adapter);
 
   absl::Status callback_status = absl::OkStatus();
-  absl::StatusOr<Handle> handle = adapter.Post(
+  absl::StatusOr<Handle> handle = (*adapter)->Post(
       /*peers=*/{"127.0.0.1:1234"}, /*requests=*/{},
       /*src_block_ids=*/{}, /*dst_block_ids=*/{},
       [&](absl::StatusOr<std::vector<int>> result) {
@@ -146,9 +168,9 @@ TEST(PeregrineTransportAdapterTest, PostWithEmptyRequestsFails) {
 }
 
 TEST(PeregrineTransportAdapterTest, PostSynchronousFailureInvokesCallback) {
-  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
-  ASSERT_THAT(transport, NotNull());
-  PeregrineTransportAdapter adapter(std::move(transport));
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      CreateAdapter();
+  ABSL_ASSERT_OK(adapter);
 
   uint8_t buf[4] = {1, 2, 3, 4};
   Request req = {};
@@ -159,7 +181,7 @@ TEST(PeregrineTransportAdapterTest, PostSynchronousFailureInvokesCallback) {
 
   // Peregrine rejects a malformed peer endpoint synchronously.
   absl::Status callback_status = absl::OkStatus();
-  absl::StatusOr<Handle> handle = adapter.Post(
+  absl::StatusOr<Handle> handle = (*adapter)->Post(
       /*peers=*/{"invalid"}, /*requests=*/absl::MakeConstSpan(&req, 1),
       /*src_block_ids=*/{}, /*dst_block_ids=*/{},
       [&](absl::StatusOr<std::vector<int>> result) {
@@ -171,31 +193,22 @@ TEST(PeregrineTransportAdapterTest, PostSynchronousFailureInvokesCallback) {
 }
 
 TEST(PeregrineTransportAdapterTest, PollUnknownHandleFails) {
-  std::unique_ptr<::peregrine::Transport> transport = CreateLoopbackTransport();
-  ASSERT_THAT(transport, NotNull());
-  PeregrineTransportAdapter adapter(std::move(transport));
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> adapter =
+      CreateAdapter();
+  ABSL_ASSERT_OK(adapter);
 
-  EXPECT_THAT(adapter.Poll(12345), StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT((*adapter)->Poll(12345), StatusIs(absl::StatusCode::kNotFound));
 }
 
 TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
-  const std::string local_endpoint = PickUnusedLoopbackEndpoint();
-  const std::string remote_endpoint = PickUnusedLoopbackEndpoint();
-  ASSERT_FALSE(local_endpoint.empty());
-  ASSERT_FALSE(remote_endpoint.empty());
-
-  std::unique_ptr<::peregrine::Transport> local_transport =
-      ::peregrine::CreateTransport(local_endpoint,
-                                   ::peregrine::TransportType::kTcp,
-                                   /*num_conns_per_peer=*/2);
-  std::unique_ptr<::peregrine::Transport> remote_transport =
-      ::peregrine::CreateTransport(remote_endpoint,
-                                   ::peregrine::TransportType::kTcp,
-                                   /*num_conns_per_peer=*/2);
-  ASSERT_NE(local_transport, nullptr);
-  ASSERT_NE(remote_transport, nullptr);
-  PeregrineTransportAdapter local_adapter(std::move(local_transport));
-  PeregrineTransportAdapter remote_adapter(std::move(remote_transport));
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> local =
+      CreateAdapter(/*num_conns_per_peer=*/2);
+  ABSL_ASSERT_OK(local);
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> remote =
+      CreateAdapter(/*num_conns_per_peer=*/2);
+  ABSL_ASSERT_OK(remote);
+  const std::string remote_endpoint =
+      absl::StrCat("127.0.0.1:", (*remote)->local_port());
 
   std::vector<uint8_t> src_buf = {10, 20, 30, 40, 50, 60, 70, 80};
   std::vector<uint8_t> remote_buf(src_buf.size(), 0);
@@ -209,7 +222,7 @@ TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
 
   absl::Notification write_done;
   absl::StatusOr<std::vector<int>> write_result;
-  absl::StatusOr<Handle> write_handle = local_adapter.Post(
+  absl::StatusOr<Handle> write_handle = (*local)->Post(
       /*peers=*/{remote_endpoint},
       /*requests=*/absl::MakeConstSpan(&write_req, 1),
       /*src_block_ids=*/{}, /*dst_block_ids=*/{},
@@ -231,16 +244,17 @@ TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
   read_req.raddr = remote_buf.data();
   read_req.len = read_buf.size();
 
-  absl::StatusOr<Handle> read_handle = local_adapter.Post(
+  absl::StatusOr<Handle> read_handle = (*local)->Post(
       /*peers=*/{remote_endpoint},
       /*requests=*/absl::MakeConstSpan(&read_req, 1),
-      /*src_block_ids=*/{}, /*dst_block_ids=*/{}, /*on_complete=*/nullptr);
+      /*src_block_ids=*/{}, /*dst_block_ids=*/{},
+      /*on_complete=*/nullptr);
   ABSL_ASSERT_OK(read_handle);
 
   Status poll_status = Status::kInProgress;
   const absl::Time deadline = absl::Now() + absl::Seconds(10);
   while (absl::Now() < deadline) {
-    absl::StatusOr<Status> current = local_adapter.Poll(*read_handle);
+    absl::StatusOr<Status> current = (*local)->Poll(*read_handle);
     ABSL_ASSERT_OK(current);
     poll_status = *current;
     if (poll_status != Status::kInProgress) {

@@ -14,18 +14,24 @@
 
 #include "tpu_sync/transport/lib/peregrine_transport_adapter.h"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/transport.h"
 #include "peregrine/src/api/transport_types.h"
+#include "peregrine/src/api/transport_util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
@@ -40,20 +46,48 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   return status;
 }
 
+// Port of an "ip:port" / "[ipv6]:port" endpoint, or -1 if it has none.
+int PortOf(absl::string_view endpoint) {
+  const size_t colon = endpoint.rfind(':');
+  if (colon == absl::string_view::npos) return -1;
+  int port;
+  return absl::SimpleAtoi(endpoint.substr(colon + 1), &port) ? port : -1;
+}
+
 }  // namespace
 
+absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>>
+PeregrineTransportAdapter::Create(absl::string_view bind_ip, int port,
+                                  int num_conns_per_peer) {
+  const std::string endpoint = absl::StrContains(bind_ip, ':')
+                                   ? absl::StrCat("[", bind_ip, "]:", port)
+                                   : absl::StrCat(bind_ip, ":", port);
+  std::unique_ptr<::peregrine::Transport> transport =
+      ::peregrine::CreateTransport(endpoint, ::peregrine::TransportType::kTcp,
+                                   num_conns_per_peer);
+  if (transport == nullptr) {
+    return absl::UnavailableError(
+        absl::StrCat("Failed to create Peregrine transport on ", endpoint));
+  }
+  const int local_port = PortOf(transport->GetControlEndpoint());
+  if (local_port <= 0) {
+    return absl::InternalError(
+        absl::StrCat("Peregrine transport on ", endpoint,
+                     " reported an invalid control endpoint: ",
+                     transport->GetControlEndpoint()));
+  }
+  return absl::WrapUnique(
+      new PeregrineTransportAdapter(std::move(transport), local_port));
+}
+
 PeregrineTransportAdapter::PeregrineTransportAdapter(
-    std::unique_ptr<::peregrine::Transport> transport)
-    : transport_(std::move(transport)) {}
+    std::unique_ptr<::peregrine::Transport> transport, int local_port)
+    : transport_(std::move(transport)), local_port_(local_port) {}
 
 absl::StatusOr<Handle> PeregrineTransportAdapter::Post(
     absl::Span<const std::string> peers, absl::Span<const Request> requests,
     absl::Span<const int> /*src_block_ids*/,
     absl::Span<const int> /*dst_block_ids*/, CompletionCallback on_complete) {
-  if (transport_ == nullptr) {
-    return ReportError(on_complete, absl::FailedPreconditionError(
-                                        "Peregrine transport is null"));
-  }
   if (peers.empty()) {
     return ReportError(on_complete,
                        absl::InvalidArgumentError("Peers cannot be empty"));
@@ -130,9 +164,6 @@ absl::StatusOr<Handle> PeregrineTransportAdapter::Post(
 }
 
 absl::StatusOr<Status> PeregrineTransportAdapter::Poll(Handle handle) {
-  if (transport_ == nullptr) {
-    return absl::FailedPreconditionError("Peregrine transport is null");
-  }
   return transport_->Poll(::peregrine::Handle(handle));
 }
 

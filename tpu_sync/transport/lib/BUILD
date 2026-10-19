@@ -94,13 +94,16 @@ cc_library(
     hdrs = ["peregrine_transport_adapter.h"],
     deps = [
         ":transport_adapter",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api:transport",
         "@peregrine//peregrine/src/api:transport_types",
+        "@peregrine//peregrine/src/api:transport_util",
     ],
 )
 
@@ -119,9 +122,6 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/api:transport",
-        "@peregrine//peregrine/src/api:transport_types",
-        "@peregrine//peregrine/src/api:transport_util",
     ],
 )
 

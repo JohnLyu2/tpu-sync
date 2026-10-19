@@ -59,6 +59,8 @@ class SocketTransportAdapter : public TransportAdapter {
 
   absl::StatusOr<Status> Poll(Handle handle) override;
 
+  int local_port() const override { return raw_transport_->local_port(); }
+
   static constexpr int kDefaultMaxSocketWorkers = 64;
 
   struct Config {

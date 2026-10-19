@@ -102,6 +102,9 @@ class TransportAdapter {
 
   virtual absl::StatusOr<Status> Poll(Handle handle) = 0;
 
+  // Port peers use to reach this transport.
+  virtual int local_port() const = 0;
+
   virtual ::peregrine::TransportMetrics GetTransportMetrics() const {
     return {};
   }
