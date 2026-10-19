@@ -29,6 +29,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -76,8 +77,10 @@ struct FfiShardDescriptor {
   std::vector<int32_t> slot_numa_nodes;
 
   // Parses |raw| for a submanager of |num_shards| slots. Fails if |raw| is
-  // empty, `shard_idx` is outside [0, kMaxShards), |raw| has more than 4 but
-  // not exactly `4 + num_shards` elements, or a NUMA node is below -1.
+  // empty, `shard_idx` is outside [0, kMaxShards), `local_slot`,
+  // `submanager_idx`, or `global_shard_idx` is below -1 (absent), |raw| has
+  // more than 4 but not exactly `4 + num_shards` elements, or a NUMA node is
+  // below -1.
   static absl::StatusOr<FfiShardDescriptor> FromSpan(
       absl::Span<const int32_t> raw, int32_t num_shards);
 
@@ -104,10 +107,13 @@ struct ShardEndpoints {
 };
 
 // Owns the `WeightSynchronizerBase` instances behind one family of FFI
-// handlers, keyed by `shard_idx`. Shards of the same submanager (same listener
-// port key) share one instance, which avoids re-binding its sockets; each shard
-// is assigned a local slot within that instance. Instances are only deleted by
-// `Clear(/*delete_instances=*/true)`.
+// handlers, keyed by `shard_idx`. Shards of the same submanager (same
+// submanager index, listener port, and local port) share one instance, which
+// avoids re-binding its sockets; each shard is assigned a local slot within
+// that instance. Re-initializing a shard with the arguments it was registered
+// with returns the same instance and changes nothing; re-initializing it with
+// conflicting arguments fails until the registry is cleared. Instances are only
+// deleted by `Clear(/*delete_instances=*/true)`.
 //
 // There are two independent process-wide registries. `Default()` holds the
 // instances created by the standard FFI (`init_weight_synchronizer`, `ws_*`),
@@ -139,14 +145,27 @@ class WeightSynchronizerFfiManager {
   WeightSynchronizerFfiManager& operator=(const WeightSynchronizerFfiManager&) =
       delete;
 
-  // Returns the instance shared by |desc|'s submanager, creating it on first
-  // use, records |desc|'s local slot and global shard index in it, and
-  // registers it for `desc.shard_idx`. A new instance gets one shard per local
-  // slot on `desc.slot_numa_nodes` and binds the data NICs of the known NUMA
-  // nodes, or only the host's first data NIC when no node is known (see
-  // `RaidenManagerBase::InitTransportServer`). Fails if
-  // `desc.slot_numa_nodes` is neither empty nor |num_shards| long
-  // (InvalidArgument).
+  // Returns the instance shared by |desc|'s submanager, keyed by
+  // `desc.effective_submanager_idx(num_shards)`, |listener_port|, and
+  // |local_port|, creating it on first use, and registers `desc.shard_idx` in
+  // it at local slot `desc.local_slot` (`shard_idx % num_shards` if absent)
+  // with global shard index `desc.effective_global_shard()`. A new instance
+  // gets one shard per local slot on `desc.slot_numa_nodes` and binds the data
+  // NICs of the known NUMA nodes, or only the host's first data NIC when no
+  // node is known (see `RaidenManagerBase::InitTransportServer`).
+  //
+  // Calling it again with the arguments a shard was registered with returns
+  // the same instance and changes nothing. Fails with InvalidArgument if
+  // |num_shards| <= 0, `desc.slot_numa_nodes` is neither empty nor
+  // |num_shards| long, or `desc.local_slot` >= |num_shards|. Fails with
+  // FailedPrecondition, leaving the registry unchanged, if `desc.shard_idx` is
+  // registered to another instance or at another slot or global shard index,
+  // its slot is taken by another shard, the instance was created with another
+  // |num_layers|, |num_shards|, |parallelism|, |slice_byte_sizes|, or
+  // (non-empty) `desc.slot_numa_nodes`, or a new instance would derive the
+  // same listener or data port as an existing one. Re-initializing with
+  // different arguments requires `Clear(/*delete_instances=*/true)` first; a
+  // clear that keeps the instances also keeps their ports bound.
   absl::StatusOr<WeightSynchronizerBase*> GetOrCreateSynchronizer(
       const FfiShardDescriptor& desc, int32_t listener_port, int32_t num_layers,
       int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
@@ -180,21 +199,63 @@ class WeightSynchronizerFfiManager {
   void Clear(bool delete_instances) ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
+  // Selects the instance shared by one submanager, from the
+  // `GetOrCreateSynchronizer` arguments that determine its ports. A negative
+  // port means "none" and is stored as -1.
+  struct InstanceKey {
+    int32_t submanager_idx;
+    int32_t listener_port;
+    int32_t local_port;
+
+    friend bool operator==(const InstanceKey& a, const InstanceKey& b) {
+      return a.submanager_idx == b.submanager_idx &&
+             a.listener_port == b.listener_port && a.local_port == b.local_port;
+    }
+    template <typename H>
+    friend H AbslHashValue(H h, const InstanceKey& key) {
+      return H::combine(std::move(h), key.submanager_idx, key.listener_port,
+                        key.local_port);
+    }
+    template <typename Sink>
+    friend void AbslStringify(Sink& sink, const InstanceKey& key) {
+      sink.Append(absl::StrCat("{submanager_idx=", key.submanager_idx,
+                               ", listener_port=", key.listener_port,
+                               ", local_port=", key.local_port, "}"));
+    }
+  };
+
   struct SlotAndGlobal {
     size_t slot;
     int64_t global_shard;
-    bool has_explicit_global;
   };
+
+  // Creation arguments and registered shards of one instance.
+  struct InstanceInfo {
+    InstanceKey key;
+    int32_t parallelism;
+    std::vector<size_t> slice_byte_sizes;
+    // NUMA node of every local slot; all -1 if created without NUMA nodes.
+    std::vector<int32_t> slot_numa_nodes;
+    // Local slot and global shard index of every registered `shard_idx`.
+    absl::flat_hash_map<int32_t, SlotAndGlobal> shards;
+  };
+
+  // Fails with FailedPrecondition if registering |desc| with these arguments
+  // in the existing instance |ws| would require different creation arguments.
+  absl::Status ValidateReuse(WeightSynchronizerBase* ws,
+                             const FfiShardDescriptor& desc, int32_t num_layers,
+                             int32_t num_shards, int32_t parallelism,
+                             const std::vector<size_t>& slice_byte_sizes) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   mutable absl::Mutex mu_;
   const std::function<std::vector<HostNicAddress>()> host_nics_;
   std::array<WeightSynchronizerBase*, kMaxShards> shard_table_
       ABSL_GUARDED_BY(mu_) = {};
-  absl::flat_hash_map<int32_t, WeightSynchronizerBase*> ws_map_
+  absl::flat_hash_map<InstanceKey, WeightSynchronizerBase*> ws_map_
       ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<WeightSynchronizerBase*,
-                      absl::flat_hash_map<int32_t, SlotAndGlobal>>
-      ws_shard_to_slot_map_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<WeightSynchronizerBase*, InstanceInfo> instances_
+      ABSL_GUARDED_BY(mu_);
   std::atomic<size_t> initialized_shards_{0};
   std::atomic<size_t> multi_h2d_completed_shards_{0};
 };

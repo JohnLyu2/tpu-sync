@@ -1052,6 +1052,60 @@ TEST_P(WeightSynchronizerFfiParamTest, DescriptorNumaNodesSetShardPlacement) {
   EXPECT_EQ(StandardWs(1), nullptr);
 }
 
+TEST_P(WeightSynchronizerFfiParamTest, ReinitIsIdempotentAndRejectsConflicts) {
+  std::vector<int32_t> anchor(256, 7);
+  FfiBufferFixture anchor_fixture(XLA_FFI_DataType_S32, anchor.data(), {256});
+  int32_t slice_byte_size = 1024;
+  FfiBufferFixture sizes_fixture(XLA_FFI_DataType_S32, &slice_byte_size, {1});
+  int32_t shard_idx = 1;
+  FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, &shard_idx, {1});
+  auto init = [&](std::vector<int32_t>& row, int32_t num_layers) {
+    FfiBufferFixture out_fixture(XLA_FFI_DataType_S32, row.data(), {6});
+    return CallInit(anchor_fixture.AsAnyBuffer(), shard_fixture.AsAnyBuffer(),
+                    sizes_fixture.AsAnyBuffer(), /*local_port=*/0,
+                    /*parallelism=*/1, num_layers, out_fixture.AsAnyBuffer(),
+                    /*listener_port=*/0, /*num_shards=*/2);
+  };
+  std::vector<int32_t> first(6, 0);
+  xla::ffi::Error err = init(first, /*num_layers=*/1);
+  ASSERT_TRUE(err.success()) << err.message();
+  WeightSynchronizerBase* ws = StandardWs(1);
+  ASSERT_NE(ws, nullptr);
+
+  // Tunix re-runs init with identical arguments on every rebind.
+  std::vector<int32_t> second(6, 0);
+  err = init(second, /*num_layers=*/1);
+  ASSERT_TRUE(err.success()) << err.message();
+  EXPECT_EQ(StandardWs(1), ws);
+  EXPECT_EQ(WeightSynchronizerFfiManager::Default().GetLocalSlot(1), 1);
+  EXPECT_EQ(second, first);
+
+  std::vector<int32_t> conflicting(6, 0);
+  err = init(conflicting, /*num_layers=*/2);
+  EXPECT_EQ(err.errc(), xla::ffi::ErrorCode::kFailedPrecondition);
+  EXPECT_THAT(err.message(), ::testing::HasSubstr("num_layers 2"));
+  EXPECT_EQ(StandardWs(1), ws);
+}
+
+TEST_P(WeightSynchronizerFfiParamTest, OutOfRangeLocalSlotIsInvalidArgument) {
+  std::vector<int32_t> anchor(256, 7);
+  FfiBufferFixture anchor_fixture(XLA_FFI_DataType_S32, anchor.data(), {256});
+  int32_t slice_byte_size = 1024;
+  FfiBufferFixture sizes_fixture(XLA_FFI_DataType_S32, &slice_byte_size, {1});
+  std::vector<int32_t> desc = {0, /*local_slot=*/2};
+  FfiBufferFixture desc_fixture(XLA_FFI_DataType_S32, desc.data(), {2});
+  std::vector<int32_t> out_data(6, 0);
+  FfiBufferFixture out_fixture(XLA_FFI_DataType_S32, out_data.data(), {6});
+  xla::ffi::Error err = CallInit(
+      anchor_fixture.AsAnyBuffer(), desc_fixture.AsAnyBuffer(),
+      sizes_fixture.AsAnyBuffer(), /*local_port=*/0, /*parallelism=*/1,
+      /*num_layers=*/1, out_fixture.AsAnyBuffer(), /*listener_port=*/-1,
+      /*num_shards=*/2);
+  EXPECT_EQ(err.errc(), xla::ffi::ErrorCode::kInvalidArgument);
+  EXPECT_THAT(err.message(), ::testing::HasSubstr("local_slot 2"));
+  EXPECT_EQ(StandardWs(0), nullptr);
+}
+
 INSTANTIATE_TEST_SUITE_P(FfiTypeTests, WeightSynchronizerFfiParamTest,
                          ::testing::Values(FfiType::kInit,
                                            FfiType::kInitAndD2h));
@@ -1119,6 +1173,20 @@ TEST(FfiShardDescriptorTest, FromSpanRejectsEmptyAndOutOfBoundsShardIdx) {
   EXPECT_THAT(FfiShardDescriptor::FromSpan(too_large, /*num_shards=*/1),
               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
                                      ::testing::HasSubstr("out of bounds")));
+}
+
+TEST(FfiShardDescriptorTest, FromSpanRejectsOptionalFieldsBelowMinusOne) {
+  const std::vector<std::string> names = {"local_slot", "submanager_idx",
+                                          "global_shard_idx"};
+  for (size_t i = 0; i < names.size(); ++i) {
+    SCOPED_TRACE(names[i]);
+    std::vector<int32_t> raw = {0, -1, -1, -1};
+    raw[i + 1] = -2;
+    EXPECT_THAT(FfiShardDescriptor::FromSpan(raw, /*num_shards=*/1),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr(absl::StrCat(names[i], " -2"))));
+  }
 }
 
 using IpBytes = std::array<uint8_t, 16>;
@@ -1242,7 +1310,8 @@ TEST_F(WeightSynchronizerFfiTest, ManagerClearWithDeleteResetsRegistration) {
   EXPECT_THAT(manager->WriteShardEndpoints(0, absl::MakeSpan(row)),
               absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 
-  // Re-registration after Clear assigns slots from scratch.
+  // Re-registration after Clear creates a new instance; a descriptor without
+  // local_slot takes slot shard_idx % num_shards.
   ABSL_ASSERT_OK(
       manager
           ->GetOrCreateSynchronizer(FfiShardDescriptor{.shard_idx = 1},
@@ -1250,7 +1319,7 @@ TEST_F(WeightSynchronizerFfiTest, ManagerClearWithDeleteResetsRegistration) {
                                     /*parallelism=*/1, sizes, /*local_port=*/0,
                                     /*num_shards=*/2)
           .status());
-  EXPECT_EQ(manager->GetLocalSlot(1), 0);
+  EXPECT_EQ(manager->GetLocalSlot(1), 1);
   EXPECT_TRUE(manager->HasActiveListener());
   manager->Clear(/*delete_instances=*/true);
   EXPECT_FALSE(manager->HasActiveListener());
@@ -1346,6 +1415,207 @@ TEST(WeightSynchronizerFfiManagerNumaTest,
   ASSERT_THAT(DataIps(rows), ::testing::ElementsAre(kCardA, kCardB));
   EXPECT_EQ(UnpackIpFromInt32s(rows[0].data() + 6),
             UnpackIpFromInt32s(rows[1].data() + 6));
+  manager.Clear(/*delete_instances=*/true);
+}
+
+// `GetOrCreateSynchronizer` arguments besides the descriptor.
+struct InitArgs {
+  int32_t num_shards = 4;
+  int32_t num_layers = 1;
+  int32_t parallelism = 1;
+  std::vector<size_t> sizes = {1024};
+  int32_t listener_port = -1;
+  int32_t local_port = 0;
+};
+
+absl::StatusOr<WeightSynchronizerBase*> Register(
+    WeightSynchronizerFfiManager& manager, const FfiShardDescriptor& desc,
+    const InitArgs& args = {}) {
+  return manager.GetOrCreateSynchronizer(
+      desc, args.listener_port, args.num_layers, args.parallelism, args.sizes,
+      args.local_port, args.num_shards);
+}
+
+TEST(WeightSynchronizerFfiManagerReuseTest,
+     RecordsCallerShardIndicesForOutOfOrderArrivals) {
+  // Host 0 with 4 chips that arrive in the order 2, 0, 3, 1. Per shard_idx,
+  // each case lists the local slot and global shard index its descriptor
+  // carries (only the first |width| descriptor elements are passed).
+  struct Case {
+    size_t width;
+    std::array<int32_t, 4> slot;
+    std::array<int32_t, 4> global;
+  };
+  const std::vector<Case> cases = {
+      // Tunix destination: mesh position only, so slot = shard_idx % 4.
+      {1, {0, 1, 2, 3}, {0, 1, 2, 3}},
+      {3, {0, 1, 2, 3}, {0, 1, 2, 3}},
+      // Torus ring order: mesh positions 2 and 3 sit in slots 3 and 2.
+      {3, {0, 1, 3, 2}, {0, 1, 2, 3}},
+      // Explicit global shard indices in permuted order.
+      {4, {0, 1, 2, 3}, {0, 2, 1, 3}},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(
+        absl::StrCat("width=", c.width, " slots=", absl::StrJoin(c.slot, ",")));
+    WeightSynchronizerFfiManager manager(TwoSocketNics);
+    for (int32_t shard_idx : {2, 0, 3, 1}) {
+      const std::vector<int32_t> raw = {shard_idx, c.slot[shard_idx], 0,
+                                        c.global[shard_idx]};
+      TF_ASSERT_OK_AND_ASSIGN(
+          FfiShardDescriptor desc,
+          FfiShardDescriptor::FromSpan(absl::MakeConstSpan(raw.data(), c.width),
+                                       /*num_shards=*/4));
+      ABSL_ASSERT_OK(Register(manager, desc).status());
+    }
+    const WeightSynchronizerBase* ws = manager.GetSynchronizerForShard(0);
+    ASSERT_NE(ws, nullptr);
+    for (int32_t shard_idx = 0; shard_idx < 4; ++shard_idx) {
+      EXPECT_EQ(manager.GetSynchronizerForShard(shard_idx), ws);
+      EXPECT_EQ(manager.GetLocalSlot(shard_idx),
+                static_cast<size_t>(c.slot[shard_idx]));
+      EXPECT_EQ(ws->global_shard_index(c.slot[shard_idx]), c.global[shard_idx]);
+    }
+    manager.Clear(/*delete_instances=*/true);
+  }
+}
+
+TEST(WeightSynchronizerFfiManagerReuseTest,
+     ConflictingReinitFailsAndLeavesRegistryUnchanged) {
+  WeightSynchronizerFfiManager manager(TwoSocketNics);
+  const FfiShardDescriptor shard0{.shard_idx = 0, .slot_numa_nodes = {0, 1}};
+  TF_ASSERT_OK_AND_ASSIGN(WeightSynchronizerBase * ws,
+                          Register(manager, shard0, {.num_shards = 2}));
+  // Identical arguments, with or without the NUMA nodes, are accepted.
+  EXPECT_THAT(Register(manager, shard0, {.num_shards = 2}),
+              absl_testing::IsOkAndHolds(ws));
+  EXPECT_THAT(Register(manager, {.shard_idx = 0}, {.num_shards = 2}),
+              absl_testing::IsOkAndHolds(ws));
+
+  struct Case {
+    std::string message;
+    FfiShardDescriptor desc;
+    InitArgs args;
+  };
+  const std::vector<Case> cases = {
+      {"bound to the instance of",
+       {.shard_idx = 0},
+       {.num_shards = 2, .local_port = -1}},
+      {"Cannot re-initialize shard_idx 0 with num_layers 2",
+       {.shard_idx = 0},
+       {.num_shards = 2, .num_layers = 2}},
+      // A new shard joining the instance with mismatched arguments.
+      {"Cannot register shard_idx 1 with num_layers 2",
+       {.shard_idx = 1},
+       {.num_shards = 2, .num_layers = 2}},
+      {"num_shards 4", {.shard_idx = 0}, {.num_shards = 4}},
+      {"parallelism 2", {.shard_idx = 0}, {.num_shards = 2, .parallelism = 2}},
+      {"slice_byte_sizes 2048",
+       {.shard_idx = 0},
+       {.num_shards = 2, .sizes = {2048}}},
+      {"slot NUMA nodes 1,0",
+       {.shard_idx = 0, .slot_numa_nodes = {1, 0}},
+       {.num_shards = 2}},
+      {"local slot 1", {.shard_idx = 0, .local_slot = 1}, {.num_shards = 2}},
+      {"global shard index 5",
+       {.shard_idx = 0, .global_shard_idx = 5},
+       {.num_shards = 2}},
+      // Shard 2 of submanager 0 maps to slot 2 % 2 = 0, which shard 0 holds.
+      {"local slot 0 of the instance",
+       {.shard_idx = 2, .submanager_idx = 0},
+       {.num_shards = 2}},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.message);
+    EXPECT_THAT(Register(manager, c.desc, c.args),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kFailedPrecondition,
+                    ::testing::AllOf(::testing::HasSubstr(c.message),
+                                     ::testing::HasSubstr(
+                                         "destroy_weight_synchronizer()"))));
+  }
+  EXPECT_EQ(manager.GetSynchronizerForShard(0), ws);
+  EXPECT_EQ(manager.GetSynchronizerForShard(1), nullptr);
+  EXPECT_EQ(manager.GetSynchronizerForShard(2), nullptr);
+  EXPECT_EQ(manager.GetLocalSlot(0), 0);
+  EXPECT_EQ(ws->global_shard_index(0), 0);
+  manager.Clear(/*delete_instances=*/true);
+}
+
+TEST(WeightSynchronizerFfiManagerReuseTest,
+     RejectsOutOfRangeLocalSlotAndNumShards) {
+  WeightSynchronizerFfiManager manager(TwoSocketNics);
+  EXPECT_THAT(
+      Register(manager, {.shard_idx = 0, .local_slot = 2}, {.num_shards = 2}),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             ::testing::HasSubstr("local_slot 2")));
+  EXPECT_THAT(Register(manager, {.shard_idx = 0}, {.num_shards = 0}),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("num_shards")));
+  EXPECT_EQ(manager.GetSynchronizerForShard(0), nullptr);
+}
+
+TEST(WeightSynchronizerFfiManagerReuseTest,
+     InstanceKeyDistinguishesSubmanagersAndPorts) {
+  WeightSynchronizerFfiManager manager(TwoSocketNics);
+  // An arithmetic key of listener_port and submanager_idx would map these two
+  // to the same instance.
+  TF_ASSERT_OK_AND_ASSIGN(
+      WeightSynchronizerBase * with_listener,
+      Register(manager, {.shard_idx = 0, .submanager_idx = 999},
+               {.num_shards = 1, .listener_port = 0}));
+  TF_ASSERT_OK_AND_ASSIGN(
+      WeightSynchronizerBase * without_listener,
+      Register(manager, {.shard_idx = 1, .submanager_idx = 0},
+               {.num_shards = 1}));
+  EXPECT_NE(without_listener, with_listener);
+  EXPECT_TRUE(with_listener->is_listener_active());
+  EXPECT_FALSE(without_listener->is_listener_active());
+  // A different local_port selects a different instance.
+  TF_ASSERT_OK_AND_ASSIGN(
+      WeightSynchronizerBase * other_local_port,
+      Register(manager, {.shard_idx = 2, .submanager_idx = 0},
+               {.num_shards = 1, .local_port = -1}));
+  EXPECT_NE(other_local_port, without_listener);
+  // Every negative port means "none", so -7 selects the same instance as -1.
+  EXPECT_THAT(Register(manager, {.shard_idx = 2, .submanager_idx = 0},
+                       {.num_shards = 1, .local_port = -7}),
+              absl_testing::IsOkAndHolds(other_local_port));
+
+  // Positive ports are offset by the submanager index, so listener_port P - 1
+  // of submanager 1 and listener_port P of submanager 0 both derive port P.
+  const int32_t port = tsl::testing::PickUnusedPortOrDie();
+  ABSL_ASSERT_OK(Register(manager, {.shard_idx = 3, .submanager_idx = 1},
+                          {.num_shards = 1, .listener_port = port - 1})
+                     .status());
+  EXPECT_THAT(Register(manager, {.shard_idx = 4, .submanager_idx = 0},
+                       {.num_shards = 1, .listener_port = port}),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kFailedPrecondition,
+                  ::testing::HasSubstr("same listener or data port")));
+  EXPECT_EQ(manager.GetSynchronizerForShard(4), nullptr);
+  manager.Clear(/*delete_instances=*/true);
+}
+
+TEST(WeightSynchronizerFfiManagerReuseTest,
+     MultiH2dCountsEachShardOnceAndClearResetsCounts) {
+  WeightSynchronizerFfiManager manager(TwoSocketNics);
+  for (int32_t shard_idx : {0, 1, 0}) {
+    ABSL_ASSERT_OK(
+        Register(manager, {.shard_idx = shard_idx}, {.num_shards = 2})
+            .status());
+  }
+  // A round is two completions; counting the re-initialized shard 0 twice
+  // would make it three.
+  EXPECT_FALSE(manager.RecordMultiH2dCompletion(/*num_shards=*/2));
+  EXPECT_TRUE(manager.RecordMultiH2dCompletion(/*num_shards=*/2));
+  EXPECT_FALSE(manager.RecordMultiH2dCompletion(/*num_shards=*/2));
+
+  manager.Clear(/*delete_instances=*/true);
+  ABSL_ASSERT_OK(
+      Register(manager, {.shard_idx = 0}, {.num_shards = 2}).status());
+  EXPECT_FALSE(manager.RecordMultiH2dCompletion(/*num_shards=*/2));
+  EXPECT_TRUE(manager.RecordMultiH2dCompletion(/*num_shards=*/2));
   manager.Clear(/*delete_instances=*/true);
 }
 

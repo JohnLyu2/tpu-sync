@@ -40,6 +40,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -81,6 +82,24 @@ constexpr size_t kEndpointsControlIpWidth = 10;
 xla::ffi::Error StatusToFfiError(const absl::Status& status) {
   return xla::ffi::Error(static_cast<xla::ffi::ErrorCode>(status.code()),
                          std::string(status.message()));
+}
+
+constexpr absl::string_view kClearRegistryHint =
+    " Re-initializing with different arguments requires deleting the "
+    "instances first (destroy_weight_synchronizer() in Python); a clear that "
+    "keeps them also keeps their ports bound.";
+
+// Returns FailedPrecondition for |action| ("register" or "re-initialize")
+// |shard_idx| with |field| |requested| while the registry holds |registered|.
+template <typename Registered, typename Requested>
+absl::Status ReuseMismatchError(absl::string_view action, int32_t shard_idx,
+                                absl::string_view field,
+                                const Registered& registered,
+                                const Requested& requested) {
+  return absl::FailedPreconditionError(
+      absl::StrCat("Cannot ", action, " shard_idx ", shard_idx, " with ", field,
+                   " ", requested, ": the registry holds ", field, " ",
+                   registered, ".", kClearRegistryHint));
 }
 
 absl::Span<const int32_t> Int32Span(const xla::ffi::AnyBuffer& buf) {
@@ -202,6 +221,17 @@ absl::StatusOr<FfiShardDescriptor> FfiShardDescriptor::FromSpan(
     return absl::InvalidArgumentError(absl::StrCat(
         "shard_idx out of bounds [0, ", kMaxShards, "): ", desc.shard_idx));
   }
+  const std::pair<absl::string_view, int32_t> optional_fields[] = {
+      {"local_slot", desc.local_slot},
+      {"submanager_idx", desc.submanager_idx},
+      {"global_shard_idx", desc.global_shard_idx}};
+  for (const auto& [name, value] : optional_fields) {
+    if (value < -1) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Shard descriptor for shard_idx ", desc.shard_idx, " has ", name, " ",
+          value, "; expected -1 (absent) or a value >= 0."));
+    }
+  }
   if (raw.size() <= kDescriptorBaseWidth) {
     return desc;
   }
@@ -276,6 +306,11 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
     return absl::InvalidArgumentError(absl::StrCat(
         "shard_idx out of bounds [0, ", kMaxShards, "): ", shard_idx));
   }
+  if (num_shards <= 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("num_shards must be positive for shard_idx ", shard_idx,
+                     ": ", num_shards));
+  }
   if (!desc.slot_numa_nodes.empty() &&
       desc.slot_numa_nodes.size() != static_cast<size_t>(num_shards)) {
     return absl::InvalidArgumentError(absl::StrCat(
@@ -283,14 +318,49 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
         desc.slot_numa_nodes.size(),
         " slot NUMA nodes; expected none or num_shards=", num_shards, "."));
   }
-  absl::MutexLock lock(mu_);
+  if (desc.local_slot >= num_shards) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Shard descriptor for shard_idx ", shard_idx,
+                     " has local_slot ", desc.local_slot,
+                     "; expected a slot in [0, num_shards=", num_shards, ")."));
+  }
+  const size_t slot = static_cast<size_t>(
+      desc.local_slot >= 0 ? desc.local_slot : shard_idx % num_shards);
+  const int64_t global_shard = desc.effective_global_shard();
   const int32_t submanager_idx = desc.effective_submanager_idx(num_shards);
-  int32_t key = (listener_port > 0)
-                    ? (listener_port + submanager_idx)
-                    : (listener_port == 0 ? -(submanager_idx + 1)
-                                          : -(submanager_idx + 1000));
-  auto& ws = ws_map_[key];
-  if (ws == nullptr) {
+  const InstanceKey key{.submanager_idx = submanager_idx,
+                        .listener_port = std::max(listener_port, -1),
+                        .local_port = std::max(local_port, -1)};
+
+  absl::MutexLock lock(mu_);
+  auto ws_it = ws_map_.find(key);
+  WeightSynchronizerBase* ws = ws_it == ws_map_.end() ? nullptr : ws_it->second;
+  WeightSynchronizerBase* bound = shard_table_[shard_idx];
+  if (bound != nullptr && bound != ws) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Cannot re-initialize shard_idx ", shard_idx,
+        ": it is bound to the instance of ", instances_.at(bound).key,
+        " but this call selects ", key, ".", kClearRegistryHint));
+  }
+  if (ws != nullptr) {
+    ABSL_RETURN_IF_ERROR(ValidateReuse(ws, desc, num_layers, num_shards,
+                                       parallelism, slice_byte_sizes));
+  } else {
+    // Positive ports are offset by the submanager index, so another key can
+    // derive the same port, which this instance could not bind.
+    for (const auto& [other, unused_ws] : ws_map_) {
+      if ((listener_port > 0 && other.listener_port > 0 &&
+           listener_port + submanager_idx ==
+               other.listener_port + other.submanager_idx) ||
+          (local_port > 0 && other.local_port > 0 &&
+           local_port + submanager_idx ==
+               other.local_port + other.submanager_idx)) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Cannot create an instance of ", key, " for shard_idx ", shard_idx,
+            ": it derives the same listener or data port as the instance of ",
+            other, "."));
+      }
+    }
     std::optional<int> opt_listener_port =
         (listener_port >= 0)
             ? std::make_optional(
@@ -304,16 +374,18 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
     // One shard per local slot on its NUMA node. The core derives the distinct
     // NUMA nodes from this placement and binds the data NICs of each; with no
     // known node it binds only the host's first data NIC.
+    std::vector<int32_t> slot_numa_nodes =
+        desc.slot_numa_nodes.empty()
+            ? std::vector<int32_t>(static_cast<size_t>(num_shards), -1)
+            : desc.slot_numa_nodes;
     std::vector<transport::ShardInfo> shards;
-    shards.reserve(static_cast<size_t>(std::max(num_shards, 0)));
-    for (int32_t slot = 0; slot < num_shards; ++slot) {
+    shards.reserve(static_cast<size_t>(num_shards));
+    for (int32_t s = 0; s < num_shards; ++s) {
       shards.push_back(
-          {.local_index = slot,
+          {.local_index = s,
            // Global shard indices are recorded via SetGlobalShardIndices below.
            .global_index = -1,
-           .numa_node = desc.slot_numa_nodes.empty()
-                            ? -1
-                            : desc.slot_numa_nodes[static_cast<size_t>(slot)]});
+           .numa_node = slot_numa_nodes[static_cast<size_t>(s)]});
     }
 
     // Shared instances are intentionally never freed (see ClearSharedWsMap).
@@ -327,52 +399,80 @@ WeightSynchronizerFfiManager::GetOrCreateSynchronizer(
             /*auto_h2d=*/false, /*numa_nodes=*/{}, host_nics_(),
             std::move(shards)));
     ws = created.release();
+    ws_map_.emplace(key, ws);
+    instances_.emplace(
+        ws, InstanceInfo{.key = key,
+                         .parallelism = parallelism,
+                         .slice_byte_sizes = slice_byte_sizes,
+                         .slot_numa_nodes = std::move(slot_numa_nodes)});
   }
-  auto& slot_map = ws_shard_to_slot_map_[ws];
-  size_t assigned_slot;
-  if (desc.local_slot >= 0 && ws->num_shards() > 0 &&
-      static_cast<size_t>(desc.local_slot) < ws->num_shards()) {
-    assigned_slot = static_cast<size_t>(desc.local_slot);
-  } else {
-    assigned_slot = (ws->num_shards() > 0)
-                        ? (slot_map.size() % ws->num_shards())
-                        : slot_map.size();
-  }
-  auto [it, inserted] = slot_map.try_emplace(
-      shard_idx, SlotAndGlobal{assigned_slot, desc.effective_global_shard(),
-                               desc.has_explicit_global()});
-  if (inserted) {
-    initialized_shards_.fetch_add(1, std::memory_order_release);
-    std::vector<int64_t> indices(ws->num_shards(), -1);
-    std::vector<int> local_indices(ws->num_shards(), -1);
-    int64_t host_base = static_cast<int64_t>(submanager_idx) *
-                        static_cast<int64_t>(ws->num_shards());
-    bool any_explicit_global = false;
-    bool all_in_host_range = (ws->num_shards() > 0);
-    for (const auto& [s_id, s_info] : slot_map) {
-      if (s_info.has_explicit_global) {
-        any_explicit_global = true;
-      }
-      if (s_info.global_shard < host_base ||
-          s_info.global_shard >=
-              host_base + static_cast<int64_t>(ws->num_shards())) {
-        all_in_host_range = false;
-      }
+  InstanceInfo& info = instances_.at(ws);
+  if (auto it = info.shards.find(shard_idx); it != info.shards.end()) {
+    if (it->second.slot != slot) {
+      return ReuseMismatchError("re-initialize", shard_idx, "local slot",
+                                it->second.slot, slot);
     }
-    for (const auto& [s_id, s_info] : slot_map) {
-      if (s_info.slot < indices.size()) {
-        indices[s_info.slot] =
-            (!any_explicit_global && all_in_host_range)
-                ? (host_base + static_cast<int64_t>(s_info.slot))
-                : s_info.global_shard;
-        local_indices[s_info.slot] = static_cast<int>(s_info.slot);
-      }
+    if (it->second.global_shard != global_shard) {
+      return ReuseMismatchError("re-initialize", shard_idx,
+                                "global shard index", it->second.global_shard,
+                                global_shard);
     }
-    ws->SetGlobalShardIndices(std::move(indices));
-    ws->SetLocalShardIndices(std::move(local_indices));
+    return ws;
   }
+  for (const auto& [other_idx, other] : info.shards) {
+    if (other.slot == slot) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Cannot register shard_idx ", shard_idx, ": local slot ", slot,
+          " of the instance of ", info.key, " is already taken by shard_idx ",
+          other_idx, ".", kClearRegistryHint));
+    }
+  }
+  info.shards.emplace(shard_idx, SlotAndGlobal{slot, global_shard});
+  initialized_shards_.fetch_add(1, std::memory_order_release);
+  std::vector<int64_t> indices(ws->num_shards(), -1);
+  std::vector<int> local_indices(ws->num_shards(), -1);
+  for (const auto& [s_id, s_info] : info.shards) {
+    indices[s_info.slot] = s_info.global_shard;
+    local_indices[s_info.slot] = static_cast<int>(s_info.slot);
+  }
+  ws->SetGlobalShardIndices(std::move(indices));
+  ws->SetLocalShardIndices(std::move(local_indices));
   shard_table_[shard_idx] = ws;
   return ws;
+}
+
+absl::Status WeightSynchronizerFfiManager::ValidateReuse(
+    WeightSynchronizerBase* ws, const FfiShardDescriptor& desc,
+    int32_t num_layers, int32_t num_shards, int32_t parallelism,
+    const std::vector<size_t>& slice_byte_sizes) const {
+  const InstanceInfo& info = instances_.at(ws);
+  const int32_t shard_idx = desc.shard_idx;
+  const absl::string_view action =
+      info.shards.contains(shard_idx) ? "re-initialize" : "register";
+  if (static_cast<int64_t>(ws->num_layers()) != num_layers) {
+    return ReuseMismatchError(action, shard_idx, "num_layers", ws->num_layers(),
+                              num_layers);
+  }
+  if (static_cast<int64_t>(ws->num_shards()) != num_shards) {
+    return ReuseMismatchError(action, shard_idx, "num_shards", ws->num_shards(),
+                              num_shards);
+  }
+  if (info.parallelism != parallelism) {
+    return ReuseMismatchError(action, shard_idx, "parallelism",
+                              info.parallelism, parallelism);
+  }
+  if (info.slice_byte_sizes != slice_byte_sizes) {
+    return ReuseMismatchError(action, shard_idx, "slice_byte_sizes",
+                              absl::StrJoin(info.slice_byte_sizes, ","),
+                              absl::StrJoin(slice_byte_sizes, ","));
+  }
+  if (!desc.slot_numa_nodes.empty() &&
+      desc.slot_numa_nodes != info.slot_numa_nodes) {
+    return ReuseMismatchError(action, shard_idx, "slot NUMA nodes",
+                              absl::StrJoin(info.slot_numa_nodes, ","),
+                              absl::StrJoin(desc.slot_numa_nodes, ","));
+  }
+  return absl::OkStatus();
 }
 
 WeightSynchronizerBase* WeightSynchronizerFfiManager::GetSynchronizerForShard(
@@ -403,10 +503,10 @@ size_t WeightSynchronizerFfiManager::GetLocalSlot(int32_t shard_idx) const {
   if (ws == nullptr) {
     return 0;
   }
-  auto it = ws_shard_to_slot_map_.find(ws);
-  if (it != ws_shard_to_slot_map_.end()) {
-    auto slot_it = it->second.find(shard_idx);
-    if (slot_it != it->second.end()) {
+  auto it = instances_.find(ws);
+  if (it != instances_.end()) {
+    auto slot_it = it->second.shards.find(shard_idx);
+    if (slot_it != it->second.shards.end()) {
       return slot_it->second.slot;
     }
   }
@@ -459,7 +559,7 @@ void WeightSynchronizerFfiManager::Clear(bool delete_instances) {
   {
     absl::MutexLock lock(mu_);
     ws_map_.clear();
-    ws_shard_to_slot_map_.clear();
+    instances_.clear();
     initialized_shards_.store(0, std::memory_order_relaxed);
     multi_h2d_completed_shards_.store(0, std::memory_order_relaxed);
     for (WeightSynchronizerBase*& ws : shard_table_) {
@@ -505,24 +605,28 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
     slice_byte_sizes[i] = static_cast<size_t>(sizes_ptr[i]);
   }
 
-  if (WeightSynchronizerFfiManager::Default().GetSynchronizerForShard(
-          shard_idx) == nullptr) {
+  const bool first_init =
+      WeightSynchronizerFfiManager::Default().GetSynchronizerForShard(
+          shard_idx) == nullptr;
+  if (first_init) {
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
         << shard_idx << ", Local Slot: " << desc->local_slot
         << ", Submanager: " << desc->submanager_idx
         << ", Global Shard: " << desc->global_shard_idx;
+  }
 
-    absl::StatusOr<WeightSynchronizerBase*> shared_ws =
-        WeightSynchronizerFfiManager::Default().GetOrCreateSynchronizer(
-            *desc, listener_port, num_layers, parallelism, slice_byte_sizes,
-            local_port, num_shards);
-    if (!shared_ws.ok()) {
-      return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
-                             "Failed to create WeightSynchronizerBase: " +
-                                 std::string(shared_ws.status().message()));
-    }
+  absl::Status init_status =
+      WeightSynchronizerFfiManager::Default()
+          .GetOrCreateSynchronizer(*desc, listener_port, num_layers,
+                                   parallelism, slice_byte_sizes, local_port,
+                                   num_shards)
+          .status();
+  if (!init_status.ok()) {
+    return StatusToFfiError(init_status);
+  }
 
+  if (first_init && g_streams[shard_idx] == nullptr) {
     // Allocate the StreamExecutor Stream once per shard, and cache E2E!
     int64_t dev_id = static_cast<int64_t>(shard_idx);
     auto platform_or =
@@ -600,24 +704,28 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
     slice_byte_sizes[i] = static_cast<size_t>(sizes_ptr[i]);
   }
 
-  if (WeightSynchronizerFfiManager::Default().GetSynchronizerForShard(
-          shard_idx) == nullptr) {
+  const bool first_init =
+      WeightSynchronizerFfiManager::Default().GetSynchronizerForShard(
+          shard_idx) == nullptr;
+  if (first_init) {
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
         << shard_idx << ", Local Slot: " << desc->local_slot
         << ", Submanager: " << desc->submanager_idx
         << ", Global Shard: " << desc->global_shard_idx;
+  }
 
-    absl::StatusOr<WeightSynchronizerBase*> shared_ws =
-        WeightSynchronizerFfiManager::Default().GetOrCreateSynchronizer(
-            *desc, listener_port, num_layers, parallelism, slice_byte_sizes,
-            local_port, num_shards);
-    if (!shared_ws.ok()) {
-      return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
-                             "Failed to create WeightSynchronizerBase: " +
-                                 std::string(shared_ws.status().message()));
-    }
+  absl::Status init_status =
+      WeightSynchronizerFfiManager::Default()
+          .GetOrCreateSynchronizer(*desc, listener_port, num_layers,
+                                   parallelism, slice_byte_sizes, local_port,
+                                   num_shards)
+          .status();
+  if (!init_status.ok()) {
+    return StatusToFfiError(init_status);
+  }
 
+  if (first_init && g_streams[shard_idx] == nullptr) {
     int64_t dev_id = static_cast<int64_t>(shard_idx);
     auto platform_or =
         stream_executor::PlatformManager::PlatformWithName("TPU");
