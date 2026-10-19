@@ -31,6 +31,8 @@
 namespace tpu_raiden::transport::lib {
 namespace {
 
+using ::peregrine::Op;
+
 absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   if (on_complete) {
     on_complete(status);
@@ -61,11 +63,34 @@ absl::StatusOr<Handle> PeregrineTransportAdapter::Post(
                        absl::InvalidArgumentError("Requests cannot be empty"));
   }
 
+  // Every request of one Post carries the same op. Receiver-allocated pushes
+  // have no remote address and cannot be expressed over Peregrine.
+  Op op;
+  switch (requests.front().op) {
+    case TransferOp::kBlockPushExplicit:
+      op = Op::kWrite;
+      break;
+    case TransferOp::kBlockPull:
+      op = Op::kRead;
+      break;
+    case TransferOp::kBlockPush:
+      return ReportError(
+          on_complete,
+          absl::UnimplementedError(
+              "Receiver-allocated block push is not supported over Peregrine; "
+              "explicit destination block ids are required"));
+    default:
+      return ReportError(on_complete,
+                         absl::InvalidArgumentError(absl::StrCat(
+                             "Unsupported op over Peregrine: ",
+                             static_cast<int>(requests.front().op))));
+  }
+
   std::vector<::peregrine::Request> peregrine_requests;
   peregrine_requests.reserve(requests.size());
   for (const Request& req : requests) {
     peregrine_requests.push_back(::peregrine::Request{
-        .op = static_cast<::peregrine::Op>(req.socket_opcode),
+        .op = op,
         .laddr = req.laddr,
         .raddr = req.raddr,
         .len = req.len,

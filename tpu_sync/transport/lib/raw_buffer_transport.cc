@@ -855,7 +855,7 @@ absl::Status RawBufferTransport::PullBuffer(
 
   uint8_t* dest_ptr = base_host_ptr + dst_offset_bytes;
   ABSL_ASSIGN_OR_RETURN(
-      const Request req,
+      const BufferRequest req,
       BuildBufferRequest(buffer_id, src_shard_idx, src_offset_bytes, dest_ptr,
                          size_bytes,
                          /*uuid=*/0, kOpBufferPull));
@@ -887,7 +887,7 @@ std::string RawBufferTransport::SourceIpForPeer(absl::string_view peer) const {
 }
 
 absl::Status RawBufferTransport::ProcessSocketBufferPull(
-    absl::string_view peer, const Request& request) {
+    absl::string_view peer, const BufferRequest& request) {
   if (peer.empty()) {
     absl::Status status =
         absl::InvalidArgumentError("Source peer address cannot be empty");
@@ -1047,7 +1047,7 @@ absl::Status RawBufferTransport::RegisterExpectedLayerChunks(
 }
 
 absl::Status RawBufferTransport::ProcessSocketBufferPush(
-    absl::string_view peer, const Request& request) {
+    absl::string_view peer, const BufferRequest& request) {
   if (peer.empty()) {
     absl::Status status =
         absl::InvalidArgumentError("Destination peer address cannot be empty");
@@ -1055,12 +1055,11 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
     return status;
   }
 
-  const uint8_t opcode = request.socket_opcode;
   const uint64_t uuid = request.uuid;
 
-  if (opcode != kOpBufferPush) {
+  if (request.opcode != kOpBufferPush) {
     absl::Status status = absl::InvalidArgumentError(
-        absl::StrCat("Unsupported buffer push opcode: ", opcode));
+        absl::StrCat("Unsupported buffer push opcode: ", request.opcode));
     RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
     return status;
   }
@@ -1156,42 +1155,35 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
   return absl::OkStatus();
 }
 
-absl::StatusOr<Request> BuildBufferRequest(
+absl::StatusOr<BufferRequest> BuildBufferRequest(
     size_t buffer_id, size_t shard_idx, size_t offset_bytes,
-    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid,
-    uint8_t socket_opcode, size_t dst_stride_bytes, size_t stride_count,
-    size_t src_stride_bytes) {
-  return Request{
-      .socket_opcode = socket_opcode,
+    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid, uint8_t opcode,
+    size_t dst_stride_bytes, size_t stride_count, size_t src_stride_bytes) {
+  return BufferRequest{
+      .opcode = opcode,
       .laddr = const_cast<uint8_t*>(data_ptr),
-      .raddr = nullptr,
       .len = size_bytes,
-      .major_order = 0,
       .layer_idx = static_cast<int>(buffer_id),
-      .parallelism = 1,
       .remote_id = offset_bytes,
       .local_id = static_cast<uint32_t>(shard_idx),
-      .count_or_size = static_cast<uint32_t>(size_bytes),
       .uuid = uuid,
-      .request_id = 0,
       .dst_stride_bytes = dst_stride_bytes,
       .stride_count = stride_count > 0 ? stride_count : 1,
       .src_stride_bytes = src_stride_bytes,
   };
 }
 
-absl::StatusOr<std::vector<Request>> BuildBufferRequests(
-    absl::Span<const BufferPushTask> tasks, uint64_t uuid,
-    uint8_t socket_opcode) {
-  std::vector<Request> requests;
+absl::StatusOr<std::vector<BufferRequest>> BuildBufferRequests(
+    absl::Span<const BufferPushTask> tasks, uint64_t uuid, uint8_t opcode) {
+  std::vector<BufferRequest> requests;
   requests.reserve(tasks.size());
   for (const auto& task : tasks) {
     ABSL_ASSIGN_OR_RETURN(
-        auto req, BuildBufferRequest(task.buffer_id, task.dst_shard_idx,
-                                     task.dst_offset_bytes, task.data_ptr,
-                                     task.size_bytes, uuid, socket_opcode,
-                                     task.dst_stride_bytes, task.count,
-                                     task.src_stride_bytes));
+        auto req,
+        BuildBufferRequest(task.buffer_id, task.dst_shard_idx,
+                           task.dst_offset_bytes, task.data_ptr,
+                           task.size_bytes, uuid, opcode, task.dst_stride_bytes,
+                           task.count, task.src_stride_bytes));
     requests.push_back(std::move(req));
   }
   return requests;
@@ -1293,7 +1285,7 @@ absl::Status RawBufferTransport::PushBuffers(
       batch_timings[batch_idx].start_time = absl::Now();
     }
     ABSL_ASSIGN_OR_RETURN(
-        std::vector<Request> requests,
+        std::vector<BufferRequest> requests,
         BuildBufferRequests(absl::MakeConstSpan(grouped_tasks)
                                 .subspan(batch.start_idx, batch.count),
                             uuid, kOpBufferPushBatched));
@@ -1392,7 +1384,7 @@ absl::Status RawBufferTransport::PushBuffers(
 }
 
 absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
-    absl::string_view peer, absl::Span<const Request> requests) {
+    absl::string_view peer, absl::Span<const BufferRequest> requests) {
   if (peer.empty()) {
     absl::Status status =
         absl::InvalidArgumentError("Destination peer address cannot be empty");

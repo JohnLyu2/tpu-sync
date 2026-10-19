@@ -1136,7 +1136,7 @@ TEST_P(RawBufferTransportTest, ProcessSocketBufferPushRejectsStridedRequest) {
 
   std::vector<uint8_t> payload(256);
   TF_ASSERT_OK_AND_ASSIGN(
-      Request req,
+      BufferRequest req,
       BuildBufferRequest(kBufferId, kDstShardIdx, /*offset_bytes=*/0,
                          payload.data(), /*size_bytes=*/128, /*uuid=*/1234,
                          kOpBufferPush, /*dst_stride_bytes=*/512,

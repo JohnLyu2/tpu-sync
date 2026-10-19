@@ -86,7 +86,7 @@ TEST(PeregrineTransportAdapterTest, NullTransportFailsGracefully) {
 
   uint8_t buf[4] = {1, 2, 3, 4};
   Request req = {};
-  req.socket_opcode = static_cast<uint8_t>(::peregrine::Op::kWrite);
+  req.op = TransferOp::kBlockPushExplicit;
   req.laddr = buf;
   req.raddr = buf;
   req.len = sizeof(buf);
@@ -111,7 +111,7 @@ TEST(PeregrineTransportAdapterTest, PostWithEmptyPeersFails) {
 
   uint8_t buf[4] = {1, 2, 3, 4};
   Request req = {};
-  req.socket_opcode = static_cast<uint8_t>(::peregrine::Op::kWrite);
+  req.op = TransferOp::kBlockPushExplicit;
   req.laddr = buf;
   req.raddr = buf;
   req.len = sizeof(buf);
@@ -152,7 +152,7 @@ TEST(PeregrineTransportAdapterTest, PostSynchronousFailureInvokesCallback) {
 
   uint8_t buf[4] = {1, 2, 3, 4};
   Request req = {};
-  req.socket_opcode = static_cast<uint8_t>(::peregrine::Op::kWrite);
+  req.op = TransferOp::kBlockPushExplicit;
   req.laddr = buf;
   req.raddr = buf;
   req.len = sizeof(buf);
@@ -202,7 +202,7 @@ TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
 
   // 1. Write (Op::kWrite) with completion callback.
   Request write_req = {};
-  write_req.socket_opcode = static_cast<uint8_t>(::peregrine::Op::kWrite);
+  write_req.op = TransferOp::kBlockPushExplicit;
   write_req.laddr = src_buf.data();
   write_req.raddr = remote_buf.data();
   write_req.len = src_buf.size();
@@ -226,7 +226,7 @@ TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
   // 2. Read (Op::kRead) with Poll().
   std::vector<uint8_t> read_buf(src_buf.size(), 0);
   Request read_req = {};
-  read_req.socket_opcode = static_cast<uint8_t>(::peregrine::Op::kRead);
+  read_req.op = TransferOp::kBlockPull;
   read_req.laddr = read_buf.data();
   read_req.raddr = remote_buf.data();
   read_req.len = read_buf.size();

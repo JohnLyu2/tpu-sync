@@ -61,17 +61,32 @@ struct RawProgress {
   uint64_t total_bytes = 0;
 };
 
-// Builds a single Request struct for buffer push/ pull operations.
-absl::StatusOr<Request> BuildBufferRequest(
+// Weight-sync buffer push/pull (kOpBufferPush / kOpBufferPull /
+// kOpBufferPushBatched). Served by RawBufferTransport directly over its TCP
+// sockets.
+struct BufferRequest {
+  uint8_t opcode;
+  uint8_t* laddr;
+  size_t len;
+  int layer_idx;
+  uint64_t remote_id;  // dst/src byte offset.
+  uint32_t local_id;   // dst/src shard index.
+  uint64_t uuid;
+  size_t dst_stride_bytes = 0;
+  size_t stride_count = 1;
+  size_t src_stride_bytes = 0;
+};
+
+// Builds a single BufferRequest for buffer push/pull operations.
+absl::StatusOr<BufferRequest> BuildBufferRequest(
     size_t buffer_id, size_t shard_idx, size_t offset_bytes,
-    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid,
-    uint8_t socket_opcode, size_t dst_stride_bytes = 0, size_t stride_count = 1,
+    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid, uint8_t opcode,
+    size_t dst_stride_bytes = 0, size_t stride_count = 1,
     size_t src_stride_bytes = 0);
 
-// Builds a batch of Requests for a span of BufferPushTasks.
-absl::StatusOr<std::vector<Request>> BuildBufferRequests(
-    absl::Span<const BufferPushTask> tasks, uint64_t uuid,
-    uint8_t socket_opcode);
+// Builds a batch of BufferRequests for a span of BufferPushTasks.
+absl::StatusOr<std::vector<BufferRequest>> BuildBufferRequests(
+    absl::Span<const BufferPushTask> tasks, uint64_t uuid, uint8_t opcode);
 
 // Standalone raw buffer TCP socket transport engine.
 class RawBufferTransport final {
@@ -140,7 +155,7 @@ class RawBufferTransport final {
   // `kOpBufferPush ChunkHeader` followed by the data. It waits for a one-byte
   // ack from the `peer` before it returns.
   absl::Status ProcessSocketBufferPush(absl::string_view peer,
-                                       const Request& request);
+                                       const BufferRequest& request);
 
   // Pushes a vector of buffers to multiple peers using
   // `ProcessSocketBufferBatchPush()`.
@@ -175,11 +190,11 @@ class RawBufferTransport final {
  private:
   // Pulls a buffer request from `peer` over a borrowed TCP connection.
   absl::Status ProcessSocketBufferPull(absl::string_view peer,
-                                       const Request& request);
+                                       const BufferRequest& request);
 
   // Pushes buffer requests to `peer` over a borrowed TCP connection.
-  absl::Status ProcessSocketBufferBatchPush(absl::string_view peer,
-                                            absl::Span<const Request> requests);
+  absl::Status ProcessSocketBufferBatchPush(
+      absl::string_view peer, absl::Span<const BufferRequest> requests);
 
   // Client-side source address for an outbound connection to `peer`, or ""
   // to let the kernel choose by route. Non-empty only when source binding

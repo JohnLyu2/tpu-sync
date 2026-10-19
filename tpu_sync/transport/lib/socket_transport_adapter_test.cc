@@ -110,7 +110,7 @@ TEST(SocketTransportAdapterTest, PostWithInvalidParallelismFails) {
   SocketTransportAdapter adapter(&raw_transport, /*parallelism=*/1);
 
   Request req = {};
-  req.socket_opcode = 1;
+  req.op = TransferOp::kBlockPush;
   req.parallelism = -1;
 
   auto result = adapter.Post(
@@ -125,7 +125,7 @@ TEST(SocketTransportAdapterTest, PostWithUnsupportedOpcodeFails) {
   SocketTransportAdapter adapter(&raw_transport, /*parallelism=*/1);
 
   Request req = {};
-  req.socket_opcode = 99;  // Unsupported opcode.
+  req.op = static_cast<TransferOp>(99);  // Unsupported opcode.
 
   auto result = adapter.Post(
       /*peers=*/{"127.0.0.1:1234"}, /*requests=*/absl::MakeConstSpan(&req, 1),
@@ -183,7 +183,7 @@ TEST(SocketTransportAdapterTest, PostSocketPushOp1Success) {
 
   std::vector<uint8_t> test_data = {1, 2, 3, 4, 5, 6, 7, 8};
   Request req = {};
-  req.socket_opcode = 1;
+  req.op = TransferOp::kBlockPush;
   req.laddr = test_data.data();
   req.len = test_data.size();
   req.count_or_size = 1;
@@ -256,7 +256,7 @@ TEST(SocketTransportAdapterTest, PostSocketPushOp6ExplicitPushSuccess) {
 
   std::vector<uint8_t> test_data = {10, 20, 30, 40};
   Request req = {};
-  req.socket_opcode = 6;
+  req.op = TransferOp::kBlockPushExplicit;
   req.laddr = test_data.data();
   req.len = test_data.size();
   req.count_or_size = 1;
@@ -312,7 +312,7 @@ TEST(SocketTransportAdapterTest, PostSocketPullOp2Success) {
 
   std::vector<uint8_t> recv_buf(4, 0);
   Request req = {};
-  req.socket_opcode = 2;
+  req.op = TransferOp::kBlockPull;
   req.laddr = recv_buf.data();
   req.len = recv_buf.size();
   req.count_or_size = 1;
@@ -411,7 +411,7 @@ TEST(SocketTransportAdapterTest,
   std::vector<uint8_t> test_data(8, 1);
   std::vector<Request> requests(2);
   for (int i = 0; i < 2; ++i) {
-    requests[i].socket_opcode = 1;
+    requests[i].op = TransferOp::kBlockPush;
     requests[i].laddr = test_data.data();
     requests[i].len = test_data.size();
     requests[i].count_or_size = 1;
@@ -492,7 +492,7 @@ TEST(SocketTransportAdapterTest,
   std::vector<uint8_t> recv_buf1(4, 0);
   std::vector<Request> requests(2);
   for (int i = 0; i < 2; ++i) {
-    requests[i].socket_opcode = 2;
+    requests[i].op = TransferOp::kBlockPull;
     requests[i].laddr = (i == 0) ? recv_buf0.data() : recv_buf1.data();
     requests[i].len = 4;
     requests[i].count_or_size = 1;
@@ -596,7 +596,7 @@ TEST(SocketTransportAdapterTest,
   std::vector<uint8_t> test_data(8, 1);
   auto make_push_request = [&](uint64_t uuid) {
     Request request = {};
-    request.socket_opcode = 1;
+    request.op = TransferOp::kBlockPush;
     request.laddr = test_data.data();
     request.len = test_data.size();
     request.count_or_size = 1;
@@ -716,7 +716,7 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
 
   std::vector<uint8_t> recv_buf(4, 0);
   Request req = {};
-  req.socket_opcode = 2;
+  req.op = TransferOp::kBlockPull;
   req.laddr = recv_buf.data();
   req.len = recv_buf.size();
   req.count_or_size = 1;
@@ -771,7 +771,7 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
 
     std::vector<uint8_t> recv_buf(4, 0);
     Request req = {};
-    req.socket_opcode = 2;
+    req.op = TransferOp::kBlockPull;
     req.laddr = recv_buf.data();
     req.len = recv_buf.size();
     req.count_or_size = 1;
@@ -802,7 +802,7 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
 
     std::vector<uint8_t> recv_buf(4, 0);
     Request req = {};
-    req.socket_opcode = 2;
+    req.op = TransferOp::kBlockPull;
     req.laddr = recv_buf.data();
     req.len = recv_buf.size();
     req.count_or_size = 1;
@@ -834,7 +834,7 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
 
     std::vector<uint8_t> recv_buf(4, 0);
     Request req = {};
-    req.socket_opcode = 2;
+    req.op = TransferOp::kBlockPull;
     req.laddr = recv_buf.data();
     req.len = recv_buf.size();
     req.count_or_size = 1;
@@ -913,7 +913,7 @@ TEST(SocketTransportAdapterTest,
   std::array<Request, 2> reqs = {};
   for (int stream = 0; stream < 2; ++stream) {
     Request& req = reqs[stream];
-    req.socket_opcode = 2;
+    req.op = TransferOp::kBlockPull;
     req.laddr = recv_bufs[stream].data();
     req.len = recv_bufs[stream].size();
     req.count_or_size = 1;
@@ -952,7 +952,7 @@ TEST(SocketTransportAdapterTest,
 
   std::vector<uint8_t> recv_buf(4, 0);
   Request req = {};
-  req.socket_opcode = 2;
+  req.op = TransferOp::kBlockPull;
   req.laddr = recv_buf.data();
   req.len = recv_buf.size();
   req.count_or_size = 1;
@@ -1036,7 +1036,7 @@ TEST(SocketTransportAdapterTest, PushTimesOutWhenHandshakeNeverResponds) {
 
   std::vector<uint8_t> test_data = {1, 2, 3, 4};
   Request req = {};
-  req.socket_opcode = 6;
+  req.op = TransferOp::kBlockPushExplicit;
   req.laddr = test_data.data();
   req.len = test_data.size();
   req.count_or_size = 1;
@@ -1087,7 +1087,7 @@ TEST(SocketTransportAdapterTest, PullTimesOutWhenHandshakeNeverResponds) {
 
   std::vector<uint8_t> recv_buf(4, 0);
   Request req = {};
-  req.socket_opcode = 2;
+  req.op = TransferOp::kBlockPull;
   req.laddr = recv_buf.data();
   req.len = recv_buf.size();
   req.count_or_size = 1;
@@ -1151,7 +1151,7 @@ TEST(SocketTransportAdapterTest, PullTimesOutWhenPayloadReadStalls) {
 
   std::vector<uint8_t> recv_buf(4, 0);
   Request req = {};
-  req.socket_opcode = 2;
+  req.op = TransferOp::kBlockPull;
   req.laddr = recv_buf.data();
   req.len = recv_buf.size();
   req.count_or_size = 1;
@@ -1217,7 +1217,7 @@ TEST(SocketTransportAdapterTest, WorkerCountGrowsPerPeer) {
   // Post to peer 1 spawns 4 workers.
   std::vector<uint8_t> test_data = {1, 2};
   Request req = {};
-  req.socket_opcode = 1;
+  req.op = TransferOp::kBlockPush;
   req.laddr = test_data.data();
   req.len = test_data.size();
   req.count_or_size = 1;
@@ -1284,7 +1284,7 @@ TEST(SocketTransportAdapterTest, WorkerCountCappedAtMaxSocketWorkers) {
   // Peer 1 spawns 4 workers.
   std::vector<uint8_t> test_data = {1, 2};
   Request req = {};
-  req.socket_opcode = 1;
+  req.op = TransferOp::kBlockPush;
   req.laddr = test_data.data();
   req.len = test_data.size();
   req.count_or_size = 1;
@@ -1331,7 +1331,7 @@ TEST(SocketTransportAdapterTest,
   std::vector<Request> reqs(2);
   std::vector<int> src_bids = {1, 2};
   for (int i = 0; i < 2; ++i) {
-    reqs[i].socket_opcode = 1;
+    reqs[i].op = TransferOp::kBlockPush;
     reqs[i].laddr = test_data.data();
     reqs[i].len = test_data.size();
     reqs[i].count_or_size = 1;
@@ -1386,7 +1386,7 @@ TEST(SocketTransportAdapterTest,
   const uint64_t session_uuid = 99999;
   std::vector<uint8_t> test_data = {1, 2};
   Request layer0_req = {};
-  layer0_req.socket_opcode = 1;
+  layer0_req.op = TransferOp::kBlockPush;
   layer0_req.laddr = test_data.data();
   layer0_req.len = test_data.size();
   layer0_req.count_or_size = 1;
@@ -1487,7 +1487,7 @@ TEST(SocketTransportAdapterTest,
   std::vector<Request> reqs(2);
   std::vector<int> src_bids = {1, 2};
   for (int i = 0; i < 2; ++i) {
-    reqs[i].socket_opcode = 1;
+    reqs[i].op = TransferOp::kBlockPush;
     reqs[i].laddr = test_data.data();
     reqs[i].len = test_data.size();
     reqs[i].count_or_size = 1;
@@ -1551,7 +1551,7 @@ TEST(SocketTransportAdapterTest, PushTimesOutWhenPayloadWriteStalls) {
 
   std::vector<uint8_t> test_data(16 * 1024 * 1024, 1);
   Request req = {};
-  req.socket_opcode = 1;
+  req.op = TransferOp::kBlockPush;
   req.laddr = test_data.data();
   req.len = test_data.size();
   req.count_or_size = 1;

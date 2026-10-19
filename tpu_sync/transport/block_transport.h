@@ -227,7 +227,7 @@ class BlockTransport final {
       size_t num_groups, lib::TransportAdapter* adapter);
 
   lib::Request BuildBlockRequest(
-      uint8_t socket_opcode, uint8_t* laddr, uint8_t* raddr, size_t len,
+      lib::TransferOp op, uint8_t* laddr, uint8_t* raddr, size_t len,
       uint32_t count_or_size, uint32_t request_id, uint64_t uuid,
       uint64_t buffer_id, int parallelism, MajorOrder major_order,
       uint32_t remote_id, uint32_t local_id, int stream_idx = 0,

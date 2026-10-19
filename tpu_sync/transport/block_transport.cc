@@ -1130,14 +1130,14 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
 }
 
 lib::Request BlockTransport::BuildBlockRequest(
-    uint8_t socket_opcode, uint8_t* laddr, uint8_t* raddr, size_t len,
+    lib::TransferOp op, uint8_t* laddr, uint8_t* raddr, size_t len,
     uint32_t count_or_size, uint32_t request_id, uint64_t uuid,
     uint64_t buffer_id, int parallelism, MajorOrder major_order,
     uint32_t remote_id, uint32_t local_id, int stream_idx,
     BlockReceivedCallback on_block_received, uint16_t shard_mask,
     int total_streams) {
   return lib::Request{
-      .socket_opcode = socket_opcode,
+      .op = op,
       .laddr = laddr,
       .raddr = raddr,
       .len = len,
@@ -1163,8 +1163,9 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
     std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
     int total_streams) {
   const size_t num_blocks = src_block_ids.size();
-  const uint8_t socket_opcode =
-      static_cast<uint8_t>(dst_block_ids.empty() ? 1 : 6);
+  const lib::TransferOp op = dst_block_ids.empty()
+                                 ? lib::TransferOp::kBlockPush
+                                 : lib::TransferOp::kBlockPushExplicit;
   const uint32_t remote_id = static_cast<uint32_t>(block_delegate_->node_id());
   // Chunks are read from the local block array `layer_idx`; the request
   // header names the array the receiver writes into.
@@ -1174,7 +1175,7 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
                                 : static_cast<uint32_t>(header_layer_idx);
   if (num_blocks == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(
-        socket_opcode, /*laddr=*/nullptr, /*raddr=*/nullptr, /*len=*/0,
+        op, /*laddr=*/nullptr, /*raddr=*/nullptr, /*len=*/0,
         /*count_or_size=*/0, /*request_id=*/0, uuid, /*buffer_id=*/0,
         parallelism, major_order, remote_id, local_id)};
   }
@@ -1259,9 +1260,9 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
               static_cast<uint32_t>(sh);
           for (const auto& chunk : chunks) {
             requests.push_back(BuildBlockRequest(
-                socket_opcode, chunk.ptr, chunk.raddr, chunk.size,
-                count_or_size, request_id, uuid, buffer_id, parallelism,
-                major_order, remote_id, local_id, stream_idx,
+                op, chunk.ptr, chunk.raddr, chunk.size, count_or_size,
+                request_id, uuid, buffer_id, parallelism, major_order,
+                remote_id, local_id, stream_idx,
                 /*on_block_received=*/nullptr, shard_mask, total_streams));
           }
           ++request_id;
@@ -1412,7 +1413,7 @@ BlockTransport::BuildBlockPullRequests(
                            : nullptr;
             }
             requests.push_back(BuildBlockRequest(
-                /*socket_opcode=*/2, bc.ptr, /*raddr=*/nullptr, bc.size,
+                lib::TransferOp::kBlockPull, bc.ptr, /*raddr=*/nullptr, bc.size,
                 count_or_size, request_id, uuid, buffer_id, parallelism,
                 major_order, remote_id, local_id, /*stream_idx=*/i,
                 on_block_received));
@@ -1446,7 +1447,7 @@ absl::Status BlockTransport::PushBuffer(absl::string_view peer,
                                         const uint8_t* data_ptr,
                                         size_t size_bytes, uint64_t uuid) {
   ABSL_ASSIGN_OR_RETURN(
-      const lib::Request req,
+      const lib::BufferRequest req,
       lib::BuildBufferRequest(buffer_id, dst_shard_idx, dst_offset_bytes,
                               data_ptr, size_bytes, uuid, lib::kOpBufferPush));
   return raw_transport_.ProcessSocketBufferPush(peer, req);
