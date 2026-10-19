@@ -2101,6 +2101,135 @@ class BroadcastEngineTest(absltest.TestCase):
               p1.shard_push_schedules[s_u][shard_idx],
           )
 
+  def test_multi_equivalence_class_1hop_coalesces_into_single_stage(
+      self,
+  ) -> None:
+    """Verifies multiple 1-hop equivalence classes coalesce into a single stage without cross-eq_class count inflation."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src_0 = RaidenId(job_name="trainer", job_replica_id="0", data_name="w")
+    dst_0 = RaidenId(job_name="sampler", job_replica_id="0", data_name="w")
+    dst_1 = RaidenId(job_name="sampler", job_replica_id="1", data_name="w")
+    data_addresses = {
+        src_0: ["10.0.0.1:8000", "10.0.0.2:8000"],
+        dst_0: ["10.0.1.0:8000"],
+        dst_1: ["10.0.1.1:8000"],
+    }
+
+    # eq_idx=0 has 1 chunk on shard 0; eq_idx=1 has 2 chunks on shard 1.
+    canonical_vars_eq0 = {
+        src_0: {1: {0: [(0, 0, 0, 512, 0, 0, 512, 512, 1)]}},
+    }
+    canonical_vars_eq1 = {
+        src_0: {
+            1: {
+                1: [
+                    (0, 0, 0, 256, 0, 0, 256, 256, 1),
+                    (0, 256, 256, 256, 0, 0, 256, 256, 1),
+                ]
+            }
+        },
+    }
+    groups_list = []
+    for lg_idx in range(2):
+      groups_list.append(
+          controller_types.StageBroadcastGroup(
+              pool_group=0,
+              layer_group_idx=lg_idx,
+              src_units=[src_0],
+              dst_units=[dst_0],
+              stage_ordered_vars_by_unit={src_0: [(lg_idx, 1)]},
+              canonical_variable_plans=canonical_vars_eq0,
+              canonical_relay_plans={},
+              data_addresses=data_addresses,
+          )
+      )
+    for lg_idx in range(2):
+      groups_list.append(
+          controller_types.StageBroadcastGroup(
+              pool_group=1,
+              layer_group_idx=lg_idx,
+              src_units=[src_0],
+              dst_units=[dst_1],
+              stage_ordered_vars_by_unit={src_0: [(lg_idx, 1)]},
+              canonical_variable_plans=canonical_vars_eq1,
+              canonical_relay_plans={},
+              data_addresses=data_addresses,
+          )
+      )
+
+    coalesced = broadcast_engine._coalesce_pipeline_groups(
+        groups_list, target_stages=1, n_seed=1
+    )
+    self.assertLen(coalesced, 1)
+    self.assertEqual(coalesced[0].dst_units, [dst_0, dst_1])
+    self.assertLen(coalesced[0].eq_class_groups, 2)
+
+    precomputed_scheds = (
+        broadcast_engine.BroadcastEngine.build_stage_trainer_push_schedules(
+            coalesced[0],
+            coalesced[0].dst_units,
+            registered_shards=data_addresses,
+        )
+    )
+    # 2 layers * 1 chunk for shard 0 -> dst_0; 2 layers * 2 chunks for shard 1 -> dst_1
+    self.assertLen(precomputed_scheds[src_0][0], 2)
+    self.assertLen(precomputed_scheds[src_0][1], 4)
+
+    sentinel_protos = {src_0: {0: "proto0", 1: "proto1"}}
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src_0],
+        dst_units=[dst_0, dst_1],
+        plan=None,
+        shard_push_schedules=precomputed_scheds,
+        worker_data_addresses=data_addresses,
+        uuid=2026,
+        is_weight_sync=True,
+        sender_push_schedule_protos=sentinel_protos,
+    )
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            n_seed=1,
+            req_id="req_1hop_multi_eq",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=data_addresses,
+            pipeline_target_stages=2,
+        )
+    )
+
+    sender_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == src_0 and plan.is_sender
+    ]
+    # Single 1-hop stage dispatch for the trainer source unit!
+    self.assertLen(sender_plans, 1)
+    self.assertIs(sender_plans[0].sender_push_schedule_protos, sentinel_protos)
+    self.assertEqual(sender_plans[0].expected_block_count, 6)
+
+    dst0_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == dst_0 and not plan.is_sender
+    ]
+    dst1_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == dst_1 and not plan.is_sender
+    ]
+    self.assertLen(dst0_plans, 1)
+    self.assertLen(dst1_plans, 1)
+    # dst_0 only receives eq_idx=0's 2 blocks (1 per layer), NOT eq_idx=1's blocks!
+    self.assertEqual(dst0_plans[0].expected_block_count, 2)
+    self.assertEqual(dst0_plans[0].expected_layer_chunk_counts, {0: 1, 1: 1})
+    # dst_1 only receives eq_idx=1's 4 blocks (2 per layer), NOT eq_idx=0's blocks!
+    self.assertEqual(dst1_plans[0].expected_block_count, 4)
+    self.assertEqual(dst1_plans[0].expected_layer_chunk_counts, {0: 2, 1: 2})
+
 
 if __name__ == "__main__":
   absltest.main()

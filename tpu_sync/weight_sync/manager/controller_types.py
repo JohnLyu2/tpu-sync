@@ -286,6 +286,9 @@ class StageBroadcastGroup:
   cached_hop_schedules: dict[Any, Any] = dataclasses.field(
       default_factory=dict, repr=False, compare=False
   )
+  eq_class_groups: list["StageBroadcastGroup"] = dataclasses.field(
+      default_factory=list, repr=False, compare=False
+  )
 
 
 @dataclasses.dataclass

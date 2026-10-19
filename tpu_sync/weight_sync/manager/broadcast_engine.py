@@ -142,6 +142,7 @@ def _coalesce_contiguous_relay_entries(
 def _coalesce_pipeline_groups(
     groups_list: list[Any],
     target_stages: int = _PIPELINE_TARGET_STAGES,
+    n_seed: int = 1,
 ) -> list[Any]:
   """Coalesces fine-grained groups into fewer pipeline stages if len > target_stages.
 
@@ -149,6 +150,8 @@ def _coalesce_pipeline_groups(
     groups_list: List of pipeline stages, where each stage is either a
       StageBroadcastGroup or a list of (key, targets) slice transfer tuples.
     target_stages: Maximum number of coalesced pipeline stages to produce.
+    n_seed: Maximum number of destination units seeded per equivalence class in
+      a single 1-hop trainer broadcast round.
 
   Returns:
     Coalesced list of pipeline stages.
@@ -245,6 +248,55 @@ def _coalesce_pipeline_groups(
               )
           )
       i = j
+
+    if target_stages == 1 and len(coalesced_stage_groups) > 1:
+      eq_groups: list[controller_types.StageBroadcastGroup] = []
+      for g in coalesced_stage_groups:
+        sub = getattr(g, "eq_class_groups", None)
+        if sub:
+          eq_groups.extend(sub)
+        else:
+          eq_groups.append(g)
+      first = eq_groups[0]
+      first_src = tuple(first.src_units)
+      if all(
+          tuple(g.src_units) == first_src and len(g.dst_units) <= n_seed
+          for g in eq_groups
+      ):
+        merged_dst_units: list[RaidenId] = []
+        seen_dst: set[RaidenId] = set()
+        merged_data_addresses: dict[RaidenId, list[str]] = {}
+        for g in eq_groups:
+          merged_data_addresses.update(g.data_addresses)
+          for d in g.dst_units:
+            if d not in seen_dst:
+              seen_dst.add(d)
+              merged_dst_units.append(d)
+        merged_ordered_vars: dict[RaidenId, list[tuple[int, int]]] = {}
+        for u in first.src_units:
+          seen_vars: set[tuple[int, int]] = set()
+          u_vars: list[tuple[int, int]] = []
+          for g in eq_groups:
+            for vp in g.stage_ordered_vars_by_unit.get(u, []):
+              if vp not in seen_vars:
+                seen_vars.add(vp)
+                u_vars.append(vp)
+          merged_ordered_vars[u] = u_vars
+        return [
+            controller_types.StageBroadcastGroup(
+                pool_group=0,
+                layer_group_idx=0,
+                src_units=list(first.src_units),
+                dst_units=merged_dst_units,
+                stage_ordered_vars_by_unit=merged_ordered_vars,
+                canonical_variable_plans=first.canonical_variable_plans,
+                canonical_relay_plans={},
+                data_addresses=merged_data_addresses,
+                cached_hop_schedules=first.cached_hop_schedules,
+                eq_class_groups=eq_groups,
+            )
+        ]
+
     return coalesced_stage_groups
 
   def _routing_key(
@@ -407,6 +459,7 @@ class BroadcastEngine:
     """Builds trainer source push schedules for a StageBroadcastGroup targeting receivers."""
     if not receivers:
       return {s_u: {} for s_u in stage_group.src_units}
+    eq_groups = getattr(stage_group, "eq_class_groups", None)
     s_u_schedules: dict[RaidenId, dict[int, Any]] = {}
     for s_u_idx, s_u in enumerate(stage_group.src_units):
       s_u_shards = (
@@ -422,22 +475,57 @@ class BroadcastEngine:
           s_u_shards, len(stage_group.src_units), s_u_idx
       )
       var_list = stage_group.stage_ordered_vars_by_unit.get(s_u, [])
-      var_plans = stage_group.canonical_variable_plans.get(s_u, {})
       stage_var_to_pid = dict(var_list)
       unique_pids = set(stage_var_to_pid.values())
       shard_plans_by_id: dict[int, dict[int, list[Any]]] = {}
-      for pid in unique_pids:
-        p_dict = var_plans.get(pid, {})
-        for local_src_idx, tuples_9 in p_dict.items():
-          if tuples_9:
-            src_host_rank = shard_host_ranks[local_src_idx]
-            shift = src_host_rank % len(receivers)
-            shifted_receivers = receivers[shift:] + receivers[:shift]
-            shard_plans_by_id.setdefault(local_src_idx, {})[pid] = [
-                (stage_group.data_addresses[d_unit][t9[0]], *t9)
-                for t9 in tuples_9
-                for d_unit in shifted_receivers
-            ]
+      if eq_groups:
+        receiver_set = set(receivers)
+        all_local_src_idxs: set[int] = set()
+        for sub_g in eq_groups:
+          sub_var_plans = sub_g.canonical_variable_plans.get(s_u, {})
+          for pid in unique_pids:
+            all_local_src_idxs.update(sub_var_plans.get(pid, {}).keys())
+        for pid in unique_pids:
+          for local_src_idx in sorted(all_local_src_idxs):
+            src_host_rank = shard_host_ranks.get(local_src_idx, s_u_idx)
+            active_targets: list[tuple[RaidenId, list[str], list[Any]]] = []
+            for sub_g in eq_groups:
+              tuples_9 = (
+                  sub_g.canonical_variable_plans.get(s_u, {})
+                  .get(pid, {})
+                  .get(local_src_idx, [])
+              )
+              if not tuples_9:
+                continue
+              sub_addrs = sub_g.data_addresses
+              for d_unit in sub_g.dst_units:
+                if d_unit in receiver_set:
+                  active_targets.append((d_unit, sub_addrs[d_unit], tuples_9))
+            if active_targets:
+              shift = src_host_rank % len(active_targets)
+              shifted_targets = active_targets[shift:] + active_targets[:shift]
+              combined_entries = [
+                  (d_addrs[t9[0]], *t9)
+                  for _, d_addrs, tuples_9 in shifted_targets
+                  for t9 in tuples_9
+              ]
+              shard_plans_by_id.setdefault(local_src_idx, {})[
+                  pid
+              ] = combined_entries
+      else:
+        var_plans = stage_group.canonical_variable_plans.get(s_u, {})
+        for pid in unique_pids:
+          p_dict = var_plans.get(pid, {})
+          for local_src_idx, tuples_9 in p_dict.items():
+            if tuples_9:
+              src_host_rank = shard_host_ranks[local_src_idx]
+              shift = src_host_rank % len(receivers)
+              shifted_receivers = receivers[shift:] + receivers[:shift]
+              shard_plans_by_id.setdefault(local_src_idx, {})[pid] = [
+                  (stage_group.data_addresses[d_unit][t9[0]], *t9)
+                  for t9 in tuples_9
+                  for d_unit in shifted_receivers
+              ]
       s_u_sched = {}
       for local_src_idx in sorted(shard_plans_by_id.keys()):
         ref_sched = controller_types.PlanReferencedShardSchedule(
@@ -517,19 +605,20 @@ class BroadcastEngine:
     effective_target_stages = (
         pipeline_target_stages
         if any(
-            len(
-                g.dst_units
-                if isinstance(g, controller_types.StageBroadcastGroup)
-                else {t[0] for _, targets in g for t in targets}
+            (
+                any(len(sub.dst_units) > n_seed for sub in g.eq_class_groups)
+                if getattr(g, "eq_class_groups", None)
+                else len(g.dst_units) > n_seed
             )
-            > n_seed
+            if isinstance(g, controller_types.StageBroadcastGroup)
+            else len({t[0] for _, targets in g for t in targets}) > n_seed
             for g in groups_list
             if g
         )
         else 1
     )
     coalesced_groups_list = _coalesce_pipeline_groups(
-        groups_list, target_stages=effective_target_stages
+        groups_list, target_stages=effective_target_stages, n_seed=n_seed
     )
 
     groups: list[_GroupBroadcastState] = []
@@ -671,7 +760,12 @@ class BroadcastEngine:
           next_idx += 1
 
         # 2. Trainer sends to up to n_seed new samplers in this round.
-        k_train = min(n_seed, n - next_idx)
+        is_coalesced_1hop = g.stage_group is not None and bool(
+            getattr(g.stage_group, "eq_class_groups", None)
+        )
+        k_train = (
+            (n - next_idx) if is_coalesced_1hop else min(n_seed, n - next_idx)
+        )
         train_child_order = sender_child_count[g.primary_src_unit]
         if g.stage_group is not None:
           if k_train > 0:
@@ -751,123 +845,134 @@ class BroadcastEngine:
       # after the final pipeline stage completes for the shared transfer UUID.
       if g.stage_group is not None:
         stage_group = g.stage_group
-        hop_cache = getattr(stage_group, "cached_hop_schedules", None)
-        layer_counts_key = (
-            "__layer_counts__",
-            stage_group.pool_group,
-            stage_group.layer_group_idx,
-        )
-        if hop_cache is not None and layer_counts_key in hop_cache:
-          (
-              seed_shard_layer_counts,
-              seed_total_blocks,
-              seed_layer_totals,
-              relay_shard_layer_counts,
-              relay_total_blocks,
-              relay_layer_totals,
-          ) = hop_cache[layer_counts_key]
-        else:
-          seed_shard_layer_counts: dict[int, dict[int, int]] = (
-              collections.defaultdict(lambda: collections.defaultdict(int))
+        sub_groups = getattr(stage_group, "eq_class_groups", None) or [
+            stage_group
+        ]
+        for sub_g in sub_groups:
+          sub_dst_set = set(sub_g.dst_units)
+          hop_cache = getattr(sub_g, "cached_hop_schedules", None)
+          if hop_cache is None:
+            hop_cache = getattr(stage_group, "cached_hop_schedules", None)
+          layer_counts_key = (
+              "__layer_counts__",
+              sub_g.pool_group,
+              sub_g.layer_group_idx,
           )
-          relay_shard_layer_counts: dict[int, dict[int, int]] = (
-              collections.defaultdict(lambda: collections.defaultdict(int))
-          )
-          seen_relay_layers: set[int] = set()
-          for s_u in stage_group.src_units:
-            var_list = stage_group.stage_ordered_vars_by_unit.get(s_u, [])
-            var_plans = stage_group.canonical_variable_plans.get(s_u, {})
-            pid_seed_dst_counts: dict[int, dict[int, int]] = {}
-            for layer_idx, plan_id in var_list:
-              dst_counts = pid_seed_dst_counts.get(plan_id)
-              if dst_counts is None:
-                dst_counts = collections.defaultdict(int)
-                for tuples_9 in var_plans.get(plan_id, {}).values():
-                  for t9 in tuples_9:
-                    dst_counts[t9[0]] += 1
-                pid_seed_dst_counts[plan_id] = dst_counts
-              for local_dst_idx, cnt in dst_counts.items():
-                seed_shard_layer_counts[local_dst_idx][layer_idx] += cnt
-              if layer_idx not in seen_relay_layers:
-                seen_relay_layers.add(layer_idx)
-                relay_shards = stage_group.canonical_relay_plans.get(
-                    plan_id, {}
-                )
-                # Relays push each pre-tiled shard as a single chunk.
-                for local_dst_idx, blocks in relay_shards.items():
-                  if blocks:
-                    relay_shard_layer_counts[local_dst_idx][layer_idx] += 1
-          seed_layer_totals: dict[int, int] = collections.defaultdict(int)
-          seed_total_blocks = 0
-          for layer_dict in seed_shard_layer_counts.values():
-            for layer_idx, cnt in layer_dict.items():
-              seed_layer_totals[layer_idx] += cnt
-              seed_total_blocks += cnt
-          relay_layer_totals: dict[int, int] = collections.defaultdict(int)
-          relay_total_blocks = 0
-          for layer_dict in relay_shard_layer_counts.values():
-            for layer_idx, cnt in layer_dict.items():
-              relay_layer_totals[layer_idx] += cnt
-              relay_total_blocks += cnt
-          if hop_cache is not None:
-            hop_cache[layer_counts_key] = (
+          if hop_cache is not None and layer_counts_key in hop_cache:
+            (
                 seed_shard_layer_counts,
                 seed_total_blocks,
                 seed_layer_totals,
                 relay_shard_layer_counts,
                 relay_total_blocks,
                 relay_layer_totals,
-            )
-
-        for hop in populated_hops:
-          dst_unit = hop.receiver
-          is_seed_hop = hop.sender == g.primary_src_unit
-          (seed_receivers if is_seed_hop else relay_receivers).add(dst_unit)
-          shard_layer_counts = (
-              seed_shard_layer_counts
-              if is_seed_hop
-              else relay_shard_layer_counts
-          )
-          hop_total_blocks = (
-              seed_total_blocks if is_seed_hop else relay_total_blocks
-          )
-          hop_layer_totals = (
-              seed_layer_totals if is_seed_hop else relay_layer_totals
-          )
-          receiver_block_counts[dst_unit] += hop_total_blocks
-          dst_lc = receiver_layer_counts[dst_unit]
-          for layer_idx, cnt in hop_layer_totals.items():
-            dst_lc[layer_idx] += cnt
-
-          dst_addrs = stage_group.data_addresses.get(dst_unit, [])
-          unique_host_ips = {
-              controller_types.extract_host_ip(dst_addrs[local_dst_idx])
-              if local_dst_idx < len(dst_addrs) and dst_addrs[local_dst_idx]
-              else ""
-              for local_dst_idx in shard_layer_counts
-          }
-          if len(unique_host_ips) == 1:
-            only_ip = next(iter(unique_host_ips))
-            if only_ip:
-              receiver_endpoint_counts[dst_unit][only_ip] += hop_total_blocks
-              ep_lc = receiver_endpoint_layer_counts[dst_unit][only_ip]
-              for layer_idx, cnt in hop_layer_totals.items():
-                ep_lc[layer_idx] += cnt
+            ) = hop_cache[layer_counts_key]
           else:
-            for local_dst_idx, layer_dict in shard_layer_counts.items():
-              dst_peer = (
-                  dst_addrs[local_dst_idx]
-                  if local_dst_idx < len(dst_addrs)
-                  else ""
+            seed_shard_layer_counts: dict[int, dict[int, int]] = (
+                collections.defaultdict(lambda: collections.defaultdict(int))
+            )
+            relay_shard_layer_counts: dict[int, dict[int, int]] = (
+                collections.defaultdict(lambda: collections.defaultdict(int))
+            )
+            seen_relay_layers: set[int] = set()
+            for s_u in sub_g.src_units:
+              var_list = sub_g.stage_ordered_vars_by_unit.get(s_u, [])
+              var_plans = sub_g.canonical_variable_plans.get(s_u, {})
+              pid_seed_dst_counts: dict[int, dict[int, int]] = {}
+              for layer_idx, plan_id in var_list:
+                dst_counts = pid_seed_dst_counts.get(plan_id)
+                if dst_counts is None:
+                  dst_counts = collections.defaultdict(int)
+                  for tuples_9 in var_plans.get(plan_id, {}).values():
+                    for t9 in tuples_9:
+                      dst_counts[t9[0]] += 1
+                  pid_seed_dst_counts[plan_id] = dst_counts
+                for local_dst_idx, cnt in dst_counts.items():
+                  seed_shard_layer_counts[local_dst_idx][layer_idx] += cnt
+                if layer_idx not in seen_relay_layers:
+                  seen_relay_layers.add(layer_idx)
+                  relay_shards = sub_g.canonical_relay_plans.get(plan_id, {})
+                  # Relays push each pre-tiled shard as a single chunk.
+                  for local_dst_idx, blocks in relay_shards.items():
+                    if blocks:
+                      relay_shard_layer_counts[local_dst_idx][layer_idx] += 1
+            seed_layer_totals: dict[int, int] = collections.defaultdict(int)
+            seed_total_blocks = 0
+            for layer_dict in seed_shard_layer_counts.values():
+              for layer_idx, cnt in layer_dict.items():
+                seed_layer_totals[layer_idx] += cnt
+                seed_total_blocks += cnt
+            relay_layer_totals: dict[int, int] = collections.defaultdict(int)
+            relay_total_blocks = 0
+            for layer_dict in relay_shard_layer_counts.values():
+              for layer_idx, cnt in layer_dict.items():
+                relay_layer_totals[layer_idx] += cnt
+                relay_total_blocks += cnt
+            if hop_cache is not None:
+              hop_cache[layer_counts_key] = (
+                  seed_shard_layer_counts,
+                  seed_total_blocks,
+                  seed_layer_totals,
+                  relay_shard_layer_counts,
+                  relay_total_blocks,
+                  relay_layer_totals,
               )
-              host_ip = (
-                  controller_types.extract_host_ip(dst_peer) if dst_peer else ""
-              )
-              if host_ip:
-                ep_lc = receiver_endpoint_layer_counts[dst_unit][host_ip]
-                for layer_idx, cnt in layer_dict.items():
-                  receiver_endpoint_counts[dst_unit][host_ip] += cnt
+
+          for hop in populated_hops:
+            dst_unit = hop.receiver
+            if dst_unit not in sub_dst_set:
+              continue
+            is_seed_hop = hop.sender == g.primary_src_unit
+            (seed_receivers if is_seed_hop else relay_receivers).add(dst_unit)
+            shard_layer_counts = (
+                seed_shard_layer_counts
+                if is_seed_hop
+                else relay_shard_layer_counts
+            )
+            hop_total_blocks = (
+                seed_total_blocks if is_seed_hop else relay_total_blocks
+            )
+            hop_layer_totals = (
+                seed_layer_totals if is_seed_hop else relay_layer_totals
+            )
+            receiver_block_counts[dst_unit] += hop_total_blocks
+            dst_lc = receiver_layer_counts[dst_unit]
+            for layer_idx, cnt in hop_layer_totals.items():
+              dst_lc[layer_idx] += cnt
+
+            dst_addrs = sub_g.data_addresses.get(
+                dst_unit, stage_group.data_addresses.get(dst_unit, [])
+            )
+            unique_host_ips = {
+                controller_types.extract_host_ip(dst_addrs[local_dst_idx])
+                if local_dst_idx < len(dst_addrs) and dst_addrs[local_dst_idx]
+                else ""
+                for local_dst_idx in shard_layer_counts
+            }
+            if len(unique_host_ips) == 1:
+              only_ip = next(iter(unique_host_ips))
+              if only_ip:
+                receiver_endpoint_counts[dst_unit][only_ip] += hop_total_blocks
+                ep_lc = receiver_endpoint_layer_counts[dst_unit][only_ip]
+                for layer_idx, cnt in hop_layer_totals.items():
                   ep_lc[layer_idx] += cnt
+            else:
+              for local_dst_idx, layer_dict in shard_layer_counts.items():
+                dst_peer = (
+                    dst_addrs[local_dst_idx]
+                    if local_dst_idx < len(dst_addrs)
+                    else ""
+                )
+                host_ip = (
+                    controller_types.extract_host_ip(dst_peer)
+                    if dst_peer
+                    else ""
+                )
+                if host_ip:
+                  ep_lc = receiver_endpoint_layer_counts[dst_unit][host_ip]
+                  for layer_idx, cnt in layer_dict.items():
+                    receiver_endpoint_counts[dst_unit][host_ip] += cnt
+                    ep_lc[layer_idx] += cnt
       else:
         for hop in populated_hops:
           dst_unit = hop.receiver
@@ -1629,9 +1734,12 @@ class BroadcastEngine:
     num_dst_eq_classes = max(
         1,
         len({
-            tuple(g.stage_group.dst_units)
+            tuple(sub.dst_units)
             for g in groups
             if g.stage_group is not None
+            for sub in getattr(g.stage_group, "eq_class_groups", None) or [
+                g.stage_group
+            ]
         }),
     )
     try:

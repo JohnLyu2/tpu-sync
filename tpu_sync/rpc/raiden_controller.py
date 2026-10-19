@@ -1231,6 +1231,7 @@ class RaidenController:
                 coalesced_groups = BroadcastEngine._coalesce_pipeline_groups(
                     groups_list,
                     target_stages=1,
+                    n_seed=cached_schedule.n_seed,
                 )
                 for stage_group in coalesced_groups:
                   sg_scheds = (
