@@ -12,7 +12,7 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 ## Project triggers
 
 - "verify lean" / "build proofs" — `cd verification && lake build` (toolchain pinned in `verification/lean-toolchain`).
-- "sync upstream" / "re-pin" — follow `verification/README.md` §"Maintenance after an upstream sync".
+- "sync upstream" / "re-pin" — merge upstream into `main` with a merge commit (never squash/rebase), run `python3 verification/tools/repin_citations.py <old> <new> [--apply]`, review `CHECK` lines by hand, update the baseline commit in preambles/docs, run `lake build`, and log in `verification/docs/upstream_rechecks.md` (see `verification/docs/conventions.md`).
 
 ## Code map
 
