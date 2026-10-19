@@ -534,6 +534,10 @@ class KVCacheStore {
   // Returns the count of active remote write operations. TESTS ONLY.
   size_t InFlightRemoteWritesCountForTesting() const;
 
+  // Runs one step of evict sweep synchronously. Preserves SweepOnce's
+  // single-caller contract only if the monitor's sweep is disabled or the
+  // test accepts concurrency on the un-synchronized sweep episode state.
+  bool SweepOnceForTesting() { return SweepOnce(); }
 
   // Rebuilds this store's LRU cache after an engine restart from the
   // crash-persistent KVCacheMetadata table in local shared memory, without

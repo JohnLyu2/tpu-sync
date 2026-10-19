@@ -178,11 +178,26 @@ KVCacheHostStoreNode::Create(const Options& options,
     backend_config.type = "HostOffloadBackend";
     backend_config.kv_pool_group = options.kv_pool_group;
     backend_config.evict_tier = options.evict_tier;
-    // Without a registry there is nothing to heartbeat, so the monitor only
-    // runs when one is configured (Create rejects the combination).
+    // The evict sweep runs on the store monitor. Without a registry there is
+    // nothing to heartbeat, so the store monitor only runs when one is
+    // configured and enable_store_monitor is true.
     backend_config.monitor_config.enable =
         options.enable_store_monitor &&
         !options.global_registry_address.empty();
+    backend_config.monitor_config.enable_evict_sweep =
+        options.enable_evict_sweep && backend_config.monitor_config.enable;
+    if (options.enable_evict_sweep && !backend_config.monitor_config.enable) {
+      LOG(WARNING)
+          << "Evict sweep disabled: it runs on the store monitor, which is off "
+             "(--enable_store_monitor=false or no global registry); this node "
+             "will not reclaim space when it fills up.";
+    }
+    backend_config.monitor_config.evict_sweep_period =
+        options.evict_sweep_period;
+    backend_config.monitor_config.evict_low_watermark =
+        options.evict_low_watermark;
+    backend_config.monitor_config.evict_high_watermark =
+        options.evict_high_watermark;
     ABSL_ASSIGN_OR_RETURN(
         store, kv_cache::KVCacheStore::Create(
                    backend_config, /*capacity=*/num_host_blocks,
