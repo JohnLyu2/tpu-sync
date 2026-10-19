@@ -191,11 +191,11 @@ TEST_F(EvictE2ETest, SweepDemotesToTheStoreNodeAndReadsBack) {
   // The sweep must raise free blocks from 2 to the 0.75 watermark's 6,
   // demoting 4 cold blocks to the node -- the only same-group higher-tier
   // store the registry knows.
-  auto* block_manager = src.store->raiden_controller()->block_manager();
-  for (int i = 0; i < 1000 && block_manager->num_free_blocks() != 6; ++i) {
+  auto* controller = src.store->raiden_controller();
+  for (int i = 0; i < 1000 && controller->num_free_blocks() != 6; ++i) {
     absl::SleepFor(absl::Milliseconds(10));
   }
-  ASSERT_EQ(block_manager->num_free_blocks(), 6)
+  ASSERT_EQ(controller->num_free_blocks(), 6)
       << "the sweep never demoted down to the high watermark";
 
   // Wipe the freed source blocks: a demotion is a copy, so without this the

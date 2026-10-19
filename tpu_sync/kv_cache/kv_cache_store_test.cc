@@ -5736,14 +5736,12 @@ class EvictSweepTest : public RemoteWriteSourceTest {
   // erases the cache entry a beat before the block id is deallocated.
   void AwaitSweepFreed(KVCacheStore& store, int expected_free) {
     for (int i = 0; i < 1000; ++i) {
-      if (store.raiden_controller()->block_manager()->num_free_blocks() ==
-          expected_free) {
+      if (store.raiden_controller()->num_free_blocks() == expected_free) {
         break;
       }
       absl::SleepFor(absl::Milliseconds(10));
     }
-    EXPECT_EQ(store.raiden_controller()->block_manager()->num_free_blocks(),
-              expected_free);
+    EXPECT_EQ(store.raiden_controller()->num_free_blocks(), expected_free);
   }
 
   // How many of `hashes` the store still resolves locally.

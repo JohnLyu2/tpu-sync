@@ -14,6 +14,7 @@
 
 #include "tpu_sync/core/controller/raiden_controller.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1844,6 +1846,49 @@ TEST_F(RaidenControllerTest,
                   .Await();
   EXPECT_FALSE(none.ok());
   EXPECT_THAT(none.message(), HasSubstr("requires exactly 1 backend_spec"));
+}
+
+TEST_F(RaidenControllerTest, ConcurrentAllocateAndNumFreeBlocksThreadSafe) {
+  constexpr int kNumBlocks = 16;
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, RaidenController::Create(
+                                               unit_, /*num_blocks=*/kNumBlocks,
+                                               /*num_shards=*/1,
+                                               /*shard_size_bytes=*/512, ""));
+
+  std::atomic<bool> done{false};
+  constexpr int kWriterIterations = 5000;
+  constexpr int kMaxReaderIterations = 100000;
+
+  std::thread writer([&]() {
+    for (int i = 0; i < kWriterIterations; ++i) {
+      auto ids_or = controller->AllocateBlockIds(/*num_blocks=*/4);
+      if (!ids_or.ok()) {
+        ADD_FAILURE() << "AllocateBlockIds failed: " << ids_or.status();
+        break;
+      }
+      auto status = controller->DeallocateBlockIds(*ids_or);
+      if (!status.ok()) {
+        ADD_FAILURE() << "DeallocateBlockIds failed: " << status;
+        break;
+      }
+    }
+    done.store(true, std::memory_order_release);
+  });
+
+  std::thread reader([&]() {
+    for (int i = 0;
+         i < kMaxReaderIterations && !done.load(std::memory_order_acquire);
+         ++i) {
+      int total = controller->total_blocks();
+      int free = controller->num_free_blocks();
+      EXPECT_EQ(total, kNumBlocks);
+      EXPECT_GE(free, 0);
+      EXPECT_LE(free, total);
+    }
+  });
+
+  writer.join();
+  reader.join();
 }
 
 }  // namespace

@@ -1831,9 +1831,8 @@ size_t KVCacheStore::Evict(const std::vector<std::string>& block_hashes) {
 }
 
 bool KVCacheStore::SweepOnce() {
-  const int free_blocks =
-      raiden_controller_->block_manager()->num_free_blocks();
-  const int total_blocks = raiden_controller_->block_manager()->total_blocks();
+  const int free_blocks = raiden_controller_->num_free_blocks();
+  const int total_blocks = raiden_controller_->total_blocks();
   if (total_blocks <= 0) {
     return false;
   }
@@ -2053,13 +2052,13 @@ absl::StatusOr<std::vector<int>> KVCacheStore::AllocateBlockIds(int needed) {
   bool request_sweep = false;
   {
     absl::MutexLock lock(mutex_);
-    int free_count = raiden_controller_->block_manager()->num_free_blocks();
+    int free_count = raiden_controller_->num_free_blocks();
     // Wake the evict sweep the moment this allocation dips below its low
     // watermark, instead of leaving detection to the sweep's fallback
     // period. The drop-evict below stays the last-ditch fallback for
     // allocations the sweep has not made room for.
     if (monitor_config_.enable_evict_sweep && store_monitor_ != nullptr) {
-      const int total = raiden_controller_->block_manager()->total_blocks();
+      const int total = raiden_controller_->total_blocks();
       request_sweep =
           total > 0 &&
           free_count - needed < monitor_config_.evict_low_watermark * total;

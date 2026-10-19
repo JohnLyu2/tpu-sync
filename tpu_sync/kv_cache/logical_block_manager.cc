@@ -27,7 +27,7 @@ namespace tpu_raiden {
 namespace kv_cache {
 
 LogicalBlockManager::LogicalBlockManager(int num_blocks)
-    : total_blocks_(num_blocks), blocks_(num_blocks) {}
+    : total_blocks_(num_blocks), blocks_(num_blocks), num_free_(num_blocks) {}
 
 absl::StatusOr<std::vector<int>> LogicalBlockManager::Allocate(
     int num_blocks_to_allocate, bool lock) {
@@ -107,6 +107,8 @@ absl::StatusOr<std::vector<int>> LogicalBlockManager::Allocate(
     blocks_[block_id].last_access_counter = access_counter_;
   }
 
+  num_free_ -= free_to_use;
+
   return allocated_block_ids;
 }
 
@@ -136,6 +138,7 @@ absl::Status LogicalBlockManager::AllocateTarget(
     blocks_[block_id].is_locked = true;
     blocks_[block_id].last_access_counter = access_counter_;
   }
+  num_free_ -= static_cast<int>(block_ids.size());
   return absl::OkStatus();
 }
 
@@ -174,7 +177,10 @@ absl::Status LogicalBlockManager::Deallocate(absl::Span<const int> block_ids) {
 
   // Perform state update.
   for (int block_id : block_ids) {
-    blocks_[block_id].is_allocated = false;
+    if (blocks_[block_id].is_allocated) {
+      blocks_[block_id].is_allocated = false;
+      ++num_free_;
+    }
     blocks_[block_id].is_locked = false;
   }
   return absl::OkStatus();
@@ -205,15 +211,7 @@ bool LogicalBlockManager::IsLocked(int block_id) const {
   return blocks_[block_id].is_locked;
 }
 
-
-
-int LogicalBlockManager::num_free_blocks() const {
-  int count = 0;
-  for (const auto& block : blocks_) {
-    if (!block.is_allocated) ++count;
-  }
-  return count;
-}
+int LogicalBlockManager::num_free_blocks() const { return num_free_; }
 
 int LogicalBlockManager::num_allocated_blocks() const {
   int count = 0;
