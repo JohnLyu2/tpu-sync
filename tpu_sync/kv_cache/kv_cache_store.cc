@@ -461,6 +461,20 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
         std::move(sweep_fn),
         /*republish_fn=*/[s = store.get()] { return s->RepublishOnce(); });
     store->store_monitor_->Start();
+
+    // Remote writes skip AllocateBlockIds, which is what wakes the sweep for
+    // local allocations, so have the server request a space check on refused
+    // and committed writes instead. Installed after the monitor starts so
+    // there is always a monitor to wake; the lifetime check makes the space
+    // check a no-op once the store is destroyed.
+    if (monitor_config.enable_evict_sweep && store->store_server_ != nullptr) {
+      store->store_server_->SetSpaceCheckFn([lifetime = store->lifetime_] {
+        absl::MutexLock lock(lifetime->mu);
+        if (KVCacheStore* self = lifetime->store; self != nullptr) {
+          self->MaybeWakeEvictSweep();
+        }
+      });
+    }
   }
 
   store->backend_configs_ = std::move(effective_configs);
@@ -1944,6 +1958,14 @@ bool KVCacheStore::SweepOnce() {
     return end_episode();
   }
   return true;
+}
+
+void KVCacheStore::MaybeWakeEvictSweep() {
+  const int total = raiden_controller_->total_blocks();
+  if (total > 0 && raiden_controller_->num_free_blocks() <
+                       monitor_config_.evict_low_watermark * total) {
+    store_monitor_->RequestSweep();
+  }
 }
 
 bool KVCacheStore::RepublishOnce() {

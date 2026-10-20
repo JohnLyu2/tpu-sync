@@ -115,6 +115,14 @@ std::string KVCacheStoreServer::GetServerAddress() const {
   return absl::StrCat(server_host_, ":", grpc_port_);
 }
 
+void KVCacheStoreServer::SetSpaceCheckFn(
+    KVCacheStoreServiceImpl::SpaceCheckFn fn) {
+  absl::MutexLock lock(mutex_);
+  if (service_ != nullptr) {
+    service_->SetSpaceCheckFn(std::move(fn));
+  }
+}
+
 void KVCacheStoreServer::Shutdown() {
   absl::MutexLock lock(mutex_);
   if (grpc_server_) {

@@ -987,6 +987,52 @@ TEST_F(WriteRemoteTest, RefusesWhenThereAreNoFreeBlocksAndEvictsNothing) {
               UnorderedElementsAre("victim"));
 }
 
+// The owner is asked for a space check once per refused write and once per
+// commit, but not for a granted allocation, a failed transfer, or a write that
+// needs no blocks.
+TEST_F(WriteRemoteTest, SpaceCheckRunsOnRefusalAndCommit) {
+  std::atomic<int> calls{0};
+  service_->SetSpaceCheckFn([&calls] { calls.fetch_add(1); });
+
+  // ALL_EXIST allocates nothing.
+  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
+      {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)}));
+  auto exist_resp = Offer({"a"});
+  ABSL_ASSERT_OK(exist_resp.status());
+  EXPECT_EQ(exist_resp->exist_state(),
+            ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
+  EXPECT_EQ(calls.load(), 0);
+
+  // A granted allocation alone is silent, and a failed transfer gives its
+  // blocks back, leaving nothing to reclaim.
+  auto failed_resp = Offer({"b"});
+  ABSL_ASSERT_OK(failed_resp.status());
+  EXPECT_EQ(calls.load(), 0);
+  latch_.Release(absl::InternalError("pull failed"));
+  ASSERT_EQ(AwaitTerminal(failed_resp->operation_id()),
+            ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::FAILED);
+  EXPECT_EQ(calls.load(), 0);
+
+  // A commit is reported before the verdict is visible.
+  auto committed_resp = Offer({"c"});
+  ABSL_ASSERT_OK(committed_resp.status());
+  EXPECT_EQ(calls.load(), 0);
+  latch_.Release(absl::OkStatus());
+  ASSERT_EQ(AwaitTerminal(committed_resp->operation_id()),
+            ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED);
+  EXPECT_EQ(calls.load(), 1);
+
+  // A refusal is reported, and evicts nothing.
+  ABSL_ASSERT_OK(store_->raiden_controller()->AllocateBlockIds(
+      store_->raiden_controller()->num_free_blocks()));
+  auto refused_resp = Offer({"d"});
+  EXPECT_THAT(refused_resp.status(),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  EXPECT_EQ(calls.load(), 2);
+  EXPECT_THAT(store_->backend()->AlreadyPresentHostResident({"c"}),
+              UnorderedElementsAre("c"));
+}
+
 TEST_F(WriteRemoteTest, PollOfAnUnknownOperationIsUnknown) {
   auto poll = Poll(999999);
   ABSL_ASSERT_OK(poll.status());

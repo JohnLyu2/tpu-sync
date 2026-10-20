@@ -82,6 +82,17 @@ class KVCacheStoreServiceImpl
   // server serves, because the member is not mutex-guarded.
   void SetTransferFnForTesting(TransferFn transfer_fn);
 
+  // Asks the owner to check its free space, so it can make room. Runs once
+  // when WriteRemote is refused landing blocks for lack of free ones, and
+  // once when an accepted write finishes with its blocks kept in the cache,
+  // before the source hears the verdict. Runs on gRPC, transfer-completion or
+  // registry-completion threads, never with write_mutex_ held. It must be
+  // cheap, must not block, and must not call back into this service.
+  using SpaceCheckFn = std::function<void()>;
+  // Installs `fn`, or clears it with nullptr. Safe to call while the service
+  // is serving.
+  void SetSpaceCheckFn(SpaceCheckFn fn);
+
   // Stops the deadline thread firing deadlines, without stopping the thread.
   // Tests only; lets a test show that the commit claim checks the wall clock
   // itself.
@@ -223,6 +234,9 @@ class KVCacheStoreServiceImpl
   static proto::WriteRemoteEvent MakeResultEvent(
       const std::shared_ptr<WriteOp>& op);
 
+  // Runs the space check, if one is installed, outside space_check_mutex_.
+  void RequestSpaceCheck();
+
   KVCacheStoreBackend* const backend_ = nullptr;
   tpu_raiden::controller::RaidenController* const controller_ = nullptr;
 
@@ -248,6 +262,12 @@ class KVCacheStoreServiceImpl
   absl::CondVar deadline_cv_;
   // Runs DeadlineLoop.
   std::unique_ptr<std::thread> deadline_thread_;
+
+  // Guards space_check_fn_.
+  absl::Mutex space_check_mutex_;
+  // See SetSpaceCheckFn; null when none is installed.
+  std::shared_ptr<const SpaceCheckFn> space_check_fn_
+      ABSL_GUARDED_BY(space_check_mutex_);
 };
 
 }  // namespace kv_cache

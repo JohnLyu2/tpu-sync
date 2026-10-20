@@ -325,7 +325,10 @@ class KVCacheStore {
   // consumes that pin; a failed save leaves it with the caller.
   //
   // Note: a destination allocates landing blocks from free space only and
-  // never evicts, so a peer with a full cache refuses every offer.
+  // never evicts inline. If the peer runs the evict sweep, a refused write or
+  // a commit that leaves it below its low watermark wakes that sweep, so a
+  // full peer refuses only writes that arrive before the sweep has made room;
+  // without the sweep it refuses every offer.
   absl::Status Save(const std::vector<std::string>& block_hashes,
                     const std::optional<RaidenId>& dst_raiden_id = std::nullopt);
 
@@ -603,6 +606,12 @@ class KVCacheStore {
   // the sweep should run again right away. The store monitor's thread is
   // the only caller, which is why the episode state below needs no lock.
   bool SweepOnce();
+
+  // Wakes the evict sweep if free blocks are below its low watermark,
+  // the point where SweepOnce has work to do. Installed as the store
+  // server's space check, so it runs on the server's threads.
+  // Requires store_monitor_.
+  void MaybeWakeEvictSweep();
 
   // One bounded step of the inventory republish that runs after this store's
   // registration lapsed at the registry (see StoreMonitor::RepublishFn): on

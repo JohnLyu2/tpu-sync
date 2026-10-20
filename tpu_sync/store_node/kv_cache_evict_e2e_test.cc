@@ -431,6 +431,103 @@ TEST_F(EvictE2ETest, FullHostStoreNodeEvictsLruBlockOnNewDemotion) {
       << "Oldest block e2e_blk_0 should no longer be discoverable by peers";
 }
 
+// Tests that demotions filling a host store node wake its evict sweep right
+// away instead of on its period, so the next demotion lands.
+TEST_F(EvictE2ETest, RemoteWriteWakesTheStoreNodeSweepBeforeItsPeriod) {
+  constexpr size_t kNodeCapacity = 4;
+  const kv_cache::RaidenId src_id{"e2e_serving", "0", "kv_pool", 0};
+  TF_ASSERT_OK_AND_ASSIGN(
+      SourceAssembly src,
+      MakeSource(src_id, "e2e_pool", /*enable_evict_sweep=*/false,
+                 /*evict_low_watermark=*/0.7,
+                 /*evict_high_watermark=*/0.75));
+
+  KVCacheHostStoreNode::Options options;
+  options.raiden_id = kv_cache::RaidenId{"e2e_store_node", "0", "kv_pool", 0};
+  options.store_server_ip = "localhost";
+  options.global_registry_address = registry_->server_address;
+  options.kv_pool_group = "e2e_pool";
+  options.evict_tier = 1;
+  options.dram_budget_bytes = kNodeCapacity * kBlockBytes;
+  // The period outlasts the test, so only a wake can run the node's sweep.
+  options.evict_sweep_period = absl::Hours(1);
+  options.evict_low_watermark = 0.5;
+  options.evict_high_watermark = 0.75;
+  StaticKVTransferSpecSource source(TestSpec());
+  absl::StatusOr<std::unique_ptr<KVCacheHostStoreNode>> node =
+      KVCacheHostStoreNode::Create(options, &source);
+  ASSERT_TRUE(node.ok()) << node.status().ToString();
+  ASSERT_EQ((*node)->num_host_blocks(), kNodeCapacity);
+
+  // Phase 1: Fill the tier-1 host store node via demotions from tier-0 source.
+  constexpr int kPhase1Blocks = 6;
+  std::vector<std::string> hashes;
+  std::vector<kv_cache::RaidenBlockId> slices;
+  TF_ASSERT_OK_AND_ASSIGN(
+      const std::vector<int> ids,
+      src.store->raiden_controller()->AllocateBlockIds(kPhase1Blocks));
+  for (int i = 0; i < kPhase1Blocks; ++i) {
+    const std::string hash = absl::StrCat("e2e_blk_", i);
+    hashes.push_back(hash);
+    slices.push_back(
+        kv_cache::RaidenBlockId(src_id, ids[i], kv_cache::BlockStatus::HOST));
+    FillBlock(*src.manager, ids[i], i);
+    ASSERT_TRUE(
+        src.store->Insert({hash}, {slices.back()}, /*on_host=*/true).ok());
+    src.store->Release({hash});
+  }
+
+  EXPECT_TRUE(src.store->SweepOnceForTesting());
+
+  const kv_cache::LookupOptions local_only{.enable_global = false};
+  for (int i = 0; i < 4; ++i) {
+    TF_ASSERT_OK_AND_ASSIGN(auto local_src,
+                            src.store->backend()->Lookup(
+                                {absl::StrCat("e2e_blk_", i)}, local_only));
+    EXPECT_TRUE(local_src.empty())
+        << "Demoted block e2e_blk_" << i << " should be evicted from tier 0";
+  }
+
+  // Bounded poll (<=5s, 10ms steps) for the node's free blocks to become
+  // non-zero.
+  auto* node_controller = (*node)->store()->raiden_controller();
+  for (int i = 0; i < 500 && node_controller->num_free_blocks() == 0; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+
+  // Phase 2: Add 1 new block to tier-0, dropping its free ratio below 0.7.
+  TF_ASSERT_OK_AND_ASSIGN(const std::vector<int> new_id,
+                          src.store->raiden_controller()->AllocateBlockIds(1));
+  const std::string new_hash = "e2e_blk_6";
+  FillBlock(*src.manager, new_id[0], 6);
+  ASSERT_TRUE(src.store
+                  ->Insert({new_hash},
+                           {kv_cache::RaidenBlockId(
+                               src_id, new_id[0], kv_cache::BlockStatus::HOST)},
+                           /*on_host=*/true)
+                  .ok());
+  src.store->Release({new_hash});
+
+  src.store->SweepOnceForTesting();
+
+  // Assertions: e2e_blk_4 landed on the node; e2e_blk_3 retained; e2e_blk_0
+  // evicted locally.
+  TF_ASSERT_OK_AND_ASSIGN(auto local_4, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_4"}, local_only));
+  EXPECT_EQ(local_4.size(), 1u)
+      << "New demotion e2e_blk_4 should land on the store node";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto local_3, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_3"}, local_only));
+  EXPECT_EQ(local_3.size(), 1u)
+      << "Phase-1 block e2e_blk_3 must be retained on the store node";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto local_0, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_0"}, local_only));
+  EXPECT_TRUE(local_0.empty())
+      << "Oldest block e2e_blk_0 should be evicted from the store node";
+}
+
 }  // namespace
 }  // namespace store_node
 }  // namespace tpu_raiden
