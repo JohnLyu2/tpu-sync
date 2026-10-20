@@ -1284,7 +1284,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
                   }
                 });
           },
-          nb::arg("callback"));
+          nb::arg("callback").none());
 
   // C++-owned reshard client. The facade-compatible surface is provided by
   // tpu_raiden/api/torch/reshard_client.py on top of this binding.

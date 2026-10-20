@@ -177,8 +177,6 @@ class KVCacheStoreTest(absltest.TestCase):
     self.assertTrue(controller.insert(hashes, slices, True))
     controller.release(hashes)
 
-
-
   def test_large_and_arbitrary_length_hashes(self):
     controller = kv_cache_store.KVCacheStore(
         capacity=5, num_shards=1, store_server_ip="127.0.0.1"
@@ -298,7 +296,6 @@ class KVCacheStoreTest(absltest.TestCase):
     # Should not fail, just return empty because the registry is now down.
     res = controller.lookup(hashes, enable_global=True)
     self.assertEmpty(res)
-
 
   def test_insert_rejects_remote_slices(self):
     # The LRU cache holds LOCAL blocks only; a REMOTE slice names a block on
@@ -428,6 +425,16 @@ class KVCacheStoreTest(absltest.TestCase):
     store.release([b"h1"])  # resident, unpinned
 
     self.assertFalse(store.load([b"h1"], [0]))
+
+  def test_set_eviction_callback_accepts_none_to_unregister(self):
+    # None is the documented way to unregister. Which evictions reach the
+    # callback is the C++ store's contract; this checks None gets through the
+    # binding to it at all.
+    store = kv_cache_store.KVCacheStore(
+        capacity=2, num_shards=1, store_server_ip="127.0.0.1"
+    )
+    store.set_eviction_callback(lambda hashes: None)
+    store.set_eviction_callback(None)
 
   def test_local_save_requires_hbm_residency(self):
     # A local save reads the bytes out of HBM; a host-only entry has nothing
