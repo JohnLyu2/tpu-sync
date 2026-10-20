@@ -74,7 +74,9 @@ per-layer view: one `netAccount` per layer, which is the coarsening A4 justifies
   `{uuid, layer}` entry of `layer_progress_`, which the transport erases once
   every layer has been called (`bt.cc:764-778`); A1 therefore also assumes no
   sender re-pushes a uuid after its entries were retired while the receive is
-  still live.
+  still live. `Transport.lean` models the table and proves A1
+  (`Transport.OnceDispatched`) from exactly that assumption (its A4, honest
+  senders); `Transport.trace_dup_after_retirement` is the re-push.
 * **A2 (registration).** The session has blocks to receive and is registered.
   `ReleaseStaging()` is only called from outside on registration failure:
   `mgr.cc:559` and `:917` run before the session is seated, and if
@@ -104,7 +106,9 @@ per-layer view: one `netAccount` per layer, which is the coarsening A4 justifies
   relies on streams reporting exactly their planned block count once (the
   counters are plain sums compared with `>=`, `.cc:478-480`): over-reporting
   would complete a shard early, which is precisely the `netAccountUnordered`
-  mutant.
+  mutant. `Transport.lean` proves the coarsening (`Transport.NetworkSound`)
+  from honest senders and shows the over-report
+  (`Transport.trace_dup_chunk_publishes_missing_layer`).
 
 ## Properties
 

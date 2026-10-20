@@ -21,7 +21,7 @@ at the commit it names).
 
 | Subsystem | What Is Modeled & Proved | Lean Models | Design & Proof Doc |
 |---|---|---|---|
-| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, and cross-peer fault isolation | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
+| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, cross-peer fault isolation, and the transport's receiver-side stream accounting (`Transport.lean`) | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
 | **Pool Resharding** | Multi-pool send/receive sessions, rank-ordered H2D waves, sub-block byte-interval coverage, `PoolStagingStorage` arena leases, block registry, and two-stage coordinator barriers | [`TpuSyncVerify/Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/) | [reshard.md](docs/transfer/reshard.md) |
 | **Controller & Remote Leases** | Remote read lease lifecycle and `NoWriteAfterRelease` safety via exhaustive state-space exploration | [`TpuSyncVerify/Controller/ReadRemote.lean`](TpuSyncVerify/Controller/ReadRemote.lean) | [read_remote.md](docs/controller/read_remote.md) |
 

@@ -38,7 +38,8 @@ here.
 | `raiden_controller_bughunt_test.cc` | F2 (shape A) and F4 (both halves) |
 | `kv_cache_store_pin_race_test.cc` | F1 |
 | `reshard_bughunt_test.cc` | R7a, R7b, R8, R2b of `docs/transfer/reshard.md` (registry / coordinator claim lifecycle; all four pass, not yet filed) |
-| `build_targets.patch` | `cc_test` targets for the three files above |
+| `reshard_send_session_bughunt_test.cc` | F10 (R6 of `docs/transfer/reshard.md`): the sender's early plan unregister and the uuid-keyed staging lease it hands to a retry |
+| `build_targets.patch` | `cc_test` targets for the four files above |
 | `candidate_fixes.patch` | fixes for F1 and F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 
@@ -57,7 +58,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 | # | Finding | Status | Reachable from production? |
 |---|---|---|---|
 | F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash ([filed](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1) 2026-10-19) | CONFIRMED (test); filed upstream, fix pending | only via the `ReadRemote` API (no in-tree caller) |
-| F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shape A; proved in Lean for shapes A and B | same |
+| F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shapes A and B (B added 2026-10-20, on upstream `449b591`); proved in Lean for both | same |
 | F3 | Data race on `RemoteReadState::lease_id` | CONFIRMED (read) | same |
 | F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `50b0774`; **FIXED upstream** by PR #1105 = `72255dd` (2026-10-07) | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
 | F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix designed and validated on `50b0774`, patch retired 2026-10-16) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
@@ -65,6 +66,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 | F7 | `end_incoming_push` hook: a failed incoming push on a `ReshardReceiveSession` is not turned into `Finish(status)` (the `TransferReceiveSession` branch does), so the session, its staging lease and plan claim stay pinned until the deadline sweep, which reports `DEADLINE_EXCEEDED` instead of the push error ([filed](filed_bugs.md#3-reshardreceivesession-ignores-a-failed-endincomingpush-and-pins-poolstagingstorage-until-timeout-r1); R1 in `docs/transfer/reshard.md`) | CONFIRMED (read) at `0ac16d1`, witnessed in Lean (`Receive.lean`); **FIXED upstream** in `fdeebcd` (2026-10-16) | yes: any pool-reshard receiver whose sender's push fails mid-transfer (socket timeout / disconnect) |
 | F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
 | F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
+| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape, reopened on the sender) (R6 in `docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `449b591`); not yet filed | yes: any pool-reshard sender with bounded host staging whose first failing push has siblings in flight and whose transfer is retried under the same `uuid` before the old session drains |
 
 ---
 
@@ -130,23 +132,38 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 
 ## F2. Remote read keeps DMA-ing into destination blocks after it has already failed with a deadline error
 
-- **Status:** **CONFIRMED (test)** for shape A, 2026-09-24. **Proved in
-  Lean** for shapes A and B (`TpuSyncVerify/Controller/ReadRemote.lean`,
-  exhaustive over the reachable state space).
-- **C++ test output** (unmodified code, verbatim):
+- **Status:** **CONFIRMED (test)** for shapes A and B. Shape A first on
+  `b68161a` (2026-09-24); both shapes on 2026-10-20 against upstream `main`
+  `449b591` (controller sources rebuilt from `449b591`, leaf libraries from
+  the `0ac16d1` OSS build; `raiden_controller.cc`'s `ReadRemote` region is
+  unchanged between the two). **Proved in Lean** for shapes A and B
+  (`TpuSyncVerify/Controller/ReadRemote.lean`, exhaustive over the reachable
+  state space).
+- **C++ test output** (unmodified code, verbatim, 2026-10-20 run; the tests
+  are written so that a failure shows the defect):
   ```
-  [F2] settled after 1.002259414s with: ReadRemote exceeded the destination deadline (1s)
+  [ RUN      ] BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled
+  [F2] settled after 1.001596645s with: ReadRemote exceeded the destination deadline (1s)
   [F2] pulls issued at settle: 0, pulls issued 4s later: 1
-  raiden_controller_bughunt_test.cc:111: Failure
+  raiden_controller_bughunt_test.cc:119: Failure
     pulls_after  Which is: 1
   A pull into dst host block 20 was issued AFTER ReadRemote settled with DeadlineExceeded.
+  [ RUN      ] BugHuntTest.ReadRemoteSettlesDeadlineWhilePullStillInFlight
+  [F2-B] settled after 1.002245805s with: ReadRemote exceeded the destination deadline (1s)
+  [F2-B] at settle: pull started=1, pull finished=0
+  [F2-B] pull finished 2.004212569s AFTER the caller was told the read failed
+  raiden_controller_bughunt_test.cc:206: Failure
+  Expected: (finished_after) <= (absl::ToUnixNanos(settled_at)), actual: 1792516287098830194 vs 1792516285094617625
+  The DMA into dst host block 20 was still running when ReadRemote settled with DeadlineExceeded, and finished afterwards.
   ```
-  The test sets `RAIDEN_REMOTE_READ_DEADLINE_S=1` and delays the source's
+  Both set `RAIDEN_REMOTE_READ_DEADLINE_S=1`. Shape A delays the source's
   `AcquireReadLease` by 2.5 s with the existing `SetLeaseGrantedHookForTest`
-  seam (`controller_service.h:106`). That configuration only makes the test
-  fast. With defaults the deadline is the lease TTL plus 30 s
+  seam (`controller_service.h:106`). Shape B answers the acquire immediately
+  and makes the worker's `H2hReadExplicit` take 3 s (`SlowReadMock`), so the
+  deadline fires while the pull is in flight. That configuration only makes
+  the tests fast. With defaults the deadline is the lease TTL plus 30 s
   (`raiden_controller.cc:107-130`), so shape A needs an acquire that takes
-  longer than that (a hung source). Shape B needs a pull that outlives the
+  longer than that (a hung source) and shape B a pull that outlives the
   deadline, which is the case the deadline exists for.
 - **Where:** `tpu_sync/core/controller/raiden_controller.cc:1051-1139`
   (acquire callback and deadline thread), `:1144-1246` (`PullAndRelease`).
@@ -584,6 +601,69 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 
 ---
 
+## F10. `ReshardSendSession`: the first failed push unregisters the plan while siblings are in flight, and hands the uuid's staging lease to a retry
+
+- **Status:** **CONFIRMED (test)** 2026-10-20 by
+  `ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6`
+  in `reshard_send_session_bughunt_test.cc` (R6 in `docs/transfer/reshard.md`,
+  witnessed in Lean by `trace_early_unregister_on_error_vs_onSettle` in
+  `Send.lean`). Built against the `1fa06d1` OSS outputs and headers (the warm
+  build on this machine); `RecordPushCompletion`, `Create`'s
+  register-before-lease order, `AcquirePoolStagingLease` /
+  `ReleasePoolStagingLeases` and `UnregisterActivePlanDirect` are unchanged
+  through upstream `449b591` (the session's later diffs are data-connection
+  reuse and the `StagingBlockAllocator` → `KVCacheManagerBase` forwarding move).
+  Not yet filed. Output, verbatim (the test asserts the defect, so it passes
+  on unmodified code):
+  ```
+  [ RUN      ] ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6
+  E0000 ... reshard_send_session.cc:351] Pool reshard send failed uuid=6001 req_id=pool_reshard_req_6001: UNAVAILABLE: peer 1 refused
+  [       OK ] ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6 (7 ms)
+  ```
+  The test drives the session's op accounting through upstream's own
+  `ReshardSendSessionTestPeer` friend seam (`reshard_send_session.h`), because
+  `ExecutePush` needs real D2H copies.
+- **Where (at `0ac16d1`):** `ReshardSendSession::RecordPushCompletion`
+  (`reshard_send_session.cc:351-392`). On the first `!status.ok()` it latches
+  `finalizing_` and calls `manager.UnregisterActivePlan(uuid_)` (`:366-367`,
+  `:383`) regardless of `in_flight_`. `EndOp` (`:418-440`) already unregisters
+  when the last op of a finalizing send is counted out, so the early call is
+  redundant on the success path and only differs when siblings are in flight.
+- **Sequence shown by the test** (bounded staging, `staging_leases = 2`,
+  one source block, two destination peers so `remaining_pool_peer_pushes = 2`):
+  1. Session A: `Create` registers plan `uuid`; its lease takes one slot
+     (`free_slots` 2 → 1); the push to peer 1 resolves one chunk at slot `P`.
+  2. Peer 1's push fails; peer 2's is still in flight. `in_flight_ == 1`,
+     `!Done()`, and **`HasActivePlan(uuid) == false`**.
+  3. A sibling resolving its chunks now gets none (`GetBlockChunks(uuid)`
+     empty). On a full-mirror storage the same call falls back to un-sliced
+     full-block extents instead (`kv_cache_manager_base.cc:3306-3325`).
+  4. A retry `Create` for the same `uuid` **succeeds** (it would be
+     `ALREADY_EXISTS` while the plan is registered — the guard `8653373` relies
+     on for the receiver). Its `AcquirePoolStagingLease(uuid)` is idempotent
+     per uuid, so it shares A's slot: `free_slots` stays 1, the retry's chunk
+     is `P`.
+  5. Peer 2's push returns; A settles; `ReleaseLeasesLocked` →
+     `ReleasePoolStagingLeases(uuid)` frees the shared slot: `free_slots`
+     back to 2 while the retry is live, and the retry's `GetBlockChunks(uuid)`
+     is now empty.
+  6. A third transfer (`uuid + 1`) leases the same slot `P` — the F6
+     aliasing, on the sender.
+- **Impact:** a send that fails on one peer with others in flight drops its
+  plan early; with a same-uuid retry arriving before it drains (the
+  coordinator's own tests retry under the same uuid), the retry's host staging
+  is released under it and reallocated to an unrelated transfer, silently.
+  Without the retry the harm is limited: later chunk resolution in the failed
+  session fails (bounded) or falls back to whole blocks (full mirror), and the
+  socket adapter's per-uuid failure latch cancels the sibling posts anyway.
+- **Fix (proposed):** drop the early `UnregisterActivePlan` in
+  `RecordPushCompletion` (keep `finalizing_`); let `EndOp` unregister at
+  settle, as it already does for sends finished from outside. Alternatively
+  make `AcquirePoolStagingLease` refuse a uuid whose lease is held by a
+  session that has not settled.
+
+---
+
 ## Refuted or closed
 
 ### R-A. Premature completion in `TransferReceiveSession::IsReadyToComplete()`: REFUTED
@@ -605,6 +685,63 @@ a failed load is recomputed, not pulled again; the only same-uuid retry is on
 (`request_block_registry.cc:440-466`) and runs before any receiver is armed.
 This remains an **API hazard** for other callers, since the headers allow
 same-uuid re-registration.
+
+
+**Sharpened 2026-10-20 (`0ac16d1`), `Transfer/PrefillDecode/Transport.lean`.**
+The hazard is narrower and the consequence more specific than the 2026-09
+wording:
+
+- Of the three completion contracts in `BlockTransport::CompleteIncomingPush`
+  (`block_transport.cc:640-793`), the sender-declared (`:732-736`) and
+  plan-declared (`:704-708`) ones reject a stream beyond the declared count and
+  fail the receive; the chunk-count contract (`:739-741`) — the one the
+  prefill-to-decode path uses whenever the receive plan has no
+  `shard_push_schedules` (`kv_cache_manager_base.cc:2687-2703`) — accepts it
+  silently. The duplicate is not dispatched (`completed_chunks ≠ num_streams`)
+  but is still reported through `OnBlockShardsReceived` (`:629-630`), so
+  `network_completed_` is reached with another layer's blocks never received,
+  and `IsReadyToComplete` (`transfer_receive_session.cc:450-455`) reports
+  success with that layer never copied
+  (`Transport.trace_dup_chunk_publishes_missing_layer`).
+- On **either** contract, once every layer has been called the transport
+  erases the uuid's `layer_progress_` entries (`:764-778`) while the receive is
+  still live (its H2D copies are in flight), and `ExecuteLayerH2d` has no
+  once-latch of its own (`transfer_receive_session.cc:642-700`). A later stream
+  for that uuid starts a fresh entry, fires `OnLayerReceived` again and issues
+  a second copy of the same layer while the first may still run. The session
+  is *not* fooled about settlement — `in_flight_` holds `done_` off until both
+  copies return (`:412-416`) — but the two callbacks bring
+  `num_completed_layers_` to `num_layers()` (`:725-731`) with another layer's
+  copy still pending, and a failing duplicate copy fails the whole receive,
+  because `FinishLocked` records the first error even when already draining
+  (`:359-363`) (`Transport.trace_dup_after_retirement`,
+  `trace_dup_copy_fails_late`). A redundant DMA and a spurious failure, not a
+  wrong publication.
+- In both cases the duplicate stream's payload read (`:604`) rewrites the
+  layer's host staging while the first H2D copy of that layer may still be
+  reading it; harmless only if the duplicate carries the same bytes.
+- With honest senders (at most the declared streams per layer, for the life of
+  the receive) none of this is reachable on either contract:
+  `Transport.reachable_safe` (`OnceDispatched`, `NetworkSound`,
+  `CompleteOnSuccess`), for any positive layer, sender, stream and block
+  counts. The model rests on two further assumptions it names but does not
+  prove (`Transport` A2, A3): the contract a layer runs under is latched by
+  its first stream (`:661-683`), and the receiver seats the session before it
+  publishes the plan (`kv_cache_manager_with_transfer.cc:549-567` vs
+  `:596-599`), so a push landing in that window would latch chunk-count on a
+  sender-declared plan; and the sender-declared contract counts distinct
+  `remote_id = node_id()` (`:1168`) against `shard_push_schedules`, which are
+  keyed by source shard, so it presumes one source shard per node.
+
+Still not reachable from the in-repo callers for the reason above (fresh uuid
+per send, no retry into an armed receiver), and no in-repo sender path opens
+more streams than it declares (`header.reserved`), so this stays an **API
+hazard** rather than a numbered finding. Two local changes close it without
+touching honest behaviour — reject `completed_chunks > num_streams` in the
+chunk-count branch, mirroring the other two, and keep a per-layer once-latch in
+`ExecuteLayerH2d` (`Transport.stepHardened`: bounded searches find no
+violation, honest traces unchanged). Worth doing if the transport is ever
+exposed to a sender it does not control.
 
 ### R-C. `RequestBlockRegistry` lifecycle: no defect found (read)
 
@@ -671,6 +808,7 @@ as in the Lean preambles: `recv.cc` = `tpu_sync/kv_cache/transfer_receive_sessio
 | `done_` is redundant in six lifecycle guards | `recv.cc:365, 412, 605, 649, 675`, `recv.h:119` (send side: `send.cc:195, 255, 326, 340, 391`) | `done → draining` and `done → in_flight_ == 0` are `Lifecycle.Consistent`, which every model keeps in its invariant (`Inv.life`); the guards without `done_` are the same functions on consistent states (`finishLocked'_eq`, `endOpLocked'_eq`, `beginOp'_eq`, `Consistent.done_or_draining`). Defensive code, not a bug. The two `LOG(DFATAL)` branches (`recv.cc:407-410`, `718-720`) are assertions — unreachable by `Accounted` / `NoRetiredCallback` — and stay. `Session.lean` |
 | a failed incoming push reaches the session as a flat `InternalError("Incoming push failed")` | `bt.cc:509-516` → `mgr.cc:267-270` | the actual cause (read timeout, size mismatch, `OnLayerReceived` error) is only in the transport log, so `failed_recving` cannot tell them apart. Observability, not correctness; the model does not distinguish error statuses. |
 | `TransferSendSession::EndSendOp` drops `mu_` inside the last op of a draining send under `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer` | `send.cc:262-289` (window `:284-287`) | closes idle data connections before `EndSendOpLocked`; `in_flight_ == 1`, `draining_`, `!done_` are fixed across the window (no new op, `FinishLocked` returns early, the poll sees `Done() == false`), so the model's atomic `endOp` is exact and only `done_` is delayed. Default `pooled` never enters the branch. `Send.lean` A7. |
+| the chunk-count completion contract has no over-count rejection; retirement erases the `OnLayerReceived` once-latch while the receive is live | `bt.cc:739-741` vs `:704-708, 732-736`; `:764-778`; `recv.cc:642-700` | sound for honest senders (`Transport.reachable_safe`); what one extra stream does, the two unproved assumptions (plan-publication window `mgr.cc:567-598`, `remote_id` vs `shard_push_schedules` identity) and a candidate hardening are under R-B above. `Transport.lean` |
 
 ---
 
@@ -769,3 +907,25 @@ clone reset. Results, verbatim:
   the claim TTL but not the claimed `request_blocks_` rows; write-up as bug 6
   in `filed_bugs.md`, pinned to `0ac16d1`; reproducer `ReshardBughuntTest.R8_…`).
   Fix pending. Remaining unfiled reshard candidates with reproducers: R7b, R7a.
+- 2026-10-20: **F2 shape B confirmed by a C++ test**
+  (`BugHuntTest.ReadRemoteSettlesDeadlineWhilePullStillInFlight`, added to
+  `raiden_controller_bughunt_test.cc`; a `SlowReadMock` makes the worker's
+  read outlive the 1 s deadline). Both F2 tests run against upstream `main`
+  `449b591` (2026-10-20; 15 commits past `0ac16d1`): controller sources
+  (`raiden_controller.cc`, `controller_service.cc`, `worker_service_impl.cc`,
+  …, `logical_block_manager.cc`) compiled from `449b591`, everything else
+  linked from the `0ac16d1` OSS build. `ReadRemote` / `PullAndRelease` are
+  byte-identical between `0ac16d1` and `449b591` (the only controller change
+  is a `num_free_blocks()` accessor, `9ac3d3e`). F1, F3 regions also
+  unchanged at `449b591`.
+- 2026-10-20 (later): **F10 added** (R6: `ReshardSendSession::RecordPushCompletion`
+  unregisters the plan on the first failed push while siblings are in flight;
+  a same-uuid retry then shares, and loses, the uuid-keyed staging lease — the
+  F6 shape on the sender). Confirmed by
+  `reshard_send_session_bughunt_test.cc` using upstream's
+  `ReshardSendSessionTestPeer` seam, against the `1fa06d1` warm build (the
+  only OSS outputs on this machine; the involved code is unchanged through
+  `449b591`). Correction to the 2026-10-20 F2 entry above: the "leaf
+  libraries" used for the F2 run are from that same `1fa06d1` build, not
+  `0ac16d1`; the controller sources were compiled from `449b591` as stated.
+  Not yet filed.
