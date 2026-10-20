@@ -284,6 +284,7 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:histogram",
+        "@peregrine//peregrine/src/api/v1:ip_util",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@peregrine//peregrine/src/api/v1:socket_util",
     ],

@@ -72,6 +72,7 @@
 #endif
 #include "absl/status/status_macros.h"
 #include "peregrine/src/api/v1/histogram.h"
+#include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/telemetry/label_util.h"
@@ -86,6 +87,7 @@
 
 namespace tpu_raiden::transport::lib {
 
+using ::peregrine::v1::GetAddrPortPair;
 using ::peregrine::v1::Histogram;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;

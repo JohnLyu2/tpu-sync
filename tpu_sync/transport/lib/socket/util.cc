@@ -57,11 +57,13 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/ip_util.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 
 namespace tpu_raiden::transport::lib {
 
 namespace {
+using ::peregrine::v1::GetAddrPortPair;
 
 // Without a bound, connect() to a dead peer blocks for the kernel's SYN
 // retries (~127 s by default). Under large fan-out bursts, however, a single
@@ -565,34 +567,6 @@ bool SourceBindEnabled() {
   const absl::string_view sv(v);
   return sv == "1" || absl::EqualsIgnoreCase(sv, "true") ||
          absl::EqualsIgnoreCase(sv, "yes") || absl::EqualsIgnoreCase(sv, "on");
-}
-
-namespace {
-std::string SockAddrToEndpoint(int fd, int (*get_fn)(int, struct sockaddr*,
-                                                     socklen_t*)) {
-  struct sockaddr_storage ss{};
-  socklen_t len = sizeof(ss);
-  if (get_fn(fd, reinterpret_cast<struct sockaddr*>(&ss), &len) != 0) {
-    return "";
-  }
-  char host[NI_MAXHOST] = "", serv[NI_MAXSERV] = "";
-  if (getnameinfo(reinterpret_cast<const struct sockaddr*>(&ss), len, host,
-                  sizeof(host), serv, sizeof(serv),
-                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-    return "";
-  }
-  return ss.ss_family == AF_INET6 ? absl::StrCat("[", host, "]:", serv)
-                                  : absl::StrCat(host, ":", serv);
-}
-}  // namespace
-
-std::string GetLocalEndpoint(int fd) {
-  return SockAddrToEndpoint(fd, ::getsockname);
-}
-
-std::string GetAddrPortPair(int fd) {
-  return absl::StrCat(SockAddrToEndpoint(fd, ::getsockname), " <> ",
-                      SockAddrToEndpoint(fd, ::getpeername));
 }
 
 }  // namespace tpu_raiden::transport::lib

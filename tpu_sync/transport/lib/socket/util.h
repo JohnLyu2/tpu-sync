@@ -16,7 +16,6 @@
 #define TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
 
 #include <memory>
-#include <string>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -76,13 +75,6 @@ size_t SourceIpRouteCacheSizeForTesting();
 // Binding stays opt-in because the policy routing that makes it useful is a
 // property of the host.
 bool SourceBindEnabled();
-
-// Returns the local endpoint ("ip:port") for the socket `fd`.
-std::string GetLocalEndpoint(int fd);
-
-// Returns a string of self/peer ip:port pair ("self_ip:port <> peer_ip:port")
-// for the socket `fd`.
-std::string GetAddrPortPair(int fd);
 
 }  // namespace tpu_raiden::transport::lib
 
