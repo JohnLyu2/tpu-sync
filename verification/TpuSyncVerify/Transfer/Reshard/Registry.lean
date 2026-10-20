@@ -1,15 +1,17 @@
-/-
-  TpuSyncVerify.Transfer.Reshard.Registry
-  =======================================
+import TpuSyncVerify.Common.System
+import TpuSyncVerify.Common.ModelCheck
+import TpuSyncVerify.Common.ListAux
 
-  Stage 4a of the pool-reshard verification plan (`docs/transfer/reshard.md` §6):
-  formal model and proofs of `RequestBlockRegistry`
-  (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`), the controller-side
-  state machine that manages `(req_id, uuid)` producer block generations across
-  registration, multi-owner planning claims, claim abandonment, per-unit
-  completion voting, and unclaimed cancellation tombstones.
+/-!
+# Request block registry generation lifecycle
 
-  Pinned to upstream commit `0ac16d1`.
+Formal model and proofs of `RequestBlockRegistry`
+(`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`), the controller-side
+state machine that manages `(req_id, uuid)` producer block generations across
+registration, multi-owner planning claims, claim abandonment, per-unit
+completion voting, and unclaimed cancellation tombstones.
+
+Pinned to upstream commit `0ac16d1`.
 
   ## C++ anchorage
 
@@ -82,9 +84,6 @@
   - `purgeExpiredAll_inv` & Observations R7 (`trace_r7_single_stage_votes_retire_multi_owner_claim`)
     and R8 (`trace_r8_split_ttl_purges_request_blocks_while_claim_active`).
 -/
-
-import TpuSyncVerify.Common.System
-import TpuSyncVerify.Common.ListAux
 
 namespace TpuSyncVerify.Transfer.Reshard.Registry
 
@@ -853,6 +852,30 @@ theorem trace_r8_split_ttl_purges_request_blocks_while_claim_active :
         , (RegGen.step s_split (.lookupAndClaim 102 [0])).isNone )) =
       some (.claimed, some [0], [], true)) := by
   decide
+
+/-- Candidate registry events over two producer units (`0, 1`) and two pipelined
+claim owners (`100, 101`). -/
+def checkEvents : List Ev :=
+  [ .register 0 true, .register 1 true, .register 0 false
+  , .lookupAndClaim 100 [0, 1], .lookupAndClaim 101 [0, 1], .lookupAndClaim 100 [0]
+  , .abandonClaim 100, .abandonClaim 101
+  , .complete 0, .complete 1
+  , .cancelIfUnclaimed, .release ]
+
+/-- Executable negation of `Inv`. -/
+def violates (s : RegGen) : Bool :=
+  (s.claimedUnits.isSome != !s.claimOwners.isEmpty) ||
+  (match s.claimedUnits with
+   | none => false
+   | some units =>
+     units.isEmpty ||
+     units.any (fun u => !(s.lookupUnit u).isSome) ||
+     allVoted units s.completedUnits) ||
+  (s.cancelled && (!s.registeredUnits.isEmpty || s.claimedUnits.isSome ||
+                   !s.claimOwners.isEmpty || !s.completedUnits.isEmpty)) ||
+  (s.retired && (!s.registeredUnits.isEmpty || s.claimedUnits.isSome || !s.claimOwners.isEmpty))
+
+#guard ModelCheck.check RegGen.sys checkEvents violates 12 = .safe
 
 end TpuSyncVerify.Transfer.Reshard.Registry
 

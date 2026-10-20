@@ -1,29 +1,12 @@
-# Pool-reshard transfer: plan, model and results
+# Pool-reshard transfer: model and results
 
-Verification plan and living results document for the pool-addressed resharding
-transfer path under `TpuSyncVerify/Transfer/Reshard/`, sibling to
-[prefill_decode.md](prefill_decode.md). Citations in the Lean files and in this
-document are to tpu-sync **`0ac16d1`**.
+Canonical code-to-model reference for the pool-addressed resharding KV-cache
+transfer subsystem under `TpuSyncVerify/Transfer/Reshard/`, sibling to
+[prefill_decode.md](prefill_decode.md). All `file:line` citations in the Lean
+modules and in this document are to tpu-sync **`0ac16d1`**.
 
-> **Living plan — amendable throughout implementation.** The stage breakdown,
-> module boundaries, state fields, and theorem statements below record the design
-> going into Stage 1. They are expected to be revised as each stage's Lean
-> proofs and C++ trace replays expose which intermediate states are
-> load-bearing, which events can be folded without losing bugs, and which
-> candidate hazards reproduce in C++. As modules land, the planned rows below are
-> replaced in place by the proved theorems and correspondence tables.
-
-## Scope and relationship to `PrefillDecode/`
-
-`Transfer/PrefillDecode/` is unchanged. Both tracks share `Common/` (`System`,
-`ModelCheck`, `ListAux`) and `Transfer/Session.lean` (`Lifecycle`, whose
-`finishLocked` / `endOpLocked` / `beginOp` already transcribe
-`ReshardReceiveSession::FinishLocked`, `EndRecvOpLocked`, and `TryBeginRecvOp`
-at `tpu_sync/kv_cache/reshard_receive_session.cc:472-510`). All reshard models live
-under `TpuSyncVerify/Transfer/Reshard/` in namespace
-`TpuSyncVerify.Transfer.Reshard`.
-
-What is qualitatively new relative to prefill-to-decode:
+Pool resharding transfers KV cache across heterogeneous parallelism topologies
+(`TP` / `PCP`) and multi-pool hybrid-model device arenas:
 
 1. **Rank-ordered pool H2D waves on aliased device pages**
    (`ReshardReceiveSession`, `reshard_receive_session.{h,cc}`): pools carry a
@@ -32,526 +15,171 @@ What is qualitatively new relative to prefill-to-decode:
    only after every expected pool of strictly lower rank has *completed* its H2D
    callback (`CollectEligiblePoolH2dsLocked`, `.cc:554-583`), even when
    higher-rank pools finish arriving over the network first.
-2. **Multi-sender fan-in and per-(pool, peer) push slots**
+2. **Multi-sender sub-block fan-in and per-(pool, peer) push slots**
    (`ReshardSendSession`, `reshard_send_session.{h,cc}`;
    `CountPoolReshardSendSlots`, `pool_reshard_send_slots.{h,cc}`;
    `BlockTransport::HandleIncomingPush` plan-declared progress,
-   `block_transport.cc:640-793`): `N` senders push disjoint sub-block slices into
-   one receiver pool; the transport counts completed streams per `(uuid, pool)`
-   against `expected_pushes` before firing `OnPoolReceived(pool_idx)` once
-   (`block_transport.cc:787`).
-3. **Two-phase Arm-then-Dispatch coordination and block registry claims**
-   (`ReshardCoordinator`, `reshard_coordinator.{h,cc}`; `RequestBlockRegistry`,
-   `request_block_registry.{h,cc}`): the source controller claims producer
-   blocks, arms every destination receiver (`PoolReshardRegisterRecv`) and
-   collects their pool host addresses before dispatching any sender
-   (`PoolReshardPush`), and retires producer blocks only when every source unit
-   votes `Complete`.
-4. **Bounded per-UUID pool host-staging leases** (`PoolStagingStorage`,
+   `block_transport.cc:640-793`): `N` senders push disjoint sub-block byte
+   slices into one receiver pool; the transport counts completed streams per
+   `(uuid, pool)` against `expected_pushes` before firing
+   `OnPoolReceived(pool_idx)` once (`block_transport.cc:787`).
+3. **Bounded per-UUID pool host-staging leases** (`PoolStagingStorage`,
    `kv_cache_manager_base.cc:2075-2162, 3250-3303`): both sessions lease bounded
    staging slots per `(storage_idx, uuid)` up front and release them by `uuid`
    on settle or destruction.
+4. **Two-phase Arm-then-Dispatch coordination and block registry claims**
+   (`ReshardCoordinator`, `reshard_coordinator.{h,cc}`; `RequestBlockRegistry`,
+   `request_block_registry.{h,cc}`): the coordinator claims producer blocks,
+   arms every destination receiver (`PoolReshardRegisterRecv`) and collects
+   their pool host addresses before dispatching any sender (`PoolReshardPush`),
+   and retires producer blocks only when every source unit votes `Complete`.
 
-## Ultimate theorem goals
+Each `trace_*` theorem's docstring names the upstream C++ test it replays with
+`file:line` — covering all 16 tests in `reshard_receive_session_test.cc`, 6 of 9
+in `reshard_send_session_test.cc` (the remaining 3 `TPU_RAIDEN_DATA_CONN_REUSE`
+mode-toggle tests at `:322-362, 406-453` are noted under `Send` A4), all 18 in
+`kv_cache_manager_with_transfer_pool_reshard_test.cc`, all 6 in
+`pool_staging_test.cc`, all 4 in `pool_reshard_planner_streams_test.cc`, and 11
+registry, coordinator, and `DefaultTransferStreams` tests in
+`reshard_service_test.cc`.
 
-1. **Resharded publication & aliased-page safety (`PublicationCorrect`,
-   `RankWaveOrder`, `attention_safe`).** When `poll_stats()` publishes
-   `done_recving` for a reshard request, every transferred pool's H2D copy has
-   completed in non-decreasing `rank` order after all `expected_pushes` streams
-   for that pool landed, so on aliased device pages higher-rank pool bytes
-   Deterministically overwrite lower-rank padding regardless of network arrival
-   order, and no in-flight H2D copy or late callback can write to destination
-   HBM afterwards.
-2. **Progress, drain-to-settle & resource cleanup (`NoOpLeak`,
-   `reachable_can_settle`, `StagingIntegrity`, `PlanUnregistered`).** From any
-   reachable state (normal completion, H2D failure, push failure, or external
-   cancel/deadline), every in-flight op has an enabled drain step and the
-   session settles in finitely many steps, releasing its `PoolStagingLease` and
-   unregistering its active transfer plan at most once.
-3. **Multi-party coordination & registry claim safety (`NoUnarmedPush`,
-   `ClaimSafety`).** Under the coordinator protocol, no sender pushes to an
-   unarmed receiver; registered producer blocks are neither overwritten nor
-   retired while claimed by an in-flight reshard plan.
+## C++ to Lean routing index
 
-## Staged roadmap (amendable)
+Use this table to map any C++ file, method, or state variable on the
+pool-reshard path to its owning Lean module, events, and theorems:
 
-| Stage | Module(s) | Scope | Target theorems & checks |
+| C++ file & lines (`0ac16d1`) | C++ methods / state | Lean module | Model events / definitions | Key theorems / mutants |
+|---|---|---|---|---|
+| `tpu_sync/kv_cache/reshard_receive_session.{h,cc}` (`.h:172-194`, `.cc:67-349, 355-529`) | `ValidatePlan` (`:67-303`), `ValidateReceiverCoverage` (`:305-349`), `Create` (`:355-418`: `RegisterActivePlanDirect` before `AcquireStagingLeases` at `:376-388`), `InitFromPlan` (`:420-470`), `FinishLocked` (`:472-489`), `EndRecvOpLocked` (`:491-502`), `TakePendingUnregister` (`:512-520`), `in_flight_`, `draining_`, `done_`, `staging_released_`, `unregister_on_settle_` | `Transfer/Session.lean`, `Reshard/Receive.lean`, `Reshard/Coverage.lean`, `Reshard/PoolStaging.lean` | `Lifecycle`, `Recv.validPlan`, `Recv.validPlanPoolsAndBlocks`, `Recv.maybeUnregisterSettled`, `Coverage.validBlockCoverage`, `PoolStaging.RegistrationPolicy` | `Recv.reachable_safe` (`SettleSafe`, `StagingIntegrity`, `PlanIntegrity`, `SettlesPromptly`), `Coverage.partition_reconstructs_perm`, `PoolStaging.reachable_reserveBeforeLease_safe`, mutant `Recv.cancelUnregisterEarly` |
+| `tpu_sync/kv_cache/reshard_receive_session.cc:531-706` | `OnPoolReceived` (`:531-552`), `CollectEligiblePoolH2dsLocked` (`:554-583`: rank gate + batch `in_flight_ += to_launch.size()`), `ExecuteEligiblePoolH2ds` (`:614-666`: `draining_` early exit at `:633-638`), `FinishPoolH2d` (`:668-706`: sets `network_completed_ = true` at `:697` before `Finish` at `:700`) | `Reshard/Receive.lean`, `Reshard/Pipeline.lean` | `Recv.Ev.onPoolReceived`, `Recv.Ev.h2dIssue`, `Recv.Ev.h2dReady`, `Recv.Ev.h2dDone`, `Recv.Ev.pollReady`, `Pipeline.writePoolHbm`, `Pipeline.clobberHigherRanks` | `Recv.RankWaveOrder` (`rankWaveOrder_iff`), `Recv.NoOpLeak`, `Recv.reachable_pollReady_disabled`, `Pipeline.AliasedPageCorrect`, mutants `Recv.onPoolReceivedIgnoringRank`, `Recv.h2dIssueLeak`, `Pipeline.mutant_ignoring_rank_corrupts_aliased_page` |
+| `tpu_sync/kv_cache/reshard_send_session.{h,cc}` (`.h:81-147`, `.cc:96-467`), `tpu_sync/core/pool_reshard_send_slots.{h,cc}` (`.cc:23-54`) | `CountPoolReshardSendSlots` (`pool_reshard_send_slots.cc:23-54`, called at `reshard_send_session.cc:131-133`), `ExecutePush` (`:193-290`), `StartPoolPush` (`:292-348`), `RecordPushCompletion` (`:360-384`), `Finish` (`:386-425`), `EndOp` (`:428-467`), `remaining_pool_peer_pushes_`, `finalizing_` | `Transfer/Session.lean`, `Reshard/Send.lean`, `Reshard/Coverage.lean` | `Send.UnregisterPolicy` (`shipping` vs. `onSettle`), `Send.Ev.d2hIssue`, `Send.Ev.execFinish`, `Send.Ev.d2hDone`, `Send.Ev.pushDone`, `Send.Ev.cancel`, `Send.Ev.publish`, `Coverage.senderStreams` | `Send.reachable_safe` (`ActiveOrDraining`, `PlanIntegrity`, `Publication`, `NoOpLeak`), `Send.reachable_onSettle_plan_iff_done`, `Send.trace_early_unregister_on_error_vs_onSettle`, mutants `Send.initOvercountedSlots`, `Send.stepWithoutEndOpUnregister`, `Send.d2hDoneLeakOnDraining` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:180-290, 634-782, 981-1066` | `begin_incoming_push` / `end_incoming_push` (`:224-290`, reshard branch `:279-289`), `PoolReshardPush` (`:634-671`), `PoolReshardRegisterRecv` (`:673-709`), `MaybeUnregisterSettledReshardRecv` (`:776-782`), `CompleteReadWithDetails` reshard send/recv sweeps (`:981-1000, 1037-1066`) | `Reshard/Receive.lean`, `Reshard/Send.lean`, `Reshard/Pipeline.lean`, `Reshard/PoolStaging.lean` | `Recv.PushEndPolicy` (`shipping` vs. `finishOnError`), `Recv.Ev.pushBegin`, `Recv.Ev.pushEnd`, `Recv.Ev.publish`, `Send.Ev.publish`, `PoolStaging.RegEv` (`beginArm`, `acquireArmLease`, `finishArm`, `settleSession`) | `Recv.trace_r1_failed_incoming_push`, `PoolStaging.trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`, `PoolStaging.trace_pool_staging_recv_registration_tests`, `Pipeline.PublicationCorrect`, `Pipeline.attention_safe` |
+| `tpu_sync/kv_cache/kv_cache_manager_base.{h,cc}` (`.h:688-691, 984-996`, `.cc:1963-2162, 3157-3325`) | `PoolStagingStorage` (`:1963-2162`), `AcquirePoolStagingLease` (`:2075-2147`), `ReleasePoolStagingLeases` (`:2149-2162`), `RegisterActivePlanDirect` (`:3157-3164`), `GetBlockRaddr` (`:3250-3296`), `GetBlockChunks` (`:3298-3325`) | `Reshard/PoolStaging.lean`, `Reshard/Send.lean` | `PoolStaging.Arena.acquireLease`, `PoolStaging.Arena.releaseLease`, `PoolStaging.Arena.resolveBlockSlot`, `PoolStaging.ArenaInv` | `PoolStaging.acquireLease_idempotent`, `PoolStaging.no_slot_aliasing_between_distinct_uuids`, `PoolStaging.allocateMissing_slot_sum`, mutants `mutant_non_idempotent_acquire_exhausts_shared_storage`, `mutant_leaking_release_breaks_conservation_and_starves` |
+| `tpu_sync/transport/block_transport.cc:640-793, 1010-1046`, `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc:315-572, 576-594, 908-922, 1117-1153` | `CompleteIncomingPush` plan-declared progress (`block_transport.cc:640-793`: counts completed streams against `expected_pushes` and fires `OnPoolReceived(pool_idx)` once at `:787`), sender stream fan-out (`:1010-1046`), `DefaultTransferStreams` (`pool_reshard_planner.cc:576-594, 908-922`), planner `expected_pushes` (`:1134-1142`) | `Reshard/Pipeline.lean`, `Reshard/Coverage.lean` | `Pipeline.Ev.landStream`, `Coverage.senderStreams`, `Coverage.recomputedExpectedPushes`, `Coverage.validateExpectedPushes`, `Coverage.defaultTransferStreams`, `CoveragePipeline` | `Pipeline.StreamAccountingSafe`, `Coverage.stream_count_matches`, `Coverage.senderStreams_pos_iff`, `CoveragePipeline.reachable_safe`, mutants `Pipeline.mutant_onPoolReceived_before_all_streams`, `Coverage.mutant_mismatched_expected_pushes_rejected` |
+| `tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}` (`.h:51-155`, `.cc:61-509`) | `PurgeExpiredRequestBlocksLocked` (`:61-69`), `PurgeExpiredLifecycleLocked` (`:71-96`), `RetireLocked` (`:98-116`), `Register` (`:250-303`), `Complete` (`:317-371`), `CancelIfUnclaimed` (`:373-405`), `LookupAndClaim` (`:425-491`), `AbandonClaim` (`:493-509`) | `Reshard/Registry.lean` | `RegGen`, `Ev.register`, `Ev.lookupAndClaim`, `Ev.abandonClaim`, `Ev.complete`, `Ev.cancelIfUnclaimed`, `Ev.release`, `RegGen.purgeExpiredAll`, `RegGen.purgeExpiredRequestBlocks` | `Registry.reachable_safe`, `tombstone_blocks_register_and_claim`, `claimed_blocks_register_and_cancel`, `abandonClaim_preserves_when_other_owner_present`, `complete_retires_iff_all_claimed_voted`, `purgeExpiredAll_inv`, `trace_r7_*`, `trace_r8_*` |
+| `tpu_sync/kv_cache/reshard/reshard_coordinator.{h,cc}` (`.h:45-129`, `.cc:110-127, 415-592`) | `BuildStartTransferForTarget` (`:110-127`), `ExecutePoolReshard` (`:415-592`: Stage 0 `LookupAndClaim` `:418-425`, Stage 1 parallel destination arming `:429-485`, Stage 2 parallel sender dispatch `:481-544`) | `Reshard/Coordinator.lean`, `Reshard/Pipeline.lean` | `CleanupPolicy` (`shipping` vs. `disarmAndAbandonOnFailure`), `CoordState`, `CoordInv`, `Coordinator.Ev` (`registerProducer`, `startPlan`, `armDstResult`, `finishArmBarrier`, `sendSrcResult`, `finishSendBarrier`), `Pipeline.initUnarmed`, `Pipeline.Ev.armRecv` | `Coordinator.reachable_coord_inv`, `no_push_before_all_armed`, `claimed_while_arming`, `reachable_disarmAndAbandon_no_orphans`, `trace_r2a_partial_arm_orphans_armed_receiver`, `trace_r2b_dispatch_failure_orphans_receivers_and_claim`, `Pipeline.NoUnarmedPush`, mutant `mutant_dispatch_without_arm_barrier_drops_push` |
+
+## Modules
+
+Each module's header docstring carries its state table, event table,
+assumptions, and properties; this is the structural map. Higher modules compose
+the lower `step` functions directly: `Pipeline` composes `Send.step` and
+`Recv.step` with per-pool stream counters, five pool-indexed memories (`srcHbm`,
+`srcStaging`, `wire`, `dstStaging`, `dstHbm`), aliased-page overwrite
+(`writePoolHbm`), and the coordinator's Arm-then-Dispatch barrier; `Coverage`
+refines `Pipeline`'s scalar stream counter into sub-block byte intervals via a
+lockstep forward simulation (`CoveragePipeline.step_pipe`); `Coordinator`
+composes `Registry.step` with multi-destination receiver arming and
+`PoolStagingLease` lifecycles.
+
+| Module | Scope | Main theorems |
+|---|---|---|
+| `Common/ListAux.lean`, `Transfer/Session.lean` | List indexing helpers and the shared settle protocol (`in_flight_`, `draining_`, `done_`, staging lease) | `Lifecycle.Consistent` preserved by `beginOp` / `finishLocked` / `endOpLocked` |
+| `Reshard/Receive.lean` | One `ReshardReceiveSession` + manager poll/unregister hooks: static plan/pool validation (`validPlan`, `validPlanPoolsAndBlocks`), rank-gated `CollectEligiblePoolH2dsLocked`, batch `in_flight_ += to_launch.size()`, `ExecuteEligiblePoolH2ds` (`draining_` early exit), `FinishPoolH2d`, `TakePendingUnregister`, `PushEndPolicy` (`shipping` vs. `finishOnError`) | `Recv.reachable_safe` (`SettleSafe`, `NoRetiredCallback`, `StagingIntegrity`, `PlanIntegrity`, `SettlesPromptly`, `RankWaveOrder`, `ReadinessSound`, `Publication`, `NoOpLeak`), `Recv.rankWaveOrder_iff`, `Recv.reachable_pollReady_disabled`, `Recv.reachable_can_settle` |
+| `Reshard/Send.lean` | One `ReshardSendSession` (`CountPoolReshardSendSlots`): per-pool D2H (`ExecutePush`), per-peer `StartPoolPush`, `remaining_pool_peer_pushes_` conservation, `UnregisterPolicy` (`shipping` vs. `onSettle`) | `Send.reachable_safe` (`SettleSafe`, `NoRetiredCallback`, `StagingIntegrity`, `SettlesPromptly`, `ActiveOrDraining`, `PlanIntegrity`, `Publication`, `NoOpLeak`), `Send.reachable_onSettle_plan_iff_done`, `Send.reachable_can_settle` |
+| `Reshard/Pipeline.lean` | Single reshard transfer: `Send` + `Recv` + per-pool `BlockTransport` stream counters + five pool-indexed memories + aliased-page `writePoolHbm` (`clobberHigherRanks`) + Arm-then-Dispatch barrier (`init` vs. `initUnarmed`) | `Pipeline.reachable_safe`, `Pipeline.reachable_unarmed_safe` (`PublicationCorrect`, `AliasedPageCorrect`, `DstHbmSafe`, `SrcHbmSafe`, `StagingSafe`, `StreamAccountingSafe`, `NoUnarmedPush`, `NoOpLeak`), `Pipeline.attention_safe`, `Pipeline.dstHbm_quiet`, `Pipeline.srcHbm_quiet`, `Pipeline.reachable_can_settle`, `Pipeline.reachable_unarmed_can_settle` |
+| `Reshard/Coverage.lean` | Multi-sender stream count conservation (`Σ_s min(parallelism, \|pairs_s\|) = expected_pushes`), `DefaultTransferStreams` (`TPU_RAIDEN_TRANSFER_STREAMS`), `ValidateReceiverCoverage` interval-partition completeness, and byte-level refinement `CoveragePipeline` over `Pipeline` | `Coverage.stream_count_matches`, `Coverage.senderStreams_pos_iff`, `Coverage.partition_reconstructs_block`, `Coverage.partition_reconstructs_perm`, `CoveragePipeline.step_pipe`, `CoveragePipeline.reachable_safe` |
+| `Reshard/PoolStaging.lean` | `PoolStagingStorage` bounded slot arena, per-`(storage, uuid)` lease idempotency & cross-UUID disjointness, and receive registration order (`RegistrationPolicy.reserveBeforeLease` shipping vs. `.leaseBeforeReserve` pre-`8653373` mutant) | `PoolStaging.acquireLease_idempotent`, `PoolStaging.no_slot_aliasing_between_distinct_uuids`, `PoolStaging.allocateMissing_slot_sum`, `PoolStaging.reachable_reserveBeforeLease_safe`, `PoolStaging.trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`, `PoolStaging.trace_pool_staging_recv_registration_tests` |
+| `Reshard/Registry.lean` | `RequestBlockRegistry` generation lifecycle: per-unit `Register`, multi-owner `LookupAndClaim`, `AbandonClaim`, full-set `Complete` voting, `CancelIfUnclaimed` tombstones, and TTL expiration (`purgeExpiredAll` vs. split `purgeExpiredRequestBlocks`) | `Registry.reachable_safe`, `Registry.tombstone_blocks_register_and_claim`, `Registry.claimed_blocks_register_and_cancel`, `Registry.abandonClaim_preserves_when_other_owner_present`, `Registry.complete_retires_iff_all_claimed_voted`, `Registry.purgeExpiredAll_inv`, `Registry.trace_r7_*`, `Registry.trace_r8_*` |
+| `Reshard/Coordinator.lean` | Two-stage `ReshardCoordinator::ExecutePoolReshard` composed with `RequestBlockRegistry` and per-destination receiver sessions (`CleanupPolicy.shipping` vs. `disarmAndAbandonOnFailure`) | `Coordinator.reachable_coord_inv`, `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Coordinator.trace_r2a_partial_arm_orphans_armed_receiver`, `Coordinator.trace_r2b_dispatch_failure_orphans_receivers_and_claim` |
+
+## Shipping C++ vs. modelled design alternatives
+
+Four modules parameterize both the **C++ behavior at `0ac16d1`** and a
+**modelled alternative** to isolate findings `R1`/`F7`, `R2a`/`R2b`/`F8`,
+`R5`/`F6`, and `R6` and prove their fixes:
+
+| Module | Parameter | C++ behavior at `0ac16d1` | Modelled alternative |
 |---|---|---|---|
-| **1 (proved)** | `Reshard/Receive.lean`, `Reshard/Send.lean` | Single `ReshardReceiveSession` (rank-gated `ExecuteEligiblePoolH2ds`, batch `in_flight_ += to_launch.size()`, `reshard_finalizing_`, `FinishPoolH2d`, `IsReadyToComplete` poll audit, `PushEndPolicy` `shipping` vs. `finishOnError`) and single `ReshardSendSession` (`ExecutePush` per-pool D2H, `StartPoolPush` per-peer `AsyncPush`, `CountPoolReshardSendSlots` / `remaining_pool_peer_pushes_`, `UnregisterPolicy` `shipping` vs. `onSettle`) on top of `Session.Lifecycle`. | `Recv.reachable_safe` (`SettleSafe`, `NoRetiredCallback`, `StagingIntegrity`, `PlanIntegrity`, `SettlesPromptly`, `RankWaveOrder`, `ReadinessSound`, `Publication`, `NoOpLeak`), `Recv.rankWaveOrder_iff`, `Recv.reachable_pollReady_disabled`, `Recv.reachable_can_settle`; `Send.reachable_safe` (`SettleSafe`, `NoRetiredCallback`, `StagingIntegrity`, `SettlesPromptly`, `ActiveOrDraining`, `PlanIntegrity`, `Publication`, `NoOpLeak`), `Send.reachable_onSettle_plan_iff_done`, `Send.reachable_can_settle`; 10 `decide` traces + `#guard` + 6 mutants. |
-| **2 (proved)** | `Reshard/Pipeline.lean` | Composed reshard pipeline: `Send` + `Recv` + per-pool transport stream counters (`sentStreams`, `landedStreams`, `landedStreams p = peerCounts p → onPoolReceived p`) + five explicit memories (`srcHbm`, `srcStaging`, `wire`, `dstStaging`, `dstHbm`) + aliased-page overwrite (`writePoolHbm` / `clobberHigherRanks`) + Arm-then-Dispatch barrier (`armed`, `init` vs. `initUnarmed`). | `Pipeline.reachable_safe` and `Pipeline.reachable_unarmed_safe` (`PublicationCorrect`, `AliasedPageCorrect`, `DstHbmSafe`, `SrcHbmSafe`, `StagingSafe`, `StreamAccountingSafe`, `NoUnarmedPush`, `NoOpLeak`); quietness (`dstHbm_quiet`, `srcHbm_quiet`, `srcStaging_quiet`, `dstStaging_quiet`) and temporal post-publication safety (`attention_safe`); progress (`reachable_can_settle`, `reachable_unarmed_can_settle`); 2 `decide` traces + `#guard` + 3 mutants. |
-| **3 (proved)** | `Reshard/Coverage.lean`, `Reshard/PoolStaging.lean` | Horizontal data-plane refinements: (a) sender stream count (`Σ_senders min(parallelism, |pairs|)`) equals receiver `expected_pushes` (`pool_reshard_planner.cc:1134-1142`, `reshard_receive_session.cc:319-323`), `DefaultTransferStreams` (`pool_reshard_planner.cc:576-594, 908-922`), and `ValidateReceiverCoverage` interval partition implies full sub-block reconstruction (`CoveragePipeline.step_pipe` simulation over `Pipeline`); (b) `PoolStagingStorage` per-`(storage, uuid)` slot conservation, idempotent re-acquire, cross-UUID disjointness, and three-phase registration lease-collision hazard (R5 / F6: `.reserveBeforeLease` shipping vs. `.leaseBeforeReserve` mutant). | `Coverage.stream_count_matches`, `Coverage.senderStreams_pos_iff`, `Coverage.partition_reconstructs_block`, `Coverage.partition_reconstructs_perm`, `CoveragePipeline.reachable_safe`; `PoolStaging.acquireLease_idempotent`, `PoolStaging.no_slot_aliasing_between_distinct_uuids`, `PoolStaging.trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`, `PoolStaging.reachable_reserveBeforeLease_safe`, `PoolStaging.trace_pool_staging_recv_registration_tests`; 13 `decide` traces + 5 mutants. |
-| **4 (proved)** | `Reshard/Registry.lean`, `Reshard/Coordinator.lean` | Control-plane state machines: `RequestBlockRegistry` (`Register`, multi-owner `LookupAndClaim`, `AbandonClaim`, `Complete` full-set voting, `CancelIfUnclaimed` tombstone, TTL expiration, Observations R7 & R8) and `ReshardCoordinator::ExecutePoolReshard` multi-destination arm-before-dispatch (`reshard_coordinator.cc:415-592`, `CleanupPolicy.shipping` vs. `disarmAndAbandonOnFailure`). | `Registry.reachable_safe` (`ClaimOwnersConsistent`, `TombstoneClean`, `RetiredClean`, `PartialVotesNotAllVoted`), `Registry.tombstone_blocks_register_and_claim`, `Registry.claimed_blocks_register_and_cancel`, `Registry.abandonClaim_preserves_when_other_owner_present`, `Registry.complete_retires_iff_all_claimed_voted`, `Registry.purgeExpiredAll_inv`, `Registry.trace_r7_single_stage_votes_retire_multi_owner_claim`, `Registry.trace_r8_split_ttl_purges_request_blocks_while_claim_active`; `Coordinator.reachable_coord_inv`, `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Coordinator.trace_r2a_partial_arm_orphans_armed_receiver`, `Coordinator.trace_r2b_dispatch_failure_orphans_receivers_and_claim`; 13 `decide` / `rfl` traces + 3 mutants. |
+| `Reshard/Receive.lean` | `PushEndPolicy` | **`PushEndPolicy.shipping`** (pre-`fdeebcd`): `end_incoming_push` (`mgr.cc:279-289`) calls `reshard_session->EndRecvOp()` without checking `status.ok()`. When a sender push stream fails mid-transfer, the receiver stays `!IsDraining() && !Done()` (`trace_r1_failed_incoming_push`), pinning its `PoolStagingLease` and active plan until `timeout_s_`. | **`PushEndPolicy.finishOnError`** (landed upstream in `fdeebcd`, Finding F7): Calls `reshard_session->Finish(status)` before `EndRecvOp()` when `!status.ok()` (matching `TransferReceiveSession` at `mgr.cc:267-270`). Preserves `Recv.reachable_safe` and immediately drains and releases staging on push failure (`trace_r1_failed_incoming_push`). |
+| `Reshard/Send.lean` | `UnregisterPolicy` | **`UnregisterPolicy.shipping`**: `RecordPushCompletion` (`reshard_send_session.cc:360-384`) calls `UnregisterActivePlan` as soon as `finalizing_` is latched on the first error, even while sibling pools/peers still have `in_flight_ > 1` (`trace_early_unregister_on_error_vs_onSettle`), exposing concurrent `StartPoolPush` calls to `GetBlockChunks` after plan removal (`R6`). | **`UnregisterPolicy.onSettle`**: Defers `UnregisterActivePlan` exclusively to `EndOp()` on settle (`in_flight_ == 1 && finalizing_`, `reshard_send_session.cc:428-440`). Proves `planUnregistered = s.life.done` in every reachable state (`reachable_onSettle_plan_iff_done`). |
+| `Reshard/PoolStaging.lean` | `RegistrationPolicy` | **`RegistrationPolicy.reserveBeforeLease`** (fixed in `8653373`, Finding F6): `ReshardReceiveSession::Create` (`reshard_receive_session.cc:376-388`) claims `uuid` via `RegisterActivePlanDirect` before constructing the session and acquiring `PoolStagingStorage` leases. Proves inductively (`reachable_reserveBeforeLease_safe`) that every active session retains its allocated staging slots (`ActiveSessionsHoldLeases`). | **`RegistrationPolicy.leaseBeforeReserve`** (pre-`8653373` order): Acquires `st.leases[uuid]` before `RegisterActivePlanDirect`. A rejected duplicate-UUID call destroys its temporary session, whose destructor calls `ReleasePoolStagingLeases(uuid)` and frees the surviving session's physical staging slots (`trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`). |
+| `Reshard/Coordinator.lean` | `CleanupPolicy` | **`CleanupPolicy.shipping`**: `ExecutePoolReshard` (`reshard_coordinator.cc:415-592`) abandons the registry claim on Stage 1 partial-arm failure (`:458-463`) without disarming already-armed receivers (`trace_r2a_partial_arm_orphans_armed_receiver`), and returns on Stage 2 sender-dispatch failure (`:542-544`) without disarming receivers or calling `AbandonClaim` (`trace_r2b_dispatch_failure_orphans_receivers_and_claim`, Finding F8). | **`CleanupPolicy.disarmAndAbandonOnFailure`**: Disarms armed destination receivers and calls `AbandonClaim` on both Stage 1 and Stage 2 failures. Proves inductively (`reachable_disarmAndAbandon_no_orphans`) that every reachable `.aborted` state has zero armed receivers, zero held staging leases, and `claimedUnits = none`. |
 
-### Stated preconditions and out-of-scope components
+## Verified properties → theorems
 
-* **Disjoint source and destination units (`src_units ∩ dst_units = ∅`).**
-  `BuildStartTransferForTarget` (`reshard_coordinator.cc:110-127`) marks a unit in
-  both lists with `is_sender = true`, which `WorkerServiceImpl` dispatches only
-  to `PoolReshardPush` (`worker_service_impl.cc:544-554`). We treat disjointness
-  as a caller/planner precondition rather than modelling dual-role units.
-* **Planner geometry & transfer-program lowering (out of scope).**
-  `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (1,241 LOC, differential-tested against Python in
-  `reshard_service_test.cc`) and `tpu_sync/core/transfer_program_reshard.cc` (338 LOC,
-  bijection-tested in `transfer_program_reshard_test.cc`) are pure compilers into
-  `StartTransferRequest`; Stage 3 models their output contract
-  (`ValidatePlan` / `ValidateReceiverCoverage` / `CountPoolReshardSendSlots` /
-  `DefaultTransferStreams`), not the planner arithmetic itself.
-* **`weight_sync/` reshard planner (out of scope).** Separate subsystem for
-  model weights, unrelated to KV-cache session transfer.
+The proved theorems establish three top-level system guarantees across the
+data and control planes, supported by per-session and per-component invariants:
 
-## Stage 1 results: `Receive.lean` and `Send.lean`
+| Property | Where proved | Statement |
+|---|---|---|
+| **1. End-to-end HBM data integrity, sub-block reconstruction & aliased-page rank-wave safety** | `Pipeline.reachable_safe`, `Pipeline.reachable_unarmed_safe` (`PublicationCorrect`, `AliasedPageCorrect`, `DstHbmSafe`, `SrcHbmSafe`), `Pipeline.attention_safe`, `Recv.RankWaveOrder` (`rankWaveOrder_iff`), `Coverage.partition_reconstructs_perm`, `CoveragePipeline.reachable_safe` | Across any number of pools, arbitrary rank assignments on aliased device pages (`writePoolHbm` / `clobberHigherRanks`), and out-of-order multi-sender sub-block arrival: (a) no pool is queued, issued, or completed for H2D while any strictly lower-rank pool is not yet `completed` (`rankWaveOrder_iff`), so lower-rank H2D waves never overwrite completed higher-rank pool bytes (`AliasedPageCorrect`); (b) any interval set accepted by `ValidateReceiverCoverage` partitions `[0, extent)` and reconstructs `good extent` under every arrival permutation (`partition_reconstructs_perm`); (c) when `poll_stats()` publishes `done_recving`, `dstHbm = good numPools` (`PublicationCorrect`) and remains invariant across all subsequent pipeline steps, source HBM retirement (`reclaim`), and staging lease reuse (`attention_safe`, `dstHbm_quiet`). |
+| **2. Bounded host-staging isolation, slot conservation & drain-to-settle liveness** | `PoolStaging.no_slot_aliasing_between_distinct_uuids`, `PoolStaging.acquireLease_idempotent`, `PoolStaging.allocateMissing_slot_sum`, `PoolStaging.reachable_reserveBeforeLease_safe`, `Pipeline.StagingSafe`, `Pipeline.srcStaging_quiet`, `Pipeline.dstStaging_quiet`, `Recv.NoOpLeak`, `Recv.reachable_can_settle`, `Send.NoOpLeak`, `Send.reachable_can_settle`, `Pipeline.reachable_can_settle` | In `PoolStagingStorage`, distinct active UUIDs `u₁ ≠ u₂` hold disjoint physical slot lists and never resolve any block IDs to the same staging slot (`no_slot_aliasing_between_distinct_uuids`); re-acquiring a shared storage for the same `uuid` is idempotent (`acquireLease_idempotent`); under `reserveBeforeLease`, every active session retains its staging lease until it settles (`reachable_reserveBeforeLease_safe`); once a session settles (`done = true`), its staging lease is released (`hasStaging = !done`) and never read or written again (`StagingSafe`, `srcStaging_quiet`, `dstStaging_quiet`); and from any reachable state (success, H2D failure, push failure, or cancellation), every in-flight op can drain (`NoOpLeak`) and the pipeline settles in finitely many steps (`reachable_can_settle`). |
+| **3. Two-phase Arm-then-Dispatch barrier & producer block registry claim safety** | `Coordinator.reachable_coord_inv`, `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Pipeline.NoUnarmedPush`, `Registry.reachable_safe`, `Registry.tombstone_blocks_register_and_claim`, `Registry.claimed_blocks_register_and_cancel`, `Registry.abandonClaim_preserves_when_other_owner_present`, `Registry.complete_retires_iff_all_claimed_voted` | Under the coordinator protocol: (a) no sender is dispatched and no stream lands until every destination unit in `dstUnits` has armed its `ReshardReceiveSession` and acquired its `PoolStagingLease` (`no_push_before_all_armed`, `NoUnarmedPush`); (b) producer blocks in `srcUnits` are claimed in `RequestBlockRegistry` before arming begins (`claimed_while_arming`), blocking `CancelIfUnclaimed` and duplicate `Register` while claimed (`claimed_blocks_register_and_cancel`); (c) abandoning one pipelined stage's `claim_owner` preserves sibling owners' claims (`abandonClaim_preserves_when_other_owner_present`); (d) `Complete` retires a generation if and only if every claimed source unit has voted (`complete_retires_iff_all_claimed_voted`); and (e) cancelling an unclaimed generation leaves a tombstone that blocks late registration and claims (`tombstone_blocks_register_and_claim`). |
+| Multi-sender stream count conservation | `Coverage.stream_count_matches`, `Coverage.senderStreams_pos_iff`, `Pipeline.StreamAccountingSafe` | For every pool group, the receiver's `expected_pushes` validated by `ValidateReceiverCoverage` (`reshard_receive_session.cc:319-323`) equals $\sum_s \min(\text{parallelism}, |\text{pairs}_s|)$ (`stream_count_matches`); a sender with zero scheduled pairs opens zero streams (`senderStreams_pos_iff`); and `OnPoolReceived(p)` fires only after all `expected_pushes` streams for pool `p` have landed (`StreamAccountingSafe`). |
+| Sender slot conservation & active-until-finalizing invariant | `Send.reachable_safe` (`ActiveOrDraining`, `Publication`) | While `!finalizing_`, `remaining_pool_peer_pushes_` equals $\sum_p \text{remainingSlots}_p$, and `ExecutePush`'s caller op keeps `0 < inFlight` until `finalizing_` is latched (`ActiveOrDraining`), preventing premature settlement between pools; `done_sending` requires every active pool to have completed all peer pushes (`allPushed pools = true`). |
+| Deferred plan unregistration & poll-finish equivalence | `Recv.PlanIntegrity`, `Recv.reachable_pollReady_disabled`, `Send.PlanIntegrity`, `Send.reachable_onSettle_plan_iff_done` | On the receiver, `(planUnregistered → done) ∧ (published ≠ none → planUnregistered)` (`Recv.PlanIntegrity`): `TakePendingUnregister` succeeds only after `done = true` and `CompleteReadWithDetails` claims any remaining pending unregistration at publication (`mgr.cc:1060-1062`); `IsReadyToComplete() && !IsDraining()` is disabled in every reachable state because `FinishPoolH2d` sets `network_completed_` and calls `Finish` in the same transition (`reachable_pollReady_disabled`, R3). On the sender, `done = true → planUnregistered = true` under both policies, strengthened to `planUnregistered = done` under `UnregisterPolicy.onSettle`. |
 
-### `TpuSyncVerify/Transfer/Reshard/Receive.lean` (`ReshardReceiveSession`)
+## System & model boundaries (horizontal, upper, and lower)
 
-Models `tpu_sync/kv_cache/reshard_receive_session.{h,cc}` together with the reshard
-branches of `KVCacheManagerWithTransfer` (`kv_cache_manager_with_transfer.cc:180-290,
-673-782, 1037-1066`), parameterized by a `ranks : List Nat` pool schedule and
-`PushEndPolicy` (`shipping` vs. `finishOnError`).
+The pool-reshard Lean model sits between three explicit boundaries:
 
-* **Rank-wave invariant (`RankWaveOrder` and `rankWaveOrder_iff`).** Every pool
-  starts at `PoolStage.waiting`, transitions to `received` when
-  `OnPoolReceived(pool_idx)` fires, is admitted to `queued` by
-  `CollectEligiblePoolH2dsLocked` (`.cc:554-583`) only when every pool with
-  strictly lower `rank` is already `completed`, transitions to `issued` when its
-  slice of `ExecuteEligiblePoolH2ds` issues `H2dPoolBlocks` (`.cc:614-666`), and
-  reaches `completed` in `FinishPoolH2d` (`.cc:668-706`). `RankWaveOrder` proves
-  that no pool is in `queued`, `issued`, `ready`, or `completed` while any
-  lower-rank pool is not yet `completed` (`rankWaveOrder_iff` states this in
-  universal form across pool indices).
-* **Batch H2D launch and `in_flight_` accounting (`Accounted`).**
-  `CollectEligiblePoolH2dsLocked` increments `in_flight_ += to_launch.size()` in
-  one critical section before `ExecuteEligiblePoolH2ds` iterates over the batch
-  outside `mu_`. If external cancellation or an earlier pool's H2D failure sets
-  `draining_ = true` mid-batch, each remaining queued pool takes the early exit
-  at `.cc:633-638` (`h2dIssue p false`) and calls `EndRecvOpLocked()`, preserving
-  `inFlight = pushes + poolOps pools`.
-* **Deferred plan unregistration (`PlanIntegrity`).** `unregister_on_settle_` is
-  initialized to `true` (`.h:179`), and `MaybeUnregisterSettledReshardRecv`
-  (`mgr.cc:776-782`) claims `TakePendingUnregister` (`.cc:512-520`) only after
-  `Done()` holds (`.cc:478-481, 501-504, 644-646, 661-663`), so `planUnregistered = true →
-  done = true` holds in all reachable states.
-* **Poll-finish audit (`reachable_pollReady_disabled`, R3).** Because
-  `FinishPoolH2d` sets `network_completed_ = true` (`.cc:697`) immediately before
-  calling `Finish` (`.cc:700`) under the same last-H2D transition and
-  `ValidateCommonPoolReshardPlan` forbids zero transferred pools (`utils.h:367-370`,
-  called at `.cc:71`), `pollReady` (`IsReadyToComplete() && !IsDraining()`,
-  `mgr.cc:1041-1046`) is disabled in every reachable state (`step pol s .pollReady = none`),
-  and end-of-transfer metrics (`durationRecorded`) are latched on success.
-* **Traces and mutants.** Six `decide` traces (`trace_rank1_arrives_before_rank0`,
-  `trace_batch_launch_on_rank_wave`, `trace_cancel_between_batch_queue_and_issue`,
-  `trace_reshard_receive_session_test_parity` for
-  `reshard_receive_session_test.cc:137-198, 405-439`,
-  `trace_duration_metric_on_success_and_failure` for
-  `kv_cache_manager_with_transfer_pool_reshard_test.cc:327-367`, and
-  `trace_r1_failed_incoming_push`), `#guard` bounded searches under both
-  `PushEndPolicy` modes, and three mutants (`onPoolReceivedIgnoringRank`,
-  `h2dIssueLeak`, `cancelUnregisterEarly`).
+| Boundary | In scope / Modelled in Lean | Out of scope / Abstracted at boundary |
+|---|---|---|
+| **1. Horizontal boundary (Pool Resharding vs. Other Subsystems & Pure Compilers)** | **Pool-addressed KV-cache resharding**: `ReshardReceiveSession`, `ReshardSendSession`, `CountPoolReshardSendSlots`, `DefaultTransferStreams`, `ValidatePlan` / `ValidateReceiverCoverage` output contracts, `PoolStagingStorage` bounded leases, `RequestBlockRegistry`, and `ReshardCoordinator::ExecutePoolReshard`. | **Prefill-to-decode ("symmetric") transfer** ([prefill_decode.md](prefill_decode.md)), **pure planner geometry & transfer-program lowering** (`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` and `tpu_sync/core/transfer_program_reshard.cc`, which compile topology geometry into `StartTransferRequest` plans validated by `ValidatePlan` / `ValidateReceiverCoverage`), and **`weight_sync/`** model-weight resharding. |
+| **2. Upper boundary (Serving Engine & Controller Orchestration ↔ `ReshardCoordinator` / Sessions)** | **`RequestBlockRegistry` & `ReshardCoordinator` two-stage protocol**: producer block registration (`Register`), multi-owner `LookupAndClaim`, `CancelIfUnclaimed` tombstones, Stage 1 destination arming (`PoolReshardRegisterRecv`), Stage 2 sender dispatch (`PoolReshardPush`), per-unit `Complete` voting, and `CompleteReadWithDetails` (`poll_stats()`) outcome publication. | **Disjoint source and destination units (`src_units ∩ dst_units = ∅`)**: `BuildStartTransferForTarget` (`reshard_coordinator.cc:110-127`) sets `is_sender = true` when a unit appears in both lists, which `WorkerServiceImpl` dispatches only to `PoolReshardPush` (`worker_service_impl.cc:544-554`). Disjointness is treated as a caller/planner precondition. External Python serving-engine scheduling above `ReshardService` is outside this repository. |
+| **3. Lower boundary (Plan-Declared Transport Progress & Staging Arena vs. Raw Socket / DMA I/O)** | **Per-(uuid, pool) stream counting, sub-block interval coverage & `PoolStagingStorage` slot maps**: `begin_incoming_push` / `end_incoming_push` op leases, `CompleteIncomingPush` counting completed streams against `expected_pushes` before firing `OnPoolReceived(pool_idx)` once (`block_transport.cc:740-789`), sub-block byte-interval partition on destination staging (`Coverage.lean`), and per-`(storage_idx, uuid)` slot allocation/release in `PoolStagingStorage` (`PoolStaging.lean`). | **Raw TCP socket loops, wire framing & PJRT DMA execution**: Peregrine `ReadExact`/`WriteExact` loops, TCP connection pooling (`EndOp` per-transfer idle connection release at `reshard_send_session.cc:449-467`, Send A4), and raw pointer `memcpy` / PJRT `CopyFromHostToDevice` / `CopyToHostAsync` internals are abstracted into atomic state-machine transitions (`d2hDone`, `landStream`, `h2dIssue`, `h2dDone`). |
 
-### `TpuSyncVerify/Transfer/Reshard/Send.lean` (`ReshardSendSession`)
+## Boundary assumptions (`A1`..`An`): discharged vs. external contracts
 
-Models `tpu_sync/kv_cache/reshard_send_session.{h,cc}`,
-`tpu_sync/core/pool_reshard_send_slots.{h,cc}`, and the sender hooks in
-`kv_cache_manager_with_transfer.cc:634-671, 981-1000`, parameterized by per-pool
-peer counts `peerCounts : List Nat` and `UnregisterPolicy` (`shipping` vs.
-`onSettle`).
+Each session module documents its numbered assumptions (`Receive` A1–A4, `Send`
+A1–A4):
 
-* **`Session.Lifecycle` reuse.** `(in_flight_, finalizing_, done_, status_.ok(),
-  !leases_released_)` is an exact instance of `Transfer.Lifecycle` (`IsDraining()`
-  returns `finalizing_` at `reshard_send_session.h:81-84`), reusing `Lifecycle.Consistent` directly.
-  Assumption A4 folds the per-transfer idle connection-release window in `EndOp`
-  (`reshard_send_session.cc:449-467`, under `DataConnectionReuse::kPerTransfer`) into `endOp`.
-* **Slot-counting invariant (`CountPoolReshardSendSlots`, `ActiveOrDraining`,
-  `Publication`).** Each active pool starts with `remainingSlots = peers > 0`,
-  and `remaining_pool_peer_pushes_` equals `∑_p p.remainingSlots` while
-  `!finalizing_`. Because `ExecutePush` holds its own caller op (`execActive`)
-  until every pool has issued its D2H copy (`allIssued`), `draining = false`
-  implies `0 < inFlight` (`ActiveOrDraining`: the session never drops to
-  `in_flight_ == 0` before `finalizing_` is latched). When the last peer push
-  succeeds (`remainingPushes ≤ 1`), `sumRemainingSlots = 0` with `noAborted`,
-  proving `allPushed pools = true` before `done_sending` can be published.
-* **Dual `UnregisterActivePlan` (`UnregisterPolicy.shipping` vs. `onSettle`).**
-  `RecordPushCompletion` (`reshard_send_session.cc:360-384`) unregisters the active plan as soon as
-  `finalizing_` is latched, whereas `EndOp()` (`reshard_send_session.cc:428-440`) unregisters on
-  settle (`in_flight_ == 1 && finalizing_`). Both policies satisfy
-  `done = true → planUnregistered = true` (`PlanIntegrity`); under `onSettle`,
-  `planUnregistered = s.life.done` (`reachable_onSettle_plan_iff_done`), whereas
-  under `shipping`, a partial failure unregisters the plan while sibling pools
-  are still in flight (`trace_early_unregister_on_error_vs_onSettle`).
-* **Traces and mutants.** Four `decide` traces
-  (`trace_reshard_send_session_test_parity` for
-  `reshard_send_session_test.cc:151-277` and
-  `kv_cache_manager_with_transfer_pool_reshard_test.cc:302-325`,
-  `trace_multi_pool_multi_peer_send`, `trace_cancel_unregisters_on_last_endOp`
-  for `reshard_send_session_test.cc:364-404`, and
-  `trace_early_unregister_on_error_vs_onSettle`, plus a section note on the
-  remaining `TPU_RAIDEN_DATA_CONN_REUSE` tests at
-  `reshard_send_session_test.cc:322-453`), `#guard` bounded searches under
-  both policies, and three mutants (`initOvercountedSlots` reproducing the
-  pre-#744 slot overcount at `reshard_send_session.cc:131-133`, `stepWithoutEndOpUnregister`, and
-  `d2hDoneLeakOnDraining`).
+| Assumption | What it states & C++ location (`0ac16d1`) | Status |
+|---|---|---|
+| **Receive A1 (At-most-once `OnPoolReceived` per declared pool)** | `BlockTransport::CompleteIncomingPush` fires `OnPoolReceived(l, uuid)` only when `plan_pushes == expected_chunks` (`block_transport.cc:686-787`), and `RecordPoolReceivedLocked` rejects undeclared or duplicate pool indices (`reshard_receive_session.cc:541-552`). | **Discharged in Lean** (`Pipeline.lean` `StreamAccountingSafe`, `Coverage.lean` `stream_count_matches` & `CoveragePipeline.step_pipe`) |
+| **Receive A2 (Registration before visibility)** | `RegisterActivePlanDirect` (`reshard_receive_session.cc:376-377`) and `AcquireStagingLeases` (`:381-388, 420-459`) succeed before the session is inserted into `active_pool_reshard_recvs_` (`kv_cache_manager_with_transfer.cc:704-707`), rolling back both on failure (`:385-386`). | **Discharged in Lean** (`PoolStaging.lean` `reachable_reserveBeforeLease_safe`, `Coordinator.lean` `no_push_before_all_armed`) |
+| **Receive A3 / Send A3 (No double end & single `StartPoolPush` lock step)** | Each admitted push and each H2D/D2H op ends at most once; `StartPoolPush`'s two `done_ \|\| finalizing_` checks (`reshard_send_session.cc:274, 315`) inspect only immutable plan fields in between and fold into `d2hDone`. | **C++ callback / control-flow discipline** |
+| **Receive A4 (Fold of `RecordPool*Locked` with `ExecuteEligiblePoolH2ds` first lock)** | An external `Finish` arriving between unlocking `mu_` after recording a pool (`reshard_receive_session.cc:609` or `:678`) and locking `mu_` in `ExecuteEligiblePoolH2ds` (`:618`) is observationally equivalent to arriving either before `:618` or immediately after `:624` (where the per-pool re-check at `:634` aborts each queued pool). | **Simulation soundness argument** (`Receive.lean` A4, `trace_cancel_between_batch_queue_and_issue`) |
+| **Send A1 (Non-empty schedule with positive peer counts per active pool)** | `ReshardSendSession::Create` rejects plans with `remaining_pool_peer_pushes <= 0` (`reshard_send_session.cc:134-138`), and `ExecutePush` skips pools with zero scheduled entries on this sender (`:217-224`), matching `CountPoolReshardSendSlots` (`pool_reshard_send_slots.cc:46-48`). | **Discharged in Lean** (`Coverage.lean` `senderStreams_pos_iff`, `Send.lean` `validPools`) |
+| **Send A2 (`ExecutePush` starts before external `Finish`)** | `PoolReshardPush` inserts the session into `active_pool_reshard_sends_` (`kv_cache_manager_with_transfer.cc:667`) and immediately invokes `ExecutePush` (`:670`), which takes its caller op (`++in_flight_`, `reshard_send_session.cc:180-184`). | **C++ init discipline** (`kv_cache_manager_with_transfer.cc:667-670`) |
+| **Send A4 (Per-transfer connection-release window in `EndOp`)** | Under `DataConnectionReuse::kPerTransfer`, the last op (`in_flight_ == 1 && finalizing_`) drops `mu_` in `EndOp` (`reshard_send_session.cc:449-467`) to call `ReleaseDataConnectionsAfterSend` before `--in_flight_` and `SettleLocked()`. Since `finalizing_ == true` and `in_flight_ == 1`, no other op is in flight and `Finish` is a no-op (`:397`). | **Simulation soundness argument** (`Send.lean` A4) |
 
-## Stage 2 results: `Pipeline.lean`
+## Counterfactual mutants
 
-### `TpuSyncVerify/Transfer/Reshard/Pipeline.lean` (composed end-to-end reshard pipeline)
+Each mutant removes a specific C++ guard or ordering constraint and is refuted by
+an executable counterexample trace or `#guard` check in `TpuSyncVerify/Transfer/Reshard/`:
 
-Composes `Reshard.Send`, `Reshard.Receive`, the per-pool `BlockTransport` stream
-counter (`tpu_sync/transport/block_transport.cc:640-793`), the coordinator's
-two-phase Arm-then-Dispatch barrier (`tpu_sync/kv_cache/reshard/reshard_coordinator.cc:429-544`),
-and five explicit pool-indexed memories (`srcHbm`, `srcStaging`, `wire`,
-`dstStaging`, `dstHbm`) with aliased-page overwrite semantics
-(`tpu_sync/kv_cache/reshard_receive_session.h:184-188`, `kv_cache_manager_base.h:688-691`).
+| Mutant | C++ guard / invariant removed (`0ac16d1`) | Property violated |
+|---|---|---|
+| `Recv.onPoolReceivedIgnoringRank` | `CollectEligiblePoolH2dsLocked` (`reshard_receive_session.cc:554-583`) checks that all pools with strictly lower `rank` are `completed` before queuing a pool for H2D | `RankWaveOrder` (higher-rank pool launches H2D before lower-rank pool finishes) |
+| `Recv.h2dIssueLeak` | `ExecuteEligiblePoolH2ds` (`reshard_receive_session.cc:633-638`) calls `EndRecvOpLocked()` on each remaining queued pool when exiting early on `draining_` | `NoOpLeak` (`in_flight_` stays positive after cancellation; session never settles) |
+| `Recv.cancelUnregisterEarly` | `unregister_on_settle_ = true` (`reshard_receive_session.h:179`, `mgr.cc:776-782`) defers `UnregisterActivePlan` until `Done()` (`in_flight_ == 0`) | `PlanIntegrity` (`planUnregistered = true` while `done = false` and H2D/push ops are still in flight) |
+| `Send.initOvercountedSlots` | `CountPoolReshardSendSlots` (`pool_reshard_send_slots.cc:23-54`, `reshard_send_session.cc:131-133`) deduplicates `(pool, peer)` slots instead of summing raw schedule entries (pre-#744 bug) | `NoOpLeak` / `Publication` (`remaining_pool_peer_pushes_` never reaches 0; session hangs with `done = false`) |
+| `Send.stepWithoutEndOpUnregister` | `EndOp()` (`reshard_send_session.cc:428-440`) calls `UnregisterActivePlan` when the last op drains after external cancellation (`Finish`) | `PlanIntegrity` (`done = true` while `planUnregistered = false`) |
+| `Send.d2hDoneLeakOnDraining` | `StartPoolPush` (`reshard_send_session.cc:292-315`) calls `EndOp()` when returning early on `finalizing_` after a D2H callback | `NoOpLeak` (leaked pool op keeps `in_flight_ > 0` forever on cancellation) |
+| `Pipeline.mutant_ignoring_rank_corrupts_aliased_page` | Rank-ordered H2D wave gate on shared device pages (`reshard_receive_session.h:184-188`, `.cc:554-583`) | `AliasedPageCorrect` / `PublicationCorrect` (out-of-order arrival writes rank 1 first, then rank 0's `writePoolHbm` clobbers rank 1 to `.junk`, yielding `dstHbm = [kv 0, junk]`) |
+| `Pipeline.mutant_onPoolReceived_before_all_streams` | `CompleteIncomingPush` (`block_transport.cc:740-789`) waits until `completed_streams == expected_pushes` before calling `OnPoolReceived(pool_idx)` | `StreamAccountingSafe` / `PublicationCorrect` (H2D reads incomplete staging before all sender streams land) |
+| `Pipeline.mutant_reclaim_before_publish_corrupts_dstHbm` | Caller/coordinator retires producer blocks only after transfer completion (`SrcHbmSafe`) | `PublicationCorrect` (reclaiming `srcHbm` before D2H copies `.junk` into `dstHbm`) |
+| `Coverage.mutant_gap_in_coverage_leaves_unwritten_byte` | `ValidateReceiverCoverage` (`reshard_receive_session.cc:334-345`) rejects coverage intervals with a gap (`cursor != extent`) | Sub-block reconstruction (`dstStaging` retains `.uninit` bytes after all streams land) |
+| `Coverage.mutant_overlap_in_coverage_rejected` | `ValidateReceiverCoverage` (`reshard_receive_session.cc:336-340`) rejects overlapping sub-block intervals (`seg.start < cursor`) | Disjoint interval partition (`validBlockCoverage = false`) |
+| `Coverage.mutant_mismatched_expected_pushes_rejected` | `ValidateReceiverCoverage` (`reshard_receive_session.cc:319-323`) rejects plans where `expected_pushes` disagrees with $\sum_s \min(\text{parallelism}, |\text{pairs}_s|)$ | `stream_count_matches` (`validExpectedPushes = false`) |
+| `PoolStaging.mutant_non_idempotent_acquire_exhausts_shared_storage` | `AcquirePoolStagingLease` (`kv_cache_manager_base.cc:2108-2113`) skips block IDs already leased by the same `uuid` | Shared-storage lease admission (second pool sharing `storage_index` re-allocates slots and exhausts bounded capacity) |
+| `PoolStaging.mutant_leaking_release_breaks_conservation_and_starves` | `ReleasePoolStagingLeases` (`kv_cache_manager_base.cc:2149-2162`) returns all leased slots to `free_slots` when erasing `leases[uuid]` | Slot conservation (`freeSlots.length + leasedSlots = capacity`; subsequent transfer starves) |
+| `Registry.mutant_premature_complete_retires_while_peer_active` | `RequestBlockRegistry::Complete` (`request_block_registry.cc:358-368`) checks `completed_units_ == claimed_units_` before calling `RetireLocked` | Multi-sender claim safety (first sender's `Complete` retires blocks while second sender is still reading) |
+| `Registry.mutant_unconditional_abandon_exposes_sibling_owner_to_cancel` | `RequestBlockRegistry::AbandonClaim` (`request_block_registry.cc:493-509`) retains `claimed_` until `claimed_owners_` is empty | Pipelined multi-owner claim safety (stage 1's `AbandonClaim` exposes stage 2's claimed blocks to `CancelIfUnclaimed`) |
+| `Coordinator.mutant_dispatch_without_arm_barrier_drops_push` | `ReshardCoordinator::ExecutePoolReshard` (`reshard_coordinator.cc:457-463`) joins all Stage 1 receiver-arming threads and verifies `arm_status.ok()` before launching Stage 2 senders | Two-phase Arm-then-Dispatch (`NoPushBeforeAllArmed`: premature sender push arrives at unarmed `dst_unit 11` and is dropped) |
 
-* **End-to-end data & aliased-page correctness (`PublicationCorrect`,
-  `AliasedPageCorrect`, `reachable_safe`, `reachable_unarmed_safe`).** When pool
-  `p` completes its H2D copy (`h2dDone p true`), `writePoolHbm` writes
-  `dstStaging[p]` to `dstHbm[p]` and clobbers every pool slot `q` with
-  `pool_q.rank > pool_p.rank` to `.junk` (`clobberHigherRanks`), modelling
-  lower-rank full-attention H2D waves overwriting padding across aliased device
-  pages. The inductive invariant `Inv.done_intact` uses `Recv.rankWaveOrder_iff`
-  to show that no pool `p` in `.ready` can have `pool_p.rank < pool_q.rank` for an
-  already-`.completed` pool `q`, so completed higher-rank slots are never
-  clobbered. When `recv.published = some true` (`done_recving`),
-  `dstHbm = good numPools` (`[kv 0, …, kv (numPools - 1)]`).
-* **Quietness & temporal post-publication safety (`dstHbm_quiet`, `srcHbm_quiet`,
-  `srcStaging_quiet`, `dstStaging_quiet`, `attention_safe`).** Once `done_recving`
-  is published, no subsequent pipeline event — including `reclaim` (source HBM
-  retirement), `reseatSrcStaging` / `reseatDstStaging` (`PoolStagingLease` reuse),
-  and late drain or cancellation steps — can modify `dstHbm` or `recv.published`
-  (`attention_safe`). Dually, `srcHbm_quiet` proves producer HBM is untouched
-  while `send.published = none`, and `srcStaging_quiet` / `dstStaging_quiet`
-  prove released `PoolStagingLease` buffers are never read or written by the
-  retired session.
-* **Two-phase Arm-then-Dispatch (`NoUnarmedPush`, `initUnarmed`, `armRecv`).**
-  Starting from `initUnarmed` (`armed = false`), no sender pool can enter `.d2h`
-  or `.pushing`, no stream can land (`landedStreams[p] = 0`), and no receiver
-  pool can leave `.waiting` until `armRecv` (`PoolReshardRegisterRecv`) completes.
-* **Progress (`reachable_can_settle`, `reachable_unarmed_can_settle`).** From any
-  reachable state, cancelling both sessions and draining via the combined measure
-  `drainRank s = s.send.life.inFlight + Recv.drainRank s.recv` settles both
-  sessions (`send.life.done = true ∧ recv.life.done = true ∧
-  send.life.inFlight = 0 ∧ recv.life.inFlight = 0`).
-* **Traces and mutants.** Two `decide` traces
-  (`trace_aliased_page_out_of_order_arrival` where rank-1 streams arrive before
-  rank-0 on a 2-pool aliased page yet `dstHbm = [kv 0, kv 1]`, and
-  `trace_arm_before_dispatch` from `initUnarmed`), `#guard` bounded searches over
-  multi-rank / multi-peer schedules, and three mutants
-  (`mutant_ignoring_rank_corrupts_aliased_page` where `dstHbm = [kv 0, junk]`,
-  `mutant_onPoolReceived_before_all_streams`, and
-  `mutant_reclaim_before_publish_corrupts_dstHbm`).
+## Findings and observations (`R1`–`R8`)
 
-## Stage 3 results: `Coverage.lean` and `PoolStaging.lean`
+| ID | Component & C++ location (`0ac16d1`) | Summary | Lean witness & C++ reproducer / fix |
+|---|---|---|---|
+| **R1 / F7** | `KVCacheManagerWithTransfer` `end_incoming_push` (`kv_cache_manager_with_transfer.cc:250-290`) | **Filed 2026-10-16, fixed upstream in `fdeebcd` ([Finding F7](../../findings/README.md)): failed incoming push on a reshard receiver does not finish the session.** The `TransferReceiveSession` branch calls `DeferUnregisterOnSettle(); Finish(status)` when `!status.ok()` (`:267-270`), whereas the `ReshardReceiveSession` branch (`:279-289`) only calls `EndRecvOp()`, ignoring `status`. Because `ReshardSendSession::RecordPushCompletion` marks the sender `finalizing_` on the first failed push without retrying (`reshard_send_session.cc:360-367`), the missing stream never arrives and the reshard receiver (with its bounded `PoolStagingLease` and active plan) stays pinned until `timeout_s_`. Fixed in `fdeebcd` by calling `Finish(status)` on a failed push (`PushEndPolicy.finishOnError`), with regression test `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline`. | Witnessed by `Recv.trace_r1_failed_incoming_push`; proved safe under `PushEndPolicy.finishOnError` (`Recv.reachable_safe` in `Receive.lean`). |
+| **R2a** | `ReshardCoordinator::ExecutePoolReshard` Stage 1 arm barrier (`reshard_coordinator.cc:433-463`) | **Partial-arm failure orphans already-armed destination receivers.** `ExecutePoolReshard` arms all `dst_units` in parallel threads; if `dst_unit 10` succeeds (creating an active `ReshardReceiveSession` holding a `PoolStagingLease` and active plan) and `dst_unit 11` fails, the coordinator calls `registry_->AbandonClaim` and returns `arm_status` without disarming `dst_unit 10` (and no cancel/unregister control-pipe command exists in `raiden_service.proto:284-292` or `kv_cache_listener.cc:103-229`), leaving its session and staging lease pinned until `timeout_s_`. | Witnessed by `Coordinator.trace_r2a_partial_arm_orphans_armed_receiver`; proved absent under `CleanupPolicy.disarmAndAbandonOnFailure` (`Coordinator.reachable_disarmAndAbandon_no_orphans` in `Coordinator.lean`). |
+| **R2b / F8** | `ReshardCoordinator::ExecutePoolReshard` Stage 2 dispatch barrier (`reshard_coordinator.cc:481-544`) | **Filed 2026-10-19 ([Finding F8](../../findings/README.md)): sender-dispatch failure leaks the `RequestBlockRegistry` claim and orphans armed receivers.** When any sender RPC fails during Stage 2 (`!sender_status.ok()`), `ExecutePoolReshard` returns `sender_status` at `:542-544` without disarming `dst_units` and (unlike lines 422, 460, and 484) without calling `registry_->AbandonClaim(args.req_id, args.uuid, claim_owner)`. Because `Complete` (`reshard_service.cc:291-303`, `request_block_registry.cc:317-371`) is only invoked for sender transfers that succeed (`reshard_coordinator.cc:494-544`), both armed `dst_units` remain orphaned until `timeout_s_` and `claimed_[(req_id, uuid)]` remains pinned in `RequestBlockRegistry` until `ttl_s_` (`request_block_registry.cc:72-96`), blocking `CancelIfUnclaimed` (`:388-390`) and re-registration (`:281-285`). | Witnessed by `Coordinator.trace_r2b_dispatch_failure_orphans_receivers_and_claim`; proved absent under `CleanupPolicy.disarmAndAbandonOnFailure` (`Coordinator.reachable_disarmAndAbandon_no_orphans` in `Coordinator.lean`); reproduced in C++ by `ReshardBughuntTest.R2b_SenderDispatchFailureOrphansRegistryClaimAndArmedReceiver` ([findings/reshard_bughunt_test.cc](../../findings/reshard_bughunt_test.cc)). |
+| **R3** | `ReshardReceiveSession::FinishPoolH2d` (`reshard_receive_session.cc:697-700`) & `CompleteReadWithDetails` (`kv_cache_manager_with_transfer.cc:1041-1046`) | **`IsReadyToComplete` poll finish on `ReshardReceiveSession` is redundant (non-bug observation).** Unlike `TransferReceiveSession`, `FinishPoolH2d` sets `network_completed_ = true` at `:697` immediately before calling `Finish` at `:700` (after latching end-of-transfer metrics at `:696`), and `ValidateCommonPoolReshardPlan` forbids zero transferred pools (`utils.h:367-370`, called at `reshard_receive_session.cc:71`). Thus `IsReadyToComplete() && !IsDraining()` in `CompleteReadWithDetails` cannot fire before the last H2D callback and never skips metrics. | Proved by `Recv.reachable_pollReady_disabled` and `Recv.trace_duration_metric_on_success_and_failure` in `Receive.lean`. |
+| **R4** | `ReshardReceiveSession` (`reshard_receive_session.h:184-188`, `.cc:554-583`) & `KVCacheManagerBase` (`kv_cache_manager_base.h:688-691`) | **Rank-ordered H2D waves protect aliased device pages (verified design invariant).** Full-attention pools (`rank = 0`) whose H2D copies span shared hybrid-model device pages always complete before state-class pools (`rank = 1`) launch H2D, so lower-rank padding writes never clobber higher-rank state bytes regardless of network arrival order. | Proved by `Recv.RankWaveOrder` (`rankWaveOrder_iff`) in `Receive.lean` and `Pipeline.AliasedPageCorrect` (`trace_aliased_page_out_of_order_arrival`) in `Pipeline.lean`. |
+| **R5 / F6** | `ReshardReceiveSession::Create` (`reshard_receive_session.cc:376-388`), `PoolReshardRegisterRecv` (`kv_cache_manager_with_transfer.cc:673-709`) & `PoolStagingStorage` (`kv_cache_manager_base.cc:2100, 2151`) | **Fixed upstream in `8653373` ([Finding F6](../../findings/README.md)): per-UUID staging lease collision across three-phase receive registration.** `PoolStagingStorage` keys leases by `uuid` alone, and `~ReshardReceiveSession` calls `ReleasePoolStagingLeases(uuid_)` (`reshard_receive_session.h:71`). Under the pre-`8653373` order (`RegistrationPolicy.leaseBeforeReserve`), `Create` acquired `st.leases[uuid]` before `RegisterActivePlanDirect` enforced `uuid` uniqueness, so a rejected duplicate-UUID call destroyed its temporary session and freed the active session's physical staging slots. Fixed in `8653373` (`RegistrationPolicy.reserveBeforeLease`, tested at `kv_cache_manager_with_transfer_pool_reshard_test.cc:624-764`) by claiming `uuid` via `RegisterActivePlanDirect` before constructing the session and acquiring staging. | Pre-fix bug witnessed by `PoolStaging.trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`; shipping fix proved safe by `PoolStaging.reachable_reserveBeforeLease_safe` and replayed by `PoolStaging.trace_pool_staging_recv_registration_tests` in `PoolStaging.lean`. |
+| **R6** | `ReshardSendSession::RecordPushCompletion` (`reshard_send_session.cc:360-384`) & `GetBlockChunks` (`kv_cache_manager_base.cc:3298-3325`) | **Early `UnregisterActivePlan` on partial send failure while sibling pools/peers are still in flight.** `RecordPushCompletion` calls `UnregisterActivePlan` as soon as `finalizing_` is latched on the first error even when `in_flight_ > 1`, whereas `EndOp()` (`:428-440`) already unregisters on settle. A concurrent `StartPoolPush` loop (`:313-348`) calling `AsyncPush` $\to$ `BuildBlockRequests` (`block_transport.cc:1040-1046`) $\to$ `GetBlockChunks` after `uuid_` is erased from `active_plans_` gets `{}` on bounded staging (`:3299-3303`) or silently falls back to full-block un-sliced extents on full-mirror staging (`:3306-3325`). | Witnessed by `Send.trace_early_unregister_on_error_vs_onSettle`; proved safe under `UnregisterPolicy.onSettle` (`Send.reachable_onSettle_plan_iff_done` in `Send.lean`). |
+| **R7** | `RequestBlockRegistry::Complete` & `AbandonClaim` (`request_block_registry.h:124, 144-149`, `.cc:358-368, 493-509`) | **Multi-owner pipelined claims share a single owner-unscoped `completed_units_` set.** `claimed_owners_` supports multiple pipelined destination stages claiming `(req_id, uuid)` under distinct `claim_owner` tokens, but `completed_units_[(req_id, uuid)]` is not scoped by `claim_owner`. Once stage 1's senders vote `Complete` for every unit in `claimed_units_`, `RetireLocked` (`:358-368`) erases `request_blocks_` and `claimed_owners_` while stage 2's claim is still active, and `AbandonClaim` (`:503-507`) does not clear `completed_units_`. | Witnessed by `Registry.trace_r7_single_stage_votes_retire_multi_owner_claim` in `Registry.lean`; reproduced in C++ by `ReshardBughuntTest.R7a_Stage0CompletionRetiresSharedClaimWhileStage1StillActive` and `ReshardBughuntTest.R7b_AbandonClaimLeavesStaleCompletionVotesThatPrematurelyRetireNextClaim` ([findings/reshard_bughunt_test.cc](../../findings/reshard_bughunt_test.cc)). |
+| **R8 / F9** | `RequestBlockRegistry` TTL expiration (`request_block_registry.cc:61-96, 263, 384, 473`) | **Filed 2026-10-19 ([Finding F9](../../findings/README.md)): split TTL expiration between `request_blocks_` and `claimed_` purges registered blocks while a claim is active.** `Register` (`:263`) sets `registration.expires_at = t_0 + ttl_s_`, whereas `LookupAndClaim` at $t_1 > t_0$ sets `claimed_[(req_id, uuid)] = t_1 + ttl_s_` (`:473`) without refreshing `registration.expires_at` on the claimed `request_blocks_` entries (and `CancelIfUnclaimed` at `:384` purges lifecycle without `request_blocks_`). In $[t_0 + \text{ttl}, t_1 + \text{ttl})$, `PurgeExpiredRequestBlocksLocked` (`:61-69`) erases `request_blocks_` while `claimed_` is still active, causing a second pipelined `LookupAndClaim` to fail with `"Missing producer block registration"` (`:463-468`). | Witnessed by `Registry.trace_r8_split_ttl_purges_request_blocks_while_claim_active` and lockstep expiration proved invariant by `Registry.purgeExpiredAll_inv` in `Registry.lean`; reproduced in C++ by `ReshardBughuntTest.R8_SplitTtlEvictsRequestBlocksWhileClaimIsStillActive` ([findings/reshard_bughunt_test.cc](../../findings/reshard_bughunt_test.cc)). |
 
-### `TpuSyncVerify/Transfer/Reshard/Coverage.lean` (sub-block byte coverage & multi-sender stream accounting)
+## Where the rest lives
 
-Refines `Reshard.Pipeline` along the data plane (`reshard_receive_session.cc:67-349`,
-`pool_reshard_planner.cc:315-572, 576-594, 908-922, 1117-1153`,
-`reshard_send_session.cc:204-225, 292-348`,
-`pool_reshard_send_slots.cc:23-54`, `block_transport.cc:651-762, 1010-1046`):
-
-* **Multi-sender stream count conservation (`stream_count_matches`,
-  `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
-  `(src_block_id, dst_block_id)` pairs (`senderPairs`) for a pool group and opens
-  `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:1020-1025`,
-  `reshard_send_session.cc:293-341`). `ValidateReceiverCoverage`
-  (`reshard_receive_session.cc:314-324`) verifies that the receiver's
-  `expected_pushes` equals $\sum_s \min(\text{parallelism}, |\text{pairs}_s|)$,
-  matching the planner (`pool_reshard_planner.cc:1134-1142`), and a sender with
-  zero scheduled pairs opens zero streams (`reshard_send_session.cc:217-224`).
-* **Exact sub-block byte reconstruction under out-of-order stream arrival
-  (`checkContiguous_covers`, `checkContiguous_head_disjoint`,
-  `writeInterval_comm`, `partition_reconstructs_block`,
-  `partition_reconstructs_perm`).** `ValidateReceiverCoverage` sorts the logical
-  live-byte intervals `[start_bytes, end_bytes)` targeting a destination block and
-  checks that they partition `[0, extent)` without gaps or overlaps
-  (`reshard_receive_session.cc:325-346`). We prove that any interval list accepted
-  by `validBlockCoverage` is pairwise disjoint and covers every byte `b < extent`,
-  so landing the intervals in *any* network permutation reconstructs `good extent`
-  (`[kv 0, …, kv (extent - 1)]`).
-* **Refinement coupling (`CoveragePipeline.step_pipe`,
-  `CoveragePipeline.reachable_safe`).** `CoveragePipeline` refines
-  `Reshard.Pipeline` by replacing each pool's scalar stream counter with a queue
-  of sub-block intervals and a byte-addressed staging buffer. Every
-  `CoveragePipeline` step projects to a `Pipeline.step`, lifting all Stage 2
-  pipeline invariants together with byte-level destination reconstruction (`good
-  extent` on every pool's staging buffer and `good numPools` on `dstHbm`).
-* **Traces and mutants.** Six `decide` traces (`trace_tp4_to_tp2_subblock_merge`,
-  `trace_multi_sender_stream_count`, `trace_coverage_pipeline_end_to_end`,
-  `trace_reshard_receive_coverage_test_parity` for
-  `reshard_receive_session_test.cc:227-403`,
-  `trace_expected_push_senders_test_parity` for
-  `kv_cache_manager_with_transfer_pool_reshard_test.cc:222-269`, and
-  `trace_default_transfer_streams_test_parity` for
-  `pool_reshard_planner_streams_test.cc:59-103` and
-  `reshard_service_test.cc:1818-1896`) and three
-  mutants (`mutant_gap_in_coverage_leaves_unwritten_byte`,
-  `mutant_overlap_in_coverage_rejected`,
-  `mutant_mismatched_expected_pushes_rejected`).
-
-### `TpuSyncVerify/Transfer/Reshard/PoolStaging.lean` (bounded `PoolStagingStorage` & per-UUID lease lifecycle)
-
-Models `KVCacheManagerBase::PoolStagingStorage`
-(`tpu_sync/kv_cache/kv_cache_manager_base.h:984-996`,
-`tpu_sync/kv_cache/kv_cache_manager_base.cc:1963-2162`) and the receive
-registration lifecycle in `PoolReshardRegisterRecv`
-(`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:673-709`,
-`tpu_sync/kv_cache/reshard_receive_session.cc:373-390, 420-470`):
-
-* **Idempotent per-UUID lease acquisition (`acquireLease_idempotent`,
-  `acquireLease_resolves_all`).** Re-acquiring a subset of already-leased block
-  IDs for the same `uuid` is a no-op (`kv_cache_manager_base.cc:2108-2113`), so
-  multiple pools sharing a physical storage (`storage_index`) share one page lease
-  without double-consuming arena slots, and any successful `acquireLease` maps
-  every requested block ID to an allocated slot.
-* **Slot conservation & cross-UUID disjointness (`allocateMissing_slot_sum`,
-  `init_inv`, `no_slot_aliasing_between_distinct_uuids`,
-  `acquireLease_preserves_other_resolve`,
-  `releaseLease_preserves_other_resolve`).** In any well-formed arena
-  (`ArenaInv`), distinct UUIDs `u₁ ≠ u₂` hold disjoint slot lists and never
-  resolve any block IDs to the same physical staging slot.
-* **Receive registration lifecycle & Risk R5 / Finding F6
-  (`RegistrationPolicy.reserveBeforeLease` vs. `.leaseBeforeReserve`,
-  `trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`,
-  `reachable_reserveBeforeLease_safe`).** Proves both the inductive safety
-  theorem `reachable_reserveBeforeLease_safe` for the shipping
-  `RegistrationPolicy.reserveBeforeLease` order (`reshard_receive_session.cc:376-388`,
-  where `ReshardReceiveSession::Create` claims `uuid` via
-  `RegisterActivePlanDirect` before constructing the session and acquiring
-  staging, guaranteeing `ActiveSessionsHoldLeases` in every reachable state) and
-  the constructive R5 counterexample under `.leaseBeforeReserve` (the pre-`8653373`
-  order where a rejected duplicate-UUID arm's destructor frees the surviving
-  session's lease and a third session `uuid = 8` is allocated the survivor's
-  physical slot `0`).
-* **Traces and mutants.** Parity `decide` traces replaying all six
-  `pool_staging_test.cc` unit tests (`trace_bounded_arena_leases_and_addressing`
-  for `pool_staging_test.cc:115-208`,
-  `trace_fallback_to_full_mirror_and_stride_mismatch` for `:212-301`,
-  `trace_shared_storage_pools_share_lease` for `:252-279`,
-  `trace_sender_raddr_and_pool_host_base_addrs` for `:306-521`, and
-  `trace_reserveBeforeLease_end_to_end`) plus
-  `trace_pool_staging_recv_registration_tests` replaying
-  `PoolStagingRecvRegistrationTest`
-  (`kv_cache_manager_with_transfer_pool_reshard_test.cc:624-764`) and two mutants
-  (`mutant_non_idempotent_acquire_exhausts_shared_storage`,
-  `mutant_leaking_release_breaks_conservation_and_starves`).
-
-## Stage 4 results: `Registry.lean` and `Coordinator.lean`
-
-### `TpuSyncVerify/Transfer/Reshard/Registry.lean` (`RequestBlockRegistry` generation lifecycle)
-
-Models `RequestBlockRegistry` (`tpu_sync/kv_cache/reshard/request_block_registry.h:51-155`,
-`tpu_sync/kv_cache/reshard/request_block_registry.cc:98-509`), tracking per-unit
-producer registrations, multi-owner planning claims (`claimed_owners_`),
-per-unit completion voting (`completed_units_`), retirement (`RetireLocked`),
-and unclaimed cancellation tombstones (`cancelled_`):
-
-* **Inductive registry invariants (`Inv`, `reachable_safe`).** Across all
-  reachable states:
-  1. `ClaimOwnersConsistent`: `claimedUnits.isSome ↔ claimOwners ≠ []`, and every
-     claimed unit `u ∈ units` is registered in `registeredUnits`.
-  2. `TombstoneClean` & `tombstone_blocks_register_and_claim`: when
-     `cancelled = true` (`request_block_registry.cc:373-405`),
-     `registeredUnits = []`, `claimedUnits = none`, and `claimOwners = []`, and
-     any subsequent `register` (`:276-280`) or `lookupAndClaim` (`:448-452`) is
-     rejected.
-  3. `claimed_blocks_register_and_cancel`: while `claimedUnits = some units`,
-     `register` is rejected (`:281-285`) and `cancelIfUnclaimed` is a no-op
-     (`:388-390`) that leaves registered blocks and claims intact.
-  4. `abandonClaim_preserves_when_other_owner_present`: when two distinct
-     pipelined owners `o₁ ≠ o₂` hold claims on the same generation
-     (`request_block_registry.h:144-147`), `abandonClaim o₁`
-     (`request_block_registry.cc:493-509`) preserves `claimedUnits` and `o₂`'s
-     membership in `claimOwners`.
-  5. `complete_retires_iff_all_claimed_voted`: when `claimedUnits = some expected`,
-     a `complete` step for `unit ∈ expected` retires the generation via
-     `RetireLocked` (`:98-116, 358-368`) if and only if every `u ∈ expected` has
-     voted in `completedUnits`.
-* **Traces, Observations R7 & R8, and mutants.** Eight `decide` traces replaying
-  `reshard_service_test.cc` registry tests (`trace_registry_multi_owner_and_voting`,
-  `trace_partial_vote_does_not_retire` for `reshard_service_test.cc:1029-1052`,
-  `trace_tombstone_blocks_late_register_and_claim` for `:933-961`,
-  `trace_request_block_status_probe_lifecycle` for `:963-1027`,
-  `trace_pipelined_stages_claim_and_abandon` for `:1278-1361`,
-  `trace_ttl_purges_expired_registrations_and_tombstones` for `:1023-1027, 1054-1062`,
-  `trace_r7_single_stage_votes_retire_multi_owner_claim`, and
-  `trace_r8_split_ttl_purges_request_blocks_while_claim_active`) plus
-  `purgeExpiredAll_inv` and two mutants
-  (`mutant_premature_complete_retires_while_peer_active`,
-  `mutant_unconditional_abandon_exposes_sibling_owner_to_cancel`).
-
-### `TpuSyncVerify/Transfer/Reshard/Coordinator.lean` (two-stage `ReshardCoordinator::ExecutePoolReshard` & Risk R2a/R2b)
-
-Composes `ReshardCoordinator::ExecutePoolReshard`
-(`tpu_sync/kv_cache/reshard/reshard_coordinator.h:45-129`,
-`tpu_sync/kv_cache/reshard/reshard_coordinator.cc:415-592`) with
-`RequestBlockRegistry` (`Registry.lean`) and per-destination-unit receiver
-sessions (`kv_cache_listener.cc:138-172`,
-`kv_cache_manager_with_transfer.cc:673-709`,
-`reshard_receive_session.cc:373-390, 420-470`), parameterized by
-`CleanupPolicy` (`shipping` vs. `disarmAndAbandonOnFailure`):
-
-* **Universal protocol guarantees (`CoordInv`, `reachable_coord_inv`,
-  `no_push_before_all_armed`, `claimed_while_arming`).** Proves inductively for
-  both cleanup policies that:
-  1. `Registry.Inv s.reg` holds at every reachable state.
-  2. `NoPushBeforeAllArmed` (`reshard_coordinator.cc:457-480`): while the
-     coordinator is in `.idle` or `.arming`, no sender is dispatched
-     (`sendResults = []`) and no destination unit receives any push.
-  3. `AllArmedInDispatching` (`reshard_coordinator.cc:457-475`): entering
-     `.dispatching` requires `armFailed = false` and all `dstUnits` reported in
-     `armResults`.
-  4. `ClaimedWhileArming` (`reshard_coordinator.cc:418-463`): throughout `.arming`,
-     `s.reg.claimedUnits = some s.srcUnits` and `s.reg.claimOwners = [s.claimOwner]`,
-     so `CancelIfUnclaimed` and duplicate `Register` are blocked.
-  5. `LeaseMatchesSession`: every destination unit holds a `PoolStagingLease` if
-     and only if its `ReshardReceiveSession` is currently armed.
-* **Risk R2a & R2b counterexample traces, `reshard_service_test.cc` parity, and
-  hardened cleanup theorem (`trace_r2a_partial_arm_orphans_armed_receiver`,
-  `trace_r2b_dispatch_failure_orphans_receivers_and_claim`,
-  `trace_coordinator_happy_path`, `trace_arm_failure_abandons_claim_and_skips_senders`,
-  `reachable_disarmAndAbandon_no_orphans`).** Replays
-  `FullPoolReshardFlowEmitsArmThenDispatch` (`reshard_service_test.cc:677-751`),
-  `MissingRegistrationKeepsContractString` (`:903-913`),
-  `ArmFailureAbandonsClaimAndSkipsSenders` (`:915-931`), and
-  `TwoDestinationsArmEachThenDispatchSendersOnce` (`:1065-1135`), witnesses both
-  partial-arm receiver orphaning at `reshard_coordinator.cc:458-463` (R2a) and
-  sender-dispatch failure orphaning both receivers and the
-  `RequestBlockRegistry` claim at `reshard_coordinator.cc:542-544` (R2b), and
-  proves inductively that under `CleanupPolicy.disarmAndAbandonOnFailure`, every
-  reachable `.aborted` state has zero armed receiver sessions, zero held staging
-  leases, and `s.reg.claimedUnits = none ∧ s.reg.claimOwners = []`.
-
-## Candidate observations and hypotheses under investigation
-
-Tracked here across the Stage 1–4 models; items marked **[HYP]** require a
-hardware-free C++ reproduction test before being promoted to `findings/`.
-
-* **R1 [HYP — Stage 1 `Receive.lean`] Failed incoming push on a reshard receiver
-  does not finish the session.** In `KVCacheManagerWithTransfer`'s
-  `end_incoming_push` hook (`kv_cache_manager_with_transfer.cc:250-290`), the
-  `TransferReceiveSession` branch calls `DeferUnregisterOnSettle();
-  Finish(status)` when `!status.ok()` (`:267-270`), whereas the
-  `ReshardReceiveSession` branch (`:279-289`) only calls `EndRecvOp()`, ignoring
-  `status`. Because `ReshardSendSession::RecordPushCompletion` marks the sender
-  `finalizing_` on the first failed push without retrying
-  (`reshard_send_session.cc:360-367`), the missing stream never arrives and the
-  reshard receiver (plus its bounded `PoolStagingLease` and active plan) stays
-  pinned until `timeout_s_`. Modeled via `PushEndPolicy` (`shipping` vs.
-  `finishOnError`) and witnessed by `trace_r1_failed_incoming_push` in
-  `Receive.lean`.
-* **R2 [HYP / Code audit — Stage 4 `Coordinator.lean`] Coordinator Stage 1 and
-  Stage 2 barrier failures orphan armed receivers and (in Stage 2) leak the
-  `RequestBlockRegistry` claim (`R2a` & `R2b`).**
-  - **R2a (Stage 1 partial-arm failure, `reshard_coordinator.cc:433-463`):**
-    `ReshardCoordinator::ExecutePoolReshard` arms all `dst_units` in parallel
-    threads; if `dst_unit 10` succeeds (creating an active `ReshardReceiveSession`
-    holding a `PoolStagingLease` and active plan) and `dst_unit 11` fails, the
-    coordinator calls `registry_->AbandonClaim` and returns `arm_status` without
-    disarming `dst_unit 10` (and no cancel/unregister control-pipe command exists
-    in `raiden_service.proto:284-292` or `kv_cache_listener.cc:103-229`), leaving
-    `dst_unit 10`'s session and staging lease orphaned until `timeout_s_`.
-    Witnessed by `trace_r2a_partial_arm_orphans_armed_receiver` in
-    `Coordinator.lean`.
-  - **R2b (Stage 2 sender-dispatch failure omits `AbandonClaim` and disarm,
-    `reshard_coordinator.cc:481-544`):** When any sender RPC fails during Stage 2
-    (`!sender_status.ok()`), `ExecutePoolReshard` returns `sender_status` at
-    `reshard_coordinator.cc:542-544` without disarming `dst_units` **and**
-    (unlike lines 422, 460, and 484) without calling
-    `registry_->AbandonClaim(args.req_id, args.uuid, claim_owner)`. Because
-    `Complete` (`reshard_service.cc:291-303`, `request_block_registry.cc:317-371`)
-    is only invoked for sender transfers that succeed (`reshard_coordinator.cc:494-544`), both the
-    armed `dst_units` remain orphaned until `timeout_s_` and
-    `claimed_[(req_id, uuid)]` remains pinned in `RequestBlockRegistry` until
-    `ttl_s_` (default 300s, `request_block_registry.cc:72-96`), blocking
-    `CancelIfUnclaimed` (`:388-390`) and re-registration (`:281-285`). Witnessed
-    by `trace_r2b_dispatch_failure_orphans_receivers_and_claim` and proved
-    absent under `CleanupPolicy.disarmAndAbandonOnFailure` by
-    `reachable_disarmAndAbandon_no_orphans` in `Coordinator.lean`.
-* **R3 [Code audit — Stage 1 `Receive.lean`] `IsReadyToComplete` poll finish on
-  `ReshardReceiveSession` is redundant.** Unlike `TransferReceiveSession`,
-  `ReshardReceiveSession::FinishPoolH2d` sets `network_completed_ = true` at
-  `reshard_receive_session.cc:697` immediately before calling `Finish` at `:700`
-  (outside `mu_`), after latching end-of-transfer metrics at `:696`, and
-  `ValidateCommonPoolReshardPlan` forbids zero transferred pools
-  (`utils.h:367-370`, called at `reshard_receive_session.cc:71`). Thus the poll's
-  `IsReadyToComplete()` branch (`kv_cache_manager_with_transfer.cc:1041-1046`)
-  is reachable only in the two-line window `reshard_receive_session.cc:697-700`
-  and produces the exact same state transition without skipping metrics
-  (`reachable_pollReady_disabled` in `Receive.lean`).
-* **R4 [Design invariant — Stage 1–2 `Receive.lean` / `Pipeline.lean`]
-  Rank-ordered H2D waves protect aliased device pages.** Documented at
-  `reshard_receive_session.h:184-188` and `kv_cache_manager_base.h:688-691`;
-  verified as `RankWaveOrder` (`rankWaveOrder_iff`) in Stage 1 and
-  `AliasedPageCorrect` in Stage 2.
-* **R5 [Fixed upstream in `8653373` (Finding F6) — Stage 1/3 `PoolStaging.lean`]
-  Per-UUID staging lease key collision across three-phase registration in
-  `PoolReshardRegisterRecv`.**
-  `PoolStagingStorage` keys leases by `uuid` alone
-  (`kv_cache_manager_base.cc:2100, 2151`), and `~ReshardReceiveSession` calls
-  `ReleasePoolStagingLeases(uuid_)` (`reshard_receive_session.h:71`). Under the
-  pre-`8653373` registration order (`RegistrationPolicy.leaseBeforeReserve`),
-  `ReshardReceiveSession::Create` acquired `st.leases[uuid]` with
-  `staging_released_ = false` *before* `RegisterActivePlanDirect` enforced `uuid`
-  uniqueness in `active_plans_`, so a rejected duplicate or racing
-  `PoolReshardRegisterRecv` destroyed its session and freed the active session's
-  staging lease (witnessed by
-  `trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`). Fixed in
-  `8653373` (`RegistrationPolicy.reserveBeforeLease`,
-  `reshard_receive_session.cc:376-388`, tested at
-  `kv_cache_manager_with_transfer_pool_reshard_test.cc:624-764`): `Create` claims
-  `uuid` via `RegisterActivePlanDirect` before constructing the session and
-  acquiring staging, releasing any partial lease while `uuid` is still claimed
-  and rolling back `UnregisterActivePlanDirect` on `AcquireStagingLeases`
-  failure. Proved safe by `reachable_reserveBeforeLease_safe` and replayed by
-  `trace_pool_staging_recv_registration_tests` in `PoolStaging.lean`. See
-  [findings/README.md §F6](../../findings/README.md).
-* **R6 [HYP / Code audit — Stage 1–2 `Send.lean` / `Pipeline.lean`]
-  `RecordPushCompletion` unregisters the active plan on partial error while
-  sibling pools/peers are still in flight.** In
-  `ReshardSendSession::RecordPushCompletion` (`reshard_send_session.cc:360-384`),
-  the first failed D2H or peer push latches `finalizing_ = true` and immediately
-  calls `UnregisterActivePlan` even when `in_flight_ > 1`, whereas `EndOp()`
-  (`reshard_send_session.cc:428-440`) already unregisters the plan at settle
-  (`in_flight_ == 1 && finalizing_`). Because `StartPoolPush`
-  (`reshard_send_session.cc:313-348`) checks `finalizing_` once under `mu_`,
-  increments `in_flight_ += transfers_by_peer.size()`, and then loops over peers
-  outside `mu_` calling `AsyncPush` $\to$ `BuildBlockRequests`
-  (`block_transport.cc:1040-1046`) $\to$ `GetBlockChunks`
-  (`kv_cache_manager_base.cc:3298-3325`), a concurrent or subsequent peer push
-  in the same session can invoke `GetBlockChunks` after `uuid_` has been erased
-  from `active_plans_`: on bounded staging (`staging_bounded == true`) it
-  returns `{}` (`:3299-3303`), while on full-mirror staging
-  (`staging_bounded == false`, `explicit_pools_ == true`) it silently falls back
-  to full-block un-sliced extents (`:3306-3325`) instead of the plan's sub-block
-  slices. Modeled via `UnregisterPolicy` (`shipping` vs. `onSettle`), proved safe
-  under `onSettle` by `reachable_onSettle_plan_iff_done`, and witnessed by
-  `trace_early_unregister_on_error_vs_onSettle` in `Send.lean`.
-* **R7 [HYP / Code audit — Stage 4 `Registry.lean`] Multi-owner pipelined claims
-  share a single owner-unscoped `completed_units_` set.**
-  `RequestBlockRegistry::claimed_owners_` (`request_block_registry.h:144-147`)
-  explicitly supports multiple pipelined destination stages claiming the same
-  source snapshot `(req_id, uuid)` under distinct `claim_owner` tokens so that
-  one stage's `AbandonClaim` does not release another stage's claim
-  (`request_block_registry.cc:493-509`). However,
-  `completed_units_[(req_id, uuid)].units` (`request_block_registry.h:124, 149`)
-  is keyed only by `(req_id, uuid)` (not `(req_id, uuid, claim_owner)`), and
-  `RequestBlockRegistry::Complete` (`request_block_registry.cc:358-368`) calls
-  `RetireLocked` as soon as every unit in `claimed_units_` has voted once —
-  erasing `request_blocks_`, `claimed_`, `claimed_units_`, and `claimed_owners_`
-  even when a second pipelined `claim_owner` is still registered. Furthermore,
-  `AbandonClaim` (`:503-507`) does not clear `completed_units_`. Witnessed by
-  `trace_r7_single_stage_votes_retire_multi_owner_claim` in `Registry.lean`.
-* **R8 [HYP / Code audit — Stage 4 `Registry.lean`] Split TTL expiration between
-  `request_blocks_` and `claimed_` purges registered blocks while a claim is
-  still active.** `RequestBlockRegistry::Register` (`request_block_registry.cc:263`)
-  sets `registration.expires_at = t_0 + ttl_s_` on `request_blocks_[(req_id, unit)]`,
-  whereas `LookupAndClaim` at time $t_1 > t_0$ sets
-  `claimed_[(req_id, uuid)] = t_1 + ttl_s_` (`:473`) **without** refreshing
-  `registration.expires_at` on the claimed `request_blocks_` entries (and
-  `CancelIfUnclaimed` at `:384` calls `PurgeExpiredLifecycleLocked` without
-  `PurgeExpiredRequestBlocksLocked`). In the window $[t_0 + \text{ttl}, t_1 + \text{ttl})$,
-  `PurgeExpiredRequestBlocksLocked` (`:61-69`) erases `request_blocks_[(req_id, unit)]`
-  while `claimed_[(req_id, uuid)]` is still active, violating
-  `ClaimOwnersConsistent` (`∀ u ∈ claimedUnits, (lookupUnit u).isSome`) and
-  causing a second pipelined stage calling `LookupAndClaim` in that window to
-  fail with `"Missing producer block registration"` (`:463-468`). Witnessed by
-  `trace_r8_split_ttl_purges_request_blocks_while_claim_active` in `Registry.lean`.
+| Content | File |
+|---|---|
+| `trace_*` witnesses and the tests they replay; `#guard` bounded and exhaustive searches | the theorem docstrings and `#guard` lines in the Lean modules (`grep -rn "theorem trace_\|#guard" TpuSyncVerify/Transfer/Reshard`) |
+| prefill-to-decode transfer model and results | [prefill_decode.md](prefill_decode.md) |
+| upstream syncs and citation re-audits | [docs/upstream_rechecks.md](../upstream_rechecks.md) |
+| bug-hunt findings F1–F9 with reproducers and patches (including F6 / R5, F7 / R1, F8 / R2b, F9 / R8) | [findings/README.md](../../findings/README.md) |
+| how the models are written (one executable `step`, ghost fields, replay, mutants) | [conventions.md](../conventions.md) |

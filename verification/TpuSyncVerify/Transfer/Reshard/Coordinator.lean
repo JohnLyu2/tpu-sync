@@ -1,9 +1,13 @@
-/-
-  TpuSyncVerify/Transfer/Reshard/Coordinator.lean
+import TpuSyncVerify.Common.System
+import TpuSyncVerify.Common.ModelCheck
+import TpuSyncVerify.Transfer.Reshard.Registry
 
-  Formal model of Stage 4b: two-stage `ReshardCoordinator::ExecutePoolReshard`
-  orchestration (`tpu_sync/kv_cache/reshard/reshard_coordinator.{h,cc}`)
-  composed with `RequestBlockRegistry` (`TpuSyncVerify.Transfer.Reshard.Registry`).
+/-!
+# Two-stage reshard coordinator (`ReshardCoordinator::ExecutePoolReshard`)
+
+Formal model of two-stage `ReshardCoordinator::ExecutePoolReshard`
+orchestration (`tpu_sync/kv_cache/reshard/reshard_coordinator.{h,cc}`)
+composed with `RequestBlockRegistry` (`TpuSyncVerify.Transfer.Reshard.Registry`).
 
   C++ source under analysis:
   * `tpu_sync/kv_cache/reshard/reshard_coordinator.h:45-129`
@@ -53,8 +57,6 @@
 
   Pinned upstream commit: `0ac16d1`
 -/
-import TpuSyncVerify.Common.System
-import TpuSyncVerify.Transfer.Reshard.Registry
 
 namespace TpuSyncVerify.Transfer.Reshard.Coordinator
 
@@ -1138,5 +1140,39 @@ theorem mutant_dispatch_without_arm_barrier_drops_push :
         s_premature.dstStates.map (fun d => (d.unit, d.completed, d.pushesReceived))) =
       some [(10, true, [0]), (11, false, [])] := by
   decide
+
+/-- Candidate coordinator events for `srcUnits = [0, 1]`, `dstUnits = [10, 11]`. -/
+def checkEvents : List Ev :=
+  [ .registerProducer 0, .registerProducer 1
+  , .startPlan true, .startPlan false
+  , .armDstResult 10 true, .armDstResult 10 false
+  , .armDstResult 11 true, .armDstResult 11 false
+  , .finishArmBarrier
+  , .sendSrcResult 0 true, .sendSrcResult 0 false
+  , .sendSrcResult 1 true, .sendSrcResult 1 false
+  , .finishSendBarrier ]
+
+/-- Executable negation of universal `CoordInv` properties. -/
+def violatesCoordInv (s : CoordState) : Bool :=
+  Registry.violates s.reg ||
+  ((s.phase == .idle || s.phase == .arming) &&
+   (!s.sendResults.isEmpty || s.dstStates.any (fun d => !d.pushesReceived.isEmpty || d.completed))) ||
+  (s.phase == .arming &&
+   (s.reg.claimedUnits != some s.srcUnits || s.reg.claimOwners != [s.claimOwner])) ||
+  ((s.phase == .dispatching || s.phase == .succeeded) &&
+   (s.armFailed || !allReported s.dstUnits s.armResults)) ||
+  s.dstStates.any (fun d => d.stagingLeaseHeld != d.sessionArmed)
+
+/-- Executable check for R2a/R2b orphan freedom in `.aborted`. -/
+def violatesNoOrphans (s : CoordState) : Bool :=
+  violatesCoordInv s ||
+  (s.phase == .aborted &&
+   (s.dstStates.any (fun d => d.sessionArmed || d.stagingLeaseHeld) ||
+    s.reg.claimedUnits.isSome || !s.reg.claimOwners.isEmpty))
+
+#guard ModelCheck.check (CoordState.sys .shipping [0, 1] [10, 11] 101) checkEvents violatesCoordInv 12 = .safe
+#guard ModelCheck.check (CoordState.sys .disarmAndAbandonOnFailure [0, 1] [10, 11] 101) checkEvents violatesNoOrphans 12 = .safe
+#guard (match ModelCheck.check (CoordState.sys .shipping [0, 1] [10, 11] 101) checkEvents violatesNoOrphans 12 with
+  | .counterexample _ => true | _ => false)
 
 end TpuSyncVerify.Transfer.Reshard.Coordinator

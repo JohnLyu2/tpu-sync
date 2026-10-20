@@ -37,7 +37,8 @@ here.
 |---|---|
 | `raiden_controller_bughunt_test.cc` | F2 (shape A) and F4 (both halves) |
 | `kv_cache_store_pin_race_test.cc` | F1 |
-| `build_targets.patch` | `cc_test` targets for the two files above |
+| `reshard_bughunt_test.cc` | R7a, R7b, R8, R2b of `docs/transfer/reshard.md` (registry / coordinator claim lifecycle; all four pass, not yet filed) |
+| `build_targets.patch` | `cc_test` targets for the three files above |
 | `candidate_fixes.patch` | fixes for F1 and F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 
@@ -55,19 +56,24 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 
 | # | Finding | Status | Reachable from production? |
 |---|---|---|---|
-| F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash | CONFIRMED (test) | only via the `ReadRemote` API (no in-tree caller) |
+| F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash ([filed](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1) 2026-10-19) | CONFIRMED (test); filed upstream, fix pending | only via the `ReadRemote` API (no in-tree caller) |
 | F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shape A; proved in Lean for shapes A and B | same |
 | F3 | Data race on `RemoteReadState::lease_id` | CONFIRMED (read) | same |
 | F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `50b0774`; **FIXED upstream** by PR #1105 = `72255dd` (2026-10-07) | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
 | F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix designed and validated on `50b0774`, patch retired 2026-10-16) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
 | F6 | `PoolReshardRegisterRecv`: a rejected duplicate (or racing) registration for an active `uuid` destroys a session object whose destructor releases the **active** session's host-staging lease ([filed](filed_bugs.md#2-poolreshardregisterrecv-duplicate-registration-frees-the-active-sessions-staging-lease-f6)) | CONFIRMED (read) at `1fa06d1`; reproduced by the reporter; **FIXED upstream** in `8653373` (2026-10-13) | yes: any pool-reshard receiver with bounded host staging (`RegisterPools(..., staging_leases > 0)`), on a duplicate or concurrent register for the same `uuid` |
+| F7 | `end_incoming_push` hook: a failed incoming push on a `ReshardReceiveSession` is not turned into `Finish(status)` (the `TransferReceiveSession` branch does), so the session, its staging lease and plan claim stay pinned until the deadline sweep, which reports `DEADLINE_EXCEEDED` instead of the push error ([filed](filed_bugs.md#3-reshardreceivesession-ignores-a-failed-endincomingpush-and-pins-poolstagingstorage-until-timeout-r1); R1 in `docs/transfer/reshard.md`) | CONFIRMED (read) at `0ac16d1`, witnessed in Lean (`Receive.lean`); **FIXED upstream** in `fdeebcd` (2026-10-16) | yes: any pool-reshard receiver whose sender's push fails mid-transfer (socket timeout / disconnect) |
+| F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
+| F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
 
 ---
 
 ## F1. `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash
 
 - **Status:** **CONFIRMED (test)**, 2026-09-24, on unmodified `b68161a`;
-  re-run on `d16701e` with the same result. Output, verbatim:
+  re-run on `d16701e` with the same result. Filed upstream 2026-10-19
+  ([write-up](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1)),
+  code unchanged through `0ac16d1`; fix pending. Output, verbatim:
   ```
   [ RUN      ] KVCacheStorePinRaceTest.EvictAndReinsertBetweenLookupAndPinReturnsStaleHostBlockId
   tpu_sync/kv_cache/kv_cache_store_pin_race_test.cc:161: Failure
@@ -464,6 +470,120 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 
 ---
 
+## F7. `end_incoming_push`: a failed push on a `ReshardReceiveSession` is not finished, pinning staging until the deadline
+
+- **Status:** **CONFIRMED (read)** at `0ac16d1`; witnessed in Lean as R1
+  (`trace_r1_failed_incoming_push` in `TpuSyncVerify/Transfer/Reshard/Receive.lean`,
+  tracked as R1 in `docs/transfer/reshard.md`). Filed upstream 2026-10-16
+  ([write-up](filed_bugs.md#3-reshardreceivesession-ignores-a-failed-endincomingpush-and-pins-poolstagingstorage-until-timeout-r1));
+  **FIXED upstream in `fdeebcd`** (2026-10-16): the reshard branch of the hook
+  now calls `reshard_session->Finish(status)` when `!status.ok()` before
+  `EndRecvOp()`, with one regression test,
+  `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline`
+  in `kv_cache_manager_with_transfer_pool_reshard_test.cc`. The description
+  below is of the unfixed code at `0ac16d1`.
+- **Where (at `0ac16d1`, before the fix):** `KVCacheManagerWithTransfer::InitializeBaseHooks()`
+  (`kv_cache_manager_with_transfer.cc:250-290`). The `TransferReceiveSession`
+  branch calls `DeferUnregisterOnSettle(); Finish(status)` on a failed push
+  before `EndRecvOp()` (`:266-271`); the `ReshardReceiveSession` branch calls
+  `EndRecvOp()` only and ignores `status` (`:279-289`).
+- **Sequence:** the sender does not retry a failed push
+  (`ReshardSendSession::RecordPushCompletion`, `reshard_send_session.cc:351-373`,
+  latches `finalizing_` on the first error), and
+  `ReshardReceiveSession::EndRecvOpLocked` (`reshard_receive_session.cc:495-505`)
+  settles only when `draining_ && in_flight_ == 0`. So a failed push drops
+  `in_flight_` to 0 with `draining_ == false` and `status_ == OK`; `Done()` is
+  false, `UnregisterSettledPlan` is skipped, and the hook returns `OK`.
+- **Impact:** the session's `PoolStagingLease` keeps its bounded slots and
+  `active_plans_[uuid]` stays registered until the deadline sweep
+  (`kv_cache_manager_with_transfer.cc:1037-1066`) fires at `timeout_s_`
+  (default 120 s) and reports `DEADLINE_EXCEEDED: Pool reshard receive timed
+  out`, masking the original error; meanwhile later pool reshards wait on
+  `AcquirePoolStagingLease` up to `pool_staging_lease_timeout()` (10 s) and
+  fail with `RESOURCE_EXHAUSTED`.
+- **Fix:** `if (!status.ok()) reshard_session->Finish(status);` before
+  `reshard_session->EndRecvOp()` — as landed in `fdeebcd`.
+
+---
+
+## F8. `ExecutePoolReshard`: sender-dispatch failure leaks the registry claim
+
+- **Status:** **CONFIRMED (test)** at `0ac16d1`, 2026-10-17, by
+  `ReshardBughuntTest.R2b_SenderDispatchFailureOrphansRegistryClaimAndArmedReceiver`
+  in `reshard_bughunt_test.cc` (tracked as R2b in `docs/transfer/reshard.md`,
+  witnessed in Lean by `trace_r2b_dispatch_failure_orphans_receivers_and_claim`
+  in `Coordinator.lean`). Filed upstream 2026-10-19
+  ([write-up](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b));
+  fix pending. Output, verbatim (built against the warm OSS Bazel outputs with
+  the recipe in `notes/empirical/oss-bazel-test-recipe.md`; all four tests in
+  the file pass):
+  ```
+  [ RUN      ] ReshardBughuntTest.R2b_SenderDispatchFailureOrphansRegistryClaimAndArmedReceiver
+  [       OK ] ReshardBughuntTest.R2b_SenderDispatchFailureOrphansRegistryClaimAndArmedReceiver (0 ms)
+  ```
+  (The test asserts the defect: after the injected sender failure,
+  `GetRequestBlockStatus` is `STATUS_CLAIMED` and `CancelIfUnclaimed` returns
+  `"false"`; it passes on unmodified code and would fail once the fix lands.)
+- **Where (at `0ac16d1`):** `ReshardCoordinator::ExecutePoolReshard`
+  (`reshard_coordinator.cc:415-544`). `BuildPoolReshardPlan` claims
+  `(req_id, uuid)` under a fresh `claim_owner` (`:417-420`). The three error
+  returns that follow — plan build (`:421-424`), receiver arm (`:458-463`),
+  null controller (`:483-487`) — call `registry_->AbandonClaim(args.req_id,
+  uuid, claim_owner)`. The sender-dispatch return (`:542-544`) does not.
+- **Impact:** the sender never started, so no `Complete` vote will arrive; the
+  claim stays in `claimed_owners_` and the request reads `STATUS_CLAIMED` until
+  `ttl_s_`. In that window `CancelIfUnclaimed`
+  (`request_block_registry.cc:388-390`) returns `false` and `Register` for the
+  same `(req_id, uuid)` is refused (`:281-285`). The receivers armed in the
+  previous step are left waiting for pushes that never come until their own
+  `timeout_s_` (that half is R2a, not filed).
+- **Fix (proposed):** call `registry_->AbandonClaim(args.req_id, uuid,
+  claim_owner);` before `return status;` at `:542-544`, matching the other
+  three paths.
+- **Sibling candidates, same file family, confirmed by the same test file but
+  not filed:** R7b (`AbandonClaim` leaves `completed_units_` behind), R7a
+  (owner-unscoped `completed_units_` in `Complete`). See
+  `docs/transfer/reshard.md`. R8 is filed as F9 below.
+
+---
+
+## F9. `LookupAndClaim`: claim TTL and registration TTL diverge, purging claimed rows
+
+- **Status:** **CONFIRMED (test)** at `0ac16d1`, 2026-10-17, by
+  `ReshardBughuntTest.R8_SplitTtlEvictsRequestBlocksWhileClaimIsStillActive`
+  in `reshard_bughunt_test.cc` (R8 in `docs/transfer/reshard.md`, witnessed in
+  Lean by `trace_r8_split_ttl_purges_request_blocks_while_claim_active` in
+  `Registry.lean`). Filed upstream 2026-10-19
+  ([write-up](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8));
+  fix pending. Output, verbatim (same run as F8):
+  ```
+  [ RUN      ] ReshardBughuntTest.R8_SplitTtlEvictsRequestBlocksWhileClaimIsStillActive
+  [       OK ] ReshardBughuntTest.R8_SplitTtlEvictsRequestBlocksWhileClaimIsStillActive (1 ms)
+  ```
+  (With `ttl_s = 60`: register at `t = 1000`, stage 0 claims at `t = 1040`,
+  at `t = 1070` the status probe still reads `STATUS_CLAIMED` while stage 1's
+  `CoordinateTransfer` fails with `"Missing producer block registration"`.)
+- **Where (at `0ac16d1`):** `request_block_registry.cc`. `Register` stamps
+  `expires_at = now + ttl_s_` on each `request_blocks_` row (`:263`).
+  `LookupAndClaim` (`:440-491`) reads those rows (`:462-470`), then sets
+  `claimed_[key] = now + ttl_s_` (`:473`) and refreshes `completed_units_`
+  (`:478`) but never touches the rows' `expires_at`.
+  `PurgeExpiredRequestBlocksLocked` (`:61-69`) runs at the top of every
+  operation and erases rows with `expires_at <= now` regardless of `claimed_`.
+- **Impact:** in `[t_reg + ttl, t_claim + ttl)` the request is claimed with no
+  backing registration. `Status` (`:421-423`) reports `STATUS_CLAIMED`,
+  `CancelIfUnclaimed` (`:388-390`) refuses, and any further `LookupAndClaim`
+  (`:464-468`) — a sibling pipelined stage, or the retry in upstream's own
+  `AbandonedStageLeavesTheSiblingClaimInPlace` — fails. With the default
+  `ttl_s_ = 600` this needs a claim that lands more than ten minutes after
+  registration; with shorter TTLs (tests use 60) it is a narrow queueing delay.
+- **Fix (proposed):** in `LookupAndClaim`, set `it->second.expires_at = now +
+  ttl_s_` on each claimed row when setting `claimed_[key]`; or make
+  `PurgeExpiredRequestBlocksLocked` skip rows whose `(req_id, uuid)` is in
+  `claimed_`.
+
+---
+
 ## Refuted or closed
 
 ### R-A. Premature completion in `TransferReceiveSession::IsReadyToComplete()`: REFUTED
@@ -627,3 +747,25 @@ clone reset. Results, verbatim:
   now throws on an invalid registration instead of returning 0 (`80e2c52`);
   `TransferDetails` reports the failed phase (`5a73483`). Two patches remain
   and apply cleanly. Tests not re-run.
+- 2026-10-19: F7 added (pool-reshard receiver: the `end_incoming_push` hook
+  does not `Finish(status)` a `ReshardReceiveSession` on a failed push, so
+  staging lease and plan claim stay pinned until the deadline sweep; R1 of
+  `docs/transfer/reshard.md`). Filed upstream 2026-10-16 and **fixed upstream**
+  by `fdeebcd` (2026-10-16, one regression test). Upstream `main` is at
+  `2a97685` (5 commits past `0ac16d1`); not yet merged into the fork, so
+  line numbers in this file stay pinned to `0ac16d1`. Separately, four
+  hardware-free reproducers for the reshard registry/coordinator candidates
+  R7a, R7b, R8 and R2b were written and pass (`reshard_bughunt_test.cc`,
+  target in `build_targets.patch`); they remain tracked in `reshard.md` until
+  filed.
+- 2026-10-19 (later): **F1 filed upstream** (write-up as bug 4 in
+  `filed_bugs.md`, pinned to `0ac16d1`); `ValidateAndPinHostBlocks` region
+  verified unchanged at `0ac16d1` (`kv_cache_store.cc:1615-1642`). Fix pending.
+- 2026-10-19 (later): **F8 filed upstream** (R2b: `ExecutePoolReshard`
+  sender-dispatch return omits `AbandonClaim`; write-up as bug 5 in
+  `filed_bugs.md`, pinned to `0ac16d1`; reproducer
+  `ReshardBughuntTest.R2b_…` in `reshard_bughunt_test.cc`). Fix pending.
+- 2026-10-19 (later): **F9 filed upstream** (R8: `LookupAndClaim` refreshes
+  the claim TTL but not the claimed `request_blocks_` rows; write-up as bug 6
+  in `filed_bugs.md`, pinned to `0ac16d1`; reproducer `ReshardBughuntTest.R8_…`).
+  Fix pending. Remaining unfiled reshard candidates with reproducers: R7b, R7a.

@@ -1,53 +1,53 @@
-/-
-  TpuSyncVerify/Transfer/Reshard/Coverage.lean
-
-  Stage 3a of `docs/transfer/reshard.md`: horizontal data-plane refinement of
-  `Reshard/Pipeline.lean` for sub-block byte-interval coverage and multi-sender
-  push-stream accounting:
-    * `tpu_sync/kv_cache/reshard_receive_session.cc` (`ValidatePlan`,
-      `ValidateReceiverCoverage`, lines 67–349)
-    * `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (`ValidateSpanCoverage`,
-      `EmitSpanSchedule` `expected_pushes` computation, and
-      `DefaultTransferStreams`, lines 315–572, 576–594, 908–922, 1117–1153)
-    * `tpu_sync/kv_cache/reshard_send_session.cc` (`ExecutePush` / `StartPoolPush`
-      per-peer `(src_block_id, dst_block_id)` deduplication, lines 204–225,
-      293–348)
-    * `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`,
-      lines 27–51)
-    * `tpu_sync/transport/block_transport.cc` (`AsyncPush` stream clamping
-      `P = min(parallelism, num_blocks)` and `HandleIncomingPush` /
-      `CompleteIncomingPush` plan-declared progress counter, lines 640–793,
-      1010–1046)
-
-  Citations in this file are checked against tpu-sync `0ac16d1`.
-
-  What this module proves:
-  1. **Multi-sender stream count conservation (`stream_count_matches`,
-     `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
-     `(src_block_id, dst_block_id)` pairs for a pool group and opens
-     `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:1020-1025`,
-     `reshard_send_session.cc:293-341`). `ValidateReceiverCoverage`
-     (`reshard_receive_session.cc:314-324`) checks that the receiver's
-     `expected_pushes` equals `∑_s min(parallelism, |pairs_s|)`, matching the
-     planner (`pool_reshard_planner.cc:1134-1142`).
-  2. **Exact sub-block byte reconstruction under out-of-order stream arrival
-     (`checkContiguous_covers`, `checkContiguous_head_disjoint`,
-     `partition_reconstructs_block`, `partition_reconstructs_perm`).**
-     `ValidateReceiverCoverage` sorts the logical live-byte intervals
-     `[start_bytes, end_bytes)` targeting a destination block and checks that
-     they partition `[0, extent)` without gaps or overlaps
-     (`reshard_receive_session.cc:325-346`). We prove that any interval list
-     accepted by this check is pairwise disjoint and covers every byte
-     `b < extent`, so landing the intervals in *any* network arrival order
-     reconstructs `good extent` (`[kv 0, …, kv (extent - 1)]`).
-  3. **Refinement coupling (`CoveragePipeline.step_pipe`,
-     `CoveragePipeline.reachable_safe`).** `CoveragePipeline` refines
-     `Reshard.Pipeline` by replacing each pool's scalar stream counter with a
-     queue of sub-block intervals and a byte-addressed staging buffer. Every
-     `CoveragePipeline` step projects to a `Pipeline.step`, lifting all Stage 2
-     pipeline invariants together with byte-level destination reconstruction.
--/
 import TpuSyncVerify.Transfer.Reshard.Pipeline
+
+/-!
+# Sub-block byte coverage and multi-sender stream accounting
+
+Horizontal data-plane refinement of `Reshard/Pipeline.lean` for sub-block
+byte-interval coverage and multi-sender push-stream accounting:
+* `tpu_sync/kv_cache/reshard_receive_session.cc` (`ValidatePlan`,
+  `ValidateReceiverCoverage`, lines 67–349)
+* `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (`ValidateSpanCoverage`,
+  `EmitSpanSchedule` `expected_pushes` computation, and
+  `DefaultTransferStreams`, lines 315–572, 576–594, 908–922, 1117–1153)
+* `tpu_sync/kv_cache/reshard_send_session.cc` (`ExecutePush` / `StartPoolPush`
+  per-peer `(src_block_id, dst_block_id)` deduplication, lines 204–225,
+  293–348)
+* `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`,
+  lines 27–51)
+* `tpu_sync/transport/block_transport.cc` (`AsyncPush` stream clamping
+  `P = min(parallelism, num_blocks)` and `HandleIncomingPush` /
+  `CompleteIncomingPush` plan-declared progress counter, lines 640–793,
+  1010–1046)
+
+Citations in this file are checked against tpu-sync `0ac16d1`.
+
+What this module proves:
+1. **Multi-sender stream count conservation (`stream_count_matches`,
+   `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
+   `(src_block_id, dst_block_id)` pairs for a pool group and opens
+   `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:1020-1025`,
+   `reshard_send_session.cc:293-341`). `ValidateReceiverCoverage`
+   (`reshard_receive_session.cc:314-324`) checks that the receiver's
+   `expected_pushes` equals `∑_s min(parallelism, |pairs_s|)`, matching the
+   planner (`pool_reshard_planner.cc:1134-1142`).
+2. **Exact sub-block byte reconstruction under out-of-order stream arrival
+   (`checkContiguous_covers`, `checkContiguous_head_disjoint`,
+   `partition_reconstructs_block`, `partition_reconstructs_perm`).**
+   `ValidateReceiverCoverage` sorts the logical live-byte intervals
+   `[start_bytes, end_bytes)` targeting a destination block and checks that
+   they partition `[0, extent)` without gaps or overlaps
+   (`reshard_receive_session.cc:325-346`). We prove that any interval list
+   accepted by this check is pairwise disjoint and covers every byte
+   `b < extent`, so landing the intervals in *any* network arrival order
+   reconstructs `good extent` (`[kv 0, …, kv (extent - 1)]`).
+3. **Refinement coupling (`CoveragePipeline.step_pipe`,
+   `CoveragePipeline.reachable_safe`).** `CoveragePipeline` refines
+   `Reshard.Pipeline` by replacing each pool's scalar stream counter with a
+   queue of sub-block intervals and a byte-addressed staging buffer. Every
+   `CoveragePipeline` step projects to a `Pipeline.step`, lifting all
+   pipeline invariants together with byte-level destination reconstruction.
+-/
 
 namespace TpuSyncVerify.Transfer.Reshard.Coverage
 
@@ -389,7 +389,7 @@ theorem reachable_pipe {ranks : List Nat} {specs : List (Nat × List Interval)}
   | init => exact .init
   | step _ hs ih => exact .step ih (step_pipe hs)
 
-/-- Every state reachable in `CoveragePipeline` satisfies all Stage 2 pipeline
+/-- Every state reachable in `CoveragePipeline` satisfies all pipeline
 safety properties (`PublicationCorrect`, `AliasedPageCorrect`, `DstHbmSafe`,
 `SrcHbmSafe`, `StagingSafe`, `StreamAccountingSafe`, `NoUnarmedPush`,
 `NoOpLeak`). -/

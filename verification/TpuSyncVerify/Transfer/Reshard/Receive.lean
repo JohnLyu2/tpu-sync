@@ -5,13 +5,12 @@ import TpuSyncVerify.Transfer.Session
 /-!
 # Reshard receive session
 
-Stage 1 of the pool-reshard model: one `ReshardReceiveSession` on the
-destination (consumer) side and the slice of `KVCacheManagerWithTransfer` that
-drives it (`PoolReshardRegisterRecv`, `OnPoolReceived`, `begin_incoming_push`,
-`end_incoming_push`, `MaybeUnregisterSettledReshardRecv`, and the
-`CompleteReadWithDetails` poll). Sender sessions, multi-sender stream counting,
-and aliased-page memory contents come in `Reshard/Send.lean` and Stage 2
-(`Reshard/Pipeline.lean`).
+One `ReshardReceiveSession` on the destination (consumer) side and the slice of
+`KVCacheManagerWithTransfer` that drives it (`PoolReshardRegisterRecv`,
+`OnPoolReceived`, `begin_incoming_push`, `end_incoming_push`,
+`MaybeUnregisterSettledReshardRecv`, and the `CompleteReadWithDetails` poll).
+Sender sessions, multi-sender stream counting, and aliased-page memory contents
+are modelled in `Reshard/Send.lean` and `Reshard/Pipeline.lean`.
 
 Citations are to tpu-sync `0ac16d1`. Unqualified `.h`/`.cc` are
 `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`; `mgr.cc` is
@@ -109,7 +108,7 @@ Session-level fields:
   fires `OnPoolReceived(l, uuid)` only when `plan_pushes == expected_chunks`
   (`bt.cc:686-787`), and `RecordPoolReceivedLocked` rejects undeclared or
   duplicate pool indices (`.cc:541-552`). Encoded as the `onPoolReceived p`
-  guard `pool.stage == .waiting`. (Discharged in Stage 2 `Reshard/Pipeline.lean`
+  guard `pool.stage == .waiting`. (Discharged in `Reshard/Pipeline.lean`
   by explicit stream counting.)
 * **A2 (registration before visibility).** `RegisterActivePlanDirect`
   (`.cc:376-377`) and `AcquireStagingLeases` (`.cc:381-388, 420-459`) succeed

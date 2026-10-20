@@ -1,13 +1,15 @@
-/-
-  TpuSyncVerify.Transfer.Reshard.PoolStaging
-  ==========================================
+import TpuSyncVerify.Common.System
+import TpuSyncVerify.Common.ModelCheck
+import TpuSyncVerify.Common.ListAux
 
-  Stage 3b of the pool-reshard verification plan (`docs/transfer/reshard.md` §6):
-  formal model and proofs of bounded host staging (`PoolStagingStorage`) and
-  per-UUID page-lease lifecycle in `KVCacheManagerBase` and
-  `KVCacheManagerWithTransfer`.
+/-!
+# Bounded pool host staging and per-UUID lease lifecycle
 
-  Pinned to upstream commit `0ac16d1`.
+Formal model and proofs of bounded host staging (`PoolStagingStorage`) and
+per-UUID page-lease lifecycle in `KVCacheManagerBase` and
+`KVCacheManagerWithTransfer`.
+
+Pinned to upstream commit `0ac16d1`.
 
   ## C++ anchorage
 
@@ -84,9 +86,6 @@
     Risk R5) showing a rejected duplicate-UUID arm freeing the survivor's lease
     and a third session (`uuid = 8`) receiving the same physical slot `0`.
 -/
-
-import TpuSyncVerify.Common.System
-import TpuSyncVerify.Common.ListAux
 
 namespace TpuSyncVerify.Transfer.Reshard.PoolStaging
 
@@ -1397,5 +1396,20 @@ theorem mutant_leaking_release_breaks_conservation_and_starves :
         (decide (a2.totalSlots < a2.numSlots), a2.acquireLease 8 [1])) =
       some (true, none) := by
   decide
+
+/-- Candidate registration events over two call IDs (`1, 2`), two UUIDs (`7, 8`),
+and block `[5]`. -/
+def checkEvents : List RegEv :=
+  [ .beginArm 1 7 [5], .acquireArmLease 1, .finishArm 1
+  , .beginArm 2 7 [5], .acquireArmLease 2, .finishArm 2
+  , .beginArm 2 8 [5]
+  , .settleSession 7, .settleSession 8 ]
+
+def violatesHoldLeases (s : RegState) : Bool :=
+  !ActiveSessionsHoldLeases s || (s.arena.totalSlots != s.arena.numSlots)
+
+#guard ModelCheck.check (RegState.sys .reserveBeforeLease 2) checkEvents violatesHoldLeases 8 = .outOfFuel
+#guard (match ModelCheck.check (RegState.sys .leaseBeforeReserve 2) checkEvents violatesHoldLeases 8 with
+  | .counterexample _ => true | _ => false)
 
 end TpuSyncVerify.Transfer.Reshard.PoolStaging

@@ -5,12 +5,11 @@ import TpuSyncVerify.Transfer.Session
 /-!
 # Reshard send session
 
-Stage 1 of the pool-reshard model: one `ReshardSendSession` on the producer
-side and the slice of `KVCacheManagerWithTransfer` that drives it
-(`PoolReshardPush`, `CountPoolReshardSendSlots`, and the
-`CompleteReadWithDetails` poll). Receiver sessions live in
-`Reshard/Receive.lean`; multi-sender stream counting and aliased-page contents
-compose both in Stage 2 (`Reshard/Pipeline.lean`).
+One `ReshardSendSession` on the producer side and the slice of
+`KVCacheManagerWithTransfer` that drives it (`PoolReshardPush`,
+`CountPoolReshardSendSlots`, and the `CompleteReadWithDetails` poll). Receiver
+sessions live in `Reshard/Receive.lean`; multi-sender stream counting and
+aliased-page contents compose both in `Reshard/Pipeline.lean`.
 
 Citations are to tpu-sync `0ac16d1`. Unqualified `.h`/`.cc` are
 `tpu_sync/kv_cache/reshard_send_session.{h,cc}`; `slots.cc` is

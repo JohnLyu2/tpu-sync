@@ -5,7 +5,7 @@ import TpuSyncVerify.Transfer.Reshard.Send
 /-!
 # Pool-reshard transfer pipeline
 
-Stage 2 of the pool-addressed resharding model (`docs/transfer/reshard.md`):
+End-to-end pool-addressed resharding model (`docs/transfer/reshard.md`):
 composes `Reshard.Send` (`ReshardSendSession`, `Send.lean`), `Reshard.Recv`
 (`ReshardReceiveSession`, `Receive.lean`), the plan-declared stream progress in
 `BlockTransport::HandleIncomingPush` / `CompleteIncomingPush` (`bt.cc:640-793`),
@@ -49,7 +49,7 @@ with the true higher-rank pool data.
 We model this pessimistic page aliasing directly on `dstHbm`: when pool `p`
 completes its H2D copy (`recv (.h2dDone p true)`), `writePoolHbm` writes
 `dstStaging[p]` to `dstHbm[p]` **and** clobbers `dstHbm[q] := .junk` for every
-pool `q` of strictly higher rank (`pool_p.rank < pool_q.rank`). Because Stage 1's
+pool `q` of strictly higher rank (`pool_p.rank < pool_q.rank`). Because
 `Recv.RankWaveOrder` guarantees that no higher-rank pool `q` has entered
 `queued`, `issued`, `ready`, or `completed` when a lower-rank pool `p` is in
 `ready`, this clobbering never overwrites a completed higher-rank pool

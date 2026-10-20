@@ -1,13 +1,14 @@
 # Filed bugs
 
 Code references below are against [`google/tpu-sync` @ `50b0774`](https://github.com/google/tpu-sync/tree/50b0774a62dd96b9aab580546fbf70a9443ce16c)
-for bug 1 and [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tree/1fa06d1f44345369f4327079828ec6c4989d6694) for bug 2.
+for bug 1, [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tree/1fa06d1f44345369f4327079828ec6c4989d6694) for bug 2,
+and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1) for bugs 3–6.
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
-the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2) and are not
-re-pinned on upstream syncs; the only edits are the italic *Update* sentences and
-one internal tooling word replaced by "with the fix". Status updates go in
-[README.md](README.md) (§Summary, §History).
+the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2, `0ac16d1` for
+bugs 3–6) and are not re-pinned on upstream syncs; the only edits are the italic
+*Update* sentences and one internal tooling word replaced by "with the fix".
+Status updates go in [README.md](README.md) (§Summary, §History).
 
 ---
 
@@ -79,3 +80,93 @@ By contrast, [`ReshardSendSession::Create`](https://github.com/google/tpu-sync/b
 - If two threads call `PoolReshardRegisterRecv(4001)` concurrently while waiting on staging slots, one returns `OK` and one returns `ALREADY_EXISTS`, and the loser's destructor erases the winner's lease (`free_slots` becomes 2, `GetBlockChunks(uuid=4001)` returns 0 chunks).
 
 **Fix.** Claim `uuid` via `RegisterActivePlanDirect` in `ReshardReceiveSession::Create` before constructing the session and acquiring staging, rolling back with `UnregisterActivePlanDirect` if `AcquireStagingLeases` fails. Change with regression tests to follow. *Update 2026-10-16: landed upstream as `8653373` (2026-10-13) with three regression tests; see README.md §F6.*
+
+
+---
+
+## 3. `ReshardReceiveSession` ignores a failed `EndIncomingPush` and pins `PoolStagingStorage` until timeout (R1)
+
+Filed 2026-10-16. Found during Lean formalization.
+
+In [`KVCacheManagerWithTransfer::InitializeBaseHooks()`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L250-L290), the `hooks.end_incoming_push` callback handles two receive session types:
+
+1. **Prefill-decode receive (`TransferReceiveSession`):** When `!status.ok()`, it calls `recv_session->DeferUnregisterOnSettle()` and `recv_session->Finish(status)` before `recv_session->EndRecvOp()` ([kv_cache_manager_with_transfer.cc:266-271](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L266-L271)).
+2. **Pool reshard receive (`ReshardReceiveSession`):** It calls `reshard_session->EndRecvOp()` directly **without** checking `if (!status.ok()) { reshard_session->Finish(status); }` ([kv_cache_manager_with_transfer.cc:279-289](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L279-L289)).
+
+Because [`ReshardSendSession::RecordPushCompletion`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard_send_session.cc#L351-L373) aborts on the first failed push without retrying, and [`ReshardReceiveSession::EndRecvOpLocked()`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard_receive_session.cc#L495-L505) only marks the session settled when `draining_ && in_flight_ == 0`:
+
+1. A failed incoming push (e.g., socket timeout/disconnect during `PushData`) decrements `in_flight_` to `0`, but `draining_` remains `false` and `status_` remains `absl::OkStatus()`.
+2. `reshard_session->Done()` returns `false`, so `UnregisterSettledPlan(uuid, generation)` is skipped and `hooks.end_incoming_push` returns `absl::OkStatus()` instead of `CANCELLED`.
+3. The session's `PoolStagingLease` continues holding bounded `PoolStagingStorage` slots (`free_slots` stays decremented), `active_plans_[uuid]` remains registered, and `GetFinishedRecvingReqIds()` does not surface the failed request in `failed_recving` until the deadline sweep in [kv_cache_manager_with_transfer.cc:1037-1066](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L1037-L1066) fires at `deadline()` (`timeout_s_`, default 120 s). When it does, the request is reported as `DEADLINE_EXCEEDED: Pool reshard receive timed out`, masking the original push error.
+4. Under transient network failures, leaked `PoolStagingLease` slots starve subsequent pool reshards: `AcquirePoolStagingLease` waits up to `pool_staging_lease_timeout()` (default 10 s) and then fails with `RESOURCE_EXHAUSTED` until the stale session times out.
+
+**Fix.** In [`KVCacheManagerWithTransfer::InitializeBaseHooks()`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L279), call `reshard_session->Finish(status)` when `!status.ok()` before `reshard_session->EndRecvOp()`. *Update 2026-10-19: landed upstream as `fdeebcd` (2026-10-16) with a regression test in `kv_cache_manager_with_transfer_pool_reshard_test.cc`; see README.md §F7.*
+
+
+---
+
+## 4. `KVCacheStore::ValidateAndPinHostBlocks`: check-then-act window between Lookup and Pin can return a stale `host_block_id` (F1)
+
+Filed 2026-10-19. Found during Lean formalization and confirmed by a unit test.
+
+[`KVCacheStore::ValidateAndPinHostBlocks`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store.cc#L1615-L1642) looks up the requested hashes first and pins them in a separate call, so it can return a `host_block_id` that no longer holds the requested hash.
+
+**Cause**
+- `backend()->Lookup(block_hashes)` at [kv_cache_store.cc:1618](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store.cc#L1618) runs with default [`LookupOptions`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store_backend.h#L101-L105) (`pin_found = false`), copies `existing.host_block_id` ([kv_cache_store.cc:1634](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store.cc#L1634)), and only then calls `backend()->Pin(block_hashes)` ([kv_cache_store.cc:1637](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store.cc#L1637)).
+- The backend mutex is released between the two calls. Only `KVCacheStore::mutex_` is held across them, and neither [`KVCacheStore::Evict`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store.cc#L1804-L1809) (*"We do not hold store mutex_ across this call"*) nor [`KVCacheStore::Insert`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store.cc#L1008-L1041) takes `mutex_`.
+- If a hash is evicted from `old_id` (and `old_id` is reused for another hash) and re-inserted at `new_id` inside that window, `Pin(block_hashes)` succeeds (pins are keyed by hash, so it pins `new_id`), while `ValidateAndPinHostBlocks` returns `old_id`.
+
+**Impact**
+- The caller pulls `old_id` (which now holds unrelated bytes) while the pin protects `new_id`; `ReleaseReadLease` still reports `LEASE_HELD`, so the wrong bytes are accepted silently.
+- Note: [`KVCacheStoreServiceImpl::Fetch`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_store_service.cc#L449-L457) already closes this exact window with `pin_found = true`. `ValidateAndPinHostBlocks` is only used by [`RaidenControllerServiceImpl::AcquireReadLease`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/core/controller/controller_service.cc#L175) ([`RaidenController::ReadRemote`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/core/controller/raiden_controller.cc#L947-L1142), which has no production caller yet).
+
+Found during the Lean formalization and confirmed by a created unit test.
+
+**Proposed fix.** Call `backend()->Lookup(block_hashes, LookupOptions{.enable_global = false, .pin_found = true})`, release the returned pins on any validation refusal, and drop the separate `backend()->Pin(block_hashes)` call, mirroring `Fetch`. Reproducer: [`kv_cache_store_pin_race_test.cc`](kv_cache_store_pin_race_test.cc); candidate fix in [`candidate_fixes.patch`](candidate_fixes.patch).
+
+
+---
+
+## 5. `ReshardCoordinator::ExecutePoolReshard`: sender dispatch failure returns without calling `AbandonClaim`, leaking the registry claim (R2b)
+
+Filed 2026-10-19. Found during Lean formalization and confirmed by a unit test.
+
+[`ReshardCoordinator::ExecutePoolReshard`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L415-L544) claims the request in `RequestBlockRegistry` under a per-call `claim_owner`, but omits `registry_->AbandonClaim(args.req_id, uuid, claim_owner)` when sender dispatch fails.
+
+**Cause**
+- `BuildPoolReshardPlan(plan_request, registry_, claim_owner)` at [reshard_coordinator.cc:420](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L420) claims `(args.req_id, uuid)` in `RequestBlockRegistry` under `claim_owner`.
+- The earlier error returns—plan build failure ([L421-424](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L421-L424)), receiver arm failure ([L458-463](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L458-L463)), and null controller ([L483-487](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L483-L487))—all roll back the claim via `registry_->AbandonClaim(args.req_id, uuid, claim_owner)`.
+- However, if receiver arming succeeds and any sender dispatch fails (`!sender_status[i].ok()`), lines [542-544](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L542-L544) return `status` directly without calling `registry_->AbandonClaim(args.req_id, uuid, claim_owner)`.
+
+**Impact**
+- Because the sender transfer failed to start, `Complete` is never called for that transfer, leaving `claim_owner` leaked in `claimed_owners_[(req_id, uuid)]` and the request stuck in `STATUS_CLAIMED` until `ttl_s_` expires.
+- While stuck in `STATUS_CLAIMED`, producer cleanup via [`RequestBlockRegistry::CancelIfUnclaimed`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L388-L390) is rejected (`returns false`), and any re-registration for `(req_id, uuid)` is rejected at [request_block_registry.cc:281-285](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L281-L285) (`"Request block registration is already claimed"`).
+
+Confirmed by a unit test. Found during Lean formalization.
+
+**Proposed fix**
+- At [reshard_coordinator.cc:542-544](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L542-L544), call `registry_->AbandonClaim(args.req_id, uuid, claim_owner);` before returning `!status.ok()`.
+
+Reproducer: `ReshardBughuntTest.R2b_SenderDispatchFailureOrphansRegistryClaimAndArmedReceiver` in [`reshard_bughunt_test.cc`](reshard_bughunt_test.cc).
+
+
+---
+
+## 6. `RequestBlockRegistry::LookupAndClaim`: claiming a request does not refresh `request_blocks_` TTL, evicting producer registrations while the claim is active (R8)
+
+Filed 2026-10-19. Found during Lean formalization and confirmed by a unit test.
+
+[`RequestBlockRegistry::LookupAndClaim`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L440-L491) sets `claimed_[lifecycle_key] = now + ttl_s_` when a request is claimed, but does not refresh `expires_at` on the corresponding `request_blocks_` entries, so [`PurgeExpiredRequestBlocksLocked`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L61-L69) evicts the producer block registrations while the claim is still active.
+
+**Cause**
+- [`RequestBlockRegistry::Register`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L263) sets `registration.expires_at = t_reg + ttl_s_` on each `request_blocks_[(req_id, unit)]` entry.
+- When `LookupAndClaim` claims `(req_id, uuid)` at `t_claim > t_reg`, it sets `claimed_[lifecycle_key] = t_claim + ttl_s_` ([L473](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L473)) and refreshes `completion_it->second.expires_at = t_claim + ttl_s_` ([L478](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L478)), but leaves `expires_at = t_reg + ttl_s_` on the `request_blocks_` rows it looked up at [L462-470](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L462-L470).
+- In the window `[t_reg + ttl_s_, t_claim + ttl_s_)`, `PurgeExpiredRequestBlocksLocked` ([L61-69](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L61-L69)) erases `request_blocks_[(req_id, unit)]` while `claimed_[(req_id, uuid)]` remains live.
+
+**Impact**
+- In that window, [`RequestBlockRegistry::Status`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L421-L423) still reports `STATUS_CLAIMED` and [`CancelIfUnclaimed`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L388-L390) still returns `false`, yet a sibling pipelined stage claiming the request—or a stage retrying after a receiver-arm failure (the scenario in [`AbandonedStageLeavesTheSiblingClaimInPlace`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_service_test.cc#L1305-L1332))—fails in `LookupAndClaim` ([L464-468](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L464-L468)) with `"Missing producer block registration"`.
+
+**Proposed fix**
+- In [`LookupAndClaim`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L462-L474), set `it->second.expires_at = now + ttl_s_` on each claimed `request_blocks_` entry alongside `claimed_[lifecycle_key] = now + ttl_s_` (alternatively, have `PurgeExpiredRequestBlocksLocked` skip rows whose `(req_id, uuid)` is present in `claimed_`).
+
+Reproducer: `ReshardBughuntTest.R8_SplitTtlEvictsRequestBlocksWhileClaimIsStillActive` in [`reshard_bughunt_test.cc`](reshard_bughunt_test.cc).
