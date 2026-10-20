@@ -5,7 +5,14 @@ numbers are for tpu-sync `0ac16d1` unless a block of test output says
 otherwise; the F1–F4 tests were run on `b68161a` and re-run on `d16701e`, the
 F5 tests on `50b0774`.
 
-Caller checked: `vllm-torchtpu` @ `6a9132a84`.
+Callers checked: [`vllm-project/vllm-torchtpu`](https://github.com/vllm-project/vllm-torchtpu)
+@ `9725110` (2026-10-20; connector
+`src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py`) and
+[`sgl-project/sglang-torchtpu`](https://github.com/sgl-project/sglang-torchtpu)
+@ `9a6eef1` (2026-10-20; `sglang_tpu/disaggregation/raiden/{pipeline,pp_swa,pp_common}.py`).
+Earlier entries that say "`vllm-torchtpu` @ `6a9132a84`" were read at that
+commit. See §Callers for what each finding needs from a caller and whether
+these two provide it.
 
 ## Evidence levels
 
@@ -66,7 +73,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 | F7 | `end_incoming_push` hook: a failed incoming push on a `ReshardReceiveSession` is not turned into `Finish(status)` (the `TransferReceiveSession` branch does), so the session, its staging lease and plan claim stay pinned until the deadline sweep, which reports `DEADLINE_EXCEEDED` instead of the push error ([filed](filed_bugs.md#3-reshardreceivesession-ignores-a-failed-endincomingpush-and-pins-poolstagingstorage-until-timeout-r1); R1 in `docs/transfer/reshard.md`) | CONFIRMED (read) at `0ac16d1`, witnessed in Lean (`Receive.lean`); **FIXED upstream** in `fdeebcd` (2026-10-16) | yes: any pool-reshard receiver whose sender's push fails mid-transfer (socket timeout / disconnect) |
 | F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
 | F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
-| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape, reopened on the sender) (R6 in `docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `449b591`); not yet filed | yes: any pool-reshard sender with bounded host staging whose first failing push has siblings in flight and whose transfer is retried under the same `uuid` before the old session drains |
+| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape, reopened on the sender) (R6 in `docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `449b591`); not yet filed | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
 
 ---
 
@@ -664,6 +671,70 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 
 ---
 
+## Callers
+
+What the two open-source engines that drive `tpu-sync` do at the points the
+reshard findings depend on. Read 2026-10-20 at `vllm-torchtpu` `9725110`
+(`tpu_connector.py`, 7,047 lines) and `sglang-torchtpu` `9a6eef1`
+(`sglang_tpu/disaggregation/raiden/`). Line numbers are for those commits.
+
+**How each caller uses the control plane.**
+
+- *vllm-torchtpu* — one `coordinate_transfer` per request ("Starts exactly one
+  source-controller transfer per request", `tpu_connector.py:5425`); a second
+  submission for the same destination request is skipped (`:5480-5491`). The
+  only retry is for the exact pre-arm error `"Missing producer block
+  registration"` (`_start_stage3_transfer_with_d5_retry`, `:5271-5303`, 10 ms
+  cadence for at most `_STAGE3_D5_REGISTRATION_WAIT_S = 5.0` s; the deferred
+  path parks and re-attempts once per scheduler step until the registration
+  wait budget, `:5966-5996`). Cancellation and pre-send connection failures
+  fail the load without retry (`:6006-6031`); **any other error after the RPC
+  is "uncertain": the load stays blocked waiting for the native terminal, and
+  is never re-coordinated** (`:6032-6050`). Pipeline decode requires the same
+  stage count as pipeline prefill, and every stage names the complete source
+  rank set (`_stage3_source_work_units`, `:4860-4893`). Admitted topologies
+  are `pp{2,4,8}_prefill → pp{2,4,8}_decode` (TP 1) and `pcp/dp` prefill →
+  `dp`/`dp…tp2` decode (`:3856-3930`); TP prefill → PP decode is not admitted.
+  Producer side: registrations past their expiry are offered to
+  `cancel_request_blocks_if_unclaimed` on every poll until it returns true
+  (`:5160-5190` and the expiry sweep above it).
+- *sglang-torchtpu* — `coordinate_transfer` retried only while the reply
+  contains `"Missing producer block registration"` and the room's deadline has
+  not passed (50 ms cadence, `pipeline.py:1672-1721`); any other failure fails
+  the room, and the room's pages stay armed for one native deadline because
+  "the controller arms the receivers before the senders, so a push can still
+  land" (`:1716-1731`). Decode must "use DP or the same pipeline stage count"
+  (`:1201-1206`): a DP decode pulls from all prefill stages in one transfer
+  (one destination unit); a PP decode stage pulls only from its own rank.
+  Twins (SWA), early parts and stage groups each get a **distinct derived
+  uuid** (`pp_common.py:197-208`, `pp_swa.py:98-99`). Producer release: with a
+  DP decode, `cancel_request_blocks_if_unclaimed` is retried every 50 ms until
+  it returns true; with a PP decode the producer votes
+  `complete_request_blocks` (`:1568-1592`).
+
+**What this means per finding.**
+
+| Finding | Caller condition it needs | vllm-torchtpu | sglang-torchtpu |
+|---|---|---|---|
+| F8 / R2b (claim leak on sender-dispatch failure) | a sender RPC failing after arming | Reached. The connector sees a post-arm error, marks the load "uncertain", waits for the receiver's native timeout, then recomputes. The producer's `cancel_request_blocks_if_unclaimed` returns `false` every poll until `ttl_s_` (600 s): its registered blocks stay pinned for that long. | Reached. Room fails, pages armed for one native deadline. DP-decode producers retry `cancel_…_if_unclaimed` every 50 ms until TTL; PP-decode producers vote `complete_request_blocks`, which does retire the claim once every rank has voted. |
+| F9 / R8 (claim refreshes `claimed_` TTL but not `request_blocks_` TTL) | a claim more than `ttl_s_` after registration, while an earlier claim is live | Reached only for pipeline decode (several stages claim the same uuid at different times) and only if a later stage's claim lands > 600 s after registration. **Its error string is the one both callers treat as the benign pre-arm "registrations not yet there" case**, so the stage would spin on retries until its wait budget (vllm: up to the registration wait; sglang: the room deadline) and then fail the load / room — a stall followed by recompute, not corruption. | Same, for PP decode. |
+| F10 / R6 — early unregister half | first failing push with siblings in flight | Reached (any multi-peer or multi-pool send). Consequence without a retry: later chunk resolution in the failed session returns nothing (bounded) or whole blocks (full mirror); the socket adapter's per-uuid failure latch cancels the sibling posts anyway. | Same. |
+| F10 / R6 — staging-lease aliasing half | a **second `coordinate_transfer` with the same uuid** while the failed sender session drains | **Not reached.** Post-arm failures are never re-coordinated; the only retry is pre-arm. | **Not reached.** Same policy; sibling transfers use distinct derived uuids. |
+| R7a (owner-unscoped `completed_units_` on multi-stage claims) | one source rank sending to ≥ 2 destination stages under one uuid | **Not reached.** Equal stage counts are enforced (`:4874-4881`), each rank feeds one stage; TP prefill → PP decode is not admitted. | **Not reached.** DP decode is one destination; PP decode requires equal stage counts (`:1201-1206`). |
+| R7b (stale `completed_units_` after `AbandonClaim`) | a vote before an abandon, then a re-claim of the same uuid | **Not reached** by the callers' retry policies (re-claims happen only before any sender was dispatched, i.e. before any vote). | Same. |
+| F7 / R1 (fixed) | a failed incoming push on a reshard receiver | Was reached: exactly the "uncertain, wait for native terminal" path, which is why the fix shortens the wait from `timeout_s_` to immediate. | Same ("pages armed until the native deadline"). |
+
+Net: F8 is the reshard finding with the widest caller exposure (every
+post-arm sender failure pins producer blocks for the TTL); F9's exposure is
+narrow but it masquerades as the callers' benign retry case; F10's aliasing
+and R7a/R7b need a same-uuid re-coordination or a rank fanning out to several
+stages, which neither caller does today. Those remain real defects in
+`tpu-sync` (the library cannot assume the caller's policy) but are not
+production incidents waiting to happen with these two engines as of these
+commits.
+
+---
+
 ## Refuted or closed
 
 ### R-A. Premature completion in `TransferReceiveSession::IsReadyToComplete()`: REFUTED
@@ -929,6 +1000,13 @@ clone reset. Results, verbatim:
   libraries" used for the F2 run are from that same `1fa06d1` build, not
   `0ac16d1`; the controller sources were compiled from `449b591` as stated.
   Not yet filed.
+- 2026-10-20 (later): callers recorded and re-read at head —
+  `vllm-torchtpu` `9725110`, `sglang-torchtpu` `9a6eef1` (§Callers). Result:
+  F8 reached by every post-arm sender failure in both engines; F9 reached
+  only by late pipeline-stage claims and then mistaken for the benign pre-arm
+  retry; F10's lease-aliasing half, R7a and R7b need a same-uuid
+  re-coordination or a rank fanning out to several stages, which neither
+  engine does. F10's summary-row reachability updated accordingly.
 - 2026-10-20 (later): **F2 + F3 filed upstream** as one report (write-up as
   bug 7 in `filed_bugs.md`, pinned to `449b591` — the commit the shape A/B
   tests ran against; `ReadRemote` unchanged since `0ac16d1`). Fix pending.
