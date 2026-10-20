@@ -58,8 +58,8 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 | # | Finding | Status | Reachable from production? |
 |---|---|---|---|
 | F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash ([filed](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1) 2026-10-19) | CONFIRMED (test); filed upstream, fix pending | only via the `ReadRemote` API (no in-tree caller) |
-| F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error | CONFIRMED (test) for shapes A and B (B added 2026-10-20, on upstream `449b591`); proved in Lean for both | same |
-| F3 | Data race on `RemoteReadState::lease_id` | CONFIRMED (read) | same |
+| F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error ([filed](filed_bugs.md#7-raidencontrollerreadremote-deadline-settles-the-read-while-the-acquire-callback-and-pull-continue-so-the-dma-writes-into-blocks-the-caller-has-already-recycled-f2--f3) 2026-10-20, together with F3) | CONFIRMED (test) for shapes A and B (B added 2026-10-20, on upstream `449b591`); proved in Lean for both; filed upstream, fix pending | same |
+| F3 | Data race on `RemoteReadState::lease_id` (filed as part of the F2 report) | CONFIRMED (read); filed upstream, fix pending | same |
 | F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `50b0774`; **FIXED upstream** by PR #1105 = `72255dd` (2026-10-07) | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
 | F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix designed and validated on `50b0774`, patch retired 2026-10-16) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
 | F6 | `PoolReshardRegisterRecv`: a rejected duplicate (or racing) registration for an active `uuid` destroys a session object whose destructor releases the **active** session's host-staging lease ([filed](filed_bugs.md#2-poolreshardregisterrecv-duplicate-registration-frees-the-active-sessions-staging-lease-f6)) | CONFIRMED (read) at `1fa06d1`; reproduced by the reporter; **FIXED upstream** in `8653373` (2026-10-13) | yes: any pool-reshard receiver with bounded host staging (`RegisterPools(..., staging_leases > 0)`), on a duplicate or concurrent register for the same `uuid` |
@@ -929,3 +929,7 @@ clone reset. Results, verbatim:
   libraries" used for the F2 run are from that same `1fa06d1` build, not
   `0ac16d1`; the controller sources were compiled from `449b591` as stated.
   Not yet filed.
+- 2026-10-20 (later): **F2 + F3 filed upstream** as one report (write-up as
+  bug 7 in `filed_bugs.md`, pinned to `449b591` — the commit the shape A/B
+  tests ran against; `ReadRemote` unchanged since `0ac16d1`). Fix pending.
+  Filed tally: F1, F2+F3, F4 (fixed), F6 (fixed), F7 (fixed), F8, F9.

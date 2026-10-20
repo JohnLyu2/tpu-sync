@@ -2,11 +2,12 @@
 
 Code references below are against [`google/tpu-sync` @ `50b0774`](https://github.com/google/tpu-sync/tree/50b0774a62dd96b9aab580546fbf70a9443ce16c)
 for bug 1, [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tree/1fa06d1f44345369f4327079828ec6c4989d6694) for bug 2,
-and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1) for bugs 3–6.
+and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1) for bugs 3–6,
+and [`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) for bug 7.
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
 the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2, `0ac16d1` for
-bugs 3–6) and are not re-pinned on upstream syncs; the only edits are the italic
+bugs 3–6, `449b591` for bug 7) and are not re-pinned on upstream syncs; the only edits are the italic
 *Update* sentences and one internal tooling word replaced by "with the fix".
 Status updates go in [README.md](README.md) (§Summary, §History).
 
@@ -170,3 +171,32 @@ Filed 2026-10-19. Found during Lean formalization and confirmed by a unit test.
 - In [`LookupAndClaim`](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/request_block_registry.cc#L462-L474), set `it->second.expires_at = now + ttl_s_` on each claimed `request_blocks_` entry alongside `claimed_[lifecycle_key] = now + ttl_s_` (alternatively, have `PurgeExpiredRequestBlocksLocked` skip rows whose `(req_id, uuid)` is present in `claimed_`).
 
 Reproducer: `ReshardBughuntTest.R8_SplitTtlEvictsRequestBlocksWhileClaimIsStillActive` in [`reshard_bughunt_test.cc`](reshard_bughunt_test.cc).
+
+
+---
+
+## 7. `RaidenController::ReadRemote`: deadline settles the read while the acquire callback and pull continue, so the DMA writes into blocks the caller has already recycled (F2 + F3)
+
+Filed 2026-10-20. Found during Lean formalization; both shapes confirmed by unit tests. Code references are against [`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) (upstream `main` on the day of filing; the `ReadRemote` region is unchanged since `0ac16d1`, shifted +6 lines by `9ac3d3e`).
+
+[`RaidenController::ReadRemote`](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L953-L1148) resolves the caller's future from a detached deadline thread, but neither the acquire callback nor the pull checks that the read has already settled, and nothing cancels an in-flight transfer. The caller is told the read failed and recycles its destination blocks while the DMA can still start or still be writing into them.
+
+**Cause**
+- The acquire callback ([raiden_controller.cc:1059-1118](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L1059-L1118)) stores `lease_id` and calls `PullAndRelease` ([L1117](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L1117)) without checking `state->settled`; `PullAndRelease` issues `TransferBuffers` ([L1202-1203](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L1202-L1203)) without checking it either.
+- The detached deadline thread ([L1125-1145](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L1125-L1145)) calls `state->Settle(DeadlineExceeded)` after `RemoteReadDeadline()` ([L111-130](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L111-L130), default lease TTL + 30 s). [`RemoteReadState::Settle`](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L942-L950) is first-wins; the losing path's work is not stopped.
+- Two shapes follow: (A) the acquire reply arrives after the deadline, so the pull **starts** after the caller saw the failure; (B) the deadline fires during the pull, so the caller sees the failure while the DMA **continues**.
+- Related data race in the same state: `RemoteReadState::lease_id` ([L938](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L938)) is a plain `uint64_t` (unlike `settled`, which is `ABSL_GUARDED_BY(mu)`), written on the gRPC callback thread ([L1075](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L1075)) and read on the deadline thread ([L1131-1142](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L1131-L1142)) with no synchronisation. If the deadline thread reads a stale 0 it skips the early `ReleaseReadLease`, and the source keeps its pins for the full TTL.
+
+**Impact**
+- `PullAndRelease`'s own contract ([L1175-1179](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/core/controller/raiden_controller.cc#L1175-L1179)) is that `KVCacheStore` returns the host staging blocks to the pool "once the read settles, success or failure", and the device blocks are the caller's to reuse. A late or continuing pull therefore writes into staging blocks that may already be reallocated and into device blocks the caller may already be refilling, with no error reported.
+- The sibling `WriteRemote` path already handles this correctly: [`KVCacheStoreServiceImpl::DeadlineLoop`](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/kv_cache/kv_cache_store_service.cc#L1053-L1066) marks the op failed at the deadline but keeps the landing blocks until the transfer future resolves ([`CompleteWriteRemote`](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/kv_cache/kv_cache_store_service.cc#L832-L872) → `ReleaseLandingBlocks`), and logs if the transfer never resolves ([L1067-1080](https://github.com/google/tpu-sync/blob/449b591/tpu_sync/kv_cache/kv_cache_store_service.cc#L1067-L1080)). `ReadRemote` has no equivalent.
+- Note: `RaidenController::ReadRemote` is only reached through `RaidenControllerServiceImpl` / tests today (`KVCacheStore::ReadRemote` routes peer loads through the `Fetch` path), so this is latent until the lease-based read is wired up.
+
+Both shapes are confirmed by unit tests (`RAIDEN_REMOTE_READ_DEADLINE_S=1`): shape A by delaying the source's `AcquireReadLease` 2.5 s — a pull into the destination block is issued ~3 s after the future settled with `DEADLINE_EXCEEDED`; shape B by making the worker's read take 3 s — at settle the pull has started and not finished, and it completes 2 s after the caller was told the read failed. An exhaustive state-space model also shows that checking `settled` before the pull closes shape A only.
+
+**Proposed fix**
+- Checking `state->settled` before `PullAndRelease` / `TransferBuffers` closes shape A only.
+- For shape B, mirror `WriteRemote`: let the deadline mark the read failed, but defer `Settle` (and therefore the caller's block reuse) until the in-flight transfer's `OnReady` fires — at the cost that a hung pull holds the caller — or add real cancellation of the in-flight transfer.
+- Make `lease_id` `std::atomic<uint64_t>` (or guard it with `mu`).
+
+Reproducers: `BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` (A) and `BugHuntTest.ReadRemoteSettlesDeadlineWhilePullStillInFlight` (B) in [`raiden_controller_bughunt_test.cc`](raiden_controller_bughunt_test.cc); model `TpuSyncVerify/Controller/ReadRemote.lean`; naive fix in [`candidate_fixes.patch`](candidate_fixes.patch).

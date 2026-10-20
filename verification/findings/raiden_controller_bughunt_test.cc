@@ -1,13 +1,21 @@
 // Bug-hunt repros for RaidenController (scratch clone only; not upstream).
 //
-// F2: ReadRemote issues its pull AFTER it has already settled with
-//     DeadlineExceeded. Neither the acquire callback nor PullAndRelease checks
-//     RemoteReadState::settled before TransferBuffers (raiden_controller.cc
-//     1034-1076, 1109-1162).
+// F2: ReadRemote's detached deadline thread settles the read while the
+//     acquire callback and the pull continue. Neither the acquire callback nor
+//     PullAndRelease checks RemoteReadState::settled before TransferBuffers,
+//     and nothing cancels an in-flight transfer (raiden_controller.cc at
+//     0ac16d1: callback 1053-1112, deadline thread 1119-1139, pull 1197).
+//       shape A: the acquire reply lands after the deadline -> the pull STARTS
+//                after the caller was told the read failed.
+//       shape B: the deadline fires during the pull -> the caller is told the
+//                read failed while the DMA is still running.
 // F4: TransferBuffers auto-allocates local host staging blocks
 //     (raiden_controller.cc:644) and then has early error returns
 //     (:673, :722, :737, :768, :776) that never deallocate them.
+//     (Fixed upstream in 72255dd; the test is kept for the record.)
 
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -111,6 +119,93 @@ TEST_F(BugHuntTest, ReadRemoteDoesNotStartPullAfterDeadlineSettled) {
   EXPECT_EQ(pulls_after, 0)
       << "A pull into dst host block 20 was issued AFTER ReadRemote settled "
          "with DeadlineExceeded.";
+}
+
+// F2, shape B ----------------------------------------------------------------
+// The worker's read into the destination block takes longer than the deadline.
+// Records when the "DMA" started and finished so the test can place the
+// caller's settle time between them.
+struct SlowReadMock : ShardAwareMockTransferManager {
+  using ShardAwareMockTransferManager::H2dRead;
+  using ShardAwareMockTransferManager::H2hRead;
+  using ShardAwareMockTransferManager::H2hWrite;
+
+  absl::Duration read_duration = absl::Seconds(3);
+  std::atomic<int64_t> read_started_ns{0};
+  std::atomic<int64_t> read_finished_ns{0};
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
+      const std::vector<::tpu_raiden::RaidenTransferEndpoint>& remote_descriptors,
+      const std::vector<int>& src_block_ids,
+      const std::vector<int>& dst_block_ids) {
+    read_started_ns = absl::ToUnixNanos(absl::Now());
+    absl::SleepFor(read_duration);  // the transfer is in flight for this long
+    auto result = ShardAwareMockTransferManager::H2hReadExplicit(
+        remote_descriptors, src_block_ids, dst_block_ids);
+    read_finished_ns = absl::ToUnixNanos(absl::Now());
+    return result;
+  }
+};
+
+TEST_F(BugHuntTest, ReadRemoteSettlesDeadlineWhilePullStillInFlight) {
+  SlowReadMock mock;
+  worker_->service->SetTransferManager(KVManagerHolder(&mock));
+
+  // The source answers AcquireReadLease immediately: the acquire is fast, the
+  // pull is slow (3 s read vs. the 1 s deadline).
+  auto src = core::controller::CreateTestControllerServer();
+  src->service->SetReadRemoteHooks(
+      [](absl::Span<const std::string> h)
+          -> absl::StatusOr<std::vector<int32_t>> {
+        return std::vector<int32_t>(h.size(), 42);
+      },
+      [](absl::Span<const std::string>) {});
+  ASSERT_TRUE(src->client
+                  ->RegisterWorker(
+                      "src_worker_0", "src_worker_0_addr",
+                      {::tpu_raiden::RaidenTransferEndpoint{"src_ep:1", {0, 1}}},
+                      /*node_id=*/0)
+                  .ok());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto dest, RaidenController::Create(unit_, /*num_blocks=*/5,
+                                          /*num_shards=*/2,
+                                          /*shard_size_bytes=*/512, ""));
+  Register(*dest);
+
+  const absl::Time start = absl::Now();
+  absl::Status st =
+      dest->ReadRemote(src->server_address, {10}, /*dst_host_block_ids=*/{20},
+                       {"h0"})
+          .Await();
+  const absl::Time settled_at = absl::Now();
+  ASSERT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded) << st;
+
+  // At settle time the pull has started and has not finished: the caller is
+  // told the read failed (and may reuse block 20) while the DMA into block 20
+  // is still running.
+  const int64_t started_at_settle = mock.read_started_ns.load();
+  const int64_t finished_at_settle = mock.read_finished_ns.load();
+
+  // Let the read drain so the process exits cleanly, and record when it ended.
+  absl::SleepFor(mock.read_duration + absl::Seconds(1));
+  const int64_t finished_after = mock.read_finished_ns.load();
+
+  std::cerr << "[F2-B] settled after " << (settled_at - start)
+            << " with: " << st.message() << "\n"
+            << "[F2-B] at settle: pull started=" << (started_at_settle != 0)
+            << ", pull finished=" << (finished_at_settle != 0) << "\n"
+            << "[F2-B] pull finished "
+            << absl::Nanoseconds(finished_after -
+                                 absl::ToUnixNanos(settled_at))
+            << " AFTER the caller was told the read failed\n";
+
+  EXPECT_NE(started_at_settle, 0) << "pull never started (acquire failed?)";
+  EXPECT_EQ(finished_at_settle, 0)
+      << "pull already finished at settle; shape B needs it still in flight";
+  EXPECT_LE(finished_after, absl::ToUnixNanos(settled_at))
+      << "The DMA into dst host block 20 was still running when ReadRemote "
+         "settled with DeadlineExceeded, and finished afterwards.";
 }
 
 // F4 --------------------------------------------------------------------------
