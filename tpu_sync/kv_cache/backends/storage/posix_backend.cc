@@ -905,70 +905,56 @@ std::vector<bool> PosixKVCacheStoreBackend::ProbeExists(
   return exists;
 }
 
-// Returns the longest prefix of `block_hashes` that is available on storage.
-//
-// Block hash -> shard keys.
-//   A KV block is written by every pipeline-parallel (PP) x
-//   prefill-context-parallel (PCP) x tensor-parallel (TP) worker, each storing
-//   its own shard as a separate file. MapKey(hash, {pp_rank = s, pcp_rank = p,
-//   tp_rank = t}) resolves the file for shard (s, p, t), e.g.
-//     <root>/<model>/pp<S>_r<s>_pcp<P>_r<p>_tp<T>_r<t>/<l1>/<l2>/<hex>.bin
-//   where an undeclared axis is omitted from the topology directory. One block
-//   hash maps to N = max(1, S) * max(1, P) * max(1, T) storage keys ("shard
-//   keys"). MapShardKeys(hash) returns the shard keys that must ALL exist for
-//   the block to count as available, pp_rank-major, then pcp_rank.
-//
-// Metadata cache contents.
-//   When enabled (metadata_cache_max_entries != 0), the cache maps one shard
-//   key (its resolved file path) to the last time it was used: a cache hit or
-//   a storage probe that found the file. It holds only positive answers: a
-//   shard key is either cached as "exists" or not cached at all. An entry is
-//   fresh while now - last_used < ttl (a sliding, idle TTL), so a hot entry
-//   is not re-checked on storage. A stale entry for a deleted file is dropped
-//   when a recall from this tier fails (Delete()), when it goes unused for
-//   ttl, or when it is evicted least-recently-used past max_entries.
-//   A block is answered from the cache only if every one of its shard keys is
-//   fresh.
-//
-// Algorithm. i = block index (block_hashes[i], request order); j = shard
-// index within MapShardKeys(block_hashes[i]) (j enumerates (pp_rank,
-// pcp_rank, tp_rank), pp_rank-major, then pcp_rank).
-//   Phase 0 (map):   shard_keys[i] = MapShardKeys(block_hashes[i]), in order.
-//                    The first hash that cannot be mapped ends the prefix.
-//   Phase 1 (cache): mark each shard key present if it has a fresh cache
-//                    entry; each fresh hit refreshes its last_used. Expired
-//                    entries are erased and treated as misses.
-//   Phase 2 (storage): gather the cache-missed shard keys of ALL blocks into
-//                    one list, in block order, and check it with
-//                    BatchExistsAsync in chunks of lookup_batch_size. Misses
-//                    from different blocks therefore share a storage call.
-//                    Early exit: if a chunk reports shard key k absent, the
-//                    block owning k is unavailable, so the result can only
-//                    contain blocks before it. Because keys are probed in
-//                    block order, every key of those earlier blocks was in
-//                    this chunk or an earlier one and is already resolved.
-//                    Remaining chunks hold keys of the unavailable block or
-//                    later blocks only, which cannot change the result, so
-//                    they are not probed.
-//   Phase 3 (merge): block i is available iff all of shard_keys[i] are present
-//                    (fresh in cache or found on storage). Return blocks up to
-//                    the first unavailable one, and cache every shard key that
-//                    storage confirmed (insert only if absent).
-//
-// With the cache disabled every shard key is a miss, so Lookup reduces to the
-// chunked storage probe with early exit.
+// Queries `block_hashes` on storage according to `options`:
+// - Returns empty immediately when `options.host_resident_only` is set (POSIX
+//   is not host-DRAM-resident) or when `block_hashes` is empty.
+// - Each block hash maps via MapShardKeys(hash) to N = max(1, S) * max(1, P) *
+//   max(1, T) shard file keys across the (PP, PCP, TP) topology; all shard keys
+//   must exist for a block to be available. When the positive-only TTL metadata
+//   cache is enabled, fresh shard hits avoid storage probes.
+// - Phase 0 (map): maps each block hash to its shard keys (`kPrefix` stops at
+//   the first unmappable hash; `kSubset` records an empty key list and
+//   continues to preserve index alignment).
+// - Phase 1 (cache): marks shard keys with a fresh metadata cache entry as
+//   present and refreshes their `last_used` timestamp.
+// - Phase 2 (storage): probes cache-missed shard keys via BatchExistsAsync in
+//   chunks of `lookup_batch_size_` (`kPrefix` exits early after the first chunk
+//   with an absent key; `kSubset` probes all chunks) and caches confirmed keys.
+// - Phase 3 (merge): emits SHARED_STORAGE entries (`kPrefix` up to the first
+//   unavailable block; `kSubset` for all available blocks).
 absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
     absl::Span<const std::string> block_hashes, const LookupOptions& options) {
+  if (options.match_mode == LookupMatchMode::kSubset && options.enable_global) {
+    return absl::InvalidArgumentError(
+        "LookupMatchMode::kSubset is not supported with enable_global=true");
+  }
+  if (options.host_resident_only && options.enable_global) {
+    return absl::InvalidArgumentError(
+        "host_resident_only is not supported with enable_global=true");
+  }
+  if (options.include_eviction_candidates && options.pin_found) {
+    return absl::InvalidArgumentError(
+        "include_eviction_candidates is not supported with pin_found=true");
+  }
+
   BlockSliceList results;
-  if (!storage_backend_ || !storage_backend_->mapper() || block_hashes.empty())
+  if (options.host_resident_only || !storage_backend_ ||
+      !storage_backend_->mapper() || block_hashes.empty()) {
     return results;
+  }
 
   // Phase 0 (map).
   std::vector<std::vector<BlockKey>> shard_keys;
   shard_keys.reserve(block_hashes.size());
   for (const std::string& hash : block_hashes) {
     absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
-    if (!keys.ok()) break;
+    if (!keys.ok()) {
+      if (options.match_mode == LookupMatchMode::kSubset) {
+        shard_keys.emplace_back();
+        continue;
+      }
+      break;
+    }
     shard_keys.push_back(*std::move(keys));
   }
   if (shard_keys.empty()) return results;
@@ -976,17 +962,12 @@ absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
   // Phase 1 (cache).
   std::vector<std::vector<bool>> present = CachedFresh(shard_keys);
 
-  // Phase 2 (storage).
+  // Phase 2 (storage): flat list of cache-missed shard keys across all blocks,
+  // probed in chunks of lookup_batch_size_.
   struct ShardRef {
     size_t block;
     size_t shard;
   };
-  // One entry per cache-missed shard key: shard_keys[block][shard]. This is a
-  // single flat list across ALL blocks, ordered by block i, then shard j
-  // within the block. Chunks below cut this list every lookup_batch_size
-  // entries without regard to block boundaries, so one BatchExistsAsync call
-  // can carry shards of several blocks, and one block's shards can be split
-  // across two consecutive calls.
   std::vector<ShardRef> misses;
   for (size_t i = 0; i < shard_keys.size(); ++i) {
     for (size_t j = 0; j < shard_keys[i].size(); ++j) {
@@ -1015,19 +996,30 @@ absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
         chunk_has_absent = true;
       }
     }
-    if (chunk_has_absent) break;  // Early exit; see Phase 2 above.
+    if (options.match_mode == LookupMatchMode::kPrefix && chunk_has_absent) {
+      break;  // Early exit; see Phase 2 above.
+    }
   }
   CacheInsert(confirmed);
 
   // Phase 3 (merge).
   auto all_present = [](const std::vector<bool>& shards) {
-    return absl::c_all_of(shards, [](bool shard_present) {
+    return !shards.empty() && absl::c_all_of(shards, [](bool shard_present) {
       return shard_present;
     });
   };
-  for (size_t i = 0; i < shard_keys.size() && all_present(present[i]); ++i) {
-    results.push_back(
-        std::make_pair(block_hashes[i], MakeSharedStorageBlock()));
+  if (options.match_mode == LookupMatchMode::kSubset) {
+    for (size_t i = 0; i < shard_keys.size(); ++i) {
+      if (all_present(present[i])) {
+        results.push_back(
+            std::make_pair(block_hashes[i], MakeSharedStorageBlock()));
+      }
+    }
+  } else {
+    for (size_t i = 0; i < shard_keys.size() && all_present(present[i]); ++i) {
+      results.push_back(
+          std::make_pair(block_hashes[i], MakeSharedStorageBlock()));
+    }
   }
   return results;
 }

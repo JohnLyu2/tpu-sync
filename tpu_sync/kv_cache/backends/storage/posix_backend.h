@@ -285,8 +285,9 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   // Number of entries currently held by the metadata cache (0 if disabled).
   size_t metadata_cache_size() const;
 
-  // Returns the longest prefix of `block_hashes` available on storage. See the
-  // definition for the algorithm and the metadata cache contents.
+  // Queries `block_hashes` on storage (longest prefix in kPrefix mode, or all
+  // available blocks in kSubset mode; returns empty when host_resident_only is
+  // set).
   absl::StatusOr<BlockSliceList> Lookup(
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override;

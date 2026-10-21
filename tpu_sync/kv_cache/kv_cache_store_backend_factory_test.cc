@@ -54,10 +54,31 @@ class CustomTestBackend : public KVCacheStoreBackend {
   std::string name() const override { return "CustomTestBackend"; }
   absl::StatusOr<BlockSliceList> Lookup(absl::Span<const std::string> hashes,
                                         const LookupOptions& options) override {
+    auto is_host_resident = [](BlockStatus s) {
+      return s == BlockStatus::HOST || s == BlockStatus::HOST_AND_HBM;
+    };
     BlockSliceList result;
+    if (options.match_mode == LookupMatchMode::kSubset && hashes.empty()) {
+      for (const auto& [h, id] : entries_) {
+        if (options.host_resident_only && !is_host_resident(id.status)) {
+          continue;
+        }
+        if (options.pin_found) {
+          ++pin_counts_[h];
+        }
+        result.push_back({h, id});
+      }
+      return result;
+    }
     for (const auto& h : hashes) {
       auto it = entries_.find(h);
-      if (it == entries_.end()) break;
+      if (it == entries_.end() || (options.host_resident_only &&
+                                   !is_host_resident(it->second.status))) {
+        if (options.match_mode == LookupMatchMode::kSubset) {
+          continue;
+        }
+        break;
+      }
       if (options.pin_found) {
         ++pin_counts_[h];
       }

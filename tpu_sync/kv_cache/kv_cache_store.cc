@@ -943,32 +943,27 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
                                             .pin_found = pin_found});
 }
 
-// ---------------------------------------------------------------------------
-// Hierarchical Multi-Tier Lookup Fallback Mechanism:
-//
-// In P/D disaggregated and hybrid serving modes, KVCacheStore enforces a
-// strict recall priority across memory and persistent storage tiers:
-//
-//   Tier 0A (Local Host DRAM) -> Tier 0B (Peer RAM) -> Tier 1 (Storage)
-//
-// 1. Tier 0 (`backends_[0]` - HostOffloadBackend):
-//    - Manages both Local Host DRAM (`BlockStatus::LOCAL`) and Peer RAM
-//      (`BlockStatus::REMOTE` discovered via GlobalRegistryClient).
-//    - Local DRAM has highest priority (PCIe / host memory latency).
-//    - Peer RAM has second priority.
-//    - Both are queried in tier 0. If a contiguous prefix matches in Local
-//      or Peer RAM, `accumulated_results` is populated and `start_idx`
-//      advances.
-//
-// 2. Tier 1 (`backends_[1]` - Secondary Storage Backend):
-//    - Generic secondary backend (e.g. file storage, block storage).
-//    - Only queried for remaining block hashes (`subspan(start_idx)`) that
-//      missed BOTH Local DRAM and Peer RAM.
-//    - Matched blocks are returned with `BlockStatus::SHARED_STORAGE`.
-// ---------------------------------------------------------------------------
+// Lookup routing across tiers:
+// - `kSubset` and `host_resident_only` queries delegate directly to tier 0
+//   (`backends_[0]`).
+// - `kPrefix` queries cascade across tiers in recall-priority order:
+//   1. Tier 0 (`backends_[0]` - HostOffloadBackend): resolves local host DRAM
+//      (`BlockStatus::HOST` / `BlockStatus::HOST_AND_HBM`) and, when
+//      `enable_global` is set, peer RAM (`BlockStatus::REMOTE`).
+//   2. Tier 1+ (`backends_[1..]` - secondary storage, e.g., POSIX): queried
+//      for the remaining suffix (`subspan(start_idx)`) that missed tier 0,
+//      returning `BlockStatus::SHARED_STORAGE`.
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes,
     const LookupOptions& options) {
+  if (options.host_resident_only ||
+      options.match_mode == LookupMatchMode::kSubset) {
+    if (backends_.empty() || backends_[0] == nullptr) {
+      return BlockSliceList{};
+    }
+    return backends_[0]->Lookup(block_hashes, options);
+  }
+
   BlockSliceList accumulated_results;
   accumulated_results.reserve(block_hashes.size());
 

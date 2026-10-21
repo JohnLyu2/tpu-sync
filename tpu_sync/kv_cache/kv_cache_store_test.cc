@@ -6440,6 +6440,39 @@ TEST(KVCacheStoreTest, LookupInterleavedTruncatesToCapacityAndUnwindsPins) {
   EXPECT_EQ(f->store->GetPinCount("r2"), 0);
 }
 
+TEST(KVCacheStoreTest,
+     LookupHostResidentSubsetAndSnapshotDelegateDirectlyToTier0) {
+  RaidenId rid{"store_subset_job", "0", "kv", 0};
+  KVCacheStore store(/*capacity=*/4, /*global_registry_address=*/"", rid,
+                     /*num_shards=*/1, /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+  KVCacheStoreTest::PlantIndexEntry(
+      store, {"h1", "hbm_only", "h2"},
+      {RaidenBlockId(rid, 10, BlockStatus::HOST),
+       RaidenBlockId(rid, -1, 3, BlockStatus::HBM),
+       RaidenBlockId(rid, 11, 4, BlockStatus::HOST_AND_HBM)},
+      /*on_host=*/true);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto subset_res,
+      store.Lookup({"missing_0", "h1", "hbm_only", "missing_1", "h2"},
+                   LookupOptions::HostResidentSubset()));
+  std::vector<std::string> subset_hashes;
+  for (const auto& [hash, _] : subset_res) {
+    subset_hashes.push_back(hash);
+  }
+  EXPECT_THAT(subset_hashes, ::testing::UnorderedElementsAre("h1", "h2"));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot_res,
+      store.Lookup(/*block_hashes=*/{}, LookupOptions::SnapshotHostResident()));
+  std::vector<std::string> snapshot_hashes;
+  for (const auto& [hash, _] : snapshot_res) {
+    snapshot_hashes.push_back(hash);
+  }
+  EXPECT_THAT(snapshot_hashes, ::testing::UnorderedElementsAre("h1", "h2"));
+}
+
 // ===========================================================================
 // Secondary Storage Backend Tiering & Coordination
 // ===========================================================================

@@ -270,11 +270,10 @@ class KVCacheStore {
       const std::vector<std::string>& block_hashes, bool enable_global = false,
       bool pin_found = true);
 
-  // Overload accepting LookupOptions for granular control. Unlike the overload
-  // above, pin_found defaults to false here, so this is what internal callers
-  // and pure observers use. The struct's enable_global default is also the
-  // opposite (true, not false), so a bare LookupOptions{} does query the
-  // registry when one is configured.
+  // Queries cached block hashes using `options`. `kSubset` and
+  // `host_resident_only` queries target tier 0 directly; `kPrefix` cascades
+  // across tiers. Note that `LookupOptions` defaults `pin_found` to false and
+  // `enable_global` to true.
   absl::StatusOr<BlockSliceList> Lookup(
       const std::vector<std::string>& block_hashes,
       const LookupOptions& options);
