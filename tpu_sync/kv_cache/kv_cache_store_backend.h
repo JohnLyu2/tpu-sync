@@ -80,28 +80,65 @@ struct RaidenBlockId {
 
 using BlockSliceList = std::vector<std::pair<std::string, RaidenBlockId>>;
 
+// Controls how Lookup matches `block_hashes`.
+enum class LookupMatchMode {
+  // Longest contiguous prefix from index 0; stops at the first miss.
+  kPrefix,
+  // All matching blocks in `block_hashes`, skipping misses. When
+  // `block_hashes` is empty, snapshots all matching blocks in the backend.
+  kSubset,
+};
+
 // Options controlling lookup behavior across storage backends.
+//
+// Invalid option combinations (return `absl::InvalidArgumentError`):
+// - `match_mode == LookupMatchMode::kSubset && enable_global`
+// - `host_resident_only && enable_global`
+// - `include_eviction_candidates && pin_found`
 struct LookupOptions {
-  // Controls whether the lookup is allowed to query the global registry.
-  // Default is true HERE, serving the internal backend call sites; the
-  // application-level KVCacheStore::Lookup(hashes, enable_global, pin_found)
-  // defaults it to false instead, because the registry query is a blocking
-  // RPC a caller should opt into.
+  // Whether Lookup may query the global registry on local misses.
+  // Defaults to true here; KVCacheStore::Lookup(hashes, enable_global,
+  // pin_found) defaults enable_global to false to avoid a blocking RPC unless
+  // requested.
   bool enable_global = true;
 
-  // Controls whether a block cached remotely may sit between two blocks cached
-  // locally in the answer. When true, the local index and the global registry
-  // are consulted for every hash and the answer runs to the first hash neither
-  // can resolve. When false, the answer stops at the first LOCAL miss and only
-  // the hashes after it are looked for remotely, so a locally cached block can
-  // never follow a remote one.
-  // Default is true.
+  // When true, prefix lookup (kPrefix) may interleave local and remote hits up
+  // to the first hash missing in both. When false, local lookup stops at the
+  // first local miss and queries the registry for the remaining suffix.
+  // Ignored in kSubset mode.
   bool enable_interleaved_lookup = true;
 
-  // Controls whether matched local blocks in store/backends are automatically
-  // pinned in memory to protect against LRU eviction.
-  // Default is false.
+  // When true, atomically pins matched active local blocks under the same lock
+  // acquisition (without resurrecting eviction candidates). When false, uses
+  // Peek() without promoting LRU order.
   bool pin_found = false;
+
+  // Prefix matching (kPrefix) vs. scattered subset / full snapshot (kSubset).
+  LookupMatchMode match_mode = LookupMatchMode::kPrefix;
+
+  // When true, matches only blocks physically resident in local host DRAM
+  // (BlockStatus::HOST or BlockStatus::HOST_AND_HBM), excluding HBM-only
+  // entries and non-DRAM tiers (unlike `enable_global = false`, which only
+  // skips the remote global registry RPC).
+  // TODO(jcgu): Review whether BlockStatus::HBM is still needed or filter out
+  // BlockStatus::HBM entries when `enable_global = false`, so
+  // `host_resident_only` and `enable_global` can be merged.
+  bool host_resident_only = false;
+
+  // When true (requires `!pin_found`), includes unpinned eviction candidates in
+  // addition to active blocks.
+  bool include_eviction_candidates = false;
+
+  // Non-contiguous subset of local host-resident blocks (including eviction
+  // candidates).
+  static LookupOptions HostResidentSubset();
+
+  // Snapshot of active local host-resident blocks (pass empty `block_hashes`).
+  static LookupOptions SnapshotHostResident();
+
+  // Non-contiguous subset of active local host-resident blocks, atomically
+  // pinned under the same lock acquisition.
+  static LookupOptions PinPresentHostResident();
 };
 
 // Abstract interface for KV cache index storage backends.
@@ -110,18 +147,19 @@ class KVCacheStoreBackend {
  public:
   virtual ~KVCacheStoreBackend() = default;
 
-  // Invalidates the backend's lifetime fence and stops any backend-owned
-  // background servers before the owning KVCacheStore destroys its
+  // Invalidates the backend's lifetime fence before KVCacheStore destroys its
   // controller and block trackers.
   virtual void Shutdown() {}
 
-  // Name identifying the backend type (e.g., "LruCacheBackend",
-  // "GlobalMemoryPoolingBackend").
+  // Human-readable backend name for logging and diagnostics (e.g.,
+  // "HostOffloadBackend", "posix").
   virtual std::string name() const = 0;
 
-  // Resolves cached block hashes in sequence.
-  // Returns a list of matched (block_hash, RaidenBlockId) pairs up to the first
-  // miss.
+  // Queries cached block hashes according to `options` (see LookupOptions for
+  // prefix vs. subset/snapshot matching, host-residency filtering, and
+  // pinning). Custom implementations must honor `options.match_mode`,
+  // `options.host_resident_only`, and `options.include_eviction_candidates` or
+  // return `absl::UnimplementedError`.
   virtual absl::StatusOr<BlockSliceList> Lookup(
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) = 0;
@@ -258,11 +296,10 @@ class KVCacheStoreBackend {
 
   // Which of `block_hashes` this backend already holds in host DRAM.
   //
-  // Not Lookup(): Lookup stops at the first miss (it answers a prefix
-  // question) so it cannot report a scattered subset, and it promotes LRU
-  // order as a side effect. This has to see eviction CANDIDATES too -- a
-  // candidate still has its host block, so treating it as absent would let a
-  // duplicate through.
+  // Equivalent to Lookup(block_hashes, LookupOptions::HostResidentSubset()):
+  // queries a non-contiguous subset without pinning or promoting LRU order
+  // (using PeekIncludingCandidates), and sees eviction candidates because a
+  // candidate still holds its host block.
   virtual std::vector<std::string> AlreadyPresentHostResident(
       absl::Span<const std::string> block_hashes) const {
     return {};

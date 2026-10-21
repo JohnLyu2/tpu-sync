@@ -158,6 +158,157 @@ TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
       backend.PinPresentHostResident(std::vector<std::string>{"h1"}).empty());
 }
 
+TEST(HostOffloadBackendTest, LookupRejectsInvalidOptionCombinations) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)},
+                 /*on_host=*/true);
+
+  EXPECT_THAT(
+      backend.Lookup({"h1"},
+                     LookupOptions{.enable_global = true,
+                                   .match_mode = LookupMatchMode::kSubset}),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(backend.Lookup({"h1"}, LookupOptions{.enable_global = true,
+                                                   .host_resident_only = true}),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(backend.Lookup(
+                  {"h1"}, LookupOptions{.enable_global = false,
+                                        .pin_found = true,
+                                        .include_eviction_candidates = true}),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+
+  // Positive control: valid local subset lookup succeeds on the same backend.
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto valid_res,
+      backend.Lookup({"h1"}, LookupOptions::HostResidentSubset()));
+  ASSERT_EQ(valid_res.size(), 1);
+  EXPECT_EQ(valid_res[0].first, "h1");
+}
+
+TEST(HostOffloadBackendTest,
+     LookupHostResidentSubsetMatchesNonContiguousAndCandidatesWithoutPinning) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/2);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1", "hbm_only"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)},
+                 /*on_host=*/true);
+  // Overflow capacity 2 to demote "h1" to an eviction candidate.
+  backend.Insert({"h2"}, {RaidenBlockId(id, 11, 6, BlockStatus::HOST_AND_HBM)},
+                 /*on_host=*/true);
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h1"));
+
+  std::vector<std::string> query = {"missing1", "h1", "hbm_only", "missing2",
+                                    "h2"};
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto subset_res,
+      backend.Lookup(query, LookupOptions::HostResidentSubset()));
+  std::vector<std::string> subset_hashes;
+  for (const auto& [hash, _] : subset_res) {
+    subset_hashes.push_back(hash);
+  }
+  EXPECT_THAT(subset_hashes, UnorderedElementsAre("h1", "h2"));
+  EXPECT_EQ(subset_hashes, backend.AlreadyPresentHostResident(query));
+  EXPECT_EQ(backend.GetPinCount("h1"), 0);
+  EXPECT_EQ(backend.GetPinCount("h2"), 0);
+  EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h1"));
+}
+
+TEST(HostOffloadBackendTest,
+     LookupSnapshotHostResidentReturnsActiveHostBlocksExcludingCandidates) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/3);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1", "h2", "hbm_only"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, 4, BlockStatus::HOST_AND_HBM),
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)},
+                 /*on_host=*/true);
+  // Overflow capacity 3 to demote "h1" to an eviction candidate.
+  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
+                 /*on_host=*/true);
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h1"));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot_res, backend.Lookup(/*block_hashes=*/{},
+                                        LookupOptions::SnapshotHostResident()));
+  std::vector<std::string> snapshot_hashes;
+  for (const auto& [hash, _] : snapshot_res) {
+    snapshot_hashes.push_back(hash);
+  }
+  EXPECT_THAT(snapshot_hashes, UnorderedElementsAre("h2", "h3"));
+  EXPECT_THAT(snapshot_hashes, ::testing::UnorderedElementsAreArray(
+                                   backend.SnapshotHostResidentHashes()));
+  EXPECT_EQ(backend.GetPinCount("h2"), 0);
+  EXPECT_EQ(backend.GetPinCount("h3"), 0);
+}
+
+TEST(HostOffloadBackendTest,
+     LookupPinPresentHostResidentPinsActiveHostSubsetAndSkipsCandidates) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/3);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"cand", "h1", "hbm_only"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, BlockStatus::HOST),
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)},
+                 /*on_host=*/true);
+  // Overflow capacity 3 to demote "cand" to an eviction candidate.
+  backend.Insert({"h2"}, {RaidenBlockId(id, 12, 6, BlockStatus::HOST_AND_HBM)},
+                 /*on_host=*/true);
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("cand"));
+
+  std::vector<std::string> query = {"missing", "cand", "h1", "hbm_only", "h2"};
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pinned_res,
+      backend.Lookup(query, LookupOptions::PinPresentHostResident()));
+  ASSERT_EQ(pinned_res.size(), 2);
+  EXPECT_EQ(pinned_res[0].first, "h1");
+  EXPECT_EQ(pinned_res[0].second.host_block_id, 11);
+  EXPECT_EQ(pinned_res[1].first, "h2");
+  EXPECT_EQ(pinned_res[1].second.host_block_id, 12);
+  EXPECT_EQ(backend.GetPinCount("h1"), 1);
+  EXPECT_EQ(backend.GetPinCount("h2"), 1);
+  EXPECT_EQ(backend.GetPinCount("cand"), 0);
+  EXPECT_EQ(backend.GetPinCount("hbm_only"), 0);
+  // Candidate must remain in evict_candidate_list_, not resurrected into
+  // pinned.
+  EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("cand"));
+
+  backend.Release({"h1", "h2"});
+  auto legacy_pinned = backend.PinPresentHostResident(query);
+  ASSERT_EQ(legacy_pinned.size(), 2);
+  EXPECT_EQ(legacy_pinned[0], std::make_pair(std::string("h1"), 11));
+  EXPECT_EQ(legacy_pinned[1], std::make_pair(std::string("h2"), 12));
+  backend.Release({"h1", "h2"});
+}
+
+TEST(HostOffloadBackendTest,
+     LookupLocalOnlyPrefixStopsAtFirstMissAndPinsMatchedPrefix) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1", "h2", "h3"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, BlockStatus::HOST),
+                  RaidenBlockId(id, 12, BlockStatus::HOST)},
+                 /*on_host=*/true);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res,
+      backend.Lookup({"h1", "h2", "missing", "h3"},
+                     LookupOptions{.enable_global = false, .pin_found = true}));
+  ASSERT_EQ(res.size(), 2);
+  EXPECT_EQ(res[0].first, "h1");
+  EXPECT_EQ(res[1].first, "h2");
+  EXPECT_EQ(backend.GetPinCount("h1"), 1);
+  EXPECT_EQ(backend.GetPinCount("h2"), 1);
+  EXPECT_EQ(backend.GetPinCount("h3"), 0);
+}
+
 TEST(HostOffloadBackendTest, LookupUnboundedByAvailableSpace) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   std::vector<std::string> hashes = {"h1", "h2"};
