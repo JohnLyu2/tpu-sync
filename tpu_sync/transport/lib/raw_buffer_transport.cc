@@ -83,7 +83,6 @@
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -91,6 +90,8 @@ using ::peregrine::v1::GetAddrPortPair;
 using ::peregrine::v1::Histogram;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
+using ::peregrine::v1::SourceBindEnabled;
+using ::peregrine::v1::SourceIpRoutesToPeer;
 using ::peregrine::v1::TestOnlyRateLimiter;
 using ::peregrine::v1::WriteExact;
 using ::peregrine::v1::WriteVExact;

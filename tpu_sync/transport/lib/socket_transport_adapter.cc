@@ -46,6 +46,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -55,7 +56,6 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden {
@@ -66,6 +66,8 @@ namespace {
 
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
+using ::peregrine::v1::SourceBindEnabled;
+using ::peregrine::v1::SourceIpRoutesToPeer;
 using ::peregrine::v1::WriteExact;
 using ::peregrine::v1::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
