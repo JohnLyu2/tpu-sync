@@ -1993,22 +1993,22 @@ bool KVCacheStore::RepublishOnce() {
   // are skipped here, and the pins keep the rest resident until the registry
   // has acknowledged them -- an eviction's Unregister can then only run
   // after this batch's Register, never be overwritten by it.
-  const std::vector<std::pair<std::string, int32_t>> pinned =
-      host_backend->PinPresentHostResident(batch);
-  if (pinned.empty()) {
+  absl::StatusOr<BlockSliceList> pinned =
+      host_backend->Lookup(batch, LookupOptions::PinPresentHostResident());
+  if (!pinned.ok() || pinned->empty()) {
     return !republish_queue_.empty();
   }
   std::vector<global_registry::Registration> registrations;
   std::vector<std::string> pinned_hashes;
-  registrations.reserve(pinned.size());
-  pinned_hashes.reserve(pinned.size());
-  for (const auto& [hash, host_block_id] : pinned) {
+  registrations.reserve(pinned->size());
+  pinned_hashes.reserve(pinned->size());
+  for (auto& [hash, block_id] : *pinned) {
     registrations.push_back({
         .prefix_hash = hash,
         .raiden_id = raiden_id_,
-        .block_id = host_block_id,
+        .block_id = block_id.host_block_id,
     });
-    pinned_hashes.push_back(hash);
+    pinned_hashes.push_back(std::move(hash));
   }
 
   // The deadline must stay under the heartbeat period: this blocks the

@@ -130,11 +130,14 @@ TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
   // republishing it would advertise a block that is gone.
   backend.Evict({"h2"});
   const int base_pins = backend.GetPinCount("h1");
-  auto pinned = backend.PinPresentHostResident(
-      std::vector<std::string>{"h1", "h2", "never_inserted"});
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pinned,
+      backend.Lookup(std::vector<std::string>{"h1", "h2", "never_inserted"},
+                     LookupOptions::PinPresentHostResident()));
   ASSERT_EQ(pinned.size(), 1);
   EXPECT_EQ(pinned[0].first, "h1");
-  EXPECT_EQ(pinned[0].second, 10);
+  EXPECT_EQ(pinned[0].second.host_block_id, 10);
+  EXPECT_EQ(pinned[0].second.status, BlockStatus::HOST);
   EXPECT_EQ(backend.GetPinCount("h1"), base_pins + 1);
   backend.Release({"h1"});
   EXPECT_EQ(backend.GetPinCount("h1"), base_pins);
@@ -158,8 +161,10 @@ TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
       auto snapshot, backend.Lookup({}, LookupOptions::SnapshotHostResident()));
   EXPECT_THAT(snapshot,
               UnorderedElementsAre(::testing::Key("h2"), ::testing::Key("h3")));
-  EXPECT_TRUE(
-      backend.PinPresentHostResident(std::vector<std::string>{"h1"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pinned, backend.Lookup(std::vector<std::string>{"h1"},
+                                  LookupOptions::PinPresentHostResident()));
+  EXPECT_TRUE(pinned.empty());
 }
 
 TEST(HostOffloadBackendTest, LookupRejectsInvalidOptionCombinations) {
@@ -280,11 +285,6 @@ TEST(HostOffloadBackendTest,
   EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("cand"));
 
-  backend.Release({"h1", "h2"});
-  auto legacy_pinned = backend.PinPresentHostResident(query);
-  ASSERT_EQ(legacy_pinned.size(), 2);
-  EXPECT_EQ(legacy_pinned[0], std::make_pair(std::string("h1"), 11));
-  EXPECT_EQ(legacy_pinned[1], std::make_pair(std::string("h2"), 12));
   backend.Release({"h1", "h2"});
 }
 

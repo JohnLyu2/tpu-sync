@@ -711,28 +711,6 @@ std::vector<int> HostOffloadBackend::Evict(
   return host_ids_to_deallocate;
 }
 
-std::vector<std::pair<std::string, int32_t>>
-HostOffloadBackend::PinPresentHostResident(
-    absl::Span<const std::string> block_hashes) {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::pair<std::string, int32_t>> pinned;
-  pinned.reserve(block_hashes.size());
-  for (const std::string& hash : block_hashes) {
-    // Peek before Pin: Pin resurrects eviction candidates, and a hash that
-    // became a candidate since the caller's snapshot must stay on its way
-    // out rather than be re-advertised.
-    const RaidenBlockId* entry = lru_cache_.Peek(hash);
-    if (entry == nullptr || (entry->status != BlockStatus::HOST &&
-                             entry->status != BlockStatus::HOST_AND_HBM)) {
-      continue;
-    }
-    if (lru_cache_.Pin(hash)) {
-      pinned.push_back({hash, entry->host_block_id});
-    }
-  }
-  return pinned;
-}
-
 absl::StatusOr<std::shared_ptr<KVCacheStoreClient>>
 HostOffloadBackend::GetKVCacheStoreClient(const RaidenId& remote_id) {
   std::shared_ptr<global_registry::GlobalRegistryClient> registry;

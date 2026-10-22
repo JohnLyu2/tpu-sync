@@ -102,15 +102,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       const std::vector<std::string>& block_hashes,
       std::vector<std::string>* evicted_hashes = nullptr) override;
 
-  // Pins the subset of `block_hashes` that is still host-resident and returns
-  // those hashes with their current host block ids, all under one lock
-  // acquisition. Unlike Pin(), absent or candidate hashes are skipped rather
-  // than failing the batch: callers feed this from a stale snapshot, and a
-  // hash evicted since the snapshot must be dropped, not resurrected. The
-  // caller Release()s the returned hashes.
-  std::vector<std::pair<std::string, int32_t>> PinPresentHostResident(
-      absl::Span<const std::string> block_hashes) override;
-
   // --- Global Memory Pooling & RPC Methods ---
   // Loads KV cache blocks from local host DRAM (if `remote_id` is empty or
   // matches this backend's id) or from the specified peer. See KVCacheStoreBackend

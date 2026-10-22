@@ -264,17 +264,6 @@ class KVCacheStoreBackend {
     return {};
   }
 
-  // Pins the subset of `block_hashes` that is still host-resident and returns
-  // those hashes with their current host block ids, all under one lock
-  // acquisition. Unlike Pin(), absent or candidate hashes are skipped rather
-  // than failing the batch: callers feed this from a stale snapshot, and a
-  // hash evicted since the snapshot must be dropped, not resurrected. The
-  // caller Release()s the returned hashes.
-  virtual std::vector<std::pair<std::string, int32_t>> PinPresentHostResident(
-      absl::Span<const std::string> block_hashes) {
-    return {};
-  }
-
   // --- Remote write (WriteRemote) & registry helpers -----------------------
   //
   // Default implementations refuse or return UnimplementedError so backends
