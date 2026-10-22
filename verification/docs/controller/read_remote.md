@@ -2,7 +2,7 @@
 
 `TpuSyncVerify/Controller/ReadRemote.lean` models the destination half of
 `RaidenController::ReadRemote` (`tpu_sync/core/controller/raiden_controller.cc`,
-tpu-sync `0ac16d1`). It is the model behind finding **F2** in
+tpu-sync `2ed6f8f`). It is the model behind finding **F2** in
 `findings/README.md`: a remote read can keep DMA-ing into the caller's
 destination blocks after the caller has been told the read failed.
 
@@ -20,7 +20,7 @@ exhausts it: `.safe` here is a proof, not a bound.
 
 | `Impl` | Acquire callback | Deadline |
 |---|---|---|
-| `shipping` | issues the pull unconditionally (`:1196-1197`) | settles (`:1119-1139`) |
+| `shipping` | issues the pull unconditionally (`:1202-1203`) | settles (`:1125-1145`) |
 | `checkSettledBeforePull` | skips the pull if already settled (`findings/candidate_fixes.patch`) | settles |
 | `deferSettleWhilePullInFlight` | as above | does not settle while a pull is in flight; the pull's completion settles — what the sibling `WriteRemote` path already does (`kv_cache_store_service.cc` `DeadlineLoop`) |
 
@@ -28,7 +28,7 @@ exhausts it: `.safe` here is a proof, not a bound.
 
 `NoWriteAfterRelease`: the caller never reuses the destination blocks while a
 pull into them is in flight (issued and not done). The caller is entitled to
-this by the comment at `:1169-1173`.
+this by the comment at `:1175-1179`.
 
 ## Results
 
@@ -59,22 +59,22 @@ the bug-hunt repro in `findings/raiden_controller_bughunt_test.cc` map to
 
 | C++ test | File & lines | Lean theorem | Notes |
 |---|---|---|---|
-| `ReadRemotePullTest.FullSuccessPathUsesAuthoritativeIdsAndSrcEndpoints` | `raiden_controller_test.cc:632-659` | `trace_full_success` | Acquire succeeds, pull issues & completes, lease released, promise settles before caller reuse |
-| `ReadRemotePullTest.HbmModeBuildsStagingPlusDeviceDst` | `raiden_controller_test.cc:661-684` | `trace_full_success` | Same settle lifecycle; C++ test also checks staging + device destination buffer construction |
-| `ReadRemotePullTest.HostModeBuildsDramDstWithNoStaging` | `raiden_controller_test.cc:686-701` | `trace_full_success` | Same settle lifecycle; C++ test checks DRAM-only destination buffer construction |
-| `ReadRemotePullTest.AcquireNotFoundFailsFastWithoutTransfer` | `raiden_controller_test.cc:795-813` | `trace_acquire_fails_fast` | Source returns `NOT_FOUND` (`acquireReply false`); settles immediately with `pullIssued = false` |
-| `ReadRemotePullTest.TransferFailureStillReleasesTheLease` | `raiden_controller_test.cc:815-831` | `trace_full_success` | Pull future resolves with error (`pullDone`), releases lease, and settles |
-| `ReadRemotePullTest.RevokedVerdictFailsTheRead` | `raiden_controller_test.cc:833-853` | `trace_full_success` | Pull completes (`pullDone`), lease release returns `REVOKED`, settles with `FailedPrecondition` |
-| `ReadRemotePullTest.ControllerTeardownMidReadIsSafe` | `raiden_controller_test.cc:855-880` | `trace_teardown_before_acquire`, `trace_teardown_during_pull` | Controller destroyed either before `acquireReply` (skips pull, settles `Cancelled`) or during `pullInFlight` (finishes pull via shared state and settles) |
+| `ReadRemotePullTest.FullSuccessPathUsesAuthoritativeIdsAndSrcEndpoints` | `raiden_controller_test.cc:634-661` | `trace_full_success` | Acquire succeeds, pull issues & completes, lease released, promise settles before caller reuse |
+| `ReadRemotePullTest.HbmModeBuildsStagingPlusDeviceDst` | `raiden_controller_test.cc:663-686` | `trace_full_success` | Same settle lifecycle; C++ test also checks staging + device destination buffer construction |
+| `ReadRemotePullTest.HostModeBuildsDramDstWithNoStaging` | `raiden_controller_test.cc:688-703` | `trace_full_success` | Same settle lifecycle; C++ test checks DRAM-only destination buffer construction |
+| `ReadRemotePullTest.AcquireNotFoundFailsFastWithoutTransfer` | `raiden_controller_test.cc:797-815` | `trace_acquire_fails_fast` | Source returns `NOT_FOUND` (`acquireReply false`); settles immediately with `pullIssued = false` |
+| `ReadRemotePullTest.TransferFailureStillReleasesTheLease` | `raiden_controller_test.cc:817-833` | `trace_full_success` | Pull future resolves with error (`pullDone`), releases lease, and settles |
+| `ReadRemotePullTest.RevokedVerdictFailsTheRead` | `raiden_controller_test.cc:835-855` | `trace_full_success` | Pull completes (`pullDone`), lease release returns `REVOKED`, settles with `FailedPrecondition` |
+| `ReadRemotePullTest.ControllerTeardownMidReadIsSafe` | `raiden_controller_test.cc:857-882` | `trace_teardown_before_acquire`, `trace_teardown_during_pull` | Controller destroyed either before `acquireReply` (skips pull, settles `Cancelled`) or during `pullInFlight` (finishes pull via shared state and settles) |
 | `BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` | `findings/raiden_controller_bughunt_test.cc:65-114` | `shipping_lateIssue`, `shipping_counterexample`, `naive_fix_closes_lateIssue` | Reproduces shape A (`[.deadline, .callerReuse, .acquireReply true]`) |
-| `ReadRemotePullTest.DeviceIdSizeMismatchRejectedBeforeAcquire`, `EmptyControllerAddressRejectedBeforeAcquire`, `EmptyHashesRejected`, `PeerChurnDoesNotGrowTheStubCacheWithoutBound` | `raiden_controller_test.cc:703-793` | Pre-RPC validation / gRPC stub cache | Synchronous argument checks before `AcquireReadLease` (or channel LRU sizing), prior to the state machine's initial state |
+| `ReadRemotePullTest.DeviceIdSizeMismatchRejectedBeforeAcquire`, `EmptyControllerAddressRejectedBeforeAcquire`, `EmptyHashesRejected`, `PeerChurnDoesNotGrowTheStubCacheWithoutBound` | `raiden_controller_test.cc:705-795` | Pre-RPC validation / gRPC stub cache | Synchronous argument checks before `AcquireReadLease` (or channel LRU sizing), prior to the state machine's initial state |
 
 ## Status
 
 | | |
 |---|---|
-| Citations | `0ac16d1` (the `ReadRemote` region of `raiden_controller.cc` is unchanged since `1fa06d1`) |
-| Tests in `findings/` | last run on `d16701e`; not re-run at `0ac16d1` |
-| Patches in `findings/` | `build_targets.patch`, `candidate_fixes.patch` apply clean at `0ac16d1` |
-| Upstream fix | none for F2 as of `0ac16d1` (2026-10-16); F4 fixed in `72255dd`, F6 in `8653373` |
+| Citations | `2ed6f8f` (the `ReadRemote` region of `raiden_controller.cc` is unchanged since `1fa06d1`, shifted +6 lines by `9ac3d3e`) |
+| Tests in `findings/` | shapes A and B last run 2026-10-20 against controller sources from `449b591` (see `findings/README.md` §F2); `ReadRemote` unchanged since |
+| Patches in `findings/` | `build_targets.patch`, `candidate_fixes.patch` (now F2 shape A only) apply clean at `2ed6f8f` |
+| Upstream fix | none for F2 as of `2ed6f8f` (2026-10-22); F1 fixed in `b3ea4dc`, F4 in `72255dd`, F6 in `8653373`, F7 in `fdeebcd` |
 

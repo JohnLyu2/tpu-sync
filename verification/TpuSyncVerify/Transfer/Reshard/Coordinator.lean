@@ -13,7 +13,7 @@ composed with `RequestBlockRegistry` (`TpuSyncVerify.Transfer.Reshard.Registry`)
   * `tpu_sync/kv_cache/reshard/reshard_coordinator.h:45-129`
   * `tpu_sync/kv_cache/reshard/reshard_coordinator.cc:415-592`
   * `tpu_sync/kv_cache/kv_cache_listener.cc:138-172` (`PoolReshardRegisterRecv` control-pipe handler)
-  * `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:673-709`
+  * `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:679-715`
     (`PoolReshardRegisterRecv`: `ReshardReceiveSession::Create` + `RegisterActivePlanDirect`)
   * `tpu_sync/kv_cache/reshard_receive_session.cc:373-390, 420-470`
     (`AcquireStagingLeases` + `ReleaseStaging` / `ReleasePoolStagingLeases`)
@@ -55,7 +55,7 @@ composed with `RequestBlockRegistry` (`TpuSyncVerify.Transfer.Reshard.Registry`)
      state has zero armed receiver sessions, zero held staging leases, and
      `s.reg.claimedUnits = none ∧ s.reg.claimOwners = []`.
 
-  Pinned upstream commit: `0ac16d1`
+  Pinned upstream commit: `2ed6f8f`
 -/
 
 namespace TpuSyncVerify.Transfer.Reshard.Coordinator
@@ -103,7 +103,7 @@ inductive CoordPhase where
   deriving DecidableEq, Repr
 
 /-- Per-destination-unit receiver state (`kv_cache_listener.cc:138-172`,
-`kv_cache_manager_with_transfer.cc:673-709`,
+`kv_cache_manager_with_transfer.cc:679-715`,
 `reshard_receive_session.cc:373-390, 420-470`). -/
 structure DstUnitState where
   /-- Destination unit ID (`UnitKey`). -/
@@ -132,7 +132,7 @@ def init (unit : Nat) : DstUnitState :=
     completed := false }
 
 /-- Arm this destination unit via `PoolReshardRegisterRecv`
-(`kv_cache_manager_with_transfer.cc:673-709`,
+(`kv_cache_manager_with_transfer.cc:679-715`,
 `reshard_receive_session.cc:373-390`). -/
 def arm (d : DstUnitState) : DstUnitState :=
   { d with
@@ -541,7 +541,7 @@ def AllArmedInDispatching (s : CoordState) : Prop :=
     s.armFailed = false ∧ allReported s.dstUnits s.armResults = true
 
 /-- **Staging Lease Matches Session Armed (`LeaseMatchesSession`,
-`kv_cache_manager_with_transfer.cc:673-709`,
+`kv_cache_manager_with_transfer.cc:679-715`,
 `reshard_receive_session.cc:373-390, 420-470`)**:
 For every destination unit, its `PoolStagingLease` is held if and only if its
 `ReshardReceiveSession` is currently armed. -/

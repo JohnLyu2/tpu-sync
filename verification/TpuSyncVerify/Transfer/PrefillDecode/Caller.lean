@@ -22,7 +22,7 @@ tpu-inference `7ed46a6`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
 `mixin.py` = `vllm/v1/worker/kv_connector_model_runner_mixin.py`,
 `kvcfg.py` = `vllm/config/kv_transfer.py`, all at vLLM `6185d73` (the pair
 `examples/*_disagg/setup.sh` pins); `mgr.cc` =
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` at tpu-sync `0ac16d1`.
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` at tpu-sync `2ed6f8f`.
 
 ## What is modelled
 
@@ -38,7 +38,7 @@ Below the engine sits tpu-sync, abstracted to the two publications of
 `Pipeline.lean`: `sendPub` is `send.published` and `recvPub` is
 `recv.published`. Each is set once, by `pOutcome ok` / `dOutcome ok`, with
 `ok = false` covering a failed push or pull *and* a send nobody pulled before
-`timeout_s` (`mgr.cc:961-970`: both go to `failed_recving_`; the connector
+`timeout_s` (`mgr.cc:967-976`: both go to `failed_recving_`; the connector
 passes `TPU_P2P_WAIT_PULL_TIMEOUT`, 180 s, as `timeout_s`, `conn.py:529`).
 Which value is published is nondeterministic here; `Pipeline.lean` says when
 each is possible.
@@ -137,7 +137,7 @@ Bounded search exhausts the state space for each configuration.
   block of the request, so recomputation starts from token 0 and the
   `num_computed_tokens ≠ 0` branch of `_update_waiting_for_remote_kv`
   (`sched.py:2393-2395`, cache the valid prefix) is not reached. tpu-sync
-  reports a receive as one outcome (`mgr.cc:1024-1026`), so a connector has
+  reports a receive as one outcome (`mgr.cc:1030-1032`), so a connector has
   no finer information to report.
 * **B3 (no preemption, prefix caching or chunking).** None of them changes
   which event frees a transfer-held block.
@@ -229,10 +229,10 @@ def init : S := {}
 
 inductive Ev where
   /-- tpu-sync publishes the send (`done_sending` if `ok`, else `failed_recving`,
-  `mgr.cc:961-970`) and P's next `get_finished()` forwards it. -/
+  `mgr.cc:967-976`) and P's next `get_finished()` forwards it. -/
   | pOutcome (ok : Bool)
   /-- tpu-sync publishes the receive (`done_recving` if `ok`, else
-  `failed_recving`, `mgr.cc:1024-1026`) and D's next `get_finished()` /
+  `failed_recving`, `mgr.cc:1030-1032`) and D's next `get_finished()` /
   `get_block_ids_with_load_errors()` forward it. -/
   | dOutcome (ok : Bool)
   /-- D's next `schedule()` promotes the waiting request (`sched.py:2414-2429`). -/

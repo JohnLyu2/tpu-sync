@@ -16,7 +16,7 @@ directory contains two components:
 ## Status & What's Covered
 
 All citations across models, `docs/`, and `findings/` are pinned to tpu-sync
-`0ac16d1` (upstream `main` merged 2026-10-16; `findings/filed_bugs.md` is frozen
+`2ed6f8f` (upstream `main` merged 2026-10-22; `findings/filed_bugs.md` is frozen
 at the commit it names). The two external callers that `Caller.lean` and
 finding C1 cite are pinned separately, to the pair `examples/*_disagg/setup.sh`
 installs: tpu-inference `7ed46a6`, vLLM `6185d73`.

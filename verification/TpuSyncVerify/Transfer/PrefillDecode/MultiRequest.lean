@@ -3,7 +3,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 /-!
 # Multi-request system and top-level properties across requests
 
-Citations are to tpu-sync `0ac16d1`; the C++ names below are those of
+Citations are to tpu-sync `2ed6f8f`; the C++ names below are those of
 `Pipeline.lean`, which this module composes.
 
 Multiple requests $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run

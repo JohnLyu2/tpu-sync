@@ -1,8 +1,8 @@
 diff --git a/tpu_sync/core/controller/raiden_controller.cc b/tpu_sync/core/controller/raiden_controller.cc
-index 7bd3750..8816a4c 100644
+index 072157b..82b15c8 100644
 --- a/tpu_sync/core/controller/raiden_controller.cc
 +++ b/tpu_sync/core/controller/raiden_controller.cc
-@@ -1193,8 +1193,16 @@ void RaidenController::PullAndRelease(
+@@ -1199,8 +1199,16 @@ void RaidenController::PullAndRelease(
    RAIDEN_LEASE_TRACE("pull issue lease=", state->lease_id,
                       " blocks=", src_buffers.size(),
                       " to_hbm=", to_hbm ? 1 : 0);
@@ -20,44 +20,3 @@ index 7bd3750..8816a4c 100644
    RAIDEN_LEASE_TRACE("pull issued lease=", state->lease_id);
  
    // ---- Phase 3: Commit -- release and read the verdict. -------------------
-diff --git a/tpu_sync/kv_cache/kv_cache_store.cc b/tpu_sync/kv_cache/kv_cache_store.cc
-index 8e5324d..21efe83 100644
---- a/tpu_sync/kv_cache/kv_cache_store.cc
-+++ b/tpu_sync/kv_cache/kv_cache_store.cc
-@@ -1615,8 +1615,16 @@ void KVCacheStore::RegisterReadRemoteHooks() {
- absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
-     absl::Span<const std::string> block_hashes) {
-   absl::MutexLock lock(mutex_);
--  ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
-+  LookupOptions options;
-+  options.enable_global = false;
-+  options.pin_found = true;
-+  ABSL_ASSIGN_OR_RETURN(const auto& slices,
-+                        backend()->Lookup(block_hashes, options));
-+  std::vector<std::string> pinned;
-+  pinned.reserve(slices.size());
-+  for (const auto& entry : slices) pinned.push_back(entry.first);
-   if (slices.size() < block_hashes.size()) {
-+    backend()->Release(pinned);
-     return absl::NotFoundError(
-         absl::StrCat("BLOCK_HASH_NOT_FOUND: ", block_hashes[slices.size()]));
-   }
-@@ -1627,6 +1635,7 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
-     const auto& existing = slices[i].second;
-     if (existing.status != BlockStatus::HOST &&
-         existing.status != BlockStatus::HOST_AND_HBM) {
-+      backend()->Release(pinned);
-       return absl::FailedPreconditionError(absl::StrCat(
-           "Block not resident in host DRAM (status=",
-           static_cast<int>(existing.status), "): ", block_hashes[i]));
-@@ -1634,10 +1643,6 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
-     src_host_block_ids.push_back(existing.host_block_id);
-   }
- 
--  if (!backend()->Pin(block_hashes)) {
--    return absl::InternalError("Failed to pin host blocks");
--  }
--
-   return src_host_block_ids;
- }
- 

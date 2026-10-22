@@ -11,7 +11,7 @@ state machine that manages `(req_id, uuid)` producer block generations across
 registration, multi-owner planning claims, claim abandonment, per-unit
 completion voting, and unclaimed cancellation tombstones.
 
-Pinned to upstream commit `0ac16d1`.
+Pinned to upstream commit `2ed6f8f`.
 
   ## C++ anchorage
 

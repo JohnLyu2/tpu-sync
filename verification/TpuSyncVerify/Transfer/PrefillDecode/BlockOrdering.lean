@@ -4,7 +4,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 /-!
 # Within-Layer Block-Index Gather, Reordering, Subset Validation & Custom Host Staging
 
-Citations are to tpu-sync `0ac16d1`;
+Citations are to tpu-sync `2ed6f8f`;
 `send.cc`, `recv.cc`, `bt.cc` and `mgr.cc` abbreviate as in `Pipeline.lean`.
 
 Stage 4 (spatial block refinement) of the prefill-to-decode model: refines
@@ -14,7 +14,7 @@ per-block arrays `Layer → BlockId → BlockCell`, modelling:
 1. **Producer block registration & pull validation** (`send.cc:77-85, 103-140`):
    - `PopulateRegisteredBlocks` (`send.cc:103-121`): `NotifyForRead` rejects
      duplicate block IDs in `registered_block_ids_` (reported with both
-     positions and thrown as `std::invalid_argument`, `mgr.cc:476-478`).
+     positions and thrown as `std::invalid_argument`, `mgr.cc:482-484`).
    - `ValidateRequestedBlocksLocked` (`send.cc:123-140`): `ValidateAndBeginPull`
      rejects empty requests, rejects any block ID not in
      `registered_block_set_` (allowing strict subset pulls), and rejects
@@ -571,7 +571,7 @@ def d2hStage (l numBlocks : Nat) (plan : CopyPlan) : List BlockCell :=
   execCoalesced .junk (goodBlockLayer numBlocks l) (junkBlockLayer plan.numBlocks) plan.d2hSpec
 
 /-- Stage 2 (Network H2H landing): `BlockTransport` lands producer host blocks
-`0 … k-1` into consumer `transport_host_block_ids` (`bt.cc:555-609`). -/
+`0 … k-1` into consumer `transport_host_block_ids` (`bt.cc:556-610`). -/
 def landStage (l numBlocks numHostBlocks : Nat) (plan : CopyPlan) : List BlockCell :=
   execElementwise .junk (d2hStage l numBlocks plan) (blankBlockLayer numHostBlocks) plan.h2hPairs
 

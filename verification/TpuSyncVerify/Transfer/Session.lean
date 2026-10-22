@@ -8,7 +8,7 @@ The settle protocol shared by TPU Sync's session classes
 set by whichever of `Finish` or the last `EndRecvOp`/`EndSendOp`/`EndOp` comes
 second. The session owns its host staging until it settles.
 
-Citations are to tpu-sync `0ac16d1`; `recv` is
+Citations are to tpu-sync `2ed6f8f`; `recv` is
 `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`, `send` is
 `tpu_sync/kv_cache/transfer_send_session.{h,cc}`.
 
@@ -399,7 +399,7 @@ theorem endOpLocked_done_mono {l : Lifecycle} (h : l.done = true) :
 /-! ## Redundant `done_` guards
 
 Audit of the `done_` mentions in the receiver's lifecycle guards (`recv` at
-`0ac16d1`). `Consistent` already decides each of them:
+`2ed6f8f`). `Consistent` already decides each of them:
 
 * `FinishLocked` `.cc:365`: past the `if (draining_) return` (`.cc:363`),
   `!done_` holds — `Consistent.not_done`;

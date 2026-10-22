@@ -20,13 +20,13 @@ byte-interval coverage and multi-sender push-stream accounting:
   `CompleteIncomingPush` plan-declared progress counter, lines 640–793,
   1010–1046)
 
-Citations in this file are checked against tpu-sync `0ac16d1`.
+Citations in this file are checked against tpu-sync `2ed6f8f`.
 
 What this module proves:
 1. **Multi-sender stream count conservation (`stream_count_matches`,
    `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
    `(src_block_id, dst_block_id)` pairs for a pool group and opens
-   `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:1020-1025`,
+   `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:1021-1026`,
    `reshard_send_session.cc:293-341`). `ValidateReceiverCoverage`
    (`reshard_receive_session.cc:314-324`) checks that the receiver's
    `expected_pushes` equals `∑_s min(parallelism, |pairs_s|)`, matching the
@@ -81,7 +81,7 @@ def senderPairs (entries : List ScheduleEntry) (sender : Nat) : List (Nat × Nat
 
 /-- Number of TCP push streams opened by `sender` under `parallelism`:
 `BlockTransport::AsyncPush` clamps `P = min(parallelism, num_blocks)`
-(`block_transport.cc:1010-1025`), and a sender with zero pairs opens no streams
+(`block_transport.cc:1011-1026`), and a sender with zero pairs opens no streams
 (`reshard_send_session.cc:217-224`). -/
 def senderStreams (parallelism : Nat) (entries : List ScheduleEntry) (sender : Nat) : Nat :=
   Nat.min parallelism (senderPairs entries sender).length
@@ -156,7 +156,7 @@ def validBlockCoverage (extent : Nat) (intervals : List Interval) : Bool :=
   decide (0 < extent) && decide (checkContiguousIntervals 0 intervals = some extent)
 
 /-- Write one logical byte interval `[iv.startByte, iv.endByte)` into a
-destination block byte buffer (`block_transport.cc:603-606`). Byte `b` in range
+destination block byte buffer (`block_transport.cc:604-607`). Byte `b` in range
 receives `.kv b`. -/
 def writeInterval (iv : Interval) (buf : List Cell) : List Cell :=
   buf.mapIdx fun b c => if iv.startByte ≤ b ∧ b < iv.endByte then .kv b else c
@@ -490,11 +490,11 @@ def validGroupExtents (liveBytes : Nat) : List Nat → Bool
   | e :: rest => decide (e = liveBytes) && validGroupExtents liveBytes rest
 
 /-- `KVCacheManagerBase::ExpectedPushSenders`
-(`tpu_sync/kv_cache/kv_cache_manager_base.cc:2687-2704`):
+(`tpu_sync/kv_cache/kv_cache_manager_base.cc:2688-2705`):
 returns `some schedules.length` when the active plan is a block-addressed
 receiver plan (`!isSender` and `pool_groups_size() == 0`) with non-empty
 `shard_push_schedules`, and `none` for sender plans, pool-grouped plans (which
-use `GetPoolPushProgressSpec`, `:2706-2745`), bare plans, or after
+use `GetPoolPushProgressSpec`, `:2643-2686`), bare plans, or after
 `UnregisterActivePlan`. -/
 def expectedPushSenders (isSender : Bool) (schedules : List (Nat × List ScheduleEntry)) :
     Option Nat :=

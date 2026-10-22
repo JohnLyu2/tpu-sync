@@ -8,13 +8,13 @@ import TpuSyncVerify.Transfer.Reshard.Send
 End-to-end pool-addressed resharding model (`docs/transfer/reshard.md`):
 composes `Reshard.Send` (`ReshardSendSession`, `Send.lean`), `Reshard.Recv`
 (`ReshardReceiveSession`, `Receive.lean`), the plan-declared stream progress in
-`BlockTransport::HandleIncomingPush` / `CompleteIncomingPush` (`bt.cc:640-793`),
+`BlockTransport::HandleIncomingPush` / `CompleteIncomingPush` (`bt.cc:641-794`),
 the Arm-then-Dispatch coordination barrier in `ReshardCoordinator::ExecutePoolReshard`
 (`coord.cc:429-544`), and the five memories KV data moves through between source
 and destination HBM — including **aliased device pages** shared across pool
 ranks (`recv.h:184-188`, `base.h:688-691`).
 
-Citations are to tpu-sync `0ac16d1`:
+Citations are to tpu-sync `2ed6f8f`:
 * `send.cc` — `tpu_sync/kv_cache/reshard_send_session.cc`
 * `slots.cc` — `tpu_sync/core/pool_reshard_send_slots.cc`
 * `recv.h` / `recv.cc` — `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`
@@ -35,7 +35,7 @@ padding on an aliased page), or `.blank` (never written on the wire).
 | `srcHbm`     | producer KV cache in source HBM | `reclaim` (after `send.published ≠ none`) |
 | `srcStaging` | sender `PoolStagingStorage` (`send.cc:229-246`) | `send (.d2hDone p true)`, `reseatSrcStaging` |
 | `wire`       | bytes delivered by sender peer pushes (`send.cc:342-347`) | `send (.pushDone p true)` |
-| `dstStaging` | receiver `PoolStagingStorage` (`recv.cc:420-459`) | `landStream p` (`bt.cc:603-685`), `reseatDstStaging` |
+| `dstStaging` | receiver `PoolStagingStorage` (`recv.cc:420-459`) | `landStream p` (`bt.cc:604-686`), `reseatDstStaging` |
 | `dstHbm`     | consumer KV cache in destination HBM (`recv.cc:600-706`) | `recv (.h2dDone p true)` via `writePoolHbm` |
 
 ### Modelling aliased device pages (`writePoolHbm`)
@@ -107,7 +107,7 @@ structure Pipeline where
   dstHbm : List Cell
   /-- Completed sender peer pushes per pool (`send.cc:342-347`). -/
   sentStreams : List Nat
-  /-- Streams landed by `BlockTransport::CompleteIncomingPush` per pool (`bt.cc:684`). -/
+  /-- Streams landed by `BlockTransport::CompleteIncomingPush` per pool (`bt.cc:685`). -/
   landedStreams : List Nat
   /-- Whether source HBM has been freed after `send.published ≠ none`. -/
   reclaimed : Bool := false
@@ -152,7 +152,7 @@ inductive Ev where
   deriving Repr, DecidableEq
 
 /-- Phase 1 of `ReshardCoordinator::ExecutePoolReshard` (`coord.cc:433-475`,
-`mgr.cc:673-709`): `PoolReshardRegisterRecv` arms the destination receiver. -/
+`mgr.cc:679-715`): `PoolReshardRegisterRecv` arms the destination receiver. -/
 def armRecv (s : Pipeline) : Option Pipeline :=
   if s.armed = false then
     some { s with armed := true }
@@ -185,26 +185,26 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   | e =>
     (Send.step .shipping s.send e).map fun snd => { s with send := snd }
 
-/-- Receiver transition (`recv.cc:541-706`, `bt.cc:686-787`). `pushBegin`
+/-- Receiver transition (`recv.cc:541-706`, `bt.cc:687-788`). `pushBegin`
 requires the receiver to be armed (`mgr.cc:224-249`); `onPoolReceived p`
-requires all `peerCounts[p]` expected streams to have landed (`bt.cc:686-787`);
+requires all `peerCounts[p]` expected streams to have landed (`bt.cc:687-788`);
 `h2dDone p true` writes `dstStaging[p]` to `dstHbm[p]` and clobbers any strictly
 higher-rank pool slots on the aliased page (`writePoolHbm`). -/
 def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   match e with
   | .pushBegin =>
     if s.armed = true then
-      (Recv.step .shipping s.recv .pushBegin).map fun rcv => { s with recv := rcv }
+      (Recv.step .finishOnError s.recv .pushBegin).map fun rcv => { s with recv := rcv }
     else none
   | .onPoolReceived p =>
     if s.landedStreams[p]? = some (s.peerCounts.getD p 0) then
-      (Recv.step .shipping s.recv (.onPoolReceived p)).map fun rcv =>
+      (Recv.step .finishOnError s.recv (.onPoolReceived p)).map fun rcv =>
         { s with recv := rcv }
     else none
   | .h2dDone p ok =>
     match s.recv.pools[p]? with
     | some pool =>
-      (Recv.step .shipping s.recv (.h2dDone p ok)).map fun rcv =>
+      (Recv.step .finishOnError s.recv (.h2dDone p ok)).map fun rcv =>
         if ok then
           { s with recv := rcv
                    dstHbm := writePoolHbm s.recv.pools p pool.rank
@@ -212,10 +212,10 @@ def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
         else { s with recv := rcv }
     | none => none
   | e =>
-    (Recv.step .shipping s.recv e).map fun rcv => { s with recv := rcv }
+    (Recv.step .finishOnError s.recv e).map fun rcv => { s with recv := rcv }
 
 /-- `BlockTransport::HandleIncomingPush` lands one push stream for pool `p` into
-`dstStaging[p]` and increments `completed_chunks` (`bt.cc:603-685`). -/
+`dstStaging[p]` and increments `completed_chunks` (`bt.cc:604-686`). -/
 def landStream (s : Pipeline) (p : Nat) : Option Pipeline :=
   if 0 < s.recv.pushes then
     match s.landedStreams[p]?, s.sentStreams[p]?, s.wire[p]? with
@@ -228,21 +228,21 @@ def landStream (s : Pipeline) (p : Nat) : Option Pipeline :=
   else none
 
 /-- Source engine/registry reclaims producer HBM once `CompleteReadWithDetails`
-has published the send session (`mgr.cc:988-996`, `coord.cc:494-544`). -/
+has published the send session (`mgr.cc:994-1002`, `coord.cc:494-544`). -/
 def reclaim (s : Pipeline) : Option Pipeline :=
   if s.send.published ≠ none ∧ s.reclaimed = false then
     some { s with srcHbm := List.replicate s.numPools .junk, reclaimed := true }
   else none
 
 /-- Released sender `PoolStagingLease` slots may be reused by another transfer
-(`mgr.cc:634-671`, `send.cc:457-481`). -/
+(`mgr.cc:640-677`, `send.cc:457-481`). -/
 def reseatSrcStaging (s : Pipeline) : Option Pipeline :=
   if s.send.life.hasStaging = false then
     some { s with srcStaging := List.replicate s.numPools .junk }
   else none
 
 /-- Released receiver `PoolStagingLease` slots may be reused by another transfer
-(`mgr.cc:673-709`, `recv.cc:461-470`). -/
+(`mgr.cc:679-715`, `recv.cc:461-470`). -/
 def reseatDstStaging (s : Pipeline) : Option Pipeline :=
   if s.recv.life.hasStaging = false then
     some { s with dstStaging := List.replicate s.numPools .junk }
@@ -376,7 +376,7 @@ def StagingSafe (s : Pipeline) : Prop :=
   (s.recv.life.hasStaging = false →
     s.recv.pushes = 0 ∧ Recv.poolOps s.recv.pools = 0)
 
-/-- Plan-declared transport progress accounting (`bt.cc:684-787`): landed streams
+/-- Plan-declared transport progress accounting (`bt.cc:685-788`): landed streams
 never exceed sent streams, sent streams never exceed `peerCounts`, and any pool
 that has passed `OnPoolReceived` (`stage ≠ .waiting`) has landed all
 `peerCounts[p]` expected streams. -/
@@ -565,7 +565,7 @@ theorem step_send_isSome {s : Pipeline} {e : Send.Ev} (he : e ∈ Send.drainEven
     rcases hp with rfl | rfl | rfl <;> simp [step, sendStep]
 
 theorem step_recv_isSome {s : Pipeline} {e : Recv.Ev} (he : e ∈ Recv.drainEvents s.numPools) :
-    (step s (.recv e)).isSome = (Recv.step .shipping s.recv e).isSome := by
+    (step s (.recv e)).isSome = (Recv.step .finishOnError s.recv e).isSome := by
   simp only [Recv.drainEvents, List.mem_append, List.mem_singleton, List.mem_flatMap,
     List.mem_range] at he
   rcases he with rfl | ⟨p, _, hp⟩
@@ -586,7 +586,7 @@ theorem inv_noOpLeak {s : Pipeline} (h : Inv s) : NoOpLeak s := by
     · simp only [drainEvents, List.mem_append, List.mem_map]
       exact Or.inl ⟨e, he, rfl⟩
     · rw [step_send_isSome he]; exact hsome
-  · obtain ⟨e, he, hsome⟩ := Recv.inv_noOpLeak .shipping h.recvInv hrcv
+  · obtain ⟨e, he, hsome⟩ := Recv.inv_noOpLeak .finishOnError h.recvInv hrcv
     rw [h.len_recv] at he
     refine ⟨.recv e, ?_, ?_⟩
     · simp only [drainEvents, List.mem_append, List.mem_map]
@@ -603,7 +603,7 @@ theorem allCompleted_getElem? {ps : List Pool} (h : Recv.allCompleted ps = true)
 
 theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
   have hsendSafe := Send.inv_safe h.sendInv
-  have hrecvSafe := Recv.inv_safe .shipping h.recvInv
+  have hrecvSafe := Recv.inv_safe .finishOnError h.recvInv
   refine ⟨?_, h.done_intact, ?_, ?_, ?_, ?_, ?_, inv_noOpLeak h⟩
   · -- PublicationCorrect
     intro hpub
@@ -1482,7 +1482,7 @@ theorem h2dDone_getElem? {r r' : Recv} {p q : Nat} {ok : Bool} {pool' : Pool}
     exact Or.inr ⟨hpq, pool₁, hget₁, hw, hc⟩
 
 theorem recv_other_stage_pres {r rcv : Recv} {e : Recv.Ev}
-    (hrcv : Recv.step .shipping r e = some rcv)
+    (hrcv : Recv.step .finishOnError r e = some rcv)
     (hne1 : e ≠ .pushBegin)
     (hne2 : ∀ p, e ≠ .onPoolReceived p)
     (hne3 : ∀ p ok, e ≠ .h2dDone p ok)
@@ -1553,7 +1553,7 @@ theorem recv_other_stage_pres {r rcv : Recv} {e : Recv.Ev}
     exact ⟨pool', hget', id, id, id⟩
 
 theorem recv_other_pushes_zero {r rcv : Recv} {e : Recv.Ev}
-    (hrcv : Recv.step .shipping r e = some rcv)
+    (hrcv : Recv.step .finishOnError r e = some rcv)
     (hne1 : e ≠ .pushBegin)
     (hne2 : ∀ p, e ≠ .onPoolReceived p)
     (hne3 : ∀ p ok, e ≠ .h2dDone p ok)
@@ -1589,12 +1589,12 @@ theorem recv_other_pushes_zero {r rcv : Recv} {e : Recv.Ev}
     exact hp0
 
 theorem step_recv_other_inv {s : Pipeline} {rcv : Recv} {e : Recv.Ev} (h : Inv s)
-    (hrcv : Recv.step .shipping s.recv e = some rcv)
+    (hrcv : Recv.step .finishOnError s.recv e = some rcv)
     (hne1 : e ≠ .pushBegin)
     (hne2 : ∀ p, e ≠ .onPoolReceived p)
     (hne3 : ∀ p ok, e ≠ .h2dDone p ok) :
     Inv { s with recv := rcv } := by
-  have hrcvInv := Recv.step_inv .shipping h.recvInv hrcv
+  have hrcvInv := Recv.step_inv .finishOnError h.recvInv hrcv
   have hdone_m : rcv.life.done = false → s.recv.life.done = false := by
     intro hnd; cases hd : s.recv.life.done
     · rfl
@@ -1628,7 +1628,7 @@ theorem step_recv_inv {s s' : Pipeline} {e : Recv.Ev} (h : Inv s)
     rename_i harm
     simp only [Option.map_eq_some_iff] at hs
     obtain ⟨rcv, hrcv, rfl⟩ := hs
-    have hrcvInv := Recv.step_inv .shipping h.recvInv hrcv
+    have hrcvInv := Recv.step_inv .finishOnError h.recvInv hrcv
     have hdone_m : rcv.life.done = false → s.recv.life.done = false := by
       intro hnd; cases hd : s.recv.life.done
       · rfl
@@ -1651,7 +1651,7 @@ theorem step_recv_inv {s s' : Pipeline} {e : Recv.Ev} (h : Inv s)
     rename_i hland_p
     simp only [Option.map_eq_some_iff] at hs
     obtain ⟨rcv, hrcv, rfl⟩ := hs
-    have hrcvInv := Recv.step_inv .shipping h.recvInv hrcv
+    have hrcvInv := Recv.step_inv .finishOnError h.recvInv hrcv
     have hdone_m : rcv.life.done = false → s.recv.life.done = false := by
       intro hnd; cases hd : s.recv.life.done
       · rfl
@@ -1703,7 +1703,7 @@ theorem step_recv_inv {s s' : Pipeline} {e : Recv.Ev} (h : Inv s)
     rename_i pool hget
     simp only [Option.map_eq_some_iff] at hs
     obtain ⟨rcv, hrcv, hs'⟩ := hs
-    have hrcvInv := Recv.step_inv .shipping h.recvInv hrcv
+    have hrcvInv := Recv.step_inv .finishOnError h.recvInv hrcv
     have hdone_m : rcv.life.done = false → s.recv.life.done = false := by
       intro hnd; cases hd : s.recv.life.done
       · rfl
@@ -2199,7 +2199,7 @@ theorem recv_drain_step_lift {s : Pipeline} (h : Inv s)
     ∃ e s', step s (.recv e) = some s' ∧
       s'.recv.life.draining = true ∧ s'.send = s.send ∧
       Recv.drainRank s'.recv < Recv.drainRank s.recv := by
-  obtain ⟨e, rcv, hrcv, hdr', hlt⟩ := Recv.drain_step .shipping h.recvInv hdr hnd
+  obtain ⟨e, rcv, hrcv, hdr', hlt⟩ := Recv.drain_step .finishOnError h.recvInv hdr hnd
   have hlift : ∃ s', step s (.recv e) = some s' ∧ s'.recv = rcv ∧ s'.send = s.send := by
     cases e with
     | pushBegin =>
@@ -2502,7 +2502,7 @@ def violates (s : Pipeline) : Bool := !checkSafe s
 2. **Premature `OnPoolReceived` (`stepPrematurePoolReceived`)**: if
    `BlockTransport::CompleteIncomingPush` fires `OnPoolReceived(p)` on the first
    arriving stream (`0 < landedStreams[p]`) instead of waiting for all
-   `peerCounts[p]` streams (`bt.cc:686-787`), `StreamAccountingSafe` is violated.
+   `peerCounts[p]` streams (`bt.cc:687-788`), `StreamAccountingSafe` is violated.
 3. **Premature producer reclamation (`stepReclaimEarly`)**: if producer HBM is
    reclaimed before `send.published ≠ none`, D2H copies `.junk` into destination
    HBM and violates `PublicationCorrect`.
@@ -2555,7 +2555,7 @@ theorem mutant_ignoring_rank_corrupts_aliased_page :
 def stepPrematurePoolReceived (s : Pipeline) : Ev → Option Pipeline
   | .recv (.onPoolReceived p) =>
     if 0 < s.landedStreams.getD p 0 then
-      (Recv.step .shipping s.recv (.onPoolReceived p)).map fun rcv =>
+      (Recv.step .finishOnError s.recv (.onPoolReceived p)).map fun rcv =>
         { s with recv := rcv }
     else none
   | e => step s e

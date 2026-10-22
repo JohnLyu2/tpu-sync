@@ -127,7 +127,7 @@ Filed 2026-10-19. Found during Lean formalization and confirmed by a unit test.
 
 Found during the Lean formalization and confirmed by a created unit test.
 
-**Proposed fix.** Call `backend()->Lookup(block_hashes, LookupOptions{.enable_global = false, .pin_found = true})`, release the returned pins on any validation refusal, and drop the separate `backend()->Pin(block_hashes)` call, mirroring `Fetch`. Reproducer: [`kv_cache_store_pin_race_test.cc`](kv_cache_store_pin_race_test.cc); candidate fix in [`candidate_fixes.patch`](candidate_fixes.patch).
+**Proposed fix.** Call `backend()->Lookup(block_hashes, LookupOptions{.enable_global = false, .pin_found = true})`, release the returned pins on any validation refusal, and drop the separate `backend()->Pin(block_hashes)` call, mirroring `Fetch`. Reproducer: [`kv_cache_store_pin_race_test.cc`](kv_cache_store_pin_race_test.cc); candidate fix in [`candidate_fixes.patch`](candidate_fixes.patch). *Update 2026-10-22: landed upstream as `b3ea4dc` (2026-10-21; the hunk has since been dropped from the patch, "Use single-lock local Lookup in ValidateAndPinHostBlocks and SaveRemote"): one `Lookup(..., {.enable_global = false, .pin_found = true})`, partial pins released on both refusal paths, no separate `Pin`; see README.md §F1.*
 
 
 ---

@@ -1,7 +1,7 @@
 # Bug-hunt findings
 
 Defects found while modelling tpu-sync, with the evidence for each. Line
-numbers are for tpu-sync `0ac16d1` unless a block of test output says
+numbers are for tpu-sync `2ed6f8f` unless a block of test output says
 otherwise; the F1–F4 tests were run on `b68161a` and re-run on `d16701e`, the
 F5 tests on `50b0774`.
 
@@ -53,7 +53,7 @@ here.
 | `reshard_bughunt_test.cc` | R7a, R7b, R8, R2b of `docs/transfer/reshard.md` (registry / coordinator claim lifecycle; all four pass, not yet filed) |
 | `reshard_send_session_bughunt_test.cc` | F10 (R6 of `docs/transfer/reshard.md`): the sender's early plan unregister and the uuid-keyed staging lease it hands to a retry |
 | `build_targets.patch` | `cc_test` targets for the four files above |
-| `candidate_fixes.patch` | fixes for F1 and F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`); see "Fix validation" |
+| `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
 
@@ -65,13 +65,16 @@ verification/findings/build_targets.patch`, then
 its test is already in the tree as `DISABLED_`
 (`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
 --test_arg=--gtest_also_run_disabled_tests`); the fix patch that re-enabled it
-was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
+was retired on 2026-10-16 (see F5). Both patches apply cleanly at `2ed6f8f`;
+`kv_cache_store_pin_race_test.cc` needs its `WindowBackend::Insert` override
+ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
+(F1 is fixed there, see §F1).
 
 ## Summary
 
 | # | Finding | Status | Reachable from production? |
 |---|---|---|---|
-| F1 | `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash ([filed](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1) 2026-10-19) | CONFIRMED (test); filed upstream, fix pending | only via the `ReadRemote` API (no in-tree caller) |
+| F1 | `ValidateAndPinHostBlocks` could return a host block id that no longer holds the hash ([filed](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1) 2026-10-19) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `0ac16d1`; **FIXED upstream** in `b3ea4dc` (2026-10-21) | only via the `ReadRemote` API (no in-tree caller) |
 | F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error ([filed](filed_bugs.md#7-raidencontrollerreadremote-deadline-settles-the-read-while-the-acquire-callback-and-pull-continue-so-the-dma-writes-into-blocks-the-caller-has-already-recycled-f2--f3) 2026-10-20, together with F3) | CONFIRMED (test) for shapes A and B (B added 2026-10-20, on upstream `449b591`); proved in Lean for both; filed upstream, fix pending | same |
 | F3 | Data race on `RemoteReadState::lease_id` (filed as part of the F2 report) | CONFIRMED (read); filed upstream, fix pending | same |
 | F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `50b0774`; **FIXED upstream** by PR #1105 = `72255dd` (2026-10-07) | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
@@ -80,17 +83,20 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 | F7 | `end_incoming_push` hook: a failed incoming push on a `ReshardReceiveSession` is not turned into `Finish(status)` (the `TransferReceiveSession` branch does), so the session, its staging lease and plan claim stay pinned until the deadline sweep, which reports `DEADLINE_EXCEEDED` instead of the push error ([filed](filed_bugs.md#3-reshardreceivesession-ignores-a-failed-endincomingpush-and-pins-poolstagingstorage-until-timeout-r1); R1 in `docs/transfer/reshard.md`) | CONFIRMED (read) at `0ac16d1`, witnessed in Lean (`Receive.lean`); **FIXED upstream** in `fdeebcd` (2026-10-16) | yes: any pool-reshard receiver whose sender's push fails mid-transfer (socket timeout / disconnect) |
 | F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
 | F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
-| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape, reopened on the sender) (R6 in `docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `449b591`); not yet filed | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
+| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape, reopened on the sender) (R6 in `docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `2ed6f8f`); not yet filed | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
 | C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_c1_*`, leaks absorbing, `contract_safe` for the fix); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet) | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
 
-## F1. `ValidateAndPinHostBlocks` can return a host block id that no longer holds the hash
+## F1. `ValidateAndPinHostBlocks` could return a host block id that no longer holds the hash
 
 - **Status:** **CONFIRMED (test)**, 2026-09-24, on unmodified `b68161a`;
   re-run on `d16701e` with the same result. Filed upstream 2026-10-19
   ([write-up](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1)),
-  code unchanged through `0ac16d1`; fix pending. Output, verbatim:
+  code unchanged through `0ac16d1`. **FIXED upstream** in `b3ea4dc`
+  (2026-10-21, "Use single-lock local Lookup in ValidateAndPinHostBlocks and
+  SaveRemote"), which is the fix proposed below. Output on the unfixed
+  code, verbatim:
   ```
   [ RUN      ] KVCacheStorePinRaceTest.EvictAndReinsertBetweenLookupAndPinReturnsStaleHostBlockId
   tpu_sync/kv_cache/kv_cache_store_pin_race_test.cc:161: Failure
@@ -102,18 +108,19 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   ValidateAndPinHostBlocks returned host block 5 but h0 now lives at 9; the returned block holds hash 'other'. The pin protects block 9, not the block the reader will pull.
   [  FAILED  ] KVCacheStorePinRaceTest.EvictAndReinsertBetweenLookupAndPinReturnsStaleHostBlockId (10 ms)
   ```
-- **Where:** `tpu_sync/kv_cache/kv_cache_store.cc:1615-1642`
-  (`KVCacheStore::ValidateAndPinHostBlocks`).
-- **Defect:** The function calls `backend()->Lookup(hashes)` with default
-  options (`:1618`; `pin_found = false` by default,
-  `kv_cache_store_backend.h:104`), copies `host_block_id`, and only then calls
-  `backend()->Pin(hashes)` (`kv_cache_store.cc:1637`). The backend mutex is
-  released between the two calls. The only lock held across them is
-  `KVCacheStore::mutex_`, and neither of the following takes it:
-  - `KVCacheStore::Evict` (`:1800`). The comment at `:1804-1806` says "We do
+- **Where:** `tpu_sync/kv_cache/kv_cache_store.cc:1623-1651`
+  (`KVCacheStore::ValidateAndPinHostBlocks`, as fixed; the unfixed function was
+  `:1615-1642` at `0ac16d1`).
+- **Defect (through `0ac16d1`):** The function called `backend()->Lookup(hashes)`
+  with default options (`pin_found = false` by default,
+  `kv_cache_store_backend.h:114`), copied `host_block_id`, and only then called
+  `backend()->Pin(hashes)`. The backend mutex was released between the two
+  calls. The only lock held across them was `KVCacheStore::mutex_`, and
+  neither of the following takes it:
+  - `KVCacheStore::Evict` (`kv_cache_store.cc:1809`). The comment at `:1813-1815` says "We do
     not hold store mutex_". It is called from `SweepOnce` and
     `AllocateBlockIds`.
-  - `KVCacheStore::Insert` (`:1008`).
+  - `KVCacheStore::Insert` (`kv_cache_store.cc:1017`).
 - **Bad interleaving:**
   1. T1 runs `Lookup(h)` and gets host block 5.
   2. T2 evicts `h`; block 5 goes back to the pool.
@@ -127,23 +134,37 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 - **Evidence that this is unintended:**
   - The Fetch path closes the same window with `pin_found = true` and a
     comment describing exactly this failure
-    (`kv_cache_store_service.cc:444-456`).
-  - The header promises "the authoritative source host_block_ids (re-derived
-    from the LRU)" (`kv_cache_store.h:388-389`).
+    (`kv_cache_store_service.cc:461-474`).
+  - The header promises "the authoritative source host_block_ids"
+    (`kv_cache_store.h:388-391`, now also stating the single-Lookup,
+    all-or-nothing contract).
 - **Reachability:**
   - The source side runs whenever a peer calls `AcquireReadLease` on this
-    controller; the hook is registered at `kv_cache_store.cc:1602-1612`.
+    controller; the hook is registered at `kv_cache_store.cc:1610-1621`.
   - The only initiator of that RPC in this tree is
     `RaidenController::ReadRemote`, which has **no production C++ caller**.
     `KVCacheStore::Load`'s remote branch uses `backend()->Load`. So in this
     snapshot the path is reachable only through the API and tests.
   - The race needs an evict **and** a re-insert of the same hash between two
     adjacent statements. Narrow, but real.
-- **Fix:** `LookupOptions{.enable_global = false, .pin_found = true}` and drop
-  the separate `Pin`, mirroring the Fetch path. This also removes a blocking
-  registry RPC made while `mutex_` is held. In `candidate_fixes.patch`.
+- **Fix (landed as `b3ea4dc`):** `LookupOptions{.enable_global = false,
+  .pin_found = true}` and no separate `Pin` (`kv_cache_store.cc:1626-1629`);
+  `HostOffloadBackend::Lookup`'s local prefix path matches and pins under one
+  `mutex_` hold (`host_offload_backend.cc:211-237`), and the two error returns
+  release the partial pins (`kv_cache_store.cc:1631, 1642`). This also removed
+  a blocking registry RPC made while `mutex_` was held. An equivalent change
+  (same options, releases by a collected list instead of by span) was in
+  `candidate_fixes.patch` until 2026-10-22, when the hunk was dropped as
+  redundant.
 - **Repro:** `kv_cache_store_pin_race_test.cc`. A delegating backend runs the
-  other threads' exact backend calls inside the window.
+  other threads' exact backend calls inside the window. Not re-run on
+  `b3ea4dc` (no Bazel on this machine, and `2ed6f8f` itself changed the
+  `KVCacheStoreBackend::Insert` signature the test's `WindowBackend`
+  overrides, so it needs a one-line adaptation first). By construction it
+  passes on the fixed code: the hook still fires after `Lookup` returns, but
+  the pin is already held, so `Evict({h})` is refused and the hook returns
+  (`kv_cache_store_pin_race_test.cc:134-138`) — the outcome §"Fix
+  validation" observed with the patch applied.
 
 ## F2. Remote read keeps DMA-ing into destination blocks after it has already failed with a deadline error
 
@@ -180,18 +201,18 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   (`raiden_controller.cc:107-130`), so shape A needs an acquire that takes
   longer than that (a hung source) and shape B a pull that outlives the
   deadline, which is the case the deadline exists for.
-- **Where:** `tpu_sync/core/controller/raiden_controller.cc:1051-1139`
-  (acquire callback and deadline thread), `:1144-1246` (`PullAndRelease`).
+- **Where:** `tpu_sync/core/controller/raiden_controller.cc:1057-1145`
+  (acquire callback and deadline thread), `:1150-1252` (`PullAndRelease`).
 - **Defect:** A detached deadline thread calls `Settle(DeadlineExceeded)`
-  (`:1119-1139`). Neither the acquire callback (`:1053-1112`) nor
-  `PullAndRelease` (`:1196-1197`) checks `state->settled` before calling
+  (`:1125-1145`). Neither the acquire callback (`:1059-1118`) nor
+  `PullAndRelease` (`:1202-1203`) checks `state->settled` before calling
   `TransferBuffers`, and an in-flight transfer is never cancelled.
   - If the acquire response arrives after the deadline, the pull **starts**
     after the caller has been told the read failed (shape A).
   - If the deadline fires during the pull, the caller is told the read
     failed while the DMA continues (shape B).
   - The comment in `PullAndRelease` says the host staging blocks are returned
-    to the pool "once the read settles, success or failure" (`:1169-1173`; see
+    to the pool "once the read settles, success or failure" (`:1175-1179`; see
     also `raiden_controller.h:180-182`). A late pull
     therefore writes into staging blocks that were freed and reallocated,
     and into device blocks the caller may already be refilling.
@@ -216,10 +237,10 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 - **Status:** CONFIRMED (read). Undefined behaviour under the C++ memory
   model. Not tested; it needs a TSan build.
 - **Where:** `raiden_controller.cc`
-  - `uint64_t lease_id` is a plain field, not under `mu` (`:932`; `settled`
-    at `:934` is guarded, `lease_id` is not).
-  - Written on the gRPC callback thread at `:1069`.
-  - Read on the detached deadline thread at `:1125`, `:1130`, `:1136` with no
+  - `uint64_t lease_id` is a plain field, not under `mu` (`:938`; `settled`
+    at `:940` is guarded, `lease_id` is not).
+  - Written on the gRPC callback thread at `:1075`.
+  - Read on the detached deadline thread at `:1131`, `:1136`, `:1142` with no
     synchronisation.
 - **Practical effect:** If the deadline thread reads 0, it skips the early
   release and the source keeps its pins for the full lease TTL.
@@ -231,10 +252,10 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   in `72255dd`** (2026-10-07, "Validate all workers before dispatching in
   `RaidenController::TransferBuffers` and release auto-allocated staging on
   error" = [PR #1105](https://github.com/google/tpu-sync/pull/1105), merged
-  via copybara). At `0ac16d1` (unchanged since `1fa06d1`) every worker is matched
-  (`raiden_controller.cc:702-740`) before staging is auto-allocated
-  (`:772-784`) and before any request is built (`:787-803`; a build failure
-  frees the staging at `:798`); dispatch starts at `:805` and has no early
+  via copybara). At `2ed6f8f` (unchanged since `1fa06d1`) every worker is matched
+  (`raiden_controller.cc:708-746`) before staging is auto-allocated
+  (`:778-790`) and before any request is built (`:793-809`; a build failure
+  frees the staging at `:804`); dispatch starts at `:811` and has no early
   return after it. Three upstream tests cover it
   (`TransferBuffersUnmatchedNodeIdDispatchesNoWorker`,
   `TransferBuffersUnmatchedNodeIdDoesNotLeakAutoStaging`,
@@ -254,23 +275,23 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   (the second after `TransferBuffers` returned `no destination worker group
   with node_id 1 ...`; `BugHuntTest.TransferBuffersDispatchesNoWorkerWhenAnyWorkerIsUnmatched`, on `d16701e`).
 - **Where (at `50b0774`, before the fix):** `RaidenController::TransferBuffers`
-  (broadcast overload), `raiden_controller.cc:573-793`. When the transfer is
+  (broadcast overload), `raiden_controller.cc:579-799`. When the transfer is
   cross-node and touches local HBM with no staging supplied, it allocates
-  staging itself (`:639-656`).
-  - Only the success path frees it (`:780-790`).
-  - The error returns at `:673` (no workers), `:722` / `:737` (node_id
-    mismatch), `:768` (request build) and `:776` (no client) never free it.
-  - Worse, `:722` / `:737` / `:768` can return **after** earlier workers were
-    already dispatched (`:771`). Those transfers keep running un-awaited
+  staging itself (`:645-662`).
+  - Only the success path frees it (`:786-796`).
+  - The error returns at `:679` (no workers), `:728` / `:743` (node_id
+    mismatch), `:774` (request build) and `:782` (no client) never free it.
+  - Worse, `:728` / `:743` / `:774` can return **after** earlier workers were
+    already dispatched (`:777`). Those transfers keep running un-awaited
     against the staging blocks and, on the destination side, against its
     buffers, while the caller already sees the error.
 - **Reachability:**
   - **Leak half: no in-tree production trigger.** Auto-allocation needs a
     cross-node transfer that touches *local HBM* with no staging supplied.
     The production callers of the broadcast overload never do that: Fetch
-    (`kv_cache_store_service.cc:525`, DRAM → remote DRAM), WriteRemote
-    (`:773`, remote DRAM → DRAM), `host_offload_backend.cc:1151`, `:1243`
-    (local DRAM → HBM), `:1325` (local HBM → DRAM). No Python binding or
+    (`kv_cache_store_service.cc:542`, DRAM → remote DRAM), WriteRemote
+    (`:805`, remote DRAM → DRAM), `host_offload_backend.cc:1168`, `:1260`
+    (local DRAM → HBM), `:1342` (local HBM → DRAM). No Python binding or
     vllm-torchtpu code calls `TransferBuffers` directly.
   - **Orphaned-copy half: reachable from production.** Fetch and WriteRemote
     pass remote worker endpoints, so they go through the node_id matching
@@ -278,9 +299,9 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
     `raiden_controller.cc:722` / `:737` (at `50b0774`)
     return after the earlier workers were dispatched. Fetch then awaits the
     error, unpins its source blocks (`unpin_cleanup`,
-    `kv_cache_store_service.cc:473`) and fails the RPC; the client's
+    `kv_cache_store_service.cc:490`) and fails the RPC; the client's
     `LoadRemoteBlocks` frees `dst_host_block_ids`
-    (`host_offload_backend.cc:1114-1125`). Meanwhile the dispatched worker
+    (`host_offload_backend.cc:1131-1142`). Meanwhile the dispatched worker
     copy may still be reading the source and writing the destination.
   - **Trigger:** the two sides disagree about which node_ids exist
     (config/topology mismatch). How likely that is in real deployments is
@@ -318,7 +339,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 - **Where:** `KVCacheManagerWithTransfer::StartRead` →
   `TransferReceiveSession::Create` → `AllocateStagingForLoad` →
   `StagingBlockAllocator::Acquire`, non-blocking and first-come-first-served
-  (`kv_cache_manager_with_transfer.cc:903-912`,
+  (`kv_cache_manager_with_transfer.cc:909-918`,
   `transfer_receive_session.cc:208-235`,
   `tpu_sync/core/staging_arena.cc:514-518`, slot pop `:494-499`; the allocator moved
   there from `kv_cache_manager_with_transfer.cc` in `fc8cff9`).
@@ -331,7 +352,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
     cancelling a read to a dead peer does not return its slot before the
     deadline.
   - On `ResourceExhausted`, `StartRead` puts the request in `failed_recving_`
-    and returns (`kv_cache_manager_with_transfer.cc:908-911`). No queueing: the
+    and returns (`kv_cache_manager_with_transfer.cc:914-917`). No queueing: the
     read is rejected, not delayed.
   - Nothing bounds how many slots one peer may hold. The September changes
     bound how *long*: control-plane deadline (`430089c`, PR #1010, the
@@ -434,25 +455,25 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 - **Where (at `1fa06d1`, before the fix):** two layers disagree about who owns a staging lease.
   1. The per-storage lease table is keyed by `uuid` only, not by session
      instance: `KVCacheManagerBase::AcquirePoolStagingLease`
-     (`kv_cache_manager_base.cc:2086-2143`) is idempotent per `uuid` — it
+     (`kv_cache_manager_base.cc:2087-2144`) is idempotent per `uuid` — it
      returns `OK` when `pool_staging_[s].leases[uuid]` already covers the
-     requested blocks (`:2095-2113`) — and `ReleasePoolStagingLeases(uuid)`
-     (`:2145-2161`) unconditionally erases `leases[uuid]` and returns all of
-     its slots to `free_slots` (`:2150-2156`). `StagingBlockAllocator`
-     forwards both (`kv_cache_manager_with_transfer.cc:1261-1275`).
+     requested blocks (`:2096-2114`) — and `ReleasePoolStagingLeases(uuid)`
+     (`:2146-2162`) unconditionally erases `leases[uuid]` and returns all of
+     its slots to `free_slots` (`:2151-2157`). `StagingBlockAllocator`
+     forwards both (`kv_cache_manager_with_transfer.cc:1267-1281`).
   2. `ReshardReceiveSession` is a per-call heap object that acquires staging
      *before* `uuid` uniqueness is enforced. `PoolReshardRegisterRecv`
-     (`kv_cache_manager_with_transfer.cc:642-677`) checks
-     `active_pool_reshard_recvs_` under `mu_` (`:649-663`), but that table
-     only holds sessions whose registration already completed (`:672-675`).
+     (`kv_cache_manager_with_transfer.cc:648-683`) checks
+     `active_pool_reshard_recvs_` under `mu_` (`:655-669`), but that table
+     only holds sessions whose registration already completed (`:678-681`).
      `mu_` is released while `ReshardReceiveSession::Create`
      (`reshard_receive_session.cc:351-377`) constructs the object (`:372-374`)
      and calls `AcquireStagingLeases` (`:375` → `:407-444`), which sets
      `staging_released_ = false` (`:419`) and leases per storage (`:437-438`,
      possibly blocking on `staging_cv_` for free slots,
-     `kv_cache_manager_base.cc:2121-2130`) — all before
+     `kv_cache_manager_base.cc:2122-2131`) — all before
      `RegisterActivePlanDirect(uuid)` claims the `uuid` in `active_plans_`
-     (`kv_cache_manager_with_transfer.cc:670-671`).
+     (`kv_cache_manager_with_transfer.cc:676-677`).
      (`ReshardSendSession::Create` does it the other way round and claims the
      `uuid` first, `reshard_send_session.cc:138-139`.)
 - **Sequence** (two `PoolReshardRegisterRecv` calls for the same `uuid = U`
@@ -515,10 +536,11 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   in `kv_cache_manager_with_transfer_pool_reshard_test.cc`. The description
   below is of the unfixed code at `0ac16d1`.
 - **Where (at `0ac16d1`, before the fix):** `KVCacheManagerWithTransfer::InitializeBaseHooks()`
-  (`kv_cache_manager_with_transfer.cc:250-290`). The `TransferReceiveSession`
-  branch calls `DeferUnregisterOnSettle(); Finish(status)` on a failed push
-  before `EndRecvOp()` (`:266-271`); the `ReshardReceiveSession` branch calls
-  `EndRecvOp()` only and ignores `status` (`:279-289`).
+  (`kv_cache_manager_with_transfer.cc:250-290` there; `:250-296` at `2ed6f8f`).
+  The `TransferReceiveSession` branch calls `DeferUnregisterOnSettle();
+  Finish(status)` on a failed push before `EndRecvOp()` (`:266-271`); the
+  `ReshardReceiveSession` branch called `EndRecvOp()` only and ignored
+  `status` (`:279-289` there; the fix is `:279-285` at `2ed6f8f`).
 - **Sequence:** the sender does not retry a failed push
   (`ReshardSendSession::RecordPushCompletion`, `reshard_send_session.cc:351-373`,
   latches `finalizing_` on the first error), and
@@ -528,7 +550,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   false, `UnregisterSettledPlan` is skipped, and the hook returns `OK`.
 - **Impact:** the session's `PoolStagingLease` keeps its bounded slots and
   `active_plans_[uuid]` stays registered until the deadline sweep
-  (`kv_cache_manager_with_transfer.cc:1037-1066`) fires at `timeout_s_`
+  (`kv_cache_manager_with_transfer.cc:1043-1072`) fires at `timeout_s_`
   (default 120 s) and reports `DEADLINE_EXCEEDED: Pool reshard receive timed
   out`, masking the original error; meanwhile later pool reshards wait on
   `AcquirePoolStagingLease` up to `pool_staging_lease_timeout()` (10 s) and
@@ -556,7 +578,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   (The test asserts the defect: after the injected sender failure,
   `GetRequestBlockStatus` is `STATUS_CLAIMED` and `CancelIfUnclaimed` returns
   `"false"`; it passes on unmodified code and would fail once the fix lands.)
-- **Where (at `0ac16d1`):** `ReshardCoordinator::ExecutePoolReshard`
+- **Where (at `2ed6f8f`, unchanged since `0ac16d1`):** `ReshardCoordinator::ExecutePoolReshard`
   (`reshard_coordinator.cc:415-544`). `BuildPoolReshardPlan` claims
   `(req_id, uuid)` under a fresh `claim_owner` (`:417-420`). The three error
   returns that follow — plan build (`:421-424`), receiver arm (`:458-463`),
@@ -595,7 +617,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   (With `ttl_s = 60`: register at `t = 1000`, stage 0 claims at `t = 1040`,
   at `t = 1070` the status probe still reads `STATUS_CLAIMED` while stage 1's
   `CoordinateTransfer` fails with `"Missing producer block registration"`.)
-- **Where (at `0ac16d1`):** `request_block_registry.cc`. `Register` stamps
+- **Where (at `2ed6f8f`, unchanged since `0ac16d1`):** `request_block_registry.cc`. `Register` stamps
   `expires_at = now + ttl_s_` on each `request_blocks_` row (`:263`).
   `LookupAndClaim` (`:440-491`) reads those rows (`:462-470`), then sets
   `claimed_[key] = now + ttl_s_` (`:473`) and refreshes `completed_units_`
@@ -638,7 +660,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   The test drives the session's op accounting through upstream's own
   `ReshardSendSessionTestPeer` friend seam (`reshard_send_session.h`), because
   `ExecutePush` needs real D2H copies.
-- **Where (at `0ac16d1`):** `ReshardSendSession::RecordPushCompletion`
+- **Where (at `2ed6f8f`, unchanged since `0ac16d1`):** `ReshardSendSession::RecordPushCompletion`
   (`reshard_send_session.cc:351-392`). On the first `!status.ok()` it latches
   `finalizing_` and calls `manager.UnregisterActivePlan(uuid_)` (`:366-367`,
   `:383`) regardless of `in_flight_`. `EndOp` (`:418-440`) already unregisters
@@ -652,7 +674,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
      `!Done()`, and **`HasActivePlan(uuid) == false`**.
   3. A sibling resolving its chunks now gets none (`GetBlockChunks(uuid)`
      empty). On a full-mirror storage the same call falls back to un-sliced
-     full-block extents instead (`kv_cache_manager_base.cc:3306-3325`).
+     full-block extents instead (`kv_cache_manager_base.cc:3307-3326`).
   4. A retry `Create` for the same `uuid` **succeeds** (it would be
      `ALREADY_EXISTS` while the plan is registered — the guard `8653373` relies
      on for the receiver). Its `AcquirePoolStagingLease(uuid)` is idempotent
@@ -705,7 +727,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   its D-side remedy is exactly the fix shape below: the failed request stays
   in `done_recving` *and* its local blocks go through a new
   `get_block_ids_with_load_errors()` in the same step. tpu-sync upstream
-  `main` `75bd590` (30 commits past `0ac16d1`) does not change the
+  through `2ed6f8f` (merged 2026-10-22) does not change the
   `failed_recving_` classification of a failed or never-pulled send. The
   `vllm-jax` successor repository holds only a README (`d086b9c`). This is a defect in the
   **caller**, recorded here because it is the production caller of the path
@@ -786,11 +808,11 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   `delay_free_blocks = True` with a fresh uuid (`:437-455`) → scheduler holds
   the blocks (`scheduler.py:2075-2092`) → worker `register_read` (`:587`) →
   tpu-sync `NotifyForRead` creates a `TransferSendSession` with
-  `deadline = now + timeout_s` (`kv_cache_manager_with_transfer.cc:456-500`;
+  `deadline = now + timeout_s` (`kv_cache_manager_with_transfer.cc:462-506`;
   `timeout_s` is the same 180 s, connector `:522`, `utils.py:88-91`). If D
   never pulls, or the push fails, the poll finishes the session with
   `DeadlineExceeded`/the push error and files the req_id in **`failed_recving_`**
-  (`mgr.cc:961-970`: `(failed ? failed_recving_ : done_sending_)`). The
+  (`mgr.cc:967-976`: `(failed ? failed_recving_ : done_sending_)`). The
   connector drops it; `finished_sending` never contains it; the blocks are
   never freed.
 - **Consumer sequence (D leaks):** `start_read` (`:606`) → tpu-sync receive
@@ -871,10 +893,10 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
   `torch_d2d_read_benchmark_runner.py:326`), i.e. exactly the reading the
   name invites.
 - **Where:** `KVCacheManagerWithTransfer::CompleteReadWithDetails`,
-  `kv_cache_manager_with_transfer.cc:958-979`. A send session past its
-  deadline and not draining is finished with `DeadlineExceeded` (`:961-967`)
+  `kv_cache_manager_with_transfer.cc:964-985`. A send session past its
+  deadline and not draining is finished with `DeadlineExceeded` (`:967-973`)
   and then `(failed ? failed_recving_ : done_sending_).insert(req_id)`
-  (`:968-970`). `poll_stats()` returns the three lists verbatim
+  (`:974-976`). `poll_stats()` returns the three lists verbatim
   (`api/jax/kv_cache_manager.py:164-171`, `api/torch/` likewise).
 - **History.** At `978efff` (2026-06-13) the sweep did
   `done_sending_.insert(entry->req_id)` for an expired send
@@ -997,7 +1019,7 @@ commits.
 ### R-A. Premature completion in `TransferReceiveSession::IsReadyToComplete()`: REFUTED
 
 The transport dispatches a layer before counting its blocks
-(`block_transport.cc:789` then `:629-630`); the receiver counts per shard
+(`block_transport.cc:790` then `:630-631`); the receiver counts per shard
 and across senders; the `network_completed_` disjunct is an intentional fast path. The
 receive-session model proves readiness sound under this ordering
 (`Transfer/PrefillDecode/Receive.lean`, assumption A4, `ReadinessSound`).
@@ -1020,19 +1042,19 @@ The hazard is narrower and the consequence more specific than the 2026-09
 wording:
 
 - Of the three completion contracts in `BlockTransport::CompleteIncomingPush`
-  (`block_transport.cc:640-793`), the sender-declared (`:732-736`) and
-  plan-declared (`:704-708`) ones reject a stream beyond the declared count and
-  fail the receive; the chunk-count contract (`:739-741`) — the one the
+  (`block_transport.cc:641-794`), the sender-declared (`:733-737`) and
+  plan-declared (`:705-709`) ones reject a stream beyond the declared count and
+  fail the receive; the chunk-count contract (`:740-742`) — the one the
   prefill-to-decode path uses whenever the receive plan has no
-  `shard_push_schedules` (`kv_cache_manager_base.cc:2687-2703`) — accepts it
+  `shard_push_schedules` (`kv_cache_manager_base.cc:2688-2704`) — accepts it
   silently. The duplicate is not dispatched (`completed_chunks ≠ num_streams`)
-  but is still reported through `OnBlockShardsReceived` (`:629-630`), so
+  but is still reported through `OnBlockShardsReceived` (`:630-631`), so
   `network_completed_` is reached with another layer's blocks never received,
   and `IsReadyToComplete` (`transfer_receive_session.cc:450-455`) reports
   success with that layer never copied
   (`Transport.trace_dup_chunk_publishes_missing_layer`).
 - On **either** contract, once every layer has been called the transport
-  erases the uuid's `layer_progress_` entries (`:764-778`) while the receive is
+  erases the uuid's `layer_progress_` entries (`:765-779`) while the receive is
   still live (its H2D copies are in flight), and `ExecuteLayerH2d` has no
   once-latch of its own (`transfer_receive_session.cc:642-700`). A later stream
   for that uuid starts a fresh entry, fires `OnLayerReceived` again and issues
@@ -1045,7 +1067,7 @@ wording:
   (`:359-363`) (`Transport.trace_dup_after_retirement`,
   `trace_dup_copy_fails_late`). A redundant DMA and a spurious failure, not a
   wrong publication.
-- In both cases the duplicate stream's payload read (`:604`) rewrites the
+- In both cases the duplicate stream's payload read (`:605`) rewrites the
   layer's host staging while the first H2D copy of that layer may still be
   reading it; harmless only if the duplicate carries the same bytes.
 - With honest senders (at most the declared streams per layer, for the life of
@@ -1054,11 +1076,11 @@ wording:
   `CompleteOnSuccess`), for any positive layer, sender, stream and block
   counts. The model rests on two further assumptions it names but does not
   prove (`Transport` A2, A3): the contract a layer runs under is latched by
-  its first stream (`:661-683`), and the receiver seats the session before it
-  publishes the plan (`kv_cache_manager_with_transfer.cc:549-567` vs
-  `:596-599`), so a push landing in that window would latch chunk-count on a
+  its first stream (`:662-684`), and the receiver seats the session before it
+  publishes the plan (`kv_cache_manager_with_transfer.cc:555-573` vs
+  `:602-605`), so a push landing in that window would latch chunk-count on a
   sender-declared plan; and the sender-declared contract counts distinct
-  `remote_id = node_id()` (`:1168`) against `shard_push_schedules`, which are
+  `remote_id = node_id()` (`:1170`) against `shard_push_schedules`, which are
   keyed by source shard, so it presumes one source shard per node.
 
 Still not reachable from the in-repo callers for the reason above (fresh uuid
@@ -1081,32 +1103,32 @@ not bugs.
 
 ### R-D. `WriteRemote` landing blocks freed at the deadline while the DMA is still writing: REFUTED (read)
 
-`DeadlineLoop` (`kv_cache_store_service.cc:1040`) marks the op failed but
+`DeadlineLoop` (`kv_cache_store_service.cc:1087`) marks the op failed but
 does **not** free the landing blocks. They are freed only when the transfer
-future resolves (`CompleteWriteRemote`, `:832-872`, → `ReleaseLandingBlocks`
-`:572`); a leak warning is logged if the transfer never resolves
-(`:1068-1079`). This is the `deferSettleWhilePullInFlight` design from the
+future resolves (`CompleteWriteRemote`, `:864-904`, → `ReleaseLandingBlocks`
+`:589`); a leak warning is logged if the transfer never resolves
+(`:1115-1126`). This is the `deferSettleWhilePullInFlight` design from the
 Lean model. `ReadRemote` (F2) lacks it, which suggests F2 is an oversight
 rather than a design choice.
 
 ### R-E. Local `KVCacheStore::Load` reads host blocks that could be evicted mid-copy: REFUTED (read)
 
 Both `Load` overloads require that the caller already holds a pin on every
-hash; eviction skips pinned entries (`host_offload_backend.cc:607, 745`,
+hash; eviction skips pinned entries (`host_offload_backend.cc:679, 778`,
 `lru_cache.h:258-294`).
 
 ### R-F. Fetch-source (production remote load) unpins before the pull finishes: REFUTED (read)
 
 It matches and pins atomically (`pin_found = true`,
-`kv_cache_store_service.cc:444-456`); the pins are released by a scope cleanup
-after `transfer_future.Await()` returns (`:473`, `:525`).
+`kv_cache_store_service.cc:461-474`); the pins are released by a scope cleanup
+after `transfer_future.Await()` returns (`:490`, `:542`).
 
 ### Open / not yet checked
 
 - `KVCacheStoreClient::Fetch` sets no RPC deadline
   (`kv_cache_store_client.cc:61-125`). If the RPC fails with a transport error
   while the source's workers are still writing, `LoadRemoteBlocks` frees
-  `dst_host_block_ids` immediately (`host_offload_backend.cc:1114-1125`). Same
+  `dst_host_block_ids` immediately (`host_offload_backend.cc:1131-1142`). Same
   shape as F2 but in the production path. Whether in-flight source DMA can
   outlive a failed Fetch RPC depends on worker and transport teardown, not
   established. **PLAUSIBLE.**
@@ -1115,7 +1137,7 @@ after `transfer_future.Await()` returns (`:473`, `:525`).
   destroyed first among the members that matter, so this is probably safe.
   Not verified.
 
-## Observations on the prefill-to-decode path (non-bugs at `0ac16d1`)
+## Observations on the prefill-to-decode path (non-bugs at `2ed6f8f`)
 
 Behaviours that looked like defects during the prefill-to-decode model work and
 turned out to be intended, dead, or proved unreachable. Kept here so they are not
@@ -1125,18 +1147,18 @@ as in the Lean preambles: `recv.cc` = `tpu_sync/kv_cache/transfer_receive_sessio
 `mgr.cc` = `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`,
 `bt.cc` = `tpu_sync/transport/block_transport.cc`.
 
-| Observation | Where (`0ac16d1`) | Note |
+| Observation | Where (`2ed6f8f`) | Note |
 |---|---|---|
-| client-side `SendAck` has no non-test caller; the server-side `OnAck → HandleAck → AckSend → Finish()` handler is wired but never triggered in-repo | `grpc_control_plane_backend.cc:373`, `tcp_control_plane_backend.cc:662`; `mgr.cc:1181-1183, 1358-1361, 1424-1435` | dead path; excluded (`Send` A5) |
-| a failed **send** is reported in `failed_recving_` | `mgr.cc:969-970` | naming/semantics quirk visible through `poll_stats()`; since `4246613` (2026-08-24) this also covers a send nobody pulled, and the tpu-inference connector drops the list — the contributing cause of **C1**'s producer half (see the "tpu-sync side" subsection under C1; judged an improvement request, not a defect) |
+| client-side `SendAck` has no non-test caller; the server-side `OnAck → HandleAck → AckSend → Finish()` handler is wired but never triggered in-repo | `grpc_control_plane_backend.cc:373`, `tcp_control_plane_backend.cc:662`; `mgr.cc:1187-1189, 1364-1367, 1430-1441` | dead path; excluded (`Send` A5) |
+| a failed **send** is reported in `failed_recving_` | `mgr.cc:975-976` | naming/semantics quirk visible through `poll_stats()`; since `4246613` (2026-08-24) this also covers a send nobody pulled, and the tpu-inference connector drops the list — the contributing cause of **C1**'s producer half (see the "tpu-sync side" subsection under C1; judged an improvement request, not a defect) |
 | first `Finish` wins on the send side; a later cancel is ignored | `send.cc:193-206` | intended; `trace_cancel_after_ok_finish` |
 | `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:450-456` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:726-732, 746-756`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlockShardsReceived` (`RecordNetworkCompleteLocked`) are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll (design alternative `stepM false` in `ReceivePoll.lean`) keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). |
 | `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:253-260` vs `recv.cc:407-410` | underflow proved unreachable (`NoUnderflow`) |
 | `LOG(DFATAL) "H2D callback for retired receive"` is unreachable | `recv.cc:718-720` | proved (`NoRetiredCallback`) |
 | `done_` is redundant in six lifecycle guards | `recv.cc:365, 412, 605, 649, 675`, `recv.h:119` (send side: `send.cc:195, 255, 326, 340, 391`) | `done → draining` and `done → in_flight_ == 0` are `Lifecycle.Consistent`, which every model keeps in its invariant (`Inv.life`); the guards without `done_` are the same functions on consistent states (`finishLocked'_eq`, `endOpLocked'_eq`, `beginOp'_eq`, `Consistent.done_or_draining`). Defensive code, not a bug. The two `LOG(DFATAL)` branches (`recv.cc:407-410`, `718-720`) are assertions — unreachable by `Accounted` / `NoRetiredCallback` — and stay. `Session.lean` |
-| a failed incoming push reaches the session as a flat `InternalError("Incoming push failed")` | `bt.cc:509-516` → `mgr.cc:267-270` | the actual cause (read timeout, size mismatch, `OnLayerReceived` error) is only in the transport log, so `failed_recving` cannot tell them apart. Observability, not correctness; the model does not distinguish error statuses. |
+| a failed incoming push reaches the session as a flat `InternalError("Incoming push failed")` | `bt.cc:510-517` → `mgr.cc:267-270` | the actual cause (read timeout, size mismatch, `OnLayerReceived` error) is only in the transport log, so `failed_recving` cannot tell them apart. Observability, not correctness; the model does not distinguish error statuses. |
 | `TransferSendSession::EndSendOp` drops `mu_` inside the last op of a draining send under `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer` | `send.cc:262-289` (window `:284-287`) | closes idle data connections before `EndSendOpLocked`; `in_flight_ == 1`, `draining_`, `!done_` are fixed across the window (no new op, `FinishLocked` returns early, the poll sees `Done() == false`), so the model's atomic `endOp` is exact and only `done_` is delayed. Default `pooled` never enters the branch. `Send.lean` A7. |
-| the chunk-count completion contract has no over-count rejection; retirement erases the `OnLayerReceived` once-latch while the receive is live | `bt.cc:739-741` vs `:704-708, 732-736`; `:764-778`; `recv.cc:642-700` | sound for honest senders (`Transport.reachable_safe`); what one extra stream does, the two unproved assumptions (plan-publication window `mgr.cc:567-598`, `remote_id` vs `shard_push_schedules` identity) and a candidate hardening are under R-B above. `Transport.lean` |
+| the chunk-count completion contract has no over-count rejection; retirement erases the `OnLayerReceived` once-latch while the receive is live | `bt.cc:740-742` vs `:705-709, 733-737`; `:765-779`; `recv.cc:642-700` | sound for honest senders (`Transport.reachable_safe`); what one extra stream does, the two unproved assumptions (plan-publication window `mgr.cc:573-604`, `remote_id` vs `shard_push_schedules` identity) and a candidate hardening are under R-B above. `Transport.lean` |
 
 ---
 
@@ -1153,13 +1175,15 @@ clone reset. Results, verbatim:
 //tpu_sync/kv_cache:kv_cache_store_pin_race_test            PASSED
 ```
 
-- **F1 fix:** with it, the eviction inside the window is refused because
+- **F1 fix** (hunk dropped 2026-10-22, upstream `b3ea4dc` is an equivalent
+  change): with it, the eviction inside the window is refused because
   `h0` is pinned. For this run the test hook was changed to "skip the
   reinsert if the eviction is refused"; it still fails on the unfixed code,
   where the eviction succeeds.
 - **F2 fix:** the naive fix only; closes shape A, not shape B.
-- **F4 fix:** every error return frees the auto-allocated staging, after
-  joining any already-dispatched worker futures.
+- **F4 fix** (hunk dropped 2026-10-10, upstream `72255dd`): every error
+  return frees the auto-allocated staging, after joining any
+  already-dispatched worker futures.
 - `kv_cache_store_test` was not run (`no_oss`, needs a gRPC registry
   environment).
 
@@ -1288,3 +1312,16 @@ clone reset. Results, verbatim:
   `0ac16d1`). The tpu-sync side stays an improvement request, not yet
   raised. Filed tally: F1, F2+F3, F4 (fixed), F6 (fixed), F7 (fixed), F8,
   F9, C1.
+- 2026-10-22 (later): upstream `2ed6f8f` merged (32 commits past `0ac16d1`).
+  **F1 FIXED upstream** by `b3ea4dc` (2026-10-21): `ValidateAndPinHostBlocks`
+  now does one `Lookup(..., pin_found = true)` and releases partial pins on
+  its error paths — the change `candidate_fixes.patch` carried, whose hunk is
+  dropped; the patch is now F2 shape A only (re-based, applies at `2ed6f8f`).
+  `fdeebcd` (F7's fix) is now in the tree; `Reshard/Receive.lean` takes
+  `PushEndPolicy.finishOnError` as its default and keeps the old hook as
+  `.endOpOnly` for the R1 witness. Other changes in cited code are
+  line-shifts only (`9ac3d3e` in `raiden_controller.cc`, `TransferOp` enum
+  and Peregrine includes in `block_transport.cc`, `LookupOptions` refactor in
+  `host_offload_backend.cc` / `kv_cache_store_service.cc`). F5's test is still
+  `DISABLED_`. Citations re-pinned to `2ed6f8f`. Filed tally: F1 (fixed),
+  F2+F3, F4 (fixed), F6 (fixed), F7 (fixed), F8, F9, C1.

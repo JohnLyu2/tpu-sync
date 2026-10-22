@@ -12,7 +12,7 @@ One `ReshardReceiveSession` on the destination (consumer) side and the slice of
 Sender sessions, multi-sender stream counting, and aliased-page memory contents
 are modelled in `Reshard/Send.lean` and `Reshard/Pipeline.lean`.
 
-Citations are to tpu-sync `0ac16d1`. Unqualified `.h`/`.cc` are
+Citations are to tpu-sync `2ed6f8f`. Unqualified `.h`/`.cc` are
 `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`; `mgr.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`; `utils.h` is
@@ -20,19 +20,19 @@ Citations are to tpu-sync `0ac16d1`. Unqualified `.h`/`.cc` are
 
 ## How a reshard receive runs
 
-`PoolReshardRegisterRecv` (`mgr.cc:673-709`) creates a `ReshardReceiveSession`
+`PoolReshardRegisterRecv` (`mgr.cc:679-715`) creates a `ReshardReceiveSession`
 (`.cc:351-418`), claiming the active plan (`RegisterActivePlanDirect`,
 `.cc:376-377`), acquiring bounded per-UUID `PoolStagingLease`s across the
 plan's destination storages (`AcquireStagingLeases`, `.cc:381-388, 420-459`),
-and inserting the session into `active_pool_reshard_recvs_` (`mgr.cc:704-707`).
+and inserting the session into `active_pool_reshard_recvs_` (`mgr.cc:710-713`).
 Each transferred pool in `expected_pool_indices_` (`.h:181`) has an order rank
 in `pool_order_ranks_` (`.h:189`, `.cc:406-417`).
 
 As incoming push streams arrive at `BlockTransport::HandleIncomingPush`
-(`bt.cc:495-793`), each stream takes a receive op via `begin_incoming_push`
+(`bt.cc:496-794`), each stream takes a receive op via `begin_incoming_push`
 (`TryBeginRecvOp`, `mgr.cc:224-249`) and releases it in `end_incoming_push`
-(`EndRecvOp`, `mgr.cc:250-290`). When all `expected_pushes` streams for a pool
-have landed, the transport fires `OnPoolReceived(pool_idx)` (`bt.cc:787`,
+(`EndRecvOp`, `mgr.cc:250-296`). When all `expected_pushes` streams for a pool
+have landed, the transport fires `OnPoolReceived(pool_idx)` (`bt.cc:788`,
 `mgr.cc:180-202`, `.cc:600-612`), which records the pool in
 `started_pool_indices_` (`.cc:541-552`) and calls `ExecuteEligiblePoolH2ds`
 (`.cc:614-666`).
@@ -85,35 +85,35 @@ Session-level fields:
 | `networkCompleted` | `network_completed_` (`.h:173`, set at `.cc:697`)                   | latched on final pool H2D success |
 | `planUnregistered` | `!unregister_on_settle_` (`.h:179`, claimed in `TakePendingUnregister` `.cc:512-520`) | active plan unregistered on settle |
 | `durationRecorded` | ghost (`should_record_duration` / `RecordTransferDuration`, `.cc:696, 702-705`) | end-of-transfer latency histogram recorded |
-| `published`        | membership in `done_recving_` / `failed_recving_` (`mgr.cc:1053-1054`) | what `poll_stats()` shows the engine |
-| `pushes`           | ghost                                                               | incoming pushes between `TryBeginRecvOp` (`mgr.cc:245`) and `EndRecvOp` (`mgr.cc:279`) |
+| `published`        | membership in `done_recving_` / `failed_recving_` (`mgr.cc:1059-1060`) | what `poll_stats()` shows the engine |
+| `pushes`           | ghost                                                               | incoming pushes between `TryBeginRecvOp` (`mgr.cc:245`) and `EndRecvOp` (`mgr.cc:285`) |
 
 ## Events
 
 | Event               | C++ |
 |---------------------|-----|
-| `pushBegin`         | `TryBeginRecvOp` (`.h:100-105`) from `begin_incoming_push` (`mgr.cc:224-249`), called at `bt.cc:507` |
-| `pushEnd ok`        | `end_incoming_push` (`mgr.cc:250-290`), called at `bt.cc:509-515, 632`. Parameterized by `PushEndPolicy`: `.shipping` runs `EndRecvOp()` unconditionally (`mgr.cc:279`), whereas `.finishOnError` calls `Finish(status)` before `EndRecvOp()` on `ok = false` (matching `TransferReceiveSession`, `mgr.cc:267-270`) |
+| `pushBegin`         | `TryBeginRecvOp` (`.h:100-105`) from `begin_incoming_push` (`mgr.cc:224-249`), called at `bt.cc:508` |
+| `pushEnd ok`        | `end_incoming_push` (`mgr.cc:250-296`), called at `bt.cc:510-516, 633`. Parameterized by `PushEndPolicy`: `.finishOnError` (shipping since `fdeebcd`) calls `Finish(status)` before `EndRecvOp()` on `ok = false` (`mgr.cc:282-285`, matching `TransferReceiveSession`, `mgr.cc:267-271`), whereas `.endOpOnly` (pre-`fdeebcd`) ran `EndRecvOp()` unconditionally |
 | `onPoolReceived p`  | `OnPoolReceived(pool_idx)` (`.cc:600-612`) + `ExecuteEligiblePoolH2ds` first lock (`.cc:618-624`): records `p` in `started_pool_indices_` and batch-queues every eligible started pool |
 | `h2dIssue p ok`     | `ExecuteEligiblePoolH2ds` loop body for queued pool `p` (`.cc:625-665`): re-checks `done_ \|\| draining_` under `mu_` (`.cc:633-638`), otherwise dispatches `H2dPoolBlocks` |
 | `h2dReady p`        | device finishes pool `p`'s H2D copy: its future in `h2d_futures_` becomes `IsReady()` |
 | `h2dDone p ok`      | `future.OnReady` callback (`.cc:654-664`) calling `FinishPoolH2d` (`.cc:668-706`), `EndRecvOp`, and `MaybeUnregisterSettledReshardRecv` |
-| `pollReady`         | `CompleteReadWithDetails` sees `!IsDraining() && IsReadyToComplete()` and calls `Finish()` (`mgr.cc:1041-1046`) |
-| `cancel`            | external `Finish(error)`: deadline (`mgr.cc:1046-1049`), shutdown (`mgr.cc:385-389`), or `UnregisterActivePlan` (`mgr.cc:741-747`) |
-| `publish`           | `CompleteReadWithDetails` moves a settled session into `done_recving_` or `failed_recving_`, claims `TakePendingUnregister`, and erases it (`mgr.cc:1052-1063`) |
+| `pollReady`         | `CompleteReadWithDetails` sees `!IsDraining() && IsReadyToComplete()` and calls `Finish()` (`mgr.cc:1047-1052`) |
+| `cancel`            | external `Finish(error)`: deadline (`mgr.cc:1052-1055`), shutdown (`mgr.cc:391-395`), or `UnregisterActivePlan` (`mgr.cc:747-753`) |
+| `publish`           | `CompleteReadWithDetails` moves a settled session into `done_recving_` or `failed_recving_`, claims `TakePendingUnregister`, and erases it (`mgr.cc:1058-1069`) |
 
 ## Assumptions
 
 * **A1 (at-most-once `OnPoolReceived` per declared pool).** `BlockTransport`
   fires `OnPoolReceived(l, uuid)` only when `plan_pushes == expected_chunks`
-  (`bt.cc:686-787`), and `RecordPoolReceivedLocked` rejects undeclared or
+  (`bt.cc:687-788`), and `RecordPoolReceivedLocked` rejects undeclared or
   duplicate pool indices (`.cc:541-552`). Encoded as the `onPoolReceived p`
   guard `pool.stage == .waiting`. (Discharged in `Reshard/Pipeline.lean`
   by explicit stream counting.)
 * **A2 (registration before visibility).** `RegisterActivePlanDirect`
   (`.cc:376-377`) and `AcquireStagingLeases` (`.cc:381-388, 420-459`) succeed
   before the session is inserted into `active_pool_reshard_recvs_`
-  (`mgr.cc:704-707`). If `AcquireStagingLeases` fails, `Create` releases the
+  (`mgr.cc:710-713`). If `AcquireStagingLeases` fails, `Create` releases the
   lease and rolls back `UnregisterActivePlanDirect` (`.cc:385-386`) before any
   hook can find the session.
 * **A3 (no double end).** Each push and each H2D op ends at most once: `pushEnd`
@@ -130,7 +130,7 @@ Session-level fields:
 ## Properties
 
 All proved on every reachable state (`reachable_safe`), under both
-`PushEndPolicy.shipping` and `PushEndPolicy.finishOnError`:
+`PushEndPolicy.finishOnError` (shipping) and `PushEndPolicy.endOpOnly`:
 
 * **Settle safety (`SettleSafe`).** `done → inFlight = 0`: a settled session
   owns no in-flight push or H2D copy, as required by `.cc:630-632` and
@@ -143,7 +143,7 @@ All proved on every reachable state (`reachable_safe`), under both
 * **Plan integrity (`PlanIntegrity`).** `(planUnregistered → done) ∧
   (published ≠ none → planUnregistered)`: the active transfer plan is never
   unregistered while any push or H2D copy can still resolve through it
-  (`.cc:685-688`, `mgr.cc:727-734, 776-782`), and is always unregistered once
+  (`.cc:685-688`, `mgr.cc:733-740, 782-788`), and is always unregistered once
   published.
 * **Prompt settle (`SettlesPromptly`).** `draining → inFlight = 0 → done`.
 * **Rank-wave ordering (`RankWaveOrder`).** For every pair of pools `p, q ∈ pools`,
@@ -211,13 +211,16 @@ structure Pool where
   stage : PoolStage := .waiting
   deriving Repr, DecidableEq
 
-/-- Policy for `end_incoming_push` on `ReshardReceiveSession` (`mgr.cc:279-289`):
-`shipping` calls `EndRecvOp()` unconditionally; `finishOnError` mirrors the
-`TransferReceiveSession` branch (`mgr.cc:267-270`) by calling
-`Finish(status)` before `EndRecvOp()` when the incoming push failed. -/
+/-- Policy for `end_incoming_push` on `ReshardReceiveSession` (`mgr.cc:279-295`):
+`finishOnError`, the shipping code since `fdeebcd` (2026-10-16, the fix for
+finding F7 / R1), mirrors the `TransferReceiveSession` branch (`mgr.cc:267-271`)
+by calling `Finish(status)` before `EndRecvOp()` when the incoming push failed
+(`mgr.cc:282-285`); `endOpOnly` is the pre-`fdeebcd` hook, which called
+`EndRecvOp()` unconditionally. Kept so `trace_r1_failed_incoming_push` still
+witnesses the defect. -/
 inductive PushEndPolicy where
-  | shipping
   | finishOnError
+  | endOpOnly
   deriving Repr, DecidableEq
 
 structure Recv where
@@ -283,7 +286,7 @@ def init (ranks : List Nat) : Recv :=
 def isReadyToComplete (s : Recv) : Bool :=
   s.networkCompleted && allH2dDone s.pools
 
-/-- `MaybeUnregisterSettledReshardRecv` (`mgr.cc:776-782`, `.cc:512-520`): once
+/-- `MaybeUnregisterSettledReshardRecv` (`mgr.cc:782-788`, `.cc:512-520`): once
 `done_` is set, claims `unregister_on_settle_` and unregisters the plan. -/
 def maybeUnregisterSettled (s : Recv) : Recv :=
   if s.life.done = true then { s with planUnregistered := true } else s
@@ -313,10 +316,10 @@ inductive Ev where
 def pushBegin (s : Recv) : Option Recv :=
   s.life.beginOp.map fun l => { s with life := l, pushes := s.pushes + 1 }
 
-/-- `end_incoming_push` (`mgr.cc:250-290`). Under `.shipping`, only `EndRecvOp()`
-runs (`mgr.cc:279`); under `.finishOnError`, a failed push calls `Finish(status)`
-before `EndRecvOp()` (`mgr.cc:267-270`). If the session is now settled,
-`TakePendingUnregister` unregisters the plan (`mgr.cc:281-284`). -/
+/-- `end_incoming_push` (`mgr.cc:250-296`). Under `.finishOnError` (shipping), a
+failed push calls `Finish(status)` before `EndRecvOp()` (`mgr.cc:282-285`);
+under `.endOpOnly` (pre-`fdeebcd`), only `EndRecvOp()` ran. If the session is now
+settled, `TakePendingUnregister` unregisters the plan (`mgr.cc:287-290`). -/
 def pushEnd (pol : PushEndPolicy) (ok : Bool) (s : Recv) : Option Recv :=
   if s.pushes = 0 then none
   else
@@ -403,23 +406,23 @@ def h2dDone (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
   | none => none
 
 /-- `CompleteReadWithDetails` polls a non-draining session and sees
-`IsReadyToComplete()` (`mgr.cc:1041-1046`). -/
+`IsReadyToComplete()` (`mgr.cc:1047-1052`). -/
 def pollReady (s : Recv) : Option Recv :=
   if s.life.draining = false ∧ isReadyToComplete s = true then
     some { s with life := s.life.finishLocked true }
   else none
 
-/-- External `Finish(error)` (`mgr.cc:385-389, 741-747, 1046-1049`). -/
+/-- External `Finish(error)` (`mgr.cc:391-395, 747-753, 1052-1055`). -/
 def cancel (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false }
 
-/-- `CompleteReadWithDetails` publishes a settled session (`mgr.cc:1052-1063`). -/
+/-- `CompleteReadWithDetails` publishes a settled session (`mgr.cc:1058-1069`). -/
 def publish (s : Recv) : Option Recv :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk, planUnregistered := true }
   else none
 
-def step (pol : PushEndPolicy := .shipping) (s : Recv) : Ev → Option Recv
+def step (pol : PushEndPolicy := .finishOnError) (s : Recv) : Ev → Option Recv
   | .pushBegin => s.pushBegin
   | .pushEnd ok => s.pushEnd pol ok
   | .onPoolReceived p => s.onPoolReceived p
@@ -431,7 +434,7 @@ def step (pol : PushEndPolicy := .shipping) (s : Recv) : Ev → Option Recv
   | .publish => s.publish
 
 /-- System for a reshard receiver with pool order ranks `ranks` under `pol`. -/
-def sys (ranks : List Nat) (pol : PushEndPolicy := .shipping) : System Recv Ev :=
+def sys (ranks : List Nat) (pol : PushEndPolicy := .finishOnError) : System Recv Ev :=
   ⟨init ranks, step pol⟩
 
 /-! ## Structural lemmas on `List Pool` -/
@@ -1182,13 +1185,13 @@ theorem reachable_inv {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
   (sys ranks pol).reachable_induction (inv_init ranks) (fun _ _ _ hi hs => step_inv pol hi hs) h
 
 /-- Main result: every reachable reshard receive session satisfies all safety
-properties under both `PushEndPolicy.shipping` and `PushEndPolicy.finishOnError`. -/
+properties under both `PushEndPolicy.finishOnError` and `PushEndPolicy.endOpOnly`. -/
 theorem reachable_safe {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
     (h : (sys ranks pol).Reachable s) : Safe pol s :=
   inv_safe pol (reachable_inv h)
 
 /-- Audit R3: at callback granularity `pollReady` (`IsReadyToComplete` in
-`CompleteReadWithDetails`, `mgr.cc:1041-1046`) is disabled on every reachable
+`CompleteReadWithDetails`, `mgr.cc:1047-1052`) is disabled on every reachable
 state, because `FinishPoolH2d` sets `network_completed_ = true` (`.cc:697`)
 immediately before `Finish` (`.cc:700`). -/
 theorem reachable_pollReady_disabled {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
@@ -1359,7 +1362,7 @@ launch across same-rank pools, cancellation between the two locks of
 (`reshard_receive_session_test.cc:137-198, 405-439`), duration metric recording
 (`FinishPoolReshardRecv*` in
 `kv_cache_manager_with_transfer_pool_reshard_test.cc:327-367`), and the R1
-comparison between `PushEndPolicy.shipping` and `PushEndPolicy.finishOnError`. -/
+comparison between `PushEndPolicy.endOpOnly` and `PushEndPolicy.finishOnError`. -/
 
 /-- Two pools with order ranks `[0, 1]` (FA at rank 0, state class at rank 1 on
 aliased arena pages, `.h:184-188`): pool 1 finishes arriving on the wire first
@@ -1518,18 +1521,22 @@ theorem trace_duration_metric_on_success_and_failure :
       some (some false, false, true)) := by
   decide
 
-/-- Candidate observation R1 (`mgr.cc:279-289` vs. `:267-270`): when an incoming
-push fails (`pushEnd false`), the shipping hook ends the op without finishing
-the session, leaving `draining = false`, `done = false`, `hasStaging = true`,
-and `planUnregistered = false` until the external deadline (`cancel`). Under
-`PushEndPolicy.finishOnError`, `pushEnd false` immediately drains and settles
-the session, releasing the pool staging lease and unregistering the plan. -/
+/-- Finding F7 / R1 (pre-`fdeebcd` `mgr.cc` hook vs. the `TransferReceiveSession`
+branch at `:267-271`): when an incoming push fails (`pushEnd false`), the old
+hook (`.endOpOnly`) ended the op without finishing the session, leaving
+`draining = false`, `done = false`, `hasStaging = true`, and
+`planUnregistered = false` until the external deadline (`cancel`). Under
+`PushEndPolicy.finishOnError` — the shipping code since `fdeebcd`, whose
+regression test is `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline`
+(`kv_cache_manager_with_transfer_pool_reshard_test.cc:766-802`) — `pushEnd false`
+immediately drains and settles the session, releasing the pool staging lease
+and unregistering the plan. -/
 theorem trace_r1_failed_incoming_push :
-    -- Shipping: after `[.pushBegin, .pushEnd false]`, session is still open and holds staging/plan.
-    ((sys [0] .shipping).run [.pushBegin, .pushEnd false]).map
+    -- Pre-`fdeebcd` (`.endOpOnly`): after `[.pushBegin, .pushEnd false]`, session is still open and holds staging/plan.
+    ((sys [0] .endOpOnly).run [.pushBegin, .pushEnd false]).map
       (fun r => (r.life.draining, r.life.done, r.life.hasStaging, r.planUnregistered)) =
       some (false, false, true, false) ∧
-    (sys [0] .shipping).run [.pushBegin, .pushEnd false, .publish] = none ∧
+    (sys [0] .endOpOnly).run [.pushBegin, .pushEnd false, .publish] = none ∧
     -- Fix (`finishOnError`): `[.pushBegin, .pushEnd false]` settles at once and publishes failure.
     ((sys [0] .finishOnError).run [.pushBegin, .pushEnd false, .publish]).map
       (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
@@ -1555,7 +1562,7 @@ def violates (pol : PushEndPolicy) (s : Recv) : Bool :=
   (s.published == some true && !(allCompleted s.pools && s.durationRecorded)) ||
   (0 < s.life.inFlight && !(drainEvents s.pools.length).any fun e => (step pol s e).isSome)
 
-#guard ModelCheck.check (sys [0, 1] .shipping) (events 2) (violates .shipping) 8 = .outOfFuel
+#guard ModelCheck.check (sys [0, 1] .endOpOnly) (events 2) (violates .endOpOnly) 8 = .outOfFuel
 #guard ModelCheck.check (sys [0, 1] .finishOnError) (events 2) (violates .finishOnError) 8 = .outOfFuel
 
 /-- Mutant 1 (`onPoolReceivedIgnoringRank`): `CollectEligiblePoolH2dsLocked`
@@ -1577,7 +1584,7 @@ def onPoolReceivedIgnoringRank (p : Nat) (s : Recv) : Option Recv :=
 
 #guard (match ModelCheck.check ⟨init [0, 1], fun s e => match e with
           | .onPoolReceived p => onPoolReceivedIgnoringRank p s
-          | e => step .shipping s e⟩ (events 2) (violates .shipping) 4 with
+          | e => step .finishOnError s e⟩ (events 2) (violates .finishOnError) 4 with
         | .counterexample _ => true
         | _ => false)
 
@@ -1596,21 +1603,21 @@ def h2dIssueLeak (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
 
 #guard (match ModelCheck.check ⟨init [0], fun s e => match e with
           | .h2dIssue p ok => h2dIssueLeak p ok s
-          | e => step .shipping s e⟩ (events 1) (violates .shipping) 5 with
+          | e => step .finishOnError s e⟩ (events 1) (violates .finishOnError) 5 with
         | .counterexample _ => true
         | _ => false)
 
 /-- Mutant 3 (`cancelUnregisterEarly`): external cancellation unregisters the
-active plan immediately when `Finish` sets `draining_` (`mgr.cc:741-747`),
+active plan immediately when `Finish` sets `draining_` (`mgr.cc:747-753`),
 instead of deferring unregistration to `MaybeUnregisterSettledReshardRecv`
-(`mgr.cc:776-782`, `.cc:512-520`) after open incoming pushes (`pushes > 0`) drain,
+(`mgr.cc:782-788`, `.cc:512-520`) after open incoming pushes (`pushes > 0`) drain,
 violating `PlanIntegrity`. -/
 def cancelUnregisterEarly (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false, planUnregistered := true }
 
 #guard (match ModelCheck.check ⟨init [0], fun s e => match e with
           | .cancel => cancelUnregisterEarly s
-          | e => step .shipping s e⟩ (events 1) (violates .shipping) 4 with
+          | e => step .finishOnError s e⟩ (events 1) (violates .finishOnError) 4 with
         | .counterexample _ => true
         | _ => false)
 

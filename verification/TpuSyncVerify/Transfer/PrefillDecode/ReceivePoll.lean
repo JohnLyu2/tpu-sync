@@ -4,8 +4,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 # Receive session: what the poll-side readiness check contributes
 
 An audit of `IsReadyToComplete` (`.cc:450-456`) and of the manager's poll
-that acts on it (`mgr.cc:1009-1013`), on the receive model of `Receive.lean`.
-Citations and abbreviations are as there (tpu-sync `0ac16d1`).
+that acts on it (`mgr.cc:1015-1019`), on the receive model of `Receive.lean`.
+Citations and abbreviations are as there (tpu-sync `2ed6f8f`).
 
 `TransferReceiveSession` has two ways to finish successfully:
 
@@ -309,7 +309,7 @@ structure RecvM where
 
 /-- `Recv.step` carrying the ghost. `poll = true` is the shipping code;
 `poll = false` removes the manager's `IsReadyToComplete` finish
-(`mgr.cc:1009-1013`) and nothing else. -/
+(`mgr.cc:1015-1019`) and nothing else. -/
 def stepM (poll : Bool) (m : RecvM) (e : Ev) : Option RecvM :=
   if e = .pollReady ∧ poll = false then none
   else (step m.s e).map fun s' =>

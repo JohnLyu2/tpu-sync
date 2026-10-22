@@ -11,7 +11,7 @@ One `ReshardSendSession` on the producer side and the slice of
 sessions live in `Reshard/Receive.lean`; multi-sender stream counting and
 aliased-page contents compose both in `Reshard/Pipeline.lean`.
 
-Citations are to tpu-sync `0ac16d1`. Unqualified `.h`/`.cc` are
+Citations are to tpu-sync `2ed6f8f`. Unqualified `.h`/`.cc` are
 `tpu_sync/kv_cache/reshard_send_session.{h,cc}`; `slots.cc` is
 `tpu_sync/core/pool_reshard_send_slots.cc`; `mgr.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.cc` is
@@ -19,13 +19,13 @@ Citations are to tpu-sync `0ac16d1`. Unqualified `.h`/`.cc` are
 
 ## How a reshard send runs
 
-`PoolReshardPush` (`mgr.cc:634-671`) creates a `ReshardSendSession`
+`PoolReshardPush` (`mgr.cc:640-677`) creates a `ReshardSendSession`
 (`.cc:92-151`), which validates the plan, computes
 `remaining_pool_peer_pushes_ = CountPoolReshardSendSlots(plan, schedule)`
 (`.cc:134-138`, `slots.cc:27-51`), registers the active plan
 (`RegisterActivePlanDirect`, `.cc:142`), and inserts the session into
-`active_pool_reshard_sends_` (`mgr.cc:667`). It then calls
-`ExecutePush(*this, src_block_ids)` (`mgr.cc:670`, `.cc:177-265`).
+`active_pool_reshard_sends_` (`mgr.cc:673`). It then calls
+`ExecutePush(*this, src_block_ids)` (`mgr.cc:676`, `.cc:177-265`).
 
 `ExecutePush` takes its own caller op (`++in_flight_; manager_ = &manager;`,
 `.cc:180-184`) and iterates over `plan_.transfer_pool_indices()` (`.cc:204`):
@@ -82,7 +82,7 @@ Session-level fields:
 | `execActive`       | `ExecutePush` caller op between `++in_flight_` (`.cc:182`) and `EndOp()` (`.cc:236, 244, 263`) | caller op active |
 | `remainingPushes`  | `remaining_pool_peer_pushes_` (`.h:138`)                            | remaining `(pool, peer)` completions |
 | `planUnregistered` | `plan_unregistered_` (`.h:149`)                                     | active plan unregistered |
-| `published`        | membership in `done_sending_` / `failed_recving_` (`mgr.cc:990`)    | what `poll_stats()` shows the engine |
+| `published`        | membership in `done_sending_` / `failed_recving_` (`mgr.cc:996`)    | what `poll_stats()` shows the engine |
 
 ## Events
 
@@ -92,8 +92,8 @@ Session-level fields:
 | `execFinish`       | `ExecutePush` finishes its pool loop and calls `EndOp()` (`.cc:263`) |
 | `d2hDone p ok`     | `pool_future.OnReady` callback (`.cc:253-261`) + `StartPoolPush` (`.cc:267-349`) + `EndOp()` (`.cc:255`) |
 | `pushDone p ok`    | one peer's `AsyncPush(...).OnReady` callback for pool `p` (`.cc:342-347`): calls `RecordPushCompletion` + `EndOp()` |
-| `cancel`           | external `Finish(error)`: deadline (`mgr.cc:984-987`) or shutdown (`mgr.cc:380-384`) |
-| `publish`          | `CompleteReadWithDetails` moves a settled session into `done_sending_` or `failed_recving_` and erases it (`mgr.cc:988-996`) |
+| `cancel`           | external `Finish(error)`: deadline (`mgr.cc:990-993`) or shutdown (`mgr.cc:386-390`) |
+| `publish`          | `CompleteReadWithDetails` moves a settled session into `done_sending_` or `failed_recving_` and erases it (`mgr.cc:994-1002`) |
 
 ## Assumptions
 
@@ -104,8 +104,8 @@ Session-level fields:
   Modeled by `validPools (init peerCounts).pools = true` (`peerCounts ≠ []` and
   `∀ n ∈ peerCounts, 0 < n`).
 * **A2 (`ExecutePush` starts before external `Finish`).** `PoolReshardPush`
-  inserts the session into `active_pool_reshard_sends_` (`mgr.cc:667`) and
-  immediately invokes `ExecutePush` (`mgr.cc:670`), which increments
+  inserts the session into `active_pool_reshard_sends_` (`mgr.cc:673`) and
+  immediately invokes `ExecutePush` (`mgr.cc:676`), which increments
   `++in_flight_` and sets `manager_ = &manager` (`.cc:180-184`). `init` starts
   at `.cc:184` with `execActive = true` and `inFlight = 1`.
 * **A3 (single `StartPoolPush` lock step).** `StartPoolPush` checks
@@ -147,8 +147,8 @@ All proved on every reachable state (`reachable_safe`) for any valid schedule
   `planUnregistered → draining` under both policies; under
   `UnregisterPolicy.onSettle`, `planUnregistered = done` (`reachable_onSettle_plan_iff_done`),
   so the active plan is never torn down while sibling pools or peer pushes are
-  still resolving chunks through `GetBlockChunks` (`base.cc:3222-3506`, sender
-  active-plan path `:3229-3296, 3346-3433`).
+  still resolving chunks through `GetBlockChunks` (`base.cc:3223-3507`, sender
+  active-plan path `:3230-3297, 3347-3434`).
 * **Slot accounting & publication (`Publication`).** `published = some true →
   remainingPushes = 0 ∧ allPushed pools = true`: `done_sending` is published
   only when `CountPoolReshardSendSlots` has counted down to `0` and every active
@@ -357,11 +357,11 @@ def pushDone (pol : UnregisterPolicy) (p : Nat) (ok : Bool) (s : Send) : Option 
     | _ => none
   | none => none
 
-/-- External `Finish(error)` (`.cc:394-410`, `mgr.cc:380-384, 984-987`). -/
+/-- External `Finish(error)` (`.cc:394-410`, `mgr.cc:386-390, 990-993`). -/
 def cancel (s : Send) : Option Send :=
   some { s with life := s.life.finishLocked false }
 
-/-- `CompleteReadWithDetails` publishes a settled session (`mgr.cc:988-996`). -/
+/-- `CompleteReadWithDetails` publishes a settled session (`mgr.cc:994-1002`). -/
 def publish (s : Send) : Option Send :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }
@@ -1370,7 +1370,7 @@ theorem trace_multi_pool_multi_peer_send :
       some (true, false, true, some true) := by
   decide
 
-/-- External deadline or cancellation (`cancel` at `mgr.cc:984-987`, `.cc:394-410`)
+/-- External deadline or cancellation (`cancel` at `mgr.cc:990-993`, `.cc:394-410`)
 while peer pushes are in flight (`ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`,
 `reshard_send_session_test.cc:364-404`): `Finish(error)` sets `finalizing_ = true`
 without unregistering the plan while `in_flight_ == 2`; the first peer push to

@@ -12,7 +12,7 @@ still running; bounded searches on the one- and two-layer instances; and
 mutants that show the memory model is sensitive to the guards the proof rests
 on, including the per-layer ones.
 
-Citations are to tpu-sync `0ac16d1`;
+Citations are to tpu-sync `2ed6f8f`;
 abbreviations as in `Pipeline.lean`.
 -/
 
@@ -24,8 +24,8 @@ def producer : List Ev :=
    .send (.wake true), .send .h2hIssue, .send .sendNext, .h2hDone 0 true, .send .publish]
 
 /-- A one-layer consumer, pull handshake to `done_recving`. Within the accepted
-push, `HandleIncomingPush` (`bt.cc:495-638`, lease window `:507-632`, dispatched from
-`HandleCustomRequest` at `bt.cc:478`) lands the chunk, dispatches
+push, `HandleIncomingPush` (`bt.cc:496-639`, lease window `:508-633`, dispatched from
+`HandleCustomRequest` at `bt.cc:479`) lands the chunk, dispatches
 `OnLayerReceived` (`h2dBegin` / `h2dIssue`) and accounts for the chunk
 (`netAccount`) before returning (`pushEnd`). -/
 def consumer : List Ev :=
