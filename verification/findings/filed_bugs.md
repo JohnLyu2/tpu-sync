@@ -4,10 +4,14 @@ Code references below are against [`google/tpu-sync` @ `50b0774`](https://github
 for bug 1, [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tree/1fa06d1f44345369f4327079828ec6c4989d6694) for bug 2,
 and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1) for bugs 3–6,
 and [`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) for bug 7.
+Bug 8 is a caller-side defect and cites
+[`vllm-project/tpu-inference` @ `c2b062b`](https://github.com/vllm-project/tpu-inference/tree/c2b062b),
+[`vllm-project/vllm` @ `5ab4e44`](https://github.com/vllm-project/vllm/tree/5ab4e44)
+and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1).
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
 the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2, `0ac16d1` for
-bugs 3–6, `449b591` for bug 7) and are not re-pinned on upstream syncs; the only edits are the italic
+bugs 3–6, `449b591` for bug 7, the three pins above for bug 8) and are not re-pinned on upstream syncs; the only edits are the italic
 *Update* sentences and one internal tooling word replaced by "with the fix".
 Status updates go in [README.md](README.md) (§Summary, §History).
 
@@ -200,3 +204,33 @@ Both shapes are confirmed by unit tests (`RAIDEN_REMOTE_READ_DEADLINE_S=1`): sha
 - Make `lease_id` `std::atomic<uint64_t>` (or guard it with `mu`).
 
 Reproducers: `BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` (A) and `BugHuntTest.ReadRemoteSettlesDeadlineWhilePullStillInFlight` (B) in [`raiden_controller_bughunt_test.cc`](raiden_controller_bughunt_test.cc); model `TpuSyncVerify/Controller/ReadRemote.lean`; naive fix in [`candidate_fixes.patch`](candidate_fixes.patch).
+
+
+---
+
+## 8. tpu-inference `tpu_raiden_connector`: `get_finished` drops tpu-sync's `failed_recving`, so failed and never-pulled transfers leak their KV blocks on both prefill and decode nodes (C1)
+
+Filed 2026-10-22 against the caller (tpu-inference), not tpu-sync. Permalinks: tpu-inference `c2b062b`, vLLM `5ab4e44`, tpu-sync `0ac16d1`. The vLLM pin is the one the report was read against, newer than the `6185d73` that `Caller.lean` and `tpu_inference_connector_c1_test.py` use (the `examples/*_disagg/setup.sh` pin); the connector and scheduler logic are the same at both, but `5ab4e44` adds the `get_transfer_results` / `KVConnectorTransferResults.failed_recving` channel named in the fix, whose `6185d73`-era equivalent is `get_block_ids_with_load_errors` (`connectorFixed`'s `loadError` in `Caller.lean`).
+
+[`TPUConnectorWorker.get_finished`](https://github.com/vllm-project/tpu-inference/blob/c2b062b/tpu_inference/distributed/tpu_raiden_connector.py#L632-L656) returns only tpu-sync's `done_sending` and `done_recving` and discards `failed_recving`, so vLLM is never told that a transfer failed and never frees the KV blocks it holds for it, on both the prefill (P) and the decode (D) node.
+
+Discarding `failed_recving` is deliberate. The comment at [L641-644](https://github.com/vllm-project/tpu-inference/blob/c2b062b/tpu_inference/distributed/tpu_raiden_connector.py#L641-L644) avoids reporting a failed receive as done (vLLM would decode on unwritten KV and crash the EngineCore) and expects that *"the request times out at the API layer instead"*; the comment at [L614-621](https://github.com/vllm-project/tpu-inference/blob/c2b062b/tpu_inference/distributed/tpu_raiden_connector.py#L614-L621) expects the producer to be freed *"by timeout if no pull happened"*. But neither timeout exists as a free path: vLLM never frees a transfer-held request on its own, and tpu-sync reports the producer timeout in the very list that is dropped.
+
+Found during Lean formulation.
+
+**Cause**
+- *Connector.* `get_finished` destructures `poll_stats()` into `(done_sending, done_recving, failed_recving)` ([L638](https://github.com/vllm-project/tpu-inference/blob/c2b062b/tpu_inference/distributed/tpu_raiden_connector.py#L638)), logs `failed_recving` ([L640-647](https://github.com/vllm-project/tpu-inference/blob/c2b062b/tpu_inference/distributed/tpu_raiden_connector.py#L640-L647)) and returns the other two ([L656](https://github.com/vllm-project/tpu-inference/blob/c2b062b/tpu_inference/distributed/tpu_raiden_connector.py#L656)). `get_block_ids_with_load_errors` is not overridden (base default `set()`). The connector's own expiry bookkeeping (`reqs_wait_pull` in `tpu_connector.py`) was not carried over when the connector was ported to tpu-sync (`a342edc3`): `SendMeta.expiration_time` is still set ([L441-446](https://github.com/vllm-project/tpu-inference/blob/c2b062b/tpu_inference/distributed/tpu_raiden_connector.py#L441-L446)) but never read.
+- *vLLM: the "API-layer timeout" does not free.* The scheduler has no timeout for a transfer-held request. It frees sender blocks only from `finished_sending` ([scheduler.py:3198-3201](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/v1/core/sched/scheduler.py#L3198-L3201)), keeps a `WAITING_FOR_REMOTE_KVS` request parked until `finished_recving` ([L3144-3149](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/v1/core/sched/scheduler.py#L3144-L3149)), and when such a request is aborted defers the free until the id appears in `finished_recving_kv_req_ids` ([L2677-2686](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/v1/core/sched/scheduler.py#L2677-L2686)). The connector contract says so explicitly ([`KVConnectorTransferResults`](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L88-L97)): *"Failed receives also appear in `finished_recving` so the scheduler can release the request from its transfer wait state"*; likewise [`get_block_ids_with_load_errors`](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L411-L429).
+- *tpu-sync: the producer "timeout" is reported in the dropped list.* A send that failed, or that nobody pulled before `timeout_s`, is filed in `failed_recving` ([kv_cache_manager_with_transfer.cc:961-970](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L961-L970)). Before tpu-sync `4246613` (2026-08-24) an expired send went to `done_sending`, which is what the connector relied on when its expiry loop was removed.
+
+**Impact**
+- **P:** every prefill whose consumer never pulls (D full local prefix hit, for which D's notify branch is a no-op by design; D absent; proxy drop) holds its HBM blocks for `TPU_P2P_WAIT_PULL_TIMEOUT` (180 s) and then leaks them; the request also stays in `scheduler.requests`.
+- **D:** every failed pull leaves the request in `WAITING_FOR_REMOTE_KVS` with its blocks; a later client abort defers the free to a `finished_recving` report that never comes.
+- Net effect: a monotone drain of the KV pool on long-running prefill and decode nodes, one `logger.error` line per event, cured only by restart.
+
+Confirmed by a CPU unit test driving the real vLLM `Scheduler` and connector classes over a stubbed `poll_stats()`: the blocks are never freed, while controls that forward the outcome free them.
+
+**Proposed fix**
+Forward `failed_recving` instead of dropping it: failed sends as `finished_sending`, failed receives via [`get_transfer_results`](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L401-L409) so vLLM recomputes rather than decodes.
+
+Reproducer: [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py). The tpu-sync side (`4246613`'s reclassification and the `failed_recving` naming) is an improvement request, not filed as a defect; see README §C1 "tpu-sync side".
