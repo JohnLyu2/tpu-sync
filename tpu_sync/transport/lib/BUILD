@@ -290,7 +290,6 @@ cc_test(
         "//tpu_sync/transport/lib/conn:pool",
         "//tpu_sync/transport/lib/socket:psp_syscall_mock",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
-        "//tpu_sync/transport/lib/socket:util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -307,6 +306,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api/v1:conn_util",
         "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )

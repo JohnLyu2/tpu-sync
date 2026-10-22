@@ -37,13 +37,15 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/ip_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
 
 namespace {
+using ::peregrine::v1::ConnectTiming;
+using ::peregrine::v1::ConnectToPeer;
 using ::peregrine::v1::GetLocalEndpoint;
 
 bool HasReadableData(const int fd) {
@@ -111,9 +113,9 @@ absl::StatusOr<int> ConnPool::Borrow(
     peer = blackhole_peer;
   }
   ConnectTiming timing;
-  ABSL_ASSIGN_OR_RETURN(int sock_fd,
-                        ConnectToPeer(peer, local_ip, require_psp, channel,
-                                      diag_vlog ? &timing : nullptr));
+  ABSL_ASSIGN_OR_RETURN(
+      int sock_fd,
+      ConnectToPeer(peer, local_ip, diag_vlog ? &timing : nullptr));
   if (ABSL_PREDICT_FALSE(diag_vlog)) {
     std::string local_endpoint = GetLocalEndpoint(sock_fd);
     std::string psp_str =
