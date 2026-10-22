@@ -283,27 +283,10 @@ class KVCacheStoreBackend {
     return {};
   }
 
-  // --- Remote write (WriteRemote) ------------------------------------------
+  // --- Remote write (WriteRemote) & registry helpers -----------------------
   //
-  // These four exist because a WriteRemote handler holds only this interface,
-  // and because each needs to happen under ONE acquisition of the backend's
-  // lock. Composing them at the service out of Lookup/Insert/Delete would
-  // check and then act with the lock dropped in between, which is exactly the
-  // window a concurrent writer needs.
-  //
-  // The defaults are all refusals, so a backend that does not implement them
-  // makes WriteRemote fail rather than half-succeed.
-
-  // Which of `block_hashes` this backend already holds in host DRAM.
-  //
-  // Equivalent to Lookup(block_hashes, LookupOptions::HostResidentSubset()):
-  // queries a non-contiguous subset without pinning or promoting LRU order
-  // (using PeekIncludingCandidates), and sees eviction candidates because a
-  // candidate still holds its host block.
-  virtual std::vector<std::string> AlreadyPresentHostResident(
-      absl::Span<const std::string> block_hashes) const {
-    return {};
-  }
+  // Default implementations refuse or return UnimplementedError so backends
+  // that do not support remote writes fail cleanly.
 
   // Inserts every hash or none, returning false if any part fails.
   //

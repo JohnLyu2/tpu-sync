@@ -841,8 +841,11 @@ TEST_F(WriteRemoteTest, CommitInsertsTheBlocksAndReportsThem) {
   ASSERT_EQ(AwaitTerminal(response->operation_id()),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED);
   EXPECT_THAT(last_poll_.committed_hashes(), UnorderedElementsAre("a", "b"));
-  EXPECT_THAT(store_->backend()->AlreadyPresentHostResident({"a", "b"}),
-              UnorderedElementsAre("a", "b"));
+  TF_ASSERT_OK_AND_ASSIGN(auto present,
+                          store_->backend()->Lookup(
+                              {"a", "b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present,
+              UnorderedElementsAre(::testing::Key("a"), ::testing::Key("b")));
 }
 
 TEST_F(WriteRemoteTest, TransferFailureFreesTheLandingBlocks) {
@@ -853,8 +856,10 @@ TEST_F(WriteRemoteTest, TransferFailureFreesTheLandingBlocks) {
   ASSERT_EQ(AwaitTerminal(response->operation_id()),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::FAILED);
   EXPECT_THAT(last_poll_.failed_hashes(), UnorderedElementsAre("a", "b"));
-  EXPECT_TRUE(
-      store_->backend()->AlreadyPresentHostResident({"a", "b"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(auto present,
+                          store_->backend()->Lookup(
+                              {"a", "b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present.empty());
   // The blocks came back: the whole pool is allocatable again.
   ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 }
@@ -884,7 +889,10 @@ TEST_F(WriteRemoteTest, ATransferThatResolvesPastTheDeadlineNeverCommits) {
 
   EXPECT_EQ(Poll(op_id)->state(),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::FAILED);
-  EXPECT_TRUE(store_->backend()->AlreadyPresentHostResident({"a", "b"}).empty())
+  TF_ASSERT_OK_AND_ASSIGN(auto present,
+                          store_->backend()->Lookup(
+                              {"a", "b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present.empty())
       << "a post-deadline transfer inserted its bytes anyway";
   ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity))
       << "the deferred free never happened";
@@ -931,8 +939,10 @@ TEST_F(WriteRemoteTest, TheClaimRefusesALateTransferEvenIfNoThreadFiredIt) {
   ASSERT_EQ(AwaitTerminal(op_id),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::FAILED)
       << "a transfer that resolved past its deadline was allowed to commit";
-  EXPECT_TRUE(
-      store_->backend()->AlreadyPresentHostResident({"a", "b"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(auto present,
+                          store_->backend()->Lookup(
+                              {"a", "b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present.empty());
   ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 }
 
@@ -968,7 +978,10 @@ TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PARTIAL_EXIST);
   EXPECT_THAT(last_poll_.existing_hashes(), UnorderedElementsAre("a"));
   // "b" was never inserted: this destination does not do partial writes.
-  EXPECT_TRUE(store_->backend()->AlreadyPresentHostResident({"b"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present_b,
+      store_->backend()->Lookup({"b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present_b.empty());
   ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 }
 
@@ -983,8 +996,10 @@ TEST_F(WriteRemoteTest, RefusesWhenThereAreNoFreeBlocksAndEvictsNothing) {
   EXPECT_THAT(response.status(),
               StatusIs(absl::StatusCode::kResourceExhausted));
   EXPECT_EQ(latch_.issued(), 0);
-  EXPECT_THAT(store_->backend()->AlreadyPresentHostResident({"victim"}),
-              UnorderedElementsAre("victim"));
+  TF_ASSERT_OK_AND_ASSIGN(auto present_victim,
+                          store_->backend()->Lookup(
+                              {"victim"}, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present_victim, UnorderedElementsAre(::testing::Key("victim")));
 }
 
 // The owner is asked for a space check once per refused write and once per
@@ -1029,8 +1044,10 @@ TEST_F(WriteRemoteTest, SpaceCheckRunsOnRefusalAndCommit) {
   EXPECT_THAT(refused_resp.status(),
               StatusIs(absl::StatusCode::kResourceExhausted));
   EXPECT_EQ(calls.load(), 2);
-  EXPECT_THAT(store_->backend()->AlreadyPresentHostResident({"c"}),
-              UnorderedElementsAre("c"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present_c,
+      store_->backend()->Lookup({"c"}, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present_c, UnorderedElementsAre(::testing::Key("c")));
 }
 
 TEST_F(WriteRemoteTest, PollOfAnUnknownOperationIsUnknown) {
@@ -1228,8 +1245,11 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
       << "STORED_UNREGISTERED must not be reported as committed";
 
   // The bytes were KEPT -- that is the whole point of not rolling back.
-  EXPECT_THAT(store.backend()->AlreadyPresentHostResident(hashes),
-              UnorderedElementsAre("unreg_a", "unreg_b"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present,
+      store.backend()->Lookup(hashes, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present, UnorderedElementsAre(::testing::Key("unreg_a"),
+                                            ::testing::Key("unreg_b")));
   // And the landing blocks belong to the cache now, so they are NOT back in
   // the pool: the store holds 8 blocks and 2 are spoken for.
   EXPECT_FALSE(store.raiden_controller()->AllocateBlockIds(8).ok())

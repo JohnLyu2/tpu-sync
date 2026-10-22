@@ -210,7 +210,6 @@ TEST(HostOffloadBackendTest,
     subset_hashes.push_back(hash);
   }
   EXPECT_THAT(subset_hashes, UnorderedElementsAre("h1", "h2"));
-  EXPECT_EQ(subset_hashes, backend.AlreadyPresentHostResident(query));
   EXPECT_EQ(backend.GetPinCount("h1"), 0);
   EXPECT_EQ(backend.GetPinCount("h2"), 0);
   EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
@@ -1057,8 +1056,9 @@ namespace {
 
 }  // namespace
 
-// Lookup cannot answer this question: it stops at the first miss, so a
-// scattered subset is unrepresentable in its result.
+// Prefix Lookup stops at the first miss, whereas
+// LookupOptions::HostResidentSubset reports a scattered subset of host-resident
+// entries.
 TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentReportsAScatteredSubset) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
@@ -1067,9 +1067,14 @@ TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentReportsAScatteredSubset) {
                   RaidenBlockId(id, 3, BlockStatus::HOST)},
                  /*on_host=*/true);
 
-  EXPECT_THAT(backend.AlreadyPresentHostResident({"a", "b", "c"}),
-              UnorderedElementsAre("a", "c"));
-  EXPECT_TRUE(backend.AlreadyPresentHostResident({"b"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present,
+      backend.Lookup({"a", "b", "c"}, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present,
+              UnorderedElementsAre(::testing::Key("a"), ::testing::Key("c")));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto missing, backend.Lookup({"b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(missing.empty());
 }
 
 // A block that is registered elsewhere but not resident here is not something
@@ -1080,7 +1085,10 @@ TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentIgnoresNonHostBlocks) {
   backend.Insert({"remote"}, {RaidenBlockId(id, 1, BlockStatus::REMOTE)},
                  /*on_host=*/true);
 
-  EXPECT_TRUE(backend.AlreadyPresentHostResident({"remote"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present,
+      backend.Lookup({"remote"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present.empty());
 }
 
 TEST(HostOffloadBackendWriteRemoteTest,
@@ -1092,8 +1100,11 @@ TEST(HostOffloadBackendWriteRemoteTest,
       {"a", "b"}, {RaidenBlockId(id, 1, BlockStatus::HOST),
                    RaidenBlockId(id, 2, BlockStatus::HOST)}));
   EXPECT_EQ(backend.GetSize(), 2);
-  EXPECT_THAT(backend.AlreadyPresentHostResident({"a", "b"}),
-              UnorderedElementsAre("a", "b"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present,
+      backend.Lookup({"a", "b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present,
+              UnorderedElementsAre(::testing::Key("a"), ::testing::Key("b")));
 }
 
 // The whole point of the primitive: one duplicate refuses the batch. Insert()
@@ -1110,7 +1121,10 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
       {"b", "a"}, {RaidenBlockId(id, 2, BlockStatus::HOST),
                    RaidenBlockId(id, 3, BlockStatus::HOST)}));
   // "b" must not have landed: nothing, not almost-everything.
-  EXPECT_TRUE(backend.AlreadyPresentHostResident({"b"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present_b,
+      backend.Lookup({"b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present_b.empty());
   EXPECT_EQ(backend.GetSize(), 1);
 }
 

@@ -993,22 +993,6 @@ HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
   return (*client)->PollWriteRemote(operation_id, wait_ms);
 }
 
-std::vector<std::string> HostOffloadBackend::AlreadyPresentHostResident(
-    absl::Span<const std::string> block_hashes) const {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> present;
-  for (const auto& hash : block_hashes) {
-    // PeekIncludingCandidates: an eviction candidate still holds its host
-    // block, so it must count as present. Peek would also promote LRU order.
-    const RaidenBlockId* entry = lru_cache_.PeekIncludingCandidates(hash);
-    if (entry != nullptr && (entry->status == BlockStatus::HOST ||
-                             entry->status == BlockStatus::HOST_AND_HBM)) {
-      present.push_back(hash);
-    }
-  }
-  return present;
-}
-
 bool HostOffloadBackend::InsertAllOrNothing(
     absl::Span<const std::string> block_hashes,
     absl::Span<const RaidenBlockId> slices) {

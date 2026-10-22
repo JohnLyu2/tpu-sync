@@ -132,11 +132,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      absl::Span<const int32_t> dst_host_block_ids,
                      BlockTracker* absl_nonnull save_tracker) override;
 
-  // --- Remote write, destination side. Helpers the service uses while a
-  // peer's offer lands here; see KVCacheStoreBackend for their contracts.
-  std::vector<std::string> AlreadyPresentHostResident(
-      absl::Span<const std::string> block_hashes) const override;
-
+  // --- WriteRemote & registry overrides ------------------------------------
   bool InsertAllOrNothing(absl::Span<const std::string> block_hashes,
                           absl::Span<const RaidenBlockId> slices) override;
 
@@ -147,11 +143,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   tsl::Future<> UnregisterBlocksAsync(
       absl::Span<const std::string> block_hashes) override;
 
-  // --- Remote write, source side ------------------------------------------
-  //
-  // BeginWriteRemote offers blocks; the verdict arrives later on the same
-  // call and updates save_tracker. PollWriteRemoteAsync is recovery for a
-  // source that lost that call. KVCacheStore owns the pins.
+  // --- Outbound remote write (SaveRemote) ----------------------------------
 
   // Offers `block_hashes` to `dst_raiden_id` and blocks until the ack (not
   // the bytes). `requested_deadline` is how long the destination may hold
