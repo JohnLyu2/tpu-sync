@@ -1624,8 +1624,12 @@ void KVCacheStore::RegisterReadRemoteHooks() {
 absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
     absl::Span<const std::string> block_hashes) {
   absl::MutexLock lock(mutex_);
-  ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
+  ABSL_ASSIGN_OR_RETURN(
+      const auto& slices,
+      backend()->Lookup(block_hashes, LookupOptions{.enable_global = false,
+                                                    .pin_found = true}));
   if (slices.size() < block_hashes.size()) {
+    backend()->Release(block_hashes.first(slices.size()));
     return absl::NotFoundError(
         absl::StrCat("BLOCK_HASH_NOT_FOUND: ", block_hashes[slices.size()]));
   }
@@ -1636,15 +1640,12 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
     const auto& existing = slices[i].second;
     if (existing.status != BlockStatus::HOST &&
         existing.status != BlockStatus::HOST_AND_HBM) {
+      backend()->Release(block_hashes);
       return absl::FailedPreconditionError(absl::StrCat(
           "Block not resident in host DRAM (status=",
           static_cast<int>(existing.status), "): ", block_hashes[i]));
     }
     src_host_block_ids.push_back(existing.host_block_id);
-  }
-
-  if (!backend()->Pin(block_hashes)) {
-    return absl::InternalError("Failed to pin host blocks");
   }
 
   return src_host_block_ids;
@@ -2197,7 +2198,9 @@ absl::Status KVCacheStore::SaveRemote(
   std::vector<int32_t> src_host_block_ids;
   {
     absl::MutexLock lock(mutex_);
-    ABSL_ASSIGN_OR_RETURN(const auto& slices, backend->Lookup(block_hashes));
+    ABSL_ASSIGN_OR_RETURN(
+        const auto& slices,
+        backend->Lookup(block_hashes, LookupOptions{.enable_global = false}));
     if (slices.size() < block_hashes.size()) {
       return absl::NotFoundError(
           absl::StrCat("Block hash not found: ", block_hashes[slices.size()]));

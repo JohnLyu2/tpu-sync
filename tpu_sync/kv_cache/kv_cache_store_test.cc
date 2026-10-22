@@ -767,6 +767,32 @@ TEST(KVCacheStoreTest, ValidateAndPinHostBlocksAtomicRollbackOnPartialMiss) {
   EXPECT_EQ(store.GetPinCount("bad"), 0);
 }
 
+TEST(KVCacheStoreTest,
+     ValidateAndPinHostBlocksReleasesPartialPrefixPinsOnMissingTail) {
+  KVCacheStore store(4, "", {}, /*num_shards=*/1, /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+  RaidenId rid{"src_job", "0", "src_cache", 0};
+  ASSERT_TRUE(
+      InsertResident(store, {"ok"},
+                     {RaidenBlockId(rid, /*host_block_id=*/3,
+                                    /*device_block_id=*/-1, BlockStatus::HOST)},
+                     /*on_host=*/true));
+
+  auto partial =
+      store.ValidateAndPinHostBlocks(std::vector<std::string>{"ok", "missing"});
+  EXPECT_THAT(partial.status(),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_EQ(store.GetPinCount("ok"), 0);
+
+  // Positive control on the same store: {"ok"} alone succeeds and pins "ok".
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto ids, store.ValidateAndPinHostBlocks(std::vector<std::string>{"ok"}));
+  EXPECT_THAT(ids, ::testing::ElementsAre(3));
+  EXPECT_EQ(store.GetPinCount("ok"), 1);
+  store.UnpinHostBlocks(std::vector<std::string>{"ok"});
+  EXPECT_EQ(store.GetPinCount("ok"), 0);
+}
+
 TEST(KVCacheStoreTest, ValidateAndPinHostBlocksEmptyInputIsOk) {
   KVCacheStore store(4, "", {}, /*num_shards=*/1, /*shard_size_bytes=*/512,
                      /*store_server_ip=*/"127.0.0.1");

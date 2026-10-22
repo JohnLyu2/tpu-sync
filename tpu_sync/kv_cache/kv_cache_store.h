@@ -384,14 +384,11 @@ class KVCacheStore {
 
   int GetPinCount(const std::string& hash) const;
 
-  // Source-side ReadRemote (All-or-Nothing validate & pin block hashes at the
-  // src controller): verifies ALL block_hashes exist in the LRU with status
-  // HOST/HOST_AND_HBM and pins them (all-or-nothing: any miss rolls back and
-  // aborts). On success returns the authoritative source host_block_ids
-  // (re-derived from the LRU). NotFound => a hash is absent
-  // (BLOCK_HASH_NOT_FOUND); FailedPrecondition => present but not
-  // host-resident. Registered as a hook on the RaidenController so a peer's
-  // ReadRemote RPC can reach this store's LRU. Public for testability.
+  // Source-side ReadRemote hook: verifies all `block_hashes` exist locally with
+  // status HOST or HOST_AND_HBM and pins them in a single local Lookup
+  // (all-or-nothing: any miss or non-host block releases partial pins and
+  // returns NotFound or FailedPrecondition). Returns the authoritative source
+  // host_block_ids on success.
   absl::StatusOr<std::vector<int32_t>> ValidateAndPinHostBlocks(
       absl::Span<const std::string> block_hashes);
   // Releases the pins taken by ValidateAndPinHostBlocks.
