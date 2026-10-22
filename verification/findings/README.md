@@ -12,7 +12,13 @@ Callers checked: [`vllm-project/vllm-torchtpu`](https://github.com/vllm-project/
 @ `9a6eef1` (2026-10-20; `sglang_tpu/disaggregation/raiden/{pipeline,pp_swa,pp_common}.py`).
 Earlier entries that say "`vllm-torchtpu` @ `6a9132a84`" were read at that
 commit. See §Callers for what each finding needs from a caller and whether
-these two provide it.
+these two provide it. The **prefill-to-decode** path (`register_read` /
+`start_read` / `poll_stats`) has a third, unrelated caller:
+[`vllm-project/tpu-inference`](https://github.com/vllm-project/tpu-inference)
+`tpu_inference/distributed/tpu_raiden_connector.py` @ `7ed46a6` (the commit
+`examples/*_disagg/setup.sh` pin; unchanged on the cited lines at `main`
+`c2b062b`, 2026-10-20) on vLLM @ `6185d73` (same scripts). Caller-side defects
+are numbered C1, C2, … and live in the caller, not in tpu-sync.
 
 ## Evidence levels
 
@@ -49,6 +55,7 @@ here.
 | `build_targets.patch` | `cc_test` targets for the four files above |
 | `candidate_fixes.patch` | fixes for F1 and F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
+| [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
 
 To run F1–F4: copy the two `.cc` files next to the code they test
 (`tpu_sync/core/controller/`, `tpu_sync/kv_cache/`), `git apply
@@ -74,6 +81,7 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 | F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
 | F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
 | F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape, reopened on the sender) (R6 in `docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `449b591`); not yet filed | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
+| C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_c1_*`, leaks absorbing, `contract_safe` for the fix); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet) | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
 
@@ -671,6 +679,242 @@ was retired on 2026-10-16 (see F5). Both patches apply cleanly at `0ac16d1`.
 
 ---
 
+## C1. tpu-inference `tpu_raiden_connector`: failed and never-pulled transfers leak their KV blocks on both nodes
+
+- **Status:** **CONFIRMED (test)** 2026-10-20, on CPU, no TPU:
+  [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py)
+  runs vLLM `6185d73`'s real `Scheduler` with tpu-inference `7ed46a6`'s real
+  `TPUConnectorScheduler`, feeds it the connector's own translation of what
+  tpu-sync `0ac16d1` reports (via the real `TPUConnectorWorker.get_finished`
+  over a stubbed `poll_stats()`), and shows the blocks are never returned on
+  either node; the two control cases (the report tpu-sync gave before
+  `4246613`, or a successful receive) free them. tpu-sync's side of the chain
+  — a never-pulled send lands in `failed_recving` — is tpu-sync's own
+  upstream test `SendDrainTest.SendNobodyPulledFailsAtItsDeadline`
+  (`kv_cache_manager_with_transfer_send_drain_test.cc:370-379`), not
+  re-run here. Not yet run end to end on hardware; filed 2026-10-22 against
+  tpu-inference (bug 8 in [`filed_bugs.md`](filed_bugs.md)). First read
+  across the three codebases earlier the same day (the cited lines are
+  identical at tpu-inference `main` `c2b062b`, and still at `main`
+  `ee8b4ac7`, 2026-10-22). **Upstream status 2026-10-22:** no fix to
+  `tpu_raiden_connector.py` on any branch. An unmerged upstream branch,
+  `fix/pd-disagg-kv-pull-hang` (`e7661c73`, 2026-10-16), fixes a *different*
+  symptom (decode hang: never-ready arrays inserted after a timed-out pull)
+  in the sibling JAX-P2P connector `tpu_connector.py` — the one
+  tpu-inference's own `examples/disagg` and kube benchmark configure — and
+  its D-side remedy is exactly the fix shape below: the failed request stays
+  in `done_recving` *and* its local blocks go through a new
+  `get_block_ids_with_load_errors()` in the same step. tpu-sync upstream
+  `main` `75bd590` (30 commits past `0ac16d1`) does not change the
+  `failed_recving_` classification of a failed or never-pulled send. The
+  `vllm-jax` successor repository holds only a README (`d086b9c`). This is a defect in the
+  **caller**, recorded here because it is the production caller of the path
+  `TpuSyncVerify/Transfer/PrefillDecode/` models and because tpu-sync's
+  `poll_stats` naming and the `4246613` reclassification (the "tpu-sync side" subsection below) are half of the P-side story.
+- **Test output** (unedited; `torch 2.14.1+cpu`, `jax 0.11.2`,
+  `vllm 0.23.1rc1.dev565+g6185d7388.empty`, `tpu-inference 7ed46a6`):
+
+  ```
+  tpu_inference_connector_c1_test.py::test_unit_get_finished_drops_failed_recving PASSED
+  tpu_inference_connector_c1_test.py::test_unit_get_finished_forwards_done_lists PASSED
+  tpu_inference_connector_c1_test.py::test_unit_get_block_ids_with_load_errors_is_default_empty PASSED
+  tpu_inference_connector_c1_test.py::test_unit_producer_request_finished_holds_blocks PASSED
+  tpu_inference_connector_c1_test.py::test_unit_expiration_time_has_no_reader PASSED
+  tpu_inference_connector_c1_test.py::test_producer_blocks_after_transfer_outcome[tpu_sync_report0-False] PASSED
+  tpu_inference_connector_c1_test.py::test_producer_blocks_after_transfer_outcome[tpu_sync_report1-True] PASSED
+  tpu_inference_connector_c1_test.py::test_consumer_blocks_after_failed_pull_and_abort[tpu_sync_report0-False] PASSED
+  tpu_inference_connector_c1_test.py::test_consumer_blocks_after_failed_pull_and_abort[tpu_sync_report1-True] PASSED
+  ============================== 9 passed in 8.92s ===============================
+  ```
+
+  Re-run 2026-10-22 with §4 of the file added (the connector variants of
+  `Caller.lean`, below): `17 passed in 9.87s`, the eight new cases being
+  `test_fixed_connector_failed_pull_frees_or_recomputes[fail|recompute]`,
+  `test_fixed_connector_abort_before_failed_pull_frees[fail|recompute]`,
+  `test_naive_connector_decodes_on_unwritten_kv[fail|recompute]`,
+  `test_load_error_only_connector_leaks[fail|recompute]`.
+
+  Captured in the failing-case runs, the connector's only trace of the
+  event: `ERROR tpu_raiden_connector.py:645 TPUConnector Worker 0 -->
+  failed_recving=['0']`. What the two composition cases assert, in words:
+  producer — a 4-block prefill finishes `FINISHED_LENGTH_CAPPED`,
+  `request_finished` holds the 4 blocks, tpu-sync's `([], [], ["0"])` is
+  translated to an empty `KVConnectorOutput`, and after 51 further scheduler
+  steps the pool is still 4 short and the request still in
+  `scheduler.requests`; consumer — a request waits for remote KV with 4
+  blocks allocated, the failed pull is translated to nothing, the API layer
+  aborts the request, and after 51 steps the 4 blocks are still held. With
+  `(["0"], [], [])` (producer) or `([], ["0"], [])` (consumer) both pools
+  return to their starting size.
+- **The contract being broken** (vLLM, `kv_connector/v1/base.py:357-389`): a
+  request for which `request_finished()` returned `True` has its blocks held
+  by the scheduler until the connector returns its id from `get_finished()`;
+  and *"even if failures occur, the request must still be reported via
+  `get_finished()`, and the failed block IDs must appear
+  [in `get_block_ids_with_load_errors`] no later than that same pass."*
+  The scheduler frees sender blocks only from `finished_sending`
+  (`scheduler.py:2471-2474`), frees or recomputes a failed receive only through
+  `invalid_block_ids → failed_recving_kv_req_ids` (`:2390-2401, 2646`), and
+  has no timeout of its own for `WAITING_FOR_REMOTE_KVS` (`:646-651` logs
+  only).
+- **Where (connector):** `get_finished` (`tpu_raiden_connector.py:632-657`)
+  destructures `poll_stats()` into `done_sending, done_recving, failed_recving`
+  (`:638`), logs `failed_recving` and returns only the first two (`:640-657`;
+  the comment: *"Do NOT report failed receives as done_recving … Leave them
+  pending; the request times out at the API layer instead"*).
+  `get_block_ids_with_load_errors` is not overridden (base default `set()`,
+  `base.py:375-393`). `SendMeta.expiration_time` is declared (`:113`) and set
+  from `TPU_P2P_WAIT_PULL_TIMEOUT` (`:441-446`) and **never read**.
+- **History and attribution.** The connector was created in one commit,
+  `a342edc3` (2026-06-08, "Use tpu-raiden for KV cache transfer"), as a port
+  of the JAX-P2P `tpu_connector.py`. The old connector had a live expiry loop
+  — *"Mark a req as done sending when it's expired. This req can then be
+  released blocks in the current scheduler step"* (`tpu_connector.py:921-935`
+  at `a342edc3^`) — that put expired sends into `done_sending` itself. The
+  port removed that loop (its `get_finished` says it *"replaces the
+  reqs_wait_pull/reqs_pulling bookkeeping"*, `:634-636`), kept the
+  `expiration_time` field and its assignment, and relied on tpu-sync's
+  `done_sending` instead. At that date the reliance was **correct**: tpu-sync
+  reported an expired send as `done_sending` (`978efff`, 2026-06-13). The
+  **D half** of C1 (failed receives never surfaced) therefore dates from
+  `a342edc3`; the **P half** dates from tpu-sync `4246613` (2026-08-24, see the "tpu-sync side" subsection),
+  which moved expired sends to `failed_recving_` without the connector
+  following. Three later connector commits (`35969606`, `134033aa`,
+  `7ed46a6`) touched the file without changing any of this, nor did the one
+  after the pin (`67d7e0b3`, 2026-09-09, IPv6) on the way to `c2b062b`.
+- **Producer sequence (P leaks):** `request_finished` returns
+  `delay_free_blocks = True` with a fresh uuid (`:437-455`) → scheduler holds
+  the blocks (`scheduler.py:2075-2092`) → worker `register_read` (`:587`) →
+  tpu-sync `NotifyForRead` creates a `TransferSendSession` with
+  `deadline = now + timeout_s` (`kv_cache_manager_with_transfer.cc:456-500`;
+  `timeout_s` is the same 180 s, connector `:522`, `utils.py:88-91`). If D
+  never pulls, or the push fails, the poll finishes the session with
+  `DeadlineExceeded`/the push error and files the req_id in **`failed_recving_`**
+  (`mgr.cc:961-970`: `(failed ? failed_recving_ : done_sending_)`). The
+  connector drops it; `finished_sending` never contains it; the blocks are
+  never freed.
+- **Consumer sequence (D leaks):** `start_read` (`:606`) → tpu-sync receive
+  fails (deadline, transport error, producer gone) → `failed_recving` →
+  dropped. The request stays `WAITING_FOR_REMOTE_KVS` with its blocks. When the
+  client disconnects and the API server aborts it, `finish_requests` sets
+  `delay_free_blocks = request_id not in finished_recving_kv_req_ids`
+  (`scheduler.py:2063-2068`) — true — and the free is deferred to a
+  `finished_recving` report that never comes.
+- **Triggers:** any D-side pull failure (both nodes); D with a **full local
+  prefix hit** for a prompt P just prefilled — D's "notify P" branch is a no-op
+  by design (`:614-621`: *"the producer is freed by the pull's own ack, or by
+  timeout if no pull happened"*) so P waits 180 s and then leaks; D absent
+  (proxy drop, D restart before `start_read`) — P; client abort of a pull that
+  later fails — D.
+- **Impact:** a monotone drain of the KV block pool on long-running P and D
+  nodes, one `logger.error` line per event and nothing else; presents as
+  shrinking KV capacity and admission stalls after hours, cured by restart.
+  The leaked requests also stay in `scheduler.requests`.
+- **What is *not* wrong:** the pair never frees a block tpu-sync may still be
+  DMA-ing into. Success, failure and abort all free either after settlement
+  or never. That discharges `Pipeline` A4 (`docs/transfer/prefill_decode.md`
+  §Upper boundary; `wroteReleased` in `MultiRequest.lean`) for this caller
+  pair, by reading — the leak is the trace where a failure report never maps
+  to a free.
+- **Lean** (`TpuSyncVerify/Transfer/PrefillDecode/Caller.lean`, 2026-10-22):
+  the pair is modelled above `Pipeline.lean`'s publication boundary — the
+  connector as a function from tpu-sync's per-request report to what it tells
+  the scheduler (`Connector`), the scheduler's transfer-held block lifecycle
+  on both nodes under both `kv_load_failure_policy` values. C1 is
+  `trace_c1_p` (P: `pOutcome false` → `leakP`), `trace_c1_d_abort_after` and
+  `trace_c1_d_abort_before` (D: `dOutcome false` and `finish` in either order
+  → `leakD`), all with `connectorCurrent`; `leakP_absorbing` /
+  `leakD_absorbing` prove no later engine event can undo either, which is the
+  formal content of "leak". The fix shape below is `connectorFixed`, and
+  `contract_safe` proves that *any* connector meeting `Contract` (forward
+  every outcome; a failed receive also on the load-failure channel — the
+  `base.py:357-393` text) never leaks and never decodes unwritten KV under
+  either policy. The two half-fixes each have a trace: `trace_naive_decodes`
+  (`done_recving` alone — the EngineCore crash the connector's comment fears
+  is real: the request is promoted with its whole prompt counted as computed)
+  and `trace_loadErrorOnly_*` (`invalid_block_ids` alone — errored or marked,
+  but the free waits for a `finished_recving` that never comes, so still a
+  leak). Each of these end states is also asserted against the real
+  scheduler in §4 of the test file. Exhaustive `search` per configuration:
+  `fixed` safe, the other three find the trace. Assumptions B1–B3 in the
+  module header (one worker, whole-transfer failure, no preemption / prefix
+  caching / chunking).
+- **Hardware repro (not yet run):** `examples/single_host_disagg`: start P
+  and D, send one request through the proxy, stop D before it pulls (or make
+  D's prefix cache hit the whole prompt), wait `TPU_P2P_WAIT_PULL_TIMEOUT`,
+  observe P's `failed_recving=` error line and that P's KV usage never
+  returns; repeat to watch it accumulate. The CPU test above covers every
+  state transition except the native timeout firing.
+- **Fix shape (for the record, not the point of this entry):** report
+  timed-out/failed sends in `finished_sending` (settled, safe) and failed
+  receives through **both** `get_finished()`'s `done_recving` and
+  `get_block_ids_with_load_errors` in the same pass — either alone is wrong
+  (`Caller.trace_naive_decodes`, `trace_loadErrorOnly_*`); the pair preserves
+  the crash protection the comment is about (`Caller.contract_safe`);
+  companion tpu-sync change: a separate `failed_sending` list from
+  `poll_stats()`.
+
+### The tpu-sync side of C1: `4246613` reclassified a never-pulled send from `done_sending` to `failed_recving`, and the list is named for the other side — contributing cause and improvement request, not a defect
+
+- **Status:** not a tpu-sync defect — downgraded 2026-10-20 after asking
+  whether it is a problem without C1. It is not: a consumer that reads all
+  three `poll_stats()` lists and frees on any outcome is unaffected, and
+  tpu-sync's behaviour is self-consistent and pinned by its own test
+  (`SendDrainTest.SendNobodyPulledFailsAtItsDeadline`,
+  `kv_cache_manager_with_transfer_send_drain_test.cc:370-379`). What
+  remains is an API-contract and naming problem that made C1's P half
+  likely and will catch the next connector author the same way; to be
+  raised with the tpu-sync owners as an **improvement request** inside C1's
+  report, not as a numbered finding. In-tree readers of `failed_recving`
+  other than the connector are two microbenchmarks that read it on the
+  receiver only (`examples/microbenchmarks/jax_d2d_read_benchmark_runner.py:360-363`,
+  `torch_d2d_read_benchmark_runner.py:326`), i.e. exactly the reading the
+  name invites.
+- **Where:** `KVCacheManagerWithTransfer::CompleteReadWithDetails`,
+  `kv_cache_manager_with_transfer.cc:958-979`. A send session past its
+  deadline and not draining is finished with `DeadlineExceeded` (`:961-967`)
+  and then `(failed ? failed_recving_ : done_sending_).insert(req_id)`
+  (`:968-970`). `poll_stats()` returns the three lists verbatim
+  (`api/jax/kv_cache_manager.py:164-171`, `api/torch/` likewise).
+- **History.** At `978efff` (2026-06-13) the sweep did
+  `done_sending_.insert(entry->req_id)` for an expired send
+  (`core/kv_cache_manager_with_transfer.cc:770-771` then): a registration
+  nobody pulled was reported as *done sending*, and the producer freed its
+  blocks. `4246613` (2026-08-24, "Retry and fail loudly when host transfer
+  staging memory is exhausted") changed that line to
+  `failed_recving_.insert(entry->req_id)` with the comment *"Nothing pulled
+  this entry within its deadline; the bytes were never sent, so the transfer
+  failed."* Its description and validation are about staging exhaustion
+  (1,112 exhaustion events, dynamic staging); the never-pulled case changed
+  meaning in the same hunk. `8b65aa8` (2026-09-10) folded both outcomes into
+  the `failed ? … : …` line that stands today. The 2026-06-08 port of the
+  tpu-inference connector (`a342edc3`) was written against the earlier
+  meaning: it relies on `done_sending` to cover expiry (its own expiry
+  bookkeeping was removed in the port, see C1) and drops `failed_recving`.
+- **Why it still matters on the tpu-sync side:** `poll_stats()`
+  is the producer's only signal that it may free the prompt's KV blocks.
+  Whether a never-pulled prefill is "done" or "failed" is a reasonable
+  design choice either way, but changing it is an API change for every
+  producer, and routing a *send* outcome through a list called
+  `failed_recving` invites exactly the reading the connector made ("the
+  consumer's failures; not our blocks"). No in-tree Python caller, test or
+  doc was updated to read `failed_recving` on the producer when `4246613`
+  landed.
+- **Effect through C1:** with the tpu-inference connector, every prefill
+  whose consumer never pulls — D full local prefix hit, D absent, proxy drop
+  — leaks its producer-side HBM blocks until restart (C1 for the vLLM
+  mechanics); two months of exposure on anything running tpu-sync ≥
+  `4246613` with that connector. Without C1: no effect.
+- **Improvement request:** report producer outcomes in their own
+  lists — at minimum a `failed_sending` alongside `done_sending` — and say
+  in `poll_stats()`'s docstring which list a producer must read to release
+  blocks. Whether an expired, never-pulled send belongs in `done_sending`
+  (the consumer does not need it, so the bytes "not being sent" is not an
+  error for the producer) or in `failed_sending` is the owners' call; what
+  matters is that it is not silently in neither place the producer reads.
+
+---
+
 ## Callers
 
 What the two open-source engines that drive `tpu-sync` do at the points the
@@ -712,6 +956,17 @@ reshard findings depend on. Read 2026-10-20 at `vllm-torchtpu` `9725110`
   it returns true; with a PP decode the producer votes
   `complete_request_blocks` (`:1568-1592`).
 
+- *tpu-inference* (`tpu_raiden_connector.py` @ `7ed46a6`, 663 lines) — the
+  **prefill-to-decode** caller; it does not use the reshard control plane at
+  all. Producer: `request_finished` holds blocks and mints a uuid
+  (`:437-455`); worker `register_read` (`:587`). Consumer: one `start_read`
+  per request (`:600-613`), a no-op "notify" when there is nothing to pull
+  (`:614-621`). Outcome: `get_finished` forwards `done_sending`/`done_recving`
+  and drops `failed_recving` (`:632-657`) — see C1. uuid: fresh per send
+  (`get_uuid`, `:659-663`), no same-uuid retry anywhere, which is what R-B
+  needs. No Python-side timeout is enforced (`SendMeta.expiration_time` is
+  dead); every deadline is tpu-sync's.
+
 **What this means per finding.**
 
 | Finding | Caller condition it needs | vllm-torchtpu | sglang-torchtpu |
@@ -722,6 +977,8 @@ reshard findings depend on. Read 2026-10-20 at `vllm-torchtpu` `9725110`
 | F10 / R6 — staging-lease aliasing half | a **second `coordinate_transfer` with the same uuid** while the failed sender session drains | **Not reached.** Post-arm failures are never re-coordinated; the only retry is pre-arm. | **Not reached.** Same policy; sibling transfers use distinct derived uuids. |
 | R7a (owner-unscoped `completed_units_` on multi-stage claims) | one source rank sending to ≥ 2 destination stages under one uuid | **Not reached.** Equal stage counts are enforced (`:4874-4881`), each rank feeds one stage; TP prefill → PP decode is not admitted. | **Not reached.** DP decode is one destination; PP decode requires equal stage counts (`:1201-1206`). |
 | R7b (stale `completed_units_` after `AbandonClaim`) | a vote before an abandon, then a re-claim of the same uuid | **Not reached** by the callers' retry policies (re-claims happen only before any sender was dispatched, i.e. before any vote). | Same. |
+| `Pipeline` A4 (no HBM free under a live DMA) | the engine frees transfer-held blocks only after the connector reports settlement | n/a (reshard caller) | n/a | 
+| C1 (block leak on failure) | a transfer failure or a never-pulled registration | n/a (reshard caller) | n/a |
 | F7 / R1 (fixed) | a failed incoming push on a reshard receiver | Was reached: exactly the "uncertain, wait for native terminal" path, which is why the fix shortens the wait from `timeout_s_` to immediate. | Same ("pages armed until the native deadline"). |
 
 Net: F8 is the reshard finding with the widest caller exposure (every
@@ -871,7 +1128,7 @@ as in the Lean preambles: `recv.cc` = `tpu_sync/kv_cache/transfer_receive_sessio
 | Observation | Where (`0ac16d1`) | Note |
 |---|---|---|
 | client-side `SendAck` has no non-test caller; the server-side `OnAck → HandleAck → AckSend → Finish()` handler is wired but never triggered in-repo | `grpc_control_plane_backend.cc:373`, `tcp_control_plane_backend.cc:662`; `mgr.cc:1181-1183, 1358-1361, 1424-1435` | dead path; excluded (`Send` A5) |
-| a failed **send** is reported in `failed_recving_` | `mgr.cc:969-970` | naming/semantics quirk visible through `poll_stats()` |
+| a failed **send** is reported in `failed_recving_` | `mgr.cc:969-970` | naming/semantics quirk visible through `poll_stats()`; since `4246613` (2026-08-24) this also covers a send nobody pulled, and the tpu-inference connector drops the list — the contributing cause of **C1**'s producer half (see the "tpu-sync side" subsection under C1; judged an improvement request, not a defect) |
 | first `Finish` wins on the send side; a later cancel is ignored | `send.cc:193-206` | intended; `trace_cancel_after_ok_finish` |
 | `IsReadyToComplete` can be true before all H2D callbacks ran | `recv.cc:450-456` | `done` still waits for every callback through `in_flight_` (`pollReady_no_settle`), so the outcome and its timing are unchanged. But when the poll wins that window the last callback finds `draining_` and skips `RecordTransferDuration`/`RecordH2dComplete`/`RecordEnd` (`recv.cc:726-732, 746-756`) — the transfer's metrics record keeps default times (`trace_poll_skips_metrics`). With `num_layers() > 0` the `num_completed_layers_ == total_layers` disjunct and the `if (all_complete)` finish in `OnBlockShardsReceived` (`RecordNetworkCompleteLocked`) are dead (`reachable_callbackFinishes`, `netAccount_frame`); only a zero-layer receive needs the poll (`noPoll_zero_layers_never_succeeds`). Removing the poll (design alternative `stepM false` in `ReceivePoll.lean`) keeps every proved property and settlement (`noPoll_safe`, `noPoll_can_settle`) and makes `published = some true → metrics` an invariant (`noPoll_metrics_on_success`). |
 | `EndSendOpLocked` has no underflow guard, `EndRecvOpLocked` does | `send.cc:253-260` vs `recv.cc:407-410` | underflow proved unreachable (`NoUnderflow`) |
@@ -1011,3 +1268,23 @@ clone reset. Results, verbatim:
   bug 7 in `filed_bugs.md`, pinned to `449b591` — the commit the shape A/B
   tests ran against; `ReadRemote` unchanged since `0ac16d1`). Fix pending.
   Filed tally: F1, F2+F3, F4 (fixed), F6 (fixed), F7 (fixed), F8, F9.
+- 2026-10-20 — Opened the prefill-to-decode caller for the first time:
+  tpu-inference `tpu_raiden_connector.py` @ `7ed46a6` (the examples' pin; same
+  at `main` `c2b062b`) on vLLM `6185d73`. Result: `Pipeline` A4 holds for the
+  pair by reading; **C1** recorded (failed/never-pulled transfers leak KV
+  blocks on P and D; `failed_recving` dropped by the connector, `SendMeta.
+  expiration_time` dead). Dated both halves: D half since the connector's
+  first commit `a342edc3` (2026-06-08); P half since tpu-sync `4246613`
+  (2026-08-24) reclassified a never-pulled send from `done_sending_` to
+  `failed_recving_` — first recorded as F11, then downgraded the same day to a
+  contributing cause / improvement request under C1 (not a problem without
+  C1). §Callers gains the third caller.
+  Then confirmed C1 by test on CPU (`tpu_inference_connector_c1_test.py`,
+  9/9 with controls; real vLLM scheduler, real connector, tpu-sync's report
+  as its own `SendNobodyPulledFailsAtItsDeadline` shows it). Neither filed yet.
+- 2026-10-22: **C1 filed** against the caller (tpu-inference), write-up as
+  bug 8 in `filed_bugs.md` (pinned to tpu-inference `c2b062b`, vLLM
+  `5ab4e44` — the version the filed lines were read against — and tpu-sync
+  `0ac16d1`). The tpu-sync side stays an improvement request, not yet
+  raised. Filed tally: F1, F2+F3, F4 (fixed), F6 (fixed), F7 (fixed), F8,
+  F9, C1.

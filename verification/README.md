@@ -17,11 +17,13 @@ directory contains two components:
 
 All citations across models, `docs/`, and `findings/` are pinned to tpu-sync
 `0ac16d1` (upstream `main` merged 2026-10-16; `findings/filed_bugs.md` is frozen
-at the commit it names).
+at the commit it names). The two external callers that `Caller.lean` and
+finding C1 cite are pinned separately, to the pair `examples/*_disagg/setup.sh`
+installs: tpu-inference `7ed46a6`, vLLM `6185d73`.
 
 | Subsystem | What Is Modeled & Proved | Lean Models | Design & Proof Doc |
 |---|---|---|---|
-| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, cross-peer fault isolation, and the transport's receiver-side stream accounting (`Transport.lean`) | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
+| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, cross-peer fault isolation, the transport's receiver-side stream accounting (`Transport.lean`), and the engine above `poll_stats()` — vLLM's scheduler through tpu-inference's connector, the other direction of the engine contract and the model behind finding C1 (`Caller.lean`) | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
 | **Pool Resharding** | Multi-pool send/receive sessions, rank-ordered H2D waves, sub-block byte-interval coverage, `PoolStagingStorage` arena leases, block registry, and two-stage coordinator barriers | [`TpuSyncVerify/Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/) | [reshard.md](docs/transfer/reshard.md) |
 | **Controller & Remote Leases** | Remote read lease lifecycle and `NoWriteAfterRelease` safety via exhaustive state-space exploration | [`TpuSyncVerify/Controller/ReadRemote.lean`](TpuSyncVerify/Controller/ReadRemote.lean) | [read_remote.md](docs/controller/read_remote.md) |
 

@@ -12,6 +12,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering
 import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
 import TpuSyncVerify.Transfer.PrefillDecode.Transport
+import TpuSyncVerify.Transfer.PrefillDecode.Caller
 import TpuSyncVerify.Transfer.Reshard.Receive
 import TpuSyncVerify.Transfer.Reshard.Send
 import TpuSyncVerify.Transfer.Reshard.Pipeline
@@ -35,7 +36,10 @@ subsystem of `tpu_sync/` they describe:
   `Transfer.PrefillDecode` the consumer and producer sessions (`Receive`,
   `ReceivePoll`, `Send`), single- and multi-request pipelines (`Pipeline`,
   `MultiRequest`, `PipelineChecks`), the transport's receiver-side stream
-  accounting behind `Receive` A1/A4 (`Transport`), multi-peer fault isolation (`PeerIsolation`),
+  accounting behind `Receive` A1/A4 (`Transport`), the engine above
+  `poll_stats()` — vLLM's scheduler through tpu-inference's connector, the
+  other direction of `Pipeline` A4 and the model behind finding C1
+  (`Caller`) — multi-peer fault isolation (`PeerIsolation`),
   UUID registration table (`UuidTable`), and block-level gather/reordering/coalescing
   (`BlockOrdering`); and under `Transfer.Reshard` the pool-addressed resharding
   path (`Receive`, `Send`, `Pipeline`, `Coverage`, `PoolStaging`, `Registry`,
