@@ -7,9 +7,13 @@ and `verification/TpuSyncVerify/Controller/ReadRemote.lean`. This note is what
 to carry into the next audit of `RaidenController`, `KVCacheStore`,
 `HostOffloadBackend` or `KVCacheStoreService`.
 
-**Verified against:** tpu-sync `50b0774` (`raiden_controller.cc` byte-identical
-to `01ffa3d`; the F1 regions of `kv_cache_store.cc` unchanged, lines moved).
-None fixed upstream; the F4 fix PR #1105 is open.
+**Verified against:** tpu-sync `2ed6f8f` (2026-10-22). Fixed upstream since
+this note was written: F4 (`72255dd`, 2026-10-07) and **F1 (`b3ea4dc`,
+2026-10-21: one `Lookup(..., pin_found = true)` under one backend lock,
+partial pins released on refusal — the fix `candidate_fixes.patch` proposed;
+the hunk is dropped and the patch now carries F2 shape A only)**. F2/F3
+remain open (filed as bug 7). The `ReadRemote` region of
+`raiden_controller.cc` is unchanged since `1fa06d1`, shifted +6 by `9ac3d3e`.
 
 ## What to carry forward
 
