@@ -97,58 +97,46 @@ TEST_F(KVCacheManagerTorchTest, ConstructorSucceedsWithMocks) {
   EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
 }
 
-TEST_F(KVCacheManagerTorchTest, ConstructorWithRawPjRtBuffersSucceeds) {
-  // Create a real CPU PJRT buffer
+TEST_F(KVCacheManagerTorchTest, GrpcServerOptionalAndOffByDefault) {
   TF_ASSERT_OK_AND_ASSIGN(
       xla::PjRtMemorySpace * memory_space,
       client_->addressable_devices()[0]->default_memory_space());
-  std::vector<float> data(8 * 1024, 1.0f);
+  std::vector<float> data(8 * 256, 1.0f);
   TF_ASSERT_OK_AND_ASSIGN(
       auto pjrt_buffer, client_->BufferFromHostBuffer(
-                            data.data(), xla::F32, {8, 1024},
+                            data.data(), xla::F32, {8, 256},
                             /*byte_strides=*/std::nullopt,
                             xla::PjRtClient::HostBufferSemantics::
                                 kImmutableUntilTransferCompletes,
                             /*on_done_with_host_buffer=*/nullptr, memory_space,
                             /*device_layout=*/nullptr));
+  at::Tensor tensor = at::zeros({8, 256}, at::kFloat);
+  RegisterMockTensor(tensor, pjrt_buffer.get());
+  std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
 
-  // Prepare 2D vector of raw PjRtBuffer pointers
-  std::vector<std::vector<xla::PjRtBuffer*>> device_buffers = {
-      {pjrt_buffer.get()}};
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr_default,
+      KVCacheManager::Create(device_tensors, /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8));
+  EXPECT_EQ(mgr_default->GetRaidenWorkerPort(), 0);
 
-  // Construct KVCacheManager directly from raw PjRtBuffers
-  KVCacheManager manager(device_buffers,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8,
-                         /*unsafe_skip_buffer_lock=*/true);
-
-  EXPECT_EQ(manager.num_layers(), 1);
-  EXPECT_EQ(manager.num_shards(), 1);
-  EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
-}
-
-TEST_F(KVCacheManagerTorchTest, GrpcServerOptionalAndOffByDefault) {
-  KVCacheManager mgr_default(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/1024, /*node_id=*/0,
-                             /*local_port=*/std::nullopt,
-                             /*host_blocks_to_allocate=*/8);
-  EXPECT_EQ(mgr_default.GetRaidenWorkerPort(), 0);
-
-  KVCacheManager mgr_explicit_off(/*num_layers=*/1, /*num_shards=*/1,
-                                  /*slice_byte_size=*/1024, /*node_id=*/0,
-                                  /*local_port=*/std::nullopt,
-                                  /*host_blocks_to_allocate=*/8,
-                                  /*parallelism=*/1, /*raiden_worker_port=*/0,
-                                  /*raiden_controller_address=*/std::nullopt);
-  EXPECT_EQ(mgr_explicit_off.GetRaidenWorkerPort(), 0);
-
-  KVCacheManager mgr_started(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/1024, /*node_id=*/0,
-                             /*local_port=*/std::nullopt,
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr_explicit_off,
+      KVCacheManager::Create(device_tensors, /*local_port=*/std::nullopt,
                              /*host_blocks_to_allocate=*/8,
+                             /*unsafe_skip_buffer_lock=*/false,
                              /*parallelism=*/1, /*raiden_worker_port=*/0,
-                             /*raiden_controller_address=*/"localhost:12345");
-  EXPECT_GT(mgr_started.GetRaidenWorkerPort(), 0);
+                             /*raiden_controller_address=*/std::nullopt));
+  EXPECT_EQ(mgr_explicit_off->GetRaidenWorkerPort(), 0);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr_started,
+      KVCacheManager::Create(device_tensors, /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8,
+                             /*unsafe_skip_buffer_lock=*/false,
+                             /*parallelism=*/1, /*raiden_worker_port=*/0,
+                             /*raiden_controller_address=*/"localhost:12345"));
+  EXPECT_GT(mgr_started->GetRaidenWorkerPort(), 0);
 }
 
 TEST_F(KVCacheManagerTorchTest, WorkerSelfRegistrationWithControllerSuccess) {
@@ -157,19 +145,36 @@ TEST_F(KVCacheManagerTorchTest, WorkerSelfRegistrationWithControllerSuccess) {
 
   std::string raiden_controller_address = test_server->server_address;
 
-  KVCacheManager mgr(/*num_layers=*/1, /*num_shards=*/1,
-                     /*slice_byte_size=*/1024, /*node_id=*/0,
-                     /*local_port=*/std::nullopt,
-                     /*host_blocks_to_allocate=*/8,
-                     /*parallelism=*/1, /*raiden_worker_port=*/0,
-                     raiden_controller_address, "torch_worker_0");
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client_->addressable_devices()[0]->default_memory_space());
+  std::vector<float> data(8 * 256, 1.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client_->BufferFromHostBuffer(
+                            data.data(), xla::F32, {8, 256},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+  at::Tensor tensor = at::zeros({8, 256}, at::kFloat);
+  RegisterMockTensor(tensor, pjrt_buffer.get());
+  std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr,
+      KVCacheManager::Create(device_tensors, /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8,
+                             /*unsafe_skip_buffer_lock=*/false,
+                             /*parallelism=*/1, /*raiden_worker_port=*/0,
+                             raiden_controller_address, "torch_worker_0"));
 
   auto workers =
       test_server->service->worker_registry()->GetRegisteredWorkers();
   ASSERT_EQ(workers.size(), 1);
   EXPECT_EQ(workers[0].worker_id, "torch_worker_0");
   EXPECT_TRUE(absl::StrContains(workers[0].raiden_worker_endpoint,
-                                std::to_string(mgr.GetRaidenWorkerPort())));
+                                std::to_string(mgr->GetRaidenWorkerPort())));
 }
 
 TEST_F(KVCacheManagerTorchTest,
@@ -790,15 +795,21 @@ TEST_F(KVCacheManagerTorchTest, LayersOnDifferentPjRtClientsAreRejected) {
           /*device_layout=*/nullptr));
 
   // Layer 0 on client_, layer 1 on other_client.
-  std::vector<std::vector<xla::PjRtBuffer*>> device_buffers = {
-      {buffer_a.get()}, {buffer_b.get()}};
-  KVCacheManager manager(device_buffers,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8,
-                         /*unsafe_skip_buffer_lock=*/true);
-  ASSERT_EQ(manager.num_layers(), 2);
+  at::Tensor tensor_a = at::zeros({8, 1024}, at::kFloat);
+  at::Tensor tensor_b = at::zeros({8, 1024}, at::kFloat);
+  RegisterMockTensor(tensor_a, buffer_a.get());
+  RegisterMockTensor(tensor_b, buffer_b.get());
+  std::vector<std::vector<at::Tensor>> device_tensors = {{tensor_a},
+                                                         {tensor_b}};
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager,
+      KVCacheManager::Create(device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8,
+                             /*unsafe_skip_buffer_lock=*/true));
+  ASSERT_EQ(manager->num_layers(), 2);
 
-  const int64_t page_nbytes = manager.slice_byte_size();
+  const int64_t page_nbytes = manager->slice_byte_size();
   const int64_t obj_nbytes = 2 * 2 * page_nbytes;
   const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
   const size_t pool_size =
@@ -814,20 +825,20 @@ TEST_F(KVCacheManagerTorchTest, LayersOnDifferentPjRtClientsAreRejected) {
 
   // Map the pool so the failure below is attributable to the split clients
   // and not to a missing registration.
-  manager.SetSharedMemoryMappedForTest(reinterpret_cast<uintptr_t>(pool),
-                                       pool_size);
+  manager->SetSharedMemoryMappedForTest(reinterpret_cast<uintptr_t>(pool),
+                                        pool_size);
 
-  const absl::Status h2d = manager.H2d({1}, {obj}, /*rank_id=*/0).status();
+  const absl::Status h2d = manager->H2d({1}, {obj}, /*rank_id=*/0).status();
   EXPECT_EQ(h2d.code(), absl::StatusCode::kUnimplemented);
   EXPECT_TRUE(absl::StrContains(h2d.message(), "share one PJRT client"))
       << h2d.message();
 
-  const absl::Status d2h = manager.D2h({1}, {obj}, /*rank_id=*/0).status();
+  const absl::Status d2h = manager->D2h({1}, {obj}, /*rank_id=*/0).status();
   EXPECT_EQ(d2h.code(), absl::StatusCode::kUnimplemented);
   EXPECT_TRUE(absl::StrContains(d2h.message(), "share one PJRT client"))
       << d2h.message();
 
-  manager.ResetSharedMemoryMappedForTest();
+  manager->ResetSharedMemoryMappedForTest();
   free(pool);
 }
 
@@ -836,20 +847,22 @@ TEST_F(KVCacheManagerTorchTest, LayersOnDifferentPjRtClientsAreRejected) {
 // validating tensor shapes first would report a bogus layer-count mismatch
 // instead of the real problem.
 TEST_F(KVCacheManagerTorchTest, ObjectTransferWithoutDeviceBuffersIsReported) {
-  const std::vector<std::vector<xla::PjRtBuffer*>> no_device_buffers;
-  KVCacheManager manager(no_device_buffers,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/0,
-                         /*unsafe_skip_buffer_lock=*/true);
+  const std::vector<std::vector<at::Tensor>> no_device_tensors;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager,
+      KVCacheManager::Create(no_device_tensors,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/0,
+                             /*unsafe_skip_buffer_lock=*/true));
 
   at::Tensor obj = at::zeros({2, 1, 4096}, at::kChar);
 
-  const absl::Status h2d = manager.H2d({0}, {obj}, /*rank_id=*/0).status();
+  const absl::Status h2d = manager->H2d({0}, {obj}, /*rank_id=*/0).status();
   EXPECT_EQ(h2d.code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_TRUE(absl::StrContains(h2d.message(), "no registered device KV cache"))
       << h2d.message();
 
-  const absl::Status d2h = manager.D2h({0}, {obj}, /*rank_id=*/0).status();
+  const absl::Status d2h = manager->D2h({0}, {obj}, /*rank_id=*/0).status();
   EXPECT_EQ(d2h.code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_TRUE(absl::StrContains(d2h.message(), "no registered device KV cache"))
       << d2h.message();

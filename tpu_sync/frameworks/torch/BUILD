@@ -62,6 +62,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
@@ -74,7 +75,6 @@ cc_library(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
-        "@com_google_absl//absl/status:status_macros",
     ],
 )
 
@@ -182,6 +182,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -263,7 +264,9 @@ nanobind_extension(
         "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:block_transport",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -428,6 +431,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
@@ -470,6 +474,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
@@ -483,7 +488,6 @@ cc_library(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
-        "@com_google_absl//absl/status:status_macros",
     ],
 )
 
