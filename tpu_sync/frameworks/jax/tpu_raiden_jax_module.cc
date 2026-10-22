@@ -130,7 +130,12 @@ NB_MODULE(_tpu_raiden_jax, m) {
   // =========================================================================
   nb::class_<tpu_raiden::kv_cache::jax::KVCacheManager>(m, "KVCacheManager")
       .def(nb::new_(xla::ValueOrThrowWrapper(
-               tpu_raiden::kv_cache::jax::KVCacheManager::Create)),
+               static_cast<absl::StatusOr<std::unique_ptr<
+                   tpu_raiden::kv_cache::jax::KVCacheManager>> (&)(
+                   nb::list, std::optional<int>, std::optional<int>, bool, int,
+                   int, std::optional<std::string>, std::optional<std::string>,
+                   int64_t, bool)>(
+                   tpu_raiden::kv_cache::jax::KVCacheManager::Create))),
            nb::arg("device_arrays"), nb::arg("local_port") = nb::none(),
            nb::arg("host_blocks_to_allocate") = nb::none(),
            nb::arg("unsafe_skip_buffer_lock") = false,

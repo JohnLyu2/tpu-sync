@@ -63,52 +63,51 @@ class NumaAwareKVCacheManager {
   NumaAwareKVCacheManager& operator=(NumaAwareKVCacheManager&&) = default;
 
 #ifndef WITHOUT_PYTHON
-  // JAX sharded constructor E2E (cache-only by default)
-  NumaAwareKVCacheManager(
+  // JAX sharded factory E2E (cache-only by default).
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
       nanobind::list device_arrays,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int64_t node_id = 0, bool enable_shm = false);
 
-  // New transfer-enabled constructor (flat list of arrays, single shard per
-  // layer). enable_shm opts this manager's host buffers into the shared-memory
+  // Transfer-enabled factory (flat list of arrays, single shard per layer).
+  // |enable_shm| opts this manager's host buffers into the shared-memory
   // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
-  NumaAwareKVCacheManager(nanobind::list kv_caches, int64_t node_id,
-                          int64_t local_control_port, int64_t max_blocks,
-                          int64_t num_slots, double timeout_s,
-                          bool unsafe_skip_buffer_lock, int parallelism,
-                          bool enable_shm = false);
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
+      nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
+      int64_t max_blocks, int64_t num_slots, double timeout_s,
+      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false);
 #endif
 
-  // Raw PjRtBuffer constructor
-  NumaAwareKVCacheManager(
+  // Raw PjRtBuffer factory.
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
       const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int64_t node_id = 0, bool enable_shm = false);
 
-  // Raw PjRtBuffer transfer-enabled constructor: the counterpart of the
-  // nanobind `kv_caches` constructor above for callers that hold
+  // Raw PjRtBuffer transfer-enabled factory: the counterpart of the
+  // nanobind |kv_caches| factory above for callers that hold
   // `xla::PjRtBuffer*` directly. |device_buffers| is laid out
   // [layer][shard]. Starts the control server on |local_control_port| (0 for
   // ephemeral) and reserves |num_slots| host staging slots of |max_blocks|
   // blocks each, which StartRead/NotifyForRead require.
-  NumaAwareKVCacheManager(
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
       const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
       int64_t node_id, int64_t local_control_port, int64_t max_blocks,
       int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
       int parallelism, bool enable_shm = false);
 
-  // FFI metadata constructor (cache-only by default)
-  NumaAwareKVCacheManager(size_t num_layers, size_t num_shards,
-                          size_t slice_byte_size, std::optional<int> local_port,
-                          std::optional<int> host_blocks_to_allocate,
-                          int parallelism = 1);
+  // FFI metadata factory (cache-only by default).
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+      int parallelism = 1);
 
-  // Test-only constructor for sub-manager mock injection
-  explicit NumaAwareKVCacheManager(
+  // Test-only factory for sub-manager mock injection.
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
       std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> sub_managers);
 
   ~NumaAwareKVCacheManager();
@@ -249,22 +248,28 @@ class NumaAwareKVCacheManager {
       absl::string_view backend_name) const;
 
  private:
-#ifndef WITHOUT_PYTHON
-  NumaAwareKVCacheManager(UnpackedCache&& cache, std::optional<int> local_port,
-                          std::optional<int> host_blocks_to_allocate,
-                          bool unsafe_skip_buffer_lock, int parallelism,
-                          int64_t node_id = 0, bool enable_shm = false);
+  NumaAwareKVCacheManager() = default;
+  explicit NumaAwareKVCacheManager(
+      std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> sub_managers);
 
-  NumaAwareKVCacheManager(UnpackedCache&& cache, int64_t node_id,
-                          int64_t local_control_port, int64_t max_blocks,
-                          int64_t num_slots, double timeout_s,
-                          bool unsafe_skip_buffer_lock, int parallelism,
-                          bool enable_shm = false);
+#ifndef WITHOUT_PYTHON
+  explicit NumaAwareKVCacheManager(nanobind::list device_arrays)
+      : device_arrays_(std::move(device_arrays)) {}
+
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
+      UnpackedCache&& cache, std::optional<int> local_port,
+      std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
+      int parallelism, int64_t node_id = 0, bool enable_shm = false);
+
+  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
+      UnpackedCache&& cache, int64_t node_id, int64_t local_control_port,
+      int64_t max_blocks, int64_t num_slots, double timeout_s,
+      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false);
 
   std::optional<nanobind::list> device_arrays_;
 #endif
 
-  void InitSubManagers(
+  absl::Status InitSubManagers(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
@@ -323,11 +328,8 @@ class KVCacheManager {
       bool enable_shm = false);
 #endif
 
-  // TODO(justinlu): Convert the remaining constructors to factory methods, make
-  // the constructors private, and avoid try/catch/throw statements in favor of
-  // absl::Status/absl::StatusOr error propagation.
-  // Raw PjRtBuffer constructor
-  KVCacheManager(
+  // Raw PjRtBuffer factory (cache-only by default).
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
       const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
@@ -348,16 +350,16 @@ class KVCacheManager {
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt);
 
-  // FFI metadata constructor (cache-only by default)
-  KVCacheManager(
+  // FFI metadata factory (cache-only by default).
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       int parallelism = 1, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt);
 
-  // Test-only constructor for sub-manager mock injection
-  explicit KVCacheManager(
+  // Test-only factory for sub-manager mock injection.
+  static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
       std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> sub_managers,
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
@@ -559,13 +561,12 @@ class KVCacheManager {
   }
 
  private:
-  // Used by Create(), CreateWithNodeId(), and CreateFromPjRtBuffers(); adopts
-  // an already constructed |numa_manager|. The gRPC server is started
+  // Adopts an already constructed |numa_manager|. The gRPC server is started
   // separately by the factory.
   explicit KVCacheManager(
       std::unique_ptr<NumaAwareKVCacheManager> numa_manager);
 
-  void StartGrpcServer(
+  absl::Status StartGrpcServer(
       int raiden_worker_port,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt);
