@@ -80,28 +80,99 @@ struct RaidenBlockId {
 
 using BlockSliceList = std::vector<std::pair<std::string, RaidenBlockId>>;
 
+// Controls how Lookup matches `block_hashes`.
+enum class LookupMatchMode {
+  // Longest contiguous prefix from index 0; stops at the first miss.
+  kPrefix,
+  // All matching blocks in `block_hashes`, skipping misses. When
+  // `block_hashes` is empty, snapshots all matching blocks in the backend.
+  kSubset,
+};
+
 // Options controlling lookup behavior across storage backends.
+//
+// Invalid option combinations (return `absl::InvalidArgumentError`):
+// - `match_mode == LookupMatchMode::kSubset && enable_global`
+// - `host_resident_only && enable_global`
+// - `include_eviction_candidates && pin_found`
 struct LookupOptions {
-  // Controls whether the lookup is allowed to query the global registry.
-  // Default is true HERE, serving the internal backend call sites; the
-  // application-level KVCacheStore::Lookup(hashes, enable_global, pin_found)
-  // defaults it to false instead, because the registry query is a blocking
-  // RPC a caller should opt into.
+  // Whether Lookup may query the global registry on local misses.
+  // Defaults to true here; KVCacheStore::Lookup(hashes, enable_global,
+  // pin_found) defaults enable_global to false to avoid a blocking RPC unless
+  // requested.
   bool enable_global = true;
 
-  // Controls whether a block cached remotely may sit between two blocks cached
-  // locally in the answer. When true, the local index and the global registry
-  // are consulted for every hash and the answer runs to the first hash neither
-  // can resolve. When false, the answer stops at the first LOCAL miss and only
-  // the hashes after it are looked for remotely, so a locally cached block can
-  // never follow a remote one.
-  // Default is true.
+  // When true, prefix lookup (kPrefix) may interleave local and remote hits up
+  // to the first hash missing in both. When false, local lookup stops at the
+  // first local miss and queries the registry for the remaining suffix.
+  // Ignored in kSubset mode.
   bool enable_interleaved_lookup = true;
 
-  // Controls whether matched local blocks in store/backends are automatically
-  // pinned in memory to protect against LRU eviction.
-  // Default is false.
+  // When true, atomically pins matched active local blocks under the same lock
+  // acquisition (without resurrecting eviction candidates). When false, uses
+  // Peek() without promoting LRU order.
   bool pin_found = false;
+
+  // Prefix matching (kPrefix) vs. scattered subset / full snapshot (kSubset).
+  LookupMatchMode match_mode = LookupMatchMode::kPrefix;
+
+  // When true, matches only blocks physically resident in local host DRAM
+  // (BlockStatus::HOST or BlockStatus::HOST_AND_HBM), excluding HBM-only
+  // entries and non-DRAM tiers (unlike `enable_global = false`, which only
+  // skips the remote global registry RPC).
+  // TODO(jcgu): Review whether BlockStatus::HBM is still needed or filter out
+  // BlockStatus::HBM entries when `enable_global = false`, so
+  // `host_resident_only` and `enable_global` can be merged.
+  bool host_resident_only = false;
+
+  // When true (requires `!pin_found`), includes unpinned eviction candidates in
+  // addition to active blocks.
+  bool include_eviction_candidates = false;
+
+  // Non-contiguous subset of local host-resident blocks (including eviction
+  // candidates).
+  static LookupOptions HostResidentSubset();
+
+  // Snapshot of active local host-resident blocks (pass empty `block_hashes`).
+  static LookupOptions SnapshotHostResident();
+
+  // Non-contiguous subset of active local host-resident blocks, atomically
+  // pinned under the same lock acquisition.
+  static LookupOptions PinPresentHostResident();
+};
+
+// Controls the insertion behavior of KVCacheStoreBackend::Insert.
+enum class InsertOption {
+  // Best-effort insert/update (default; replaces legacy Insert()):
+  // - Overwrites any active entry's RaidenBlockId in-place without promoting
+  //   it in the LRU list.
+  // - Inserts new keys in forward order, clearing stale candidate metadata.
+  // - Asynchronously unregisters any entries displaced from the active LRU
+  //   cache from the global registry.
+  kBestEffortUpdate,
+
+  // Atomic insert-and-pin (replaces legacy InsertAndLock()):
+  // - Pins existing active entries, overwriting their RaidenBlockId ONLY if
+  //   their current status is BlockStatus::HBM (preserving HOST and
+  //   HOST_AND_HBM bindings).
+  // - Pre-validates available_space() >= new_indices.size(), inserts new keys
+  //   in reverse order so block_hashes[0] lands at the MRU front, and pins all
+  //   new keys (rolling back all pins and insertions on any failure).
+  // - Discards displaced entries into the eviction-candidates list without
+  //   withdrawing them from the global registry.
+  kInsertAndPin,
+
+  // Strict atomic admission without pinning (replaces InsertAllOrNothing()):
+  // - Rejects the batch if block_hashes.empty(), block_hashes.size() !=
+  //   slices.size(), block_hashes contains intra-batch duplicate keys, any key
+  //   is already present (active or eviction candidate), or available_space() <
+  //   block_hashes.size().
+  // - Inserts all keys in forward order without pinning, verifying each Put()
+  //   and rolling back the batch (clearing metadata and erasing prior entries)
+  //   if any insertion fails.
+  // - Discards displaced entries into the eviction-candidates list without
+  //   withdrawing them from the global registry.
+  kAdmitStrict,
 };
 
 // Abstract interface for KV cache index storage backends.
@@ -110,18 +181,19 @@ class KVCacheStoreBackend {
  public:
   virtual ~KVCacheStoreBackend() = default;
 
-  // Invalidates the backend's lifetime fence and stops any backend-owned
-  // background servers before the owning KVCacheStore destroys its
+  // Invalidates the backend's lifetime fence before KVCacheStore destroys its
   // controller and block trackers.
   virtual void Shutdown() {}
 
-  // Name identifying the backend type (e.g., "LruCacheBackend",
-  // "GlobalMemoryPoolingBackend").
+  // Human-readable backend name for logging and diagnostics (e.g.,
+  // "HostOffloadBackend", "posix").
   virtual std::string name() const = 0;
 
-  // Resolves cached block hashes in sequence.
-  // Returns a list of matched (block_hash, RaidenBlockId) pairs up to the first
-  // miss.
+  // Queries cached block hashes according to `options` (see LookupOptions for
+  // prefix vs. subset/snapshot matching, host-residency filtering, and
+  // pinning). Custom implementations must honor `options.match_mode`,
+  // `options.host_resident_only`, and `options.include_eviction_candidates` or
+  // return `absl::UnimplementedError`.
   virtual absl::StatusOr<BlockSliceList> Lookup(
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) = 0;
@@ -153,16 +225,13 @@ class KVCacheStoreBackend {
     return tsl::Future<>(absl::UnimplementedError("Save not implemented."));
   }
 
-  // Inserts key-block mappings into the backend. Backend-internal: the store
-  // facade does not expose this form -- KVCacheStore::Insert() maps to
-  // InsertAndLock below -- and its remaining callers are internal (the
-  // store's pollers rewrite a completed entry through it).
-  // Returns:
-  //   - bool: true if all hashes were newly inserted (none already existed)
-  //   - BlockSliceList: entries evicted from this backend during insertion
-  virtual std::pair<bool, BlockSliceList> Insert(
+  // Inserts or updates key-block mappings in the backend according to `option`
+  // (see InsertOption for kBestEffortUpdate, kInsertAndPin, and kAdmitStrict
+  // semantics). Returns true if the operation succeeded.
+  virtual bool Insert(
       absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) = 0;
+      absl::Span<const RaidenBlockId> slices,
+      InsertOption option = InsertOption::kBestEffortUpdate) = 0;
 
   // Pins existing hashes and inserts & locks new hashes if space permits.
   // Performs complete rollback on failure. Returns true on full success.
@@ -226,47 +295,10 @@ class KVCacheStoreBackend {
     return {};
   }
 
-  // Every hash with a host-resident copy, pinned entries included, eviction
-  // candidates excluded. One-shot inventory snapshot for republishing to the
-  // global registry after a registration lapse; not an enumeration to build
-  // logic on -- entries may be evicted the moment the lock drops.
-  virtual std::vector<std::string> SnapshotHostResidentHashes() const {
-    return {};
-  }
-
-  // Pins the subset of `block_hashes` that is still host-resident and returns
-  // those hashes with their current host block ids, all under one lock
-  // acquisition. Unlike Pin(), absent or candidate hashes are skipped rather
-  // than failing the batch: callers feed this from a stale snapshot, and a
-  // hash evicted since the snapshot must be dropped, not resurrected. The
-  // caller Release()s the returned hashes.
-  virtual std::vector<std::pair<std::string, int32_t>> PinPresentHostResident(
-      absl::Span<const std::string> block_hashes) {
-    return {};
-  }
-
-  // --- Remote write (WriteRemote) ------------------------------------------
+  // --- Remote write (WriteRemote) & registry helpers -----------------------
   //
-  // These four exist because a WriteRemote handler holds only this interface,
-  // and because each needs to happen under ONE acquisition of the backend's
-  // lock. Composing them at the service out of Lookup/Insert/Delete would
-  // check and then act with the lock dropped in between, which is exactly the
-  // window a concurrent writer needs.
-  //
-  // The defaults are all refusals, so a backend that does not implement them
-  // makes WriteRemote fail rather than half-succeed.
-
-  // Which of `block_hashes` this backend already holds in host DRAM.
-  //
-  // Not Lookup(): Lookup stops at the first miss (it answers a prefix
-  // question) so it cannot report a scattered subset, and it promotes LRU
-  // order as a side effect. This has to see eviction CANDIDATES too -- a
-  // candidate still has its host block, so treating it as absent would let a
-  // duplicate through.
-  virtual std::vector<std::string> AlreadyPresentHostResident(
-      absl::Span<const std::string> block_hashes) const {
-    return {};
-  }
+  // Default implementations refuse or return UnimplementedError so backends
+  // that do not support remote writes fail cleanly.
 
   // Inserts every hash or none, returning false if any part fails.
   //

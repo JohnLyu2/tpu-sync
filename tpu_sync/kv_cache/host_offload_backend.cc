@@ -87,6 +87,10 @@ bool IsTransportError(const absl::Status& status) {
   return absl::IsUnavailable(status) || absl::IsDeadlineExceeded(status);
 }
 
+bool IsHostResidentStatus(BlockStatus status) {
+  return status == BlockStatus::HOST || status == BlockStatus::HOST_AND_HBM;
+}
+
 }  // namespace
 
 HostOffloadBackend::HostOffloadBackend(
@@ -138,57 +142,135 @@ absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
 
 absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
     absl::Span<const std::string> block_hashes, const LookupOptions& options) {
+  if (options.match_mode == LookupMatchMode::kSubset && options.enable_global) {
+    return absl::InvalidArgumentError(
+        "LookupMatchMode::kSubset is not supported with enable_global=true");
+  }
+  if (options.host_resident_only && options.enable_global) {
+    return absl::InvalidArgumentError(
+        "host_resident_only is not supported with enable_global=true");
+  }
+  if (options.include_eviction_candidates && options.pin_found) {
+    return absl::InvalidArgumentError(
+        "include_eviction_candidates is not supported with pin_found=true");
+  }
+
+  // Fast Path A: full snapshot of the local index.
+  if (options.match_mode == LookupMatchMode::kSubset && block_hashes.empty()) {
+    absl::MutexLock lock(mutex_);
+    BlockSliceList results;
+    results.reserve(lru_cache_.size());
+    for (const auto& [hash, _] : lru_cache_.map()) {
+      if (!options.include_eviction_candidates && !lru_cache_.Contains(hash)) {
+        continue;
+      }
+      const RaidenBlockId* block_id_ptr =
+          options.include_eviction_candidates
+              ? lru_cache_.PeekIncludingCandidates(hash)
+              : lru_cache_.Peek(hash);
+      if (block_id_ptr == nullptr) {
+        continue;
+      }
+      if (options.host_resident_only &&
+          !IsHostResidentStatus(block_id_ptr->status)) {
+        continue;
+      }
+      if (options.pin_found) {
+        lru_cache_.Pin(hash);
+      }
+      results.emplace_back(hash, *block_id_ptr);
+    }
+    return results;
+  }
+
+  // Fast Path B: non-contiguous subset over block_hashes.
+  if (options.match_mode == LookupMatchMode::kSubset) {
+    absl::MutexLock lock(mutex_);
+    BlockSliceList results;
+    results.reserve(block_hashes.size());
+    for (const std::string& hash : block_hashes) {
+      const RaidenBlockId* block_id_ptr =
+          options.include_eviction_candidates
+              ? lru_cache_.PeekIncludingCandidates(hash)
+              : lru_cache_.Peek(hash);
+      if (block_id_ptr == nullptr) {
+        continue;
+      }
+      if (options.host_resident_only &&
+          !IsHostResidentStatus(block_id_ptr->status)) {
+        continue;
+      }
+      if (options.pin_found) {
+        lru_cache_.Pin(hash);
+      }
+      results.emplace_back(hash, *block_id_ptr);
+    }
+    return results;
+  }
+
+  // Fast Path C: local-only contiguous prefix over block_hashes.
+  if (!options.enable_global) {
+    if (block_hashes.empty()) {
+      return BlockSliceList{};
+    }
+    absl::MutexLock lock(mutex_);
+    BlockSliceList results;
+    results.reserve(block_hashes.size());
+    for (const std::string& hash : block_hashes) {
+      const RaidenBlockId* block_id_ptr =
+          options.include_eviction_candidates
+              ? lru_cache_.PeekIncludingCandidates(hash)
+              : lru_cache_.Peek(hash);
+      if (block_id_ptr == nullptr) {
+        break;
+      }
+      if (options.host_resident_only &&
+          !IsHostResidentStatus(block_id_ptr->status)) {
+        break;
+      }
+      if (options.pin_found) {
+        lru_cache_.Pin(hash);
+      }
+      results.emplace_back(hash, *block_id_ptr);
+    }
+    return results;
+  }
+
   if (block_hashes.empty()) {
     return BlockSliceList{};
   }
 
-  // Which hashes the local sweep matched -- one bit each, not the entries
-  // themselves. Neither the matched values nor pointers to them survive the
-  // registry RPC below: the RPC runs with mutex_ released, and copying a
-  // RaidenBlockId means copying the three strings inside its RaidenId, while a
-  // pointer into an LRU node dangles the moment a concurrent Delete or Evict
-  // erases that node. The assembly phase re-reads the index under the lock
-  // instead, which is both cheaper than the copies and the only way to tell
-  // that an entry is still there.
-  //
-  // The bits are still needed: they say which pins this call took, and which
-  // hashes the registry was asked about.
+  // Track local hits as bits rather than copying RaidenBlockIds or holding
+  // pointers across the unlocked registry RPC; Phase 3 re-reads under mutex_.
   std::vector<bool> local_hit(block_hashes.size(), false);
   std::vector<std::string> missing_hashes;
 
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
 
-  // Phase 1: sweep the local index for EVERY hash, and pin each hit as it is
-  // found. Pinning up front is what makes the answer trustworthy: the registry
-  // RPC below is a blocking round trip, and without the pins another thread
-  // could evict a block between matching it here and returning it. Hits that
-  // turn out to sit past the end of the answer are unpinned again in phase 4.
+  // Phase 1: sweep the local index and pin active hits up front so they cannot
+  // be evicted during the blocking registry RPC (tail hits past the first miss
+  // are unpinned in Phase 4).
   {
     absl::MutexLock lock(mutex_);
     client = registry_client_;
     local_id = raiden_id_;
     for (size_t i = 0; i < block_hashes.size(); ++i) {
       const auto& hash = block_hashes[i];
-      // Peek in BOTH cases, so pin_found decides only whether a hit is pinned,
-      // never whether it is a hit. GetAndPin would also resurrect an eviction
-      // candidate -- it splices the node out of evict_candidate_list_ -- which
-      // would make a lookup silently un-queue a block the store had already
-      // decided to reclaim, and make the space accounting behind it wrong.
-      // Candidates are invisible to lookup; pinning must not change that.
-      const RaidenBlockId* existing = lru_cache_.Peek(hash);
+      // Use Peek + Pin rather than GetAndPin so pinning never resurrects an
+      // eviction candidate.
+      const RaidenBlockId* existing =
+          options.include_eviction_candidates
+              ? lru_cache_.PeekIncludingCandidates(hash)
+              : lru_cache_.Peek(hash);
       if (existing != nullptr) {
         if (options.pin_found) {
-          // Not a candidate (Peek just proved it), so this only moves the node
-          // from the active LRU list to the pinned list.
           lru_cache_.Pin(hash);
         }
         local_hit[i] = true;
         continue;
       }
       if (!options.enable_interleaved_lookup) {
-        // Without interleaving the answer cannot continue past a local miss,
-        // so everything from here on is the registry's to answer.
         missing_hashes.assign(block_hashes.begin() + i, block_hashes.end());
         break;
       }
@@ -196,9 +278,8 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
     }
   }
 
-  // Phase 2: ask the registry about the holes only. A failure is not an error
-  // for the caller -- it just means nothing fills the holes, so the answer ends
-  // at the first one.
+  // Phase 2: query the global registry for local misses. RPC failures are
+  // logged and treated as remote misses.
   std::vector<global_registry::KVBlockMetadata> remote_hits;
   if (!missing_hashes.empty() && options.enable_global && client != nullptr) {
     auto lookup_remote = [&]() -> absl::Status {
@@ -210,34 +291,29 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
     (void)lookup_remote();
   }
 
-  // Phases 3 and 4, under one lock: walk the request in order taking each hash
-  // from whichever source has it, then hand back the pins that fell past the
-  // end of the answer.
+  // Phases 3 & 4: assemble the contiguous prefix from local and remote hits
+  // under mutex_, then release any Phase 1 pins past the first unresolved miss.
   BlockSliceList results;
   results.reserve(block_hashes.size());
   {
     absl::MutexLock lock(mutex_);
-
-    // The registry answers positionally against missing_hashes and truncates at
-    // its own first miss, so its results line up with the holes in the order
-    // they were found.
     size_t remote_idx = 0;
     for (size_t i = 0; i < block_hashes.size(); ++i) {
       if (local_hit[i]) {
-        // Re-read rather than trusting the sweep: a hit that was not pinned
-        // (pin_found unset) can have been evicted while the registry RPC was in
-        // flight, and reporting a block this node no longer holds is worse than
-        // a short answer. A pinned hit is still here by construction, and this
-        // costs one index lookup either way.
-        const RaidenBlockId* existing = lru_cache_.Peek(block_hashes[i]);
+        // Re-verify unpinned local hits in case they were evicted during
+        // Phase 2.
+        const RaidenBlockId* existing =
+            options.include_eviction_candidates
+                ? lru_cache_.PeekIncludingCandidates(block_hashes[i])
+                : lru_cache_.Peek(block_hashes[i]);
         if (existing == nullptr) {
-          break;  // Gone underneath us: the answer ends here.
+          break;
         }
         results.emplace_back(block_hashes[i], *existing);
         continue;
       }
       if (remote_idx >= remote_hits.size()) {
-        break;  // Neither source has this hash: the answer ends here.
+        break;
       }
       const auto& metadata = remote_hits[remote_idx++];
       const auto& proto_id = metadata.raiden_id();
@@ -248,16 +324,15 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
           .data_replica_idx = proto_id.data_replica_idx(),
       };
       if (remote_id == local_id) {
-        // Unverified HOST hit from a registry that did not filter the caller.
+        // Ignore stale self-entries returned by the registry.
         break;
       }
       results.emplace_back(
-          block_hashes[i], RaidenBlockId(remote_id, metadata.block_id(), BlockStatus::REMOTE));
+          block_hashes[i],
+          RaidenBlockId(remote_id, metadata.block_id(), BlockStatus::REMOTE));
     }
 
-    // Give back the pins taken in phase 1 for hits that fell past the end of
-    // the answer. The caller never learns about those blocks, so it would never
-    // release them itself. Unpin is a no-op for a hash that is no longer there.
+    // Phase 4: unpin local hits that fell past the returned prefix.
     if (options.pin_found) {
       for (size_t i = results.size(); i < block_hashes.size(); ++i) {
         if (local_hit[i]) {
@@ -270,11 +345,14 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
   return results;
 }
 
-std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
-  BlockSliceList evicted_entries;
-  bool all_inserted = true;
+bool HostOffloadBackend::Insert(absl::Span<const std::string> block_hashes,
+                                absl::Span<const RaidenBlockId> slices,
+                                InsertOption option) {
+  if (option != InsertOption::kBestEffortUpdate) {
+    return false;
+  }
+
+  std::vector<std::string> evicted_hashes;
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
 
@@ -283,7 +361,6 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
     for (size_t i = 0; i < block_hashes.size(); ++i) {
       const std::string& hash = block_hashes[i];
       if (lru_cache_.Contains(hash)) {
-        all_inserted = false;
         if (i < slices.size()) {
           if (RaidenBlockId* existing = lru_cache_.PeekMutable(hash)) {
             *existing = slices[i];
@@ -306,7 +383,7 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
         evicted = lru_cache_.Put(hash, RaidenBlockId());
       }
       if (evicted.has_value()) {
-        evicted_entries.push_back(std::move(*evicted));
+        evicted_hashes.push_back(std::move(evicted->first));
       }
     }
     client = registry_client_;
@@ -315,12 +392,7 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
 
   // Withdraw only: a completed save publishes, this does not. What was evicted
   // to make room is unreadable from now on, and nothing else retires it.
-  if (client != nullptr && !evicted_entries.empty()) {
-    std::vector<std::string> evicted_hashes;
-    evicted_hashes.reserve(evicted_entries.size());
-    for (const auto& [hash, block_id] : evicted_entries) {
-      evicted_hashes.push_back(hash);
-    }
+  if (client != nullptr && !evicted_hashes.empty()) {
     client
         ->UnregisterAsync(evicted_hashes, local_id,
                           global_registry::kUnwaitedMutationTimeout)
@@ -333,7 +405,7 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
         });
   }
 
-  return std::make_pair(all_inserted, std::move(evicted_entries));
+  return true;
 }
 
 bool HostOffloadBackend::InsertAndLock(
@@ -636,45 +708,6 @@ std::vector<int> HostOffloadBackend::Evict(
   return host_ids_to_deallocate;
 }
 
-std::vector<std::string> HostOffloadBackend::SnapshotHostResidentHashes()
-    const {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> hashes;
-  hashes.reserve(lru_cache_.size());
-  for (const auto& [hash, it] : lru_cache_.map()) {
-    // Candidates are excluded on purpose: they are queued for eviction, and
-    // republishing one would advertise a block that is about to disappear.
-    if (it->location != NodeLocation::kCandidate &&
-        (it->value.status == BlockStatus::HOST ||
-         it->value.status == BlockStatus::HOST_AND_HBM)) {
-      hashes.push_back(hash);
-    }
-  }
-  return hashes;
-}
-
-std::vector<std::pair<std::string, int32_t>>
-HostOffloadBackend::PinPresentHostResident(
-    absl::Span<const std::string> block_hashes) {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::pair<std::string, int32_t>> pinned;
-  pinned.reserve(block_hashes.size());
-  for (const std::string& hash : block_hashes) {
-    // Peek before Pin: Pin resurrects eviction candidates, and a hash that
-    // became a candidate since the caller's snapshot must stay on its way
-    // out rather than be re-advertised.
-    const RaidenBlockId* entry = lru_cache_.Peek(hash);
-    if (entry == nullptr || (entry->status != BlockStatus::HOST &&
-                             entry->status != BlockStatus::HOST_AND_HBM)) {
-      continue;
-    }
-    if (lru_cache_.Pin(hash)) {
-      pinned.push_back({hash, entry->host_block_id});
-    }
-  }
-  return pinned;
-}
-
 absl::StatusOr<std::shared_ptr<KVCacheStoreClient>>
 HostOffloadBackend::GetKVCacheStoreClient(const RaidenId& remote_id) {
   std::shared_ptr<global_registry::GlobalRegistryClient> registry;
@@ -916,22 +949,6 @@ HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
     return tsl::Future<proto::PollWriteRemoteResponse>(client.status());
   }
   return (*client)->PollWriteRemote(operation_id, wait_ms);
-}
-
-std::vector<std::string> HostOffloadBackend::AlreadyPresentHostResident(
-    absl::Span<const std::string> block_hashes) const {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> present;
-  for (const auto& hash : block_hashes) {
-    // PeekIncludingCandidates: an eviction candidate still holds its host
-    // block, so it must count as present. Peek would also promote LRU order.
-    const RaidenBlockId* entry = lru_cache_.PeekIncludingCandidates(hash);
-    if (entry != nullptr && (entry->status == BlockStatus::HOST ||
-                             entry->status == BlockStatus::HOST_AND_HBM)) {
-      present.push_back(hash);
-    }
-  }
-  return present;
 }
 
 bool HostOffloadBackend::InsertAllOrNothing(
@@ -1274,7 +1291,7 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
         }
       }
       if (!update_hashes.empty()) {
-        Insert(update_hashes, update_slices, /*on_host=*/true);
+        Insert(update_hashes, update_slices);
         Release(update_hashes);
       }
       load_tracker->MarkDone(hashes);
@@ -1366,7 +1383,7 @@ tsl::Future<> HostOffloadBackend::Save(
             }
           }
           if (!update_hashes.empty()) {
-            Insert(update_hashes, update_slices, /*on_host=*/true);
+            Insert(update_hashes, update_slices);
           }
           save_tracker->MarkDone(hashes);
           save_promise.Set(absl::OkStatus());

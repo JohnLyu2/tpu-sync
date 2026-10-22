@@ -239,6 +239,111 @@ TEST(LogicalBlockManagerTest, TargetAllocatedBlocksReusableAfterUnlock) {
   EXPECT_THAT(blocks, ElementsAre(1));
 }
 
+TEST(LogicalBlockManagerTest, NumFreeBlocksTracksAllocateAndFailure) {
+  LogicalBlockManager manager(5);
+  // Construction
+  EXPECT_EQ(manager.num_free_blocks(), 5);
+
+  // Allocate locked: leaves 2 free blocks and 0 evictable blocks.
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks1, manager.Allocate(3, /*lock=*/true));
+  EXPECT_EQ(manager.num_free_blocks(), 2);
+
+  // A failing Allocate: insufficient blocks when no evictable blocks exist
+  // (requested 3 > 2 free blocks) leaves count unchanged.
+  EXPECT_THAT(manager.Allocate(3),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  EXPECT_EQ(manager.num_free_blocks(), 2);
+
+  // A failing Allocate: invalid requests leave count unchanged.
+  EXPECT_THAT(manager.Allocate(0),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 2);
+
+  EXPECT_THAT(manager.Allocate(-1),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 2);
+
+  EXPECT_THAT(manager.Allocate(10),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 2);
+
+  // Allocate unlocked: leaves 1 free block.
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks2, manager.Allocate(1, /*lock=*/false));
+  EXPECT_EQ(manager.num_free_blocks(), 1);
+}
+
+TEST(LogicalBlockManagerTest, NumFreeBlocksUnchangedOnEvictReusePath) {
+  LogicalBlockManager manager(4);
+  EXPECT_EQ(manager.num_free_blocks(), 4);
+
+  // Allocate all 4 blocks unlocked.
+  TF_ASSERT_OK_AND_ASSIGN(auto initial_blocks,
+                          manager.Allocate(4, /*lock=*/false));
+  EXPECT_EQ(manager.num_free_blocks(), 0);
+
+  // Subsequent allocation must reuse evictable (unlocked) blocks.
+  // Count of free blocks must remain 0.
+  TF_ASSERT_OK_AND_ASSIGN(auto reused_unlocked,
+                          manager.Allocate(2, /*lock=*/false));
+  EXPECT_EQ(manager.num_free_blocks(), 0);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto reused_locked,
+                          manager.Allocate(2, /*lock=*/true));
+  EXPECT_EQ(manager.num_free_blocks(), 0);
+}
+
+TEST(LogicalBlockManagerTest, NumFreeBlocksTracksAllocateTargetAndRejection) {
+  LogicalBlockManager manager(5);
+  EXPECT_EQ(manager.num_free_blocks(), 5);
+
+  ABSL_EXPECT_OK(manager.AllocateTarget({1, 3}));
+  EXPECT_EQ(manager.num_free_blocks(), 3);
+
+  // Rejected AllocateTarget: out of range ID.
+  EXPECT_THAT(manager.AllocateTarget({5}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 3);
+
+  // Rejected AllocateTarget: already allocated ID.
+  EXPECT_THAT(manager.AllocateTarget({1}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_EQ(manager.num_free_blocks(), 3);
+
+  // Rejected AllocateTarget: duplicate ID in request batch.
+  EXPECT_THAT(manager.AllocateTarget({2, 2}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 3);
+}
+
+TEST(LogicalBlockManagerTest,
+     NumFreeBlocksTracksDeallocateWithDuplicatesAndRejection) {
+  LogicalBlockManager manager(4);
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks, manager.Allocate(3, /*lock=*/true));
+  EXPECT_EQ(manager.num_free_blocks(), 1);
+
+  // Rejected Deallocate: invalid block ID.
+  EXPECT_THAT(manager.Deallocate({-1}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 1);
+
+  EXPECT_THAT(manager.Deallocate({4}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 1);
+
+  // Rejected Deallocate: unallocated block ID.
+  EXPECT_THAT(manager.Deallocate({3}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(manager.num_free_blocks(), 1);
+
+  // Deallocate with duplicate ID in batch: block 0 should only be freed once.
+  ABSL_EXPECT_OK(manager.Deallocate({0, 0}));
+  EXPECT_EQ(manager.num_free_blocks(), 2);
+
+  // Deallocate remaining allocated blocks.
+  ABSL_EXPECT_OK(manager.Deallocate({1, 2}));
+  EXPECT_EQ(manager.num_free_blocks(), 4);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

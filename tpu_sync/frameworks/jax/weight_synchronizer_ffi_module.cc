@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <unordered_set>
-
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include "tpu_sync/frameworks/jax/weight_synchronizer.h"
@@ -47,39 +45,22 @@ nb::list prepare_extended_info(nb::list gathered_info_list, nb::list device_ids,
 
 NB_MODULE(_weight_synchronizer_ffi, m) {
   m.def("destroy_weight_synchronizer", []() {
-    std::unordered_set<tpu_raiden::weight_sync::WeightSynchronizerBase*>
-        deleted;
-    for (size_t i = 0; i < tpu_raiden::weight_sync::kMaxShards; ++i) {
-      if (tpu_raiden::weight_sync::g_weight_synchronizers[i] != nullptr) {
-        if (deleted.insert(tpu_raiden::weight_sync::g_weight_synchronizers[i])
-                .second) {
-          delete tpu_raiden::weight_sync::g_weight_synchronizers[i];
-        }
-        tpu_raiden::weight_sync::g_weight_synchronizers[i] = nullptr;
-      }
-    }
+    tpu_raiden::weight_sync::WeightSynchronizerFfiManager::Default().Clear(
+        /*delete_instances=*/true);
     tpu_raiden::weight_sync::ClearSharedWsMap();
   });
 
   m.def(
       "is_listener_active",
       [](int shard_idx = 0) -> bool {
-        if (shard_idx >= 0 &&
-            static_cast<size_t>(shard_idx) <
-                tpu_raiden::weight_sync::kMaxShards &&
-            tpu_raiden::weight_sync::g_weight_synchronizers[shard_idx] !=
-                nullptr) {
-          return tpu_raiden::weight_sync::g_weight_synchronizers[shard_idx]
-              ->is_listener_active();
+        if (const auto* ws =
+                tpu_raiden::weight_sync::WeightSynchronizerFfiManager::Default()
+                    .GetSynchronizerForShard(shard_idx);
+            ws != nullptr) {
+          return ws->is_listener_active();
         }
-        for (size_t i = 0; i < tpu_raiden::weight_sync::kMaxShards; ++i) {
-          if (tpu_raiden::weight_sync::g_weight_synchronizers[i] != nullptr &&
-              tpu_raiden::weight_sync::g_weight_synchronizers[i]
-                  ->is_listener_active()) {
-            return true;
-          }
-        }
-        return false;
+        return tpu_raiden::weight_sync::WeightSynchronizerFfiManager::Default()
+            .HasActiveListener();
       },
       nb::arg("shard_idx") = 0);
 

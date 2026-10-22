@@ -33,13 +33,13 @@
 #include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
+#include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/socket_transport_adapter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/lib/transport_metrics_exporter.h"
@@ -227,7 +227,7 @@ class BlockTransport final {
       size_t num_groups, lib::TransportAdapter* adapter);
 
   lib::Request BuildBlockRequest(
-      uint8_t socket_opcode, uint8_t* laddr, uint8_t* raddr, size_t len,
+      lib::TransferOp op, uint8_t* laddr, uint8_t* raddr, size_t len,
       uint32_t count_or_size, uint32_t request_id, uint64_t uuid,
       uint64_t buffer_id, int parallelism, MajorOrder major_order,
       uint32_t remote_id, uint32_t local_id, int stream_idx = 0,

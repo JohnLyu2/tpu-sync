@@ -45,38 +45,22 @@ namespace torch {
 
 class TorchKVCacheManager : public KVCacheManagerWithTransfer {
  public:
-  // PyTorch sharded constructor E2E (cache-only by default)
-  TorchKVCacheManager(
+  // PyTorch sharded factory E2E (cache-only by default).
+  static absl::StatusOr<std::unique_ptr<TorchKVCacheManager>> Create(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int64_t node_id = 0, bool enable_shm = false);
 
-  // Raw PjRtBuffer sharded constructor
-  TorchKVCacheManager(
-      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
-      std::optional<int> local_port = std::nullopt,
-      std::optional<int> host_blocks_to_allocate = std::nullopt,
-      bool unsafe_skip_buffer_lock = false, int parallelism = 1,
-      int64_t node_id = 0, bool enable_shm = false);
-
-  // New transfer-enabled constructor (flat list of tensors, single shard per
-  // layer). enable_shm opts this manager's host buffers into the shared-memory
+  // Transfer-enabled factory (flat list of tensors, single shard per layer).
+  // |enable_shm| opts this manager's host buffers into the shared-memory
   // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
-  TorchKVCacheManager(const std::vector<at::Tensor>& kv_caches, int64_t node_id,
-                      int64_t local_control_port, int64_t max_blocks,
-                      int64_t num_slots, double timeout_s,
-                      bool unsafe_skip_buffer_lock, int parallelism = 4,
-                      std::optional<int> listener_port = std::nullopt,
-                      bool enable_shm = false);
-
-  // Metadata-only constructor for host-memory Stage 1 resharding tests.
-  TorchKVCacheManager(size_t num_layers, size_t num_shards,
-                      size_t slice_byte_size, int64_t node_id,
-                      std::optional<int> local_port,
-                      std::optional<int> host_blocks_to_allocate,
-                      int parallelism);
+  static absl::StatusOr<std::unique_ptr<TorchKVCacheManager>> Create(
+      const std::vector<at::Tensor>& kv_caches, int64_t node_id,
+      int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
+      double timeout_s, bool unsafe_skip_buffer_lock, int parallelism = 4,
+      std::optional<int> listener_port = std::nullopt, bool enable_shm = false);
 
   ~TorchKVCacheManager() override;
 
@@ -135,12 +119,9 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   static UnpackedLayers UnpackLayers(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
       bool unsafe_skip_buffer_lock = false);
-  static UnpackedLayers UnpackLayers(
-      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
-      bool unsafe_skip_buffer_lock = false);
 
-  // Delegated-to constructor for BOTH public ctors. Moves the keep-alive refs
-  // into buffer_refs_ so the materialized device buffers survive for this
+  // Delegated-to constructor for BOTH public factories. Moves the keep-alive
+  // refs into buffer_refs_ so the materialized device buffers survive for this
   // manager's lifetime. `kv_caches` is retained for the disagg path's
   // kv_caches() accessor (empty for the offload path).
   TorchKVCacheManager(UnpackedLayers unpacked, std::optional<int> local_port,
@@ -173,16 +154,6 @@ class KVCacheManager {
       std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
       bool enable_shm = false);
 
-  KVCacheManager(
-      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
-      std::optional<int> local_port = std::nullopt,
-      std::optional<int> host_blocks_to_allocate = std::nullopt,
-      bool unsafe_skip_buffer_lock = false, int parallelism = 1,
-      int raiden_worker_port = 0,
-      std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
-      bool enable_shm = false);
-
   // Creates a transfer-enabled manager over the flat list of per-layer
   // tensors in |kv_caches| (single shard per layer). |enable_shm| opts this
   // manager's host buffers into the shared-memory segments named by
@@ -197,14 +168,6 @@ class KVCacheManager {
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt,
       bool enable_shm = false);
-
-  KVCacheManager(
-      size_t num_layers, size_t num_shards, size_t slice_byte_size,
-      int64_t node_id, std::optional<int> local_port,
-      std::optional<int> host_blocks_to_allocate, int parallelism = 1,
-      int raiden_worker_port = 0,
-      std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
 
   ~KVCacheManager();
 
@@ -513,11 +476,11 @@ class KVCacheManager {
   }
 
  private:
-  // Used by Create(); adopts an already constructed |torch_manager|. The gRPC
-  // server is started separately by the factory.
+  // Adopts an already constructed |torch_manager|. The gRPC server is started
+  // separately by the factory.
   explicit KVCacheManager(std::unique_ptr<TorchKVCacheManager> torch_manager);
 
-  void StartGrpcServer(
+  absl::Status StartGrpcServer(
       int raiden_worker_port,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt);

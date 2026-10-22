@@ -90,9 +90,7 @@ TEST(HostOffloadBackendTest, BasicInsertAndLookup) {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST)};
 
-  auto [all_new, evicted] = backend.Insert(hashes, slices, /*on_host=*/true);
-  EXPECT_TRUE(all_new);
-  EXPECT_TRUE(evicted.empty());
+  EXPECT_TRUE(backend.Insert(hashes, slices));
   EXPECT_EQ(backend.GetSize(), 2);
 
   // Lookup both
@@ -119,20 +117,25 @@ TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST_AND_HBM)};
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
 
-  EXPECT_THAT(backend.SnapshotHostResidentHashes(),
-              UnorderedElementsAre("h1", "h2"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot, backend.Lookup({}, LookupOptions::SnapshotHostResident()));
+  EXPECT_THAT(snapshot,
+              UnorderedElementsAre(::testing::Key("h1"), ::testing::Key("h2")));
 
   // A hash evicted after the snapshot must be skipped, not resurrected --
   // republishing it would advertise a block that is gone.
   backend.Evict({"h2"});
   const int base_pins = backend.GetPinCount("h1");
-  auto pinned = backend.PinPresentHostResident(
-      std::vector<std::string>{"h1", "h2", "never_inserted"});
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pinned,
+      backend.Lookup(std::vector<std::string>{"h1", "h2", "never_inserted"},
+                     LookupOptions::PinPresentHostResident()));
   ASSERT_EQ(pinned.size(), 1);
   EXPECT_EQ(pinned[0].first, "h1");
-  EXPECT_EQ(pinned[0].second, 10);
+  EXPECT_EQ(pinned[0].second.host_block_id, 10);
+  EXPECT_EQ(pinned[0].second.status, BlockStatus::HOST);
   EXPECT_EQ(backend.GetPinCount("h1"), base_pins + 1);
   backend.Release({"h1"});
   EXPECT_EQ(backend.GetPinCount("h1"), base_pins);
@@ -141,21 +144,157 @@ TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
 TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"h1", "h2"},
-                 {RaidenBlockId(id, 10, BlockStatus::HOST),
-                  RaidenBlockId(id, 11, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h1", "h2"}, {RaidenBlockId(id, 10, BlockStatus::HOST),
+                                RaidenBlockId(id, 11, BlockStatus::HOST)});
   // A third insert overflows capacity 2 and demotes the LRU entry ("h1") to
   // an eviction candidate: still holding its host block, but on its way out.
-  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)});
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("h1"));
 
-  EXPECT_THAT(backend.SnapshotHostResidentHashes(),
-              UnorderedElementsAre("h2", "h3"));
-  EXPECT_TRUE(
-      backend.PinPresentHostResident(std::vector<std::string>{"h1"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot, backend.Lookup({}, LookupOptions::SnapshotHostResident()));
+  EXPECT_THAT(snapshot,
+              UnorderedElementsAre(::testing::Key("h2"), ::testing::Key("h3")));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pinned, backend.Lookup(std::vector<std::string>{"h1"},
+                                  LookupOptions::PinPresentHostResident()));
+  EXPECT_TRUE(pinned.empty());
+}
+
+TEST(HostOffloadBackendTest, LookupRejectsInvalidOptionCombinations) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)});
+
+  EXPECT_THAT(
+      backend.Lookup({"h1"},
+                     LookupOptions{.enable_global = true,
+                                   .match_mode = LookupMatchMode::kSubset}),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(backend.Lookup({"h1"}, LookupOptions{.enable_global = true,
+                                                   .host_resident_only = true}),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(backend.Lookup(
+                  {"h1"}, LookupOptions{.enable_global = false,
+                                        .pin_found = true,
+                                        .include_eviction_candidates = true}),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+
+  // Positive control: valid local subset lookup succeeds on the same backend.
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto valid_res,
+      backend.Lookup({"h1"}, LookupOptions::HostResidentSubset()));
+  ASSERT_EQ(valid_res.size(), 1);
+  EXPECT_EQ(valid_res[0].first, "h1");
+}
+
+TEST(HostOffloadBackendTest,
+     LookupHostResidentSubsetMatchesNonContiguousAndCandidatesWithoutPinning) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/2);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1", "hbm_only"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)});
+  // Overflow capacity 2 to demote "h1" to an eviction candidate.
+  backend.Insert({"h2"}, {RaidenBlockId(id, 11, 6, BlockStatus::HOST_AND_HBM)});
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h1"));
+
+  std::vector<std::string> query = {"missing1", "h1", "hbm_only", "missing2",
+                                    "h2"};
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto subset_res,
+      backend.Lookup(query, LookupOptions::HostResidentSubset()));
+  std::vector<std::string> subset_hashes;
+  for (const auto& [hash, _] : subset_res) {
+    subset_hashes.push_back(hash);
+  }
+  EXPECT_THAT(subset_hashes, UnorderedElementsAre("h1", "h2"));
+  EXPECT_EQ(backend.GetPinCount("h1"), 0);
+  EXPECT_EQ(backend.GetPinCount("h2"), 0);
+  EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h1"));
+}
+
+TEST(HostOffloadBackendTest,
+     LookupSnapshotHostResidentReturnsActiveHostBlocksExcludingCandidates) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/3);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1", "h2", "hbm_only"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, 4, BlockStatus::HOST_AND_HBM),
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)});
+  // Overflow capacity 3 to demote "h1" to an eviction candidate.
+  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)});
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h1"));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot_res, backend.Lookup(/*block_hashes=*/{},
+                                        LookupOptions::SnapshotHostResident()));
+  std::vector<std::string> snapshot_hashes;
+  for (const auto& [hash, _] : snapshot_res) {
+    snapshot_hashes.push_back(hash);
+  }
+  EXPECT_THAT(snapshot_hashes, UnorderedElementsAre("h2", "h3"));
+  EXPECT_EQ(backend.GetPinCount("h2"), 0);
+  EXPECT_EQ(backend.GetPinCount("h3"), 0);
+}
+
+TEST(HostOffloadBackendTest,
+     LookupPinPresentHostResidentPinsActiveHostSubsetAndSkipsCandidates) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/3);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"cand", "h1", "hbm_only"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, BlockStatus::HOST),
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)});
+  // Overflow capacity 3 to demote "cand" to an eviction candidate.
+  backend.Insert({"h2"}, {RaidenBlockId(id, 12, 6, BlockStatus::HOST_AND_HBM)});
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("cand"));
+
+  std::vector<std::string> query = {"missing", "cand", "h1", "hbm_only", "h2"};
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pinned_res,
+      backend.Lookup(query, LookupOptions::PinPresentHostResident()));
+  ASSERT_EQ(pinned_res.size(), 2);
+  EXPECT_EQ(pinned_res[0].first, "h1");
+  EXPECT_EQ(pinned_res[0].second.host_block_id, 11);
+  EXPECT_EQ(pinned_res[1].first, "h2");
+  EXPECT_EQ(pinned_res[1].second.host_block_id, 12);
+  EXPECT_EQ(backend.GetPinCount("h1"), 1);
+  EXPECT_EQ(backend.GetPinCount("h2"), 1);
+  EXPECT_EQ(backend.GetPinCount("cand"), 0);
+  EXPECT_EQ(backend.GetPinCount("hbm_only"), 0);
+  // Candidate must remain in evict_candidate_list_, not resurrected into
+  // pinned.
+  EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("cand"));
+
+  backend.Release({"h1", "h2"});
+}
+
+TEST(HostOffloadBackendTest,
+     LookupLocalOnlyPrefixStopsAtFirstMissAndPinsMatchedPrefix) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1", "h2", "h3"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, BlockStatus::HOST),
+                  RaidenBlockId(id, 12, BlockStatus::HOST)});
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res,
+      backend.Lookup({"h1", "h2", "missing", "h3"},
+                     LookupOptions{.enable_global = false, .pin_found = true}));
+  ASSERT_EQ(res.size(), 2);
+  EXPECT_EQ(res[0].first, "h1");
+  EXPECT_EQ(res[1].first, "h2");
+  EXPECT_EQ(backend.GetPinCount("h1"), 1);
+  EXPECT_EQ(backend.GetPinCount("h2"), 1);
+  EXPECT_EQ(backend.GetPinCount("h3"), 0);
 }
 
 TEST(HostOffloadBackendTest, LookupUnboundedByAvailableSpace) {
@@ -166,7 +305,7 @@ TEST(HostOffloadBackendTest, LookupUnboundedByAvailableSpace) {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST)};
 
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
   EXPECT_TRUE(backend.Pin(hashes));
   EXPECT_EQ(backend.GetAvailableSpace(), 0);
 
@@ -615,8 +754,7 @@ TEST(HostOffloadBackendTest, EndToEndFetchRPC) {
       RaidenBlockId(dst_raiden_id, 101, BlockStatus::HOST),
       RaidenBlockId(dst_raiden_id, 102, BlockStatus::HOST),
   };
-  backend->Insert({"fetch_hash_1", "fetch_hash_2"}, dst_slices,
-                  /*on_host=*/true);
+  backend->Insert({"fetch_hash_1", "fetch_hash_2"}, dst_slices);
 
   core::controller::RaidenControllerClient dst_controller_client(
       dst_controller->controller_address());
@@ -735,7 +873,7 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
   std::vector<RaidenBlockId> remote_slices = {
       RaidenBlockId(remote_node_id, 42, BlockStatus::HOST),
   };
-  remote_backend->Insert({"load_hash_1"}, remote_slices, /*on_host=*/true);
+  remote_backend->Insert({"load_hash_1"}, remote_slices);
 
   auto remote_server = KVCacheStoreServer::Create();
   // A wildcard bind reports no publishable address,
@@ -819,8 +957,7 @@ TEST(HostOffloadBackendTest, LoadLocalSuccess) {
   ASSERT_NE(backend, nullptr);
 
   backend->Insert({"local_hash_1"},
-                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)});
 
   BlockTracker tracker1;
   auto load_future = backend->Load(RaidenId{}, {"local_hash_1"}, {5},
@@ -881,8 +1018,7 @@ TEST(HostOffloadBackendTest, LoadLocalNonHostBlockError) {
 
   RaidenId remote_id{"remote_job", "0", "data", 0};
   backend->Insert({"remote_hash"},
-                  {RaidenBlockId(remote_id, 10, BlockStatus::REMOTE)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(remote_id, 10, BlockStatus::REMOTE)});
 
   BlockTracker tracker3;
   auto load_future =
@@ -906,19 +1042,23 @@ namespace {
 
 }  // namespace
 
-// Lookup cannot answer this question: it stops at the first miss, so a
-// scattered subset is unrepresentable in its result.
+// Prefix Lookup stops at the first miss, whereas
+// LookupOptions::HostResidentSubset reports a scattered subset of host-resident
+// entries.
 TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentReportsAScatteredSubset) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"a", "c"},
-                 {RaidenBlockId(id, 1, BlockStatus::HOST),
-                  RaidenBlockId(id, 3, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"a", "c"}, {RaidenBlockId(id, 1, BlockStatus::HOST),
+                              RaidenBlockId(id, 3, BlockStatus::HOST)});
 
-  EXPECT_THAT(backend.AlreadyPresentHostResident({"a", "b", "c"}),
-              UnorderedElementsAre("a", "c"));
-  EXPECT_TRUE(backend.AlreadyPresentHostResident({"b"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present,
+      backend.Lookup({"a", "b", "c"}, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present,
+              UnorderedElementsAre(::testing::Key("a"), ::testing::Key("c")));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto missing, backend.Lookup({"b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(missing.empty());
 }
 
 // A block that is registered elsewhere but not resident here is not something
@@ -926,10 +1066,12 @@ TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentReportsAScatteredSubset) {
 TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentIgnoresNonHostBlocks) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"remote"}, {RaidenBlockId(id, 1, BlockStatus::REMOTE)},
-                 /*on_host=*/true);
+  backend.Insert({"remote"}, {RaidenBlockId(id, 1, BlockStatus::REMOTE)});
 
-  EXPECT_TRUE(backend.AlreadyPresentHostResident({"remote"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present,
+      backend.Lookup({"remote"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present.empty());
 }
 
 TEST(HostOffloadBackendWriteRemoteTest,
@@ -941,8 +1083,11 @@ TEST(HostOffloadBackendWriteRemoteTest,
       {"a", "b"}, {RaidenBlockId(id, 1, BlockStatus::HOST),
                    RaidenBlockId(id, 2, BlockStatus::HOST)}));
   EXPECT_EQ(backend.GetSize(), 2);
-  EXPECT_THAT(backend.AlreadyPresentHostResident({"a", "b"}),
-              UnorderedElementsAre("a", "b"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present,
+      backend.Lookup({"a", "b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_THAT(present,
+              UnorderedElementsAre(::testing::Key("a"), ::testing::Key("b")));
 }
 
 // The whole point of the primitive: one duplicate refuses the batch. Insert()
@@ -952,14 +1097,16 @@ TEST(HostOffloadBackendWriteRemoteTest,
 TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"a"}, {RaidenBlockId(id, 1, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"a"}, {RaidenBlockId(id, 1, BlockStatus::HOST)});
 
   EXPECT_FALSE(backend.InsertAllOrNothing(
       {"b", "a"}, {RaidenBlockId(id, 2, BlockStatus::HOST),
                    RaidenBlockId(id, 3, BlockStatus::HOST)}));
   // "b" must not have landed: nothing, not almost-everything.
-  EXPECT_TRUE(backend.AlreadyPresentHostResident({"b"}).empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto present_b,
+      backend.Lookup({"b"}, LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(present_b.empty());
   EXPECT_EQ(backend.GetSize(), 1);
 }
 
@@ -1035,7 +1182,7 @@ TEST(HostOffloadBackendTest, LookupAndPinBasicHits) {
       RaidenBlockId(id, 11, BlockStatus::HOST),
       RaidenBlockId(id, 12, BlockStatus::HOST)};
 
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto res, backend.Lookup(hashes, LookupOptions{.pin_found = true}));
@@ -1053,7 +1200,7 @@ TEST(HostOffloadBackendTest, LookupAndPinPartialMiss) {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST)};
 
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto res,
@@ -1153,8 +1300,7 @@ std::unique_ptr<InterleavedFixture> MakeInterleavedFixture(
 void InsertLocal(KVCacheStoreBackend* backend, const RaidenId& local_id,
                  const std::string& hash, int host_block_id) {
   backend->Insert({hash},
-                  {RaidenBlockId(local_id, host_block_id, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(local_id, host_block_id, BlockStatus::HOST)});
 }
 
 // Publishes `hash` as owned by `owner` at `block_id`.
@@ -1309,10 +1455,8 @@ TEST(HostOffloadBackendTest, LookupInterleavedWithoutRegistryClient) {
   // leading run of local hits, and nothing is left pinned past it.
   HostOffloadBackendTest::Backend backend(/*capacity=*/5);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"l1", "l2"},
-                 {RaidenBlockId(id, 11, BlockStatus::HOST),
-                  RaidenBlockId(id, 12, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"l1", "l2"}, {RaidenBlockId(id, 11, BlockStatus::HOST),
+                                RaidenBlockId(id, 12, BlockStatus::HOST)});
 
   auto res =
       backend.Lookup({"l1", "gap", "l2"}, LookupOptions{.pin_found = true});
@@ -1326,8 +1470,7 @@ TEST(HostOffloadBackendTest, LookupInterleavedWithoutRegistryClient) {
 TEST(HostOffloadBackendTest, DeleteSkipsPinnedBlocks) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)});
   ASSERT_TRUE(backend.Pin({"h1"}));
   EXPECT_EQ(backend.GetPinCount("h1"), 1);
 
@@ -1383,8 +1526,7 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
 
   // Success path:
   backend->Insert({"load_success_1"},
-                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)});
 
   BlockTracker success_tracker;
   success_tracker.AddPending("load_success_1");
@@ -1398,8 +1540,7 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
 
   // Failure path (transfer failure):
   backend->Insert({"load_fail_1"},
-                  {RaidenBlockId(node_id, 11, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(node_id, 11, BlockStatus::HOST)});
   transfer_mock->fail_transfers = true;
 
   BlockTracker failure_tracker;
@@ -1449,8 +1590,7 @@ TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
 
   // Success path:
   backend->Insert({"save_success_1"},
-                  {RaidenBlockId(node_id, -1, 7, BlockStatus::HBM)},
-                  /*on_host=*/false);
+                  {RaidenBlockId(node_id, -1, 7, BlockStatus::HBM)});
 
   BlockTracker success_tracker;
   success_tracker.AddPending("save_success_1");

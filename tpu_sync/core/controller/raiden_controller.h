@@ -247,6 +247,13 @@ class RaidenController {
   kv_cache::LogicalBlockManager* block_manager() const {
     return block_manager_.get();
   }
+
+  // Returns the total number of blocks managed by this controller.
+  int total_blocks() const { return total_blocks_; }
+
+  // Returns the number of currently free blocks. Thread-safe.
+  int num_free_blocks() const ABSL_LOCKS_EXCLUDED(mutex_);
+
   std::shared_ptr<core::controller::WorkerRegistry> worker_registry() const {
     return worker_registry_;
   }
@@ -295,6 +302,7 @@ class RaidenController {
   int num_shards_;
   int64_t shard_size_bytes_;
   int num_total_blocks_;
+  const int total_blocks_;
   bool preprovision_worker_buffers_ = true;
   std::vector<::tpu_sync::proto::BufferProto> all_sharded_buffers_;
   std::shared_ptr<core::controller::WorkerRegistry> worker_registry_;

@@ -69,9 +69,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override;
 
-  std::pair<bool, BlockSliceList> Insert(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) override;
+  bool Insert(absl::Span<const std::string> block_hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override;
 
   bool InsertAndLock(absl::Span<const std::string> block_hashes,
                      absl::Span<const RaidenBlockId> slices,
@@ -102,21 +102,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       const std::vector<std::string>& block_hashes,
       std::vector<std::string>* evicted_hashes = nullptr) override;
 
-  // Every hash with a host-resident copy, pinned entries included, eviction
-  // candidates excluded. One-shot inventory snapshot for republishing to the
-  // global registry after a registration lapse; not an enumeration to build
-  // logic on -- entries may be evicted the moment the lock drops.
-  std::vector<std::string> SnapshotHostResidentHashes() const override;
-
-  // Pins the subset of `block_hashes` that is still host-resident and returns
-  // those hashes with their current host block ids, all under one lock
-  // acquisition. Unlike Pin(), absent or candidate hashes are skipped rather
-  // than failing the batch: callers feed this from a stale snapshot, and a
-  // hash evicted since the snapshot must be dropped, not resurrected. The
-  // caller Release()s the returned hashes.
-  std::vector<std::pair<std::string, int32_t>> PinPresentHostResident(
-      absl::Span<const std::string> block_hashes) override;
-
   // --- Global Memory Pooling & RPC Methods ---
   // Loads KV cache blocks from local host DRAM (if `remote_id` is empty or
   // matches this backend's id) or from the specified peer. See KVCacheStoreBackend
@@ -132,11 +117,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      absl::Span<const int32_t> dst_host_block_ids,
                      BlockTracker* absl_nonnull save_tracker) override;
 
-  // --- Remote write, destination side. Helpers the service uses while a
-  // peer's offer lands here; see KVCacheStoreBackend for their contracts.
-  std::vector<std::string> AlreadyPresentHostResident(
-      absl::Span<const std::string> block_hashes) const override;
-
+  // --- WriteRemote & registry overrides ------------------------------------
   bool InsertAllOrNothing(absl::Span<const std::string> block_hashes,
                           absl::Span<const RaidenBlockId> slices) override;
 
@@ -147,11 +128,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   tsl::Future<> UnregisterBlocksAsync(
       absl::Span<const std::string> block_hashes) override;
 
-  // --- Remote write, source side ------------------------------------------
-  //
-  // BeginWriteRemote offers blocks; the verdict arrives later on the same
-  // call and updates save_tracker. PollWriteRemoteAsync is recovery for a
-  // source that lost that call. KVCacheStore owns the pins.
+  // --- Outbound remote write (SaveRemote) ----------------------------------
 
   // Offers `block_hashes` to `dst_raiden_id` and blocks until the ack (not
   // the bytes). `requested_deadline` is how long the destination may hold

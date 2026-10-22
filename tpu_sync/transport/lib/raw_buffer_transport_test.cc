@@ -71,7 +71,6 @@
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h" // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/socket/util.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
@@ -1136,7 +1135,7 @@ TEST_P(RawBufferTransportTest, ProcessSocketBufferPushRejectsStridedRequest) {
 
   std::vector<uint8_t> payload(256);
   TF_ASSERT_OK_AND_ASSIGN(
-      Request req,
+      BufferRequest req,
       BuildBufferRequest(kBufferId, kDstShardIdx, /*offset_bytes=*/0,
                          payload.data(), /*size_bytes=*/128, /*uuid=*/1234,
                          kOpBufferPush, /*dst_stride_bytes=*/512,

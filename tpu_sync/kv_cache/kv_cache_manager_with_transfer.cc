@@ -276,6 +276,12 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                        " failed: ", recv_session->GetStatus().message()))
                  : absl::OkStatus();
     }
+    // A failed push is terminal for the pool receive (the sender does not
+    // retry): fail the session so EndRecvOp settles it now, releasing its
+    // staging lease and plan claim, instead of waiting for the deadline sweep.
+    if (!status.ok()) {
+      reshard_session->Finish(status);
+    }
     reshard_session->EndRecvOp();
     uint64_t generation = 0;
     if (reshard_session->Done() &&

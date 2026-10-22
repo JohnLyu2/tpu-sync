@@ -23,6 +23,8 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/log_severity.h"
+#include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -32,6 +34,7 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
@@ -44,6 +47,7 @@ namespace tpu_raiden {
 namespace store_node {
 namespace {
 
+using ::testing::_;
 using ::testing::HasSubstr;
 using ::testing::UnorderedElementsAre;
 
@@ -335,6 +339,31 @@ TEST_F(KVCacheHostStoreNodeBootTest, BootsServesAndPublishesWithRegistry) {
   ASSERT_EQ(targets->size(), 1u);
   EXPECT_EQ((*targets)[0].store_server_address(),
             (*node)->store_server_address());
+}
+
+TEST_F(KVCacheHostStoreNodeBootTest,
+       BootsWithStoreMonitorDisabledAndWarnsEvictSweepDisabled) {
+  auto registry_server =
+      kv_cache::global_registry::CreateTestGlobalRegistryServer();
+
+  KVCacheHostStoreNode::Options options = BootOptions();
+  options.global_registry_address = registry_server->server_address;
+  options.kv_pool_group = "prefill_pool";
+  options.enable_store_monitor = false;
+  options.enable_evict_sweep = true;
+
+  absl::ScopedMockLog log;
+  EXPECT_CALL(
+      log, Log(absl::LogSeverity::kWarning, _,
+               HasSubstr("Evict sweep disabled: it runs on the store monitor")))
+      .Times(1);
+  log.StartCapturingLogs();
+
+  StaticKVTransferSpecSource source(TestSpec());
+  TF_ASSERT_OK_AND_ASSIGN(auto node,
+                          KVCacheHostStoreNode::Create(options, &source));
+  EXPECT_EQ(node->num_host_blocks(), 8u);
+  EXPECT_NE(node->store(), nullptr);
 }
 
 TEST_F(KVCacheHostStoreNodeBootTest, BootsFromGrsPublishedSpec) {

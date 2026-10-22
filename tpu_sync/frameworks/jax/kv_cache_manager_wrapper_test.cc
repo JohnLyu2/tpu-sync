@@ -59,9 +59,7 @@ class MockSubManager : public KVCacheManagerWithTransfer {
   class MockBase : public kv_cache::KVCacheManagerBase {
    public:
     explicit MockBase(MockSubManager* parent)
-        : kv_cache::KVCacheManagerBase({}, std::nullopt, std::nullopt, false, 1,
-                                       nullptr),
-          parent_(parent) {}
+        : kv_cache::KVCacheManagerBase(/*layer_buffers=*/{}), parent_(parent) {}
 
     absl::StatusOr<raiden::PjRtCopyFuture> D2h(
         const std::vector<int64_t>& src_offsets_major_dim = {},
@@ -179,18 +177,19 @@ TEST(KVCacheManagerWrapperTest,
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
 
   // 1. Only sub0 finishes recving for req_123
   ptr0->recving.push_back("req_123");
-  auto [s1, r1, f1] = mgr.CompleteReadRaw();
+  auto [s1, r1, f1] = mgr->CompleteReadRaw();
   EXPECT_TRUE(s1.empty());
   EXPECT_TRUE(r1.empty());
   EXPECT_TRUE(f1.empty());
 
   // 2. Now sub1 finishes recving for req_123
   ptr1->recving.push_back("req_123");
-  auto [s2, r2, f2] = mgr.CompleteReadRaw();
+  auto [s2, r2, f2] = mgr->CompleteReadRaw();
   EXPECT_TRUE(s2.empty());
   EXPECT_EQ(r2, std::vector<std::string>{"req_123"});
   EXPECT_TRUE(f2.empty());
@@ -207,18 +206,19 @@ TEST(KVCacheManagerWrapperTest,
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
 
   // 1. sub0 reports failure for req_fail
   ptr0->failed.push_back("req_fail");
-  auto [s1, r1, f1] = mgr.CompleteReadRaw();
+  auto [s1, r1, f1] = mgr->CompleteReadRaw();
   EXPECT_TRUE(s1.empty());
   EXPECT_TRUE(r1.empty());
   EXPECT_EQ(f1, std::vector<std::string>{"req_fail"});
 
   // 2. Later sub1 finishes recving for req_fail (should be suppressed)
   ptr1->recving.push_back("req_fail");
-  auto [s2, r2, f2] = mgr.CompleteReadRaw();
+  auto [s2, r2, f2] = mgr->CompleteReadRaw();
   EXPECT_TRUE(s2.empty());
   EXPECT_TRUE(r2.empty());
   EXPECT_TRUE(f2.empty());
@@ -235,13 +235,14 @@ TEST(KVCacheManagerWrapperTest,
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
 
   ptr0->sending.push_back("req_send");
-  EXPECT_TRUE(std::get<0>(mgr.CompleteReadRaw()).empty());
+  EXPECT_TRUE(std::get<0>(mgr->CompleteReadRaw()).empty());
 
   ptr1->sending.push_back("req_send");
-  EXPECT_EQ(std::get<0>(mgr.CompleteReadRaw()),
+  EXPECT_EQ(std::get<0>(mgr->CompleteReadRaw()),
             std::vector<std::string>{"req_send"});
 }
 
@@ -256,10 +257,11 @@ TEST(KVCacheManagerWrapperTest,
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
 
   // Local sub0 holds shards [4, 5, 6, 7], sub1 holds [0, 1, 2, 3]
-  mgr.SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
+  mgr->SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
 
   std::vector<RaidenTransferEndpoint> remote_descs = {
       {"10.0.0.1:45000", {0, 1, 2, 3}}, {"10.0.0.2:45000", {4, 5, 6, 7}}};
@@ -267,7 +269,7 @@ TEST(KVCacheManagerWrapperTest,
   std::vector<int64_t> remote_blocks = {10, 20};
   std::vector<int64_t> local_blocks = {30, 40};
 
-  mgr.StartRead("req_test", 999, remote_descs, remote_blocks, local_blocks);
+  mgr->StartRead("req_test", 999, remote_descs, remote_blocks, local_blocks);
 
   EXPECT_EQ(ptr0->started_ep, "10.0.0.2:45000");
   EXPECT_EQ(ptr0->started_remote_blocks, remote_blocks);
@@ -293,10 +295,11 @@ TEST(KVCacheManagerWrapperTest,
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
 
   // Local sub0 holds shards [4, 5, 6, 7], sub1 holds [0, 1, 2, 3].
-  mgr.SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
+  mgr->SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
 
   // Remote peer endpoints tagged with their global shards, listed in the
   // OPPOSITE order to the local sub-managers to prove matching is by shard, not
@@ -307,8 +310,8 @@ TEST(KVCacheManagerWrapperTest,
   std::vector<int> src_blocks = {10, 20};
   std::vector<int> dst_blocks = {30, 40};
 
-  auto status = mgr.H2hWrite(remote_descs, src_blocks, dst_blocks, /*uuid=*/7,
-                             /*layer_idx=*/0);
+  auto status = mgr->H2hWrite(remote_descs, src_blocks, dst_blocks, /*uuid=*/7,
+                              /*layer_idx=*/0);
   ASSERT_TRUE(status.ok()) << status.status().message();
 
   // sub0 ([4-7]) -> the [4-7] endpoint; sub1 ([0-3]) -> the [0-3] endpoint.
@@ -334,17 +337,18 @@ TEST(KVCacheManagerWrapperTest,
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
 
   // Local sub0 holds shards [4, 5, 6, 7], sub1 holds [0, 1, 2, 3].
-  mgr.SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
+  mgr->SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
 
   std::vector<RaidenTransferEndpoint> remote_descs = {
       {"10.0.0.1:45000", {0, 1, 2, 3}}, {"10.0.0.2:45000", {4, 5, 6, 7}}};
 
   std::vector<int> src_blocks = {11, 22};
 
-  auto status = mgr.H2hRead(remote_descs, src_blocks);
+  auto status = mgr->H2hRead(remote_descs, src_blocks);
   ASSERT_TRUE(status.ok()) << status.status().message();
 
   EXPECT_EQ(ptr0->h2h_read_calls, 1);
@@ -370,15 +374,16 @@ TEST(KVCacheManagerWrapperTest, H2hWriteEmptyShardsFallsBackToFirstEndpoint) {
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
-  mgr.SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
+  mgr->SetSubmanagerShardsForTesting({{4, 5, 6, 7}, {0, 1, 2, 3}});
 
   // Endpoints with empty shard lists -> no intersection possible.
   std::vector<RaidenTransferEndpoint> remote_descs = {{"10.0.0.1:45000", {}},
                                                       {"10.0.0.2:45000", {}}};
 
-  auto status = mgr.H2hWrite(remote_descs, /*src_block_ids=*/{10},
-                             /*dst_block_ids=*/{30});
+  auto status = mgr->H2hWrite(remote_descs, /*src_block_ids=*/{10},
+                              /*dst_block_ids=*/{30});
   ASSERT_TRUE(status.ok()) << status.status().message();
 
   EXPECT_EQ(ptr0->last_h2h_write_peer, "10.0.0.1:45000");
@@ -394,16 +399,17 @@ TEST(KVCacheManagerWrapperTest,
   MockSubManager* ptr0 = sub0.get();
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
   subs.push_back(std::move(sub0));
-  KVCacheManager mgr(std::move(subs));
-  mgr.SetSubmanagerShardsForTesting({{0, 1, 2, 3}});
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
+  mgr->SetSubmanagerShardsForTesting({{0, 1, 2, 3}});
 
   std::vector<RaidenTransferEndpoint> remote_descs = {
       {"10.0.0.5:41000", {0, 1, 2, 3}}};
   std::vector<int> src_blocks = {5, 6};
   std::vector<int> dst_blocks = {7, 8};
 
-  auto status = mgr.H2hWrite(remote_descs, src_blocks, dst_blocks, /*uuid=*/3,
-                             /*layer_idx=*/0);
+  auto status = mgr->H2hWrite(remote_descs, src_blocks, dst_blocks, /*uuid=*/3,
+                              /*layer_idx=*/0);
   ASSERT_TRUE(status.ok()) << status.status().message();
   EXPECT_EQ(ptr0->h2h_write_calls, 1);
   EXPECT_EQ(ptr0->last_h2h_write_peer, "10.0.0.5:41000");
@@ -417,14 +423,15 @@ TEST(KVCacheManagerWrapperTest,
   MockSubManager* ptr0 = sub0.get();
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
   subs.push_back(std::move(sub0));
-  KVCacheManager mgr(std::move(subs));
-  mgr.SetSubmanagerShardsForTesting({{0, 1, 2, 3}});
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
+  mgr->SetSubmanagerShardsForTesting({{0, 1, 2, 3}});
 
   std::vector<RaidenTransferEndpoint> remote_descs = {
       {"10.0.0.5:41000", {0, 1, 2, 3}}};
   std::vector<int> src_blocks = {11, 12};
 
-  auto status = mgr.H2hRead(remote_descs, src_blocks);
+  auto status = mgr->H2hRead(remote_descs, src_blocks);
   ASSERT_TRUE(status.ok()) << status.status().message();
   EXPECT_EQ(ptr0->h2h_read_calls, 1);
   EXPECT_EQ(ptr0->last_h2h_read_peer, "10.0.0.5:41000");
@@ -441,9 +448,10 @@ TEST(KVCacheManagerWrapperTest, StartReadUnifiedMultiEndpointMultiSubManager) {
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
   // Local sub0 holds shards [0, 1], sub1 holds [2, 3]
-  mgr.SetSubmanagerShardsForTesting({{0, 1}, {2, 3}});
+  mgr->SetSubmanagerShardsForTesting({{0, 1}, {2, 3}});
 
   std::vector<RaidenTransferEndpoint> remote_descs = {
       {"10.0.0.1:45000", {0, 1}},
@@ -456,8 +464,8 @@ TEST(KVCacheManagerWrapperTest, StartReadUnifiedMultiEndpointMultiSubManager) {
   std::vector<int64_t> host_blocks = {1000, 2000, 3000, 4000, 5000};
   uint64_t uuid = 1000;
 
-  mgr.StartRead("req_unified", uuid, remote_descs, remote_blocks, local_blocks,
-                1, host_blocks);
+  mgr->StartRead("req_unified", uuid, remote_descs, remote_blocks, local_blocks,
+                 1, host_blocks);
 
   // In unified architecture, full block lists are passed to each submanager
   // with original req_id (no _ep0/_ep1 slicing)
@@ -483,12 +491,12 @@ TEST(KVCacheManagerWrapperTest, StartReadUnifiedMultiEndpointMultiSubManager) {
   // 1. sub0 completes first -> parent req_unified should NOT be returned yet
   // (needs sub1 too)
   ptr0->recving.push_back("req_unified");
-  auto [s1, r1, f1] = mgr.CompleteReadRaw();
+  auto [s1, r1, f1] = mgr->CompleteReadRaw();
   EXPECT_TRUE(r1.empty());
 
   // 2. sub1 completes -> parent req_unified SHOULD be returned in done_recving
   ptr1->recving.push_back("req_unified");
-  auto [s2, r2, f2] = mgr.CompleteReadRaw();
+  auto [s2, r2, f2] = mgr->CompleteReadRaw();
   EXPECT_EQ(r2, std::vector<std::string>{"req_unified"});
 }
 
@@ -499,33 +507,40 @@ TEST(KVCacheManagerWrapperTest, StartReadInputVectorValidation) {
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
   subs.push_back(std::move(sub0));
 
-  KVCacheManager mgr(std::move(subs));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
 
   std::vector<RaidenTransferEndpoint> remote_descs = {{"10.0.0.1:45000", {0}}};
   std::vector<int64_t> remote_blocks = {10, 20};
   std::vector<int64_t> local_blocks = {100};  // Size mismatch!
 
-  mgr.StartRead("req_mismatch", 100, remote_descs, remote_blocks, local_blocks);
+  mgr->StartRead("req_mismatch", 100, remote_descs, remote_blocks,
+                 local_blocks);
   EXPECT_TRUE(ptr0->start_read_calls.empty());
 }
 
 TEST(KVCacheManagerWrapperTest, GrpcServerOptionalAndOffByDefault) {
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs1;
   subs1.push_back(std::make_unique<MockSubManager>());
-  KVCacheManager mgr_default(std::move(subs1));
-  EXPECT_EQ(mgr_default.GetRaidenWorkerPort(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr_default,
+                          KVCacheManager::Create(std::move(subs1)));
+  EXPECT_EQ(mgr_default->GetRaidenWorkerPort(), 0);
 
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs2;
   subs2.push_back(std::make_unique<MockSubManager>());
-  KVCacheManager mgr_explicit_off(std::move(subs2), /*raiden_worker_port=*/0,
-                                  /*raiden_controller_address=*/std::nullopt);
-  EXPECT_EQ(mgr_explicit_off.GetRaidenWorkerPort(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr_explicit_off,
+      KVCacheManager::Create(std::move(subs2), /*raiden_worker_port=*/0,
+                             /*raiden_controller_address=*/std::nullopt));
+  EXPECT_EQ(mgr_explicit_off->GetRaidenWorkerPort(), 0);
 
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs3;
   subs3.push_back(std::make_unique<MockSubManager>());
-  KVCacheManager mgr_started(std::move(subs3), /*raiden_worker_port=*/0,
-                             /*raiden_controller_address=*/"localhost:12345");
-  EXPECT_GT(mgr_started.GetRaidenWorkerPort(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr_started,
+      KVCacheManager::Create(std::move(subs3), /*raiden_worker_port=*/0,
+                             /*raiden_controller_address=*/"localhost:12345"));
+  EXPECT_GT(mgr_started->GetRaidenWorkerPort(), 0);
 }
 
 TEST(KVCacheManagerWrapperTest, RaidenControllerTransferBuffersIntegration) {
@@ -535,9 +550,11 @@ TEST(KVCacheManagerWrapperTest, RaidenControllerTransferBuffersIntegration) {
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
   subs.push_back(std::move(sub0));
 
-  KVCacheManager mgr(std::move(subs), /*raiden_worker_port=*/0,
-                     /*raiden_controller_address=*/"localhost:12345");
-  int port = mgr.GetRaidenWorkerPort();
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr,
+      KVCacheManager::Create(std::move(subs), /*raiden_worker_port=*/0,
+                             /*raiden_controller_address=*/"localhost:12345"));
+  int port = mgr->GetRaidenWorkerPort();
   ASSERT_GT(port, 0);
 
   ::tpu_sync::rpc::RaidenIdProto unit;
@@ -604,15 +621,17 @@ TEST(KVCacheManagerWrapperTest, WorkerSelfRegistrationWithControllerSuccess) {
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
   subs.push_back(std::move(sub0));
 
-  KVCacheManager mgr(std::move(subs), /*raiden_worker_port=*/0,
-                     raiden_controller_address, "test_worker_node");
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> mgr,
+      KVCacheManager::Create(std::move(subs), /*raiden_worker_port=*/0,
+                             raiden_controller_address, "test_worker_node"));
 
   auto workers =
       test_server->service->worker_registry()->GetRegisteredWorkers();
   ASSERT_EQ(workers.size(), 1);
   EXPECT_EQ(workers[0].worker_id, "test_worker_node");
   EXPECT_NE(workers[0].raiden_worker_endpoint.find(
-                std::to_string(mgr.GetRaidenWorkerPort())),
+                std::to_string(mgr->GetRaidenWorkerPort())),
             std::string::npos);
 }
 
@@ -637,14 +656,16 @@ TEST(KVCacheManagerWrapperTest, ConstructorWithRawPjRtBuffersSucceeds) {
       {pjrt_buffer.get()}};
 
   // Construct KVCacheManager directly from raw PjRtBuffers
-  KVCacheManager manager(device_buffers,
-                         /*local_port=*/std::nullopt,
-                         /*host_blocks_to_allocate=*/8,
-                         /*unsafe_skip_buffer_lock=*/true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager,
+      KVCacheManager::Create(device_buffers,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/8,
+                             /*unsafe_skip_buffer_lock=*/true));
 
-  EXPECT_EQ(manager.num_layers(), 1);
-  EXPECT_EQ(manager.num_shards(), 1);
-  EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
+  EXPECT_EQ(manager->num_layers(), 1);
+  EXPECT_EQ(manager->num_shards(), 1);
+  EXPECT_EQ(manager->slice_byte_size(), 1024 * sizeof(float));
 }
 
 }  // namespace

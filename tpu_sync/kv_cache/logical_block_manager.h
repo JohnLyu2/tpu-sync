@@ -31,7 +31,7 @@ namespace kv_cache {
 // to automatically free unlocked blocks when resources are exhausted.
 //
 // This class is not thread-safe and requires external synchronization for
-// concurrent access.
+// concurrent access. num_free_blocks() is O(1).
 class LogicalBlockManager {
  public:
 
@@ -90,6 +90,7 @@ class LogicalBlockManager {
   int total_blocks_;
   uint64_t access_counter_ = 0;
   std::vector<BlockState> blocks_;
+  int num_free_ = 0;
 };
 
 }  // namespace kv_cache

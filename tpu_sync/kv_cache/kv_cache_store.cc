@@ -461,6 +461,20 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
         std::move(sweep_fn),
         /*republish_fn=*/[s = store.get()] { return s->RepublishOnce(); });
     store->store_monitor_->Start();
+
+    // Remote writes skip AllocateBlockIds, which is what wakes the sweep for
+    // local allocations, so have the server request a space check on refused
+    // and committed writes instead. Installed after the monitor starts so
+    // there is always a monitor to wake; the lifetime check makes the space
+    // check a no-op once the store is destroyed.
+    if (monitor_config.enable_evict_sweep && store->store_server_ != nullptr) {
+      store->store_server_->SetSpaceCheckFn([lifetime = store->lifetime_] {
+        absl::MutexLock lock(lifetime->mu);
+        if (KVCacheStore* self = lifetime->store; self != nullptr) {
+          self->MaybeWakeEvictSweep();
+        }
+      });
+    }
   }
 
   store->backend_configs_ = std::move(effective_configs);
@@ -929,32 +943,27 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
                                             .pin_found = pin_found});
 }
 
-// ---------------------------------------------------------------------------
-// Hierarchical Multi-Tier Lookup Fallback Mechanism:
-//
-// In P/D disaggregated and hybrid serving modes, KVCacheStore enforces a
-// strict recall priority across memory and persistent storage tiers:
-//
-//   Tier 0A (Local Host DRAM) -> Tier 0B (Peer RAM) -> Tier 1 (Storage)
-//
-// 1. Tier 0 (`backends_[0]` - HostOffloadBackend):
-//    - Manages both Local Host DRAM (`BlockStatus::LOCAL`) and Peer RAM
-//      (`BlockStatus::REMOTE` discovered via GlobalRegistryClient).
-//    - Local DRAM has highest priority (PCIe / host memory latency).
-//    - Peer RAM has second priority.
-//    - Both are queried in tier 0. If a contiguous prefix matches in Local
-//      or Peer RAM, `accumulated_results` is populated and `start_idx`
-//      advances.
-//
-// 2. Tier 1 (`backends_[1]` - Secondary Storage Backend):
-//    - Generic secondary backend (e.g. file storage, block storage).
-//    - Only queried for remaining block hashes (`subspan(start_idx)`) that
-//      missed BOTH Local DRAM and Peer RAM.
-//    - Matched blocks are returned with `BlockStatus::SHARED_STORAGE`.
-// ---------------------------------------------------------------------------
+// Lookup routing across tiers:
+// - `kSubset` and `host_resident_only` queries delegate directly to tier 0
+//   (`backends_[0]`).
+// - `kPrefix` queries cascade across tiers in recall-priority order:
+//   1. Tier 0 (`backends_[0]` - HostOffloadBackend): resolves local host DRAM
+//      (`BlockStatus::HOST` / `BlockStatus::HOST_AND_HBM`) and, when
+//      `enable_global` is set, peer RAM (`BlockStatus::REMOTE`).
+//   2. Tier 1+ (`backends_[1..]` - secondary storage, e.g., POSIX): queried
+//      for the remaining suffix (`subspan(start_idx)`) that missed tier 0,
+//      returning `BlockStatus::SHARED_STORAGE`.
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes,
     const LookupOptions& options) {
+  if (options.host_resident_only ||
+      options.match_mode == LookupMatchMode::kSubset) {
+    if (backends_.empty() || backends_[0] == nullptr) {
+      return BlockSliceList{};
+    }
+    return backends_[0]->Lookup(block_hashes, options);
+  }
+
   BlockSliceList accumulated_results;
   accumulated_results.reserve(block_hashes.size());
 
@@ -1176,8 +1185,7 @@ absl::Status KVCacheStore::SaveLocal(
         update_slices.push_back(block);
       }
       if (!update_hashes.empty() && host_ram_backend != nullptr) {
-        host_ram_backend->Insert(update_hashes, update_slices,
-                                 /*on_host=*/true);
+        host_ram_backend->Insert(update_hashes, update_slices);
       }
       {
         absl::MutexLock lock(lifetime->mu);
@@ -1615,8 +1623,12 @@ void KVCacheStore::RegisterReadRemoteHooks() {
 absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
     absl::Span<const std::string> block_hashes) {
   absl::MutexLock lock(mutex_);
-  ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
+  ABSL_ASSIGN_OR_RETURN(
+      const auto& slices,
+      backend()->Lookup(block_hashes, LookupOptions{.enable_global = false,
+                                                    .pin_found = true}));
   if (slices.size() < block_hashes.size()) {
+    backend()->Release(block_hashes.first(slices.size()));
     return absl::NotFoundError(
         absl::StrCat("BLOCK_HASH_NOT_FOUND: ", block_hashes[slices.size()]));
   }
@@ -1627,15 +1639,12 @@ absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
     const auto& existing = slices[i].second;
     if (existing.status != BlockStatus::HOST &&
         existing.status != BlockStatus::HOST_AND_HBM) {
+      backend()->Release(block_hashes);
       return absl::FailedPreconditionError(absl::StrCat(
           "Block not resident in host DRAM (status=",
           static_cast<int>(existing.status), "): ", block_hashes[i]));
     }
     src_host_block_ids.push_back(existing.host_block_id);
-  }
-
-  if (!backend()->Pin(block_hashes)) {
-    return absl::InternalError("Failed to pin host blocks");
   }
 
   return src_host_block_ids;
@@ -1831,9 +1840,8 @@ size_t KVCacheStore::Evict(const std::vector<std::string>& block_hashes) {
 }
 
 bool KVCacheStore::SweepOnce() {
-  const int free_blocks =
-      raiden_controller_->block_manager()->num_free_blocks();
-  const int total_blocks = raiden_controller_->block_manager()->total_blocks();
+  const int free_blocks = raiden_controller_->num_free_blocks();
+  const int total_blocks = raiden_controller_->total_blocks();
   if (total_blocks <= 0) {
     return false;
   }
@@ -1947,6 +1955,14 @@ bool KVCacheStore::SweepOnce() {
   return true;
 }
 
+void KVCacheStore::MaybeWakeEvictSweep() {
+  const int total = raiden_controller_->total_blocks();
+  if (total > 0 && raiden_controller_->num_free_blocks() <
+                       monitor_config_.evict_low_watermark * total) {
+    store_monitor_->RequestSweep();
+  }
+}
+
 bool KVCacheStore::RepublishOnce() {
   KVCacheStoreBackend* host_backend = backend().get();
   if (host_backend == nullptr) {
@@ -1954,9 +1970,14 @@ bool KVCacheStore::RepublishOnce() {
   }
 
   if (republish_queue_.empty()) {
-    republish_queue_ = host_backend->SnapshotHostResidentHashes();
-    if (republish_queue_.empty()) {
+    absl::StatusOr<BlockSliceList> snapshot =
+        host_backend->Lookup({}, LookupOptions::SnapshotHostResident());
+    if (!snapshot.ok() || snapshot->empty()) {
       return false;
+    }
+    republish_queue_.reserve(snapshot->size());
+    for (auto& [hash, _] : *snapshot) {
+      republish_queue_.push_back(std::move(hash));
     }
     LOG(INFO) << "Republishing " << republish_queue_.size()
               << " host-resident block(s) to the global registry.";
@@ -1972,22 +1993,22 @@ bool KVCacheStore::RepublishOnce() {
   // are skipped here, and the pins keep the rest resident until the registry
   // has acknowledged them -- an eviction's Unregister can then only run
   // after this batch's Register, never be overwritten by it.
-  const std::vector<std::pair<std::string, int32_t>> pinned =
-      host_backend->PinPresentHostResident(batch);
-  if (pinned.empty()) {
+  absl::StatusOr<BlockSliceList> pinned =
+      host_backend->Lookup(batch, LookupOptions::PinPresentHostResident());
+  if (!pinned.ok() || pinned->empty()) {
     return !republish_queue_.empty();
   }
   std::vector<global_registry::Registration> registrations;
   std::vector<std::string> pinned_hashes;
-  registrations.reserve(pinned.size());
-  pinned_hashes.reserve(pinned.size());
-  for (const auto& [hash, host_block_id] : pinned) {
+  registrations.reserve(pinned->size());
+  pinned_hashes.reserve(pinned->size());
+  for (auto& [hash, block_id] : *pinned) {
     registrations.push_back({
         .prefix_hash = hash,
         .raiden_id = raiden_id_,
-        .block_id = host_block_id,
+        .block_id = block_id.host_block_id,
     });
-    pinned_hashes.push_back(hash);
+    pinned_hashes.push_back(std::move(hash));
   }
 
   // The deadline must stay under the heartbeat period: this blocks the
@@ -2053,13 +2074,13 @@ absl::StatusOr<std::vector<int>> KVCacheStore::AllocateBlockIds(int needed) {
   bool request_sweep = false;
   {
     absl::MutexLock lock(mutex_);
-    int free_count = raiden_controller_->block_manager()->num_free_blocks();
+    int free_count = raiden_controller_->num_free_blocks();
     // Wake the evict sweep the moment this allocation dips below its low
     // watermark, instead of leaving detection to the sweep's fallback
     // period. The drop-evict below stays the last-ditch fallback for
     // allocations the sweep has not made room for.
     if (monitor_config_.enable_evict_sweep && store_monitor_ != nullptr) {
-      const int total = raiden_controller_->block_manager()->total_blocks();
+      const int total = raiden_controller_->total_blocks();
       request_sweep =
           total > 0 &&
           free_count - needed < monitor_config_.evict_low_watermark * total;
@@ -2176,7 +2197,9 @@ absl::Status KVCacheStore::SaveRemote(
   std::vector<int32_t> src_host_block_ids;
   {
     absl::MutexLock lock(mutex_);
-    ABSL_ASSIGN_OR_RETURN(const auto& slices, backend->Lookup(block_hashes));
+    ABSL_ASSIGN_OR_RETURN(
+        const auto& slices,
+        backend->Lookup(block_hashes, LookupOptions{.enable_global = false}));
     if (slices.size() < block_hashes.size()) {
       return absl::NotFoundError(
           absl::StrCat("Block hash not found: ", block_hashes[slices.size()]));

@@ -31,6 +31,7 @@
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/store_node/grs_kv_transfer_spec_source.h"
 #include "tpu_sync/store_node/kv_cache_host_store_node.h"
@@ -84,6 +85,19 @@ ABSL_FLAG(bool, enable_store_monitor, true,
           "placement) and refresh the free capacity placement ranks by; "
           "without them this node is registered forever but never offers "
           "capacity.");
+ABSL_FLAG(bool, enable_evict_sweep, true,
+          "Enable periodic evict sweep to reclaim cold blocks when free "
+          "capacity falls below --evict_low_watermark. The sweep runs on the "
+          "store monitor and requires --enable_store_monitor=true and a "
+          "global registry; otherwise boot logs a WARNING and the sweep stays "
+          "off.");
+ABSL_FLAG(absl::Duration, evict_sweep_period, absl::Seconds(30),
+          "Fallback period between evict sweep pressure checks.");
+ABSL_FLAG(double, evict_low_watermark, 0.03,
+          "Free-block ratio (free / total) below which the evict sweep starts "
+          "reclaiming blocks.");
+ABSL_FLAG(double, evict_high_watermark, 0.05,
+          "Free-block ratio at which an active evict sweep stops.");
 
 // Capacity.
 ABSL_FLAG(size_t, dram_budget_bytes, 0,
@@ -133,6 +147,10 @@ int Run() {
   }
   options.evict_tier = absl::GetFlag(FLAGS_evict_tier);
   options.enable_store_monitor = absl::GetFlag(FLAGS_enable_store_monitor);
+  options.enable_evict_sweep = absl::GetFlag(FLAGS_enable_evict_sweep);
+  options.evict_sweep_period = absl::GetFlag(FLAGS_evict_sweep_period);
+  options.evict_low_watermark = absl::GetFlag(FLAGS_evict_low_watermark);
+  options.evict_high_watermark = absl::GetFlag(FLAGS_evict_high_watermark);
   GrsKVTransferSpecSource kv_transfer_spec_source(
       options.global_registry_address, options.kv_pool_group);
 

@@ -46,6 +46,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -55,7 +56,6 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden {
@@ -66,6 +66,8 @@ namespace {
 
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
+using ::peregrine::v1::SourceBindEnabled;
+using ::peregrine::v1::SourceIpRoutesToPeer;
 using ::peregrine::v1::WriteExact;
 using ::peregrine::v1::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
@@ -382,18 +384,18 @@ absl::StatusOr<Handle> SocketTransportAdapter::Post(
                        absl::InvalidArgumentError("Requests cannot be empty"));
   }
 
-  const uint8_t opcode = requests.front().socket_opcode;
-  switch (opcode) {
-    case 1:
-    case 6:
+  const TransferOp op = requests.front().op;
+  switch (op) {
+    case TransferOp::kBlockPush:
+    case TransferOp::kBlockPushExplicit:
       return PostSocketPush(peers, requests, src_block_ids, dst_block_ids,
                             std::move(on_complete));
-    case 2:
+    case TransferOp::kBlockPull:
       return PostSocketPull(peers, requests, std::move(on_complete));
     default:
-      return ReportError(on_complete,
-                         absl::UnimplementedError(absl::StrCat(
-                             "Unsupported socket opcode: ", opcode)));
+      return ReportError(on_complete, absl::UnimplementedError(absl::StrCat(
+                                          "Unsupported socket opcode: ",
+                                          static_cast<int>(op))));
   }
 }
 
@@ -577,7 +579,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   }
 
   const auto& first = requests.front();
-  const uint8_t socket_opcode = first.socket_opcode;
+  const TransferOp op = first.op;
   const uint64_t uuid = first.uuid;
   const uint32_t remote_id = first.remote_id;
   const uint32_t local_id = first.local_id;
@@ -599,7 +601,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
 
   ChunkHeader header = {};
   header.version = 1;
-  header.op = socket_opcode;
+  header.op = static_cast<uint8_t>(op);
   header.flags = major_order;
   // Shard subset of these streams (0 = every shard) and the total stream
   // count the receiver completes the push on.
@@ -618,7 +620,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     return s;
   }
 
-  if (socket_opcode == 6) {
+  if (op == TransferOp::kBlockPushExplicit) {
     ABSL_DCHECK_LE(block_offset + block_count, dst_block_ids.size());
     const auto s_dst_ids =
         SerializeBlockIds({dst_block_ids.data() + block_offset, block_count});
@@ -799,7 +801,7 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
   const auto& first = requests.front();
   const uint64_t uuid = first.uuid;
   const uint8_t major_order = first.major_order;
-  const uint8_t socket_opcode = first.socket_opcode;
+  const uint8_t socket_opcode = static_cast<uint8_t>(first.op);
 
   auto borrowed_fd = raw_transport_->BorrowConnection(peer, local_ip);
   if (!borrowed_fd.ok()) {

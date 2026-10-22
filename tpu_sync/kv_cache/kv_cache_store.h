@@ -270,11 +270,10 @@ class KVCacheStore {
       const std::vector<std::string>& block_hashes, bool enable_global = false,
       bool pin_found = true);
 
-  // Overload accepting LookupOptions for granular control. Unlike the overload
-  // above, pin_found defaults to false here, so this is what internal callers
-  // and pure observers use. The struct's enable_global default is also the
-  // opposite (true, not false), so a bare LookupOptions{} does query the
-  // registry when one is configured.
+  // Queries cached block hashes using `options`. `kSubset` and
+  // `host_resident_only` queries target tier 0 directly; `kPrefix` cascades
+  // across tiers. Note that `LookupOptions` defaults `pin_found` to false and
+  // `enable_global` to true.
   absl::StatusOr<BlockSliceList> Lookup(
       const std::vector<std::string>& block_hashes,
       const LookupOptions& options);
@@ -325,7 +324,10 @@ class KVCacheStore {
   // consumes that pin; a failed save leaves it with the caller.
   //
   // Note: a destination allocates landing blocks from free space only and
-  // never evicts, so a peer with a full cache refuses every offer.
+  // never evicts inline. If the peer runs the evict sweep, a refused write or
+  // a commit that leaves it below its low watermark wakes that sweep, so a
+  // full peer refuses only writes that arrive before the sweep has made room;
+  // without the sweep it refuses every offer.
   absl::Status Save(const std::vector<std::string>& block_hashes,
                     const std::optional<RaidenId>& dst_raiden_id = std::nullopt);
 
@@ -382,14 +384,11 @@ class KVCacheStore {
 
   int GetPinCount(const std::string& hash) const;
 
-  // Source-side ReadRemote (All-or-Nothing validate & pin block hashes at the
-  // src controller): verifies ALL block_hashes exist in the LRU with status
-  // HOST/HOST_AND_HBM and pins them (all-or-nothing: any miss rolls back and
-  // aborts). On success returns the authoritative source host_block_ids
-  // (re-derived from the LRU). NotFound => a hash is absent
-  // (BLOCK_HASH_NOT_FOUND); FailedPrecondition => present but not
-  // host-resident. Registered as a hook on the RaidenController so a peer's
-  // ReadRemote RPC can reach this store's LRU. Public for testability.
+  // Source-side ReadRemote hook: verifies all `block_hashes` exist locally with
+  // status HOST or HOST_AND_HBM and pins them in a single local Lookup
+  // (all-or-nothing: any miss or non-host block releases partial pins and
+  // returns NotFound or FailedPrecondition). Returns the authoritative source
+  // host_block_ids on success.
   absl::StatusOr<std::vector<int32_t>> ValidateAndPinHostBlocks(
       absl::Span<const std::string> block_hashes);
   // Releases the pins taken by ValidateAndPinHostBlocks.
@@ -534,6 +533,10 @@ class KVCacheStore {
   // Returns the count of active remote write operations. TESTS ONLY.
   size_t InFlightRemoteWritesCountForTesting() const;
 
+  // Runs one step of evict sweep synchronously. Preserves SweepOnce's
+  // single-caller contract only if the monitor's sweep is disabled or the
+  // test accepts concurrency on the un-synchronized sweep episode state.
+  bool SweepOnceForTesting() { return SweepOnce(); }
 
   // Rebuilds this store's LRU cache after an engine restart from the
   // crash-persistent KVCacheMetadata table in local shared memory, without
@@ -599,6 +602,12 @@ class KVCacheStore {
   // the sweep should run again right away. The store monitor's thread is
   // the only caller, which is why the episode state below needs no lock.
   bool SweepOnce();
+
+  // Wakes the evict sweep if free blocks are below its low watermark,
+  // the point where SweepOnce has work to do. Installed as the store
+  // server's space check, so it runs on the server's threads.
+  // Requires store_monitor_.
+  void MaybeWakeEvictSweep();
 
   // One bounded step of the inventory republish that runs after this store's
   // registration lapsed at the registry (see StoreMonitor::RepublishFn): on

@@ -39,8 +39,14 @@ using Handle = uint32_t;
 using BlockReceivedCallback = std::function<absl::Status(
     size_t layer_idx, size_t shard_idx, int block_id, size_t size_bytes)>;
 
+enum class TransferOp : uint8_t {
+  kBlockPush = 1,  // receiver allocates dst blocks
+  kBlockPull = 2,
+  kBlockPushExplicit = 6,  // explicit dst block ids
+};
+
 struct Request {
-  uint8_t socket_opcode;
+  TransferOp op;
   uint8_t* laddr;
   uint8_t* raddr;
   size_t len;
@@ -54,21 +60,15 @@ struct Request {
   uint8_t major_order;
   int layer_idx;
   int parallelism;
-  uint64_t remote_id;  // Block: sender node_id / remote block ID | Buffer:
-                       // dst/src byte offset.
-  uint32_t local_id;   // Block: layer_idx / local block ID |
-                       // Buffer: dst/src shard index.
+  uint64_t remote_id;  // sender node_id (push) / remote block ID (pull)
+  uint32_t local_id;   // layer_idx (push) / local block ID (pull)
   uint32_t count_or_size;
   uint64_t uuid;
   uint32_t request_id;
   int stream_idx;
-  size_t dst_stride_bytes = 0;
-  size_t stride_count = 1;
-  size_t src_stride_bytes = 0;
 
-  // Block push streams only (socket_opcode 1/6); identical across the
-  // requests of one Post(). Both are wire-only: they go into the chunk header
-  // and do not change how the adapter schedules its `parallelism` streams.
+  // Block push streams only (kBlockPush / kBlockPushExplicit); identical
+  // across the requests of one Post().
   //
   // Bitmask of shard indices carried by these streams (bit `i` = shard `i`);
   // 0 = legacy, every shard. Sent as `ChunkHeader::buffer_id` so the receiver
@@ -101,6 +101,9 @@ class TransportAdapter {
       CompletionCallback on_complete = nullptr) = 0;
 
   virtual absl::StatusOr<Status> Poll(Handle handle) = 0;
+
+  // Port peers use to reach this transport.
+  virtual int local_port() const = 0;
 
   virtual ::peregrine::TransportMetrics GetTransportMetrics() const {
     return {};

@@ -270,16 +270,6 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
            nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false)
-      .def(nb::init<size_t, size_t, size_t, int64_t, std::optional<int>,
-                    std::optional<int>, int, int, std::optional<std::string>,
-                    std::optional<std::string>>(),
-           nb::arg("num_layers"), nb::arg("num_shards"),
-           nb::arg("slice_byte_size"), nb::arg("node_id"),
-           nb::arg("local_port") = nb::none(),
-           nb::arg("host_blocks_to_allocate") = nb::none(),
-           nb::arg("parallelism") = 1, nb::arg("raiden_worker_port") = 0,
-           nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none())
       .def("node_id", &KVCacheManager::node_id)
       .def("get_raiden_worker_port", &KVCacheManager::GetRaidenWorkerPort)
       .def(
@@ -1284,7 +1274,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
                   }
                 });
           },
-          nb::arg("callback"));
+          nb::arg("callback").none());
 
   // C++-owned reshard client. The facade-compatible surface is provided by
   // tpu_raiden/api/torch/reshard_client.py on top of this binding.

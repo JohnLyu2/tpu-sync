@@ -763,5 +763,43 @@ TEST(PoolStagingRecvRegistrationTest,
   EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
 }
 
+TEST(PoolReshardRecvTest,
+     FailedIncomingPushReleasesStagingLeaseBeforeDeadline) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
+  ASSERT_TRUE(manager.base()->PoolStorageStagingBounded(0));
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+
+  const StartTransferRequest plan = ValidPlan(/*uuid=*/3003);
+  ABSL_ASSERT_OK(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+  EXPECT_TRUE(manager.base()->HasActivePlan(3003));
+
+  // A push that fails mid-stream (socket timeout, peer disconnect) is terminal
+  // for the receive: the session must settle now, releasing its staging lease
+  // and plan claim, rather than at the session deadline.
+  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/3003));
+  EXPECT_THAT(
+      manager.base()->EndIncomingPush(
+          /*uuid=*/3003, absl::DeadlineExceededError("Socket read timed out")),
+      StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+  EXPECT_FALSE(manager.base()->HasActivePlan(3003));
+
+  // The failure is reported on the next poll, not after the deadline sweep.
+  const auto [done_sending, done_recving, failed_recving] =
+      manager.CompleteReadRaw();
+  EXPECT_THAT(done_recving, IsEmpty());
+  EXPECT_THAT(failed_recving, Contains("pool_reshard_req_3003"));
+}
+
 }  // namespace
 }  // namespace tpu_raiden

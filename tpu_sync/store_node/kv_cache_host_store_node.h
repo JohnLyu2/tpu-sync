@@ -26,6 +26,7 @@
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
+#include "tpu_sync/kv_cache/store_monitor.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 namespace tpu_raiden {
 namespace store_node {
@@ -112,6 +113,24 @@ class KVCacheHostStoreNode {
     // the registry. Off means a TTL-less registration that never reports
     // capacity.
     bool enable_store_monitor = true;
+
+    // Runs periodic evict sweep to reclaim cold blocks when free capacity falls
+    // below evict_low_watermark. The sweep runs on the store monitor and
+    // therefore requires enable_store_monitor=true and a configured
+    // global_registry_address; otherwise boot logs a WARNING and the sweep
+    // stays off.
+    bool enable_evict_sweep = true;
+
+    // Fallback period between sweep pressure checks.
+    absl::Duration evict_sweep_period =
+        kv_cache::StoreMonitor::kDefaultSweepPeriod;
+
+    // Free-block ratio (free / total) below which the sweep starts reclaiming.
+    // Matches kv_cache_store.cc defaults (kDefaultEvictLowWatermark / High).
+    double evict_low_watermark = 0.03;
+
+    // Free-block ratio at which an active sweep stops.
+    double evict_high_watermark = 0.05;
 
     // Host DRAM lent to the pool. Converted to whole blocks of the received
     // spec's block geometry; the remainder below one block is not allocated.

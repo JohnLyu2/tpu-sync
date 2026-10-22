@@ -26,7 +26,7 @@
 #include <optional>
 #include <string>
 #include <system_error>  // NOLINT(build/c++11)
-#include <thread>  // NOLINT(build/c++11)
+#include <thread>        // NOLINT(build/c++11)
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -128,7 +128,9 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kSentBytesTotal.description,
             "Total count of bytes sent over TPU Raiden interfaces.");
   EXPECT_EQ(metric_metadata::kSentBytesTotal.type, MetricType::kCounter);
-  EXPECT_THAT(metric_metadata::kSentBytesTotal.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kSentBytesTotal.label_names,
+              ElementsAre(metric_labels::kDirection, metric_labels::kSrcIp,
+                          metric_labels::kDstIp));
 
   // ReceivedBytesTotal
   EXPECT_EQ(metric_names::kReceivedBytesTotal, "received_bytes_total");
@@ -138,7 +140,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kReceivedBytesTotal.description,
             "Total count of bytes received over TPU Raiden interfaces.");
   EXPECT_EQ(metric_metadata::kReceivedBytesTotal.type, MetricType::kCounter);
-  EXPECT_THAT(metric_metadata::kReceivedBytesTotal.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kReceivedBytesTotal.label_names,
+              ElementsAre(metric_labels::kDirection));
 
   // TransferFailuresTotal
   EXPECT_EQ(metric_names::kTransferFailuresTotal, "transfer_failures_total");
@@ -151,7 +154,9 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
       metric_metadata::kTransferFailuresTotal.description,
       "Cumulative total count of transfer failures across all interfaces.");
   EXPECT_EQ(metric_metadata::kTransferFailuresTotal.type, MetricType::kCounter);
-  EXPECT_THAT(metric_metadata::kTransferFailuresTotal.label_names, IsEmpty());
+  EXPECT_THAT(
+      metric_metadata::kTransferFailuresTotal.label_names,
+      ElementsAre(metric_labels::kDirection, metric_labels::kErrorCode));
 
   // P2pTransferTimeMs
   EXPECT_EQ(metric_labels::kSrcIp, "src_ip");
@@ -163,7 +168,9 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.description,
             "Peer-to-Peer network batch transfer latency in milliseconds.");
   EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.type, MetricType::kHistogram);
-  EXPECT_THAT(metric_metadata::kP2pTransferTimeMs.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kP2pTransferTimeMs.label_names,
+              ElementsAre(metric_labels::kSrcIp, metric_labels::kDstIp,
+                          metric_labels::kLocalRank));
 
   // H2dBytesTotal
   EXPECT_EQ(metric_labels::kHostIp, "host_ip");
@@ -177,7 +184,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "Cumulative bytes requested for Host DRAM to Device HBM transfers "
             "that completed successfully.");
   EXPECT_EQ(metric_metadata::kH2dBytesTotal.type, MetricType::kCounter);
-  EXPECT_THAT(metric_metadata::kH2dBytesTotal.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kH2dBytesTotal.label_names,
+              ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
   // H2dTransferTimeMs
   EXPECT_EQ(metric_names::kH2dTransferTimeMs, "h2d_transfer_time_ms");
@@ -193,7 +201,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_names::kH2dDmaTimeMs, "h2d_dma_time_ms");
   EXPECT_EQ(metric_metadata::kH2dDmaTimeMs.name, "h2d_dma_time_ms");
   EXPECT_EQ(metric_metadata::kH2dDmaTimeMs.type, MetricType::kHistogram);
-  EXPECT_THAT(metric_metadata::kH2dDmaTimeMs.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kH2dDmaTimeMs.label_names,
+              ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
   // D2hBytesTotal
   EXPECT_EQ(metric_names::kD2hBytesTotal, "d2h_bytes_total");
@@ -205,7 +214,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "Cumulative bytes requested for Device HBM to Host DRAM transfers "
             "that completed successfully.");
   EXPECT_EQ(metric_metadata::kD2hBytesTotal.type, MetricType::kCounter);
-  EXPECT_THAT(metric_metadata::kD2hBytesTotal.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kD2hBytesTotal.label_names,
+              ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
   // D2hTransferTimeMs
   EXPECT_EQ(metric_names::kD2hTransferTimeMs, "d2h_transfer_time_ms");
@@ -221,7 +231,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_names::kD2hDmaTimeMs, "d2h_dma_time_ms");
   EXPECT_EQ(metric_metadata::kD2hDmaTimeMs.name, "d2h_dma_time_ms");
   EXPECT_EQ(metric_metadata::kD2hDmaTimeMs.type, MetricType::kHistogram);
-  EXPECT_THAT(metric_metadata::kD2hDmaTimeMs.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kD2hDmaTimeMs.label_names,
+              ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
   // TransferDurationMs
   EXPECT_EQ(metric_names::kTransferDurationMs, "transfer_duration_ms");
@@ -365,9 +376,26 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_labels::kDirectionPullResponse, "pull_response");
   EXPECT_EQ(metric_labels::kDirectionWrite, "write");
   EXPECT_EQ(metric_labels::kDirectionRead, "read");
+  EXPECT_THAT(metric_labels::kDirectionLabels,
+              ElementsAre(metric_labels::kDirection));
+  EXPECT_THAT(metric_labels::kSentBytesLabels,
+              ElementsAre(metric_labels::kDirection, metric_labels::kSrcIp,
+                          metric_labels::kDstIp));
 
   // Error Code Labels
   EXPECT_EQ(metric_labels::kErrorCode, "error_code");
+  EXPECT_THAT(
+      metric_labels::kTransferFailuresLabels,
+      ElementsAre(metric_labels::kDirection, metric_labels::kErrorCode));
+
+  // P2P IP Labels
+  EXPECT_THAT(metric_labels::kP2pTransferTimeLabels,
+              ElementsAre(metric_labels::kSrcIp, metric_labels::kDstIp,
+                          metric_labels::kLocalRank));
+
+  // PCIe Transfer Labels
+  EXPECT_THAT(metric_labels::kPcieTransferLabels,
+              ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
   // All Metrics
   // clang-format off

@@ -1061,6 +1061,87 @@ TEST_F(StorageDriverTest, LookupWindowedPrefixHitsAndChunkBoundaries) {
   EXPECT_EQ(small_lookup_or->size(), 6);
 }
 
+TEST_F(StorageDriverTest,
+       LookupSubsetContinuesPastMissingBlocksAcrossChunkBoundaries) {
+  auto env = CreateStoreBackend(/*batch_size=*/2);
+  EXPECT_EQ(env.store->lookup_batch_size(), 2);
+
+  env.CreateBlock("present_0");
+  env.CreateBlock("present_2");
+  env.CreateBlock("present_3");
+
+  // With batch_size=2, chunk 0 probes ["present_0", "missing_1"] (which has an
+  // absent key), and chunk 1 probes ["present_2", "present_3"]. In kSubset mode
+  // (plus an unmappable empty hash ""), Lookup must not stop at "missing_1" or
+  // "".
+  std::vector<std::string> hashes = {"present_0", "missing_1", "", "present_2",
+                                     "present_3"};
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto subset_res,
+      env.store->Lookup(
+          hashes,
+          ::tpu_raiden::kv_cache::LookupOptions{
+              .enable_global = false,
+              .match_mode = ::tpu_raiden::kv_cache::LookupMatchMode::kSubset}));
+  ASSERT_EQ(subset_res.size(), 3);
+  EXPECT_EQ(subset_res[0].first, "present_0");
+  EXPECT_EQ(subset_res[0].second.status, BlockStatus::SHARED_STORAGE);
+  EXPECT_EQ(subset_res[1].first, "present_2");
+  EXPECT_EQ(subset_res[1].second.status, BlockStatus::SHARED_STORAGE);
+  EXPECT_EQ(subset_res[2].first, "present_3");
+  EXPECT_EQ(subset_res[2].second.status, BlockStatus::SHARED_STORAGE);
+}
+
+TEST_F(StorageDriverTest,
+       LookupHostResidentAndEmptySnapshotReturnEmptyOnPosixBackend) {
+  auto env = CreateStoreBackend(/*batch_size=*/4);
+  env.CreateBlock("present_0");
+  env.CreateBlock("present_1");
+
+  // Positive control: standard local prefix lookup finds both blocks.
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto prefix_res, env.store->Lookup({"present_0", "present_1"},
+                                         ::tpu_raiden::kv_cache::LookupOptions{
+                                             .enable_global = false}));
+  EXPECT_EQ(prefix_res.size(), 2);
+
+  // Host-resident queries and empty-span snapshots return empty on secondary
+  // storage.
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto host_subset,
+      env.store->Lookup(
+          {"present_0", "present_1"},
+          ::tpu_raiden::kv_cache::LookupOptions::HostResidentSubset()));
+  EXPECT_TRUE(host_subset.empty());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot,
+      env.store->Lookup(
+          /*block_hashes=*/{},
+          ::tpu_raiden::kv_cache::LookupOptions::SnapshotHostResident()));
+  EXPECT_TRUE(snapshot.empty());
+
+  // Invalid option combinations return InvalidArgumentError.
+  EXPECT_THAT(
+      env.store->Lookup(
+          {"present_0"},
+          ::tpu_raiden::kv_cache::LookupOptions{
+              .enable_global = true,
+              .match_mode = ::tpu_raiden::kv_cache::LookupMatchMode::kSubset}),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      env.store->Lookup({"present_0"},
+                        ::tpu_raiden::kv_cache::LookupOptions{
+                            .enable_global = true, .host_resident_only = true}),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(env.store->Lookup({"present_0"},
+                                ::tpu_raiden::kv_cache::LookupOptions{
+                                    .enable_global = false,
+                                    .pin_found = true,
+                                    .include_eviction_candidates = true}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 // ===========================================================================
 // Theme 4: Atomic Commit & Filesystem Fault Recovery
 // ===========================================================================

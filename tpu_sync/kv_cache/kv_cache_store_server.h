@@ -56,6 +56,11 @@ class KVCacheStoreServer {
   // "[::]:12345"). Returns an empty string if the server is not running.
   std::string GetServerAddress() const;
 
+  // Installs `fn` on the hosted service; see
+  // KVCacheStoreServiceImpl::SetSpaceCheckFn. No-op if the server is not
+  // running.
+  void SetSpaceCheckFn(KVCacheStoreServiceImpl::SpaceCheckFn fn);
+
   // Gracefully shuts down the gRPC server and cleans up service state.
   void Shutdown();
 

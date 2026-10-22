@@ -697,6 +697,7 @@ cc_library(
 
 cc_library(
     name = "kv_cache_store_backend",
+    srcs = ["kv_cache_store_backend.cc"],
     hdrs = ["kv_cache_store_backend.h"],
     visibility = ["//visibility:public"],
     deps = [

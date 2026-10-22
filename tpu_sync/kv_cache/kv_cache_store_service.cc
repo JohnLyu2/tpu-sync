@@ -360,15 +360,32 @@ void KVCacheStoreServiceImpl::SetTransferFnForTesting(TransferFn transfer_fn) {
   transfer_fn_override_ = std::move(transfer_fn);
 }
 
+void KVCacheStoreServiceImpl::SetSpaceCheckFn(SpaceCheckFn fn) {
+  absl::MutexLock lock(space_check_mutex_);
+  space_check_fn_ =
+      fn ? std::make_shared<const SpaceCheckFn>(std::move(fn)) : nullptr;
+}
+
+void KVCacheStoreServiceImpl::RequestSpaceCheck() {
+  std::shared_ptr<const SpaceCheckFn> fn;
+  {
+    absl::MutexLock lock(space_check_mutex_);
+    fn = space_check_fn_;
+  }
+  if (fn != nullptr) {
+    (*fn)();
+  }
+}
+
 void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
   if (backend_ == nullptr) {
     return;
   }
-  // A lookup miss does not mean the block is gone: the lookup cannot see an
-  // eviction candidate, and a candidate still holds its host block. So probe
-  // with AlreadyPresentHostResident, which does see candidates, and leave the
-  // entry alone if one is what the lookup missed.
-  if (!backend_->AlreadyPresentHostResident({hash}).empty()) {
+  // Keep the registry entry if another concurrent path re-cached the block in
+  // host DRAM (active or candidate).
+  absl::StatusOr<BlockSliceList> present = backend_->Lookup(
+      absl::MakeConstSpan(&hash, 1), LookupOptions::HostResidentSubset());
+  if (!present.ok() || !present->empty()) {
     return;
   }
   backend_->UnregisterBlocksAsync({hash}).OnReady([](absl::Status) {});
@@ -653,8 +670,20 @@ KVCacheStoreServiceImpl::WriteRemote(
 
   // Quick check: if we ALREADY hold every requested hash in host DRAM, answer
   // immediately without allocating landing blocks or pulling bytes.
-  std::vector<std::string> present =
-      backend_->AlreadyPresentHostResident(block_hashes);
+  absl::StatusOr<BlockSliceList> present_slices =
+      backend_->Lookup(block_hashes, LookupOptions::HostResidentSubset());
+  if (!present_slices.ok()) {
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
+    reactor->Finish(::grpc::Status(
+        static_cast<::grpc::StatusCode>(present_slices.status().raw_code()),
+        std::string(present_slices.status().message())));
+    return reactor;
+  }
+  std::vector<std::string> present;
+  present.reserve(present_slices->size());
+  for (auto& [hash, _] : *present_slices) {
+    present.push_back(std::move(hash));
+  }
   if (present.size() == block_hashes.size()) {
     auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     proto::WriteRemoteEvent ack_event;
@@ -696,6 +725,9 @@ KVCacheStoreServiceImpl::WriteRemote(
   // Allocate landing blocks in destination host DRAM for the transfer.
   auto allocated_ids = controller_->AllocateBlockIds(block_hashes.size());
   if (!allocated_ids.ok()) {
+    // Out of free blocks: this write is refused, but the owner can still make
+    // room for the next one.
+    RequestSpaceCheck();
     auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -876,8 +908,17 @@ KVCacheStoreServiceImpl::CompleteWriteRemote(uint64_t op_id,
   // Claimed path: write_mutex_ NOT held across backend and registry calls.
 
   // Re-check existence.
-  std::vector<std::string> present =
-      backend_->AlreadyPresentHostResident(op->block_hashes);
+  absl::StatusOr<BlockSliceList> present_slices =
+      backend_->Lookup(op->block_hashes, LookupOptions::HostResidentSubset());
+  if (!present_slices.ok()) {
+    Finish(op, OpState::kFailed, {});
+    return std::nullopt;
+  }
+  std::vector<std::string> present;
+  present.reserve(present_slices->size());
+  for (auto& [hash, _] : *present_slices) {
+    present.push_back(std::move(hash));
+  }
   if (present.size() == op->block_hashes.size()) {
     Finish(op, OpState::kAllExist, {});
     return std::nullopt;
@@ -945,6 +986,12 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
                                      std::vector<std::string> existing) {
   const bool kept_by_cache =
       state == OpState::kCommitted || state == OpState::kStoredUnregistered;
+  if (kept_by_cache) {
+    // The write is done and its blocks stay in the cache, now evictable. Ask
+    // for the space check before the verdict goes out, so the owner can make
+    // room before the source sends more.
+    RequestSpaceCheck();
+  }
   std::shared_ptr<WriteRemoteReactorGate> gate;
   proto::WriteRemoteEvent result_event;
   {

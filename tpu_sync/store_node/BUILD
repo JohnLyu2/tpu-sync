@@ -76,6 +76,7 @@ cc_library(
         "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/kv_cache:kv_cache_store",
         "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache:store_monitor",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/random",
@@ -104,6 +105,7 @@ cc_binary(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:initialize",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/time",
     ],
 )
 
@@ -125,12 +127,15 @@ cc_test(
         "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/log:scoped_mock_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )
 
@@ -160,5 +165,6 @@ cc_test(
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )

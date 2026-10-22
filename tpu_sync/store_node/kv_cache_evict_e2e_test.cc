@@ -28,6 +28,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
@@ -81,8 +82,10 @@ class EvictE2ETest : public ::testing::Test {
   }
   void TearDown() override { unsetenv("RAIDEN_DISABLE_SINGLETON_WORKER"); }
 
-  absl::StatusOr<SourceAssembly> MakeSource(const kv_cache::RaidenId& id,
-                                            absl::string_view kv_pool_group) {
+  absl::StatusOr<SourceAssembly> MakeSource(
+      const kv_cache::RaidenId& id, absl::string_view kv_pool_group,
+      bool enable_evict_sweep = true, double evict_low_watermark = 0.5,
+      double evict_high_watermark = 0.75) {
     SourceAssembly src;
     src.manager = std::make_unique<KVCacheManagerWithTransfer>(
         kNumBlockArrays, /*num_shards=*/1, kArrayBytes,
@@ -96,10 +99,10 @@ class EvictE2ETest : public ::testing::Test {
     config.global_registry_address = registry_->server_address;
     config.kv_pool_group = std::string(kv_pool_group);
     config.monitor_config.enable = true;
-    config.monitor_config.enable_evict_sweep = true;
+    config.monitor_config.enable_evict_sweep = enable_evict_sweep;
     config.monitor_config.evict_sweep_period = absl::Milliseconds(200);
-    config.monitor_config.evict_low_watermark = 0.5;
-    config.monitor_config.evict_high_watermark = 0.75;
+    config.monitor_config.evict_low_watermark = evict_low_watermark;
+    config.monitor_config.evict_high_watermark = evict_high_watermark;
     ABSL_ASSIGN_OR_RETURN(
         src.store, kv_cache::KVCacheStore::Create(
                        config, kSourceCapacity, registry_->server_address, id,
@@ -191,11 +194,11 @@ TEST_F(EvictE2ETest, SweepDemotesToTheStoreNodeAndReadsBack) {
   // The sweep must raise free blocks from 2 to the 0.75 watermark's 6,
   // demoting 4 cold blocks to the node -- the only same-group higher-tier
   // store the registry knows.
-  auto* block_manager = src.store->raiden_controller()->block_manager();
-  for (int i = 0; i < 1000 && block_manager->num_free_blocks() != 6; ++i) {
+  auto* controller = src.store->raiden_controller();
+  for (int i = 0; i < 1000 && controller->num_free_blocks() != 6; ++i) {
     absl::SleepFor(absl::Milliseconds(10));
   }
-  ASSERT_EQ(block_manager->num_free_blocks(), 6)
+  ASSERT_EQ(controller->num_free_blocks(), 6)
       << "the sweep never demoted down to the high watermark";
 
   // Wipe the freed source blocks: a demotion is a copy, so without this the
@@ -268,6 +271,261 @@ TEST_F(EvictE2ETest, SweepDemotesToTheStoreNodeAndReadsBack) {
         src.store->raiden_controller()->DeallocateBlockIds({dst_block}).ok());
   }
   EXPECT_EQ(demoted, 4);
+}
+
+// Tests that when a tier-1 host store node fills up, its own background evict
+// sweep proactively reclaims headroom down to its high watermark so that a new
+// demotion from tier 0 can land via FREE-only WriteRemote allocation, while
+// the oldest unpinned LRU block is evicted locally and from the registry.
+TEST_F(EvictE2ETest, FullHostStoreNodeEvictsLruBlockOnNewDemotion) {
+  constexpr size_t kNodeCapacity = 4;
+  const kv_cache::RaidenId src_id{"e2e_serving", "0", "kv_pool", 0};
+  // Tier-0 source has its background sweep disabled; driven via
+  // SweepOnceForTesting. Low watermark 0.7 and high 0.75 ensure:
+  // - Phase 1: 6 blocks used (free ratio 2/8 = 0.25 <= 0.7), deficit 4 ->
+  // demotes 4 blocks.
+  // - Phase 2: 3 blocks used (free ratio 5/8 = 0.625 <= 0.7), deficit 1 ->
+  // demotes 1 block.
+  TF_ASSERT_OK_AND_ASSIGN(
+      SourceAssembly src,
+      MakeSource(src_id, "e2e_pool", /*enable_evict_sweep=*/false,
+                 /*evict_low_watermark=*/0.7,
+                 /*evict_high_watermark=*/0.75));
+
+  KVCacheHostStoreNode::Options options;
+  options.raiden_id = kv_cache::RaidenId{"e2e_store_node", "0", "kv_pool", 0};
+  options.store_server_ip = "localhost";
+  options.global_registry_address = registry_->server_address;
+  options.kv_pool_group = "e2e_pool";
+  options.evict_tier = 1;
+  options.dram_budget_bytes = kNodeCapacity * kBlockBytes;  // 4 blocks capacity
+  options.evict_sweep_period = absl::Milliseconds(100);
+  // Watermarks chosen so when the 4-block node is full (free ratio 0.0 < 0.5),
+  // evict sweep triggers and frees headroom up to high watermark 0.75 (deficit
+  // 3). When node has 2+ free blocks (ratio >= 0.5), sweep stays idle.
+  options.evict_low_watermark = 0.5;
+  options.evict_high_watermark = 0.75;
+  StaticKVTransferSpecSource source(TestSpec());
+  absl::StatusOr<std::unique_ptr<KVCacheHostStoreNode>> node =
+      KVCacheHostStoreNode::Create(options, &source);
+  ASSERT_TRUE(node.ok()) << node.status().ToString();
+  ASSERT_EQ((*node)->num_host_blocks(), kNodeCapacity);
+
+  // -------------------------------------------------------------------------
+  // Phase 1: Fill the tier-1 host store node via demotions from tier-0 source.
+  // -------------------------------------------------------------------------
+  // Insert blocks one-by-one into tier-0 so that e2e_blk_0 is the oldest (LRU
+  // tail) and e2e_blk_5 is the newest (MRU head). Batch insert reverses LRU
+  // order (host_offload_backend.cc:401).
+  constexpr int kPhase1Blocks = 6;
+  std::vector<std::string> hashes;
+  std::vector<kv_cache::RaidenBlockId> slices;
+  TF_ASSERT_OK_AND_ASSIGN(
+      const std::vector<int> ids,
+      src.store->raiden_controller()->AllocateBlockIds(kPhase1Blocks));
+  for (int i = 0; i < kPhase1Blocks; ++i) {
+    const std::string hash = absl::StrCat("e2e_blk_", i);
+    hashes.push_back(hash);
+    slices.push_back(
+        kv_cache::RaidenBlockId(src_id, ids[i], kv_cache::BlockStatus::HOST));
+    FillBlock(*src.manager, ids[i], i);
+    ASSERT_TRUE(
+        src.store->Insert({hash}, {slices.back()}, /*on_host=*/true).ok());
+    src.store->Release({hash});
+  }
+
+  // Synchronously drive the sweep on tier 0. It picks the 4 oldest blocks from
+  // the LRU tail (e2e_blk_0 .. e2e_blk_3) and demotes them to the host store
+  // node.
+  EXPECT_TRUE(src.store->SweepOnceForTesting());
+
+  // Phase 1 guarantees: tier 0 successfully demoted blk_0..3 to the node and
+  // evicted them locally. We check tier 0 local eviction here. On the node,
+  // because the background sweep is active from boot, the node transitions to
+  // full and begins freeing headroom; therefore, we avoid a racy
+  // "num_free_blocks == 0" assertion on the node and instead poll for the
+  // sweep to free headroom below.
+  const kv_cache::LookupOptions local_only{.enable_global = false};
+  for (int i = 0; i < 4; ++i) {
+    TF_ASSERT_OK_AND_ASSIGN(auto local_src,
+                            src.store->backend()->Lookup(
+                                {absl::StrCat("e2e_blk_", i)}, local_only));
+    EXPECT_TRUE(local_src.empty())
+        << "Demoted block e2e_blk_" << i << " should be evicted from tier 0";
+  }
+
+  // Bounded poll (≤5s, 10ms steps) for the node's background sweep to free
+  // headroom. No ASSERT hard stop here: on unpatched base, sweep is disabled
+  // so free blocks stay 0, and continuing allows the test to reach the 4
+  // assertions below and fail cleanly as the reproducer.
+  auto* node_controller = (*node)->store()->raiden_controller();
+  for (int i = 0; i < 500 && node_controller->num_free_blocks() == 0; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2: Add 1 new block to tier-0, dropping its free ratio below 0.7.
+  // Free blocks on source becomes 5 / 8 = 0.625 < 0.7.
+  // Deficit to reach high watermark (6 free) is 6 - 5 = 1 block.
+  // The oldest evictable block remaining on tier-0 is e2e_blk_4.
+  // -------------------------------------------------------------------------
+  TF_ASSERT_OK_AND_ASSIGN(const std::vector<int> new_id,
+                          src.store->raiden_controller()->AllocateBlockIds(1));
+  const std::string new_hash = "e2e_blk_6";
+  FillBlock(*src.manager, new_id[0], 6);
+  ASSERT_TRUE(src.store
+                  ->Insert({new_hash},
+                           {kv_cache::RaidenBlockId(
+                               src_id, new_id[0], kv_cache::BlockStatus::HOST)},
+                           /*on_host=*/true)
+                  .ok());
+  src.store->Release({new_hash});
+
+  // Drive SweepOnce on tier 0 to demote e2e_blk_4 to the store node.
+  // On base (without host store node evict sweep enabled): the node stays full,
+  // destination WriteRemote allocates via AllocateBlockIds (FREE only) and
+  // refuses with RESOURCE_EXHAUSTED; e2e_blk_4 is dropped locally on tier-0
+  // and never lands on the store node.
+  // In CL 1: the host store node's own background evict sweep has freed
+  // headroom, so the new demotion lands, leaving the previously sweep-evicted
+  // oldest block (e2e_blk_0) gone locally and unregistered from the global
+  // registry.
+  src.store->SweepOnceForTesting();
+
+  // -------------------------------------------------------------------------
+  // Invariant checks (fails on base, passes after fix):
+  // -------------------------------------------------------------------------
+  // 1. The new demotion (e2e_blk_4) must have successfully landed on the node.
+  TF_ASSERT_OK_AND_ASSIGN(auto local_4, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_4"}, local_only));
+  EXPECT_EQ(local_4.size(), 1u)
+      << "New demotion e2e_blk_4 should land on the full host store node";
+
+  // 2. Positive retention: the newest block from Phase 1 (e2e_blk_3) was not
+  // reclaimed by the node's sweep (which reclaimed 3 blocks down to high
+  // watermark) and remains on the node.
+  TF_ASSERT_OK_AND_ASSIGN(auto local_3, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_3"}, local_only));
+  EXPECT_EQ(local_3.size(), 1u)
+      << "Newest Phase-1 block e2e_blk_3 must be retained on the store node";
+
+  // 3. The oldest unpinned LRU block on the node (e2e_blk_0) must be evicted
+  // locally.
+  TF_ASSERT_OK_AND_ASSIGN(auto local_0, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_0"}, local_only));
+  EXPECT_TRUE(local_0.empty())
+      << "Oldest block e2e_blk_0 should be evicted from the store node";
+
+  // 4. The oldest block (e2e_blk_0) must be unregistered from the global
+  // registry.
+  TF_ASSERT_OK_AND_ASSIGN(auto registry_lookup,
+                          registry_->client->Lookup({"e2e_blk_0"}));
+  EXPECT_TRUE(registry_lookup.empty())
+      << "Oldest block e2e_blk_0 should no longer be present in global "
+         "registry";
+
+  // 5. Global lookup from peer store must no longer resolve e2e_blk_0.
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto global_0, src.store->Lookup({"e2e_blk_0"}, /*enable_global=*/true));
+  EXPECT_TRUE(global_0.empty())
+      << "Oldest block e2e_blk_0 should no longer be discoverable by peers";
+}
+
+// Tests that demotions filling a host store node wake its evict sweep right
+// away instead of on its period, so the next demotion lands.
+TEST_F(EvictE2ETest, RemoteWriteWakesTheStoreNodeSweepBeforeItsPeriod) {
+  constexpr size_t kNodeCapacity = 4;
+  const kv_cache::RaidenId src_id{"e2e_serving", "0", "kv_pool", 0};
+  TF_ASSERT_OK_AND_ASSIGN(
+      SourceAssembly src,
+      MakeSource(src_id, "e2e_pool", /*enable_evict_sweep=*/false,
+                 /*evict_low_watermark=*/0.7,
+                 /*evict_high_watermark=*/0.75));
+
+  KVCacheHostStoreNode::Options options;
+  options.raiden_id = kv_cache::RaidenId{"e2e_store_node", "0", "kv_pool", 0};
+  options.store_server_ip = "localhost";
+  options.global_registry_address = registry_->server_address;
+  options.kv_pool_group = "e2e_pool";
+  options.evict_tier = 1;
+  options.dram_budget_bytes = kNodeCapacity * kBlockBytes;
+  // The period outlasts the test, so only a wake can run the node's sweep.
+  options.evict_sweep_period = absl::Hours(1);
+  options.evict_low_watermark = 0.5;
+  options.evict_high_watermark = 0.75;
+  StaticKVTransferSpecSource source(TestSpec());
+  absl::StatusOr<std::unique_ptr<KVCacheHostStoreNode>> node =
+      KVCacheHostStoreNode::Create(options, &source);
+  ASSERT_TRUE(node.ok()) << node.status().ToString();
+  ASSERT_EQ((*node)->num_host_blocks(), kNodeCapacity);
+
+  // Phase 1: Fill the tier-1 host store node via demotions from tier-0 source.
+  constexpr int kPhase1Blocks = 6;
+  std::vector<std::string> hashes;
+  std::vector<kv_cache::RaidenBlockId> slices;
+  TF_ASSERT_OK_AND_ASSIGN(
+      const std::vector<int> ids,
+      src.store->raiden_controller()->AllocateBlockIds(kPhase1Blocks));
+  for (int i = 0; i < kPhase1Blocks; ++i) {
+    const std::string hash = absl::StrCat("e2e_blk_", i);
+    hashes.push_back(hash);
+    slices.push_back(
+        kv_cache::RaidenBlockId(src_id, ids[i], kv_cache::BlockStatus::HOST));
+    FillBlock(*src.manager, ids[i], i);
+    ASSERT_TRUE(
+        src.store->Insert({hash}, {slices.back()}, /*on_host=*/true).ok());
+    src.store->Release({hash});
+  }
+
+  EXPECT_TRUE(src.store->SweepOnceForTesting());
+
+  const kv_cache::LookupOptions local_only{.enable_global = false};
+  for (int i = 0; i < 4; ++i) {
+    TF_ASSERT_OK_AND_ASSIGN(auto local_src,
+                            src.store->backend()->Lookup(
+                                {absl::StrCat("e2e_blk_", i)}, local_only));
+    EXPECT_TRUE(local_src.empty())
+        << "Demoted block e2e_blk_" << i << " should be evicted from tier 0";
+  }
+
+  // Bounded poll (<=5s, 10ms steps) for the node's free blocks to become
+  // non-zero.
+  auto* node_controller = (*node)->store()->raiden_controller();
+  for (int i = 0; i < 500 && node_controller->num_free_blocks() == 0; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+
+  // Phase 2: Add 1 new block to tier-0, dropping its free ratio below 0.7.
+  TF_ASSERT_OK_AND_ASSIGN(const std::vector<int> new_id,
+                          src.store->raiden_controller()->AllocateBlockIds(1));
+  const std::string new_hash = "e2e_blk_6";
+  FillBlock(*src.manager, new_id[0], 6);
+  ASSERT_TRUE(src.store
+                  ->Insert({new_hash},
+                           {kv_cache::RaidenBlockId(
+                               src_id, new_id[0], kv_cache::BlockStatus::HOST)},
+                           /*on_host=*/true)
+                  .ok());
+  src.store->Release({new_hash});
+
+  src.store->SweepOnceForTesting();
+
+  // Assertions: e2e_blk_4 landed on the node; e2e_blk_3 retained; e2e_blk_0
+  // evicted locally.
+  TF_ASSERT_OK_AND_ASSIGN(auto local_4, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_4"}, local_only));
+  EXPECT_EQ(local_4.size(), 1u)
+      << "New demotion e2e_blk_4 should land on the store node";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto local_3, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_3"}, local_only));
+  EXPECT_EQ(local_3.size(), 1u)
+      << "Phase-1 block e2e_blk_3 must be retained on the store node";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto local_0, (*node)->store()->backend()->Lookup(
+                                            {"e2e_blk_0"}, local_only));
+  EXPECT_TRUE(local_0.empty())
+      << "Oldest block e2e_blk_0 should be evicted from the store node";
 }
 
 }  // namespace

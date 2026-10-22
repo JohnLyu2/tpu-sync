@@ -54,10 +54,31 @@ class CustomTestBackend : public KVCacheStoreBackend {
   std::string name() const override { return "CustomTestBackend"; }
   absl::StatusOr<BlockSliceList> Lookup(absl::Span<const std::string> hashes,
                                         const LookupOptions& options) override {
+    auto is_host_resident = [](BlockStatus s) {
+      return s == BlockStatus::HOST || s == BlockStatus::HOST_AND_HBM;
+    };
     BlockSliceList result;
+    if (options.match_mode == LookupMatchMode::kSubset && hashes.empty()) {
+      for (const auto& [h, id] : entries_) {
+        if (options.host_resident_only && !is_host_resident(id.status)) {
+          continue;
+        }
+        if (options.pin_found) {
+          ++pin_counts_[h];
+        }
+        result.push_back({h, id});
+      }
+      return result;
+    }
     for (const auto& h : hashes) {
       auto it = entries_.find(h);
-      if (it == entries_.end()) break;
+      if (it == entries_.end() || (options.host_resident_only &&
+                                   !is_host_resident(it->second.status))) {
+        if (options.match_mode == LookupMatchMode::kSubset) {
+          continue;
+        }
+        break;
+      }
       if (options.pin_found) {
         ++pin_counts_[h];
       }
@@ -73,13 +94,16 @@ class CustomTestBackend : public KVCacheStoreBackend {
     CHECK(load_tracker != nullptr);
     return tsl::Future<>(absl::UnimplementedError("Load is not supported."));
   }
-  std::pair<bool, BlockSliceList> Insert(absl::Span<const std::string> hashes,
-                                         absl::Span<const RaidenBlockId> slices,
-                                         bool) override {
+  bool Insert(absl::Span<const std::string> hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override {
+    if (option != InsertOption::kBestEffortUpdate) {
+      return false;
+    }
     for (size_t i = 0; i < hashes.size() && i < slices.size(); ++i) {
       entries_[hashes[i]] = slices[i];
     }
-    return {true, {}};
+    return true;
   }
   bool InsertAndLock(absl::Span<const std::string> hashes,
                      absl::Span<const RaidenBlockId> slices, bool) override {
@@ -246,8 +270,6 @@ TEST(KVCacheStoreBackendFactoryTest, CustomBackendDefaultHostOffloadHooks) {
   TF_ASSERT_OK_AND_ASSIGN(auto backend,
                           KVCacheStoreBackendFactory::Create(config));
   EXPECT_EQ(backend->name(), "CustomTestBackend");
-  EXPECT_TRUE(backend->SnapshotHostResidentHashes().empty());
-  EXPECT_TRUE(backend->PinPresentHostResident({"h1"}).empty());
 
   BlockTracker save_tracker;
   EXPECT_THAT(

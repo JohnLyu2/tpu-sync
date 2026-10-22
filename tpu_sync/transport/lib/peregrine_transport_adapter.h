@@ -19,6 +19,7 @@
 #include <string>
 
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/transport.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -28,8 +29,11 @@ namespace tpu_raiden::transport::lib {
 // Peregrine implementation of TransportAdapter.
 class PeregrineTransportAdapter : public TransportAdapter {
  public:
-  explicit PeregrineTransportAdapter(
-      std::unique_ptr<::peregrine::Transport> transport);
+  // Creates a TCP Peregrine transport listening on `bind_ip`:`port` (0 =
+  // kernel-assigned).
+  static absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> Create(
+      absl::string_view bind_ip, int port, int num_conns_per_peer);
+
   ~PeregrineTransportAdapter() override = default;
 
   absl::StatusOr<Handle> Post(absl::Span<const std::string> peers,
@@ -40,8 +44,14 @@ class PeregrineTransportAdapter : public TransportAdapter {
 
   absl::StatusOr<Status> Poll(Handle handle) override;
 
+  int local_port() const override { return local_port_; }
+
  private:
-  std::unique_ptr<::peregrine::Transport> transport_;
+  PeregrineTransportAdapter(std::unique_ptr<::peregrine::Transport> transport,
+                            int local_port);
+
+  const std::unique_ptr<::peregrine::Transport> transport_;
+  const int local_port_;
 };
 
 }  // namespace tpu_raiden::transport::lib

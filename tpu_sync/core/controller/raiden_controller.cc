@@ -283,6 +283,7 @@ RaidenController::RaidenController(const ::tpu_sync::rpc::RaidenIdProto& unit,
       num_shards_(num_shards),
       shard_size_bytes_(shard_size_bytes),
       num_total_blocks_(num_blocks),
+      total_blocks_(num_blocks),
       preprovision_worker_buffers_(preprovision_worker_buffers),
       worker_registry_(std::make_shared<core::controller::WorkerRegistry>()),
       block_manager_(
@@ -472,6 +473,11 @@ absl::Status RaidenController::AllocateTargetBlockIds(
     absl::Span<const int> block_ids) {
   absl::MutexLock lock(mutex_);
   return block_manager_->AllocateTarget(block_ids);
+}
+
+int RaidenController::num_free_blocks() const {
+  absl::ReaderMutexLock lock(mutex_);
+  return block_manager_->num_free_blocks();
 }
 
 absl::Status RaidenController::DeallocateBuffers(
