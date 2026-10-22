@@ -102,12 +102,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       const std::vector<std::string>& block_hashes,
       std::vector<std::string>* evicted_hashes = nullptr) override;
 
-  // Every hash with a host-resident copy, pinned entries included, eviction
-  // candidates excluded. One-shot inventory snapshot for republishing to the
-  // global registry after a registration lapse; not an enumeration to build
-  // logic on -- entries may be evicted the moment the lock drops.
-  std::vector<std::string> SnapshotHostResidentHashes() const override;
-
   // Pins the subset of `block_hashes` that is still host-resident and returns
   // those hashes with their current host block ids, all under one lock
   // acquisition. Unlike Pin(), absent or candidate hashes are skipped rather

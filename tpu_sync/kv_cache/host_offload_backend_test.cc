@@ -121,8 +121,10 @@ TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
       RaidenBlockId(id, 11, BlockStatus::HOST_AND_HBM)};
   backend.Insert(hashes, slices, /*on_host=*/true);
 
-  EXPECT_THAT(backend.SnapshotHostResidentHashes(),
-              UnorderedElementsAre("h1", "h2"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot, backend.Lookup({}, LookupOptions::SnapshotHostResident()));
+  EXPECT_THAT(snapshot,
+              UnorderedElementsAre(::testing::Key("h1"), ::testing::Key("h2")));
 
   // A hash evicted after the snapshot must be skipped, not resurrected --
   // republishing it would advertise a block that is gone.
@@ -152,8 +154,10 @@ TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("h1"));
 
-  EXPECT_THAT(backend.SnapshotHostResidentHashes(),
-              UnorderedElementsAre("h2", "h3"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto snapshot, backend.Lookup({}, LookupOptions::SnapshotHostResident()));
+  EXPECT_THAT(snapshot,
+              UnorderedElementsAre(::testing::Key("h2"), ::testing::Key("h3")));
   EXPECT_TRUE(
       backend.PinPresentHostResident(std::vector<std::string>{"h1"}).empty());
 }
@@ -239,8 +243,6 @@ TEST(HostOffloadBackendTest,
     snapshot_hashes.push_back(hash);
   }
   EXPECT_THAT(snapshot_hashes, UnorderedElementsAre("h2", "h3"));
-  EXPECT_THAT(snapshot_hashes, ::testing::UnorderedElementsAreArray(
-                                   backend.SnapshotHostResidentHashes()));
   EXPECT_EQ(backend.GetPinCount("h2"), 0);
   EXPECT_EQ(backend.GetPinCount("h3"), 0);
 }

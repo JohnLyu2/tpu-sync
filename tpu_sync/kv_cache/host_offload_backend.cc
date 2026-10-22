@@ -711,23 +711,6 @@ std::vector<int> HostOffloadBackend::Evict(
   return host_ids_to_deallocate;
 }
 
-std::vector<std::string> HostOffloadBackend::SnapshotHostResidentHashes()
-    const {
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> hashes;
-  hashes.reserve(lru_cache_.size());
-  for (const auto& [hash, it] : lru_cache_.map()) {
-    // Candidates are excluded on purpose: they are queued for eviction, and
-    // republishing one would advertise a block that is about to disappear.
-    if (it->location != NodeLocation::kCandidate &&
-        (it->value.status == BlockStatus::HOST ||
-         it->value.status == BlockStatus::HOST_AND_HBM)) {
-      hashes.push_back(hash);
-    }
-  }
-  return hashes;
-}
-
 std::vector<std::pair<std::string, int32_t>>
 HostOffloadBackend::PinPresentHostResident(
     absl::Span<const std::string> block_hashes) {

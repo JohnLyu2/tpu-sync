@@ -267,7 +267,6 @@ TEST(KVCacheStoreBackendFactoryTest, CustomBackendDefaultHostOffloadHooks) {
   TF_ASSERT_OK_AND_ASSIGN(auto backend,
                           KVCacheStoreBackendFactory::Create(config));
   EXPECT_EQ(backend->name(), "CustomTestBackend");
-  EXPECT_TRUE(backend->SnapshotHostResidentHashes().empty());
   EXPECT_TRUE(backend->PinPresentHostResident({"h1"}).empty());
 
   BlockTracker save_tracker;

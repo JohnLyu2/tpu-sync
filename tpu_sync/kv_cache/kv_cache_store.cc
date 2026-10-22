@@ -1970,9 +1970,14 @@ bool KVCacheStore::RepublishOnce() {
   }
 
   if (republish_queue_.empty()) {
-    republish_queue_ = host_backend->SnapshotHostResidentHashes();
-    if (republish_queue_.empty()) {
+    absl::StatusOr<BlockSliceList> snapshot =
+        host_backend->Lookup({}, LookupOptions::SnapshotHostResident());
+    if (!snapshot.ok() || snapshot->empty()) {
       return false;
+    }
+    republish_queue_.reserve(snapshot->size());
+    for (auto& [hash, _] : *snapshot) {
+      republish_queue_.push_back(std::move(hash));
     }
     LOG(INFO) << "Republishing " << republish_queue_.size()
               << " host-resident block(s) to the global registry.";

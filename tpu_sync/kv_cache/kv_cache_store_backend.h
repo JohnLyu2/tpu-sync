@@ -264,14 +264,6 @@ class KVCacheStoreBackend {
     return {};
   }
 
-  // Every hash with a host-resident copy, pinned entries included, eviction
-  // candidates excluded. One-shot inventory snapshot for republishing to the
-  // global registry after a registration lapse; not an enumeration to build
-  // logic on -- entries may be evicted the moment the lock drops.
-  virtual std::vector<std::string> SnapshotHostResidentHashes() const {
-    return {};
-  }
-
   // Pins the subset of `block_hashes` that is still host-resident and returns
   // those hashes with their current host block ids, all under one lock
   // acquisition. Unlike Pin(), absent or candidate hashes are skipped rather
