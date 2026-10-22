@@ -300,10 +300,10 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
     return tsl::Future<>(absl::OkStatus());
   }
 
-  std::pair<bool, BlockSliceList> Insert(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) override {
-    return {true, {}};
+  bool Insert(absl::Span<const std::string> block_hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override {
+    return option == InsertOption::kBestEffortUpdate;
   }
 
   bool InsertAndLock(absl::Span<const std::string> block_hashes,

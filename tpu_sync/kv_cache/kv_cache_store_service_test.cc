@@ -1448,13 +1448,9 @@ TEST(FetchWithdrawTest, AFetchRefusedOnTheWrongTierKeepsTheEntry) {
   auto* backend = store.backend().get();
 
   // Local, matched by the lookup, but with no host block to send.
-  ASSERT_TRUE(backend
-                  ->Insert({"staged"},
-                           {RaidenBlockId(src_id, /*host_block_id=*/-1,
-                                          /*device_block_id=*/50,
-                                          BlockStatus::HBM)},
-                           /*on_host=*/false)
-                  .first);
+  ASSERT_TRUE(backend->Insert(
+      {"staged"}, {RaidenBlockId(src_id, /*host_block_id=*/-1,
+                                 /*device_block_id=*/50, BlockStatus::HBM)}));
   ABSL_ASSERT_OK(registry->Register({{"staged", src_id, 10}}));
 
   KVCacheStoreServiceImpl service(backend, store.raiden_controller());
@@ -1503,11 +1499,8 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
 
   // Unpinned, so it can be displaced. Insert also withdraws whatever it
   // evicts, and this first one evicts nothing.
-  ASSERT_TRUE(backend
-                  ->Insert({"demoted"},
-                           {RaidenBlockId(src_id, 10, BlockStatus::HOST)},
-                           /*on_host=*/true)
-                  .first);
+  ASSERT_TRUE(backend->Insert({"demoted"},
+                              {RaidenBlockId(src_id, 10, BlockStatus::HOST)}));
   ABSL_ASSERT_OK(registry->Register({{"demoted", src_id, 10}}));
 
   // InsertAndLock, not Insert: it discards what Put displaces, on purpose --

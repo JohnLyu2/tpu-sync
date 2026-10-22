@@ -345,11 +345,14 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
   return results;
 }
 
-std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
-  BlockSliceList evicted_entries;
-  bool all_inserted = true;
+bool HostOffloadBackend::Insert(absl::Span<const std::string> block_hashes,
+                                absl::Span<const RaidenBlockId> slices,
+                                InsertOption option) {
+  if (option != InsertOption::kBestEffortUpdate) {
+    return false;
+  }
+
+  std::vector<std::string> evicted_hashes;
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
 
@@ -358,7 +361,6 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
     for (size_t i = 0; i < block_hashes.size(); ++i) {
       const std::string& hash = block_hashes[i];
       if (lru_cache_.Contains(hash)) {
-        all_inserted = false;
         if (i < slices.size()) {
           if (RaidenBlockId* existing = lru_cache_.PeekMutable(hash)) {
             *existing = slices[i];
@@ -381,7 +383,7 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
         evicted = lru_cache_.Put(hash, RaidenBlockId());
       }
       if (evicted.has_value()) {
-        evicted_entries.push_back(std::move(*evicted));
+        evicted_hashes.push_back(std::move(evicted->first));
       }
     }
     client = registry_client_;
@@ -390,12 +392,7 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
 
   // Withdraw only: a completed save publishes, this does not. What was evicted
   // to make room is unreadable from now on, and nothing else retires it.
-  if (client != nullptr && !evicted_entries.empty()) {
-    std::vector<std::string> evicted_hashes;
-    evicted_hashes.reserve(evicted_entries.size());
-    for (const auto& [hash, block_id] : evicted_entries) {
-      evicted_hashes.push_back(hash);
-    }
+  if (client != nullptr && !evicted_hashes.empty()) {
     client
         ->UnregisterAsync(evicted_hashes, local_id,
                           global_registry::kUnwaitedMutationTimeout)
@@ -408,7 +405,7 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
         });
   }
 
-  return std::make_pair(all_inserted, std::move(evicted_entries));
+  return true;
 }
 
 bool HostOffloadBackend::InsertAndLock(
@@ -1294,7 +1291,7 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
         }
       }
       if (!update_hashes.empty()) {
-        Insert(update_hashes, update_slices, /*on_host=*/true);
+        Insert(update_hashes, update_slices);
         Release(update_hashes);
       }
       load_tracker->MarkDone(hashes);
@@ -1386,7 +1383,7 @@ tsl::Future<> HostOffloadBackend::Save(
             }
           }
           if (!update_hashes.empty()) {
-            Insert(update_hashes, update_slices, /*on_host=*/true);
+            Insert(update_hashes, update_slices);
           }
           save_tracker->MarkDone(hashes);
           save_promise.Set(absl::OkStatus());

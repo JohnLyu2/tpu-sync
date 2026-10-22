@@ -1185,8 +1185,7 @@ absl::Status KVCacheStore::SaveLocal(
         update_slices.push_back(block);
       }
       if (!update_hashes.empty() && host_ram_backend != nullptr) {
-        host_ram_backend->Insert(update_hashes, update_slices,
-                                 /*on_host=*/true);
+        host_ram_backend->Insert(update_hashes, update_slices);
       }
       {
         absl::MutexLock lock(lifetime->mu);

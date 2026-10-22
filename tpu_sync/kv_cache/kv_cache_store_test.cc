@@ -149,9 +149,8 @@ class KVCacheStoreTest {
 
   static void PlantIndexEntry(KVCacheStore& store,
                               const std::vector<std::string>& block_hashes,
-                              const std::vector<RaidenBlockId>& slices,
-                              bool on_host) {
-    store.backend()->Insert(block_hashes, slices, on_host);
+                              const std::vector<RaidenBlockId>& slices) {
+    store.backend()->Insert(block_hashes, slices);
   }
 
   static std::optional<KVCacheStore::RemoteWriteState> TakeRemoteWrite(
@@ -1927,8 +1926,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesMixedStatusesFails) {
       RaidenBlockId(remote_rid, 0, -1, BlockStatus::REMOTE),
       RaidenBlockId(rid, 1, -1, BlockStatus::HOST)};
 
-  KVCacheStoreTest::PlantIndexEntry(store, {"hash_1"}, {slices[0]},
-                                    /*on_host=*/false);
+  KVCacheStoreTest::PlantIndexEntry(store, {"hash_1"}, {slices[0]});
   ASSERT_TRUE(InsertResident(store, {"hash_2"}, {slices[1]}, /*on_host=*/true));
   ABSL_ASSERT_OK(store.Lookup(hashes));
 
@@ -1964,8 +1962,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesRemoteSuccess) {
   std::vector<RaidenBlockId> remote_slices = {
       RaidenBlockId(remote_rid, 42, BlockStatus::HOST),
   };
-  remote_backend->Insert({"load_remote_hash_1"}, remote_slices,
-                         /*on_host=*/true);
+  remote_backend->Insert({"load_remote_hash_1"}, remote_slices);
 
   auto remote_server = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(remote_server->StartServer(remote_backend.get(),
@@ -1986,8 +1983,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesRemoteSuccess) {
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(remote_rid, 42, BlockStatus::REMOTE)};
 
-  KVCacheStoreTest::PlantIndexEntry(store, hashes, slices,
-                                    /*on_host=*/false);
+  KVCacheStoreTest::PlantIndexEntry(store, hashes, slices);
   // No pin: a load from a peer requires none and consumes none.
 
   absl::Status status = store.Load(hashes, slices, {5});
@@ -2045,8 +2041,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadRemoteWithSlicesRecordsNothing) {
       std::dynamic_pointer_cast<HostOffloadBackend>(remote_backend_raw);
   ASSERT_NE(remote_backend, nullptr);
   remote_backend->Insert({"slice_load_hash"},
-                         {RaidenBlockId(remote_rid, 42, BlockStatus::HOST)},
-                         /*on_host=*/true);
+                         {RaidenBlockId(remote_rid, 42, BlockStatus::HOST)});
 
   auto remote_server = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(remote_server->StartServer(remote_backend.get(),
@@ -2118,8 +2113,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadRefusesRemoteBlock) {
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(remote_rid, /*host_block_id=*/-1, /*device_block_id=*/-1,
                     BlockStatus::REMOTE)};
-  KVCacheStoreTest::PlantIndexEntry(store, hashes, slices,
-                                    /*on_host=*/false);
+  KVCacheStoreTest::PlantIndexEntry(store, hashes, slices);
 
   absl::Status status = store.Load(hashes, {0});
   EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
@@ -2842,7 +2836,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSuccess) {
   std::vector<RaidenBlockId> src_slices = {
       RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
   };
-  src_backend->Insert({"hash_0"}, src_slices, /*on_host=*/true);
+  src_backend->Insert({"hash_0"}, src_slices);
 
   auto src_store_server = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(src_store_server->StartServer(src_backend.get(),
@@ -2932,7 +2926,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteReturnsStagingOnSuccess) {
   for (int round = 0; round < 3; ++round) {
     src_backend->Insert({absl::StrCat("hash_", round, "_a"),
                          absl::StrCat("hash_", round, "_b")},
-                        src_slices, /*on_host=*/true);
+                        src_slices);
   }
 
   auto src_store_server = KVCacheStoreServer::Create();
@@ -3091,8 +3085,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
       RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
       RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST)};
-  src_backend->Insert({"hash_0", "hash_1", "hash_2", "hash_3"}, src_slices,
-                      /*on_host=*/true);
+  src_backend->Insert({"hash_0", "hash_1", "hash_2", "hash_3"}, src_slices);
 
   auto old_src = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(
@@ -3402,8 +3395,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
       std::dynamic_pointer_cast<HostOffloadBackend>(src_backend_raw);
   ASSERT_NE(src_backend, nullptr);
   src_backend->Insert({"hash_0"},
-                      {RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST)},
-                      /*on_host=*/true);
+                      {RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST)});
 
   auto src_server = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(
@@ -3477,9 +3469,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteMultipleSources) {
       HostOffloadBackend::Create(src_config_1, controller.get()));
   auto src_backend_1 =
       std::dynamic_pointer_cast<HostOffloadBackend>(src_backend_raw_1);
-  src_backend_1->Insert({"hash_0"},
-                        {RaidenBlockId(src_raiden_id_1, 10, BlockStatus::HOST)},
-                        /*on_host=*/true);
+  src_backend_1->Insert(
+      {"hash_0"}, {RaidenBlockId(src_raiden_id_1, 10, BlockStatus::HOST)});
   auto src_server_1 = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(src_server_1->StartServer(src_backend_1.get(),
                                            controller.get(), "127.0.0.1"));
@@ -3495,9 +3486,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteMultipleSources) {
       HostOffloadBackend::Create(src_config_2, controller.get()));
   auto src_backend_2 =
       std::dynamic_pointer_cast<HostOffloadBackend>(src_backend_raw_2);
-  src_backend_2->Insert({"hash_1"},
-                        {RaidenBlockId(src_raiden_id_2, 20, BlockStatus::HOST)},
-                        /*on_host=*/true);
+  src_backend_2->Insert(
+      {"hash_1"}, {RaidenBlockId(src_raiden_id_2, 20, BlockStatus::HOST)});
   auto src_server_2 = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(src_server_2->StartServer(src_backend_2.get(),
                                            controller.get(), "127.0.0.1"));
@@ -3759,13 +3749,13 @@ TEST(KVCacheStoreTest, MultiBackendPriorityLookupChain) {
   std::vector<RaidenBlockId> b1_slices = {
       RaidenBlockId(id, 1, BlockStatus::HOST),
       RaidenBlockId(id, 2, BlockStatus::HOST)};
-  b1->Insert(b1_hashes, b1_slices, /*on_host=*/true);
+  b1->Insert(b1_hashes, b1_slices);
 
   std::vector<std::string> b2_hashes = {"h3", "h4"};
   std::vector<RaidenBlockId> b2_slices = {
       RaidenBlockId(id, 3, BlockStatus::HOST),
       RaidenBlockId(id, 4, BlockStatus::HOST)};
-  b2->Insert(b2_hashes, b2_slices, /*on_host=*/true);
+  b2->Insert(b2_hashes, b2_slices);
 
   KVCacheStore store(std::vector<std::shared_ptr<KVCacheStoreBackend>>{b1, b2},
                      RaidenId{}, /*num_shards=*/1, /*shard_size_bytes=*/512,
@@ -3790,10 +3780,8 @@ TEST(KVCacheStoreTest, MultiBackendLocalLookupWhenGlobalDisabled) {
   auto b2 = std::make_shared<TestHostOffloadBackend>(/*capacity=*/2);
 
   RaidenId id{"job", "0", "cache", 0};
-  b1->Insert({"h1"}, {RaidenBlockId(id, 1, BlockStatus::HOST)},
-             /*on_host=*/true);
-  b2->Insert({"h2"}, {RaidenBlockId(id, 2, BlockStatus::HOST)},
-             /*on_host=*/true);
+  b1->Insert({"h1"}, {RaidenBlockId(id, 1, BlockStatus::HOST)});
+  b2->Insert({"h2"}, {RaidenBlockId(id, 2, BlockStatus::HOST)});
 
   KVCacheStore store(std::vector<std::shared_ptr<KVCacheStoreBackend>>{b1, b2},
                      RaidenId{}, /*num_shards=*/1, /*shard_size_bytes=*/512,
@@ -6139,10 +6127,10 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
     CHECK(load_tracker != nullptr);
     return {};
   }
-  std::pair<bool, BlockSliceList> Insert(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) override {
-    return {false, {}};
+  bool Insert(absl::Span<const std::string> block_hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override {
+    return false;
   }
   bool InsertAndLock(absl::Span<const std::string> block_hashes,
                      absl::Span<const RaidenBlockId> slices,
@@ -6233,8 +6221,7 @@ TEST(KVCacheStoreTest, LookupPinFoundFalseObservesWithoutPinning) {
 TEST(KVCacheStoreTest, LookupAndPinErrorRollback) {
   auto b1 = std::make_shared<TestHostOffloadBackend>(/*capacity=*/2);
   RaidenId id{"job", "0", "cache", 0};
-  b1->Insert({"h1"}, {RaidenBlockId(id, 1, BlockStatus::HOST)},
-             /*on_host=*/true);
+  b1->Insert({"h1"}, {RaidenBlockId(id, 1, BlockStatus::HOST)});
 
   auto b2 = std::make_shared<ErrorLookupBackend>();
 
@@ -6252,12 +6239,9 @@ TEST(KVCacheStoreTest, LookupAndPinCapacityTruncation) {
   auto b2 = std::make_shared<TestHostOffloadBackend>(/*capacity=*/2);
 
   RaidenId id{"job", "0", "cache", 0};
-  b1->Insert({"h1", "h2"},
-             {RaidenBlockId(id, 1, BlockStatus::HOST),
-              RaidenBlockId(id, 2, BlockStatus::HOST)},
-             /*on_host=*/true);
-  b2->Insert({"h3"}, {RaidenBlockId(id, 3, BlockStatus::HOST)},
-             /*on_host=*/true);
+  b1->Insert({"h1", "h2"}, {RaidenBlockId(id, 1, BlockStatus::HOST),
+                            RaidenBlockId(id, 2, BlockStatus::HOST)});
+  b2->Insert({"h3"}, {RaidenBlockId(id, 3, BlockStatus::HOST)});
 
   KVCacheStore store(std::vector<std::shared_ptr<KVCacheStoreBackend>>{b1, b2},
                      RaidenId{}, /*num_shards=*/1, /*shard_size_bytes=*/512,
@@ -6476,8 +6460,7 @@ TEST(KVCacheStoreTest,
       store, {"h1", "hbm_only", "h2"},
       {RaidenBlockId(rid, 10, BlockStatus::HOST),
        RaidenBlockId(rid, -1, 3, BlockStatus::HBM),
-       RaidenBlockId(rid, 11, 4, BlockStatus::HOST_AND_HBM)},
-      /*on_host=*/true);
+       RaidenBlockId(rid, 11, 4, BlockStatus::HOST_AND_HBM)});
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto subset_res,
@@ -7242,7 +7225,7 @@ class ReadRemoteTest : public KVCacheStoreEmbeddedControllerTest {
         entries.push_back({opts.peer_hashes[i], peer_a_,
                            static_cast<int>(kPeerHostBlockBase + i)});
       }
-      peer_backend_->Insert(opts.peer_hashes, peer_slices, /*on_host=*/true);
+      peer_backend_->Insert(opts.peer_hashes, peer_slices);
 
       peer_server_ = KVCacheStoreServer::Create();
       ABSL_ASSERT_OK(peer_server_->StartServer(peer_backend_.get(),

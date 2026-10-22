@@ -69,9 +69,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override;
 
-  std::pair<bool, BlockSliceList> Insert(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) override;
+  bool Insert(absl::Span<const std::string> block_hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override;
 
   bool InsertAndLock(absl::Span<const std::string> block_hashes,
                      absl::Span<const RaidenBlockId> slices,

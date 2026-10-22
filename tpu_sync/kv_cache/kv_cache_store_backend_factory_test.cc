@@ -94,13 +94,16 @@ class CustomTestBackend : public KVCacheStoreBackend {
     CHECK(load_tracker != nullptr);
     return tsl::Future<>(absl::UnimplementedError("Load is not supported."));
   }
-  std::pair<bool, BlockSliceList> Insert(absl::Span<const std::string> hashes,
-                                         absl::Span<const RaidenBlockId> slices,
-                                         bool) override {
+  bool Insert(absl::Span<const std::string> hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override {
+    if (option != InsertOption::kBestEffortUpdate) {
+      return false;
+    }
     for (size_t i = 0; i < hashes.size() && i < slices.size(); ++i) {
       entries_[hashes[i]] = slices[i];
     }
-    return {true, {}};
+    return true;
   }
   bool InsertAndLock(absl::Span<const std::string> hashes,
                      absl::Span<const RaidenBlockId> slices, bool) override {

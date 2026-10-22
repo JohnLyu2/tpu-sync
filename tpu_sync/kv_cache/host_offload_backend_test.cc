@@ -90,9 +90,7 @@ TEST(HostOffloadBackendTest, BasicInsertAndLookup) {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST)};
 
-  auto [all_new, evicted] = backend.Insert(hashes, slices, /*on_host=*/true);
-  EXPECT_TRUE(all_new);
-  EXPECT_TRUE(evicted.empty());
+  EXPECT_TRUE(backend.Insert(hashes, slices));
   EXPECT_EQ(backend.GetSize(), 2);
 
   // Lookup both
@@ -119,7 +117,7 @@ TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST_AND_HBM)};
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto snapshot, backend.Lookup({}, LookupOptions::SnapshotHostResident()));
@@ -146,14 +144,11 @@ TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
 TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"h1", "h2"},
-                 {RaidenBlockId(id, 10, BlockStatus::HOST),
-                  RaidenBlockId(id, 11, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h1", "h2"}, {RaidenBlockId(id, 10, BlockStatus::HOST),
+                                RaidenBlockId(id, 11, BlockStatus::HOST)});
   // A third insert overflows capacity 2 and demotes the LRU entry ("h1") to
   // an eviction candidate: still holding its host block, but on its way out.
-  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)});
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("h1"));
 
@@ -170,8 +165,7 @@ TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
 TEST(HostOffloadBackendTest, LookupRejectsInvalidOptionCombinations) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/4);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)});
 
   EXPECT_THAT(
       backend.Lookup({"h1"},
@@ -201,11 +195,9 @@ TEST(HostOffloadBackendTest,
   RaidenId id{"job", "0", "data", 0};
   backend.Insert({"h1", "hbm_only"},
                  {RaidenBlockId(id, 10, BlockStatus::HOST),
-                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)},
-                 /*on_host=*/true);
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)});
   // Overflow capacity 2 to demote "h1" to an eviction candidate.
-  backend.Insert({"h2"}, {RaidenBlockId(id, 11, 6, BlockStatus::HOST_AND_HBM)},
-                 /*on_host=*/true);
+  backend.Insert({"h2"}, {RaidenBlockId(id, 11, 6, BlockStatus::HOST_AND_HBM)});
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("h1"));
 
@@ -232,11 +224,9 @@ TEST(HostOffloadBackendTest,
   backend.Insert({"h1", "h2", "hbm_only"},
                  {RaidenBlockId(id, 10, BlockStatus::HOST),
                   RaidenBlockId(id, 11, 4, BlockStatus::HOST_AND_HBM),
-                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)},
-                 /*on_host=*/true);
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)});
   // Overflow capacity 3 to demote "h1" to an eviction candidate.
-  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)});
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("h1"));
 
@@ -259,11 +249,9 @@ TEST(HostOffloadBackendTest,
   backend.Insert({"cand", "h1", "hbm_only"},
                  {RaidenBlockId(id, 10, BlockStatus::HOST),
                   RaidenBlockId(id, 11, BlockStatus::HOST),
-                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)},
-                 /*on_host=*/true);
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM)});
   // Overflow capacity 3 to demote "cand" to an eviction candidate.
-  backend.Insert({"h2"}, {RaidenBlockId(id, 12, 6, BlockStatus::HOST_AND_HBM)},
-                 /*on_host=*/true);
+  backend.Insert({"h2"}, {RaidenBlockId(id, 12, 6, BlockStatus::HOST_AND_HBM)});
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
               UnorderedElementsAre("cand"));
 
@@ -295,8 +283,7 @@ TEST(HostOffloadBackendTest,
   backend.Insert({"h1", "h2", "h3"},
                  {RaidenBlockId(id, 10, BlockStatus::HOST),
                   RaidenBlockId(id, 11, BlockStatus::HOST),
-                  RaidenBlockId(id, 12, BlockStatus::HOST)},
-                 /*on_host=*/true);
+                  RaidenBlockId(id, 12, BlockStatus::HOST)});
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto res,
@@ -318,7 +305,7 @@ TEST(HostOffloadBackendTest, LookupUnboundedByAvailableSpace) {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST)};
 
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
   EXPECT_TRUE(backend.Pin(hashes));
   EXPECT_EQ(backend.GetAvailableSpace(), 0);
 
@@ -767,8 +754,7 @@ TEST(HostOffloadBackendTest, EndToEndFetchRPC) {
       RaidenBlockId(dst_raiden_id, 101, BlockStatus::HOST),
       RaidenBlockId(dst_raiden_id, 102, BlockStatus::HOST),
   };
-  backend->Insert({"fetch_hash_1", "fetch_hash_2"}, dst_slices,
-                  /*on_host=*/true);
+  backend->Insert({"fetch_hash_1", "fetch_hash_2"}, dst_slices);
 
   core::controller::RaidenControllerClient dst_controller_client(
       dst_controller->controller_address());
@@ -887,7 +873,7 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
   std::vector<RaidenBlockId> remote_slices = {
       RaidenBlockId(remote_node_id, 42, BlockStatus::HOST),
   };
-  remote_backend->Insert({"load_hash_1"}, remote_slices, /*on_host=*/true);
+  remote_backend->Insert({"load_hash_1"}, remote_slices);
 
   auto remote_server = KVCacheStoreServer::Create();
   // A wildcard bind reports no publishable address,
@@ -971,8 +957,7 @@ TEST(HostOffloadBackendTest, LoadLocalSuccess) {
   ASSERT_NE(backend, nullptr);
 
   backend->Insert({"local_hash_1"},
-                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)});
 
   BlockTracker tracker1;
   auto load_future = backend->Load(RaidenId{}, {"local_hash_1"}, {5},
@@ -1033,8 +1018,7 @@ TEST(HostOffloadBackendTest, LoadLocalNonHostBlockError) {
 
   RaidenId remote_id{"remote_job", "0", "data", 0};
   backend->Insert({"remote_hash"},
-                  {RaidenBlockId(remote_id, 10, BlockStatus::REMOTE)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(remote_id, 10, BlockStatus::REMOTE)});
 
   BlockTracker tracker3;
   auto load_future =
@@ -1064,10 +1048,8 @@ namespace {
 TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentReportsAScatteredSubset) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"a", "c"},
-                 {RaidenBlockId(id, 1, BlockStatus::HOST),
-                  RaidenBlockId(id, 3, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"a", "c"}, {RaidenBlockId(id, 1, BlockStatus::HOST),
+                              RaidenBlockId(id, 3, BlockStatus::HOST)});
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto present,
@@ -1084,8 +1066,7 @@ TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentReportsAScatteredSubset) {
 TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentIgnoresNonHostBlocks) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"remote"}, {RaidenBlockId(id, 1, BlockStatus::REMOTE)},
-                 /*on_host=*/true);
+  backend.Insert({"remote"}, {RaidenBlockId(id, 1, BlockStatus::REMOTE)});
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto present,
@@ -1116,8 +1097,7 @@ TEST(HostOffloadBackendWriteRemoteTest,
 TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"a"}, {RaidenBlockId(id, 1, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"a"}, {RaidenBlockId(id, 1, BlockStatus::HOST)});
 
   EXPECT_FALSE(backend.InsertAllOrNothing(
       {"b", "a"}, {RaidenBlockId(id, 2, BlockStatus::HOST),
@@ -1202,7 +1182,7 @@ TEST(HostOffloadBackendTest, LookupAndPinBasicHits) {
       RaidenBlockId(id, 11, BlockStatus::HOST),
       RaidenBlockId(id, 12, BlockStatus::HOST)};
 
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto res, backend.Lookup(hashes, LookupOptions{.pin_found = true}));
@@ -1220,7 +1200,7 @@ TEST(HostOffloadBackendTest, LookupAndPinPartialMiss) {
       RaidenBlockId(id, 10, BlockStatus::HOST),
       RaidenBlockId(id, 11, BlockStatus::HOST)};
 
-  backend.Insert(hashes, slices, /*on_host=*/true);
+  backend.Insert(hashes, slices);
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto res,
@@ -1320,8 +1300,7 @@ std::unique_ptr<InterleavedFixture> MakeInterleavedFixture(
 void InsertLocal(KVCacheStoreBackend* backend, const RaidenId& local_id,
                  const std::string& hash, int host_block_id) {
   backend->Insert({hash},
-                  {RaidenBlockId(local_id, host_block_id, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(local_id, host_block_id, BlockStatus::HOST)});
 }
 
 // Publishes `hash` as owned by `owner` at `block_id`.
@@ -1476,10 +1455,8 @@ TEST(HostOffloadBackendTest, LookupInterleavedWithoutRegistryClient) {
   // leading run of local hits, and nothing is left pinned past it.
   HostOffloadBackendTest::Backend backend(/*capacity=*/5);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"l1", "l2"},
-                 {RaidenBlockId(id, 11, BlockStatus::HOST),
-                  RaidenBlockId(id, 12, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"l1", "l2"}, {RaidenBlockId(id, 11, BlockStatus::HOST),
+                                RaidenBlockId(id, 12, BlockStatus::HOST)});
 
   auto res =
       backend.Lookup({"l1", "gap", "l2"}, LookupOptions{.pin_found = true});
@@ -1493,8 +1470,7 @@ TEST(HostOffloadBackendTest, LookupInterleavedWithoutRegistryClient) {
 TEST(HostOffloadBackendTest, DeleteSkipsPinnedBlocks) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
-  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)},
-                 /*on_host=*/true);
+  backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)});
   ASSERT_TRUE(backend.Pin({"h1"}));
   EXPECT_EQ(backend.GetPinCount("h1"), 1);
 
@@ -1550,8 +1526,7 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
 
   // Success path:
   backend->Insert({"load_success_1"},
-                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)});
 
   BlockTracker success_tracker;
   success_tracker.AddPending("load_success_1");
@@ -1565,8 +1540,7 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
 
   // Failure path (transfer failure):
   backend->Insert({"load_fail_1"},
-                  {RaidenBlockId(node_id, 11, BlockStatus::HOST)},
-                  /*on_host=*/true);
+                  {RaidenBlockId(node_id, 11, BlockStatus::HOST)});
   transfer_mock->fail_transfers = true;
 
   BlockTracker failure_tracker;
@@ -1616,8 +1590,7 @@ TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
 
   // Success path:
   backend->Insert({"save_success_1"},
-                  {RaidenBlockId(node_id, -1, 7, BlockStatus::HBM)},
-                  /*on_host=*/false);
+                  {RaidenBlockId(node_id, -1, 7, BlockStatus::HBM)});
 
   BlockTracker success_tracker;
   success_tracker.AddPending("save_success_1");

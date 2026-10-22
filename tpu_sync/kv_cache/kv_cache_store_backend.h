@@ -141,6 +141,40 @@ struct LookupOptions {
   static LookupOptions PinPresentHostResident();
 };
 
+// Controls the insertion behavior of KVCacheStoreBackend::Insert.
+enum class InsertOption {
+  // Best-effort insert/update (default; replaces legacy Insert()):
+  // - Overwrites any active entry's RaidenBlockId in-place without promoting
+  //   it in the LRU list.
+  // - Inserts new keys in forward order, clearing stale candidate metadata.
+  // - Asynchronously unregisters any entries displaced from the active LRU
+  //   cache from the global registry.
+  kBestEffortUpdate,
+
+  // Atomic insert-and-pin (replaces legacy InsertAndLock()):
+  // - Pins existing active entries, overwriting their RaidenBlockId ONLY if
+  //   their current status is BlockStatus::HBM (preserving HOST and
+  //   HOST_AND_HBM bindings).
+  // - Pre-validates available_space() >= new_indices.size(), inserts new keys
+  //   in reverse order so block_hashes[0] lands at the MRU front, and pins all
+  //   new keys (rolling back all pins and insertions on any failure).
+  // - Discards displaced entries into the eviction-candidates list without
+  //   withdrawing them from the global registry.
+  kInsertAndPin,
+
+  // Strict atomic admission without pinning (replaces InsertAllOrNothing()):
+  // - Rejects the batch if block_hashes.empty(), block_hashes.size() !=
+  //   slices.size(), block_hashes contains intra-batch duplicate keys, any key
+  //   is already present (active or eviction candidate), or available_space() <
+  //   block_hashes.size().
+  // - Inserts all keys in forward order without pinning, verifying each Put()
+  //   and rolling back the batch (clearing metadata and erasing prior entries)
+  //   if any insertion fails.
+  // - Discards displaced entries into the eviction-candidates list without
+  //   withdrawing them from the global registry.
+  kAdmitStrict,
+};
+
 // Abstract interface for KV cache index storage backends.
 // Implementations must be thread-safe.
 class KVCacheStoreBackend {
@@ -191,16 +225,13 @@ class KVCacheStoreBackend {
     return tsl::Future<>(absl::UnimplementedError("Save not implemented."));
   }
 
-  // Inserts key-block mappings into the backend. Backend-internal: the store
-  // facade does not expose this form -- KVCacheStore::Insert() maps to
-  // InsertAndLock below -- and its remaining callers are internal (the
-  // store's pollers rewrite a completed entry through it).
-  // Returns:
-  //   - bool: true if all hashes were newly inserted (none already existed)
-  //   - BlockSliceList: entries evicted from this backend during insertion
-  virtual std::pair<bool, BlockSliceList> Insert(
+  // Inserts or updates key-block mappings in the backend according to `option`
+  // (see InsertOption for kBestEffortUpdate, kInsertAndPin, and kAdmitStrict
+  // semantics). Returns true if the operation succeeded.
+  virtual bool Insert(
       absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) = 0;
+      absl::Span<const RaidenBlockId> slices,
+      InsertOption option = InsertOption::kBestEffortUpdate) = 0;
 
   // Pins existing hashes and inserts & locks new hashes if space permits.
   // Performs complete rollback on failure. Returns true on full success.
