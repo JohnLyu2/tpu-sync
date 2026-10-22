@@ -20,6 +20,11 @@
 # torch release listed in ci/build_wheel_impl.sh; the extension binds
 # torch_tpu's symbols at import to the installed torch_tpu wheel.
 #
+# Every run also keeps a nightly-manifest-<version> artifact naming the commit
+# it built, so that a wheel version maps back to its commit on main; the
+# golden-commit workflow (golden_commit.yml) reads it through the artifacts
+# API, from the artifact's workflow run.
+#
 # Repository variables:
 #   vars.RAIDEN_REGISTRY_URL      (optional) overrides the Artifact Registry
 #                                 upload URL
@@ -70,11 +75,37 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       wheel_version_extras: ${{ steps.stamp.outputs.wheel_version_extras }}
+      version: ${{ steps.stamp.outputs.version }}
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
       - id: stamp
         # One timestamp for the whole run so the jax and torch wheels of a
         # single nightly share a version.
-        run: echo "wheel_version_extras=.dev$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+        run: |
+          BASE_VERSION=$(sed -n -E 's/^version = "(.*)"/\1/p' pyproject.toml | head -1)
+          EXTRAS=".dev$(date -u +%Y%m%d%H%M%S)"
+          echo "wheel_version_extras=${EXTRAS}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASE_VERSION}${EXTRAS}" >> "$GITHUB_OUTPUT"
+      # The artifact's name carries the version and its workflow run carries
+      # the commit; the file repeats both for anyone who downloads it.
+      - name: Write nightly manifest
+        env:
+          VERSION: ${{ steps.stamp.outputs.version }}
+        run: |
+          mkdir -p manifest
+          printf '{"version": "%s", "commit": "%s", "run_url": "%s/%s/actions/runs/%s"}\n' \
+            "${VERSION}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}" \
+            > manifest/nightly_manifest.json
+          cat manifest/nightly_manifest.json
+      - name: Upload nightly manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: nightly-manifest-${{ steps.stamp.outputs.version }}
+          path: manifest/nightly_manifest.json
+          retention-days: 90
+          if-no-files-found: error
 
   build:
     name: "Build ${{ matrix.framework }} wheel"
