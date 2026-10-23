@@ -7,13 +7,10 @@ peers.
 
 This directory models those paths in Lean 4. It contains the **formalization
 (`TpuSyncVerify/`)**: models of the C++ session state machines, staging
-allocators, and multi-node transfer pipelines, with proofs of end-to-end data correctness, HBM and host-staging
-memory safety, lifecycle termination, and cross-peer fault isolation; the
-code-to-model reference docs (`docs/`); and the tooling that resolves and
-checks the source maps (`tools/`). You do not need Lean to use `docs/`: each doc maps C++
-symbols to the model's states, events, assumptions and proved properties; the
-`.lean` files are what the machine checks. The proofs use no `sorry`, no
-axioms, and no Mathlib.
+allocators, and multi-node transfer pipelines, with proofs of end-to-end data
+correctness, HBM and host-staging memory safety, lifecycle termination, and
+cross-peer fault isolation; the code-to-model reference docs (`docs/`); and the
+tooling that resolves and checks the source maps (`tools/`).
 
 ## Status & What's Covered
 
