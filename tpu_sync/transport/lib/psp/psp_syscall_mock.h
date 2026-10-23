@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TPU_SYNC_TRANSPORT_LIB_SOCKET_PSP_SYSCALL_MOCK_H_
-#define TPU_SYNC_TRANSPORT_LIB_SOCKET_PSP_SYSCALL_MOCK_H_
+#ifndef TPU_SYNC_TRANSPORT_LIB_PSP_PSP_SYSCALL_MOCK_H_
+#define TPU_SYNC_TRANSPORT_LIB_PSP_PSP_SYSCALL_MOCK_H_
 
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
 
-#endif  // TPU_SYNC_TRANSPORT_LIB_SOCKET_PSP_SYSCALL_MOCK_H_
+#endif  // TPU_SYNC_TRANSPORT_LIB_PSP_PSP_SYSCALL_MOCK_H_

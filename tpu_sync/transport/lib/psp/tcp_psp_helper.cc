@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 
 #include <sys/socket.h>
 

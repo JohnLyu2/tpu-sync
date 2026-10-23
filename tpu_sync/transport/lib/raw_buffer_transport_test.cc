@@ -43,6 +43,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
+#include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
@@ -57,6 +58,8 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "peregrine/src/api/v1/conn_pool.h"
+#include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
@@ -65,16 +68,16 @@
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/lib/conn/pool.h"
-#include "tpu_sync/transport/lib/peregrine_control_service.h"
+#include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
+#include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
+#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h" // NOLINT
-#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
 
+using ::peregrine::v1::ConnectToPeer;
+using ::peregrine::v1::ConnPool;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::WriteExact;
 
@@ -116,10 +119,9 @@ bool AllZero(absl::Span<const uint8_t> data) {
 }
 
 void RandomNonZero(absl::Span<uint8_t> data) {
-  thread_local std::mt19937 gen(std::random_device{}());
-  std::uniform_int_distribution<int> dist(1, 255);
+  thread_local absl::BitGen bitgen;
   for (uint8_t& b : data) {
-    b = static_cast<uint8_t>(dist(gen));
+    b = absl::Uniform<uint8_t>(absl::IntervalClosedClosed, bitgen, 0x01, 0xff);
   }
 }
 

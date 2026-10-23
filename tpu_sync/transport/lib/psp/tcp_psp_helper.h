@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TPU_SYNC_TRANSPORT_LIB_SOCKET_TCP_PSP_HELPER_H_
-#define TPU_SYNC_TRANSPORT_LIB_SOCKET_TCP_PSP_HELPER_H_
+#ifndef TPU_SYNC_TRANSPORT_LIB_PSP_TCP_PSP_HELPER_H_
+#define TPU_SYNC_TRANSPORT_LIB_PSP_TCP_PSP_HELPER_H_
 
 #include <sys/socket.h>
 
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <utility>
 
 #include "absl/flags/declare.h"
 #include "absl/status/status.h"
@@ -54,7 +53,7 @@ absl::StatusOr<PspPeerKey> RegisterPspPeerKey(int server_fd,
                                               absl::string_view peer_target);
 
 // Returns true if the accepted socket has valid PSP encryption active
-// according to GetInitialRxSpi.
+// according to GetInitialRxSpi().
 bool PspEnabled(int client_fd);
 
 // Performs out-of-band PSP key exchange on sock_fd using the provided gRPC
@@ -67,4 +66,4 @@ absl::Status TcpPspConnect(int sock_fd, const struct sockaddr* addr,
 
 }  // namespace tpu_raiden::transport::lib
 
-#endif  // TPU_SYNC_TRANSPORT_LIB_SOCKET_TCP_PSP_HELPER_H_
+#endif  // TPU_SYNC_TRANSPORT_LIB_PSP_TCP_PSP_HELPER_H_

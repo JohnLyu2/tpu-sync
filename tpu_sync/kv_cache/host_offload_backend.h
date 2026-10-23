@@ -73,12 +73,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override;
 
-  bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                     absl::Span<const RaidenBlockId> slices,
-                     bool on_host) override;
-
-  size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override;
-
   void Delete(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices) override;
 
@@ -118,9 +112,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      BlockTracker* absl_nonnull save_tracker) override;
 
   // --- WriteRemote & registry overrides ------------------------------------
-  bool InsertAllOrNothing(absl::Span<const std::string> block_hashes,
-                          absl::Span<const RaidenBlockId> slices) override;
-
   tsl::Future<> RegisterBlocksAsync(
       absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> host_block_ids) override;
@@ -207,6 +198,13 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   void ClearMetadataEntry(const RaidenBlockId& block)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  bool InsertBestEffortUpdate(absl::Span<const std::string> block_hashes,
+                              absl::Span<const RaidenBlockId> slices);
+  bool InsertAndPin(absl::Span<const std::string> block_hashes,
+                    absl::Span<const RaidenBlockId> slices);
+  bool InsertAdmitStrict(absl::Span<const std::string> block_hashes,
+                         absl::Span<const RaidenBlockId> slices);
 
   // INVARIANT: no thread holds `mutex_` across a registry RPC. Every call site
   // unlocks first, and nothing enforces that but their shape. The synchronous

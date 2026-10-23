@@ -76,10 +76,19 @@ only.
 For each config and direction: correctness round-trip must pass, then
 `median >= floor`, where `floor = baseline_median − 3.5·MADσ` — an
 outlier-resistant lower bound of the config's own run-to-run spread
-(`MADσ = 1.4826 · median(|x − median|)`). Floors live in
-`h2d_d2h_gating_baselines.json`, recorded once (large `--iters` for a stable MAD)
-by `h2d_d2h_record_baselines.sh`; they can be refreshed periodically via the
-record workflow.
+(`MADσ = 1.4826 · median(|x − median|)`). Floors live in one file per framework,
+`h2d_d2h_gating_{jax,torch}_baselines.json`, since JAX and PyTorch run different
+transfer code. They are recorded once with the gate's `--record` flag (large
+`--iters` for a stable MAD) and can be refreshed periodically via the record
+workflow.
+
+Record floors only on the machine that enforces them: the CI runner, through the
+Record H2D/D2H Baselines workflow (`benchmark_registry_record.pbtxt`). A floor
+is a few robust sigmas below *that machine's* median, so numbers from another
+machine don't transfer, even one with the same chips: a Cloud TPU v5e-8 VM
+measured ~6% faster than the runner, which put every runner median far below
+its floors. The runner's spread is also wider, so its floors sit further below
+their baselines (3-12%) than a dedicated VM's would.
 
 A perf-floor failure blocks the PR, unless the author adds `[skip-perf-gate]`
 (or `[skip-h2d-d2h-gating]`) to the CL description, or a maintainer sets
@@ -88,19 +97,28 @@ A perf-floor failure blocks the PR, unless the author adds `[skip-perf-gate]`
 ## Running it
 
 ```bash
-# Full gate across both JAX and PyTorch (default):
+# JAX (the gate's default framework):
 bazel run -c opt --config=oss --config=ci \
   //tpu_sync/benchmarks:h2d_d2h_benchmark_gating
 
-# Select a single framework:
-bazel run -c opt --config=oss --config=ci \
-  //tpu_sync/benchmarks:h2d_d2h_benchmark_gating -- --framework=torch # or --framework=jax
+# PyTorch, from a Python 3.12 virtualenv (the runner pip-installs into it):
+# installs torch and torch_tpu, builds the torch extension with build.sh, then
+# runs the same gate.
+python3 ci/run_in_torch_env.py \
+  tpu_sync/benchmarks/h2d_d2h_benchmark_gating.py --framework=torch
 ```
 
-In CI it runs as the unified `h2d_d2h_gating` workload in `benchmark_registry.pbtxt`
-via the `run_benchmarks` workflow (on pull requests), evaluating both frameworks
-on the assigned Cloud TPU runner. Re-record baselines for all frameworks with
-the `--record` flag (or the `h2d_d2h_record` workflow).
+The PyTorch gate can't run under `bazel run`: the torch extension has to be
+compiled against the installed torch and torch_tpu wheels, which
+`build.sh torch` sets up, so `ci/run_in_torch_env.py` builds it first and then
+runs the gate outside Bazel.
+
+In CI, each framework is its own workload in `benchmark_registry.pbtxt`,
+`h2d_d2h_gating_jax` (JAX) and `h2d_d2h_gating_torch` (PyTorch). Both run on
+pull requests, after merge and nightly, on the assigned Cloud TPU runner, and
+both are required checks with enforced floors. Re-record a framework's
+baselines with the Record H2D/D2H Baselines workflow (`h2d_d2h_record_jax` and
+`h2d_d2h_record_torch`), which runs `--record` on that runner.
 
 ## Scope
 

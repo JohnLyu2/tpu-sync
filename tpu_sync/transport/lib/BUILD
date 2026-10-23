@@ -31,22 +31,40 @@ cc_library(
 )
 
 cc_library(
-    name = "transport_adapter",
-    hdrs = ["transport_adapter.h"],
+    name = "chunk_serializer",
+    srcs = ["chunk_serializer.cc"],
+    hdrs = ["chunk_serializer.h"],
     deps = [
-        "@com_google_absl//absl/functional:any_invocable",
+        ":chunk",
+        ":chunk_cc_fbs",
+        "@com_github_google_flatbuffers//:flatbuffers",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:transport_metrics",
-        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_test(
+    name = "chunk_serializer_test",
+    srcs = ["chunk_serializer_test.cc"],
+    deps = [
+        ":chunk",
+        ":chunk_serializer",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
 cc_library(
     name = "transport_metrics_exporter",
-    srcs = ["transport_metrics_exporter.cc"],
-    hdrs = ["transport_metrics_exporter.h"],
+    srcs = ["metrics/transport_metrics_exporter.cc"],
+    hdrs = ["metrics/transport_metrics_exporter.h"],
     deps = [
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
@@ -57,7 +75,7 @@ cc_library(
 
 cc_test(
     name = "transport_metrics_exporter_test",
-    srcs = ["transport_metrics_exporter_test.cc"],
+    srcs = ["metrics/transport_metrics_exporter_test.cc"],
     deps = [
         ":transport_metrics_exporter",
         "//tpu_sync/telemetry:metrics_backend",
@@ -69,9 +87,22 @@ cc_test(
 )
 
 cc_library(
+    name = "transport_adapter",
+    hdrs = ["adapter/transport_adapter.h"],
+    deps = [
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:transport_metrics",
+        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_library(
     name = "peregrine_transport_adapter",
-    srcs = ["peregrine_transport_adapter.cc"],
-    hdrs = ["peregrine_transport_adapter.h"],
+    srcs = ["adapter/peregrine_transport_adapter.cc"],
+    hdrs = ["adapter/peregrine_transport_adapter.h"],
     deps = [
         ":transport_adapter",
         "@com_google_absl//absl/memory",
@@ -89,7 +120,7 @@ cc_library(
 
 cc_test(
     name = "peregrine_transport_adapter_test",
-    srcs = ["peregrine_transport_adapter_test.cc"],
+    srcs = ["adapter/peregrine_transport_adapter_test.cc"],
     deps = [
         ":peregrine_transport_adapter",
         ":transport_adapter",
@@ -107,8 +138,8 @@ cc_test(
 
 cc_library(
     name = "socket_transport_adapter",
-    srcs = ["socket_transport_adapter.cc"],
-    hdrs = ["socket_transport_adapter.h"],
+    srcs = ["adapter/socket_transport_adapter.cc"],
+    hdrs = ["adapter/socket_transport_adapter.h"],
     copts = [
         "-fno-strict-aliasing",
         "-fexceptions",
@@ -144,7 +175,7 @@ cc_library(
 
 cc_test(
     name = "socket_transport_adapter_test",
-    srcs = ["socket_transport_adapter_test.cc"],
+    srcs = ["adapter/socket_transport_adapter_test.cc"],
     copts = [
         "-fno-strict-aliasing",
         "-fexceptions",
@@ -190,37 +221,6 @@ cc_library(
 )
 
 cc_library(
-    name = "chunk_serializer",
-    srcs = ["chunk_serializer.cc"],
-    hdrs = ["chunk_serializer.h"],
-    deps = [
-        ":chunk",
-        ":chunk_cc_fbs",
-        "@com_github_google_flatbuffers//:flatbuffers",
-        "@com_google_absl//absl/container:inlined_vector",
-        "@com_google_absl//absl/log:check",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/types:span",
-    ],
-)
-
-cc_test(
-    name = "chunk_serializer_test",
-    srcs = ["chunk_serializer_test.cc"],
-    deps = [
-        ":chunk",
-        ":chunk_serializer",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:status_matchers",
-        "@com_google_absl//absl/types:span",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-cc_library(
     name = "raw_buffer_transport",
     srcs = ["raw_buffer_transport.cc"],
     hdrs = ["raw_buffer_transport.h"],
@@ -241,8 +241,7 @@ cc_library(
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:buffer_push_task",
-        "//tpu_sync/transport/lib/conn:pool",
-        "//tpu_sync/transport/lib/socket:tcp_psp_helper",
+        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -261,6 +260,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api/v1:conn_pool",
         "@peregrine//peregrine/src/api/v1:histogram",
         "@peregrine//peregrine/src/api/v1:ip_util",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
@@ -280,23 +280,22 @@ cc_test(
     deps = [
         ":chunk",
         ":chunk_serializer",
-        ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
         "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:buffer_push_task",
-        "//tpu_sync/transport/lib/conn:pool",
-        "//tpu_sync/transport/lib/socket:psp_syscall_mock",
-        "//tpu_sync/transport/lib/socket:tcp_psp_helper",
-        "//tpu_sync/transport/lib/socket:util",
+        "//tpu_sync/transport/lib/psp:peregrine_control_service",
+        "//tpu_sync/transport/lib/psp:psp_syscall_mock",
+        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:status_matchers",
@@ -307,44 +306,8 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api/v1:conn_pool",
+        "@peregrine//peregrine/src/api/v1:conn_util",
         "@peregrine//peregrine/src/api/v1:socket_util",
-    ],
-)
-
-cc_library(
-    name = "peregrine_control_service",
-    hdrs = ["peregrine_control_service.h"],
-    deps = [
-        ":raw_buffer_transport",
-        "//tpu_sync/common:grpc_util",
-        "@com_github_grpc_grpc//:grpc++",
-        "@com_google_absl//absl/status:statusor",
-        "@peregrine//peregrine/src/internal/control:message_cc_proto",
-        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
-        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
-    ],
-)
-
-cc_test(
-    name = "peregrine_control_service_test",
-    srcs = ["peregrine_control_service_test.cc"],
-    copts = [
-        "-fno-strict-aliasing",
-        "-fexceptions",
-    ],
-    features = ["-use_header_modules"],
-    deps = [
-        ":peregrine_control_service",
-        ":raw_buffer_transport",
-        ":raw_buffer_transport_delegate",
-        "//tpu_sync/transport/lib/socket:psp_syscall_mock",
-        "//tpu_sync/transport/lib/socket:tcp_psp_helper",
-        "@com_github_grpc_grpc//:grpc++",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/internal/control:message_cc_proto",
-        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
-        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
     ],
 )

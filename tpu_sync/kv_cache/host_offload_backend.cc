@@ -25,6 +25,7 @@
 
 #include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -348,10 +349,20 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
 bool HostOffloadBackend::Insert(absl::Span<const std::string> block_hashes,
                                 absl::Span<const RaidenBlockId> slices,
                                 InsertOption option) {
-  if (option != InsertOption::kBestEffortUpdate) {
-    return false;
+  switch (option) {
+    case InsertOption::kBestEffortUpdate:
+      return InsertBestEffortUpdate(block_hashes, slices);
+    case InsertOption::kInsertAndPin:
+      return InsertAndPin(block_hashes, slices);
+    case InsertOption::kAdmitStrict:
+      return InsertAdmitStrict(block_hashes, slices);
   }
+  return false;
+}
 
+bool HostOffloadBackend::InsertBestEffortUpdate(
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const RaidenBlockId> slices) {
   std::vector<std::string> evicted_hashes;
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
@@ -390,8 +401,9 @@ bool HostOffloadBackend::Insert(absl::Span<const std::string> block_hashes,
     local_id = raiden_id_;
   }
 
-  // Withdraw only: a completed save publishes, this does not. What was evicted
-  // to make room is unreadable from now on, and nothing else retires it.
+  // Withdraw only: a completed save publishes, this does not. What was
+  // evicted to make room is unreadable from now on, and nothing else
+  // retires it.
   if (client != nullptr && !evicted_hashes.empty()) {
     client
         ->UnregisterAsync(evicted_hashes, local_id,
@@ -408,9 +420,9 @@ bool HostOffloadBackend::Insert(absl::Span<const std::string> block_hashes,
   return true;
 }
 
-bool HostOffloadBackend::InsertAndLock(
+bool HostOffloadBackend::InsertAndPin(
     absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
+    absl::Span<const RaidenBlockId> slices) {
   absl::MutexLock lock(mutex_);
 
   std::vector<size_t> existing_indices;
@@ -431,15 +443,16 @@ bool HostOffloadBackend::InsertAndLock(
       }
       return false;
     }
-    // An entry that is only in HBM describes a device block and nothing else:
-    // no host bytes were ever written for it, so there is nothing here worth
-    // keeping. Its device block belongs to whoever is inserting now, and the
-    // one recorded earlier may since have been handed back and refilled with
-    // unrelated data -- a save driven from that stale id would copy the wrong
-    // bytes. Take the caller's binding, which is the only current one.
+    // An entry that is only in HBM describes a device block and nothing
+    // else: no host bytes were ever written for it, so there is nothing
+    // here worth keeping. Its device block belongs to whoever is inserting
+    // now, and the one recorded earlier may since have been handed back and
+    // refilled with unrelated data -- a save driven from that stale id
+    // would copy the wrong bytes. Take the caller's binding, which is the
+    // only current one.
     //
-    // HOST and HOST_AND_HBM entries are left alone: those DO hold host bytes,
-    // and the caller is re-offering a block the store already has.
+    // HOST and HOST_AND_HBM entries are left alone: those DO hold host
+    // bytes, and the caller is re-offering a block the store already has.
     if (i < slices.size()) {
       RaidenBlockId* existing = lru_cache_.PeekMutable(block_hashes[i]);
       if (existing != nullptr && existing->status == BlockStatus::HBM) {
@@ -467,8 +480,8 @@ bool HostOffloadBackend::InsertAndLock(
       }
     }
     // Put's displaced entry is discarded: a displaced entry becomes an
-    // eviction candidate that still holds its host block, and GetEvictableKeys
-    // finds it there. Nothing puts a displaced entry back.
+    // eviction candidate that still holds its host block, and
+    // GetEvictableKeys finds it there. Nothing puts a displaced entry back.
     if (i < slices.size()) {
       lru_cache_.Put(hash, slices[i]);
       SetMetadataEntry(hash, slices[i]);
@@ -500,26 +513,53 @@ bool HostOffloadBackend::InsertAndLock(
   return true;
 }
 
-size_t HostOffloadBackend::ReleaseAndDelete(
-    absl::Span<const std::string> block_hashes) {
-  absl::MutexLock lock(mutex_);
-  size_t deleted_blocks = 0;
-
-  for (auto it = block_hashes.rbegin(); it != block_hashes.rend(); ++it) {
-    lru_cache_.Unpin(*it);
+bool HostOffloadBackend::InsertAdmitStrict(
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const RaidenBlockId> slices) {
+  if (block_hashes.empty() || block_hashes.size() != slices.size()) {
+    return false;
   }
+  absl::MutexLock lock(mutex_);
 
-  for (const std::string& hash : block_hashes) {
-    auto* val = lru_cache_.Peek(hash);
-    if (val != nullptr && lru_cache_.GetPinCount(hash) == 0 &&
-        val->status != BlockStatus::HOST &&
-        val->status != BlockStatus::HOST_AND_HBM) {
-      lru_cache_.Erase(hash);
-      deleted_blocks++;
+  // Phase 1: validate the whole batch before touching anything.
+  // - PeekIncludingCandidates, not Contains: an eviction candidate is still
+  //   HOST and must count as a duplicate.
+  // - seen_in_batch: reject intra-batch duplicate hashes.
+  // - available_space(), not capacity(): pinned entries take space.
+  absl::flat_hash_set<absl::string_view> seen_in_batch;
+  seen_in_batch.reserve(block_hashes.size());
+  for (const auto& hash : block_hashes) {
+    if (!seen_in_batch.insert(hash).second ||
+        lru_cache_.PeekIncludingCandidates(hash) != nullptr) {
+      return false;
     }
   }
+  if (block_hashes.size() > lru_cache_.available_space()) {
+    return false;
+  }
 
-  return deleted_blocks;
+  // Phase 2: insert. Phase 1 rejected duplicates, so Put never rebinds an
+  // existing hash. Put can also silently insert nothing (e.g. everything
+  // pinned), so each insert is verified and the batch rolled back if not.
+  for (size_t i = 0; i < block_hashes.size(); ++i) {
+    const std::string& hash = block_hashes[i];
+    std::optional<std::pair<std::string, RaidenBlockId>> evicted =
+        lru_cache_.Put(hash, slices[i]);
+    if (lru_cache_.Peek(hash) == nullptr) {
+      LOG(ERROR) << "Insert(kAdmitStrict): LRUCache::Put inserted nothing "
+                    "for a validated hash; rolling the batch back";
+      for (size_t j = 0; j < i; ++j) {
+        ClearMetadataEntry(slices[j]);
+        lru_cache_.Erase(block_hashes[j]);
+      }
+      return false;
+    }
+    SetMetadataEntry(hash, slices[i]);
+    // An eviction here only demotes the entry to a candidate; its host
+    // block stays allocated, so there is nothing to free.
+    (void)evicted;
+  }
+  return true;
 }
 
 void HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
@@ -949,50 +989,6 @@ HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
     return tsl::Future<proto::PollWriteRemoteResponse>(client.status());
   }
   return (*client)->PollWriteRemote(operation_id, wait_ms);
-}
-
-bool HostOffloadBackend::InsertAllOrNothing(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices) {
-  if (block_hashes.empty() || block_hashes.size() != slices.size()) {
-    return false;
-  }
-  absl::MutexLock lock(mutex_);
-
-  // Phase 1: validate the whole batch before touching anything.
-  // - PeekIncludingCandidates, not Contains: an eviction candidate is still
-  //   HOST and must count as a duplicate.
-  // - available_space(), not capacity(): pinned entries take space.
-  for (const auto& hash : block_hashes) {
-    if (lru_cache_.PeekIncludingCandidates(hash) != nullptr) {
-      return false;
-    }
-  }
-  if (block_hashes.size() > lru_cache_.available_space()) {
-    return false;
-  }
-
-  // Phase 2: insert. Phase 1 rejected duplicates, so Put never rebinds an
-  // existing hash. Put can also silently insert nothing (e.g. everything
-  // pinned), so each insert is verified and the batch rolled back if not.
-  for (size_t i = 0; i < block_hashes.size(); ++i) {
-    const std::string& hash = block_hashes[i];
-    std::optional<std::pair<std::string, RaidenBlockId>> evicted =
-        lru_cache_.Put(hash, slices[i]);
-    if (lru_cache_.Peek(hash) == nullptr) {
-      LOG(ERROR) << "InsertAllOrNothing: LRUCache::Put inserted nothing for a "
-                    "validated hash; rolling the batch back";
-      for (size_t j = 0; j < i; ++j) {
-        lru_cache_.Erase(block_hashes[j]);
-      }
-      return false;
-    }
-    SetMetadataEntry(hash, slices[i]);
-    // An eviction here only demotes the entry to a candidate; its host block
-    // stays allocated, so there is nothing to free.
-    (void)evicted;
-  }
-  return true;
 }
 
 tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/transport/lib/transport_metrics_exporter.h"
+#include "tpu_sync/transport/lib/metrics/transport_metrics_exporter.h"
 
 #include <cstddef>
 #include <cstdint>

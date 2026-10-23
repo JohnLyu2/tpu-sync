@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/transport/lib/peregrine_transport_adapter.h"
+#include "tpu_sync/transport/lib/adapter/peregrine_transport_adapter.h"
 
 #include <cstddef>
 #include <memory>
@@ -32,7 +32,7 @@
 #include "peregrine/src/api/transport.h"
 #include "peregrine/src/api/transport_types.h"
 #include "peregrine/src/api/transport_util.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
+#include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {

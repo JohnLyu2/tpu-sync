@@ -54,6 +54,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -63,15 +64,15 @@
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "tpu_sync/transport/lib/socket/util.h"
+#include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
+#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 
 namespace tpu_raiden {
 namespace transport {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::peregrine::v1::ConnectToPeer;
 using ::peregrine::v1::ReadExact;
 using ::testing::Each;
 using ::testing::Eq;
@@ -2099,8 +2100,7 @@ TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
   BlockTransport receiver(&delegate, /*local_port=*/0);
 
   TF_ASSERT_OK_AND_ASSIGN(
-      int fd,
-      lib::ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
+      int fd, ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
   auto close_fd = absl::MakeCleanup([fd] { close(fd); });
 
   // Send an Op 6 header for 2 blocks, then stall before sending block IDs.
@@ -2134,8 +2134,7 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
   BlockTransport receiver(&delegate, /*local_port=*/0);
 
   TF_ASSERT_OK_AND_ASSIGN(
-      int fd,
-      lib::ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
+      int fd, ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
   auto close_fd = absl::MakeCleanup([fd] { close(fd); });
 
   // Complete the Op 6 handshake for 1 block, then stall mid-payload.
@@ -2187,8 +2186,8 @@ TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
   MockDelegate delegate(/*slice_size=*/1, /*max_blocks=*/1);
   BlockTransport receiver(&delegate, /*local_port=*/0);
 
-  TF_ASSERT_OK_AND_ASSIGN(int fd, lib::ConnectToPeer(absl::StrCat(
-                                      "127.0.0.1:", receiver.local_port())));
+  TF_ASSERT_OK_AND_ASSIGN(
+      int fd, ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
   auto close_fd = absl::MakeCleanup([fd] { close(fd); });
   int rcvbuf = 4096;
   ASSERT_EQ(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);

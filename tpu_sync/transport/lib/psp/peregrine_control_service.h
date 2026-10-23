@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TPU_SYNC_TRANSPORT_LIB_PEREGRINE_CONTROL_SERVICE_H_
-#define TPU_SYNC_TRANSPORT_LIB_PEREGRINE_CONTROL_SERVICE_H_
+#ifndef TPU_SYNC_TRANSPORT_LIB_PSP_PEREGRINE_CONTROL_SERVICE_H_
+#define TPU_SYNC_TRANSPORT_LIB_PSP_PEREGRINE_CONTROL_SERVICE_H_
 
 #include "absl/status/statusor.h"
 #include "grpcpp/server_context.h"
@@ -88,4 +88,4 @@ class PeregrineControlServiceImpl final
 
 }  // namespace tpu_raiden::transport::lib
 
-#endif  // TPU_SYNC_TRANSPORT_LIB_PEREGRINE_CONTROL_SERVICE_H_
+#endif  // TPU_SYNC_TRANSPORT_LIB_PSP_PEREGRINE_CONTROL_SERVICE_H_

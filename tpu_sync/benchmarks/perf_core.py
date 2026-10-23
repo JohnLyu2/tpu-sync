@@ -46,9 +46,10 @@ _GOOGLE_PCI_VENDOR_ID = "0x1ae0"
 # third_party/py/torch_tpu/_internal/utils/hardware.py
 _V4_TOPOLOGY = {1: "1,1,1", 2: "1,2,1", 4: "2,2,1", 8: "2,2,2"}
 _V5P_TOPOLOGY = {1: "1,1,1", 2: "1,2,1", 4: "2,2,1", 8: "2,2,2"}
-# 8-chip v5e is discovered as a 2x2x2 cube internally, but Cloud TPU VMs wire it
-# as a 2x4 mesh. Set TORCH_TPU_TOPOLOGY=2,4,1 to override there.
-_V5E_TOPOLOGY = {1: "1,1,1", 4: "2,2,1", 8: "2,2,2"}
+# 8-chip v5e is a virtual 2x2x2 cube in internal test environments, but Cloud
+# TPU VMs (including the GitHub CI runner) wire it as a 2x4 mesh. As in
+# torch_tpu's hardware.py, the open-source export uses the Cloud layout.
+_V5E_TOPOLOGY = {1: "1,1,1", 4: "2,2,1", 8: "2,4,1"}
 _V6E_TOPOLOGY = {1: "1,1,1", 4: "2,2,1", 8: "2,4,1"}
 _V7_TOPOLOGY = {2: "1,1,1,2", 4: "1,2,1,2", 8: "2,2,1,2"}
 _V8I_TOPOLOGY = {2: "1,1,1,2", 4: "2,1,1,2", 8: "4,1,1,2"}

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -35,7 +35,7 @@
 #include "peregrine/src/internal/control/message.pb.h"
 #include "peregrine/src/internal/control/message_internal.pb.h"
 #include "peregrine/src/internal/control/service.grpc.pb.h"
-#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
+#include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
 
 namespace tpu_raiden::transport::lib {
 namespace {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/transport/lib/socket_transport_adapter.h"
+#include "tpu_sync/transport/lib/adapter/socket_transport_adapter.h"
 
 #include <sys/uio.h>
 
@@ -53,10 +53,10 @@
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden {
 namespace transport {
