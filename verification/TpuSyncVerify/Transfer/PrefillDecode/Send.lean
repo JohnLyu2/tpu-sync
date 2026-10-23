@@ -897,30 +897,9 @@ theorem drain_step {s : Send} (h : Inv s) (hdr : s.life.draining = true)
                   finish_of_draining true (s := { s with h2hRetired := s.h2hRetired + 1, h2hOk := s.h2hOk + 1 }) hdr]
               exact ⟨.h2hDone true, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
 
-theorem draining_can_settle_aux (n : Nat) :
-    ∀ (k : Nat) {s : Send}, drainRank s ≤ k → Inv s → s.life.draining = true →
-      ∃ evs s', (sys n).runFrom s evs = some s' ∧
-        s'.life.done = true ∧ s'.life.hasStaging = false
-  | 0, s, hk, h, hdr => by
-    have hacc := h.accounted
-    unfold Accounted at hacc
-    unfold drainRank at hk
-    have hd : s.life.done = true := h.life.prompt hdr (by omega)
-    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
-    exact ⟨[], s, rfl, hd, hst⟩
-  | k + 1, s, hk, h, hdr => by
-    cases hnd : s.life.done
-    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step h hdr hnd
-      obtain ⟨evs, s', hrun, hd', hst'⟩ :=
-        draining_can_settle_aux n k (by omega) (step_inv h hs₁) hdr₁
-      refine ⟨e :: evs, s', ?_, hd', hst'⟩
-      simp only [System.runFrom, sys, List.foldlM_cons, hs₁]
-      exact hrun
-    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
-      exact ⟨[], s, rfl, hnd, hst⟩
-
 /-- Every reachable send session can settle and release its staging buffer in a
-finite number of steps. -/
+finite number of steps (`System.settles_of_rank` over `drainRank`, with
+`drain_step` as the one-step argument). -/
 theorem reachable_can_settle {n : Nat} {s : Send} (h : (sys n).Reachable s) :
     ∃ evs s', (sys n).runFrom s evs = some s' ∧
       s'.life.done = true ∧ s'.life.hasStaging = false := by
@@ -929,9 +908,14 @@ theorem reachable_can_settle {n : Nat} {s : Send} (h : (sys n).Reachable s) :
   have hinv₁ := step_inv hinv hcancel
   have hdr₁ : (s.finish false).life.draining = true :=
     hinv.life.finishOnceLocked_draining false
-  obtain ⟨evs, s', hrun, hd', hst'⟩ :=
-    draining_can_settle_aux n (drainRank (s.finish false)) (Nat.le_refl _) hinv₁ hdr₁
-  refine ⟨.cancel :: evs, s', ?_, hd', hst'⟩
+  obtain ⟨evs, s', hrun, ⟨hinv', _⟩, hd'⟩ :=
+    (sys n).settles_of_rank (Inv := fun s => Inv s ∧ s.life.draining = true)
+      (Done := fun s => s.life.done = true) drainRank
+      (fun s ⟨hi, hdr⟩ hnd => by
+        obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step hi hdr (by simpa using hnd)
+        exact ⟨e, s₁, hs₁, ⟨step_inv hi hs₁, hdr₁⟩, hlt⟩)
+      ⟨hinv₁, hdr₁⟩
+  refine ⟨.cancel :: evs, s', ?_, hd', by rw [hinv'.life.staging, hd']; rfl⟩
   simp only [System.runFrom, sys, List.foldlM_cons, hcancel]
   exact hrun
 
@@ -1217,22 +1201,16 @@ def events : List Ev :=
    .wake true, .wake false, .h2hIssue, .sendNext, .h2hDone true, .h2hDone false,
    .cancel, .publish]
 
-/-- Executable negation of `Safe`. -/
-def violates (s : Send) : Bool :=
-  (s.life.done && s.life.inFlight != 0) ||
-  (s.life.done && (s.d2hPending || s.d2hRetired != s.d2hIssued || s.woken != s.queued ||
-    s.pooled != 0 || s.chaining != 0 || s.h2hRetired != s.h2hIssued)) ||
-  (s.life.hasStaging != !s.life.done) ||
-  (s.life.draining && s.life.inFlight == 0 && !s.life.done) ||
-  s.underflow ||
-  (s.published == some true && s.h2hOk != s.numLayers) ||
-  !(s.d2hRetired ≤ s.d2hReady && s.d2hReady ≤ s.d2hIssued &&
-    s.d2hIssued + (if s.d2hPending then 1 else 0) ≤ s.numLayers &&
-    s.woken ≤ s.queued && s.queued ≤ s.d2hIssued && s.woken ≤ s.d2hReady &&
-    s.pooled + s.h2hIssued ≤ s.woken && s.h2hRetired ≤ s.h2hIssued && s.h2hOk ≤ s.h2hRetired) ||
-  (0 < s.life.inFlight && !(drainEvents.any fun e => (step s e).isSome)) ||
-  (s.started && !s.pullStarted) ||
-  ((s.d2hPending || 0 < s.d2hIssued) && !s.started)
+instance (s : Send) : Decidable (Safe s) := by
+  unfold Safe SettleSafe Drained StagingIntegrity SettlesPromptly NoUnderflow Publication CountersOrdered NoOpLeak PullClaimed
+  infer_instance
+
+/-- Executable negation of `Safe`, by construction: the bounded searches and the
+`reachable_safe` theorem check the same predicate. -/
+def violates (s : Send) : Bool := !decide (Safe s)
+
+theorem violates_iff (s : Send) : violates s = false ↔ Safe s := by
+  simp [violates]
 
 /-- Sanity check on the search itself: a `Finish` that settles at once, ignoring
 in-flight work, must be caught. -/

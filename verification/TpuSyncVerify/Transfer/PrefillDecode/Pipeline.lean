@@ -1456,47 +1456,31 @@ theorem drain_recv_step {s : Pipeline} (h : Inv s)
             simp [step, recvStep, Recv.step, Recv.h2dDone, hret, hnd, hdr]
           exact ⟨.recv (.h2dDone true), _, hs₁, by simp [hdr], rfl, by simp [Recv.drainRank]; omega⟩
 
-theorem draining_can_settle_aux (n : Nat) :
-    ∀ (k : Nat) {s : Pipeline}, drainRank s ≤ k → Inv s →
-      s.send.life.draining = true → s.recv.life.draining = true →
-      ∃ evs s', (sys n).runFrom s evs = some s' ∧
-        s'.send.life.done = true ∧ s'.send.life.hasStaging = false ∧
-        s'.recv.life.done = true ∧ s'.recv.life.hasStaging = false
-  | 0, s, hk, h, hdrS, hdrR => by
-    have haccS := h.send.accounted
-    have haccR := h.recv.accounted
-    unfold Send.Accounted at haccS
-    unfold Recv.Accounted at haccR
-    unfold drainRank Send.drainRank Recv.drainRank at hk
-    have hdS : s.send.life.done = true := h.send.life.prompt hdrS (by omega)
-    have hstS : s.send.life.hasStaging = false := by rw [h.send.life.staging, hdS]; rfl
-    have hdR : s.recv.life.done = true := h.recv.life.prompt hdrR (by omega)
-    have hstR : s.recv.life.hasStaging = false := by rw [h.recv.life.staging, hdR]; rfl
-    exact ⟨[], s, rfl, hdS, hstS, hdR, hstR⟩
-  | k + 1, s, hk, h, hdrS, hdrR => by
-    cases hndS : s.send.life.done
-    · obtain ⟨e, s₁, hs₁, hdrS₁, hrecv_eq, hlt⟩ := drain_send_step h hdrS hndS
-      have hdrR₁ : s₁.recv.life.draining = true := by rw [hrecv_eq]; exact hdrR
-      have hrk : drainRank s₁ ≤ k := by
-        unfold drainRank at hk ⊢; rw [hrecv_eq]; omega
-      obtain ⟨evs, s', hrun, hdS', hstS', hdR', hstR'⟩ :=
-        draining_can_settle_aux n k hrk (step_inv h hs₁) hdrS₁ hdrR₁
-      refine ⟨e :: evs, s', ?_, hdS', hstS', hdR', hstR'⟩
-      simp only [System.runFrom, sys, List.foldlM_cons, hs₁]
-      exact hrun
-    · cases hndR : s.recv.life.done
-      · obtain ⟨e, s₁, hs₁, hdrR₁, hsend_eq, hlt⟩ := drain_recv_step h hdrR hndR
-        have hdrS₁ : s₁.send.life.draining = true := by rw [hsend_eq]; exact hdrS
-        have hrk : drainRank s₁ ≤ k := by
-          unfold drainRank at hk ⊢; rw [hsend_eq]; omega
-        obtain ⟨evs, s', hrun, hdS', hstS', hdR', hstR'⟩ :=
-          draining_can_settle_aux n k hrk (step_inv h hs₁) hdrS₁ hdrR₁
-        refine ⟨e :: evs, s', ?_, hdS', hstS', hdR', hstR'⟩
-        simp only [System.runFrom, sys, List.foldlM_cons, hs₁]
-        exact hrun
-      · have hstS : s.send.life.hasStaging = false := by rw [h.send.life.staging, hndS]; rfl
-        have hstR : s.recv.life.hasStaging = false := by rw [h.recv.life.staging, hndR]; rfl
-        exact ⟨[], s, rfl, hndS, hstS, hndR, hstR⟩
+/-- Both sessions drain to `done` with staging released
+(`System.settles_of_rank` over `drainRank`; `drain_send_step` / `drain_recv_step`
+supply the one-step argument, whichever session is still open). -/
+theorem draining_can_settle (n : Nat) {s : Pipeline} (h : Inv s)
+    (hdrS : s.send.life.draining = true) (hdrR : s.recv.life.draining = true) :
+    ∃ evs s', (sys n).runFrom s evs = some s' ∧
+      s'.send.life.done = true ∧ s'.send.life.hasStaging = false ∧
+      s'.recv.life.done = true ∧ s'.recv.life.hasStaging = false := by
+  obtain ⟨evs, s', hrun, ⟨hinv', _, _⟩, hdS', hdR'⟩ :=
+    (sys n).settles_of_rank
+      (Inv := fun s => Inv s ∧ s.send.life.draining = true ∧ s.recv.life.draining = true)
+      (Done := fun s => s.send.life.done = true ∧ s.recv.life.done = true) drainRank
+      (fun s ⟨hi, hdrS, hdrR⟩ hnd => by
+        cases hndS : s.send.life.done
+        · obtain ⟨e, s₁, hs₁, hdrS₁, hrecv_eq, hlt⟩ := drain_send_step hi hdrS hndS
+          refine ⟨e, s₁, hs₁, ⟨step_inv hi hs₁, hdrS₁, by rw [hrecv_eq]; exact hdrR⟩, ?_⟩
+          unfold drainRank; rw [hrecv_eq]; omega
+        · cases hndR : s.recv.life.done
+          · obtain ⟨e, s₁, hs₁, hdrR₁, hsend_eq, hlt⟩ := drain_recv_step hi hdrR hndR
+            refine ⟨e, s₁, hs₁, ⟨step_inv hi hs₁, by rw [hsend_eq]; exact hdrS, hdrR₁⟩, ?_⟩
+            unfold drainRank; rw [hsend_eq]; omega
+          · exact absurd ⟨hndS, hndR⟩ hnd)
+      ⟨h, hdrS, hdrR⟩
+  exact ⟨evs, s', hrun, hdS', by rw [hinv'.send.life.staging, hdS']; rfl,
+    hdR', by rw [hinv'.recv.life.staging, hdR']; rfl⟩
 
 /-- The remaining finalization events once both sessions have settled: publish
 any unpublished session outcome and reclaim prefill HBM if not yet reclaimed. -/
@@ -1538,8 +1522,7 @@ theorem inv_can_settle (n : Nat) {s : Pipeline} (hinv : Inv s) :
   have hdrS₂ : s₂.send.life.draining = true :=
     hinv.send.life.finishOnceLocked_draining false
   have hdrR₂ : s₂.recv.life.draining = true := by simp [s₂]
-  obtain ⟨evs_d, s_d, hrd, hdS, hstS, hdR, hstR⟩ :=
-    draining_can_settle_aux n (drainRank s₂) (Nat.le_refl _) hinv₂ hdrS₂ hdrR₂
+  obtain ⟨evs_d, s_d, hrd, hdS, hstS, hdR, hstR⟩ := draining_can_settle n hinv₂ hdrS₂ hdrR₂
   obtain ⟨evs_f, s', hrf, hdS', hstS', hdR', hstR', hpubS', hpubR', hrec'⟩ :=
     settled_can_finalize n hdS hstS hdR hstR
   have hr_cancel : (sys n).runFrom s [.send .cancel, .recv .cancel] = some s₂ := by

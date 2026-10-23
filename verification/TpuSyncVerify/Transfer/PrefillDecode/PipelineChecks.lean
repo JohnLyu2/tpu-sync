@@ -264,23 +264,16 @@ def events (n : Nat) : List Ev :=
        .h2dBegin l, .h2dIssue l true, .h2dIssue l false, .h2dReady l, .land l]) ++
     [.reclaim, .reseatPrefillStaging, .reseatDecodeStaging]
 
-/-- Executable negation of `Safe`. -/
-def violates (s : Pipeline) : Bool :=
-  (s.recv.published == some true && s.decodeHbm != good s.numLayers) ||
-  (s.recv.published != none && (s.recv.pending != 0 || s.recv.retired != s.recv.issued)) ||
-  (s.send.published != none && (s.send.d2hPending || s.send.d2hRetired != s.send.d2hIssued)) ||
-  (!s.send.life.hasStaging &&
-    (s.send.d2hPending || s.send.d2hRetired != s.send.d2hIssued ||
-     s.send.h2hRetired != s.send.h2hIssued)) ||
-  (!s.recv.life.hasStaging &&
-    (s.recv.pushes != 0 || s.recv.pending != 0 || s.recv.retired != s.recv.issued)) ||
-  (s.send.started && (!s.send.pullStarted || !s.registered)) ||
-  (s.send.pullStarted && !s.registered) ||
-  ((s.send.d2hPending || 0 < s.send.d2hIssued || 0 < s.send.h2hIssued) &&
-    (!s.send.pullStarted || !s.registered)) ||
-  (s.pullWaiting && (!s.recv.pullPending || s.send.pullStarted)) ||
-  ((0 < s.send.life.inFlight || 0 < s.recv.life.inFlight) &&
-    !((drainEvents s.numLayers).any fun e => (step s e).isSome))
+instance (s : Pipeline) : Decidable (Safe s) := by
+  unfold Safe PublicationCorrect DecodeHbmSafe PrefillHbmSafe StagingSafe HandshakeSafe NoOpLeak
+  infer_instance
+
+/-- Executable negation of `Safe`, by construction: the mutant searches and
+`reachable_safe` check the same predicate. -/
+def violates (s : Pipeline) : Bool := !decide (Safe s)
+
+theorem violates_iff {s : Pipeline} : violates s = false ↔ Safe s := by
+  simp [violates]
 
 /-- The state the producer leaves behind; the mutant searches below start here
 so that every consumer interleaving with reclaim, staging reuse and

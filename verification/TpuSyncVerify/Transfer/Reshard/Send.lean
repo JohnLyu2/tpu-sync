@@ -1288,28 +1288,11 @@ theorem drain_step (pol : UnregisterPolicy) {s : Send} (h : Inv pol s)
         simp [step, execFinish, hex, hiss]
       exact ⟨.execFinish, _, hs₁, by simp [endOp, hdr], by simp [endOp]; omega⟩
 
-theorem draining_can_settle_aux (ns : List Nat) (pol : UnregisterPolicy) :
-    ∀ (k : Nat) {s : Send}, s.life.inFlight ≤ k → Inv pol s → s.life.draining = true →
-      ∃ evs s', (sys ns pol).runFrom s evs = some s' ∧
-        s'.life.done = true ∧ s'.life.hasStaging = false ∧ s'.planUnregistered = true
-  | 0, s, hk, h, hdr => by
-    have hd : s.life.done = true := h.life.prompt hdr (by omega)
-    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
-    exact ⟨[], s, rfl, hd, hst, h.done_plan hd⟩
-  | k + 1, s, hk, h, hdr => by
-    cases hnd : s.life.done
-    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step pol h hdr hnd
-      obtain ⟨evs, s', hrun, hd', hst', hpl'⟩ :=
-        draining_can_settle_aux ns pol k (by omega) (step_inv pol h hs₁) hdr₁
-      refine ⟨e :: evs, s', ?_, hd', hst', hpl'⟩
-      simp only [System.runFrom, sys, List.foldlM_cons, hs₁]
-      exact hrun
-    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
-      exact ⟨[], s, rfl, hnd, hst, h.done_plan hnd⟩
-
 /-- Every reachable reshard send session on a valid schedule can drain to
 `done = true`, release its `PoolStagingLease`s (`hasStaging = false`), and
-unregister its active plan (`planUnregistered = true`) in finitely many steps. -/
+unregister its active plan (`planUnregistered = true`) in finitely many steps
+(`System.settles_of_rank` over `in_flight_`, with `drain_step` as the one-step
+argument). -/
 theorem reachable_can_settle {ns : List Nat} {pol : UnregisterPolicy} {s : Send}
     (hvalid : validSchedule ns = true) (h : (sys ns pol).Reachable s) :
     ∃ evs s', (sys ns pol).runFrom s evs = some s' ∧
@@ -1317,12 +1300,14 @@ theorem reachable_can_settle {ns : List Nat} {pol : UnregisterPolicy} {s : Send}
   have hinv := reachable_inv hvalid h
   have hcancel : step pol s .cancel = some { s with life := s.life.finishLocked false } := rfl
   have hinv₁ := step_inv pol hinv hcancel
-  have hdr₁ : ({ s with life := s.life.finishLocked false } : Send).life.draining = true := by simp
-  obtain ⟨evs, s', hrun, hd', hst', hpl'⟩ :=
-    draining_can_settle_aux ns pol
-      ({ s with life := s.life.finishLocked false } : Send).life.inFlight
-      (Nat.le_refl _) hinv₁ hdr₁
-  refine ⟨.cancel :: evs, s', ?_, hd', hst', hpl'⟩
+  obtain ⟨evs, s', hrun, ⟨hinv', _⟩, hd'⟩ :=
+    (sys ns pol).settles_of_rank (Inv := fun s => Inv pol s ∧ s.life.draining = true)
+      (Done := fun s => s.life.done = true) (fun s => s.life.inFlight)
+      (fun s ⟨hi, hdr⟩ hnd => by
+        obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step pol hi hdr (by simpa using hnd)
+        exact ⟨e, s₁, hs₁, ⟨step_inv pol hi hs₁, hdr₁⟩, hlt⟩)
+      ⟨hinv₁, by simp⟩
+  refine ⟨.cancel :: evs, s', ?_, hd', by rw [hinv'.life.staging, hd']; rfl, hinv'.done_plan hd'⟩
   simp only [System.runFrom, sys, List.foldlM_cons, hcancel]
   exact hrun
 
@@ -1486,18 +1471,16 @@ def events (numPools : Nat) : List Ev :=
      .d2hDone p true, .d2hDone p false,
      .pushDone p true, .pushDone p false]
 
-/-- Executable negation of `Safe`. -/
-def violates (pol : UnregisterPolicy) (s : Send) : Bool :=
-  (s.life.done && s.life.inFlight != 0) ||
-  (s.life.done && (s.execActive || poolOps s.pools != 0)) ||
-  (s.life.hasStaging != !s.life.done) ||
-  (s.life.draining && s.life.inFlight == 0 && !s.life.done) ||
-  (!s.life.draining && s.life.inFlight == 0) ||
-  (s.life.done && !s.planUnregistered) ||
-  (s.planUnregistered && !s.life.draining) ||
-  (pol == .onSettle && s.planUnregistered && !s.life.done) ||
-  (s.published == some true && !(s.remainingPushes == 0 && allPushed s.pools)) ||
-  (0 < s.life.inFlight && !(drainEvents s.pools.length).any fun e => (step pol s e).isSome)
+instance (pol : UnregisterPolicy) (s : Send) : Decidable (Safe pol s) := by
+  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ActiveOrDraining PlanIntegrity Publication NoOpLeak
+  infer_instance
+
+/-- Executable negation of `Safe`, by construction: the bounded searches and the
+`reachable_safe` theorem check the same predicate. -/
+def violates (pol : UnregisterPolicy) (s : Send) : Bool := !decide (Safe pol s)
+
+theorem violates_iff (pol : UnregisterPolicy) (s : Send) : violates pol s = false ↔ Safe pol s := by
+  simp [violates]
 
 
 /-- Mutant 1 (`initOvercountedSlots`, cf. `ReshardSendSession::Create`):

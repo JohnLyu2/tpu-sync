@@ -89,6 +89,38 @@ theorem runFrom_append :
       simp only [hse] at h₁ ⊢
       exact runFrom_append evs₁ evs₂ h₁ h₂
 
+/-- Ranking-function argument for eventual settlement. If every state that
+satisfies `Inv` but not `Done` has an enabled event that preserves `Inv` and
+strictly decreases `rank`, then from any `Inv` state a finite replay reaches a
+`Done` state (which still satisfies `Inv`). The models instantiate `Inv` with
+their inductive invariant plus `draining`, `Done` with `done`, and `rank` with
+a count of the operations still in flight; the per-model content is the
+one-step lemma `hstep`. -/
+theorem settles_of_rank {Inv Done : S → Prop} (rank : S → Nat)
+    (hstep : ∀ s, Inv s → ¬ Done s →
+      ∃ e s', sys.step s e = some s' ∧ Inv s' ∧ rank s' < rank s) :
+    ∀ {s : S}, Inv s → ∃ evs s', sys.runFrom s evs = some s' ∧ Inv s' ∧ Done s' := by
+  suffices aux : ∀ (k : Nat) {s : S}, rank s ≤ k → Inv s →
+      ∃ evs s', sys.runFrom s evs = some s' ∧ Inv s' ∧ Done s' from
+    fun {s} hs => aux (rank s) (Nat.le_refl _) hs
+  intro k
+  induction k with
+  | zero =>
+    intro s hk hs
+    by_cases hd : Done s
+    · exact ⟨[], s, rfl, hs, hd⟩
+    · obtain ⟨_, _, _, _, hlt⟩ := hstep s hs hd
+      omega
+  | succ k ih =>
+    intro s hk hs
+    by_cases hd : Done s
+    · exact ⟨[], s, rfl, hs, hd⟩
+    · obtain ⟨e, s₁, hse, hs₁, hlt⟩ := hstep s hs hd
+      obtain ⟨evs, s', hrun, hs', hd'⟩ := ih (by omega) hs₁
+      refine ⟨e :: evs, s', ?_, hs', hd'⟩
+      simp only [runFrom, List.foldlM_cons, hse]
+      exact hrun
+
 end System
 
 end TpuSyncVerify

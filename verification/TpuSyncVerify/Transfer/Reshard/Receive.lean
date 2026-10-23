@@ -1391,30 +1391,10 @@ theorem drain_step (pol : PushEndPolicy) {s : Recv} (h : Inv s)
     | waiting | received | completed | aborted =>
       simp [hst, PoolStage.holdsOp] at hh
 
-theorem draining_can_settle_aux (ranks : List Nat) (pol : PushEndPolicy) :
-    ∀ (k : Nat) {s : Recv}, drainRank s ≤ k → Inv s → s.life.draining = true →
-      ∃ evs s', (sys ranks pol).runFrom s evs = some s' ∧
-        s'.life.done = true ∧ s'.life.hasStaging = false
-  | 0, s, hk, h, hdr => by
-    have hacc := h.accounted; unfold Accounted at hacc
-    unfold drainRank at hk
-    have := poolOps_le_poolDrainSteps s.pools
-    have hd : s.life.done = true := h.life.prompt hdr (by omega)
-    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
-    exact ⟨[], s, rfl, hd, hst⟩
-  | k + 1, s, hk, h, hdr => by
-    cases hnd : s.life.done
-    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step pol h hdr hnd
-      obtain ⟨evs, s', hrun, hd', hst'⟩ :=
-        draining_can_settle_aux ranks pol k (by omega) (step_inv pol h hs₁) hdr₁
-      refine ⟨e :: evs, s', ?_, hd', hst'⟩
-      simp only [System.runFrom, sys, List.foldlM_cons, hs₁]
-      exact hrun
-    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
-      exact ⟨[], s, rfl, hnd, hst⟩
-
 /-- Every reachable reshard receive session can drain to `done = true` and
-release its bounded `PoolStagingLease` in finitely many steps. -/
+release its bounded `PoolStagingLease` in finitely many steps
+(`System.settles_of_rank` over `drainRank`, with `drain_step` as the one-step
+argument). -/
 theorem reachable_can_settle {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
     (h : (sys ranks pol).Reachable s) :
     ∃ evs s', (sys ranks pol).runFrom s evs = some s' ∧
@@ -1422,11 +1402,14 @@ theorem reachable_can_settle {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
   have hinv := reachable_inv h
   have hcancel : step pol s .cancel = some { s with life := s.life.finishLocked false } := rfl
   have hinv₁ := step_inv pol hinv hcancel
-  have hdr₁ : ({ s with life := s.life.finishLocked false } : Recv).life.draining = true := by simp
-  obtain ⟨evs, s', hrun, hd', hst'⟩ :=
-    draining_can_settle_aux ranks pol (drainRank { s with life := s.life.finishLocked false })
-      (Nat.le_refl _) hinv₁ hdr₁
-  refine ⟨.cancel :: evs, s', ?_, hd', hst'⟩
+  obtain ⟨evs, s', hrun, ⟨hinv', _⟩, hd'⟩ :=
+    (sys ranks pol).settles_of_rank (Inv := fun s => Inv s ∧ s.life.draining = true)
+      (Done := fun s => s.life.done = true) drainRank
+      (fun s ⟨hi, hdr⟩ hnd => by
+        obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step pol hi hdr (by simpa using hnd)
+        exact ⟨e, s₁, hs₁, ⟨step_inv pol hi hs₁, hdr₁⟩, hlt⟩)
+      ⟨hinv₁, by simp⟩
+  refine ⟨.cancel :: evs, s', ?_, hd', by rw [hinv'.life.staging, hd']; rfl⟩
   simp only [System.runFrom, sys, List.foldlM_cons, hcancel]
   exact hrun
 
@@ -1643,18 +1626,16 @@ def events (numPools : Nat) : List Ev :=
     [.onPoolReceived p, .h2dIssue p true, .h2dIssue p false,
      .h2dReady p, .h2dDone p true, .h2dDone p false]
 
-/-- Executable negation of `Safe`. -/
-def violates (pol : PushEndPolicy) (s : Recv) : Bool :=
-  (s.life.done && s.life.inFlight != 0) ||
-  (s.life.done && poolOps s.pools != 0) ||
-  (s.life.hasStaging != !s.life.done) ||
-  (s.planUnregistered && !s.life.done) ||
-  (s.published.isSome && !s.planUnregistered) ||
-  (s.life.draining && s.life.inFlight == 0 && !s.life.done) ||
-  !rankWaveOrder s.pools ||
-  (isReadyToComplete s && !allCompleted s.pools) ||
-  (s.published == some true && !(allCompleted s.pools && s.durationRecorded)) ||
-  (0 < s.life.inFlight && !(drainEvents s.pools.length).any fun e => (step pol s e).isSome)
+instance (pol : PushEndPolicy) (s : Recv) : Decidable (Safe pol s) := by
+  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity PlanIntegrity SettlesPromptly RankWaveOrder ReadinessSound Publication NoOpLeak
+  infer_instance
+
+/-- Executable negation of `Safe`, by construction: the bounded searches and the
+`reachable_safe` theorem check the same predicate. -/
+def violates (pol : PushEndPolicy) (s : Recv) : Bool := !decide (Safe pol s)
+
+theorem violates_iff (pol : PushEndPolicy) (s : Recv) : violates pol s = false ↔ Safe pol s := by
+  simp [violates]
 
 
 /-- Mutant 1 (`onPoolReceivedIgnoringRank`): `CollectEligiblePoolH2dsLocked`

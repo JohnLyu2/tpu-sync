@@ -774,30 +774,9 @@ theorem drain_step {s : Recv} (h : Inv s) (hdr : s.life.draining = true)
             simp [step, h2dDone, hret, hnd, hdr]
           exact ⟨.h2dDone true, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
 
-theorem draining_can_settle_aux (n : Nat) :
-    ∀ (k : Nat) {s : Recv}, drainRank s ≤ k → Inv s → s.life.draining = true →
-      ∃ evs s', (sysPush n).runFrom s evs = some s' ∧
-        s'.life.done = true ∧ s'.life.hasStaging = false
-  | 0, s, hk, h, hdr => by
-    have hacc := h.accounted
-    unfold Accounted at hacc
-    unfold drainRank at hk
-    have hd : s.life.done = true := h.life.prompt hdr (by omega)
-    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
-    exact ⟨[], s, rfl, hd, hst⟩
-  | k + 1, s, hk, h, hdr => by
-    cases hnd : s.life.done
-    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step h hdr hnd
-      obtain ⟨evs, s', hrun, hd', hst'⟩ :=
-        draining_can_settle_aux n k (by omega) (step_inv h hs₁) hdr₁
-      refine ⟨e :: evs, s', ?_, hd', hst'⟩
-      simp only [System.runFrom, sysPush, List.foldlM_cons, hs₁]
-      exact hrun
-    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
-      exact ⟨[], s, rfl, hnd, hst⟩
-
 /-- Every reachable receive session can settle and release its staging buffer
-in a finite number of steps. -/
+in a finite number of steps (`System.settles_of_rank` over `drainRank`, with
+`drain_step` as the one-step argument). -/
 theorem reachable_can_settle {n : Nat} {s : Recv}
     (h : (sysPush n).Reachable s ∨ (sysLoad n).Reachable s) :
     ∃ evs s', (sysPush n).runFrom s evs = some s' ∧
@@ -805,11 +784,14 @@ theorem reachable_can_settle {n : Nat} {s : Recv}
   have hinv := h.elim reachable_inv_push reachable_inv_load
   have hcancel : step s .cancel = some { s with life := s.life.finishLocked false } := rfl
   have hinv₁ := step_inv hinv hcancel
-  have hdr₁ : ({ s with life := s.life.finishLocked false } : Recv).life.draining = true := by simp
-  obtain ⟨evs, s', hrun, hd', hst'⟩ :=
-    draining_can_settle_aux n (drainRank { s with life := s.life.finishLocked false })
-      (Nat.le_refl _) hinv₁ hdr₁
-  refine ⟨.cancel :: evs, s', ?_, hd', hst'⟩
+  obtain ⟨evs, s', hrun, ⟨hinv', _⟩, hd'⟩ :=
+    (sysPush n).settles_of_rank (Inv := fun s => Inv s ∧ s.life.draining = true)
+      (Done := fun s => s.life.done = true) drainRank
+      (fun s ⟨hi, hdr⟩ hnd => by
+        obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step hi hdr (by simpa using hnd)
+        exact ⟨e, s₁, hs₁, ⟨step_inv hi hs₁, hdr₁⟩, hlt⟩)
+      ⟨hinv₁, by simp⟩
+  refine ⟨.cancel :: evs, s', ?_, hd', by rw [hinv'.life.staging, hd']; rfl⟩
   simp only [System.runFrom, sysPush, List.foldlM_cons, hcancel]
   exact hrun
 
@@ -1059,17 +1041,16 @@ def events : List Ev :=
    .h2dIssue true, .h2dIssue false, .h2dReady, .h2dDone true, .h2dDone false,
    .netAccount, .pollReady, .cancel, .publish]
 
-/-- Executable negation of `Safe`. -/
-def violates (s : Recv) : Bool :=
-  (s.life.done && s.life.inFlight != 0) ||
-  (s.life.done && s.retired != s.issued) ||
-  (s.life.hasStaging != !s.life.done) ||
-  (s.life.draining && s.life.inFlight == 0 && !s.life.done) ||
-  (decide (isReadyToComplete s) && s.ready != s.numLayers) ||
-  (s.published == some true && s.completed != s.numLayers) ||
-  !(s.completed ≤ s.retired && s.retired ≤ s.ready && s.ready ≤ s.issued &&
-    s.issued ≤ s.numLayers && s.layersAccounted ≤ s.issued) ||
-  (0 < s.life.inFlight && !(drainEvents.any fun e => (step s e).isSome))
+instance (s : Recv) : Decidable (Safe s) := by
+  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ReadinessSound Publication CountersOrdered NoOpLeak
+  infer_instance
+
+/-- Executable negation of `Safe`, by construction: the bounded searches and the
+`reachable_safe` theorem check the same predicate. -/
+def violates (s : Recv) : Bool := !decide (Safe s)
+
+theorem violates_iff (s : Recv) : violates s = false ↔ Safe s := by
+  simp [violates]
 
 /-- Sanity check on the search itself: a `Finish` that settles at once, ignoring
 in-flight work, must be caught. -/

@@ -67,10 +67,14 @@ Each model file, in order:
 3. `inductive Ev`; one `def` per event (named so it does not collide with a
    field of `S`, or dot-notation breaks); `step`; `sys`.
 4. Property definitions, `Safe` as their conjunction.
-5. `Inv`, `inv_init`, `inv_safe`, `step_inv`, `reachable_safe`.
+5. `Inv`, `inv_init`, `inv_safe`, `step_inv`, `reachable_safe`; progress as
+   `drainRank` + a one-step `drain_step` lemma, discharged through
+   `System.settles_of_rank`.
 6. Frame lemmas other modules need.
 7. **Replay and bounded search**: named `trace_*` theorems, `events`,
-   executable `violates`, `#guard` searches, mutants.
+   `instance : Decidable (Safe s)` and `violates s := !decide (Safe s)` (so
+   the searches and the theorems check one predicate; `violates_iff` records
+   it), `#guard` searches, mutants.
 
 ## Citations and source maps
 

@@ -2348,30 +2348,26 @@ theorem both_done_settle (sys₀ : System Pipeline Ev) (hstep : sys₀.step = st
     | some b =>
       exact absurd (h.recvInv.published_done b hpub).2 hpl
 
-theorem draining_can_settle_aux (sys₀ : System Pipeline Ev) (hstep : sys₀.step = step) :
-    ∀ (k : Nat) {s : Pipeline}, drainRank s ≤ k → Inv s →
-      s.send.life.draining = true → s.recv.life.draining = true →
-      ∃ evs s', sys₀.runFrom s evs = some s' ∧
-        s'.send.life.done = true ∧ s'.recv.life.done = true ∧
-        s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false ∧
-        s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true
-  | 0, s, hk, h, hsdr, hrdr => by
-    unfold drainRank Recv.drainRank at hk
-    have hle := Recv.poolOps_le_poolDrainSteps s.recv.pools
-    have hacc := h.recvInv.accounted; unfold Recv.Accounted at hacc
-    have hs_done : s.send.life.done = true := h.sendInv.life.prompt hsdr (by omega)
-    have hr_done : s.recv.life.done = true := h.recvInv.life.prompt hrdr (by omega)
-    exact both_done_settle sys₀ hstep h hs_done hr_done
-  | k + 1, s, hk, h, hsdr, hrdr => by
-    by_cases hboth : s.send.life.done = true ∧ s.recv.life.done = true
-    · exact both_done_settle sys₀ hstep h hboth.1 hboth.2
-    · obtain ⟨e, s₁, hs₁, hsdr₁, hrdr₁, hlt⟩ := drain_step h hsdr hrdr hboth
-      obtain ⟨evs, s', hrun, h1, h2, h3, h4, h5, h6⟩ :=
-        draining_can_settle_aux sys₀ hstep k (by omega) (step_inv h hs₁) hsdr₁ hrdr₁
-      have hstep₁ : sys₀.step s e = some s₁ := hstep ▸ hs₁
-      refine ⟨e :: evs, s', ?_, h1, h2, h3, h4, h5, h6⟩
-      simp only [System.runFrom, List.foldlM_cons, hstep₁]
-      exact hrun
+/-- Both sessions drain to `done`, then `both_done_settle` finishes the job
+(`System.settles_of_rank` over `drainRank` with `drain_step` as the one-step
+argument). -/
+theorem draining_can_settle (sys₀ : System Pipeline Ev) (hstep : sys₀.step = step)
+    {s : Pipeline} (h : Inv s)
+    (hsdr : s.send.life.draining = true) (hrdr : s.recv.life.draining = true) :
+    ∃ evs s', sys₀.runFrom s evs = some s' ∧
+      s'.send.life.done = true ∧ s'.recv.life.done = true ∧
+      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false ∧
+      s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true := by
+  obtain ⟨evs₁, s₁, hrun₁, ⟨hinv₁, _, _⟩, hsd, hrd⟩ :=
+    sys₀.settles_of_rank
+      (Inv := fun s => Inv s ∧ s.send.life.draining = true ∧ s.recv.life.draining = true)
+      (Done := fun s => s.send.life.done = true ∧ s.recv.life.done = true) drainRank
+      (fun s ⟨hi, hsdr, hrdr⟩ hnd => by
+        obtain ⟨e, s₁, hs₁, hsdr₁, hrdr₁, hlt⟩ := drain_step hi hsdr hrdr hnd
+        exact ⟨e, s₁, hstep ▸ hs₁, ⟨step_inv hi hs₁, hsdr₁, hrdr₁⟩, hlt⟩)
+      ⟨h, hsdr, hrdr⟩
+  obtain ⟨evs₂, s', hrun₂, h1, h2, h3, h4, h5, h6⟩ := both_done_settle sys₀ hstep hinv₁ hsd hrd
+  exact ⟨evs₁ ++ evs₂, s', sys₀.runFrom_append evs₁ evs₂ hrun₁ hrun₂, h1, h2, h3, h4, h5, h6⟩
 
 theorem can_settle_of_inv (sys₀ : System Pipeline Ev) (hstep : sys₀.step = step)
     {s : Pipeline} (hinv : Inv s) :
@@ -2388,7 +2384,7 @@ theorem can_settle_of_inv (sys₀ : System Pipeline Ev) (hstep : sys₀.step = s
   have hsdr₂ : s₂.send.life.draining = true := by simp [s₂, s₁]
   have hrdr₂ : s₂.recv.life.draining = true := by simp [s₂]
   obtain ⟨evs, s', hrun, h1, h2, h3, h4, h5, h6⟩ :=
-    draining_can_settle_aux sys₀ hstep (drainRank s₂) (Nat.le_refl _) hinv₂ hsdr₂ hrdr₂
+    draining_can_settle sys₀ hstep hinv₂ hsdr₂ hrdr₂
   have hstep₁ : sys₀.step s (.send .cancel) = some s₁ := hstep ▸ hs₁
   have hstep₂ : sys₀.step s₁ (.recv .cancel) = some s₂ := hstep ▸ hs₂
   refine ⟨.send .cancel :: .recv .cancel :: evs, s', ?_, h1, h2, h3, h4, h5, h6⟩
@@ -2505,35 +2501,26 @@ def allEvents (n : Nat) : List Ev :=
   (Recv.events n).map Ev.recv ++
   (List.range n).map Ev.landStream
 
-def checkSafe (s : Pipeline) : Bool :=
-  let pubOk := !(s.recv.published == some true) || (s.dstHbm == good s.numPools)
-  let aliasedOk := (List.range s.numPools).all fun q =>
-    match s.recv.pools[q]? with
-    | some pool => !(pool.stage == .completed) || (s.dstHbm[q]? == some (.kv q))
-    | none => true
-  let dstSafe := s.recv.published.isNone || (Recv.poolOps s.recv.pools == 0)
-  let srcSafe :=
-    (s.send.published.isNone || (!s.send.execActive && Send.poolOps s.send.pools == 0)) &&
-    (!s.reclaimed || (s.send.life.done && !s.send.execActive && Send.poolOps s.send.pools == 0))
-  let stgSafe :=
-    (s.send.life.hasStaging || (!s.send.execActive && Send.poolOps s.send.pools == 0)) &&
-    (s.recv.life.hasStaging || (s.recv.pushes == 0 && Recv.poolOps s.recv.pools == 0))
-  let streamOk := (List.range s.numPools).all fun p =>
-    decide (s.landedStreams.getD p 0 ≤ s.sentStreams.getD p 0) &&
-    decide (s.sentStreams.getD p 0 ≤ s.peerCounts.getD p 0) &&
-    match s.recv.pools[p]? with
-    | some pool => (pool.stage == .waiting) || (s.landedStreams.getD p 0 == s.peerCounts.getD p 0)
-    | none => true
-  let armOk := s.armed ||
-    (s.send.pools.all (fun pool => pool.stage == .pending || pool.stage == .aborted) &&
-     s.recv.pushes == 0 &&
-     s.recv.pools.all (fun pool => pool.stage == .waiting))
-  let noLeak :=
-    !(decide (0 < s.send.life.inFlight) || decide (0 < s.recv.life.inFlight)) ||
-    (drainEvents s.numPools).any fun e => (step s e).isSome
-  pubOk && aliasedOk && dstSafe && srcSafe && stgSafe && streamOk && armOk && noLeak
+/-- `∀ x, o = some x → P x` is decided by inspecting `o`. -/
+private instance decForallSome {α : Type} (o : Option α) (P : α → Prop) [DecidablePred P] :
+    Decidable (∀ x, o = some x → P x) :=
+  match o with
+  | none => isTrue (fun _ h => by cases h)
+  | some a =>
+    if h : P a then isTrue (fun _ hx => by cases hx; exact h)
+    else isFalse (fun hall => h (hall a rfl))
 
-def violates (s : Pipeline) : Bool := !checkSafe s
+instance (s : Pipeline) : Decidable (Safe s) := by
+  unfold Safe PublicationCorrect AliasedPageCorrect DstHbmSafe SrcHbmSafe StagingSafe
+    StreamAccountingSafe NoUnarmedPush NoOpLeak
+  infer_instance
+
+/-- Executable negation of `Safe`, by construction: the bounded searches and the
+`reachable_safe` theorems check the same predicate. -/
+def violates (s : Pipeline) : Bool := !decide (Safe s)
+
+theorem violates_iff {s : Pipeline} : violates s = false ↔ Safe s := by
+  simp [violates]
 
 
 /-! ## Mutants (`docs/transfer/reshard.md`)

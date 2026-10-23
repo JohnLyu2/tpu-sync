@@ -436,12 +436,16 @@ def CompleteOnSuccess (s : S) : Prop :=
 
 def Safe (c : Cfg) (s : S) : Prop := OnceDispatched s ∧ NetworkSound c s ∧ CompleteOnSuccess s
 
-/-- Executable negation of `Safe`, for the bounded searches. -/
-def violates (c : Cfg) (s : S) : Bool :=
-  s.layers.any (fun L => decide (1 < L.dispatched)) ||
-  (networkCompleted c s && s.layers.any (fun L => decide (L.dispatched = 0))) ||
-  (published s &&
-    s.layers.any (fun L => !(decide (L.dispatched = 1) && decide (L.pending = 0))))
+instance (c : Cfg) (s : S) : Decidable (Safe c s) := by
+  unfold Safe OnceDispatched NetworkSound CompleteOnSuccess
+  infer_instance
+
+/-- Executable negation of `Safe`, by construction: the bounded searches and the
+`reachable_safe` theorem check the same predicate. -/
+def violates (c : Cfg) (s : S) : Bool := !decide (Safe c s)
+
+theorem violates_iff (c : Cfg) (s : S) : violates c s = false ↔ Safe c s := by
+  simp [violates]
 
 /-! ## Arithmetic over `natSum` -/
 

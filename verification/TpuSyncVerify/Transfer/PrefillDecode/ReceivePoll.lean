@@ -473,37 +473,29 @@ theorem noPoll_metrics_on_success {n : Nat} {m : RecvM}
   (noPoll_reachable_inv h).2
 
 /-- The drain argument of `Receive.lean` never used the poll (the poll is
-disabled while draining), so it lifts to the no-poll model as it is. -/
-theorem noPoll_draining_can_settle_aux (n : Nat) :
-    ∀ (k : Nat) (s : Recv) (b : Bool), drainRank s ≤ k → Inv s → s.life.draining = true →
-      ∃ evs m', (sysMPush false n).runFrom ⟨s, b⟩ evs = some m' ∧
-        m'.s.life.done = true ∧ m'.s.life.hasStaging = false
-  | 0, s, b, hk, h, hdr => by
-    have hacc := h.accounted
-    unfold Accounted at hacc
-    unfold drainRank at hk
-    have hd : s.life.done = true := h.life.prompt hdr (by omega)
-    have hst : s.life.hasStaging = false := by rw [h.life.staging, hd]; rfl
-    exact ⟨[], ⟨s, b⟩, rfl, hd, hst⟩
-  | k + 1, s, b, hk, h, hdr => by
-    cases hnd : s.life.done
-    · obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step h hdr hnd
-      have hne : e ≠ .pollReady := by
-        intro he
-        subst he
-        simp [step, pollReady, hdr] at hs₁
-      obtain ⟨evs, m', hrun, hd', hst'⟩ :=
-        noPoll_draining_can_settle_aux n k s₁
-          (b || (decide (e = .h2dDone true) && decide (recordsMetrics s)))
-          (by omega) (step_inv h hs₁) hdr₁
-      refine ⟨e :: evs, m', ?_, hd', hst'⟩
-      have hstep : stepM false ⟨s, b⟩ e =
-          some ⟨s₁, b || (decide (e = .h2dDone true) && decide (recordsMetrics s))⟩ := by
-        simp [stepM, hne, hs₁]
-      simp only [System.runFrom, sysMPush, List.foldlM_cons, hstep]
-      exact hrun
-    · have hst : s.life.hasStaging = false := by rw [h.life.staging, hnd]; rfl
-      exact ⟨[], ⟨s, b⟩, rfl, hnd, hst⟩
+disabled while draining), so it lifts to the no-poll model as it is:
+`System.settles_of_rank` over `drainRank` of the underlying session, with
+`Recv.drain_step` lifted through `stepM false`. -/
+theorem noPoll_draining_can_settle (n : Nat) {m : RecvM} (h : Inv m.s)
+    (hdr : m.s.life.draining = true) :
+    ∃ evs m', (sysMPush false n).runFrom m evs = some m' ∧
+      m'.s.life.done = true ∧ m'.s.life.hasStaging = false := by
+  obtain ⟨evs, m', hrun, ⟨hinv', _⟩, hd'⟩ :=
+    (sysMPush false n).settles_of_rank
+      (Inv := fun m : RecvM => Inv m.s ∧ m.s.life.draining = true)
+      (Done := fun m : RecvM => m.s.life.done = true) (fun m => drainRank m.s)
+      (fun m ⟨hi, hdr⟩ hnd => by
+        obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step hi hdr (by simpa using hnd)
+        have hne : e ≠ .pollReady := by
+          intro he
+          subst he
+          simp [step, pollReady, hdr] at hs₁
+        refine ⟨e, ⟨s₁, m.metrics || (decide (e = .h2dDone true) && decide (recordsMetrics m.s))⟩,
+          ?_, ⟨step_inv hi hs₁, hdr₁⟩, hlt⟩
+        show stepM false m e = _
+        simp [stepM, hne, hs₁])
+      ⟨h, hdr⟩
+  exact ⟨evs, m', hrun, hd', by rw [hinv'.life.staging, hd']; rfl⟩
 
 /-- Without the poll, every reachable session can still settle and release
 its staging in finitely many steps. -/
@@ -517,7 +509,7 @@ theorem noPoll_can_settle {n : Nat} {m : RecvM}
   have hdr₁ : ({ m.s with life := m.s.life.finishLocked false } : Recv).life.draining = true := by
     simp
   obtain ⟨evs, m', hrun, hd', hst'⟩ :=
-    noPoll_draining_can_settle_aux n _ _ m.metrics (Nat.le_refl _) hinv₁ hdr₁
+    noPoll_draining_can_settle n (m := ⟨{ m.s with life := m.s.life.finishLocked false }, m.metrics⟩) hinv₁ hdr₁
   refine ⟨.cancel :: evs, m', ?_, hd', hst'⟩
   have hstep : stepM false m .cancel =
       some ⟨{ m.s with life := m.s.life.finishLocked false }, m.metrics⟩ := by
