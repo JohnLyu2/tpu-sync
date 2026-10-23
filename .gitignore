@@ -93,6 +93,9 @@ tpu_sync/rpc/*_pb2*.py
 # Python bytecode caches
 **/__pycache__/
 
+# Lean / Lake build output
+tpu_sync/formal_verification/.lake/
+
 # Binaries
 tpu_raiden/kv_cache/global_registry/global_registry_server
 tpu_sync/kv_cache/global_registry/global_registry_server
