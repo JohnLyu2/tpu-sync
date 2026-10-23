@@ -562,28 +562,6 @@ bool HostOffloadBackend::InsertAdmitStrict(
   return true;
 }
 
-size_t HostOffloadBackend::ReleaseAndDelete(
-    absl::Span<const std::string> block_hashes) {
-  absl::MutexLock lock(mutex_);
-  size_t deleted_blocks = 0;
-
-  for (auto it = block_hashes.rbegin(); it != block_hashes.rend(); ++it) {
-    lru_cache_.Unpin(*it);
-  }
-
-  for (const std::string& hash : block_hashes) {
-    auto* val = lru_cache_.Peek(hash);
-    if (val != nullptr && lru_cache_.GetPinCount(hash) == 0 &&
-        val->status != BlockStatus::HOST &&
-        val->status != BlockStatus::HOST_AND_HBM) {
-      lru_cache_.Erase(hash);
-      deleted_blocks++;
-    }
-  }
-
-  return deleted_blocks;
-}
-
 void HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
                                 absl::Span<const RaidenBlockId> /*slices*/) {
   std::shared_ptr<global_registry::GlobalRegistryClient> client;

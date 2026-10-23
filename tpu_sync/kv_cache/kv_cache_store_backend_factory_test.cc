@@ -108,7 +108,6 @@ class CustomTestBackend : public KVCacheStoreBackend {
     }
     return true;
   }
-  size_t ReleaseAndDelete(absl::Span<const std::string>) override { return 0; }
   void Delete(absl::Span<const std::string>,
               absl::Span<const RaidenBlockId>) override {}
   bool Pin(absl::Span<const std::string> hashes) override {

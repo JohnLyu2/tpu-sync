@@ -1017,7 +1017,7 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
 absl::Status KVCacheStore::Insert(const std::vector<std::string>& block_hashes,
                                   const std::vector<RaidenBlockId>& slices,
                                   bool /*on_host*/) {
-  if (backends_.empty()) {
+  if (backends_.empty() || !backends_[0]) {
     return absl::FailedPreconditionError("KVCacheStore has no backend");
   }
 
@@ -1033,19 +1033,11 @@ absl::Status KVCacheStore::Insert(const std::vector<std::string>& block_hashes,
     }
   }
 
-  std::vector<size_t> locked_backends;
-  for (size_t i = 0; i < backends_.size(); ++i) {
-    if (!backends_[i]) continue;
-    if (!backends_[i]->Insert(block_hashes, slices,
-                              InsertOption::kInsertAndPin)) {
-      for (size_t lb : locked_backends) {
-        backends_[lb]->ReleaseAndDelete(block_hashes);
-      }
-      return absl::ResourceExhaustedError(
-          "Insert refused: not enough unpinned space, or a hash could not be "
-          "pinned");
-    }
-    locked_backends.push_back(i);
+  if (!backends_[0]->Insert(block_hashes, slices,
+                            InsertOption::kInsertAndPin)) {
+    return absl::ResourceExhaustedError(
+        "Insert refused: not enough unpinned space, or a hash could not be "
+        "pinned");
   }
   return absl::OkStatus();
 }
