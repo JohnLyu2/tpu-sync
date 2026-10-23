@@ -1,11 +1,13 @@
 # Formal Verification of TPU Sync (Lean 4)
 
-TPU Sync moves KV-cache blocks across TPU HBM, host DRAM staging pools, and
-network peers using asynchronous callbacks and lock-scoped state machines.
+TPU Sync is a KV-cache orchestration, host-memory offload and cross-node
+transfer library for TPUs. Its data paths run on asynchronous callbacks and
+lock-scoped state machines across TPU HBM, host DRAM staging pools, and network
+peers.
 
-This directory contains the **Lean 4 formalization (`TpuSyncVerify/`)**: models
-of the C++ session state machines, staging allocators, and multi-node transfer
-pipelines, with proofs of end-to-end data correctness, HBM and host-staging
+This directory models those paths in Lean 4. It contains the **formalization
+(`TpuSyncVerify/`)**: models of the C++ session state machines, staging
+allocators, and multi-node transfer pipelines, with proofs of end-to-end data correctness, HBM and host-staging
 memory safety, lifecycle termination, and cross-peer fault isolation; the
 code-to-model reference docs (`docs/`); and the tooling that resolves and
 checks the source maps (`tools/`). You do not need Lean to use `docs/`: each doc maps C++
