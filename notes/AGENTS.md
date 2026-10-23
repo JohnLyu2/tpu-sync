@@ -25,7 +25,10 @@ conventions: `../AGENTS.md`.
   `journal/2026-10/2026-10-10-upstream-1fa06d1-sync.md`); 2026-10-16..21 at `0ac16d1`
   (`StagingBlockAllocator` in `tpu_sync/core/staging_arena.*`,
   `journal/2026-10/2026-10-16-upstream-0ac16d1-sync.md`); since 2026-10-22 the
-  pin is `2ed6f8f` (`journal/2026-10/2026-10-22-upstream-2ed6f8f-sync-and-repin-tool-defect.md`).
+  pin is `2ed6f8f` (`journal/2026-10/2026-10-22-upstream-2ed6f8f-sync-and-repin-tool-defect.md`);
+  from 2026-10-23 (afternoon) it is `c15ead5` (`verification/docs/upstream_rechecks.md`
+  row 2026-10-23: no cited symbol changed; `tpu_sync/transport/lib/` reorganised
+  into `adapter/`, `psp/`, `metrics/`).
 - Markers as in the skill: `[FACT]` source-grounded or Lean-proved (`durable/`);
   `[EMP]` reproducible result with a "Verified against" stamp (`empirical/`);
   `[OBS YYYY-MM-DD]` and `[HYP]` (`journal/YYYY-MM/`); `[OPEN]` with a parked
