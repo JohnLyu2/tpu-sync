@@ -76,6 +76,20 @@ Each model file, in order:
    the searches and the theorems check one predicate; `violates_iff` records
    it), `#guard` searches, mutants.
 
+Modules over roughly a thousand lines are split along these sections into a
+directory of part files plus an umbrella: `X.lean` keeps item 1 (the module
+docstring with the source map) and only re-exports `X/Model.lean` (items 2–4),
+`X/Invariant.lean` (5, up to `reachable_safe`), `X/Progress.lean`,
+`X/Frame.lean` (6) and `X/Traces.lean` (7), with `X/Lemmas.lean` for a
+structural-lemma section between the model and the invariant where one exists
+(modules with their own numbering, such as `BlockOrdering` and `PoolStaging`,
+name their parts after their sections). Parts import each other in a linear
+chain and repeat the namespace preamble; `import …X` keeps working, and only
+`X.lean` carries a source map. An upstream sync therefore touches `X.lean`
+(the map), `X/Model.lean` (if the modelled code changed) and `X/Traces.lean`
+(if a replayed test was renamed), and a reviewer can read those three without
+the proofs.
+
 ## Citations and source maps
 
 1. **Single baseline commit (`verification/README.md` §Status).** The baseline
