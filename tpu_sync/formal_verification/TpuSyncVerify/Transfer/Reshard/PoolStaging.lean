@@ -44,7 +44,7 @@ line ranges for every symbol, sub-block, and test are in the generated
      Looks up `st.leases.find(uuid)`, pushes every `slot ∈ lease->slots` back
      onto `st.free_slots`, and erases `uuid` from `st.leases`.
 
-  4. **Receive registration lifecycle & Risk R5 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv` in `mgr.cc`,
+  4. **Receive registration lifecycle (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv` in `mgr.cc`,
      `ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`, `ReshardReceiveSession::ReleaseStaging` in `reshard_recv.cc`):**
      `PoolReshardRegisterRecv` executes in three steps:
      - Phase 1 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv` checking `active_pool_reshard_recvs_`,
@@ -61,8 +61,8 @@ line ranges for every symbol, sub-block, and test are in the generated
        `base->UnregisterActivePlanDirect(plan.uuid())`.
      - Phase 3 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, `active_pool_reshard_recvs_[plan.uuid()] = std::move(recv_session);` under `mu_`):
        inserts the session into `active_pool_reshard_recvs_`.
-     Under the unreserved mutant (`RegistrationPolicy.leaseBeforeReserve`,
-     Finding F6 / Risk R5), if Phase 2 ran before `RegisterActivePlanDirect`
+     Under the unreserved mutant (`RegistrationPolicy.leaseBeforeReserve`),
+     if Phase 2 ran before `RegisterActivePlanDirect`
      claimed `uuid`, two concurrent or duplicate `PoolReshardRegisterRecv`
      calls with the same `uuid` would share `st.leases[uuid]` in Phase 2; when
      `RegisterActivePlanDirect` rejected the second call (`AlreadyExistsError`),
@@ -86,8 +86,8 @@ line ranges for every symbol, sub-block, and test are in the generated
     protocol (claiming `uuid` before acquiring staging leases), every reachable
     state keeps active session leases live and pairwise slot-disjoint.
   - `trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`: constructive
-    counterexample trace under the `leaseBeforeReserve` mutant (Finding F6 /
-    Risk R5) showing a rejected duplicate-UUID arm freeing the survivor's lease
+    counterexample trace under the `leaseBeforeReserve` mutant showing a
+    rejected duplicate-UUID arm freeing the survivor's lease
     and a third session (`uuid = 8`) receiving the same physical slot `0`.
 
 ## Source map

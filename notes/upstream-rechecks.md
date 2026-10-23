@@ -1,10 +1,12 @@
 # Upstream re-checks
 
-One row per upstream sync or citation re-audit of the Lean corpus. The
-procedure is in [README.md](../README.md) §"Maintenance after an upstream
-sync"; the model-side consequences of each sync are described in the
-preamble of each affected module. The current citation baseline is stated
-once in README.md §Status.
+One row per upstream sync or citation re-audit of the Lean corpus
+(`tpu_sync/formal_verification/`). The procedure is the "sync upstream"
+trigger in `../AGENTS.md`; the current citation baseline is stated once in
+`tpu_sync/formal_verification/README.md` §Status. Moved here from the corpus
+on 2026-10-23: it is fork process history (findings closed, patches
+regenerated, re-pin tooling), not a description of the code, and finding
+numbers (F#, C1, R-x) refer to `../findings/README.md`.
 
 ## Prefill-to-decode transfer (`TpuSyncVerify/Transfer/`)
 

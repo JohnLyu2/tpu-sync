@@ -53,12 +53,10 @@ structure Pool where
 
 /-- Policy for `hooks.end_incoming_push` on `ReshardReceiveSession`
 (`KVCacheManagerWithTransfer::InitializeBaseHooks`): `finishOnError`, the
-shipping code since `fdeebcd` (2026-10-16, the fix for finding F7 / R1), mirrors
-the `TransferReceiveSession` branch by calling `reshard_session->Finish(status)`
-before `reshard_session->EndRecvOp()` when the incoming push failed;
-`endOpOnly` is the pre-`fdeebcd` hook, which called `EndRecvOp()`
-unconditionally. Kept so `trace_r1_failed_incoming_push` still witnesses the
-defect. -/
+shipping code, mirrors the `TransferReceiveSession` branch by calling
+`reshard_session->Finish(status)` before `reshard_session->EndRecvOp()` when
+the incoming push failed; `endOpOnly` is the mutant that calls `EndRecvOp()`
+unconditionally (`trace_r1_failed_incoming_push` shows what that leaks). -/
 inductive PushEndPolicy where
   | finishOnError
   | endOpOnly
@@ -163,7 +161,7 @@ def pushBegin (s : Recv) : Option Recv :=
 /-- `hooks.end_incoming_push` (`KVCacheManagerWithTransfer::InitializeBaseHooks`).
 Under `.finishOnError` (shipping), a failed push calls
 `reshard_session->Finish(status)` before `reshard_session->EndRecvOp()`; under
-`.endOpOnly` (pre-`fdeebcd`), only `EndRecvOp()` ran. If the session is now
+`.endOpOnly` (mutant), only `EndRecvOp()` runs. If the session is now
 settled, `reshard_session->TakePendingUnregister(&generation)` unregisters the
 plan (`UnregisterSettledPlan`). -/
 def pushEnd (pol : PushEndPolicy) (ok : Bool) (s : Recv) : Option Recv :=

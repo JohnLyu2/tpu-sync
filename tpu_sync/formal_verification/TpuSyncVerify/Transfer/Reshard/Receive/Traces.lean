@@ -195,19 +195,17 @@ theorem trace_duration_metric_on_success_and_failure :
       some (some false, false, true)) := by
   decide
 
-/-- Finding F7 / R1 (pre-`fdeebcd` `hooks.end_incoming_push` vs. the
-`TransferReceiveSession` branch in
-`KVCacheManagerWithTransfer::InitializeBaseHooks`): when an incoming push fails
-(`pushEnd false`), the old hook (`.endOpOnly`) ended the op without finishing
-the session, leaving `draining = false`, `done = false`, `hasStaging = true`,
-and `planUnregistered = false` until the external deadline (`cancel`). Under
-`PushEndPolicy.finishOnError` — the shipping code since `fdeebcd`, whose
-regression test is
+/-- R1: `hooks.end_incoming_push` on a failed push
+(`KVCacheManagerWithTransfer::InitializeBaseHooks`). Under the `.endOpOnly`
+mutant the hook ends the op without finishing the session, leaving
+`draining = false`, `done = false`, `hasStaging = true`, and
+`planUnregistered = false` until the external deadline (`cancel`). Under
+`PushEndPolicy.finishOnError` — the shipping code, replaying
 `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline` —
 `pushEnd false` immediately drains and settles the session, releasing the pool
 staging lease and unregistering the plan. -/
 theorem trace_r1_failed_incoming_push :
-    -- Pre-`fdeebcd` (`.endOpOnly`): after `[.pushBegin, .pushEnd false]`, session is still open and holds staging/plan.
+    -- `.endOpOnly` mutant: after `[.pushBegin, .pushEnd false]`, session is still open and holds staging/plan.
     ((sys [0] .endOpOnly).run [.pushBegin, .pushEnd false]).map
       (fun r => (r.life.draining, r.life.done, r.life.hasStaging, r.planUnregistered)) =
       some (false, false, true, false) ∧

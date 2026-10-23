@@ -15,10 +15,8 @@ File aliases used in the source map below:
 `ctrl.cc` (`tpu_sync/core/controller/raiden_controller.cc`),
 `ctrl_test.cc` (`tpu_sync/core/controller/raiden_controller_test.cc`).
 
-This is the model behind finding **F2** (bug-hunt report in the fork's
-`findings/`, see `tpu_sync/formal_verification/README.md`): a remote
-read can keep DMA-ing into the caller's destination blocks after the caller
-has been told the read failed.
+The model shows that a remote read can keep DMA-ing into the caller's
+destination blocks after the caller has been told the read failed.
 
 ## How a read runs
 
@@ -63,12 +61,11 @@ blocks are the caller's to refill.
 
 * `shipping` — the shipping code: nothing checks `settled` before
   `TransferBuffers`, and the deadline settles regardless of an in-flight pull;
-* `checkSettledBeforePull` — the naive fix: skip the pull if already settled
-  (the fork's `findings/candidate_fixes.patch` does this);
+* `checkSettledBeforePull` — the naive fix: skip the pull if already settled;
 * `deferSettleWhilePullInFlight` — the naive fix plus: the deadline does not
   settle while a pull is in flight; the pull's completion settles. This is
   what the sibling `WriteRemote` path already does
-  (`kv_cache_store_service.cc` `DeadlineLoop`, finding R-D).
+  (`kv_cache_store_service.cc` `DeadlineLoop`).
 
 ## Property
 
@@ -81,10 +78,8 @@ pull into them is in flight (issued and not done).
   settles, the caller takes its blocks back, the acquire reply arrives
   afterwards and the pull is issued into them anyway. **Shape B** (in flight): the pull is
   issued, the deadline settles while it runs, the caller reuses the blocks
-  under the DMA. Shape A is confirmed by a C++ test
-  (`BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled`, in the fork's
-  `findings/raiden_controller_bughunt_test.cc`); shape B is
-  the case the deadline exists for.
+  under the DMA. Shape A is deterministic (delay the acquire reply past the
+  deadline); shape B is the case the deadline exists for.
 * The naive fix closes A and not B.
 * Deferring the deadline's settle while a pull is in flight has no violation
   anywhere in the reachable state space (`deferred_settle_is_safe`). Its cost:

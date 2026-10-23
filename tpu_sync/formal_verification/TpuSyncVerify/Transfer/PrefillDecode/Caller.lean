@@ -13,9 +13,8 @@ request's HBM any more (`PrefillHbmSafe`, `DecodeHbmSafe`), and it *assumes*
 models the other direction of the same contract — what the engine must do
 *with* a publication — for the production caller of the prefill-to-decode
 path: vLLM's scheduler driving `tpu-sync` through tpu-inference's
-`TPUConnector`. Finding **C1** (bug-hunt report in the fork's `findings/`,
-see `tpu_sync/formal_verification/README.md`) is the trace where a
-publication never becomes a free.
+`TPUConnector`. The `trace_current_connector_*` theorems are the traces
+where, with the connector as it is, a publication never becomes a free.
 
 Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py` at
 tpu-inference `7ed46a6`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
@@ -134,8 +133,8 @@ every P outcome yields `finishedSending`, every D outcome yields
 same pass"). `contract_safe` proves that any connector satisfying it, under
 either failure policy, never leaks and never decodes unwritten KV;
 `connectorFixed` satisfies it (`fixed_contract`). The other three do not, and
-each has a trace: `trace_c1_p`, `trace_c1_d_abort_after`,
-`trace_c1_d_abort_before` (C1, the current connector), `trace_naive_decodes`
+each has a trace: `trace_current_connector_p`, `trace_current_connector_d_abort_after`,
+`trace_current_connector_d_abort_before` (the current connector), `trace_naive_decodes`
 (why the comment's fear was justified), `trace_loadErrorOnly_fail`,
 `trace_loadErrorOnly_recompute` (why the failure channel alone is not enough).
 Bounded search exhausts the state space for each configuration.
@@ -763,33 +762,33 @@ theorem trace_current_ok :
     some ⟨false, .finished, false, false, false⟩ := by
   decide
 
-/-- **C1, P side.** The send is published as failed — a push that failed, or
+/-- **Current connector, P side.** The send is published as failed — a push that failed, or
 one nobody pulled within `timeout_s` — and dropped by `get_finished()`; P keeps
 the blocks. `leakP_absorbing`: forever. -/
-theorem trace_c1_p :
+theorem trace_current_connector_p :
     ((sys (current .fail)).run [.pOutcome false]).map (fun s => (view s, leakP s)) =
     some (⟨true, .waitingRemoteKv, true, false, false⟩, true) := by
   decide
 
-/-- **C1, D side, abort after.** The pull fails, the report is dropped, the
+/-- **Current connector, D side, abort after.** The pull fails, the report is dropped, the
 request stays parked; "the request times out at the API layer instead"
 (`conn.py:644`) — and the abort defers the free to a `finished_recving` that
 will never come (`sched.py:2064-2066`). -/
-theorem trace_c1_d_abort_after :
+theorem trace_current_connector_d_abort_after :
     ((sys (current .fail)).run [.dOutcome false, .finish]).map (fun s => (view s, leakD s)) =
     some (⟨true, .finished, true, false, false⟩, true) := by
   decide
 
-/-- **C1, D side, abort before.** The client gives up while the pull is still
+/-- **Current connector, D side, abort before.** The client gives up while the pull is still
 running; the free is deferred; the pull then fails and the report is dropped. -/
-theorem trace_c1_d_abort_before :
+theorem trace_current_connector_d_abort_before :
     ((sys (current .fail)).run [.finish, .dOutcome false]).map (fun s => (view s, leakD s)) =
     some (⟨true, .finished, true, false, false⟩, true) := by
   decide
 
 /-- The same two D-side traces under the recompute policy: the policy never
 gets to act, because nothing reaches the scheduler. -/
-theorem trace_c1_d_recompute :
+theorem trace_current_connector_d_recompute :
     ((sys (current .recompute)).run [.dOutcome false]).map (fun s => (view s, leakD s)) =
     some (⟨true, .waitingRemoteKv, true, false, false⟩, true) ∧
     ((sys (current .recompute)).run [.finish, .dOutcome false]).map (fun s => (view s, leakD s)) =

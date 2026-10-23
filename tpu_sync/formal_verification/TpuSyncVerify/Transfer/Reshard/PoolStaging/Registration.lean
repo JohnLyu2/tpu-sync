@@ -8,7 +8,7 @@ namespace TpuSyncVerify.Transfer.Reshard.PoolStaging
 
 open TpuSyncVerify
 
-/-! ## Part III — Receive Registration Lifecycle & Risk R5 (`PoolReshardRegisterRecv`)
+/-! ## Part III — Receive Registration Lifecycle (`PoolReshardRegisterRecv`)
 
 We now model the interaction between `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
 `ReshardReceiveSession` (`ReshardReceiveSession::Create`,
@@ -18,7 +18,7 @@ and `PoolStagingStorage` across two registration policies:
   claims `uuid` via `base->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false)`
   before constructing the session and calling `AcquirePoolStagingLease`, rolling
   back the claim on lease failure (`session->ReleaseStaging(); base->UnregisterActivePlanDirect(plan.uuid()).IgnoreError();`).
-- `RegistrationPolicy.leaseBeforeReserve` (Finding F6 / Risk R5 mutant):
+- `RegistrationPolicy.leaseBeforeReserve` (mutant):
   `AcquirePoolStagingLease` runs before `RegisterActivePlanDirect` claims `uuid`,
   so a rejected duplicate registration's destructor releases the active session's
   staging lease. -/
@@ -157,7 +157,7 @@ def ActiveSessionsHoldLeases (s : RegState) : Bool :=
   s.activeSessions.all (fun (uuid, blocks) =>
     blocks.all (fun b => (s.arena.resolveBlockSlot uuid b).isSome))
 
-/-- **Risk R5 / Finding F6 Constructive Counterexample Trace
+/-- **Constructive counterexample trace for the `leaseBeforeReserve` mutant
 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, `ReshardReceiveSession::Create`, `ReshardReceiveSession::ReleaseStagingLocked`)**:
 Under the unreserved mutant `.leaseBeforeReserve`:
 1. Call 1 (`uuid = 7`, `blocks = [5]`) and Call 2 (duplicate `uuid = 7`,

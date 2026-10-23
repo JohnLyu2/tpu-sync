@@ -114,15 +114,13 @@ the proofs.
    - `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff <old_ref> <new_ref>`
      classifies every anchor across an upstream sync as `same`, `shift` (pure
      line-offset shift, body identical), `modified` (body changed between the
-     two commits — inspect the Lean model), or `FAIL` (anchor renamed/removed),
-     and `docs/upstream_rechecks.md` logs what changed.
-3. **Findings are frozen at confirmation.** The bug-hunt reports live outside
-   `tpu_sync/formal_verification/`, in the fork's `findings/README.md` and
-   `findings/filed_bugs.md`; each finding's body (`## Fn.`) is an immutable
-   historical record pinned to the commit where the finding was confirmed or
-   fixed, and only that README's `Summary` table and `History` section are
-   updated when upstream lands a fix. Documents here cite findings by number
-   (F1–F10, C1, R-A/R-B) and never link into `findings/`.
+     two commits — inspect the Lean model), or `FAIL` (anchor renamed/removed).
+3. **The corpus describes the code as it is.** Models, docs and docstrings
+   state what the current C++ does and what is proved about it. Behaviour
+   that upstream has since changed is not narrated as history; if it is
+   still instructive, it survives only as a named mutant or policy variant
+   ("what breaks without this guard"). Defect tracking — reports, reproducers,
+   filing status, fixes — is kept outside this directory.
 
 ## Assumptions
 

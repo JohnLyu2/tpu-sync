@@ -2,11 +2,9 @@
 
 `TpuSyncVerify/Controller/ReadRemote.lean` models the destination half of
 `RaidenController::ReadRemote` (`tpu_sync/core/controller/raiden_controller.cc`,
-pinned to the baseline commit in `tpu_sync/formal_verification/README.md` §Status). It is the
-model behind finding **F2** (bug-hunt report in the fork's `findings/`): a
-remote read can keep
-DMA-ing into the caller's destination blocks after the caller has been told the
-read failed.
+pinned to the baseline commit in `tpu_sync/formal_verification/README.md` §Status). It
+shows that a remote read can keep DMA-ing into the caller's destination blocks
+after the caller has been told the read failed.
 
 ## What is modelled
 
@@ -23,7 +21,7 @@ exhausts it: `.safe` here is a proof, not a bound.
 | `Impl` | Acquire callback | Deadline |
 |---|---|---|
 | `shipping` | issues `TransferBuffers(src_buffers, dst_buffers, staging_buffers)` in `RaidenController::PullAndRelease` unconditionally | `std::thread([state, deadline = RemoteReadDeadline()] { ... })` in `RaidenController::ReadRemote` calls `state->Settle(DeadlineExceededError(...))` |
-| `checkSettledBeforePull` | skips the pull if already settled (the fork's `findings/candidate_fixes.patch`) | settles |
+| `checkSettledBeforePull` | candidate fix: skips the pull if already settled | settles |
 | `deferSettleWhilePullInFlight` | as above | does not settle while a pull is in flight; the pull's completion settles — what the sibling `WriteRemote` path already does (`kv_cache_store_service.cc` `DeadlineLoop`) |
 
 ## Property
@@ -47,10 +45,9 @@ this by the `if (to_hbm)` comment in `RaidenController::PullAndRelease`
 | `trace_teardown_before_acquire` | `[shutdown, acquireReply true, callerReuse]` — controller torn down before acquire reply settles with `Cancelled` without issuing a pull (`pullIssued = false`, `violates = false`) |
 | `trace_teardown_during_pull` | `[acquireReply true, shutdown, pullDone, callerReuse]` — controller torn down during pull still completes and settles cleanly (`pullDone = true`, `violates = false`) |
 
-Shape A is confirmed on unmodified code by
-`BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` (the fork's
-`findings/raiden_controller_bughunt_test.cc`); shape B is the case the deadline
-exists for and has no deterministic test. The deferred-settle design's cost
+Shape A is deterministic (the acquire reply can be delayed until after the
+deadline); shape B is the case the deadline exists for and has no
+deterministic test. The deferred-settle design's cost
 is that a hung pull holds the caller until it resolves; a complete fix needs
 cancellation, or settle-with-error while the blocks stay quarantined.
 
@@ -60,10 +57,9 @@ The `ReadRemote` implementation in `tpu_sync/core/controller/raiden_controller.c
 (`ctrl.cc`), its unit tests in `tpu_sync/core/controller/raiden_controller_test.cc`
 (`ctrl_test.cc`, `bazel test //tpu_sync/core/controller:raiden_controller_test`)
 map to `ReadRemote.lean` as follows (line ranges resolved by
-`tools/resolve_anchors.py`); the fork's bug-hunt reproducer
-`BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` replays shape A
-(`[.deadline, .callerReuse, .acquireReply true]`, i.e. `shipping_lateIssue`,
-`shipping_counterexample`, `naive_fix_closes_lateIssue`):
+`tools/resolve_anchors.py`); shape A is
+`[.deadline, .callerReuse, .acquireReply true]`, i.e. `shipping_lateIssue`,
+`shipping_counterexample`, `naive_fix_closes_lateIssue`:
 
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines | Lean theorem | Notes |
@@ -91,6 +87,4 @@ map to `ReadRemote.lean` as follows (line ranges resolved by
 | | |
 |---|---|
 | Citations | baseline commit in [`tpu_sync/formal_verification/README.md` §Status](../../README.md#status-whats-covered) (the `ReadRemote` region of `raiden_controller.cc` is unchanged since `1fa06d1`, shifted +6 lines by `9ac3d3e`) |
-| Reproducers and patches | in the fork's `findings/` (report F2): shapes A and B last run 2026-10-20 against controller sources from `449b591`; `build_targets.patch` and `candidate_fixes.patch` (F2 shape A only) apply clean at the baseline commit |
-| Upstream fix | none for F2 at the baseline commit (2026-10-22); F1 fixed in `b3ea4dc`, F4 in `72255dd`, F6 in `8653373`, F7 in `fdeebcd` |
 

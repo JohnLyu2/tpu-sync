@@ -1,4 +1,4 @@
-# Lean 4 Formalization & Formal-Backed Code-Reasoning Agent
+# Lean 4 Formalization
 
 TPU Sync moves KV-cache blocks across TPU HBM, host DRAM staging pools, and
 network peers using asynchronous callbacks and lock-scoped state machines. This
@@ -10,13 +10,6 @@ code-to-model reference docs (`docs/`); and the tools that keep the citations
 honest (`tools/`). It is self-contained: everything it refers to is either in
 this directory or in `tpu_sync/`.
 
-The bug-hunt reports the models produced (findings **F1–F10**, **C1**,
-**R-A/R-B**, with their C++ reproducers and candidate patches), the Typst
-slides, and the `tpu-sync-lean-helper` code-reasoning agent that answers
-questions against these models live outside this directory, at the root of
-the fork repository (`findings/`, `slides/`, `agents/` in github.com/JohnLyu2/tpu-sync).
-This directory refers to findings by number only.
-
 ## Status & What's Covered
 
 The formal models (`TpuSyncVerify/`) and design docs (`docs/`) are pinned to
@@ -26,14 +19,13 @@ GTest `Suite.TestName`s; exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables generated and
 verified from the C++ source tree by
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py). The two external
-callers that `Caller.lean` and finding C1 cite are pinned separately, to the
-pair `examples/*_disagg/setup.sh` installs: tpu-inference `7ed46a6`, vLLM
-`6185d73`. (The bug-hunt reports themselves are frozen at the commit where each
-finding was confirmed; see the fork's `findings/README.md`.)
+callers that `Caller.lean` cites are pinned separately, to the pair
+`examples/*_disagg/setup.sh` installs: tpu-inference `7ed46a6`, vLLM
+`6185d73`.
 
 | Subsystem | What Is Modeled & Proved | Lean Models | Design & Proof Doc |
 |---|---|---|---|
-| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, cross-peer fault isolation, the transport's receiver-side stream accounting (`Transport.lean`), and the engine above `poll_stats()` — vLLM's scheduler through tpu-inference's connector, the other direction of the engine contract and the model behind finding C1 (`Caller.lean`) | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
+| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, cross-peer fault isolation, the transport's receiver-side stream accounting (`Transport.lean`), and the engine above `poll_stats()` — vLLM's scheduler through tpu-inference's connector, the other direction of the engine contract (`Caller.lean`) | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
 | **Pool Resharding** | Multi-pool send/receive sessions, rank-ordered H2D waves, sub-block byte-interval coverage, `PoolStagingStorage` arena leases, block registry, and two-stage coordinator barriers | [`TpuSyncVerify/Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/) | [reshard.md](docs/transfer/reshard.md) |
 | **Controller & Remote Leases** | Remote read lease lifecycle and `NoWriteAfterRelease` safety via exhaustive state-space exploration | [`TpuSyncVerify/Controller/ReadRemote.lean`](TpuSyncVerify/Controller/ReadRemote.lean) | [read_remote.md](docs/controller/read_remote.md) |
 
@@ -51,7 +43,7 @@ finding was confirmed; see the fork's `findings/README.md`.)
   [`TpuSyncVerify/Common/`](TpuSyncVerify/Common/).
 - **Tools (`tools/`):** [`resolve_anchors.py`](tools/resolve_anchors.py)
   (source-map resolution and drift check) and the ad hoc Lean counterfactual
-  runner [`run_lean.sh`](tools/run_lean.sh) used by the code-reasoning agent.
+  runner [`run_lean.sh`](tools/run_lean.sh).
 
 ## Building & Verifying
 

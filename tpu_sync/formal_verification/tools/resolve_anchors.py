@@ -106,7 +106,6 @@ NO_MAP_FILES = {
     "TpuSyncVerify/Common/ModelCheck.lean",
     "TpuSyncVerify/Common/System.lean",
     "docs/conventions.md",
-    "docs/upstream_rechecks.md",
 }
 
 
@@ -781,7 +780,7 @@ def main():
         # and are only checked for stray citations.
         is_part = os.path.isfile(os.path.dirname(src) + ".lean")
         if not has_begin and (rel in NO_MAP_FILES or is_part):
-            if rel not in ("docs/conventions.md", "docs/upstream_rechecks.md"):
+            if rel != "docs/conventions.md":
                 totals["stray"] += check_stray_citations(src, rel)
             continue
         checked_files += 1

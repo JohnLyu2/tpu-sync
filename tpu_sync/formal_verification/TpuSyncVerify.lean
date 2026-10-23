@@ -38,15 +38,14 @@ subsystem of `tpu_sync/` they describe:
   `MultiRequest`, `PipelineChecks`), the transport's receiver-side stream
   accounting behind `Receive` A1/A4 (`Transport`), the engine above
   `poll_stats()` — vLLM's scheduler through tpu-inference's connector, the
-  other direction of `Pipeline` A4 and the model behind finding C1
-  (`Caller`) — multi-peer fault isolation (`PeerIsolation`),
+  other direction of `Pipeline` A4 (`Caller`) — multi-peer fault isolation (`PeerIsolation`),
   UUID registration table (`UuidTable`), and block-level gather/reordering/coalescing
   (`BlockOrdering`); and under `Transfer.Reshard` the pool-addressed resharding
   path (`Receive`, `Send`, `Pipeline`, `Coverage`, `PoolStaging`, `Registry`,
   `Coordinator`) of `docs/transfer/reshard.md`.
 * `Controller` — `RaidenController` (`tpu_sync/core/controller`).
-  `Controller.ReadRemote` is the exhaustive check behind finding F2 (bug-hunt
-  reports live in the fork, see `README.md`).
+  `Controller.ReadRemote` is the exhaustive check of the destination-side
+  settle protocol of `RaidenController::ReadRemote`.
 
 Citations are to the single baseline commit stated in `README.md` §Status;
 exact line spans live in each module's source map, checked by
