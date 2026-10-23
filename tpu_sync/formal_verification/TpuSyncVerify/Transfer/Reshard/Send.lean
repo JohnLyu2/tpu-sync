@@ -13,7 +13,6 @@ One `ReshardSendSession` on the producer side and the slice of
 sessions live in `Reshard/Receive.lean`; multi-sender stream counting and
 aliased-page contents compose both in `Reshard/Pipeline.lean`.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 In the source-map table below, `reshard_send.h` and `reshard_send.cc` are
 `tpu_sync/kv_cache/reshard_send_session.{h,cc}`; `reshard_recv.cc` is
 `tpu_sync/kv_cache/reshard_receive_session.cc`; `slots.cc` is

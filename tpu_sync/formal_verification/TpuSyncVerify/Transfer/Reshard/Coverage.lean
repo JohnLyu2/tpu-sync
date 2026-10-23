@@ -19,7 +19,6 @@ byte-interval coverage and multi-sender push-stream accounting:
   `BlockTransport::HandleIncomingPush` / `BlockTransport::CompleteIncomingPush`
   plan-declared progress counter)
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 File aliases used in the source map below:
 `reshard_recv.cc` (`tpu_sync/kv_cache/reshard_receive_session.cc`),
 `planner.{h,cc}` (`tpu_sync/kv_cache/reshard/pool_reshard_planner.{h,cc}`),

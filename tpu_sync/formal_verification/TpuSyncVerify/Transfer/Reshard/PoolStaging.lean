@@ -11,7 +11,6 @@ Formal model and proofs of bounded host staging (`PoolStagingStorage`) and
 per-UUID page-lease lifecycle in `KVCacheManagerBase` and
 `KVCacheManagerWithTransfer`.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 `base.h`/`base.cc` are `tpu_sync/kv_cache/kv_cache_manager_base.{h,cc}`;
 `mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`;
 `reshard_recv.h`/`reshard_recv.cc` are

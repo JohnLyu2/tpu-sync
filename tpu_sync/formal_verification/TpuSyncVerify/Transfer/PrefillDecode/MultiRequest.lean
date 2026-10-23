@@ -3,8 +3,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 /-!
 # Multi-request system and top-level properties across requests
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status; the
-C++ names below are those of `Pipeline.lean`, which this module composes.
+The C++ names below are those of `Pipeline.lean`, which this module composes.
 
 Multiple requests $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run
 concurrently and recycle the four memories (`prefillHbm`, `prefillStaging`,

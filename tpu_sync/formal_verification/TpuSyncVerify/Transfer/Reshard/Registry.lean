@@ -11,7 +11,6 @@ state machine that manages `(req_id, uuid)` producer block generations across
 registration, multi-owner planning claims, claim abandonment, per-unit
 completion voting, and unclaimed cancellation tombstones.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 File aliases used in the source map below:
 `reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`).
 

@@ -14,7 +14,6 @@ One `ReshardReceiveSession` on the destination (consumer) side and the slice of
 Sender sessions, multi-sender stream counting, and aliased-page memory contents
 are modelled in `Reshard/Send.lean` and `Reshard/Pipeline.lean`.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 `reshard_recv.h`/`reshard_recv.cc` are
 `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`; `mgr.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is

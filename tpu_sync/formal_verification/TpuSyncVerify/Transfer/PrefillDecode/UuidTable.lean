@@ -20,7 +20,6 @@ UUIDs, and session retries (`KVCacheManagerWithTransfer::NotifyForRead`,
 `ControlHandshakeTest.DuplicateReceiveDoesNotReplaceOrLeakFirstRead` and
 `ControlHandshakeTest.RepeatedReceiveAnnouncementIsIdempotent` in
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc`).
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 
 ## Source map
 

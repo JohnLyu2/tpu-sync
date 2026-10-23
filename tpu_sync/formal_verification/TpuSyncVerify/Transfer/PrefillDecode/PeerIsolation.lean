@@ -6,8 +6,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 
 Models a decode consumer (`KVCacheManagerWithTransfer`) pulling KV caches from
 multiple prefill producers concurrently (`Peer.sick` vs. `Peer.healthy`) across
-the two finite consumer resources shared by `StartRead`. Citations are to the
-baseline commit in `tpu_sync/formal_verification/README.md` §Status; `mgr.cc` is
+the two finite consumer resources shared by `StartRead`. `mgr.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`, `recv.cc` is
 `tpu_sync/kv_cache/transfer_receive_session.cc`, `arena.cc` is
 `tpu_sync/core/staging_arena.cc`, and `control_test.cc` is

@@ -15,7 +15,6 @@ engine is told `done_recving`, its HBM holds the prefill's KV cache. Buffer
 safety properties (prefill HBM reclaimed, staging released) follow as
 corollaries of the sessions' settle protocol and are stated here too.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 `send.cc` is `tpu_sync/kv_cache/transfer_send_session.cc`; `recv.cc` is
 `tpu_sync/kv_cache/transfer_receive_session.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`; `mgr.cc` is

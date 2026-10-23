@@ -6,8 +6,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive
 An audit of `TransferReceiveSession::IsReadyToComplete` and of the manager's
 poll that acts on it (`KVCacheManagerWithTransfer::CompleteReadWithDetails`,
 `if (session->IsReadyToComplete()) { ... session->Finish(); }`), on the receive
-model of `Receive.lean`. Citations are to the baseline commit in
-`tpu_sync/formal_verification/README.md` §Status; abbreviations as in `Receive.lean` (`send.cc`
+model of `Receive.lean`. Abbreviations as in `Receive.lean` (`send.cc`
 is `tpu_sync/kv_cache/transfer_send_session.cc`). Exact line ranges for every
 symbol and sub-block are in the generated `## Source map` table below.
 

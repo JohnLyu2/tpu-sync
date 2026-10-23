@@ -1,8 +1,7 @@
 # Prefill-to-decode transfer: model and results
 
 Canonical code-to-model reference for the prefill-to-decode KV-cache transfer
-subsystem under `TpuSyncVerify/Transfer/`. Citations are to the baseline commit
-in [tpu_sync/formal_verification/README.md](../../README.md) §Status.
+subsystem under `TpuSyncVerify/Transfer/`.
 
 This file is the short map: routing from C++ to the owning Lean module, what is
 proved, the model boundaries, the assumptions and the mutants. Each `trace_*`

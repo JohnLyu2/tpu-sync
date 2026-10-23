@@ -18,7 +18,7 @@ through between source and destination HBM — including **aliased device pages*
 shared across pool ranks (`pool_order_ranks_` in `ReshardReceiveSession`,
 `D2hPoolBlocks` / `H2dPoolBlocks` in `KVCacheManagerBase`).
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status:
+File aliases used in the source map below:
 * `reshard_send.cc` — `tpu_sync/kv_cache/reshard_send_session.cc`
 * `slots.cc` — `tpu_sync/core/pool_reshard_send_slots.cc`
 * `reshard_recv.h` / `reshard_recv.cc` — `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`

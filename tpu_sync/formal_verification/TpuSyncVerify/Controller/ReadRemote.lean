@@ -10,7 +10,6 @@ system, checked exhaustively. Seven booleans, every event fires at most once,
 so `ModelCheck.check` visits the *whole* reachable state space: `.safe` here is
 a verification result, not a bounded one.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 File aliases used in the source map below:
 `ctrl.cc` (`tpu_sync/core/controller/raiden_controller.cc`),
 `ctrl_test.cc` (`tpu_sync/core/controller/raiden_controller_test.cc`).

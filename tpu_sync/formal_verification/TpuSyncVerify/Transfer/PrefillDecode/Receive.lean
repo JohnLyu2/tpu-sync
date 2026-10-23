@@ -16,7 +16,6 @@ with the transport's block accounting, the readiness predicate
 `failed_recving`. Layer data, memory contents and the producer are modelled in
 `Send.lean` and `Pipeline.lean`.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 `recv.h`/`recv.cc` are `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`;
 `mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`. Exact line ranges for every symbol,

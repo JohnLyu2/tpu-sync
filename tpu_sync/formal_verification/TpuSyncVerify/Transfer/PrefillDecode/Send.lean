@@ -14,7 +14,6 @@ drives it. The sender stages each layer's device blocks into host staging
 let the engine reuse the device blocks, or the allocator reseat the staging,
 while any copy or push is still running. Memory contents are in `Pipeline.lean`.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 `send.h`/`send.cc` are `tpu_sync/kv_cache/transfer_send_session.{h,cc}`;
 `mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`. Exact line ranges for every symbol,

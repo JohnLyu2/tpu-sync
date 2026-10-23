@@ -11,7 +11,6 @@ Formal model of two-stage `ReshardCoordinator::ExecutePoolReshard`
 orchestration (`tpu_sync/kv_cache/reshard/reshard_coordinator.{h,cc}`)
 composed with `RequestBlockRegistry` (`TpuSyncVerify.Transfer.Reshard.Registry`).
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 `coord.h`/`coord.cc` are `tpu_sync/kv_cache/reshard/reshard_coordinator.{h,cc}`;
 `mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`;
 `reshard_recv.cc` is `tpu_sync/kv_cache/reshard_receive_session.cc`;

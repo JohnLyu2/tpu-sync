@@ -8,7 +8,6 @@ import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering.Traces
 /-!
 # Within-Layer Block-Index Gather, Reordering, Subset Validation & Custom Host Staging
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status;
 `send.cc`, `recv.cc`, `bt.cc` and `mgr.cc` abbreviate as in `Pipeline.lean`.
 
 ## Source map

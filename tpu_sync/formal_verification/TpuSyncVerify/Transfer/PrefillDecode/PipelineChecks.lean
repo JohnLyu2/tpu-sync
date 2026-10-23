@@ -12,8 +12,7 @@ still running; bounded searches on the one- and two-layer instances; and
 mutants that show the memory model is sensitive to the guards the proof rests
 on, including the per-layer ones.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status;
-abbreviations as in `Pipeline.lean`. Exact line ranges for every symbol,
+Abbreviations as in `Pipeline.lean`. Exact line ranges for every symbol,
 sub-block, and test are in the generated `## Source map` table below.
 
 ## Source map

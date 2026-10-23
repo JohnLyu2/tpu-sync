@@ -1,8 +1,7 @@
 # `ReadRemote`: destination-side settle protocol
 
 `TpuSyncVerify/Controller/ReadRemote.lean` models the destination half of
-`RaidenController::ReadRemote` (`tpu_sync/core/controller/raiden_controller.cc`,
-pinned to the baseline commit in `tpu_sync/formal_verification/README.md` §Status). It
+`RaidenController::ReadRemote` (`tpu_sync/core/controller/raiden_controller.cc`). It
 shows that a remote read can keep DMA-ing into the caller's destination blocks
 after the caller has been told the read failed.
 
@@ -81,10 +80,3 @@ map to `ReadRemote.lean` as follows (line ranges resolved by
 | `ctrl_test.cc` | `ReadRemotePullTest.RevokedVerdictFailsTheRead` | `:835-855` | `trace_full_success` | Pull completes (`pullDone`), lease release returns `REVOKED`, settles with `FailedPrecondition` |
 | `ctrl_test.cc` | `ReadRemotePullTest.ControllerTeardownMidReadIsSafe` | `:857-882` | `trace_teardown_before_acquire`, `trace_teardown_during_pull` | Controller destroyed either before `acquireReply` (skips pull, settles `Cancelled`) or during `pullInFlight` (finishes pull via shared state and settles) |
 <!-- source-map:end -->
-
-## Status
-
-| | |
-|---|---|
-| Citations | baseline commit in [`tpu_sync/formal_verification/README.md` §Status](../../README.md#status-whats-covered) (the `ReadRemote` region of `raiden_controller.cc` is unchanged since `1fa06d1`, shifted +6 lines by `9ac3d3e`) |
-

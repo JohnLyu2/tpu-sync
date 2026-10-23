@@ -12,7 +12,6 @@ assumption `Receive.lean` calls **A1** ("one dispatch per layer") and the
 coarsening behind **A4** ("a layer's blocks are accounted once its copy is
 issued"), and to state exactly what they rest on.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 Abbreviations: `bt.cc` = `tpu_sync/transport/block_transport.cc`, `bt.h` =
 `tpu_sync/transport/block_transport.h`, `recv.cc` =
 `tpu_sync/kv_cache/transfer_receive_session.cc`, `mgr.cc` =

@@ -8,7 +8,6 @@ The settle protocol shared by TPU Sync's session classes
 set by whichever of `Finish` or the last `EndRecvOp`/`EndSendOp`/`EndOp` comes
 second. The session owns its host staging until it settles.
 
-Citations are to the baseline commit in `tpu_sync/formal_verification/README.md` §Status.
 `recv.h`/`recv.cc` are `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`;
 `send.h`/`send.cc` are `tpu_sync/kv_cache/transfer_send_session.{h,cc}`. Exact
 line ranges for every symbol and sub-block are in the generated `## Source map`

@@ -22,8 +22,7 @@ tpu-inference `7ed46a6`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
 `mixin.py` = `vllm/v1/worker/kv_connector_model_runner_mixin.py`,
 `kvcfg.py` = `vllm/config/kv_transfer.py`, all at vLLM `6185d73` (the pair
 `examples/*_disagg/setup.sh` pins); `mgr.cc` =
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` at the baseline commit in
-`tpu_sync/formal_verification/README.md` §Status.
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`.
 
 ## Source map
 
