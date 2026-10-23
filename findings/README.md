@@ -87,7 +87,7 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
 | F7 | `end_incoming_push` hook: a failed incoming push on a `ReshardReceiveSession` is not turned into `Finish(status)` (the `TransferReceiveSession` branch does), so the session, its staging lease and plan claim stay pinned until the deadline sweep, which reports `DEADLINE_EXCEEDED` instead of the push error ([filed](filed_bugs.md#3-reshardreceivesession-ignores-a-failed-endincomingpush-and-pins-poolstagingstorage-until-timeout-r1); R1 in `verification/docs/transfer/reshard.md`) | CONFIRMED (read) at `0ac16d1`, witnessed in Lean (`Receive.lean`); **FIXED upstream** in `fdeebcd` (2026-10-16) | yes: any pool-reshard receiver whose sender's push fails mid-transfer (socket timeout / disconnect) |
 | F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `verification/docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
 | F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `verification/docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
-| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape, reopened on the sender) (R6 in `verification/docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `2ed6f8f`); not yet filed | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
+| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape on the sender; early unregister since `FinishPoolReshardSend` before `1673c9b`, lease-aliasing window since `3d1b5d4`) (R6 in `verification/docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `2ed6f8f`); **filed 2026-10-23** (bug 9 in `filed_bugs.md`) | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
 | C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_c1_*`, leaks absorbing, `contract_safe` for the fix); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet) | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
@@ -652,9 +652,9 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   build on this machine); `RecordPushCompletion`, `Create`'s
   register-before-lease order, `AcquirePoolStagingLease` /
   `ReleasePoolStagingLeases` and `UnregisterActivePlanDirect` are unchanged
-  through upstream `449b591` (the session's later diffs are data-connection
+  through upstream `2ed6f8f` (the session's later diffs are data-connection
   reuse and the `StagingBlockAllocator` → `KVCacheManagerBase` forwarding move).
-  Not yet filed. Output, verbatim (the test asserts the defect, so it passes
+  **Filed upstream 2026-10-23** (bug 9 in [`filed_bugs.md`](filed_bugs.md)). Output, verbatim (the test asserts the defect, so it passes
   on unmodified code):
   ```
   [ RUN      ] ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6
@@ -670,6 +670,14 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   `:383`) regardless of `in_flight_`. `EndOp` (`:418-440`) already unregisters
   when the last op of a finalizing send is counted out, so the early call is
   redundant on the success path and only differs when siblings are in flight.
+- **History and attribution:** the early `UnregisterActivePlan` on the first
+  failed push predates the `ReshardSendSession` extraction (`1673c9b`,
+  2026-09-19; it was already in `FinishPoolReshardSend` at `674e7fb`). Before
+  `3d1b5d4` (2026-09-24) `ReleasePoolStagingLeases(uuid)` also ran on the first
+  failure; `3d1b5d4` moved the lease release to `SettleLocked` (and added
+  `EndOp`'s settle-time unregister) without removing `RecordPushCompletion`'s
+  first-failure unregister, opening the lease-aliasing window between the first
+  failed push and settle.
 - **Sequence shown by the test** (bounded staging, `staging_leases = 2`,
   one source block, two destination peers so `remaining_pool_peer_pushes = 2`):
   1. Session A: `Create` registers plan `uuid`; its lease takes one slot
@@ -1329,3 +1337,6 @@ clone reset. Results, verbatim:
   `host_offload_backend.cc` / `kv_cache_store_service.cc`). F5's test is still
   `DISABLED_`. Citations re-pinned to `2ed6f8f`. Filed tally: F1 (fixed),
   F2+F3, F4 (fixed), F6 (fixed), F7 (fixed), F8, F9, C1.
+- 2026-10-23: **F10 (R6) filed upstream** (write-up as bug 9 in
+  `filed_bugs.md`, pinned to `2ed6f8f`). Filed tally: F1 (fixed), F2+F3, F4
+  (fixed), F6 (fixed), F7 (fixed), F8, F9, F10, C1.

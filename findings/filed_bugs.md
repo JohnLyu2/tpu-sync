@@ -3,7 +3,8 @@
 Code references below are against [`google/tpu-sync` @ `50b0774`](https://github.com/google/tpu-sync/tree/50b0774a62dd96b9aab580546fbf70a9443ce16c)
 for bug 1, [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tree/1fa06d1f44345369f4327079828ec6c4989d6694) for bug 2,
 and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1) for bugs 3–6,
-and [`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) for bug 7.
+[`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) for bug 7,
+and [`google/tpu-sync` @ `2ed6f8f`](https://github.com/google/tpu-sync/tree/2ed6f8f) for bug 9.
 Bug 8 is a caller-side defect and cites
 [`vllm-project/tpu-inference` @ `c2b062b`](https://github.com/vllm-project/tpu-inference/tree/c2b062b),
 [`vllm-project/vllm` @ `5ab4e44`](https://github.com/vllm-project/vllm/tree/5ab4e44)
@@ -11,7 +12,7 @@ and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac1
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
 the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2, `0ac16d1` for
-bugs 3–6, `449b591` for bug 7, the three pins above for bug 8) and are not re-pinned on upstream syncs; the only edits are the italic
+bugs 3–6, `449b591` for bug 7, the three pins above for bug 8, `2ed6f8f` for bug 9) and are not re-pinned on upstream syncs; the only edits are the italic
 *Update* sentences and one internal tooling word replaced by "with the fix".
 Status updates go in [README.md](README.md) (§Summary, §History).
 
@@ -234,3 +235,28 @@ Confirmed by a CPU unit test driving the real vLLM `Scheduler` and connector cla
 Forward `failed_recving` instead of dropping it: failed sends as `finished_sending`, failed receives via [`get_transfer_results`](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L401-L409) so vLLM recomputes rather than decodes.
 
 Reproducer: [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py). The tpu-sync side (`4246613`'s reclassification and the `failed_recving` naming) is an improvement request, not filed as a defect; see README §C1 "tpu-sync side".
+
+
+---
+
+## 9. `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the first failed push while sibling pushes are still in flight (F10 / R6)
+
+Filed 2026-10-23. Permalinks: [`google/tpu-sync` @ `2ed6f8f`](https://github.com/google/tpu-sync/tree/2ed6f8f).
+
+[`ReshardSendSession::RecordPushCompletion`](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/reshard_send_session.cc#L351-L392) calls `UnregisterActivePlan(uuid_)` as soon as the **first** push of a pool reshard send fails, while the session's other pushes are still in flight. On the success path the plan stays registered until the last push completes; on failure it is dropped immediately, so for the rest of the drain the uuid has no plan and is free to be re-registered.
+
+**Cause**
+- On `!status.ok()` the function latches `finalizing_` and sets `should_unregister` regardless of `in_flight_` ([L360-372](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/reshard_send_session.cc#L360-L372)), then unregisters ([L383](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/reshard_send_session.cc#L383)). The success branch unregisters only when `--remaining_pool_peer_pushes_ == 0` ([L368-370](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/reshard_send_session.cc#L368-L370)).
+- [`EndOp`](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/reshard_send_session.cc#L418-L440) already unregisters a finalizing send on its last op, so the early call is redundant except when siblings are in flight.
+- The uuid's host staging lease is keyed by uuid and acquired idempotently ([`AcquirePoolStagingLease`](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/kv_cache_manager_base.cc#L2097-L2115), copy-on-write at [L2134-2136](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/kv_cache_manager_base.cc#L2134-L2136)); it is released only when the session settles ([`SettleLocked` → `ReleaseLeasesLocked`](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/reshard_send_session.cc#L470-L481) → [`ReleasePoolStagingLeases`](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/kv_cache_manager_base.cc#L2147-L2163)). `Create` registers the plan before any lease is taken ([L141-142](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/reshard_send_session.cc#L141-L142)), and the only thing that refuses a duplicate uuid is [`RegisterActivePlan`'s `ALREADY_EXISTS`](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/kv_cache_manager_base.cc#L3158-L3166).
+
+**Impact**
+- *Siblings in flight resolve against no plan.* [`GetBlockChunks`](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/kv_cache_manager_base.cc#L3233-L3244) looks the uuid up in `active_plans_`; after the early unregister a sibling's chunk resolution ([L3299-L3325](https://github.com/google/tpu-sync/blob/2ed6f8f/tpu_sync/kv_cache/kv_cache_manager_base.cc#L3299-L3325)) finds nothing (bounded storage: no chunks; full mirror: falls back to un-sliced whole-block extents). Reached by any multi-pool / multi-peer send whose first failure has siblings outstanding.
+- *A same-uuid retry is seated on the draining session's staging.* With the plan gone, a retry `Create` for the same uuid succeeds instead of `ALREADY_EXISTS`, its `AcquirePoolStagingLease(uuid)` returns the old session's slots, and when the old session's last push returns and it settles, `ReleasePoolStagingLeases(uuid)` frees those slots under the live retry; the next transfer is leased the same slot while the retry still stages into it. This needs a same-uuid re-coordination while the failed send drains, which the current engine callers do not do, so this half is latent today.
+
+Confirmed by a unit test. Found during Lean formalization.
+
+**Proposed fix**
+Drop the early `UnregisterActivePlan` in `RecordPushCompletion` (keep `finalizing_` / `status_`); `EndOp` already unregisters at settle.
+
+Reproducer: `ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6` in [`reshard_send_session_bughunt_test.cc`](reshard_send_session_bughunt_test.cc).
