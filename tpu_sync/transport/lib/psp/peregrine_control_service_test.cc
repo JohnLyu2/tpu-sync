@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/transport/lib/peregrine_control_service.h"
+#include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
 
 #include <cstddef>
 #include <cstdint>

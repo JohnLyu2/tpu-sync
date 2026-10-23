@@ -280,7 +280,6 @@ cc_test(
     deps = [
         ":chunk",
         ":chunk_serializer",
-        ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
         "//tpu_sync/fault_injection:hooks",
@@ -288,6 +287,7 @@ cc_test(
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib/conn:pool",
+        "//tpu_sync/transport/lib/psp:peregrine_control_service",
         "//tpu_sync/transport/lib/psp:psp_syscall_mock",
         "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
@@ -309,43 +309,5 @@ cc_test(
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api/v1:conn_util",
         "@peregrine//peregrine/src/api/v1:socket_util",
-    ],
-)
-
-cc_library(
-    name = "peregrine_control_service",
-    hdrs = ["peregrine_control_service.h"],
-    deps = [
-        ":raw_buffer_transport",
-        "//tpu_sync/common:grpc_util",
-        "@com_github_grpc_grpc//:grpc++",
-        "@com_google_absl//absl/status:statusor",
-        "@peregrine//peregrine/src/internal/control:message_cc_proto",
-        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
-        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
-    ],
-)
-
-cc_test(
-    name = "peregrine_control_service_test",
-    srcs = ["peregrine_control_service_test.cc"],
-    copts = [
-        "-fno-strict-aliasing",
-        "-fexceptions",
-    ],
-    features = ["-use_header_modules"],
-    deps = [
-        ":peregrine_control_service",
-        ":raw_buffer_transport",
-        ":raw_buffer_transport_delegate",
-        "//tpu_sync/transport/lib/psp:psp_syscall_mock",
-        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
-        "@com_github_grpc_grpc//:grpc++",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/internal/control:message_cc_proto",
-        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
-        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
     ],
 )

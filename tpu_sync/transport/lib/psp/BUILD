@@ -83,3 +83,41 @@ cc_library(
         "@com_google_absl//absl/synchronization",
     ],
 )
+
+cc_library(
+    name = "peregrine_control_service",
+    hdrs = ["peregrine_control_service.h"],
+    deps = [
+        "//tpu_sync/common:grpc_util",
+        "//tpu_sync/transport/lib:raw_buffer_transport",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/status:statusor",
+        "@peregrine//peregrine/src/internal/control:message_cc_proto",
+        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
+        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
+    ],
+)
+
+cc_test(
+    name = "peregrine_control_service_test",
+    srcs = ["peregrine_control_service_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        "psp_syscall_mock",
+        "tcp_psp_helper",
+        ":peregrine_control_service",
+        "//tpu_sync/transport/lib:raw_buffer_transport",
+        "//tpu_sync/transport/lib:raw_buffer_transport_delegate",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/internal/control:message_cc_proto",
+        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
+        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
+    ],
+)

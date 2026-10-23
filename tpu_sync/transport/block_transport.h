@@ -41,7 +41,7 @@
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/metrics/transport_metrics_exporter.h"
-#include "tpu_sync/transport/lib/peregrine_control_service.h"
+#include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 
 namespace tpu_raiden {
