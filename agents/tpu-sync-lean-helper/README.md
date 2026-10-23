@@ -4,7 +4,7 @@
 1. **Answer questions about how the code works and what it guarantees**: Explain session lifecycles, buffer/HBM ownership, protocol invariants, and boundary assumptions using the Lean model, including why specific checks or locks exist and what races they prevent.
 2. **Check whether a proposed code change is safe**: Evaluate a C++ diff or "what-if" change (such as relaxing a check, reordering operations, or changing a state update) against the formal model, and run the Lean verifier on the modified logic to either **find a concrete multi-threaded race trace that breaks safety** or **mathematically prove that the invariants still hold**.
 
-Under the hood, the subagent pairs live C++ code inspection with **`TpuSyncVerify`** ([`verification/`](../../verification/)), a Lean 4 formal verification suite that models TPU Sync's state machines, buffer ownership lifecycles, and concurrency invariants (currently supporting the symmetric prefill-to-decode KV-cache transfer subsystem). Unlike a standard AI assistant that reasons informally and can easily miss subtle multi-threaded interleavings, `tpu-sync-lean-helper` backs its answers with machine-checked proofs and exhaustive state exploration—clearly distinguishing between **what is mathematically guaranteed**, **what depends on external callers or lower layers (like the Python orchestrator or TCP/RDMA transport)**, and **what lies outside the model**.
+Under the hood, the subagent pairs live C++ code inspection with **`TpuSyncVerify`** ([`tpu_sync/formal_verification/`](../../tpu_sync/formal_tpu_sync/formal_verification/)), a Lean 4 formal verification suite that models TPU Sync's state machines, buffer ownership lifecycles, and concurrency invariants (currently supporting the symmetric prefill-to-decode KV-cache transfer subsystem). Unlike a standard AI assistant that reasons informally and can easily miss subtle multi-threaded interleavings, `tpu-sync-lean-helper` backs its answers with machine-checked proofs and exhaustive state exploration—clearly distinguishing between **what is mathematically guaranteed**, **what depends on external callers or lower layers (like the Python orchestrator or TCP/RDMA transport)**, and **what lies outside the model**.
 
 To use this agent, engineers do not need to know Lean 4 or formal methods: you ask questions about the C++ code, and the agent handles all Lean verification behind the scenes and reports back in **C++ terms**.
 
@@ -14,7 +14,7 @@ To use this agent, engineers do not need to know Lean 4 or formal methods: you a
 
 ## Scope
 
-The formal model used by this agent currently covers the prefill-to-decode KV-cache transfer subsystem within three boundaries (see [`verification/docs/transfer/prefill_decode.md`](../../verification/docs/transfer/prefill_decode.md) for details):
+The formal model used by this agent currently covers the prefill-to-decode KV-cache transfer subsystem within three boundaries (see [`tpu_sync/formal_verification/docs/transfer/prefill_decode.md`](../../tpu_sync/formal_tpu_sync/formal_verification/docs/transfer/prefill_decode.md) for details):
 
 - **Subsystem boundary**: Currently, the agent is scoped to the **prefill-to-decode ("symmetric") KV-cache transfer path** (`TransferSendSession`, `TransferReceiveSession`, `KVCacheManagerWithTransfer`, control-plane backends, and `BlockTransport` session callbacks). Pool resharding ("asymmetric TP" / `ReshardSendSession` / `ReshardReceiveSession`), `RaidenController`, and `kv_cache_store` are out of scope for this subagent.
 - **Upper boundary (Serving engines: vLLM / SGLang)**: The session-level transfer model starts at TPU Sync's transfer API (`NotifyForRead`, `StartRead`, `CompleteReadWithDetails` / `poll_stats()`) and its caller HBM-lifetime contract (the serving engine must not reuse prefill or decode HBM blocks until `poll_stats()` publishes the session in `done_sending`, `done_recving`, or `failed_recving`). External serving-engine schedulers, queues, bootstrap servers, and Python-side timeouts sit above this boundary.
@@ -28,7 +28,7 @@ If a question is purely outside these boundaries, the agent states that it is ou
 
 1. **Setup**: Register `agents` (this repository's root-level agent directory) in your agent configuration (e.g., `"entries": [{ "path": "agents" }]` in `agents.json`) so `tpu-sync-lean-helper` ([`agent.json`](agent.json), [`config.yaml`](config.yaml)) is discovered when working in the repository.
 2. **Invocation**: Mention `@tpu-sync-lean-helper` directly in chat or ask the main agent to invoke the `tpu-sync-lean-helper` subagent on your question or diff.
-3. **Lean Toolchain**: Code Q&A runs with zero shell commands. When the subagent needs to run the Lean 4 verifier live on a new code change via [`verification/tools/run_lean.sh`](../../verification/tools/run_lean.sh), it uses [`elan`](https://github.com/leanprover/elan) with the toolchain pinned in [`verification/lean-toolchain`](../../verification/lean-toolchain) (`leanprover/lean4:v4.33.0`) and evaluates snippets via `stdin` without modifying the working tree.
+3. **Lean Toolchain**: Code Q&A runs with zero shell commands. When the subagent needs to run the Lean 4 verifier live on a new code change via [`tpu_sync/formal_verification/tools/run_lean.sh`](../../tpu_sync/formal_tpu_sync/formal_verification/tools/run_lean.sh), it uses [`elan`](https://github.com/leanprover/elan) with the toolchain pinned in [`tpu_sync/formal_verification/lean-toolchain`](../../tpu_sync/formal_tpu_sync/formal_verification/lean-toolchain) (`leanprover/lean4:v4.33.0`) and evaluates snippets via `stdin` without modifying the working tree.
 
 ---
 
@@ -66,11 +66,11 @@ If a question is purely outside these boundaries, the agent states that it is ou
 ## Directory Organization
 
 ```text
-agents/tpu-sync-lean-helper/                    # this directory (fork-only; not part of verification/)
+agents/tpu-sync-lean-helper/                    # this directory (fork-only; not part of tpu_sync/formal_verification/)
 ├── README.md                                   # Overview, usage examples, and setup guide
 ├── agent.json                                  # Subagent manifest
 └── config.yaml                                 # Subagent system prompt, tool configuration, and workflow
-verification/
+tpu_sync/formal_verification/
 ├── lean-toolchain                              # Pinned Lean 4 version (leanprover/lean4:v4.33.0)
 ├── lakefile.toml                               # Lake package config (zero external dependencies)
 ├── TpuSyncVerify.lean                          # Root umbrella module
@@ -85,6 +85,6 @@ verification/
 ```
 
 - **Agent Configuration ([`agent.json`](agent.json), [`config.yaml`](config.yaml))**: Defines the `tpu-sync-lean-helper` subagent, its read-only workspace tools, and the workflow that maps C++ questions and diffs to the Lean suite and translates formal results back into C++ terms.
-- **Formal Models & Proofs ([`verification/TpuSyncVerify/`](../../verification/TpuSyncVerify/))**: Self-contained Lean 4 models, inductive invariant proofs, executable trace witnesses, and counterfactual mutants for the symmetric prefill-to-decode KV-cache transfer subsystem (`Session`, `Receive`, `ReceivePoll`, `Send`, `Pipeline`, `MultiRequest`, `PeerIsolation`, `UuidTable`, `BlockOrdering`, and `Transport`), pinned to the baseline `tpu-sync` commit in [`verification/README.md` §Status](../../verification/README.md#status-whats-covered).
-- **Code-to-Model Reference Docs ([`verification/docs/`](../../verification/docs/))**: [`transfer/prefill_decode.md`](../../verification/docs/transfer/prefill_decode.md) provides the full routing table between `tpu_sync/` C++ files/methods and the Lean modules, along with explicit subsystem/caller/transport boundary assumptions; [`conventions.md`](../../verification/docs/conventions.md) documents how C++ state machines and mutants are encoded in Lean.
-- **Zero-Footprint Lean Runner ([`verification/tools/run_lean.sh`](../../verification/tools/run_lean.sh))**: Evaluates ad-hoc Lean snippets and counterfactual mutants via `stdin` without touching files in the working tree.
+- **Formal Models & Proofs ([`tpu_sync/formal_verification/TpuSyncVerify/`](../../tpu_sync/formal_tpu_sync/formal_verification/TpuSyncVerify/))**: Self-contained Lean 4 models, inductive invariant proofs, executable trace witnesses, and counterfactual mutants for the symmetric prefill-to-decode KV-cache transfer subsystem (`Session`, `Receive`, `ReceivePoll`, `Send`, `Pipeline`, `MultiRequest`, `PeerIsolation`, `UuidTable`, `BlockOrdering`, and `Transport`), pinned to the baseline `tpu-sync` commit in [`tpu_sync/formal_verification/README.md` §Status](../../tpu_sync/formal_tpu_sync/formal_verification/README.md#status-whats-covered).
+- **Code-to-Model Reference Docs ([`tpu_sync/formal_verification/docs/`](../../tpu_sync/formal_tpu_sync/formal_verification/docs/))**: [`transfer/prefill_decode.md`](../../tpu_sync/formal_tpu_sync/formal_verification/docs/transfer/prefill_decode.md) provides the full routing table between `tpu_sync/` C++ files/methods and the Lean modules, along with explicit subsystem/caller/transport boundary assumptions; [`conventions.md`](../../tpu_sync/formal_tpu_sync/formal_verification/docs/conventions.md) documents how C++ state machines and mutants are encoded in Lean.
+- **Zero-Footprint Lean Runner ([`tpu_sync/formal_verification/tools/run_lean.sh`](../../tpu_sync/formal_tpu_sync/formal_verification/tools/run_lean.sh))**: Evaluates ad-hoc Lean snippets and counterfactual mutants via `stdin` without touching files in the working tree.

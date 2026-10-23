@@ -1,4 +1,4 @@
-# Reproducer for finding C1 (verification/findings/README.md): tpu-inference's
+# Reproducer for finding C1 (findings/README.md): tpu-inference's
 # tpu_raiden_connector drops tpu-sync's failed_recving report, so KV blocks
 # held for a failed or never-pulled prefill-to-decode transfer are never
 # returned to vLLM's block pool on either node. Runs on CPU; no TPU.
@@ -34,7 +34,7 @@
 # *would* give if it forwarded the outcome, and shows the blocks come back.
 #
 # Pinned sources: vLLM 6185d73, tpu-inference 7ed46a6 (lines cited in
-# verification/findings/README.md C1), tpu-sync 0ac16d1.
+# findings/README.md C1), tpu-sync 0ac16d1.
 
 import os
 import sys
