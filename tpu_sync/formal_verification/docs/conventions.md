@@ -1,166 +1,195 @@
 # Modelling conventions
 
-How the models under `TpuSyncVerify/` are written, so that a new one looks
-like the existing ones and a reader of one can read the others.
+Every model under `TpuSyncVerify/` is built the same way and laid out in the
+same order. This page is the template for writing a new one and the key for
+reading an existing one.
 
-## One executable `step` is the definition
+* Writing a model: [The shape of a model](#the-shape-of-a-model),
+  [How a module file is laid out](#how-a-module-file-is-laid-out),
+  [Staying faithful to the C++](#staying-faithful-to-the-c).
+* Proving: [Properties and proofs](#properties-and-proofs),
+  [Evidence that the proof means something](#evidence-that-the-proof-means-something).
+* Changing C++ that a model refers to: [Citing the C++](#citing-the-c).
 
-Every model is a `System S Ev := ⟨init, step⟩` (`Common/System.lean`) with
-`step : S → Ev → Option S`. `none` means the event is not enabled. Nothing
-else defines the transition relation: `Reachable` is the closure of `step`
-from `init`, `run`/`runFrom` replay an event list, and
-`ModelCheck.check` searches the same `step`. There is no separate inductive
-`Step` whose guards could drift from the function.
+## The shape of a model
 
-Consequences we rely on:
+A model is a transition system: an initial state and one function that says
+what each event does to a state.
 
-* a concrete scenario is a theorem about `run` proved by `decide`;
-* a bounded search (`#guard ModelCheck.check … = .safe`, or a mutant's
-  `.counterexample`) and the inductive proof talk about the same system;
-* a mutant is `⟨init, fun s e => match e with | .x => mutated s | e => step s e⟩`.
+```lean
+System S Ev := ⟨init, step⟩      -- Common/System.lean
+step : S → Ev → Option S         -- none means "this event is not enabled here"
+```
 
-Events carry their outcome (`h2dDone (ok : Bool)`, `acquireReply ok`) rather
-than being split into two constructors, so the event list for a search stays
-short and the C++ callback maps to one row of the table.
+Nothing else defines the behaviour. `Reachable` is the closure of `step` from
+`init`; `run` replays a list of events through `step`; `ModelCheck.check`
+searches the same `step`. There is no separate inductive `Step` relation whose
+guards could drift from the function. Three things follow:
 
-## Transcribe, do not paraphrase
+* a concrete scenario is a theorem about `run`, proved by `decide`;
+* a bounded search and an inductive proof talk about the same system;
+* a **mutant** — a variant of the model with one guard removed or one
+  ordering changed — is just a different `step`:
+  `⟨init, fun s e => match e with | .x => mutated s | e => step s e⟩`.
 
-The settle logic that the proofs rest on (`FinishLocked`, `EndRecvOpLocked`,
-`TryBeginRecvOp`) is transcribed into small Lean functions
-(`Transfer/Session.lean`) and every event is composed from them. An event
-never re-derives `done` or `draining` by hand.
+Events are named in the voice of the C++ (`h2dBegin`, `pullReply`, `cancel`),
+not of the property, and carry their outcome as an argument (`h2dDone (ok :
+Bool)`, `acquireReply ok`) instead of being split into a success and a
+failure constructor. Event lists stay short, and one C++ callback maps to one
+row of the events table.
 
-Where the C++ has a race window the model has an event boundary: an op taken
-under one lock and used under a second is two events (`h2dBegin` /
-`h2dIssue`), and the field between them is a ghost counter.
+## How a module file is laid out
 
-## Ghost fields
+Modules are grouped by subsystem (`Transfer/…`, `Controller/…`), with shared
+machinery in `Common/`. Each model file has these sections, in this order:
 
-A ghost field has no single C++ variable. It records *where each unit of a
-counter came from* (`pending`, `retired`, `chaining`, …) or a fact about the
-environment (`reused`). Ghosts are what make `Accounted`-style invariants
-statable: "`in_flight_` equals the sum of the things that hold an op".
-Each ghost is listed in the module's state table and marked `ghost`.
-
-Prefer counters to indexed maps when identity does not matter. `Nat` keeps
-`DecidableEq`, avoids `funext`, and lets the same model be proved and
-model-checked. Use indexed structure only where the property needs it
-(`Pipeline` memories are `List Cell` indexed by layer). When identity does
-matter but the session keeps only a counter, add a per-item `List Bool`
-ghost set next to the counter and tie them with an invariant
-(`countTrue set = counter`); the counter stays the thing the C++ checks,
-the set is what the proof reasons about.
-
-## Module layout
-
-Each model file, in order:
-
-1. Module docstring: what is modelled, pointer to `tpu_sync/formal_verification/README.md`
-   §Status for the baseline commit, abbreviations for cited files; **State**
-   table (field → C++ → role); **Events** table (event → C++ symbol / code
-   fragment); **Source map** (`<!-- source-map:begin --> ... <!-- source-map:end -->`
-   table generated and verified by `tools/resolve_anchors.py`); **Assumptions**
-   (numbered A1, A2, …, each with its C++ symbol/fragment and how it is
-   encoded); **Properties** (each stated in words, with the C++ comment or
-   promise it corresponds to).
-2. `structure S`, `init`.
+1. **Module docstring** — what is modelled; abbreviations for cited files; the
+   **State** table (field → C++ → role); the **Events** table (event → C++
+   symbol or code fragment); the **Source map** (see [Citing the
+   C++](#citing-the-c)); **Assumptions**; **Properties**, each stated in words
+   with the C++ promise it corresponds to.
+2. `structure S` and `init`.
 3. `inductive Ev`; one `def` per event (named so it does not collide with a
-   field of `S`, or dot-notation breaks); `step`; `sys`.
-4. Property definitions, `Safe` as their conjunction.
-5. `Inv`, `inv_init`, `inv_safe`, `step_inv`, `reachable_safe`; progress as
-   `drainRank` + a one-step `drain_step` lemma, discharged through
-   `System.settles_of_rank`.
+   field of `S`, or dot notation breaks); `step`; `sys`.
+4. Property definitions and `Safe`.
+5. `Inv`, `inv_init`, `inv_safe`, `step_inv`, `reachable_safe`; progress.
 6. Frame lemmas other modules need.
-7. **Replay and bounded search**: named `trace_*` theorems, `events`,
-   `instance : Decidable (Safe s)` and `violates s := !decide (Safe s)` (so
-   the searches and the theorems check one predicate; `violates_iff` records
-   it), `#guard` searches, mutants.
+7. Replay traces, `violates`, `#guard` searches, mutants.
 
-Modules over roughly a thousand lines are split along these sections into a
-directory of part files plus an umbrella: `X.lean` keeps item 1 (the module
-docstring with the source map) and only re-exports `X/Model.lean` (items 2–4),
-`X/Invariant.lean` (5, up to `reachable_safe`), `X/Progress.lean`,
-`X/Frame.lean` (6) and `X/Traces.lean` (7), with `X/Lemmas.lean` for a
-structural-lemma section between the model and the invariant where one exists
-(modules with their own numbering, such as `BlockOrdering` and `PoolStaging`,
-name their parts after their sections). Parts import each other in a linear
-chain and repeat the namespace preamble; `import …X` keeps working, and only
-`X.lean` carries a source map. An upstream sync therefore touches `X.lean`
-(the map), `X/Model.lean` (if the modelled code changed) and `X/Traces.lean`
-(if a replayed test was renamed), and a reviewer can read those three without
-the proofs.
+The next three chapters say how to write them: sections 1–4 under
+[Staying faithful to the C++](#staying-faithful-to-the-c), section 5 under
+[Properties and proofs](#properties-and-proofs), section 7 under
+[Evidence that the proof means something](#evidence-that-the-proof-means-something).
 
-## Citations and source maps
+A module over roughly a thousand lines is split along these sections into an
+umbrella file and a directory of parts:
 
-1. **Single baseline commit (`tpu_sync/formal_verification/README.md` §Status).** The baseline
-   `tpu-sync` commit hash is stated once in `tpu_sync/formal_verification/README.md` §Status.
-   Individual `.lean` modules and `docs/*.md` files point there rather than
-   repeating the commit hash in their headers.
-2. **Symbols and code fragments in prose; line numbers only in `source-map`
-   tables.** Prose, state/event tables, `def` docstrings, and `theorem`
-   docstrings cite C++ symbols (`Class::Method`), quoted C++ code fragments
-   (`if (done_ || draining_)`), and GTest `Suite.TestName`s — never raw
-   `file:line` or bare `:line` numbers (except where a sentence explicitly
-   discusses a historical commit hash or an external foreign-repo Python file).
-   Each module and subsystem doc has a single
-   `<!-- source-map:begin --> ... <!-- source-map:end -->` table (`| File | Symbol / anchor | Lines |`)
-   whose `Lines` column is resolved directly from the C++ source tree by
-   `python3 tpu_sync/formal_verification/tools/resolve_anchors.py`:
-   - `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --check` verifies that every
-     `Lines` cell matches the working tree and that no stray raw `file:line`
-     citations exist outside `source-map` blocks.
-   - `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --apply` updates `Lines`
-     cells in place from the C++ tree.
-   - `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff <old_ref> <new_ref>`
-     classifies every anchor across an upstream sync as `same`, `shift` (pure
-     line-offset shift, body identical), `modified` (body changed between the
-     two commits — inspect the Lean model), or `FAIL` (anchor renamed/removed).
-3. **The corpus describes the code as it is.** Models, docs and docstrings
-   state what the current C++ does and what is proved about it. Behaviour
-   that upstream has since changed is not narrated as history; if it is
-   still instructive, it survives only as a named mutant or policy variant
-   ("what breaks without this guard"). Defect tracking — reports, reproducers,
-   filing status, fixes — is kept outside this directory.
+* `X.lean` — the module docstring and source map; re-exports the parts, so
+  `import …X` still brings in the whole model.
+* `X/Model.lean` — state, events, `step`, properties.
+* `X/Lemmas.lean` — structural lemmas, where needed.
+* `X/Invariant.lean` — `Inv` and `reachable_safe`.
+* `X/Progress.lean` — the drain measure and settlement.
+* `X/Frame.lean` — frame lemmas for other modules.
+* `X/Traces.lean` — traces, searches, mutants.
 
-## Assumptions
+Modules with their own internal numbering (`BlockOrdering`, `PoolStaging`)
+name their parts after their sections instead.
 
-Anything the proof trusts about code outside the model is an assumption with
-a number, a citation and the guard that encodes it. If an assumption's
-failure would be a real bug, say so and, if cheap, show the failure as a
-mutant (`netAccountUnordered` for the receive model's A4).
+## Staying faithful to the C++
+
+**Transcribe, do not paraphrase.** The settle logic the proofs rest on
+(`FinishLocked`, `EndRecvOpLocked`, `TryBeginRecvOp`) is transcribed into small
+Lean functions in `Transfer/Session.lean`, and every event is composed from
+them. No event re-derives `done` or `draining` by hand.
+
+**One event per race window.** Where the C++ takes a value under one lock and
+uses it under another, the model has two events (`h2dBegin` / `h2dIssue`), and
+the state between them is a ghost counter.
+
+**Ghost fields.** A ghost field has no single C++ variable behind it. It
+records where each unit of a counter came from (`pending`, `retired`,
+`chaining`, …) or a fact about the environment (`reused`). Ghosts are what let
+an invariant say "`in_flight_` equals the number of things that currently hold
+an op". Every ghost is listed in the module's state table and marked `ghost`.
+
+Prefer counters to indexed maps when identity does not matter: `Nat` keeps
+`DecidableEq`, avoids `funext`, and lets the same model be both proved and
+model-checked. Use indexed structure only where a property needs it
+(`Pipeline` memories are a `List Cell` indexed by layer). When identity matters
+but the C++ keeps only a counter, add a per-item `List Bool` ghost next to the
+counter and tie them with an invariant (`countTrue set = counter`): the counter
+is what the C++ checks, the set is what the proof reasons about.
+
+**Assumptions.** Anything the proof trusts about code outside the model is an
+assumption with a number (A1, A2, …), a C++ citation, and the guard that
+encodes it. If violating the assumption would be a real bug, say so and, when
+cheap, show the consequence as a mutant (`netAccountUnordered` for the receive
+model's A4).
 
 ## Properties and proofs
 
-State a property against the C++ comment that motivates it, in the form the
-engine or the next module consumes (`published = some true → …`, not an
-internal counter equation). `Safe` is the conjunction; `Inv` is whatever
-strengthening the induction needs; `reachable_safe` is the theorem to cite.
+**State observable outcomes.** Phrase each property the way its consumer would
+read it — the caller of the C++ or the next Lean module — not as a fact about
+the model's bookkeeping. For example, the receive model's promise to the
+engine is "once `poll_stats()` reports `done_recving`, nothing writes that
+request's decode HBM again", so its property is
 
-Proofs are `induction` on `Reachable` and `cases` on the event, with
-per-event lemmas where a case is long. No `sorry`, no axioms, no Mathlib.
+```lean
+DecodeHbmSafe s := s.published = some true → <decode HBM no longer changes>
+```
 
-## Replay, search, mutants
+and not `published ≠ none → pending = 0 ∧ retired = issued`. The second
+statement is true and is *why* the first holds (every issued H2D op has
+retired), but `pending`, `retired` and `issued` are ghost counters a C++
+reader cannot map to anything. Counter equations like that belong in `Inv`,
+the strengthening the induction needs; `Safe` is the conjunction of the
+observable properties, and `reachable_safe` is the theorem to cite.
 
-Every module ends with evidence that the proof is not vacuous:
+**Proof shape.** Proofs are `induction` on `Reachable` and `cases` on the
+event, with a lemma per event where a case is long. Progress is a `drainRank`
+measure plus a one-step `drain_step` lemma, discharged through
+`System.settles_of_rank`.
 
-* traces that reach the interesting states (publication, a deadline during
-  a copy, the race a re-check closes) and traces that are refused;
-* where the state space is finite, an exhaustive search for `violates`
-  (`#guard … = .safe`). A depth-bounded search that ends in `.outOfFuel` is
-  not a verification result and is kept only where no theorem covers the
-  property (then the `#guard` carries a `-- Bounded only` comment saying so);
-  it is never placed beside a proved `reachable_safe` for the same system;
-* at least one mutant per load-bearing guard, shown to produce a
-  counterexample.
+**No `sorry`, no axioms, no Mathlib.**
 
-`decide` on traces of ~20 events is instant; a mutant BFS at fuel 6–8 is
-under a second. Keep `#guard`s under ~5 s so `lake build` stays quick.
+## Evidence that the proof means something
 
-## Naming
+Every module ends with checks that the proved system is the intended one:
 
-* Modules by subsystem: `Transfer/…`, `Controller/…`; shared machinery in
-  `Common/`.
-* Events in the voice of the C++ (`h2dBegin`, `pullReply`, `cancel`), not of
-  the property.
-* Mutants named for what they break (`cancelEager`, `dispatchEarly`,
-  `reseatAtFinish`).
+* **Replay traces** — `trace_*` theorems that reach the interesting states
+  (a publication, a deadline during a copy, the interleaving a re-check
+  guards against) and traces that are correctly refused.
+* **Search** — where the state space is finite, an exhaustive search for
+  `violates` (`#guard ModelCheck.check … = .safe`). A depth-bounded search
+  that ends in `.outOfFuel` is *not* a verification result; it is kept only
+  where no theorem covers the property, marked `-- Bounded only`, and never
+  placed next to a proved `reachable_safe` for the same system.
+* **Mutants** — at least one per load-bearing guard, each shown to produce a
+  counterexample, and named for what it breaks (`cancelEager`,
+  `dispatchEarly`, `reseatAtFinish`).
+
+**The search tests the proved predicate.** The theorems are about `Safe`; the
+model checker needs a `Bool`. Give `Safe` a `Decidable` instance and define
+
+```lean
+def violates (s : S) : Bool := !decide (Safe s)
+```
+
+so a `#guard` search and `reachable_safe` are statements about one and the
+same predicate (`violates_iff` records the equivalence). Never hand-write a
+second boolean version of `Safe` for the checker — the two drift apart.
+
+**Keep checks fast.** `decide` on a 20-event trace is instant and a mutant
+search at fuel 6–8 takes under a second. Keep every `#guard` under about 5 s;
+they all run on every `lake build`.
+
+## Citing the C++
+
+**Symbols in prose, line numbers in tables.** Prose, state/event tables, and
+`def`/`theorem` docstrings cite C++ symbols (`Class::Method`), quoted code
+fragments (`if (done_ || draining_)`), and GTest names (`Suite.TestName`).
+Each module and subsystem doc carries one source-map table,
+
+```
+<!-- source-map:begin -->
+| File | Symbol / anchor | Lines |
+...
+<!-- source-map:end -->
+```
+
+whose `Lines` column is resolved from the C++ tree by `tools/resolve_anchors.py`:
+
+* `--check` verifies every `Lines` cell against the working tree and reports
+  stray raw citations outside source-map blocks;
+* `--apply` rewrites the `Lines` cells from the current tree;
+* `--diff <old> <new>` classifies each anchor between two commits as `same`,
+  `shift` (moved, body identical), `modified` (body changed — reread the
+  model) or `FAIL` (renamed or removed).
+
+**One last-resolved commit.** The commit at which the spans were last resolved
+is stated once, in `README.md`; modules and docs do not repeat it.
+
+**Describe the code as it is.** Models and docs state what the current C++
+does and what is proved about it. An old behaviour worth remembering is kept
+only as a mutant.

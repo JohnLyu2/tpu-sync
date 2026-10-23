@@ -13,42 +13,30 @@ machine-checked proofs about them.
   `KVCacheManagerWithTransfer`, the receiver side of `BlockTransport`.
 - Lean: [`Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean),
   [`Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/).
-- Proved: when a receive is published as done, decode HBM holds exactly the
-  prefill's data; no DMA touches prefill or decode HBM after its session is
-  published; host staging is held exactly while a session is unsettled; block
-  gather, reordering and DMA coalescing land every requested block where the
-  caller asked; a pull is claimed once per handshake; from any reachable state
-  every session can drain to settle; one unresponsive peer cannot wedge
-  another's reads; the transport's per-stream accounting fires the session
-  callbacks exactly when the model assumes.
+- Proved: data correctness on publication, HBM and staging safety,
+  drain-to-settle termination, cross-peer isolation.
 
 **Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries
-- Python: the engine above `poll_stats()` — vLLM's scheduler through
-  tpu-inference's connector.
+- Python: vLLM's scheduler through tpu-inference's connector, above
+  `poll_stats()`.
 - Lean: [`Transfer/PrefillDecode/Caller.lean`](TpuSyncVerify/Transfer/PrefillDecode/Caller.lean).
-- Proved: a connector that forwards every publication never leaks a held block
-  on either node and never lets decode run on unwritten KV — the other
-  direction of the HBM-lifetime contract the transfer models assume.
+- Proved: a connector that forwards every publication leaks no held block and
+  never decodes on unwritten KV.
 
 **Pool resharding** — [reshard.md](docs/transfer/reshard.md)
 - C++: `ReshardSendSession`, `ReshardReceiveSession`, `PoolStagingStorage`,
   `RequestBlockRegistry`, `ReshardCoordinator`.
 - Lean: [`Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/).
-- Proved: published destination HBM holds the right bytes, with sub-block
-  coverage reconstructing every byte exactly once and rank-ordered H2D waves
-  never corrupting aliased device pages; staging slots are conserved and never
-  shared across uuids; the receiver's expected stream count matches what the
-  senders produce; registry claims retire only when every owner has completed;
-  no push is dispatched before all receivers are armed; sessions drain to
-  settle and unregister their plan exactly at settle.
+- Proved: data correctness including sub-block coverage and aliased-page
+  ordering, staging slot conservation, registry claim safety,
+  arm-before-dispatch, termination.
 
 **Controller remote leases** — [read_remote.md](docs/controller/read_remote.md)
 - C++: `RaidenController::ReadRemote`.
 - Lean: [`Controller/ReadRemote.lean`](TpuSyncVerify/Controller/ReadRemote.lean).
-- Checked: exhaustive search of `NoWriteAfterRelease` (the caller never reuses
-  destination blocks while a pull into them is in flight). The current code
-  violates it in two ways, each with a witness trace; deferring the deadline's
-  settle while a pull is in flight makes it hold everywhere.
+- Checked: `NoWriteAfterRelease` by exhaustive search — violated by the
+  current code (two witness traces), holds if the deadline defers while a pull
+  is in flight.
 
 ## Layout
 

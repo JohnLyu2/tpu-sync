@@ -25,29 +25,12 @@ import TpuSyncVerify.Controller.ReadRemote
 /-!
 # TpuSyncVerify
 
-Formal models of TPU Sync protocols and proofs about them, organised by the
-subsystem of `tpu_sync/` they describe:
+Lean 4 models of TPU Sync's KV-cache data paths and machine-checked proofs
+about them. This module imports every model; see `README.md` for what is
+modelled, the directory layout, and how the C++ is cited.
 
-* `Common` — the transition-system core, list/pigeonhole lemmas, and a bounded
-  model checker shared by every model.
-* `Transfer` — the session-based KV transfer path (`tpu_sync/kv_cache/transfer_*`,
-  `tpu_sync/kv_cache/reshard_*`, `tpu_sync/kv_cache/kv_cache_manager_with_transfer.*`,
-  `tpu_sync/transport`): shared session lifecycle (`Transfer.Session`); under
-  `Transfer.PrefillDecode` the consumer and producer sessions (`Receive`,
-  `ReceivePoll`, `Send`), single- and multi-request pipelines (`Pipeline`,
-  `MultiRequest`, `PipelineChecks`), the transport's receiver-side stream
-  accounting behind `Receive` A1/A4 (`Transport`), the engine above
-  `poll_stats()` — vLLM's scheduler through tpu-inference's connector, the
-  other direction of `Pipeline` A4 (`Caller`) — multi-peer fault isolation (`PeerIsolation`),
-  UUID registration table (`UuidTable`), and block-level gather/reordering/coalescing
-  (`BlockOrdering`); and under `Transfer.Reshard` the pool-addressed resharding
-  path (`Receive`, `Send`, `Pipeline`, `Coverage`, `PoolStaging`, `Registry`,
-  `Coordinator`) of `docs/transfer/reshard.md`.
-* `Controller` — `RaidenController` (`tpu_sync/core/controller`).
-  `Controller.ReadRemote` is the exhaustive check of the destination-side
-  settle protocol of `RaidenController::ReadRemote`.
-
-Citations are to the single baseline commit stated in `README.md` §Status;
-exact line spans live in each module's source map, checked by
-`tools/resolve_anchors.py`.
+* `Common` — transition-system core, list lemmas, bounded model checker.
+* `Transfer` — `Session` (settle protocol shared by every transfer session),
+  `PrefillDecode/`, `Reshard/`.
+* `Controller` — `ReadRemote`.
 -/
