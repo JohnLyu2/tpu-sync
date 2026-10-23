@@ -208,6 +208,13 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   void ClearMetadataEntry(const RaidenBlockId& block)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
+  bool InsertBestEffortUpdate(absl::Span<const std::string> block_hashes,
+                              absl::Span<const RaidenBlockId> slices);
+  bool InsertAndPin(absl::Span<const std::string> block_hashes,
+                    absl::Span<const RaidenBlockId> slices);
+  bool InsertAdmitStrict(absl::Span<const std::string> block_hashes,
+                         absl::Span<const RaidenBlockId> slices);
+
   // INVARIANT: no thread holds `mutex_` across a registry RPC. Every call site
   // unlocks first, and nothing enforces that but their shape. The synchronous
   // Register and Unregister are Await() on a promise a gRPC callback thread

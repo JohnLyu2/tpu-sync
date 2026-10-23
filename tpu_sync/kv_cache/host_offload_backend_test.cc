@@ -383,6 +383,102 @@ TEST(HostOffloadBackendTest, InsertAndLockKeepsHostResidentEntry) {
   EXPECT_EQ(lookup_res[0].second.host_block_id, 3);
 }
 
+TEST(HostOffloadBackendTest,
+     InsertBestEffortUpdateOverwritesActiveInPlaceWithoutPromoting) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/2);
+  RaidenId id{"job", "0", "data", 0};
+  ASSERT_TRUE(backend.Insert({"h1", "h2"},
+                             {RaidenBlockId(id, 10, BlockStatus::HOST),
+                              RaidenBlockId(id, 11, BlockStatus::HOST)},
+                             InsertOption::kBestEffortUpdate));
+
+  // Overwriting active "h1" updates its block ID without promoting it to MRU.
+  ASSERT_TRUE(backend.Insert({"h1"}, {RaidenBlockId(id, 20, BlockStatus::HOST)},
+                             InsertOption::kBestEffortUpdate));
+  TF_ASSERT_OK_AND_ASSIGN(auto res_h1, backend.Lookup({"h1"}));
+  ASSERT_EQ(res_h1.size(), 1);
+  EXPECT_EQ(res_h1[0].second.host_block_id, 20);
+
+  // Inserting "h3" displaces the LRU entry ("h1", not "h2") into candidates.
+  ASSERT_TRUE(backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
+                             InsertOption::kBestEffortUpdate));
+  EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h1"));
+}
+
+TEST(HostOffloadBackendTest,
+     InsertAndPinRebindsHbmAndPreservesHostAndHostAndHbm) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/3);
+  RaidenId id{"job", "0", "data", 0};
+
+  ASSERT_TRUE(backend.Insert(
+      {"hbm", "host", "both"},
+      {RaidenBlockId(id, /*host_block_id=*/-1, /*device_block_id=*/1,
+                     BlockStatus::HBM),
+       RaidenBlockId(id, /*host_block_id=*/10, BlockStatus::HOST),
+       RaidenBlockId(id, /*host_block_id=*/11, /*device_block_id=*/2,
+                     BlockStatus::HOST_AND_HBM)},
+      InsertOption::kInsertAndPin));
+  backend.Release({"hbm", "host", "both"});
+
+  ASSERT_TRUE(
+      backend.Insert({"hbm", "host", "both"},
+                     {RaidenBlockId(id, /*host_block_id=*/-1,
+                                    /*device_block_id=*/91, BlockStatus::HBM),
+                      RaidenBlockId(id, /*host_block_id=*/-1,
+                                    /*device_block_id=*/92, BlockStatus::HBM),
+                      RaidenBlockId(id, /*host_block_id=*/-1,
+                                    /*device_block_id=*/93, BlockStatus::HBM)},
+                     InsertOption::kInsertAndPin));
+  EXPECT_EQ(backend.GetPinCount("hbm"), 1);
+  EXPECT_EQ(backend.GetPinCount("host"), 1);
+  EXPECT_EQ(backend.GetPinCount("both"), 1);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res,
+                          backend.Lookup({"hbm", "host", "both"}));
+  ASSERT_EQ(lookup_res.size(), 3);
+  EXPECT_EQ(lookup_res[0].second.status, BlockStatus::HBM);
+  EXPECT_EQ(lookup_res[0].second.device_block_id, 91);
+  EXPECT_EQ(lookup_res[1].second.status, BlockStatus::HOST);
+  EXPECT_EQ(lookup_res[1].second.host_block_id, 10);
+  EXPECT_EQ(lookup_res[2].second.status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ(lookup_res[2].second.host_block_id, 11);
+  EXPECT_EQ(lookup_res[2].second.device_block_id, 2);
+}
+
+TEST(HostOffloadBackendTest,
+     InsertAndPinReverseOrderPlacesFirstHashAtMruAndRollsBackOnOverflow) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/2);
+  RaidenId id{"job", "0", "data", 0};
+
+  ASSERT_TRUE(backend.Insert({"h1", "h2"},
+                             {RaidenBlockId(id, 10, BlockStatus::HOST),
+                              RaidenBlockId(id, 11, BlockStatus::HOST)},
+                             InsertOption::kInsertAndPin));
+  EXPECT_EQ(backend.GetPinCount("h1"), 1);
+  EXPECT_EQ(backend.GetPinCount("h2"), 1);
+
+  // Batch mixing existing "h1" with 2 new keys ("h3", "h4") exceeds available
+  // space (0) and must unpin "h1" back to its prior pin count of 1.
+  EXPECT_FALSE(backend.Insert({"h1", "h3", "h4"},
+                              {RaidenBlockId(id, 10, BlockStatus::HOST),
+                               RaidenBlockId(id, 12, BlockStatus::HOST),
+                               RaidenBlockId(id, 13, BlockStatus::HOST)},
+                              InsertOption::kInsertAndPin));
+  EXPECT_EQ(backend.GetPinCount("h1"), 1);
+  EXPECT_EQ(backend.GetPinCount("h2"), 1);
+
+  backend.Release({"h1", "h2"});
+
+  // Because new keys were inserted in reverse order ("h2" then "h1"), "h1" is
+  // at the MRU front and "h2" is at the LRU tail. Inserting "h3" displaces
+  // "h2" into the eviction-candidates list.
+  ASSERT_TRUE(backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
+                             InsertOption::kInsertAndPin));
+  EXPECT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("h2"));
+}
+
 TEST(HostOffloadBackendTest, LookupReturnsRemoteDescriptors) {
   // Setup local gRPC registry server
   auto reg_server = global_registry::CreateTestGlobalRegistryServer();
@@ -1122,6 +1218,46 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRespectsPinnedSpace) {
 
   EXPECT_FALSE(backend.InsertAllOrNothing(
       {"c"}, {RaidenBlockId(id, 3, BlockStatus::HOST)}));
+}
+
+TEST(HostOffloadBackendWriteRemoteTest,
+     AdmitStrictRejectsEmptyMismatchedCollisionsAndIntraBatchDuplicates) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/2);
+  RaidenId id{"job", "0", "data", 0};
+
+  // Empty batch and mismatched span sizes are rejected.
+  EXPECT_FALSE(backend.Insert({}, {}, InsertOption::kAdmitStrict));
+  EXPECT_FALSE(backend.Insert({"a", "b"},
+                              {RaidenBlockId(id, 1, BlockStatus::HOST)},
+                              InsertOption::kAdmitStrict));
+
+  // Intra-batch duplicate keys {"a", "a"} are rejected before modifying state.
+  EXPECT_FALSE(backend.Insert({"a", "a"},
+                              {RaidenBlockId(id, 1, BlockStatus::HOST),
+                               RaidenBlockId(id, 2, BlockStatus::HOST)},
+                              InsertOption::kAdmitStrict));
+  EXPECT_EQ(backend.GetSize(), 0);
+
+  // Valid batch succeeds without pinning.
+  ASSERT_TRUE(backend.Insert({"a", "b"},
+                             {RaidenBlockId(id, 1, BlockStatus::HOST),
+                              RaidenBlockId(id, 2, BlockStatus::HOST)},
+                             InsertOption::kAdmitStrict));
+  EXPECT_EQ(backend.GetPinCount("a"), 0);
+  EXPECT_EQ(backend.GetPinCount("b"), 0);
+
+  // Active key collision is rejected.
+  EXPECT_FALSE(backend.Insert({"b"}, {RaidenBlockId(id, 3, BlockStatus::HOST)},
+                              InsertOption::kAdmitStrict));
+
+  // Admitting "c" displaces "a" into eviction candidates; a subsequent
+  // kAdmitStrict for candidate "a" must also be rejected.
+  ASSERT_TRUE(backend.Insert({"c"}, {RaidenBlockId(id, 4, BlockStatus::HOST)},
+                             InsertOption::kAdmitStrict));
+  ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(backend),
+              UnorderedElementsAre("a"));
+  EXPECT_FALSE(backend.Insert({"a"}, {RaidenBlockId(id, 5, BlockStatus::HOST)},
+                              InsertOption::kAdmitStrict));
 }
 
 // With no registry there is nothing to advertise, and no way for the blocks to

@@ -97,11 +97,14 @@ class CustomTestBackend : public KVCacheStoreBackend {
   bool Insert(absl::Span<const std::string> hashes,
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override {
-    if (option != InsertOption::kBestEffortUpdate) {
+    if (option == InsertOption::kAdmitStrict) {
       return false;
     }
     for (size_t i = 0; i < hashes.size() && i < slices.size(); ++i) {
       entries_[hashes[i]] = slices[i];
+      if (option == InsertOption::kInsertAndPin) {
+        ++pin_counts_[hashes[i]];
+      }
     }
     return true;
   }
