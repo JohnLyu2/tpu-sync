@@ -197,15 +197,8 @@ absl::StatusOr<BlockSliceList> PeekLookup(
   return store.Lookup(block_hashes, LookupOptions{.enable_global = false});
 }
 
-// Populates the cache with ordinary, EVICTABLE residents.
-//
-// Insert() pins what it takes -- that pin is what a later Save() consumes --
-// but most cases below only need the cache populated, not a pin held, and a
-// held pin makes an entry unevictable and undeletable. Handing it straight
-// back is what the real flow does via a successful save; doing it here keeps
-// those cases about their own subject.
-//
-// Cases whose subject IS insert's pin call Insert() directly.
+// Inserts blocks via store.Insert() and immediately releases their pins so the
+// entries are evictable.
 bool InsertResident(KVCacheStore& store,
                     const std::vector<std::string>& block_hashes,
                     const std::vector<RaidenBlockId>& slices, bool on_host) {
@@ -254,13 +247,11 @@ TEST(KVCacheStoreTest, EvictionTracking) {
       RaidenId{"inference_server", "0", "kv_cache", 0},
       RaidenId{"inference_server", "1", "kv_cache", 1}};
 
-  // 1. Insert 101 and 102, filling the cache. Both come back PINNED.
+  // 1. Insert 101 and 102, filling the cache. Both come back pinned.
   ABSL_EXPECT_OK(controller.Insert(hashes_1_2, slices_1_2, true));
 
-  // 2. Insert 103. available_space() is capacity minus the PINNED entries, so
-  // with both slots pinned there is nothing insert is allowed to reclaim and
-  // it refuses rather than evicting a block somebody is holding. All-or-
-  // nothing: 103 is not inserted and 101/102 keep their pins.
+  // 2. Insert 103 fails because both slots are pinned (available_space() == 0).
+  // 103 is not inserted and 101/102 keep their pins.
   std::vector<std::string> hash_3 = {"103"};
   std::vector<RaidenBlockId> slice_3 = {
       RaidenId{"inference_server", "2", "kv_cache", 2}};
@@ -269,13 +260,8 @@ TEST(KVCacheStoreTest, EvictionTracking) {
   EXPECT_EQ(controller.GetPinCount("101"), 1);
   EXPECT_EQ(controller.GetPinCount("102"), 1);
 
-  // 3. Release them -- in the real flow a successful save() does this -- and
-  // the same insert now succeeds by evicting.
-  //
-  // The victim is 102, not 101. Release walks the batch in REVERSE so that the
-  // tail of a sequence becomes evictable first, which is what you want for
-  // prefix caches: dropping the tail of a shared prefix costs less than
-  // dropping its head.
+  // 3. Release 101 and 102 (in reverse order, making 102 LRU), then insert 103
+  // to displace 102 into eviction candidates.
   controller.Release(hashes_1_2);
   ABSL_EXPECT_OK(controller.Insert(hash_3, slice_3, true));
 

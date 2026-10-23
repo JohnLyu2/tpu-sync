@@ -141,37 +141,24 @@ struct LookupOptions {
   static LookupOptions PinPresentHostResident();
 };
 
-// Controls the insertion behavior of KVCacheStoreBackend::Insert.
+// Options controlling KVCacheStoreBackend::Insert() behavior.
 enum class InsertOption {
-  // Best-effort insert/update (default):
-  // - Overwrites any active entry's RaidenBlockId in-place without promoting
-  //   it in the LRU list.
-  // - Inserts new keys in forward order, clearing stale candidate metadata.
-  // - Asynchronously unregisters any entries displaced from the active LRU
-  //   cache from the global registry.
+  // Inserts new entries without pinning and overwrites existing active entries
+  // in place without changing LRU order. Unregisters displaced entries from the
+  // global registry.
   kBestEffortUpdate,
 
-  // Atomic insert-and-pin:
-  // - Pins existing active entries, overwriting their RaidenBlockId ONLY if
-  //   their current status is BlockStatus::HBM (preserving HOST and
-  //   HOST_AND_HBM bindings).
-  // - Pre-validates available_space() >= new_indices.size(), inserts new keys
-  //   in reverse order so block_hashes[0] lands at the MRU front, and pins all
-  //   new keys (rolling back all pins and insertions on any failure).
-  // - Discards displaced entries into the eviction-candidates list without
-  //   withdrawing them from the global registry.
+  // Atomically inserts and pins all entries if unpinned space fits all new
+  // keys. Pins existing active entries (updating HBM-only entries and
+  // preserving HOST and HOST_AND_HBM entries), inserts new keys in reverse
+  // order (making block_hashes[0] MRU), and moves displaced entries to
+  // eviction candidates without unregistering them.
   kInsertAndPin,
 
-  // Strict atomic admission without pinning:
-  // - Rejects the batch if block_hashes.empty(), block_hashes.size() !=
-  //   slices.size(), block_hashes contains intra-batch duplicate keys, any key
-  //   is already present (active or eviction candidate), or available_space() <
-  //   block_hashes.size().
-  // - Inserts all keys in forward order without pinning, verifying each Put()
-  //   and rolling back the batch (clearing metadata and erasing prior entries)
-  //   if any insertion fails.
-  // - Discards displaced entries into the eviction-candidates list without
-  //   withdrawing them from the global registry.
+  // Atomically inserts new entries without pinning. Fails if the batch is
+  // empty, span sizes mismatch, any key is duplicated or already present
+  // (including eviction candidates), or unpinned space is insufficient. Moves
+  // displaced entries to eviction candidates without unregistering them.
   kAdmitStrict,
 };
 
@@ -225,25 +212,19 @@ class KVCacheStoreBackend {
     return tsl::Future<>(absl::UnimplementedError("Save not implemented."));
   }
 
-  // Inserts or updates key-block mappings in the backend according to `option`
-  // (see InsertOption for kBestEffortUpdate, kInsertAndPin, and kAdmitStrict
-  // semantics). Returns true if the operation succeeded.
+  // Inserts a batch of blocks with semantics controlled by `option`.
+  // Returns true if the batch succeeds, or false if the batch is rejected.
   virtual bool Insert(
       absl::Span<const std::string> block_hashes,
       absl::Span<const RaidenBlockId> slices,
       InsertOption option = InsertOption::kBestEffortUpdate) = 0;
 
-  // Explicitly deletes cached block entries from the backend, skipping
-  // pinned ones. Backend-internal bookkeeping: the store's public API has
-  // no caller-driven removal -- reclamation is the store's own eviction.
+  // Removes unpinned entries in `block_hashes` from the backend index.
   virtual void Delete(absl::Span<const std::string> block_hashes,
                       absl::Span<const RaidenBlockId> slices) = 0;
 
-  // Pins block hashes to protect them from LRU eviction.
-  // Returns true if all hashes exist and were successfully pinned.
-  // Backend-internal: application code acquires pins through the store's
-  // Lookup()/Insert(); this is for the store's own extra pins (a peer's
-  // read lease, a remote save's internal pin, the evict sweep).
+  // Increments the pin count of each hash in `block_hashes` to protect it
+  // from LRU eviction. Returns true if all hashes are present and pinned.
   virtual bool Pin(absl::Span<const std::string> block_hashes) = 0;
 
   // Releases (unpins) previously pinned block hashes. Absent hashes are not

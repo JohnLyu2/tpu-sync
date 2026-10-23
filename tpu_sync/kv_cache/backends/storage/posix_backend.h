@@ -300,6 +300,8 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
     return tsl::Future<>(absl::OkStatus());
   }
 
+  // No-op on the storage tier (blocks are written via async offload transfers).
+  // Returns false for kAdmitStrict, which applies only to host-RAM admission.
   bool Insert(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override {
