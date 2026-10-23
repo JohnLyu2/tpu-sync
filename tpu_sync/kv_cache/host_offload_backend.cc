@@ -562,12 +562,6 @@ bool HostOffloadBackend::InsertAdmitStrict(
   return true;
 }
 
-bool HostOffloadBackend::InsertAndLock(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
-  return Insert(block_hashes, slices, InsertOption::kInsertAndPin);
-}
-
 size_t HostOffloadBackend::ReleaseAndDelete(
     absl::Span<const std::string> block_hashes) {
   absl::MutexLock lock(mutex_);

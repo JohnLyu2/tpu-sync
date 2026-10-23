@@ -233,16 +233,9 @@ class KVCacheStoreBackend {
       absl::Span<const RaidenBlockId> slices,
       InsertOption option = InsertOption::kBestEffortUpdate) = 0;
 
-  // Pins existing hashes and inserts & locks new hashes if space permits.
-  // Performs complete rollback on failure. Returns true on full success.
-  // This is the operation behind the store's public Insert().
-  virtual bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                             absl::Span<const RaidenBlockId> slices,
-                             bool on_host) = 0;
-
-  // Reverts an InsertAndLock operation: unpins hashes, erases non-host blocks
-  // whose pin count drops to 0, and restores candidate evictions.
-  // Returns the number of deleted blocks.
+  // Reverts an Insert(..., InsertOption::kInsertAndPin) operation: unpins
+  // hashes, erases non-host blocks whose pin count drops to 0, and restores
+  // candidate evictions. Returns the number of deleted blocks.
   // Backend-internal: the store facade no longer exposes it; its remaining
   // store-level use is rolling back a multi-backend Insert when a later
   // tier refuses.

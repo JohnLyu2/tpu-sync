@@ -6132,11 +6132,6 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
               InsertOption option = InsertOption::kBestEffortUpdate) override {
     return false;
   }
-  bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                     absl::Span<const RaidenBlockId> slices,
-                     bool on_host) override {
-    return false;
-  }
   size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override {
     return 0;
   }

@@ -1016,7 +1016,7 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
 
 absl::Status KVCacheStore::Insert(const std::vector<std::string>& block_hashes,
                                   const std::vector<RaidenBlockId>& slices,
-                                  bool on_host) {
+                                  bool /*on_host*/) {
   if (backends_.empty()) {
     return absl::FailedPreconditionError("KVCacheStore has no backend");
   }
@@ -1036,7 +1036,8 @@ absl::Status KVCacheStore::Insert(const std::vector<std::string>& block_hashes,
   std::vector<size_t> locked_backends;
   for (size_t i = 0; i < backends_.size(); ++i) {
     if (!backends_[i]) continue;
-    if (!backends_[i]->InsertAndLock(block_hashes, slices, on_host)) {
+    if (!backends_[i]->Insert(block_hashes, slices,
+                              InsertOption::kInsertAndPin)) {
       for (size_t lb : locked_backends) {
         backends_[lb]->ReleaseAndDelete(block_hashes);
       }

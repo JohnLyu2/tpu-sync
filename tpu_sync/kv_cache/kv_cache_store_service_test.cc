@@ -1503,13 +1503,14 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
                               {RaidenBlockId(src_id, 10, BlockStatus::HOST)}));
   ABSL_ASSERT_OK(registry->Register({{"demoted", src_id, 10}}));
 
-  // InsertAndLock, not Insert: it discards what Put displaces, on purpose --
-  // the displaced entry becomes a candidate that still holds its host block.
-  // So this demotes "demoted" and withdraws nothing, which is exactly the
-  // state the refusal below must not mistake for a dead entry.
-  ASSERT_TRUE(backend->InsertAndLock(
-      {"newcomer"}, {RaidenBlockId(src_id, 11, BlockStatus::HOST)},
-      /*on_host=*/true));
+  // Insert(kInsertAndPin), not Insert(kBestEffortUpdate): it discards what Put
+  // displaces, on purpose -- the displaced entry becomes a candidate that still
+  // holds its host block. So this demotes "demoted" and withdraws nothing,
+  // which is exactly the state the refusal below must not mistake for a dead
+  // entry.
+  ASSERT_TRUE(backend->Insert({"newcomer"},
+                              {RaidenBlockId(src_id, 11, BlockStatus::HOST)},
+                              InsertOption::kInsertAndPin));
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(
                   *static_cast<HostOffloadBackend*>(backend)),
               Contains("demoted"));
