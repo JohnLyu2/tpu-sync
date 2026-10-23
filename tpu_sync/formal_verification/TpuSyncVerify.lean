@@ -1,8 +1,9 @@
 import TpuSyncVerify.Common.System
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Common.ListAux
--- The Transfer and Controller models land in follow-up changes and are
--- imported here as they arrive.
+import TpuSyncVerify.Transfer.Session
+-- The remaining Transfer models and the Controller model land in follow-up
+-- changes and are imported here as they arrive.
 
 /-!
 # TpuSyncVerify
