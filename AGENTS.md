@@ -12,7 +12,7 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 ## Project triggers
 
 - "verify lean" / "build proofs" — `cd tpu_sync/formal_verification && lake build && python3 tools/resolve_anchors.py --check` (toolchain pinned in `tpu_sync/formal_verification/lean-toolchain`).
-- "sync upstream" / "re-pin" — merge upstream into `main` with a merge commit (never squash/rebase), run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff <old> <new>`, inspect any `MODIFIED` or `FAIL` anchors, run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --apply --check`, update the baseline commit in `tpu_sync/formal_verification/README.md` §Status, run `lake build`, and log in `tpu_sync/formal_verification/docs/upstream_rechecks.md` (see `tpu_sync/formal_verification/docs/conventions.md`).
+- "sync upstream" / "re-pin" — merge upstream into `main` with a merge commit (never squash/rebase), run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff <old> <new>`, inspect any `MODIFIED` or `FAIL` anchors, run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --apply --check`, update the baseline commit in `tpu_sync/formal_verification/README.md` §Status, run `lake build`, and log in `notes/upstream-rechecks.md` (see `tpu_sync/formal_verification/docs/conventions.md`).
 
 ## Code map
 

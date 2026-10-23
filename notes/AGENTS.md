@@ -13,7 +13,7 @@ conventions: `../AGENTS.md`.
   correction trail. Never copy a fact table or a citation list into a note;
   every copy made so far went stale within a week.
 - Upstream-sync facts (what changed in cited code, what was re-pinned) go in
-  `tpu_sync/formal_verification/docs/upstream_rechecks.md` and
+  `notes/upstream-rechecks.md` and
   `findings/README.md` §"History"; the journal records the delta
   of understanding, corrections and tooling lessons, with a link.
 - `loose-ends/parked.md` is the only backlog.
@@ -26,7 +26,7 @@ conventions: `../AGENTS.md`.
   (`StagingBlockAllocator` in `tpu_sync/core/staging_arena.*`,
   `journal/2026-10/2026-10-16-upstream-0ac16d1-sync.md`); since 2026-10-22 the
   pin is `2ed6f8f` (`journal/2026-10/2026-10-22-upstream-2ed6f8f-sync-and-repin-tool-defect.md`);
-  from 2026-10-23 (afternoon) it is `c15ead5` (`tpu_sync/formal_verification/docs/upstream_rechecks.md`
+  from 2026-10-23 (afternoon) it is `c15ead5` (`notes/upstream-rechecks.md`
   row 2026-10-23: no cited symbol changed; `tpu_sync/transport/lib/` reorganised
   into `adapter/`, `psp/`, `metrics/`).
 - Markers as in the skill: `[FACT]` source-grounded or Lean-proved (`durable/`);
