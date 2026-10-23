@@ -1,5 +1,5 @@
 benchmarks {
-  name: "h2d_d2h_record"
+  name: "h2d_d2h_record_jax"
   description: "Re-measure and emit h2d_d2h_gating_jax_baselines.json as a workload artifact."
   owner: "raiden-dev"
   workload {
