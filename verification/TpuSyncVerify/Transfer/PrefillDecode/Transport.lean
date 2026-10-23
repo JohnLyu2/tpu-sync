@@ -12,69 +12,79 @@ assumption `Receive.lean` calls **A1** ("one dispatch per layer") and the
 coarsening behind **A4** ("a layer's blocks are accounted once its copy is
 issued"), and to state exactly what they rest on.
 
-Citations are against tpu-sync `2ed6f8f`. Abbreviations: `bt.cc` =
-`tpu_sync/transport/block_transport.cc`, `bt.h` =
+Citations are to the baseline commit in `verification/README.md` §Status.
+Abbreviations: `bt.cc` = `tpu_sync/transport/block_transport.cc`, `bt.h` =
 `tpu_sync/transport/block_transport.h`, `recv.cc` =
 `tpu_sync/kv_cache/transfer_receive_session.cc`, `mgr.cc` =
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`.
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`, `send.cc` =
+`tpu_sync/kv_cache/transfer_send_session.cc`, `base.cc` =
+`tpu_sync/kv_cache/kv_cache_manager_base.cc`. Exact line ranges for every
+symbol and sub-block are in the generated `## Source map` table below.
 
 ## What is modelled
 
 One receive (`uuid`) with `numLayers` block arrays, each pushed by
 `numSenders` senders that each declare `numStreams` streams per layer
-(`header.reserved`, `bt.cc:620,642`) carrying `blocksPerStream` blocks. A
-stream is `HandleIncomingPush` (`bt.cc:496-639`) from the admission gate to
-the final ack, collapsed into one event: the progress-table update is one
-`progress_mu_` critical section (`bt.cc:675-782`) and the two delegate
-callbacks that follow run on the same reader thread, so interleaving other
-streams between them changes nothing the properties here observe. The
-sender always names one layer per stream (`send.cc:520` → `bt.cc:1173-1176`),
-so the all-layers form `local_id == 0xFFFFFFFF` (`bt.cc:356-358, 652`) does
-not arise and `l` ranges over `0 .. numLayers - 1`.
+(`header.reserved` passed as `num_streams` to `CompleteIncomingPush`) carrying
+`blocksPerStream` blocks. A stream is `BlockTransport::HandleIncomingPush` from
+the admission gate to the final ack, collapsed into one event: the
+progress-table update is one `progress_mu_` critical section in
+`CompleteIncomingPush` (`auto& progress = layer_progress_[{uuid, l}]`) and the
+two delegate callbacks that follow run on the same reader thread, so
+interleaving other streams between them changes nothing the properties here
+observe. The sender always names one layer per stream
+(`TransferSendSession::SendNextLayer`'s `H2hWriteDirectAsync` →
+`BlockTransport::BuildBlockRequests`'s `header_layer_idx`), so the all-layers
+form `local_id == 0xFFFFFFFF` in `ResolveIncomingPushSpec` and
+`CompleteIncomingPush` does not arise and `l` ranges over `0 .. numLayers - 1`.
 
-Two of the three completion contracts of `CompleteIncomingPush`
-(`bt.cc:641-794`) are modelled, selected by `Cfg.declared`:
+Two of the three completion contracts of `BlockTransport::CompleteIncomingPush`
+are modelled, selected by `Cfg.declared`:
 
-* **chunk-count** (`expected_senders = nullopt`, `bt.cc:740-742`): the layer
+* **chunk-count** (`expected_senders = nullopt`,
+  `array_complete = progress.completed_chunks == expected_chunks`): the layer
   completes when `completed_chunks == num_streams`. This is the contract of
   the prefill-to-decode path whenever no receiver plan with
-  `shard_push_schedules` is registered (`ExpectedPushSenders`,
-  `kv_cache_manager_base.cc:2688-2704`) — in particular always on the
-  `StartRead` pull path, which registers no plan (`mgr.cc:850-954`).
-* **sender-declared** (`expected_senders = some n`, `bt.cc:711-739`): per
-  sender `landed`/`declared`, `senders_complete`, and three rejections
-  (`AlreadyExists` when a sender lands more than it declared or more senders
-  than expected appear, `FailedPrecondition` when a sender re-declares).
+  `shard_push_schedules` is registered (`KVCacheManagerBase::ExpectedPushSenders`)
+  — in particular always on the `StartRead` pull path, which registers no plan
+  (`KVCacheManagerWithTransfer::StartRead(remote_endpoint)`).
+* **sender-declared** (`expected_senders = some n`,
+  `else if (expected_senders.has_value())`): per sender `landed`/`declared`,
+  `senders_complete`, and three rejections (`AlreadyExists` when a sender lands
+  more than it declared or more senders than expected appear,
+  `FailedPrecondition` when a sender re-declares).
 
-The plan-declared contract (`bt.cc:687-710`, pool resharding) is out of
-scope; see `Reshard/`.
+The plan-declared contract (`if (plan_declared)` in `CompleteIncomingPush`, pool
+resharding) is out of scope; see `Reshard/`.
 
 The session side is `Transfer/Session.lean`'s `Lifecycle`, transcribed as
-`Receive.lean` does: the push lease is `beginOp` (`TryBeginRecvOp`,
-`mgr.cc:243-248`) and is returned inside the same event (`EndRecvOp`,
-`mgr.cc:271`/`bt.cc:633`); the H2D callback and the poll finish through
-`finishLocked`/`endOpLocked` (`recv.cc:357-370, 406-417`). `inFlight` counts
+`Receive.lean` does: the push lease is `beginOp` (`TryBeginRecvOp` via
+`hooks.begin_incoming_push`) and is returned inside the same event (`EndRecvOp`
+via `hooks.end_incoming_push` / `HandleIncomingPush`); the H2D callback and the
+poll finish through `finishLocked`/`endOpLocked`
+(`TransferReceiveSession::FinishLocked`, `EndRecvOpLocked`). `inFlight` counts
 only H2D copies whose callback has not run.
 
 ## State
 
 | Field | C++ | Role |
 |---|---|---|
-| `Layer.entry` | `layer_progress_[{uuid, l}]` (`bt.h:289-310, 322, 333`) | `none` = no entry (never created, or erased by retirement) |
+| `Layer.entry` | `layer_progress_[{uuid, l}]` (`BlockTransport::LayerProgress`, `layer_progress_`) | `none` = no entry (never created, or erased by retirement) |
 | `Progress.completedChunks` | `LayerProgress::completed_chunks` | chunk-count contract |
 | `Progress.landed` | `SenderStreams::landed` per sender | sender-declared contract |
 | `Progress.sendersComplete` | `LayerProgress::senders_complete` | sender-declared contract |
 | `Progress.called` | `LayerProgress::on_layer_received_called` | the once-latch |
 | `Layer.sent` | ghost | streams accepted per sender for this layer |
 | `Layer.dispatched` | ghost | `OnLayerReceived` → `ExecuteLayerH2d` entries for this layer |
-| `Layer.pending` | subset of `h2d_futures_` (`recv.cc:696-699`) | copies issued for this layer whose callback has not run |
-| `blocks` | `blocks_received_per_shard_` collapsed to one shard (`recv.cc:474-490`) | block units reported by `OnBlockShardsReceived` |
-| `completedLayers` | `num_completed_layers_` (`recv.cc:725`) | H2D callbacks that ran OK |
+| `Layer.pending` | subset of `h2d_futures_` (`ExecuteLayerH2d`: `h2d_futures_.push_back(future)`) | copies issued for this layer whose callback has not run |
+| `blocks` | `blocks_received_per_shard_` collapsed to one shard (`RecordBlockShardsReceivedLocked`) | block units reported by `OnBlockShardsReceived` |
+| `completedLayers` | `num_completed_layers_` (`ExecuteLayerH2d`: `self->num_completed_layers_++`) | H2D callbacks that ran OK |
 | `life` | `in_flight_`, `draining_`, `done_`, `status_`, staging (`Lifecycle`) | settle protocol |
 
 The shard dimension is collapsed: every shard shares the one target
-`total_blocks_ * num_layers` (`recv.cc:474-475`) and a stream adds its block
-count to every shard it carries, so one counter against
+`total_blocks_ * num_layers` (`RecordBlockShardsReceivedLocked`:
+`const int64_t per_shard_target = total_blocks_ * num_layers`) and a stream adds
+its block count to every shard it carries, so one counter against
 `numSenders * numStreams * blocksPerStream * numLayers` has the same
 completion behaviour (A4 in `Receive.lean` restates this over shards).
 
@@ -82,26 +92,26 @@ completion behaviour (A4 in `Receive.lean` restates this over shards).
 
 | Event | C++ |
 |---|---|
-| `stream l s` | `HandleIncomingPush`: `BeginIncomingPush` → `TryBeginRecvOp` (`mgr.cc:224-249`, refuses once `done_`/`draining_`), payload, `CompleteIncomingPush` (`bt.cc:619-622`), on completion `OnLayerReceived` → `ExecuteLayerH2d` (`mgr.cc:163-178`, `recv.cc:642-700`, `++in_flight_` at `:652`), then `OnBlockShardsReceived` (`bt.cc:630-631`, `recv.cc:592-640`), `EndIncomingPush` (`bt.cc:633`). A rejection inside `CompleteIncomingPush` returns early and the `absl::Cleanup` ends the push with `InternalError` (`bt.cc:510-517`), which `end_incoming_push` turns into `Finish(status)` then `EndRecvOp` (`mgr.cc:267-271`). |
-| `h2dDone l ok` | the `OnReady` callback of a layer's copy (`recv.cc:702-744`): on OK `num_completed_layers_++` and, at `num_layers()` while not draining, the success `FinishLocked()` (`:725-731`); on error `FinishLocked(status, kH2dPhase)` (`:737`); then the cleanup's `EndRecvOp` (`:712`) |
-| `publish` | `CompleteReadWithDetails` (`mgr.cc:1015-1019`): a receive that is not draining and `IsReadyToComplete()` (`recv.cc:450-455`: `network_completed_ || num_completed_layers_ == num_layers`, and every issued future ready) is `Finish()`ed. "Every future ready" is taken as "every callback has run"; the window between the two is `ReceivePoll.lean`'s subject (`pollReady`) and changes no property here. |
-| `cancel` | the deadline sweep (`mgr.cc:1020-1026`) or any other `Finish(error)` on a receive that is not yet draining |
+| `stream l s` | `HandleIncomingPush`: `BeginIncomingPush` → `TryBeginRecvOp` (`hooks.begin_incoming_push`, refuses once `done_`/`draining_`), payload, `CompleteIncomingPush`, on completion `OnLayerReceived` → `ExecuteLayerH2d` (`hooks.on_layer_received`, `++in_flight_`), then `OnBlockShardsReceived`, `EndIncomingPush`. A rejection inside `CompleteIncomingPush` returns early and `absl::Cleanup end_incoming_push` ends the push with `InternalError("Incoming push failed")`, which `hooks.end_incoming_push` turns into `Finish(status)` then `EndRecvOp()`. |
+| `h2dDone l ok` | the `future.OnReady` callback of a layer's copy in `ExecuteLayerH2d`: on OK `num_completed_layers_++` and, at `num_layers()` while not draining, the success `FinishLocked()`; on error `FinishLocked(status_or.status(), kH2dPhase)`; then `absl::Cleanup end_op`'s `EndRecvOp()` |
+| `publish` | `CompleteReadWithDetails`: a receive that is not draining and `IsReadyToComplete()` (`network_completed_ || num_completed_layers_ == num_layers`, and every issued future ready) is `Finish()`ed. "Every future ready" is taken as "every callback has run"; the window between the two is `ReceivePoll.lean`'s subject (`pollReady`) and changes no property here. |
+| `cancel` | the deadline sweep in `CompleteReadWithDetails` (`else if (session->deadline() <= now)`) or any other `Finish(error)` on a receive that is not yet draining |
 
 `published` (`life.done && life.statusOk`) is what the poll reports in
-`done_recving_` (`mgr.cc:1030-1032`).
+`done_recving_` (`CompleteReadWithDetails`).
 
 ## Assumptions
 
-* **A1 (one lock).** All progress-table mutation is under `progress_mu_`
-  (`bt.cc:675-782`); the latch is set in the same critical section that
-  decides completion (`bt.cc:743-745`). Encoded by making the table update
-  one step.
+* **A1 (one lock).** All progress-table mutation is under `progress_mu_` in
+  `CompleteIncomingPush`; the latch is set in the same critical section that
+  decides completion (`if (array_complete && !progress.on_layer_received_called)`).
+  Encoded by making the table update one step.
 * **A2 (stable expectation).** `ExpectedPushSenders(uuid)` is read outside
-  the lock and latched on the layer's first stream (`bt.cc:662-684`), so the
-  contract a layer runs under is whatever the first stream saw. Encoded as
+  the lock and latched on the layer's first stream (`if (!progress.expected_senders_resolved)`),
+  so the contract a layer runs under is whatever the first stream saw. Encoded as
   the fixed `Cfg.declared`. On the `StartRead` path there is never a plan;
-  on the plan path the session is seated (`mgr.cc:555-573`) *before* the
-  plan is published (`:602-605`), so a push landing in that window would
+  on the plan path (`RegisterActivePlan`) the session is seated (`EmplaceRecvSessionLocked`)
+  *before* the plan is published (`base_->RegisterActivePlan`), so a push landing in that window would
   latch chunk-count on a layer of a sender-declared plan. That the sender
   does not start before the receiver's registration has returned is a
   controller-side ordering outside this repository's code; it is assumed,
@@ -109,18 +119,21 @@ completion behaviour (A4 in `Receive.lean` restates this over shards).
   on a multi-sender plan.
 * **A3 (uniform declaration, one node per schedule).** Every sender declares
   the same `numStreams`, and no sender outside the expected set appears; the
-  `FailedPrecondition` and "more senders" rejections (`bt.cc:720-728`) are
+  `FailedPrecondition` and "more senders" rejections in `CompleteIncomingPush`
+  (`else if (streams.declared != num_streams)` and
+  `if (progress.sender_streams.size() > *expected_senders)`) are
   therefore never taken and are not modelled. Senders are told apart by
-  `header.remote_id = node_id()` (`bt.cc:1170`) while `expected_senders`
-  counts `shard_push_schedules`, keyed by source shard partition
-  (`raiden_service.proto:178-180`); the contract therefore presumes one
-  source shard per node, which the receiver never checks.
+  `header.remote_id = node_id()` (`BuildBlockRequests`:
+  `remote_id = static_cast<uint32_t>(block_delegate_->node_id())`) while
+  `expected_senders` counts `shard_push_schedules`, keyed by source shard
+  partition (`StartTransferRequest.shard_push_schedules`); the contract
+  therefore presumes one source shard per node, which the receiver never checks.
 * **A4 (honest senders) — `Cfg.honest`.** Every sender sends at most the
   streams it declared for each layer, for the life of the receive. Encoded as
   a guard on `stream`: a stream beyond the declaration is not enabled. This
   is the assumption the C++ does **not** enforce on the chunk-count contract,
   nor on any contract after the table entries are retired
-  (`bt.cc:765-779`); the traces at the end drop it.
+  (`if (all_layers_called)` in `CompleteIncomingPush`); the traces at the end drop it.
 
 ## Properties
 
@@ -142,6 +155,39 @@ stream does: on the chunk-count contract before retirement the receive is
 published with a layer never copied; on either contract after retirement the
 layer is copied twice (the session's `in_flight_` still holds `done_` off
 until both copies return, and a failing duplicate copy fails the receive).
+
+## Source map
+
+Generated by `tools/resolve_anchors.py`.
+
+<!-- source-map:begin -->
+| File | Symbol / anchor | Lines |
+|---|---|---|
+| `bt.h` | `BlockTransport` (`struct LayerProgress` .. `ProgressMap layer_progress_`) | `:289-333` |
+| `bt.cc` | `ResolveIncomingPushSpec` | `:352-407` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:496-639` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:641-794` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` (`bool array_complete = false;` .. `array_complete = progress.completed_chunks == expected_chunks;`) | `:686-741` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` (`bool all_layers_called = true;` .. `layer_progress_.erase({uuid, layer});`) | `:765-777` |
+| `bt.cc` | `BlockTransport::BuildBlockRequests` (`const uint32_t remote_id =` .. `static_cast<uint32_t>(header_layer_idx);`) | `:1170-1176` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:357-370` |
+| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:406-417` |
+| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:450-456` |
+| `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` | `:465-492` |
+| `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:592-640` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:642-763` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:702-760` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_layer_received =`) | `:163-179` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:224-249` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:250-296` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:529-617` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_descriptors)` | `:824-848` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:850-954` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();`) | `:1011-1042` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:518-540` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2688-2705` |
+| `tpu_sync/rpc/raiden_service.proto` | `StartTransferRequest` (`map<int32, ShardPushScheduleProto> shard_push_schedules`) | `:180` |
+<!-- source-map:end -->
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.Transport
@@ -164,7 +210,7 @@ structure Cfg where
   honest : Bool
   deriving Repr, DecidableEq
 
-/-- `LayerProgress` (`bt.h:289-310`). -/
+/-- `BlockTransport::LayerProgress`. -/
 structure Progress where
   completedChunks : Nat
   landed : List Nat
@@ -197,22 +243,24 @@ def natSum : List Nat → Nat
 /-- Blocks an honest run delivers per layer. -/
 def Cfg.perLayer (c : Cfg) : Nat := c.numSenders * c.numStreams * c.blocksPerStream
 
-/-- `total_blocks_ * num_layers` (`recv.cc:474-475`). -/
+/-- `total_blocks_ * num_layers` (`RecordBlockShardsReceivedLocked`). -/
 def Cfg.target (c : Cfg) : Nat := c.perLayer * c.numLayers
 
 /-- The preconditions the C++ already enforces or the deployment guarantees:
 at least one layer-array sender, a positive declared stream count
-(`bt.cc:714-718`), and non-empty streams. -/
+(`CompleteIncomingPush`: `if (num_streams == 0)`), and non-empty streams. -/
 structure Cfg.WF (c : Cfg) : Prop where
   senders : 0 < c.numSenders
   streams : 0 < c.numStreams
   blocks : 0 < c.blocksPerStream
   /-- The chunk-count contract is single-sender. On the `StartRead` path no
   receiver plan is registered at all and the pull goes to one endpoint
-  (`mgr.cc:846`, `:954`), so there is one sender; on the plan path a plan with
-  several `shard_push_schedules` makes `ExpectedPushSenders` return their count
-  (`kv_cache_manager_base.cc:2697-2704`), selecting the sender-declared
-  contract. `trace_chunk_two_senders` shows what the excluded instance does. -/
+  (`StartRead(remote_endpoint)` → `ExecutePullRequest`), so there is one sender;
+  on the plan path a plan with several `shard_push_schedules` makes
+  `ExpectedPushSenders` return their count
+  (`plan_snapshot->request.shard_push_schedules_size()`), selecting the
+  sender-declared contract. `trace_chunk_two_senders` shows what the excluded
+  instance does. -/
   chunkSingle : c.declared = false → c.numSenders = 1
 
 def freshLayer (c : Cfg) : Layer :=
@@ -222,10 +270,10 @@ def init (c : Cfg) : S :=
   { layers := List.replicate c.numLayers (freshLayer c),
     blocks := 0, completedLayers := 0, life := {} }
 
-/-- `network_completed_` (`recv.cc:484-487`), derived. -/
+/-- `network_completed_` (`RecordBlockShardsReceivedLocked`), derived. -/
 def networkCompleted (c : Cfg) (s : S) : Bool := decide (c.target ≤ s.blocks)
 
-/-- What `CompleteReadWithDetails` reports in `done_recving_` (`mgr.cc:1030-1032`). -/
+/-- What `CompleteReadWithDetails` reports in `done_recving_`. -/
 def published (s : S) : Bool := s.life.done && s.life.statusOk
 
 /-! ## Events -/
@@ -241,11 +289,12 @@ def freshProgress (c : Cfg) : Progress :=
   { completedChunks := 0, landed := List.replicate c.numSenders 0,
     sendersComplete := 0, called := false }
 
-/-- `CompleteIncomingPush` on one table entry (`bt.cc:675-745`). Returns the
-updated entry, whether this stream completed the layer (`trigger_completion`),
-and whether the push was rejected. In the sender-declared contract the
-`landed` increment (`bt.cc:730`) persists even when the over-count check that
-follows it (`bt.cc:733-737`) rejects the push. -/
+/-- `CompleteIncomingPush` on one table entry (`auto& progress = layer_progress_[{uuid, l}]` ..
+`trigger_completion = true;`). Returns the updated entry, whether this stream
+completed the layer (`trigger_completion`), and whether the push was rejected.
+In the sender-declared contract the `++streams.landed` increment persists even
+when the over-count check (`else if (streams.landed > streams.declared)`) that
+follows it rejects the push. -/
 def completePush (c : Cfg) (p : Progress) (sender : Nat) : Progress × Bool × Bool :=
   if c.declared then
     let landed := p.landed.getD sender 0 + 1
@@ -270,8 +319,8 @@ def Layer.entryCalled (L : Layer) : Bool :=
   | some p => p.called
   | none => false
 
-/-- Retirement (`bt.cc:765-779`): once every layer's latch is set, the uuid's
-entries are erased. -/
+/-- Retirement (`if (all_layers_called)` in `CompleteIncomingPush`): once every
+layer's latch is set, the uuid's entries are erased. -/
 def retire (layers : List Layer) : List Layer :=
   if layers.all Layer.entryCalled then layers.map (fun L => { L with entry := none })
   else layers
@@ -294,10 +343,10 @@ def nextLayer (L : Layer) (p' : Progress) (sent' : List Nat) (fire : Bool) : Lay
     (nextLayer L p' s' f).pending = if f then L.pending + 1 else L.pending := rfl
 
 /-- The session side of one stream, given the transport's verdict. Push lease
-`TryBeginRecvOp` (`beginOp`, `mgr.cc:243-248`); on completion `ExecuteLayerH2d`
-takes the copy's op (`recv.cc:652`, `fire`); a rejection runs the cleanup's
-`EndIncomingPush(InternalError)` → `Finish(status)` (`mgr.cc:267-270`); the
-lease is returned by `EndRecvOp` (`mgr.cc:271`, or `bt.cc:633` on success). -/
+`TryBeginRecvOp` (`beginOp`, `hooks.begin_incoming_push`); on completion `ExecuteLayerH2d`
+takes the copy's op (`++in_flight_`, `fire`); a rejection runs the cleanup's
+`EndIncomingPush(InternalError)` → `Finish(status)` (`hooks.end_incoming_push`); the
+lease is returned by `EndRecvOp` (`hooks.end_incoming_push`, or `EndIncomingPush` on success). -/
 def streamLife (l : Lifecycle) (fire reject : Bool) : Lifecycle :=
   let l := if fire then { l with inFlight := l.inFlight + 1 } else l
   let l := if reject then l.finishLocked false else l
@@ -329,10 +378,10 @@ def Layer.copyDone (L : Layer) : Layer := { L with pending := L.pending - 1 }
 @[simp] theorem Layer.copyDone_sent (L : Layer) : L.copyDone.sent = L.sent := rfl
 @[simp] theorem Layer.copyDone_entry (L : Layer) : L.copyDone.entry = L.entry := rfl
 
-/-- The H2D `OnReady` callback (`recv.cc:702-744`): on success
+/-- The H2D `future.OnReady` callback in `ExecuteLayerH2d`: on success
 `num_completed_layers_++` and, at `num_layers()` while not draining, the
-success `FinishLocked()`; on failure `FinishLocked(status, kH2dPhase)`; then
-the cleanup's `EndRecvOp`. -/
+success `FinishLocked()`; on failure `FinishLocked(status_or.status(), kH2dPhase)`;
+then `absl::Cleanup end_op`'s `EndRecvOp()`. -/
 def callbackLife (c : Cfg) (l : Lifecycle) (ok : Bool) (completed : Nat) : Lifecycle :=
   let l :=
     if ok then
@@ -351,8 +400,8 @@ def h2dDoneStep (c : Cfg) (s : S) (l : Nat) (ok : Bool) : Option S :=
                     completedLayers := completed,
                     life := callbackLife c s.life ok completed }
 
-/-- The poll (`mgr.cc:1015-1019`): a receive that is not draining and
-`IsReadyToComplete()` (`recv.cc:450-455`) is finished with OK. `AllH2dDoneLocked`
+/-- The poll (`CompleteReadWithDetails`): a receive that is not draining and
+`IsReadyToComplete()` is finished with OK. `AllH2dDoneLocked`
 (every issued future ready) is taken as "every callback has run"; the window
 between the two is `ReceivePoll.lean`'s subject and changes nothing here. -/
 def publishStep (c : Cfg) (s : S) : Option S :=
@@ -362,7 +411,8 @@ def publishStep (c : Cfg) (s : S) : Option S :=
     some { s with life := s.life.finishLocked true }
   else none
 
-/-- The deadline sweep (`mgr.cc:1020-1026`) or any other `Finish(error)`. -/
+/-- The deadline sweep in `CompleteReadWithDetails` (`else if (session->deadline() <= now)`)
+or any other `Finish(error)`. -/
 def cancelStep (s : S) : Option S :=
   if s.life.draining then none else some { s with life := s.life.finishLocked false }
 
@@ -1156,14 +1206,14 @@ theorem trace_dup_chunk_publishes_missing_layer :
   decide
 
 /-- **Either contract, after retirement.** Both layers land and the table
-entries are erased (`bt.cc:765-779`). An extra stream for layer 0 then
-creates a fresh entry whose first stream completes it: `OnLayerReceived`
-fires again and a second copy of layer 0 is issued while the first may still
-run (`dispatched = [2, 1]`). The session is not fooled about settlement —
-`in_flight_` holds `done_` off until every copy has returned — but
-`num_completed_layers_` reaches `num_layers()` after the two layer-0
-callbacks, so the receive starts draining with layer 1's copy still pending,
-and settles with OK once it returns. -/
+entries are erased (`if (all_layers_called)` in `CompleteIncomingPush`). An
+extra stream for layer 0 then creates a fresh entry whose first stream
+completes it: `OnLayerReceived` fires again and a second copy of layer 0 is
+issued while the first may still run (`dispatched = [2, 1]`). The session is
+not fooled about settlement — `in_flight_` holds `done_` off until every copy
+has returned — but `num_completed_layers_` reaches `num_layers()` after the two
+layer-0 callbacks, so the receive starts draining with layer 1's copy still
+pending, and settles with OK once it returns. -/
 theorem trace_dup_after_retirement :
     ((sys (cfgChunk 2 1 1 false)).run
       [.stream 0 0, .stream 1 0, .stream 0 0, .h2dDone 0 true, .h2dDone 0 true]).map view =
@@ -1179,9 +1229,9 @@ theorem trace_dup_after_retirement :
   decide
 
 /-- The redundant copy can also fail the receive: `FinishLocked` records the
-first error even when already draining (`recv.cc:359-363`), so a duplicate
-copy that fails after the honest copies succeeded turns a complete transfer
-into `failed_recving`. -/
+first error even when already draining (`if (!status.ok() && status_.ok())`),
+so a duplicate copy that fails after the honest copies succeeded turns a
+complete transfer into `failed_recving`. -/
 theorem trace_dup_copy_fails_late :
     ((sys (cfgChunk 2 1 1 false)).run
       [.stream 0 0, .stream 1 0, .stream 0 0, .h2dDone 0 true, .h2dDone 1 true,
@@ -1190,8 +1240,9 @@ theorem trace_dup_copy_fails_late :
   decide
 
 /-- **Sender-declared contract, before retirement.** The same duplicate is
-rejected (`landed > declared`, `bt.cc:733-737`), the push fails and the
-receive is finished with an error: loud, not silent. -/
+rejected (`else if (streams.landed > streams.declared)` in
+`CompleteIncomingPush`), the push fails and the receive is finished with an
+error: loud, not silent. -/
 theorem trace_dup_declared_rejected :
     ((sys (cfgDeclared 2 1 1 false)).run [.stream 0 0, .stream 0 0]).map view =
       some ⟨true, false, false, [1, 0], [1, 0]⟩ ∧
@@ -1205,7 +1256,8 @@ theorem trace_dup_declared_rejected :
 
 Two small changes close every trace above without touching the honest
 behaviour: (1) the chunk-count contract rejects a stream beyond the declared
-count, as the other two contracts already do (`bt.cc:705-709, 733-737`);
+count, as the other two contracts already do (`if (plan_pushes > expected_chunks)`
+and `else if (streams.landed > streams.declared)` in `CompleteIncomingPush`);
 (2) `ExecuteLayerH2d` keeps a per-layer once-latch of its own, so a dispatch
 after the transport retired its entries is a no-op. `stepHardened` is `step`
 with exactly those two edits. The dishonest state space stays infinite (after

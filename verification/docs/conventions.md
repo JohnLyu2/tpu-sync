@@ -55,12 +55,14 @@ the set is what the proof reasons about.
 
 Each model file, in order:
 
-1. Module docstring: what is modelled, which tpu-sync commit the citations
-   are for, abbreviations for cited files; **State** table (field → C++ →
-   role); **Events** table (event → C++ location); **Assumptions**
-   (numbered A1, A2, …, each with its citation and how it is encoded);
-   **Properties** (each stated in words, with the C++ comment or promise it
-   corresponds to).
+1. Module docstring: what is modelled, pointer to `verification/README.md`
+   §Status for the baseline commit, abbreviations for cited files; **State**
+   table (field → C++ → role); **Events** table (event → C++ symbol / code
+   fragment); **Source map** (`<!-- source-map:begin --> ... <!-- source-map:end -->`
+   table generated and verified by `tools/resolve_anchors.py`); **Assumptions**
+   (numbered A1, A2, …, each with its C++ symbol/fragment and how it is
+   encoded); **Properties** (each stated in words, with the C++ comment or
+   promise it corresponds to).
 2. `structure S`, `init`.
 3. `inductive Ev`; one `def` per event (named so it does not collide with a
    field of `S`, or dot-notation breaks); `step`; `sys`.
@@ -70,13 +72,37 @@ Each model file, in order:
 7. **Replay and bounded search**: named `trace_*` theorems, `events`,
    executable `violates`, `#guard` searches, mutants.
 
-## Citations
+## Citations and source maps
 
-`file:line` against a named commit, stated once per module. Abbreviate
-heavily cited files in the docstring preamble (`recv.cc`, `mgr.cc`, `bt.cc`).
-Line numbers are for reading alongside the code, not for machine checking;
-when upstream moves, re-check the cited regions and update the commit in the
-preamble (`docs/upstream_rechecks.md` records what was re-checked and when).
+1. **Single baseline commit (`verification/README.md` §Status).** The baseline
+   `tpu-sync` commit hash is stated once in `verification/README.md` §Status.
+   Individual `.lean` modules and `docs/*.md` files point there rather than
+   repeating the commit hash in their headers.
+2. **Symbols and code fragments in prose; line numbers only in `source-map`
+   tables.** Prose, state/event tables, `def` docstrings, and `theorem`
+   docstrings cite C++ symbols (`Class::Method`), quoted C++ code fragments
+   (`if (done_ || draining_)`), and GTest `Suite.TestName`s — never raw
+   `file:line` or bare `:line` numbers (except where a sentence explicitly
+   discusses a historical commit hash or an external foreign-repo Python file).
+   Each module and subsystem doc has a single
+   `<!-- source-map:begin --> ... <!-- source-map:end -->` table (`| File | Symbol / anchor | Lines |`)
+   whose `Lines` column is resolved directly from the C++ source tree by
+   `python3 verification/tools/resolve_anchors.py`:
+   - `python3 verification/tools/resolve_anchors.py --check` verifies that every
+     `Lines` cell matches the working tree and that no stray raw `file:line`
+     citations exist outside `source-map` blocks.
+   - `python3 verification/tools/resolve_anchors.py --apply` updates `Lines`
+     cells in place from the C++ tree.
+   - `python3 verification/tools/resolve_anchors.py --diff <old_ref> <new_ref>`
+     classifies every anchor across an upstream sync as `same`, `shift` (pure
+     line-offset shift, body identical), `modified` (body changed between the
+     two commits — inspect the Lean model), or `FAIL` (anchor renamed/removed),
+     and `docs/upstream_rechecks.md` logs what changed.
+3. **Findings are frozen at confirmation (`findings/`).** In `findings/README.md`
+   and `findings/filed_bugs.md`, each finding's body (`## Fn.`) is an immutable
+   historical record pinned to the commit where the finding was confirmed or
+   fixed; only the `Summary` table and `History` section in `findings/README.md`
+   are updated when upstream lands a fix.
 
 ## Assumptions
 

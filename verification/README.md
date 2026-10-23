@@ -15,10 +15,17 @@ directory contains two components:
 
 ## Status & What's Covered
 
-All citations across models, `docs/`, and `findings/` are pinned to tpu-sync
-`2ed6f8f` (upstream `main` merged 2026-10-22; `findings/filed_bugs.md` is frozen
-at the commit it names). The two external callers that `Caller.lean` and
-finding C1 cite are pinned separately, to the pair `examples/*_disagg/setup.sh`
+The formal models (`TpuSyncVerify/`) and design docs (`docs/`) are pinned to
+tpu-sync baseline commit **`2ed6f8f`** (upstream `main` merged 2026-10-22).
+Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
+GTest `Suite.TestName`s; exact line spans live in per-file
+`<!-- source-map:begin --> ... <!-- source-map:end -->` tables generated and
+verified from the C++ source tree by
+[`tools/resolve_anchors.py`](tools/resolve_anchors.py). Individual bug-hunt
+reports in [`findings/README.md`](findings/README.md) (`## Fn.`) and
+[`findings/filed_bugs.md`](findings/filed_bugs.md) are frozen at the commit
+where each finding was confirmed. The two external callers that `Caller.lean`
+and finding C1 cite are pinned separately, to the pair `examples/*_disagg/setup.sh`
 installs: tpu-inference `7ed46a6`, vLLM `6185d73`.
 
 | Subsystem | What Is Modeled & Proved | Lean Models | Design & Proof Doc |
@@ -57,7 +64,9 @@ Requires [elan](https://github.com/leanprover/elan); the toolchain pinned in
 ```sh
 cd verification
 lake build
+python3 tools/resolve_anchors.py --check
 ```
 
-A clean build takes about half a minute; every `theorem` is machine-checked and
-every `#guard` bounded search is executed.
+A clean build takes about half a minute; every `theorem` is machine-checked,
+every `#guard` bounded search is executed, and `resolve_anchors.py --check`
+verifies all C++ source-map tables and checks for stray raw line citations.

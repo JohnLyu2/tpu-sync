@@ -1,9 +1,13 @@
 # Bug-hunt findings
 
-Defects found while modelling tpu-sync, with the evidence for each. Line
-numbers are for tpu-sync `2ed6f8f` unless a block of test output says
-otherwise; the F1–F4 tests were run on `b68161a` and re-run on `d16701e`, the
-F5 tests on `50b0774`.
+Defects found while modelling tpu-sync, with the evidence for each. Each
+finding's write-up (`## Fn.`) is a historical record frozen at the commit where
+it was confirmed or fixed (line numbers in `## Fn.` bodies reflect `2ed6f8f` as
+of 2026-10-22 unless a block of test output or historical note says otherwise;
+the F1–F4 tests were run on `b68161a` and re-run on `d16701e`, the F5 tests on
+`50b0774`). When upstream lands a fix or moves unrelated lines, update the
+`Summary` table and `History` section rather than re-pinning frozen `## Fn.`
+bodies.
 
 Callers checked: [`vllm-project/vllm-torchtpu`](https://github.com/vllm-project/vllm-torchtpu)
 @ `9725110` (2026-10-20; connector

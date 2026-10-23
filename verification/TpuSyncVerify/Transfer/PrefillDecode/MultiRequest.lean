@@ -3,8 +3,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 /-!
 # Multi-request system and top-level properties across requests
 
-Citations are to tpu-sync `2ed6f8f`; the C++ names below are those of
-`Pipeline.lean`, which this module composes.
+Citations are to the baseline commit in `verification/README.md` §Status; the
+C++ names below are those of `Pipeline.lean`, which this module composes.
 
 Multiple requests $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run
 concurrently and recycle the four memories (`prefillHbm`, `prefillStaging`,
@@ -47,6 +47,23 @@ request `idx`:
    staging buffers to `StagingBlockAllocator`, and publishes both HBM outcomes
    via `poll_stats()` (`HandedOff`), enabling both `.recyclePrefill idx` and
    `.nextRequest idx`.
+
+## Source map
+
+<!-- source-map:begin -->
+| File | Symbol / anchor | Lines |
+|---|---|---|
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::Allocation::Reset` | `:387-398` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::AcquireLocked` | `:477-512` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::Acquire` | `:514-518` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseSlot` | `:571-577` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseDynamicBlocks` | `:579-587` |
+| `tpu_sync/kv_cache/transfer_send_session.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:183-186` |
+| `tpu_sync/kv_cache/transfer_receive_session.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:348-350` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:462-509` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:850-954` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:956-1097` |
+<!-- source-map:end -->
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.Pipeline

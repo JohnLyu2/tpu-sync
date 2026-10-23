@@ -5,48 +5,106 @@ import TpuSyncVerify.Transfer.Reshard.Pipeline
 
 Horizontal data-plane refinement of `Reshard/Pipeline.lean` for sub-block
 byte-interval coverage and multi-sender push-stream accounting:
-* `tpu_sync/kv_cache/reshard_receive_session.cc` (`ValidatePlan`,
-  `ValidateReceiverCoverage`, lines 67–349)
+* `tpu_sync/kv_cache/reshard_receive_session.cc` (`ReshardReceiveSession::ValidatePlan`,
+  `ReshardReceiveSession::ValidateReceiverCoverage`)
 * `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (`ValidateSpanCoverage`,
-  `EmitSpanSchedule` `expected_pushes` computation, and
-  `DefaultTransferStreams`, lines 315–572, 576–594, 908–922, 1117–1153)
-* `tpu_sync/kv_cache/reshard_send_session.cc` (`ExecutePush` / `StartPoolPush`
-  per-peer `(src_block_id, dst_block_id)` deduplication, lines 204–225,
-  293–348)
-* `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`,
-  lines 27–51)
-* `tpu_sync/transport/block_transport.cc` (`AsyncPush` stream clamping
-  `P = min(parallelism, num_blocks)` and `HandleIncomingPush` /
-  `CompleteIncomingPush` plan-declared progress counter, lines 640–793,
-  1010–1046)
+  `EmitSpanSchedule` `expected_pushes` computation, `DefaultTransferStreams`,
+  and `BuildPoolReshardPlan`)
+* `tpu_sync/kv_cache/reshard_send_session.cc` (`ReshardSendSession::ExecutePush` /
+  `ReshardSendSession::StartPoolPush` per-peer `(src_block_id, dst_block_id)`
+  deduplication)
+* `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`)
+* `tpu_sync/transport/block_transport.cc` (`BlockTransport::AsyncPushShards`
+  stream clamping `P = min(parallelism, num_blocks)` and
+  `BlockTransport::HandleIncomingPush` / `BlockTransport::CompleteIncomingPush`
+  plan-declared progress counter)
 
-Citations in this file are checked against tpu-sync `2ed6f8f`.
+Citations are to the baseline commit in `verification/README.md` §Status.
+File aliases used in the source map below:
+`reshard_recv.cc` (`tpu_sync/kv_cache/reshard_receive_session.cc`),
+`planner.{h,cc}` (`tpu_sync/kv_cache/reshard/pool_reshard_planner.{h,cc}`),
+`reshard_send.cc` (`tpu_sync/kv_cache/reshard_send_session.cc`),
+`slots.cc` (`tpu_sync/core/pool_reshard_send_slots.cc`),
+`bt.cc` (`tpu_sync/transport/block_transport.cc`),
+`base.cc` (`tpu_sync/kv_cache/kv_cache_manager_base.cc`),
+`reshard_recv_test.cc` (`tpu_sync/kv_cache/reshard_receive_session_test.cc`),
+`pool_reshard_test.cc` (`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`).
 
 What this module proves:
 1. **Multi-sender stream count conservation (`stream_count_matches`,
    `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
    `(src_block_id, dst_block_id)` pairs for a pool group and opens
-   `min(parallelism, |pairs_s|)` TCP push streams (`block_transport.cc:1021-1026`,
-   `reshard_send_session.cc:293-341`). `ValidateReceiverCoverage`
-   (`reshard_receive_session.cc:314-324`) checks that the receiver's
-   `expected_pushes` equals `∑_s min(parallelism, |pairs_s|)`, matching the
-   planner (`pool_reshard_planner.cc:1134-1142`).
+   `min(parallelism, |pairs_s|)` TCP push streams
+   (`BlockTransport::AsyncPushShards` in `block_transport.cc`,
+   `ReshardSendSession::StartPoolPush` in `reshard_send_session.cc`).
+   `ReshardReceiveSession::ValidateReceiverCoverage`
+   (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`
+   in `reshard_receive_session.cc`) checks that the receiver's `expected_pushes`
+   equals `∑_s min(parallelism, |pairs_s|)`, matching the planner
+   (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`).
 2. **Exact sub-block byte reconstruction under out-of-order stream arrival
    (`checkContiguous_covers`, `checkContiguous_head_disjoint`,
    `partition_reconstructs_block`, `partition_reconstructs_perm`).**
-   `ValidateReceiverCoverage` sorts the logical live-byte intervals
-   `[start_bytes, end_bytes)` targeting a destination block and checks that
-   they partition `[0, extent)` without gaps or overlaps
-   (`reshard_receive_session.cc:325-346`). We prove that any interval list
-   accepted by this check is pairwise disjoint and covers every byte
-   `b < extent`, so landing the intervals in *any* network arrival order
-   reconstructs `good extent` (`[kv 0, …, kv (extent - 1)]`).
+   `ReshardReceiveSession::ValidateReceiverCoverage` sorts the logical live-byte
+   intervals `[start_bytes, end_bytes)` targeting a destination block and checks
+   that they partition `[0, extent)` without gaps or overlaps
+   (`for (size_t ordinal = 0; ordinal < view.dst_ids.size(); ++ordinal)` in
+   `reshard_receive_session.cc`). We prove that any interval list accepted by
+   this check is pairwise disjoint and covers every byte `b < extent`, so
+   landing the intervals in *any* network arrival order reconstructs
+   `good extent` (`[kv 0, …, kv (extent - 1)]`).
 3. **Refinement coupling (`CoveragePipeline.step_pipe`,
    `CoveragePipeline.reachable_safe`).** `CoveragePipeline` refines
    `Reshard.Pipeline` by replacing each pool's scalar stream counter with a
    queue of sub-block intervals and a byte-addressed staging buffer. Every
    `CoveragePipeline` step projects to a `Pipeline.step`, lifting all
    pipeline invariants together with byte-level destination reconstruction.
+
+## Source map
+
+<!-- source-map:begin -->
+| File | Symbol / anchor | Lines |
+|------|-----------------|-------|
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:67-144` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` | `:146-349` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`const int64_t parallelism = plan.parallelism();`) | `:188` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)`) | `:245-258` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:286-305` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:314-319` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:328-339` |
+| `planner.h` | `*` (`inline constexpr char kTransferStreamsEnvVar[]`) | `:143` |
+| `planner.cc` | `ValidateSpanCoverage` | `:315-452` |
+| `planner.cc` | `EmitSpanSchedule` | `:468-572` |
+| `planner.cc` | `DefaultTransferStreams` | `:576-593` |
+| `planner.cc` | `BuildPoolReshardPlan` (`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`) | `:908-918` |
+| `planner.cc` | `BuildPoolReshardPlan` (`expected_pushes_by_dst;` .. `if (expected_pushes_by_dst.at(dst_unit_id) <= 0)`) | `:1133-1145` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`for (int32_t encoded_pool_idx : plan_.transfer_pool_indices())` .. `if (pool_src_block_ids.empty())`) | `:204-217` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:267-349` |
+| `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` (`if (expected_size > 0)`) | `:604-608` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:641-794` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:1011-1041` |
+| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2643-2686` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2688-2705` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:227-255` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:278-289` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:291-302` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsShortCoverage` | `:304-314` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsNonPrefixExtents` | `:316-330` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingExtents` | `:332-341` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingParallelism` | `:343-352` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:354-363` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:365-403` |
+| `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:222-269` |
+| `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.UnsetEmptyOrZeroKeepsOneStreamPerSourceRank` | `:59-72` |
+| `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.PositiveValueCapsStreamsWithinAdmission` | `:74-87` |
+| `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsUnparsableValueNamingVariableAndValue` | `:89-95` |
+| `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsNegativeValueNamingVariableAndValue` | `:97-103` |
+| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:1818-1838` |
+| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:1840-1860` |
+| `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:1862-1879` |
+| `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:1881-1896` |
+<!-- source-map:end -->
 -/
 
 namespace TpuSyncVerify.Transfer.Reshard.Coverage
@@ -59,14 +117,17 @@ open TpuSyncVerify.Transfer.Reshard.Pipeline
 /-! ## Part 1: Multi-sender `(src_block, dst_block)` pair deduplication and stream counts -/
 
 /-- A logical sub-block range `[startByte, endByte)` inside a destination block's
-live byte extent (`reshard_receive_session.cc:289-304`). -/
+live byte extent (`ReshardReceiveSession::ValidateReceiverCoverage`
+`PhysicalLiveRangeToLogical` in `reshard_receive_session.cc`). -/
 structure Interval where
   startByte : Nat
   endByte : Nat
   deriving Repr, DecidableEq
 
-/-- One entry of a pool group's push schedule (`reshard_receive_session.cc:266-308`,
-`reshard_send_session.cc:295-304`), attributed to `sender` (`source_rank`). -/
+/-- One entry of a pool group's push schedule
+(`ReshardReceiveSession::ValidateReceiverCoverage` in `reshard_receive_session.cc`,
+`ReshardSendSession::StartPoolPush` in `reshard_send_session.cc`), attributed to
+`sender` (`source_rank`). -/
 structure ScheduleEntry where
   sender : Nat
   srcBlock : Nat
@@ -75,27 +136,33 @@ structure ScheduleEntry where
   deriving Repr, DecidableEq
 
 /-- Distinct `(srcBlock, dstBlock)` pairs scheduled for `sender`
-(`reshard_send_session.cc:293-304`, `reshard_receive_session.cc:305-307`). -/
+(`ReshardSendSession::StartPoolPush` `block_pairs` in `reshard_send_session.cc`,
+`ReshardReceiveSession::ValidateReceiverCoverage` `state.pairs_by_sender[source_rank].insert`
+in `reshard_receive_session.cc`). -/
 def senderPairs (entries : List ScheduleEntry) (sender : Nat) : List (Nat × Nat) :=
   ((entries.filter fun e => e.sender == sender).map fun e => (e.srcBlock, e.dstBlock)).eraseDups
 
 /-- Number of TCP push streams opened by `sender` under `parallelism`:
-`BlockTransport::AsyncPush` clamps `P = min(parallelism, num_blocks)`
-(`block_transport.cc:1011-1026`), and a sender with zero pairs opens no streams
-(`reshard_send_session.cc:217-224`). -/
+`BlockTransport::AsyncPushShards` clamps `P = min(parallelism, num_blocks)`
+(`block_transport.cc`), and a sender with zero pairs opens no streams
+(`ReshardSendSession::ExecutePush` `if (pool_src_block_ids.empty())` in
+`reshard_send_session.cc`). -/
 def senderStreams (parallelism : Nat) (entries : List ScheduleEntry) (sender : Nat) : Nat :=
   Nat.min parallelism (senderPairs entries sender).length
 
-/-- Total push streams recomputed across `senders` (`pool_reshard_planner.cc:1134-1142`,
-`reshard_receive_session.cc:314-318`). -/
+/-- Total push streams recomputed across `senders` (`BuildPoolReshardPlan` in
+`pool_reshard_planner.cc`, `ReshardReceiveSession::ValidateReceiverCoverage`
+`int64_t calculated_pushes = 0;` in `reshard_receive_session.cc`). -/
 def recomputedExpectedPushes (parallelism : Nat) (senders : List Nat)
     (entries : List ScheduleEntry) : Nat :=
   match senders with
   | [] => 0
   | s :: ss => senderStreams parallelism entries s + recomputedExpectedPushes parallelism ss entries
 
-/-- Receiver push-count validation (`reshard_receive_session.cc:188-192, 314-324`
-and `pool_reshard_planner.cc:1144-1152`). -/
+/-- Receiver push-count validation (`ReshardReceiveSession::ValidateReceiverCoverage`
+`const int64_t parallelism = plan.parallelism();` and
+`if (calculated_pushes != view.expected_pushes)` in `reshard_receive_session.cc`,
+and `BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
 def validateExpectedPushes (parallelism : Nat) (senders : List Nat)
     (entries : List ScheduleEntry) (expectedPushes : Nat) : Bool :=
   decide (0 < parallelism) &&
@@ -124,7 +191,9 @@ theorem senderStreams_le_pairs (parallelism : Nat) (entries : List ScheduleEntry
 
 /-- When `validateExpectedPushes` succeeds, the sum of streams emitted by all
 senders in `senders` equals the receiver's `expectedPushes`, and `0 < expectedPushes`
-(`reshard_receive_session.cc:319-324`, `pool_reshard_planner.cc:1134-1152`). -/
+(`ReshardReceiveSession::ValidateReceiverCoverage`
+`if (calculated_pushes != view.expected_pushes)` in `reshard_receive_session.cc`,
+`BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
 theorem stream_count_matches {parallelism : Nat} {senders : List Nat}
     {entries : List ScheduleEntry} {expectedPushes : Nat}
     (h : validateExpectedPushes parallelism senders entries expectedPushes = true) :
@@ -135,9 +204,10 @@ theorem stream_count_matches {parallelism : Nat} {senders : List Nat}
 
 /-! ## Part 2: Sub-block interval partition and byte-level block reconstruction -/
 
-/-- Contiguous interval scan from `ValidateReceiverCoverage`
-(`reshard_receive_session.cc:329-345`): starting at `coveredUntil`, each
-interval `[startByte, endByte)` must start at `coveredUntil` (`start_bytes ==
+/-- Contiguous interval scan from `ReshardReceiveSession::ValidateReceiverCoverage`
+(`for (size_t ordinal = 0; ordinal < view.dst_ids.size(); ++ordinal)` in
+`reshard_receive_session.cc`): starting at `coveredUntil`, each interval
+`[startByte, endByte)` must start at `coveredUntil` (`start_bytes ==
 covered_until`, rejecting both overlaps `start_bytes < covered_until` and gaps
 `start_bytes > covered_until`) and be non-empty (`startByte < endByte`, from
 `size_bytes > 0` in `PhysicalLiveRangeToLogical`). Returns `some coveredUntil`
@@ -150,14 +220,18 @@ def checkContiguousIntervals (coveredUntil : Nat) : List Interval → Option Nat
     else
       none
 
-/-- Full block coverage check (`reshard_receive_session.cc:246-252, 329-346`):
+/-- Full block coverage check (`ReshardReceiveSession::ValidateReceiverCoverage`
+`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)` and
+`for (size_t ordinal = 0; ordinal < view.dst_ids.size(); ++ordinal)` in
+`reshard_receive_session.cc`):
 `0 < extent` and the sorted intervals partition `[0, extent)`. -/
 def validBlockCoverage (extent : Nat) (intervals : List Interval) : Bool :=
   decide (0 < extent) && decide (checkContiguousIntervals 0 intervals = some extent)
 
 /-- Write one logical byte interval `[iv.startByte, iv.endByte)` into a
-destination block byte buffer (`block_transport.cc:604-607`). Byte `b` in range
-receives `.kv b`. -/
+destination block byte buffer (`BlockTransport::HandleIncomingPush`
+`ReadVExact(client_fd, ToIovec(chunks),` in `block_transport.cc`). Byte `b` in
+range receives `.kv b`. -/
 def writeInterval (iv : Interval) (buf : List Cell) : List Cell :=
   buf.mapIdx fun b c => if iv.startByte ≤ b ∧ b < iv.endByte then .kv b else c
 
@@ -418,7 +492,7 @@ theorem trace_tp4_to_tp2_subblock_merge :
 
 /-- Multi-sender stream count witness: sender 0 has 3 `(src, dst)` pairs and
 sender 1 has 1 pair under `parallelism = 2`, yielding `min(2, 3) + min(2, 1) = 3`
-expected push streams (`pool_reshard_planner.cc:1134-1142`). -/
+expected push streams (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
 theorem trace_multi_sender_stream_count :
     let entries : List ScheduleEntry :=
       [ ⟨0, 10, 0, ⟨0, 8⟩⟩
@@ -463,14 +537,19 @@ theorem mutant_gap_in_coverage_leaves_unwritten_byte :
   decide
 
 /-- Mutant 2: overlapping sub-block intervals (`[0, 20)` and `[16, 32)`) are
-rejected by `validBlockCoverage` (`reshard_receive_session.cc:331-336`). -/
+rejected by `validBlockCoverage`
+(`ReshardReceiveSession::ValidateReceiverCoverage`
+`if (interval.start_bytes < covered_until)` in `reshard_receive_session.cc`). -/
 theorem mutant_overlap_in_coverage_rejected :
     validBlockCoverage 32 [⟨0, 20⟩, ⟨16, 32⟩] = false := by
   decide
 
 /-- Mutant 3: declaring `expected_pushes = 3` (summing the 3 raw pairs from
 sender `0` instead of `min(parallelism, |pairs_s|) = min(2, 3) = 2`) is
-rejected by `validateExpectedPushes` (`reshard_receive_session.cc:319-324`). -/
+rejected by `validateExpectedPushes`
+(`ReshardReceiveSession::ValidateReceiverCoverage`
+`if (calculated_pushes != view.expected_pushes)` in
+`reshard_receive_session.cc`). -/
 theorem mutant_mismatched_expected_pushes_rejected :
     let entries : List ScheduleEntry :=
       [ ⟨0, 10, 0, ⟨0, 8⟩⟩
@@ -480,8 +559,10 @@ theorem mutant_mismatched_expected_pushes_rejected :
     validateExpectedPushes 2 [0] entries 2 = true := by
   decide
 
-/-- Group destination-extent prefix validation from `ValidateReceiverCoverage`
-(`reshard_receive_session.cc:227-264`):
+/-- Group destination-extent prefix validation from
+`ReshardReceiveSession::ValidateReceiverCoverage`
+(`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)` in
+`reshard_receive_session.cc`):
 every non-last destination block must cover the full `liveBytes` (`extent == liveBytes`),
 and the final destination block must satisfy `0 < extent ≤ liveBytes`. -/
 def validGroupExtents (liveBytes : Nat) : List Nat → Bool
@@ -490,11 +571,11 @@ def validGroupExtents (liveBytes : Nat) : List Nat → Bool
   | e :: rest => decide (e = liveBytes) && validGroupExtents liveBytes rest
 
 /-- `KVCacheManagerBase::ExpectedPushSenders`
-(`tpu_sync/kv_cache/kv_cache_manager_base.cc:2688-2705`):
+(`tpu_sync/kv_cache/kv_cache_manager_base.cc`):
 returns `some schedules.length` when the active plan is a block-addressed
 receiver plan (`!isSender` and `pool_groups_size() == 0`) with non-empty
 `shard_push_schedules`, and `none` for sender plans, pool-grouped plans (which
-use `GetPoolPushProgressSpec`, `:2643-2686`), bare plans, or after
+use `KVCacheManagerBase::GetPoolPushProgressSpec`), bare plans, or after
 `UnregisterActivePlan`. -/
 def expectedPushSenders (isSender : Bool) (schedules : List (Nat × List ScheduleEntry)) :
     Option Nat :=
@@ -502,22 +583,24 @@ def expectedPushSenders (isSender : Bool) (schedules : List (Nat × List Schedul
   else some schedules.length
 
 /-- Replay of `ReshardReceiveSessionTest` coverage and push-count unit tests
-(`tpu_sync/kv_cache/reshard_receive_session_test.cc:227-403`):
-1. `ChecksEveryPoolSpanAndDestinationZeroCover` (`:227-255`, zero intervals `[]`
-   on extent `16` rejected at `:249-254`).
-2. `RejectsCoverageGap` (`:278-289`, extent `48` with `[0, 16)` and `[32, 48)`).
-3. `RejectsCoverageOverlap` (`:291-302`, extent `24` with `[0, 16)` and `[8, 24)`).
-4. `RejectsShortCoverage` (`:304-314`, extent `24` with `[0, 16)`).
-5. `RejectsNonPrefixExtents` (`:316-330`, modeled with `liveBytes = 64`: `[32, 64]`
-   has a partially filled non-last block; `[80]` exceeds `liveBytes`; `[64, 32]`
-   is a valid prefix).
-6. `RejectsMissingExtents` (`:332-341`, modeled with extent `0`).
-7. `RejectsMissingParallelism` (`:343-352`, `parallelism = 0`).
-8. `RejectsExpectedPushMismatch` (`:354-363`, 1 schedule entry with
-   `expected_pushes = 2`).
-9. `RejectsWriteBeyondDeclaredLiveTail` (`:365-403`, declared `extent = 40` with
-   logical intervals `[0, 32)` and `[32, 48)` rejected at `:394-396`, and
-   `[0, 32)` and `[32, 40)` accepted at `:398-402`). -/
+(`tpu_sync/kv_cache/reshard_receive_session_test.cc`):
+1. `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover`
+   (zero intervals `[]` on extent `16` rejected).
+2. `ReshardReceiveSessionTest.RejectsCoverageGap` (extent `48` with `[0, 16)`
+   and `[32, 48)`).
+3. `ReshardReceiveSessionTest.RejectsCoverageOverlap` (extent `24` with `[0, 16)`
+   and `[8, 24)`).
+4. `ReshardReceiveSessionTest.RejectsShortCoverage` (extent `24` with `[0, 16)`).
+5. `ReshardReceiveSessionTest.RejectsNonPrefixExtents` (modeled with
+   `liveBytes = 64`: `[32, 64]` has a partially filled non-last block; `[80]`
+   exceeds `liveBytes`; `[64, 32]` is a valid prefix).
+6. `ReshardReceiveSessionTest.RejectsMissingExtents` (modeled with extent `0`).
+7. `ReshardReceiveSessionTest.RejectsMissingParallelism` (`parallelism = 0`).
+8. `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` (1 schedule entry
+   with `expected_pushes = 2`).
+9. `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` (declared
+   `extent = 40` with logical intervals `[0, 32)` and `[32, 48)` rejected, and
+   `[0, 32)` and `[32, 40)` accepted). -/
 theorem trace_reshard_receive_coverage_test_parity :
     let e1 : List ScheduleEntry := [⟨0, 3, 1, ⟨0, 16⟩⟩]
     validBlockCoverage 16 [] = false ∧
@@ -536,11 +619,11 @@ theorem trace_reshard_receive_coverage_test_parity :
   decide
 
 /-- Replay of `ExpectedPushSendersTest.CountsReceiverPlanSchedules`
-(`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc:222-269`):
+(`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`):
 - Receiver plan (`isSender = false`) with 2 source schedules (`ranks 4 and 5`)
-  reports `some 2` (`:228-245`).
-- Sender plan (`isSender = true`) reports `none` (`:247-259`).
-- Bare plan (`schedules = []`) reports `none` (`:261-265`). -/
+  reports `some 2`.
+- Sender plan (`isSender = true`) reports `none`.
+- Bare plan (`schedules = []`) reports `none`. -/
 theorem trace_expected_push_senders_test_parity :
     let sched4 : List ScheduleEntry := [⟨4, 0, 1, ⟨0, 16⟩⟩]
     let sched5 : List ScheduleEntry := [⟨5, 0, 2, ⟨0, 16⟩⟩]
@@ -550,8 +633,8 @@ theorem trace_expected_push_senders_test_parity :
   decide
 
 /-- Parsed `TPU_RAIDEN_TRANSFER_STREAMS` environment variable
-(`kTransferStreamsEnvVar`, `tpu_sync/kv_cache/reshard/pool_reshard_planner.h:136-149`,
-`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc:576-594`). -/
+(`kTransferStreamsEnvVar` in `tpu_sync/kv_cache/reshard/pool_reshard_planner.h`,
+`DefaultTransferStreams` in `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`). -/
 inductive TransferStreamsEnv where
   | unsetOrEmpty
   | intVal (n : Int)
@@ -559,10 +642,13 @@ inductive TransferStreamsEnv where
   deriving Repr, DecidableEq
 
 /-- `DefaultTransferStreams(topology_parallelism)`
-(`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc:576-594`):
-- Unset, empty, or `0` returns `some topologyParallelism` (`:578, 585`).
-- A positive integer `n` returns `some (min n topologyParallelism)` (`:586-592`).
-- Unparsable or negative values return `none` (`InvalidArgumentError`, `:580-584`). -/
+(`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`):
+- Unset, empty, or `0` returns `some topologyParallelism`
+  (`if (raw == nullptr || raw[0] == '\0')` / `if (parsed == 0)`).
+- A positive integer `n` returns `some (min n topologyParallelism)`
+  (`if (parsed > topology_parallelism)`).
+- Unparsable or negative values return `none` (`InvalidArgumentError`,
+  `if (!absl::SimpleAtoi(raw, &parsed) || parsed < 0)`). -/
 def defaultTransferStreams (topologyParallelism : Nat) : TransferStreamsEnv → Option Nat
   | .unsetOrEmpty => some topologyParallelism
   | .intVal n =>
@@ -572,7 +658,8 @@ def defaultTransferStreams (topologyParallelism : Nat) : TransferStreamsEnv → 
   | .unparsable => none
 
 /-- Plan parallelism resolution in `BuildPoolReshardPlan`
-(`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc:908-922`):
+(`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`
+in `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`):
 an explicit `request.parallelism` overrides `TPU_RAIDEN_TRANSFER_STREAMS` and must
 lie in `(0, topologyParallelism]`; otherwise `DefaultTransferStreams` is used. -/
 def resolvePlanParallelism (topologyParallelism : Nat) (explicit : Option Nat)
@@ -587,22 +674,20 @@ def resolvePlanParallelism (topologyParallelism : Nat) (explicit : Option Nat)
   | none => none
 
 /-- Replay of `DefaultTransferStreamsTest`
-(`tpu_sync/kv_cache/reshard/pool_reshard_planner_streams_test.cc:59-103`) and
+(`tpu_sync/kv_cache/reshard/pool_reshard_planner_streams_test.cc`) and
 `ReshardStackTest` stream-count tests
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1818-1896`):
-1. `UnsetEmptyOrZeroKeepsOneStreamPerSourceRank`
-   (`pool_reshard_planner_streams_test.cc:59-72`): unset/empty or `0` on
-   `topology_parallelism = 8` returns `some 8`.
-2. `PositiveValueCapsStreamsWithinAdmission` (`:74-87`): `"1"` → `some 1`,
-   `"4"` → `some 4`, and `"16"` clamps to `some 8`.
-3. `RejectsUnparsableValueNamingVariableAndValue` (`:89-95`) and
-   `RejectsNegativeValueNamingVariableAndValue` (`:97-103`): `"many"` and `"-2"`
-   return `none`.
-4. `UnsetTransferStreamsPlansOneStreamPerSourceRank`
-   (`reshard_service_test.cc:1818-1838`),
-   `TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` (`:1840-1860`),
-   `ExplicitPlanParallelismOverridesTransferStreamsEnv` (`:1862-1879`), and
-   `InvalidTransferStreamsEnvFailsThePlan` (`:1881-1896`): with 2 source ranks
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`):
+1. `DefaultTransferStreamsTest.UnsetEmptyOrZeroKeepsOneStreamPerSourceRank`:
+   unset/empty or `0` on `topology_parallelism = 8` returns `some 8`.
+2. `DefaultTransferStreamsTest.PositiveValueCapsStreamsWithinAdmission`:
+   `"1"` → `some 1`, `"4"` → `some 4`, and `"16"` clamps to `some 8`.
+3. `DefaultTransferStreamsTest.RejectsUnparsableValueNamingVariableAndValue` and
+   `DefaultTransferStreamsTest.RejectsNegativeValueNamingVariableAndValue`:
+   `"many"` and `"-2"` return `none`.
+4. `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank`,
+   `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes`,
+   `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv`, and
+   `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan`: with 2 source ranks
    (`topology_parallelism = 2`) and 2 block pairs per rank, unset env plans
    `parallelism = 2` and `expected_pushes = 4`; `TPU_RAIDEN_TRANSFER_STREAMS=1`
    caps `parallelism = 1` and `expected_pushes = 2`; explicit `request.parallelism = 2`

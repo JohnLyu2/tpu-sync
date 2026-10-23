@@ -14,12 +14,12 @@ engine is told `done_recving`, its HBM holds the prefill's KV cache. Buffer
 safety properties (prefill HBM reclaimed, staging released) follow as
 corollaries of the sessions' settle protocol and are stated here too.
 
-Citations are to tpu-sync `2ed6f8f`:
-`send.cc` is
-`tpu_sync/kv_cache/transfer_send_session.cc`, `recv.cc` is
-`tpu_sync/kv_cache/transfer_receive_session.cc`, `bt.cc` is
-`tpu_sync/transport/block_transport.cc`, `mgr.cc` is
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`.
+Citations are to the baseline commit in `verification/README.md` §Status.
+`send.cc` is `tpu_sync/kv_cache/transfer_send_session.cc`; `recv.cc` is
+`tpu_sync/kv_cache/transfer_receive_session.cc`; `bt.cc` is
+`tpu_sync/transport/block_transport.cc`; `mgr.cc` is
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`. Exact line ranges for
+every symbol and sub-block are in the generated `## Source map` table below.
 
 ## Memories
 
@@ -31,20 +31,23 @@ or `.blank` (never written). Layer `l` of a memory is correct iff it is
 | Memory           | Role | Written by |
 |------------------|------|------------|
 | `prefillHbm`     | the request's KV cache in prefill HBM | `reclaim` (the engine frees prefill HBM) |
-| `prefillStaging` | the send's host staging (`send.cc:380-385`) | `d2hReady l` (D2H copy, `send.cc:425-434`), `reseatPrefillStaging` |
-| `wire`           | data delivered by a direct H2H write (`send.cc:518-540`) | `h2hDone l true` |
-| `decodeStaging`  | the receive's host staging | `land l` (transport, `bt.cc:556-610`), `reseatDecodeStaging` |
-| `decodeHbm`      | the decode request's KV cache in decode HBM | `h2dReady l` (H2D copy, `recv.cc:642-763`) |
+| `prefillStaging` | the send's host staging (`AcquireStagingWithRetry` in `TransferSendSession::StartPush`) | `d2hReady l` (D2H copy, `base_->D2hSyncDispatch` in `StartPush`), `reseatPrefillStaging` |
+| `wire`           | data delivered by a direct H2H write (`base_->H2hWriteDirectAsync` in `TransferSendSession::SendNextLayer`) | `h2hDone l true` |
+| `decodeStaging`  | the receive's host staging | `land l` (transport, `ForEachPayload` in `BlockTransport::HandleIncomingPush`), `reseatDecodeStaging` |
+| `decodeHbm`      | the decode request's KV cache in decode HBM | `h2dReady l` (H2D copy, `TransferReceiveSession::ExecuteLayerH2d`) |
 
 ## Layers complete in any order
 
 The sessions count copies; they do not say which layer a copy was for. The
-real system issues D2H copies in layer order (`send.cc:417`) and pushes in
-layer order (`send.cc:544`), but D2H futures resolve in any order, pushes
-travel over separate connections and land in any order (`bt.cc:743-745`
-reports each layer when *its* last block is in), and H2D futures resolve in
-any order. So every event that touches a memory carries the layer it is for,
-and per-layer ghost sets record which layers have passed each stage:
+real system issues D2H copies in layer order (`for (size_t l = 0; l < total_layers; ++l)`
+in `TransferSendSession::StartPush`) and pushes in layer order
+(`self->SendNextLayer(l + 1)` in `TransferSendSession::SendNextLayer`), but D2H
+futures resolve in any order, pushes travel over separate connections and land
+in any order (`BlockTransport::CompleteIncomingPush` sets
+`if (array_complete && !progress.on_layer_received_called)` and reports each
+layer when *its* last block is in), and H2D futures resolve in any order. So
+every event that touches a memory carries the layer it is for, and per-layer
+ghost sets record which layers have passed each stage:
 
 | Ghost         | Layers that … | Agrees with |
 |---------------|---------------|-------------|
@@ -62,17 +65,17 @@ and per-layer ghost sets record which layers have passed each stage:
 
 | Event                   | What it is |
 |-------------------------|-----------|
-| `notifyForRead`         | `NotifyForRead` registers the offer in `send_sessions_[uuid]` (`registered := true`) and calls `cv_.SignalAll()` (`mgr.cc:493-499`) |
-| `pullWait`              | `HandlePullStream` arrives before `NotifyForRead` (`registered = false`) and enters `cv_.WaitWithTimeout` (`pullWaiting := true`, `mgr.cc:1261-1272`) |
-| `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `beginPull` (`ValidateAndBeginPull`) requires `registered = true` and clears `pullWaiting`. `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`send.cc:473-477`), not on any future |
+| `notifyForRead`         | `KVCacheManagerWithTransfer::NotifyForRead` registers the offer in `send_sessions_[uuid]` (`registered := true`) and calls `cv_.SignalAll()` |
+| `pullWait`              | `KVCacheManagerWithTransfer::HandlePullStream` arrives before `NotifyForRead` (`registered = false`) and enters `cv_.WaitWithTimeout(&mu_, left)` (`pullWaiting := true`) |
+| `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `beginPull` (`ValidateAndBeginPull`) requires `registered = true` and clears `pullWaiting`. `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`layer_future = d2h_layer_futures_[l]` .. `layer_future->OnReady`), not on any future |
 | `d2hReady l`            | the D2H copy of layer `l` finishes: `prefillStaging[l] := prefillHbm[l]`. Issued iff `l < d2hIssued` (copies are issued in order) |
-| `h2hDone l ok`          | the push callback for layer `l` (`send.cc:522-540`). Push `l` exists iff `l < h2hIssued` (pushes are issued in order). On success `wire[l] := prefillStaging[l]` |
+| `h2hDone l ok`          | the push callback for layer `l` in `SendNextLayer` (`H2hWriteDirectAsync`). Push `l` exists iff `l < h2hIssued` (pushes are issued in order). On success `wire[l] := prefillStaging[l]` |
 | `recv e`                | the receive session's event `e`, no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady` are disabled here. `pullReply ok` requires `ok = false ∨ send.pullStarted = true` and clears `pullWaiting` |
-| `h2dBegin l`            | `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: once per layer (A1), only after layer `l` landed (`bt.cc:743-745`) |
-| `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:668-699`): dispatches layer `l`'s H2D copy unless draining or failed |
+| `h2dBegin l`            | `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: once per layer (A1), only after layer `l` landed (`if (array_complete && !progress.on_layer_received_called)` in `CompleteIncomingPush`) |
+| `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the `if (done_ || draining_)` re-check through `h2d_futures_.push_back(future)`: dispatches layer `l`'s H2D copy unless draining or failed |
 | `h2dReady l`            | the H2D copy of layer `l` finishes: `decodeHbm[l] := decodeStaging[l]` |
-| `land l`                | the transport writes layer `l` from the wire into `decodeStaging[l]`, inside an accepted push (`bt.cc:508` … `bt.cc:633`) |
-| `reclaim`               | the engine frees prefill HBM once `poll_stats()` has reported the send (`mgr.cc:974-982`) |
+| `land l`                | the transport writes layer `l` from the wire into `decodeStaging[l]`, inside an accepted push (`BeginIncomingPush` .. `EndIncomingPush` in `BlockTransport::HandleIncomingPush`) |
+| `reclaim`               | the engine frees prefill HBM once `poll_stats()` (`CompleteReadWithDetails`) has reported the send (`if (session->Done())` in the `send_sessions_` loop) |
 | `reseatPrefillStaging`  | the host staging pool hands the send's released staging to someone else, who writes to it |
 | `reseatDecodeStaging`   | likewise for the receive's staging |
 
@@ -85,32 +88,33 @@ that reads at issue time admits no violation this one does not.
 
 * **A1 (layers move whole).** Blocks are not modelled: a layer is copied as a
   unit. The transport delivers a layer's blocks individually but reports the
-  layer only once the last block is in (`on_layer_received_called`,
-  `bt.cc:743-745`), and both device copies are per layer.
+  layer only once the last block is in
+  (`if (array_complete && !progress.on_layer_received_called)` in
+  `BlockTransport::CompleteIncomingPush`), and both device copies are per layer.
 * **A2 (delivery ordered after the callback).** In the model, the sender's
   push callback (`h2hDone l true`) puts layer `l` on the wire and the
   receiver lands it (`land l`) at or after that step. In the real system the
   write lands *before* the callback fires (the receiver acks after
-  `EndIncomingPush`, `bt.cc:633-637`). This reversal is sound because
-  `prefillStaging[l]` is invariant throughout `[h2hIssue, h2hDone]`: the push
-  holds an op (`in_flight_ > 0`), so the send cannot settle and its staging
-  cannot be reseated, and `d2hReady l` has already run before
-  `SendNextLayer(l)` woke and cannot run a second time. Reading
-  `prefillStaging[l]` at `h2hDone` therefore reads the exact value that was
-  present when the real transport streamed the data, so every real trace with
-  a successful callback has a model trace with the same receiver-side states.
-  The model cannot express a layer that landed whose push callback then
+  `EndIncomingPush(header.uuid)` in `BlockTransport::HandleIncomingPush`). This
+  reversal is sound because `prefillStaging[l]` is invariant throughout
+  `[h2hIssue, h2hDone]`: the push holds an op (`in_flight_ > 0`), so the send
+  cannot settle and its staging cannot be reseated, and `d2hReady l` has
+  already run before `SendNextLayer(l)` woke and cannot run a second time.
+  Reading `prefillStaging[l]` at `h2hDone` therefore reads the exact value that
+  was present when the real transport streamed the data, so every real trace
+  with a successful callback has a model trace with the same receiver-side
+  states. The model cannot express a layer that landed whose push callback then
   reports failure (lost ack); that trace is safe for the same reason, but it
   is not in the model.
 * **A3 (one sender per layer).** Each layer's data comes from one producer in
   one push stream. With several streams per layer (several producers, or one
   producer's push split by source NUMA node into shard groups — producer side
-  `ShardGroupsByNuma` in `AsyncPush`, `bt.cc:965-986`, joined into the layer's
-  single callback at `:988-990`; receiver side `ShardsFromMask`, `bt.cc:545-547`)
-  the transport's per-stream completion (`CompleteIncomingPush`,
-  `bt.cc:641-794`) and the receiver's per-shard counters decide when the layer
-  is complete; each contributing stream still read a correct source, which is
-  all the proof uses.
+  `ShardGroupsByNuma` in `BlockTransport::AsyncPush`, joined into the layer's
+  single callback via `tsl::JoinFutures`; receiver side `ShardsFromMask` in
+  `BlockTransport::HandleIncomingPush`) the transport's per-stream completion
+  (`BlockTransport::CompleteIncomingPush`) and the receiver's per-shard counters
+  decide when the layer is complete; each contributing stream still read a
+  correct source, which is all the proof uses.
 * **A4 (engine contract).** The decode engine reads the KV cache only after
   `poll_stats()` reports `done_recving`; the prefill engine frees prefill HBM
   only after it reports the send. Both are outside tpu-sync.
@@ -157,6 +161,34 @@ make this true are exactly the sessions' refusal to begin an op once draining
 and their refusal to settle while an op is in flight — the settle protocol of
 stage 1 — plus the per-layer guards that a push waits for its own layer's
 copy and an H2D dispatch for its own layer's landing.
+
+## Source map
+
+Generated by `tools/resolve_anchors.py`.
+
+<!-- source-map:begin -->
+| File | Symbol / anchor | Lines |
+|---|---|---|
+| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:142-156` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `Finish(acquire_status);`) | `:380-383` |
+| `send.cc` | `TransferSendSession::StartPush` (`for (size_t l = 0; l < total_layers; ++l)`) | `:417-454` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future = d2h_layer_futures_[l];` .. `layer_future->OnReady`) | `:473-477` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:518-540` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->SendNextLayer(l + 1);`) | `:544` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:642-763` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:669-698` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:496-639` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` (`ABSL_RETURN_IF_ERROR(block_delegate_->BeginIncomingPush(header.uuid));` .. `FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);`) | `:508-635` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` (`ShardsFromMask`) | `:547` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` (`ABSL_RETURN_IF_ERROR(ForEachPayload(`) | `:556-610` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:641-794` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` (`if (array_complete && !progress.on_layer_received_called)`) | `:743-781` |
+| `bt.cc` | `BlockTransport::AsyncPush` | `:959-991` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` (`if (!send_sessions_.try_emplace(uuid, session).second)` .. `cv_.SignalAll();`) | `:493-499` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();` .. `send_sessions_.erase(it++);`) | `:964-982` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1236-1362` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`const absl::Time give_up = absl::Now() + grace;` .. `session->ValidateAndBeginPull`) | `:1260-1286` |
+<!-- source-map:end -->
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode
@@ -194,9 +226,9 @@ structure Pipeline where
   /-- ghost: layers whose H2D copy has finished -/
   h2dReadyL : List Bool
   reclaimed : Bool := false
-  /-- Whether `NotifyForRead` has registered the offer in `send_sessions_[uuid]` (`mgr.cc:493-499`). -/
+  /-- Whether `NotifyForRead` has registered the offer in `send_sessions_[uuid]`. -/
   registered : Bool := true
-  /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout` (`mgr.cc:1261-1272`). -/
+  /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout`. -/
   pullWaiting : Bool := false
   deriving Repr, DecidableEq
 
@@ -220,7 +252,7 @@ def init (n : Nat) : Pipeline :=
 
 /-- An `n`-layer transfer before `NotifyForRead` has registered the offer in
 `send_sessions_[uuid]`: models the `PullAheadOfRegistration` grace-wait and
-unregistered-pull rejection paths (`mgr.cc:1261-1282`). -/
+unregistered-pull rejection paths in `KVCacheManagerWithTransfer::HandlePullStream`. -/
 def initUnregistered (n : Nat) : Pipeline :=
   { init n with registered := false }
 
@@ -240,15 +272,16 @@ inductive Ev where
   | reseatDecodeStaging
   deriving Repr, DecidableEq
 
-/-- `NotifyForRead` registers the send session under `transfer_uuid` in
-`send_sessions_` and calls `cv_.SignalAll()` (`mgr.cc:493-499`). -/
+/-- `KVCacheManagerWithTransfer::NotifyForRead` registers the send session under
+`transfer_uuid` in `send_sessions_` (`send_sessions_.try_emplace(uuid, session)`)
+and calls `cv_.SignalAll()`. -/
 def notifyForRead (s : Pipeline) : Option Pipeline :=
   if s.registered = false then
     some { s with registered := true }
   else none
 
-/-- `HandlePullStream` arrives before `NotifyForRead` has registered the offer
-and enters the `cv_.WaitWithTimeout` grace wait (`mgr.cc:1261-1272`). -/
+/-- `KVCacheManagerWithTransfer::HandlePullStream` arrives before `NotifyForRead`
+has registered the offer and enters the `cv_.WaitWithTimeout` grace wait. -/
 def pullWait (s : Pipeline) : Option Pipeline :=
   if s.registered = false ∧ s.pullWaiting = false ∧ s.recv.pullPending = true then
     some { s with pullWaiting := true }
@@ -256,7 +289,7 @@ def pullWait (s : Pipeline) : Option Pipeline :=
 
 /-- A send event with no memory effect. The two that move data are the
 layer-indexed `d2hReady l` / `h2hDone l ok` and are disabled here. `beginPull`
-(`ValidateAndBeginPull`, `mgr.cc:1286`) requires the offer to be registered in
+(`session->ValidateAndBeginPull` in `HandlePullStream`) requires the offer to be registered in
 `send_sessions_` (`s.registered = true`) and clears any grace-wait state
 (`pullWaiting := false`). `wake` gets the per-layer guard the counter model
 cannot state: `SendNextLayer(woken)` waits on layer `woken`'s own future. -/
@@ -275,7 +308,7 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   | _ => (Send.step s.send e).map fun snd => { s with send := snd }
 
 /-- The D2H copy of layer `l` finishes: `prefillStaging[l] := prefillHbm[l]`.
-Copies are issued in layer order (`send.cc:417`), so layer `l`'s exists iff
+Copies are issued in layer order (`for (size_t l = 0; l < total_layers; ++l)` in `StartPush`), so layer `l`'s exists iff
 `l < d2hIssued`; which finishes first is up to the device. -/
 def d2hReady (s : Pipeline) (l : Nat) : Option Pipeline :=
   if l < s.send.d2hIssued ∧ s.d2hReadyL[l]? = some false then
@@ -285,7 +318,7 @@ def d2hReady (s : Pipeline) (l : Nat) : Option Pipeline :=
                d2hReadyL := s.d2hReadyL.set l true }
   else none
 
-/-- The push callback for layer `l` (`send.cc:522-540`). Pushes are issued in
+/-- The push callback for layer `l` in `SendNextLayer` (`H2hWriteDirectAsync`). Pushes are issued in
 layer order by the `SendNextLayer` chain, so push `l` exists iff
 `l < h2hIssued`; pushes complete in any order. A successful push delivers
 `prefillStaging[l]`. -/
@@ -315,7 +348,7 @@ def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   | _ => (Recv.step s.recv e).map fun rcv => { s with recv := rcv }
 
 /-- `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: fires
-once per layer (A1), after layer `l` landed (`bt.cc:743-745`). -/
+once per layer (A1), after layer `l` landed (`if (array_complete && !progress.on_layer_received_called)` in `CompleteIncomingPush`). -/
 def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
   if s.landedL[l]? = some true ∧ s.claimedL[l]? = some false then
     (Recv.step s.recv .h2dBegin).map fun rcv =>
@@ -324,7 +357,8 @@ def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
                h2dPendingL := s.h2dPendingL.set l true }
   else none
 
-/-- `ExecuteLayerH2d(l)` from the re-check on (`recv.cc:668-699`): consumes
+/-- `ExecuteLayerH2d(l)` from the `if (done_ || draining_)` re-check through
+`h2d_futures_.push_back(future)`: consumes
 layer `l`'s pending claim from `h2dBegin l` and, if the session is still active
 and dispatch succeeds (`ok = true`), marks layer `l`'s copy as issued. -/
 def h2dIssue (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=
@@ -424,8 +458,9 @@ def StagingSafe (s : Pipeline) : Prop :=
   (s.recv.life.hasStaging = false →
     s.recv.pushes = 0 ∧ s.recv.pending = 0 ∧ s.recv.retired = s.recv.issued)
 
-/-- Handshake rendezvous invariant (`mgr.cc:493-499`, `mgr.cc:1261-1329`,
-`send.cc:142-156`):
+/-- Handshake rendezvous invariant (`KVCacheManagerWithTransfer::NotifyForRead`,
+`KVCacheManagerWithTransfer::HandlePullStream`,
+`TransferSendSession::ValidateAndBeginPull`):
 1. `StartPush` (`send.started = true`) and all D2H/H2H activity require the
    offer to have been registered (`registered = true`) and claimed by
    `ValidateAndBeginPull` (`send.pullStarted = true`).

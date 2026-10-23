@@ -12,26 +12,30 @@ drives it. The sender stages each layer's device blocks into host staging
 let the engine reuse the device blocks, or the allocator reseat the staging,
 while any copy or push is still running. Memory contents are in `Pipeline.lean`.
 
-Citations are to tpu-sync `2ed6f8f`.
-Unqualified `.h`/`.cc` are
-`tpu_sync/kv_cache/transfer_send_session.{h,cc}`; `mgr.cc` is
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`.
+Citations are to the baseline commit in `verification/README.md` §Status.
+`send.h`/`send.cc` are `tpu_sync/kv_cache/transfer_send_session.{h,cc}`;
+`mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
+`tpu_sync/transport/block_transport.cc`. Exact line ranges for every symbol,
+sub-block, and test are in the generated `## Source map` table below.
 
 ## How a send runs
 
-`StartPush` (`.cc:358-457`) runs once on a worker thread spawned by the
-consumer's pull request (`mgr.cc:1330-1343`). It acquires staging
-(`.cc:380-385`), then issues one D2H copy per layer in a loop (`.cc:417-454`),
-each counted in `in_flight_` from before its dispatch until its future's
-`OnReady` ends the op (`.cc:450-453`). After the loop it calls
-`SendNextLayer(0)` (`.cc:456`).
+`StartPush` runs once on a worker thread spawned by the
+consumer's pull request (`HandlePullStream`'s `std::thread`). It acquires staging
+(`AcquireStagingWithRetry`), then issues one D2H copy per layer in a loop
+(`for (size_t l = 0; l < total_layers; ++l)`), each counted in `in_flight_` from
+before its dispatch until its future's `layer_future.OnReady` callback ends the
+op (`self->EndSendOp()`). After the loop it calls `SendNextLayer(0)`.
 
-`SendNextLayer(l)` (`.cc:459-547`) takes an op (`.cc:468-475`) and waits on
-layer `l`'s D2H future. When it is ready (`.cc:477-499`) the layer is handed to
-the push pool, whose task (`.cc:500-545`) takes a second op for the H2H push,
-issues it, calls `SendNextLayer(l+1)`, and only then releases the first op.
-The push's callback (`.cc:522-540`) releases the second op and, when the last
-layer's push completes, finishes the session OK (`.cc:535-539`).
+`SendNextLayer(l)` takes an op (`layer_future = d2h_layer_futures_[l]; ++in_flight_`)
+and waits on layer `l`'s D2H future. When it is ready (`layer_future->OnReady`)
+the layer is handed to the push pool (`self->base_->push_pool()->Schedule`),
+whose task takes a second op (`++self->in_flight_`) for the H2H push,
+issues it (`H2hWriteDirectAsync`), calls `SendNextLayer(l + 1)`, and only then
+releases the first op via its `absl::Cleanup end_op`. The push's callback
+releases the second op and, when the last layer's push completes
+(`remaining_h2h_layers_.fetch_sub(1) == 1`), finishes the session OK
+(`self->Finish()`).
 
 So two chains run against the same `in_flight_`: the D2H copies, all issued up
 front, and the pushes, strictly one layer after another. The session settles
@@ -44,49 +48,49 @@ The settle protocol is `Transfer.Lifecycle`. On top of it:
 | Field        | C++                                             | Role |
 |--------------|-------------------------------------------------|------|
 | `numLayers`  | `base_->num_layers()`                           | fixed |
-| `pullStarted`| `pull_started_` (`.h:211`)                      | `ValidateAndBeginPull` (`.cc:142-156`) claimed the offer |
-| `started`    | `StartPush` passed its locked section (`.cc:389-404`) | staging acquired, copies may start |
-| `d2hPending` | ghost                                           | the D2H loop is between `++in_flight_` (`.cc:423`) and the dispatch's outcome |
-| `d2hIssued`  | `d2h_layer_futures_.size()` (`.h:222`)          | copies handed to the device |
+| `pullStarted`| `pull_started_` (`TransferSendSession`)         | `ValidateAndBeginPull` claimed the offer |
+| `started`    | `StartPush` passed its locked section (`host_block_ids.assign` .. `dst_ints_.assign`) | staging acquired, copies may start |
+| `d2hPending` | ghost                                           | the D2H loop is between `++in_flight_` and `D2hSyncDispatch`'s outcome |
+| `d2hIssued`  | `d2h_layer_futures_.size()` (`TransferSendSession`) | copies handed to the device |
 | `d2hReady`   | futures with `IsReady()`                        | copies finished |
-| `d2hRetired` | ghost                                           | copies whose `OnReady` at `.cc:450-453` has ended their op |
-| `queued`     | ghost                                           | `SendNextLayer(l)` calls that took their op (`.cc:474`) |
-| `woken`      | ghost                                           | of those, the future callback (`.cc:477`) has run |
-| `pooled`     | ghost                                           | layers scheduled on `push_pool` (`.cc:500`) whose task has not run |
-| `h2hIssued`  | ghost                                           | pushes handed to the transport (`.cc:518`) |
-| `chaining`   | ghost                                           | pool tasks that issued their push and still hold the `SendNextLayer` op (`.cc:518-544`) |
-| `h2hRetired` | ghost                                           | push callbacks that have run (`.cc:522`) |
-| `h2hOk`      | `num_layers - remaining_h2h_layers_` (`.h:227`) | pushes that completed OK |
-| `published`  | membership in `done_sending_` / `failed_recving_` (`mgr.cc:975-976`) | what `poll_stats()` shows the engine |
+| `d2hRetired` | ghost                                           | copies whose `layer_future.OnReady` in `StartPush` has ended their op |
+| `queued`     | ghost                                           | `SendNextLayer(l)` calls that took their op (`++in_flight_`) |
+| `woken`      | ghost                                           | of those, the future callback (`layer_future->OnReady`) has run |
+| `pooled`     | ghost                                           | layers scheduled on `push_pool()->Schedule` whose task has not run |
+| `h2hIssued`  | ghost                                           | pushes handed to the transport (`H2hWriteDirectAsync`) |
+| `chaining`   | ghost                                           | pool tasks that issued their push and still hold the `SendNextLayer` op (`H2hWriteDirectAsync` .. `SendNextLayer(l + 1)`) |
+| `h2hRetired` | ghost                                           | push callbacks (`H2hWriteDirectAsync` callback) that have run |
+| `h2hOk`      | `num_layers - remaining_h2h_layers_` (`TransferSendSession`) | pushes that completed OK |
+| `published`  | membership in `done_sending_` / `failed_recving_` (`CompleteReadWithDetails`) | what `poll_stats()` shows the engine |
 | `underflow`  | —                                               | `EndSendOpLocked` ran with `in_flight_ == 0` |
 
 Ghost fields record where each unit of `in_flight_` came from, which is what
 `Accounted` is about. `underflow` exists because `EndSendOpLocked`
-(`.cc:253-260`) decrements without a guard; the model records the event
+decrements `--in_flight_` without a guard; the model records the event
 instead of silently saturating so that `NoUnderflow` is a theorem.
 
 ## Events
 
 | Event          | C++ |
 |----------------|-----|
-| `beginPull`    | `ValidateAndBeginPull` (`.cc:142-156`, called from `HandlePullStream` at `mgr.cc:1286`): rejects if `deadline_ <= now` (`.cc:146-149`; modelled together with pre-pull cancellation via `draining`/`done`) or `pull_started_` is already set (`.cc:151-154`), otherwise sets `pull_started_ = true` (`.cc:155`) |
-| `start`        | `StartPush` from the acquisition (`.cc:380-385`) through its locked section (`.cc:389-404`), spawned after `ValidateAndBeginPull`: a zero-layer send finishes OK at once (`.cc:394-397`) |
-| `d2hBegin`     | one iteration of the D2H loop up to `++in_flight_` (`.cc:418-424`) |
-| `d2hIssue ok`  | the dispatch (`.cc:425-434`): failure finishes the session and ends the op (`.cc:435-443`); success records the future (`.cc:445-449`). For the last layer, `SendNextLayer(0)` (`.cc:456`, `.cc:468-475`) is attempted as part of the event |
+| `beginPull`    | `ValidateAndBeginPull` (called from `HandlePullStream`): rejects if `deadline_ <= now` (modelled together with pre-pull cancellation via `draining`/`done`) or `pull_started_` is already set, otherwise sets `pull_started_ = true` |
+| `start`        | `StartPush` from the acquisition (`AcquireStagingWithRetry`) through its locked section, spawned after `ValidateAndBeginPull`: a zero-layer send (`total_layers == 0`) calls `FinishLocked(absl::OkStatus())` at once |
+| `d2hBegin`     | one iteration of `StartPush`'s D2H loop up to `++in_flight_` (`if (draining_) return; ++in_flight_;`) |
+| `d2hIssue ok`  | the dispatch (`D2hSyncDispatch`): failure finishes the session and ends the op (`FinishLocked(future.status()); EndSendOpLocked()`); success records the future (`d2h_layer_futures_.push_back(layer_future)`). For the last layer, `SendNextLayer(0)` (up to its lock) is attempted as part of the event |
 | `d2hReady`     | the device finishes a copy: its future becomes `IsReady()` |
-| `d2hEnd`       | the copy's `OnReady` at `.cc:450-453` ends its op via `EndSendOp` (`.cc:262-289`; see the lock-window note below) |
-| `wake ok`      | `SendNextLayer`'s future callback (`.cc:477-499`): a failed copy finishes the session (`.cc:484-490`); a draining session drops the layer (`.cc:491-497`); otherwise the layer is scheduled on the push pool and the op is carried over (`.cc:499-500`) |
-| `h2hIssue`     | the pool task up to the push (`.cc:501-518`): a draining session drops the layer and ends the op via `cleanup` (`.cc:501, 506-509`); otherwise a second op is taken (`.cc:513`) and the push issued (`H2hWriteDirectAsync` → `BlockTransport::AsyncPush`, which fans a layer out into one stream group per source NUMA node and joins them into this one callback, `bt.cc:965-990`; the callback may even run inline on an argument error) |
-| `sendNext`     | the pool task's `SendNextLayer(l+1)` (`.cc:544`, `.cc:462-475`) followed by the release of the carried-over op (`.cc:501`) |
-| `h2hDone ok`   | the push callback (`.cc:522-540`): failure finishes the session (`.cc:523-529`); the last OK push finishes it OK (`.cc:535-539`); the op ends either way |
-| `cancel`       | any `Finish(error)` from outside the data path: deadline (`mgr.cc:967-973`), shutdown (`mgr.cc:374-380`), pull-worker spawn failure (`mgr.cc:1321-1329`), staging acquisition failure (`.cc:382-385`), bad arguments (`.cc:369-374`), pull-worker exceptions (`mgr.cc:1335-1340`) |
-| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session into `done_sending_` or `failed_recving_` by its status and drops it (`mgr.cc:974-982`) |
+| `d2hEnd`       | the copy's `layer_future.OnReady` in `StartPush` ends its op via `EndSendOp` (see the lock-window note below) |
+| `wake ok`      | `SendNextLayer`'s `layer_future->OnReady` callback: a failed copy finishes the session (`self->FinishLocked(status_or.status(), kD2hPhase)`); a draining session drops the layer (`if (self->draining_) return;`); otherwise the layer is scheduled on `push_pool()->Schedule` and `std::move(end_op).Cancel()` carries the op over |
+| `h2hIssue`     | the `push_pool` task up to the push: a draining session (`if (self->draining_) return;`) drops the layer and ends the op via `absl::Cleanup end_op`; otherwise a second op is taken (`++self->in_flight_`) and the push issued (`H2hWriteDirectAsync` → `BlockTransport::AsyncPush`, which fans a layer out into one stream group per source NUMA node via `AsyncPushShards` and joins them via `tsl::JoinFutures` into this one callback; the callback may even run inline on an argument error) |
+| `sendNext`     | the pool task's `SendNextLayer(l + 1)` followed by the release of the carried-over op (`absl::Cleanup end_op`) |
+| `h2hDone ok`   | the `H2hWriteDirectAsync` push callback: failure finishes the session (`self->FinishLocked(push_res.status(), kPushPhase)`); the last OK push (`remaining_h2h_layers_.fetch_sub(1) == 1`) finishes it OK (`self->Finish()`); the op ends either way |
+| `cancel`       | any `Finish(error)` from outside the data path: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), pull-worker spawn failure (`HandlePullStream`'s `counter_cleanup`), staging acquisition failure (`!acquire_status.ok()`), bad arguments in `StartPush` (`src_block_ids.empty() || ...`), pull-worker exceptions (`HandlePullStream`'s `catch`) |
+| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`session->Done()`) into `done_sending_` or `failed_recving_` by its status and erases it from `send_sessions_` |
 
 ## Assumptions
 
-* **A1 (at-most-once `StartPush`).** `ValidateAndBeginPull` (`.cc:142-156`)
-  rejects a duplicate pull or an expired offer and sets `pull_started_`
-  (`.cc:155`); the model's `beginPull` does the same and gates `start`
+* **A1 (at-most-once `StartPush`).** `ValidateAndBeginPull`
+  rejects a duplicate pull or an expired offer and sets `pull_started_ = true`;
+  the model's `beginPull` does the same and gates `start`
   (`PullClaimed`), so a second `StartPush` on one session is unreachable.
 * **A2 (sequential loop).** The D2H loop is one thread, so at most one
   dispatch is between its `++in_flight_` and its outcome: `d2hPending` is a
@@ -101,34 +105,35 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
   admits.
 * **A4 (no double end).** Each op ends once: every op-ending event is guarded
   by the ghost counter that opened it.
-* **A5 (no consumer Ack).** `HandleAck → AckSend → Finish()` (`mgr.cc:1364-1367,
-  1430-1441`) would finish a send OK from outside. No code in the repository at
-  `2ed6f8f` sends an Ack (`SendAck` has only test callers), so it is not an
+* **A5 (no consumer Ack).** `HandleAck → AckSend → session->Finish()`
+  would finish a send OK from outside. No code in the repository
+  sends an Ack (`SendAck` has only test callers), so it is not an
   event; nor is the ack-first path of `NotifyForRead`, which reports
-  `done_sending` without registering the session when `pending_acks_` already holds
-  the uuid (`mgr.cc:489-492`, filled only by `AckSend`, `:1430-1438`). With it,
+  `done_sending` without registering the session when `pending_acks_.erase(uuid) > 0`
+  (filled only by `AckSend` when `it == send_sessions_.end()`). With it,
   `Publication` below would read "the consumer acked", not "every layer was
   pushed".
 * **A6 (fold of `SendNextLayer(0)`).** Between recording the last future
-  (`.cc:448`) and `SendNextLayer(0)`'s lock (`.cc:469`) only a `Finish` can
-  change the outcome of the attempt, and it has the same effect ordered before
-  the event; the two are one event.
+  (`d2h_layer_futures_.push_back(layer_future)`) and `SendNextLayer(0)`'s lock,
+  only a `Finish` can change the outcome of the attempt, and it has the same
+  effect ordered before the event; the two are one event.
 
-* **A7 (connection release window).** `EndSendOp` (`.cc:262-289`)
+* **A7 (connection release window).** `EndSendOp`
   is modelled as the atomic `endOp`. Under `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer`
   (default `pooled`, which never enters this branch) the last op of a draining
   send first drops `mu_` to close the idle data connections to the consumer
-  (`:276-287`; the branch also needs recorded endpoints and
-  `!connections_released_`, `:278-279`) and only then runs `EndSendOpLocked`.
-  In that window `in_flight_ == 1`, `draining_` and `!done_` hold: no new op
-  can begin (`beginOp` refuses while draining, `.cc:422, 470, 507`), no other
-  op can end (this is the only one, A3), `FinishLocked` returns at `.cc:195`,
-  `ValidateAndBeginPull` throws on `pull_started_` (`.cc:151-154`), and the
-  poll cannot publish (`Done()` is false), so no modelled variable changes
-  between the check and the decrement; `connections_released_` (`.h:220`) only
-  stops a second pass. The direct `EndSendOpLocked()` on a copy that could not
-  be issued (`.cc:442`) bypasses the window, but no push exists then. The
-  window delays `done_`, which every trace already allows between events.
+  (`ReleaseDataConnectionsAfterSend`; the branch `release_due` also needs
+  `!remote_data_endpoints_.empty()` and `!connections_released_`) and only then
+  runs `EndSendOpLocked`. In that window `in_flight_ == 1`, `draining_` and
+  `!done_` hold: no new op can begin (`beginOp` refuses while `draining_` in
+  `StartPush` and `SendNextLayer`), no other op can end (this is the only one,
+  A3), `FinishLocked` returns at `if (draining_ || done_) return;`,
+  `ValidateAndBeginPull` throws on `if (pull_started_)`, and the poll cannot
+  publish (`Done()` is false), so no modelled variable changes between the
+  check and the decrement; `connections_released_` only stops a second pass.
+  The direct `EndSendOpLocked()` on a copy that could not be issued in
+  `StartPush` bypasses the window, but no push exists then. The window delays
+  `done_`, which every trace already allows between events.
 
 ## Properties
 
@@ -139,7 +144,8 @@ All proved on every reachable state (`reachable_safe`):
   callback, pool task or push is outstanding. In particular no D2H copy still
   reads the device blocks (so the engine may reuse them) or writes the staging,
   and no push still reads the staging (so the allocator may reseat it). This is
-  what the comments at `.h:212-213` and `mgr.cc:967-971` promise.
+  what the comments on `in_flight_` (`TransferSendSession`) and the
+  send-deadline loop in `CompleteReadWithDetails` promise.
 * **Staging integrity.** `hasStaging = !done`: staging, once acquired, is held
   exactly until the session settles.
 * **Prompt settle.** `draining → inFlight = 0 → done`.
@@ -164,10 +170,72 @@ the first (`Lifecycle.finishOnceLocked`), unlike the receiver's. An OK finish
 happens inside the last push callback while D2H `OnReady`s may still be
 outstanding, so a shutdown or deadline in that window leaves the status OK
 (`trace_cancel_after_ok_finish`); harmless, since the send did complete.
-(2) A failed send is reported in `failed_recving_` (`mgr.cc:975-976`), there is
-no `failed_sending_`. (3) The D2H loop's `if (draining_) return;` (`.cc:422`)
-also skips `SendNextLayer(0)`, which is fine because every later
+(2) A failed send is reported in `failed_recving_` (`CompleteReadWithDetails`),
+there is no `failed_sending_`. (3) The D2H loop's `if (draining_) return;` in
+`StartPush` also skips `SendNextLayer(0)`, which is fine because every later
 `SendNextLayer` re-checks `draining_`.
+
+## Source map
+
+Generated by `tools/resolve_anchors.py`.
+
+<!-- source-map:begin -->
+| File | Symbol / anchor | Lines |
+|---|---|---|
+| `send.h` | `TransferSendSession` (`bool pull_started_` .. `std::atomic<size_t> remaining_h2h_layers_`) | `:211-227` |
+| `send.cc` | `*` (`constexpr absl::string_view kAwaitPullPhase` .. `constexpr absl::string_view kPushPhase`) | `:55-58` |
+| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:142-156` |
+| `send.cc` | `TransferSendSession::FinishLocked` | `:193-206` |
+| `send.cc` | `TransferSendSession::Finish` | `:208-217` |
+| `send.cc` | `TransferSendSession::Details` | `:225-241` |
+| `send.cc` | `TransferSendSession::CurrentPhaseLocked` | `:243-251` |
+| `send.cc` | `TransferSendSession::EndSendOpLocked` | `:253-260` |
+| `send.cc` | `TransferSendSession::EndSendOp` | `:262-289` |
+| `send.cc` | `TransferSendSession::AcquireStagingWithRetry` | `:322-356` |
+| `send.cc` | `TransferSendSession::StartPush` | `:358-457` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (src_block_ids.empty()`) | `:369-374` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `dst_ints_.assign`) | `:380-403` |
+| `send.cc` | `TransferSendSession::StartPush` (`for (size_t l = 0; l < total_layers; ++l)`) | `:417-454` |
+| `send.cc` | `TransferSendSession::StartPush` (`layer_future.OnReady`) | `:450-453` |
+| `send.cc` | `TransferSendSession::SendNextLayer` | `:459-547` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (l >= base_->num_layers())` .. `++in_flight_;`) | `:462-474` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future->OnReady`) | `:477-546` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->push_pool()->Schedule`) | `:500-545` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:518-540` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : send_sessions_)`) | `:376-380` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:462-509` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();`) | `:964-986` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1236-1362` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`absl::Cleanup counter_cleanup` .. `std::move(counter_cleanup).Cancel();`) | `:1321-1344` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandleAck` | `:1364-1367` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::AckSend` | `:1430-1453` |
+| `bt.cc` | `BlockTransport::AsyncPush` | `:959-991` |
+| `send_drain_test.cc` | `SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds` | `:324-348` |
+| `send_drain_test.cc` | `SendDrainTest.SendNobodyPulledFailsAtItsDeadline` | `:370-379` |
+| `send_drain_test.cc` | `SendDrainTest.FailedLayerWaitsForTheOtherLayersCopies` | `:350-368` |
+| `send_drain_test.cc` | `SendLifecycleTest.FailedSendWithoutWorkSettlesImmediately` | `:435-445` |
+| `send_drain_test.cc` | `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess` | `:467-479` |
+| `send_drain_test.cc` | `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure` | `:481-493` |
+| `send_drain_test.cc` | `SendLifecycleTest.DetailsSayAnUnpulledSendTimedOutAwaitingItsPull` | `:513-534` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsSayAnExpiredSendWasStillCopying` | `:536-553` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsCarryTheErrorOfAFailedCopy` | `:555-568` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun` | `:570-597` |
+| `pool_reshard_test.cc` | `SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` | `:369-378` |
+| `control_test.cc` | `ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected` | `:311-333` |
+| `control_test.cc` | `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement` | `:370-382` |
+| `transfer_send_session_test.cc` | `FakeSendBase::CompleteH2h` | `:82-89` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone` | `:189-212` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:214-234` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush` | `:236-268` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush` | `:270-296` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:298-313` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface` | `:315-345` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator` | `:380-423` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm` | `:425-452` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `:454-511` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang` | `:550-569` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone` | `:592-622` |
+<!-- source-map:end -->
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode
@@ -196,21 +264,22 @@ structure Send where
 
 namespace Send
 
-/-- A registered send (`NotifyForRead`, `mgr.cc:475-497`) that nobody has
+/-- A registered send (`NotifyForRead`) that nobody has
 pulled yet. -/
 def init (numLayers : Nat) : Send := { numLayers }
 
-/-- `EndSendOpLocked` (`.cc:253-260`): `--in_flight_` and settle. The C++ has
+/-- `EndSendOpLocked`: `--in_flight_` and settle. The C++ has
 no underflow check; the model records one instead of ignoring it. -/
 def endOp (s : Send) : Send :=
   if s.life.inFlight = 0 then { s with underflow := true }
   else { s with life := s.life.endOpLocked }
 
-/-- `Finish(status)` / `FinishLocked(status)` (`.cc:193-217`). -/
+/-- `Finish(status)` / `FinishLocked(status)`. -/
 def finish (ok : Bool) (s : Send) : Send := { s with life := s.life.finishOnceLocked ok }
 
-/-- `SendNextLayer(l)` up to its lock (`.cc:462-475`) for `l = queued`: takes an
-op unless the session is draining or layer `l`'s copy was never issued. -/
+/-- `SendNextLayer(l)` up to its lock (`if (l >= base_->num_layers())` .. `++in_flight_;`)
+for `l = queued`: takes an op unless the session is draining or layer `l`'s copy
+was never issued. -/
 def trySendNext (s : Send) : Send :=
   if s.queued < s.d2hIssued then
     match s.life.beginOp with
@@ -233,38 +302,38 @@ inductive Ev where
   | publish
   deriving Repr, DecidableEq
 
-/-- `ValidateAndBeginPull` (`.cc:142-156`): rejects an expired offer
-(`deadline_ <= now`, `.cc:146-149`; modelled together with pre-pull
+/-- `ValidateAndBeginPull`: rejects an expired offer
+(`deadline_ <= now`; modelled together with pre-pull
 cancellation via `draining`/`done`; the deadline is the only lifecycle check
 `ValidateAndBeginPull` itself makes — `draining_`/`done_` are not read there,
 but under A5 an unpulled send only drains by deadline or by shutdown, which
-`HandlePullStream` rejects first via `stopping_`, `mgr.cc:1268-1276`) or a
-duplicate pull (`.cc:151-154`), and otherwise claims `pull_started_ = true`
-(`.cc:155`) before `HandlePullStream` spawns the `StartPush` worker thread
-(`mgr.cc:1286-1343`). -/
+`HandlePullStream` rejects first via `stopping_.load()`) or a
+duplicate pull (`if (pull_started_)`), and otherwise claims `pull_started_ = true`
+before `HandlePullStream` spawns the `StartPush` worker thread. -/
 def beginPull (s : Send) : Option Send :=
   if s.pullStarted = true ∨ s.life.draining = true ∨ s.life.done = true then none
   else some { s with pullStarted := true }
 
-/-- `StartPush` with staging acquired (`.cc:358-404`), spawned after
-`ValidateAndBeginPull` claimed `pull_started_` (`mgr.cc:1286-1343`). A failed
-acquisition or worker spawn failure (`mgr.cc:1321-1329`) is `Finish(error)` with
-nothing in flight, i.e. `cancel`. On a session that finished meanwhile the call
-returns (`.cc:391-393`) and nothing changes. -/
+/-- `StartPush` with staging acquired, spawned after
+`ValidateAndBeginPull` claimed `pull_started_` in `HandlePullStream`. A failed
+acquisition (`!acquire_status.ok()`) or worker spawn failure (`HandlePullStream`'s
+`counter_cleanup`) is `Finish(error)` with nothing in flight, i.e. `cancel`. On
+a session that finished meanwhile the call returns (`if (draining_ || done_) return;`)
+and nothing changes. -/
 def start (s : Send) : Option Send :=
   if s.pullStarted = false ∨ s.started = true ∨ s.life.draining = true ∨ s.life.done = true then none
   else if s.numLayers = 0 then some (s.finish true)
   else some { s with started := true }
 
-/-- One iteration of the D2H loop up to `++in_flight_` (`.cc:418-424`). -/
+/-- One iteration of `StartPush`'s D2H loop up to `++in_flight_`. -/
 def d2hBegin (s : Send) : Option Send :=
   if s.started = true ∧ s.d2hPending = false ∧ s.d2hIssued < s.numLayers then
     s.life.beginOp.map fun l => { s with life := l, d2hPending := true }
   else none
 
-/-- The dispatch's outcome. Failure: `FinishLocked(status); EndSendOpLocked()`
-(`.cc:440-442`). Success: the future is recorded (`.cc:448`), and after the
-last layer `SendNextLayer(0)` is attempted (`.cc:456`, A6). -/
+/-- The dispatch's outcome in `StartPush`. Failure: `FinishLocked(future.status()); EndSendOpLocked()`.
+Success: the future is recorded (`d2h_layer_futures_.push_back(layer_future)`),
+and after the last layer `SendNextLayer(0)` is attempted (A6). -/
 def d2hIssue (ok : Bool) (s : Send) : Option Send :=
   if s.d2hPending = false then none
   else
@@ -278,12 +347,12 @@ def d2hIssue (ok : Bool) (s : Send) : Option Send :=
 def markD2hReady (s : Send) : Option Send :=
   if s.d2hReady < s.d2hIssued then some { s with d2hReady := s.d2hReady + 1 } else none
 
-/-- The copy's `OnReady` at `.cc:450-453` ends its op. -/
+/-- The copy's `layer_future.OnReady` in `StartPush` ends its op (`self->EndSendOp()`). -/
 def d2hEnd (s : Send) : Option Send :=
   if s.d2hRetired < s.d2hReady then some { s with d2hRetired := s.d2hRetired + 1 }.endOp
   else none
 
-/-- `SendNextLayer`'s future callback (`.cc:477-499`) for layer `woken`, which
+/-- `SendNextLayer`'s `layer_future->OnReady` callback for layer `woken`, which
 needs its copy ready. -/
 def wake (ok : Bool) (s : Send) : Option Send :=
   if s.woken < s.queued ∧ s.woken < s.d2hReady then
@@ -293,7 +362,7 @@ def wake (ok : Bool) (s : Send) : Option Send :=
     else some { s with pooled := s.pooled + 1 }
   else none
 
-/-- The pool task up to and including the push (`.cc:501-518`). -/
+/-- The `push_pool()->Schedule` task in `SendNextLayer` up to and including `H2hWriteDirectAsync`. -/
 def h2hIssue (s : Send) : Option Send :=
   if s.pooled = 0 then none
   else
@@ -302,13 +371,13 @@ def h2hIssue (s : Send) : Option Send :=
     | some l => some { s with life := l, h2hIssued := s.h2hIssued + 1, chaining := s.chaining + 1 }
     | none => some s.endOp
 
-/-- The pool task's tail: `SendNextLayer(l+1)` (`.cc:544`), then the cleanup
-at `.cc:501` ends the op it carried. -/
+/-- The pool task's tail in `SendNextLayer`: `self->SendNextLayer(l + 1)`, then
+`absl::Cleanup end_op` ends the op it carried. -/
 def sendNext (s : Send) : Option Send :=
   if s.chaining = 0 then none
   else some { s with chaining := s.chaining - 1 }.trySendNext.endOp
 
-/-- The push callback (`.cc:522-540`). -/
+/-- The `H2hWriteDirectAsync` push callback in `SendNextLayer`. -/
 def h2hDone (ok : Bool) (s : Send) : Option Send :=
   if s.h2hRetired < s.h2hIssued then
     let s := { s with h2hRetired := s.h2hRetired + 1 }
@@ -322,7 +391,7 @@ def h2hDone (ok : Bool) (s : Send) : Option Send :=
 def cancel (s : Send) : Option Send := some (s.finish false)
 
 /-- `CompleteReadWithDetails` / `CompleteReadRaw` publishes a settled session
-(`mgr.cc:974-982`). -/
+(`if (session->Done())`). -/
 def publish (s : Send) : Option Send :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }
@@ -1001,22 +1070,18 @@ theorem trace_normal :
       some (true, some true, 2, 0) := by
   decide
 
-/-- "One nobody pulled is reported now" (`mgr.cc:968-969`;
-`SendDrainTest.SendNobodyPulledFailsAtItsDeadline` in
-`kv_cache_manager_with_transfer_send_drain_test.cc:370-379` and
-`SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` in
-`kv_cache_manager_with_transfer_pool_reshard_test.cc:369-378`): before the
+/-- "One nobody pulled is reported now" (`CompleteReadWithDetails`;
+`SendDrainTest.SendNobodyPulledFailsAtItsDeadline` and
+`SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone`): before the
 deadline an unpulled send holds its `Lifecycle` staging token (`hasStaging = true`
-by the `Session.lean:44-49` convention) and cannot be published; once the deadline
+by the `Session.lean` convention) and cannot be published; once the deadline
 fires on the idle send it settles at once (`hasStaging = false`), publishes
 failure (`some false`), and the model also checks that any late `.beginPull`
-(`ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected`,
-`kv_cache_manager_with_transfer_control_test.cc:311-333`) or `.start` is
+(`ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected`) or `.start` is
 rejected. The `[.cancel, .publish]` conjunct is also
 `SendLifecycleTest.FailedSendWithoutWorkSettlesImmediately`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:435-445`: a synthetic send
-with `in_flight = 0` failed via `Decide(failed = true)` settles, releases staging
-and is reported in `failed_recving` at once). -/
+(a synthetic send with `in_flight = 0` failed via `Decide(failed = true)` settles,
+releases staging and is reported in `failed_recving` at once). -/
 theorem trace_never_pulled :
     ((sys 2).run []).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (false, true, none) ∧
@@ -1028,25 +1093,24 @@ theorem trace_never_pulled :
     (sys 2).run [.cancel, .start] = none := by
   decide
 
-/-- `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement`
-(`kv_cache_manager_with_transfer_control_test.cc:370-382`): once `ValidateAndBeginPull`
-(`.beginPull`) has claimed `pull_started_ = true`, any duplicate pull is
-rejected both before and after `StartPush` (`.start`) begins (the C++ test
-sets `pull_started_` through the `MarkPullStarted` hook and checks only the
-pre-`StartPush` duplicate; the post-`StartPush` conjunct is model-only). -/
+/-- `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement`: once
+`ValidateAndBeginPull` (`.beginPull`) has claimed `pull_started_ = true`, any
+duplicate pull is rejected both before and after `StartPush` (`.start`) begins
+(the C++ test sets `pull_started_` through the `MarkPullStarted` hook and checks
+only the pre-`StartPush` duplicate; the post-`StartPush` conjunct is
+model-only). -/
 theorem trace_duplicate_pull_rejected :
     ((sys 1).run [.beginPull]).map (fun s => (s.pullStarted, s.started)) = some (true, false) ∧
     (sys 1).run [.beginPull, .beginPull] = none ∧
     (sys 1).run [.beginPull, .start, .beginPull] = none := by
   decide
 
-/-- `HandlePullStream` worker spawn failure (`mgr.cc:1321-1329`,
-`hooks::kKvCacheManagerPullSpawn`): if `ValidateAndBeginPull` (`.beginPull`)
-succeeds but spawning the `StartPush` thread fails, `counter_cleanup` calls
-`session->Finish(InternalError)` (`.cancel`), which settles the session at once,
-releases staging, reports failure, and blocks any late `.start`
-(`TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm`,
-`transfer_send_session_test.cc:425-452`). -/
+/-- `HandlePullStream` worker spawn failure (`hooks::kKvCacheManagerPullSpawn`):
+if `ValidateAndBeginPull` (`.beginPull`) succeeds but spawning the `StartPush`
+thread fails, `counter_cleanup` calls `session->Finish(InternalError)`
+(`.cancel`), which settles the session at once, releases staging, reports
+failure, and blocks any late `.start`
+(`TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm`). -/
 theorem trace_pull_spawn_failure_cleanup :
     ((sys 1).run [.beginPull, .cancel, .publish]).map
       (fun s => (s.pullStarted, s.started, s.life.done, s.life.hasStaging, s.published)) =
@@ -1056,11 +1120,10 @@ theorem trace_pull_spawn_failure_cleanup :
 
 /-- The deadline fires while a copy runs: the send drains, keeps its staging,
 issues nothing more, and settles when the copy's `OnReady` ends the op
-(`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`,
-`kv_cache_manager_with_transfer_send_drain_test.cc:324-348`;
-analogous `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface`,
-`transfer_send_session_test.cc:315-345`: one layer, `Finish(error)` with a D2H in
-flight while `SendNextLayer(0)`'s op also drains). -/
+(`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`;
+analogous `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface`:
+one layer, `Finish(error)` with a D2H in flight while `SendNextLayer(0)`'s op
+also drains). -/
 theorem trace_deadline_during_copy :
     ((sys 2).run [.beginPull, .start, .d2hBegin, .d2hIssue true, .cancel]).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
@@ -1072,7 +1135,7 @@ theorem trace_deadline_during_copy :
 /-- A push fails: the session drains, the layer still waiting in the chain is
 dropped by `h2hIssue`'s re-check, and the send is published as failed. No C++
 test exercises this "both copies done, next layer queued" shape:
-`FakeSendBase::CompleteH2h(i, error)` (`transfer_send_session_test.cc:82-89`)
+`FakeSendBase::CompleteH2h(i, error)`
 accepts an error status but every caller passes success; the one test that does
 fail a push, `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun`,
 is the "copy still running" shape replayed by
@@ -1087,11 +1150,9 @@ theorem trace_push_fails :
 
 /-- Correspondence note (1): the OK finish happens in the last push callback
 while a D2H `OnReady` may still be outstanding; a `Finish(error)` in that
-window is ignored (`SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess`,
-`kv_cache_manager_with_transfer_send_drain_test.cc:467-479`;
+window is ignored (`SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess`;
 analogous `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone`,
-`transfer_send_session_test.cc:592-622`, where the OK finish is an external
-`Finish(OkStatus())`). -/
+where the OK finish is an external `Finish(OkStatus())`). -/
 theorem trace_cancel_after_ok_finish :
     ((sys 1).run
       [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady, .wake true, .h2hIssue, .sendNext,
@@ -1100,8 +1161,7 @@ theorem trace_cancel_after_ok_finish :
   decide
 
 /-- A zero-layer send finishes OK inside `StartPush`
-(`TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang`,
-`transfer_send_session_test.cc:550-569`). -/
+(`TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang`). -/
 theorem trace_zero_layers :
     ((sys 0).run [.beginPull, .start, .publish]).map (fun s => s.published) = some (some true) := by
   decide
@@ -1137,16 +1197,14 @@ theorem trace_failed_d2h_waits_for_other_layer :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
-/-- `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:481-493`; the C++ test calls
+/-- `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure` (the C++ test calls
 `Decide(true)` then `Decide(false)` while a D2H copy is in flight, which this
 trace exercises via `.cancel` followed by `.h2hDone true`), and the lifecycle
 assertion of `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`
-(`transfer_send_session_test.cc:236-268`) and
-`PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush` (`:270-296`): dual of
-`trace_cancel_after_ok_finish`. If `Finish(error)` runs while the last push is
-in flight, a subsequent OK push completion (`h2hDone true` calling `finish true`)
-cannot override the earlier failure. -/
+and `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush`:
+dual of `trace_cancel_after_ok_finish`. If `Finish(error)` runs while the last
+push is in flight, a subsequent OK push completion (`h2hDone true` calling
+`finish true`) cannot override the earlier failure. -/
 theorem trace_ok_after_cancel_keeps_failure :
     ((sys 1).run
       [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady, .d2hEnd, .wake true, .h2hIssue, .sendNext,
@@ -1189,7 +1247,7 @@ def cancelEager (s : Send) : Option Send :=
         | .counterexample _ => true
         | _ => false)
 
-/-- And the point of the op `SendNextLayer` takes at `.cc:474`: without it a
+/-- And the point of the op `SendNextLayer` takes (`++in_flight_`): without it a
 send whose copies have all ended settles under a `Finish`, and the pool task
 that then runs ends an op the session no longer owns. -/
 def trySendNextUncounted (s : Send) : Send :=
@@ -1216,9 +1274,9 @@ def d2hIssueUncounted (ok : Bool) (s : Send) : Option Send :=
         | _ => false)
 
 /-- Mutant for `NoOpLeak`: `SendNextLayer(l)` omits the
-`l >= base_->num_layers()` (`.cc:462`) / `l >= d2h_layer_futures_.size()`
-(`.cc:470-472`) bounds checks and takes an op unconditionally. After the last
-layer's pool task calls `SendNextLayer(numLayers)` (`.cc:544`), that call claims
+`l >= base_->num_layers()` / `l >= d2h_layer_futures_.size()`
+bounds checks and takes an op unconditionally. After the last
+layer's pool task calls `SendNextLayer(numLayers)`, that call claims
 an op for a non-existent layer whose D2H future never becomes ready, leaking the
 session and its staging forever (`SettleSafe` holds vacuously, `NoOpLeak`
 catches it). -/
@@ -1240,32 +1298,35 @@ def sendNextUnbounded (s : Send) : Option Send :=
 /-! ## Failure phase (`TransferDetails`)
 
 A failed session records the phase it failed in:
-`FinishLocked(status, phase)` (`.cc:193-199`) latches `failed_phase_` from the
-explicit `phase` argument when the failing step knows it (`kD2hPhase` at
-`.cc:488`, `kPushPhase` at `.cc:527`) and otherwise from `CurrentPhaseLocked`
-(`.cc:243-251`), and `Details()` (`.cc:225-241`) reports it to
-`CompleteReadWithDetails` (`mgr.cc:977`). Nothing in the lifecycle reads it, so
+`FinishLocked(status, phase)` latches `failed_phase_` from the
+explicit `phase` argument when the failing step knows it (`kD2hPhase` in
+`SendNextLayer`'s `layer_future->OnReady`, `kPushPhase` in
+`H2hWriteDirectAsync`'s callback) and otherwise from `CurrentPhaseLocked`,
+and `Details()` reports it to
+`CompleteReadWithDetails` (`transfer_details_[session->req_id()] = session->Details()`).
+Nothing in the lifecycle reads it, so
 it is not state here; `phase` below is `CurrentPhaseLocked` evaluated on the
 model, and `failedPhase s e` is the value `FinishLocked` latches when event `e`
 fails in state `s`. Inside `StartPush` before its locked section the model
 has one state (`pullStarted ∧ ¬started`) where C++ has three phases —
-`await_pull` before the endpoints are recorded (`.cc:375-378`), `staging` while
-`AcquireStagingWithRetry` runs (`.cc:380-385`, the shape of
-`TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator`,
-`transfer_send_session_test.cc:380-423`), `d2h` between `staging_ = …` (`.cc:346`)
-and the re-check (`.cc:391`) — because `start` is atomic; `phase` reports
+`await_pull` before the endpoints are recorded (`remote_data_endpoints_ = remote_data_endpoints`),
+`staging` while `AcquireStagingWithRetry` runs (the shape of
+`TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator`),
+`d2h` between `staging_ = *std::move(acquired)` and the `if (draining_ || done_)`
+re-check — because `start` is atomic; `phase` reports
 `awaitPull` for all three. No replayed test evaluates a phase in that window;
 the `trace_details_*` theorems only read `phase` in states where the two agree. -/
 
-/-- The four phases of `TransferSendSession::CurrentPhaseLocked` (`.cc:55-58`). -/
+/-- The four phases of `TransferSendSession::CurrentPhaseLocked` (`kAwaitPullPhase` .. `kPushPhase`). -/
 inductive Phase
   | awaitPull | staging | d2h | push
   deriving Repr, DecidableEq
 
-/-- `CurrentPhaseLocked` (`.cc:243-251`): no endpoints yet (`.cc:244`, set at
-`StartPush` entry `.cc:375-378`, i.e. `started = false`) → `awaitPull`; some
-D2H future missing or not ready (`.cc:246-249`) → `d2h`; otherwise `push`.
-The `staging_.empty()` branch (`.cc:245`, `staging`) is folded into `awaitPull`
+/-- `CurrentPhaseLocked`: no endpoints yet (`remote_data_endpoints_.empty()`, set at
+`StartPush` entry, i.e. `started = false`) → `awaitPull`; some
+D2H future missing or not ready (`d2h_layer_futures_.size() < base_->num_layers()`
+or `!future.IsReady()`) → `d2h`; otherwise `push`.
+The `staging_.empty()` branch (`staging`) is folded into `awaitPull`
 because `start` is atomic (see above). -/
 def phase (s : Send) : Phase :=
   if s.started = false then .awaitPull
@@ -1273,17 +1334,16 @@ def phase (s : Send) : Phase :=
   else .push
 
 /-- The phase `FinishLocked` latches when `e` fails in `s`: the D2H completion
-callback passes `kD2hPhase` (`.cc:488`), the push callback `kPushPhase`
-(`.cc:527`); every other failure (`Finish(error)` from the deadline, shutdown,
-spawn failure, a copy that could not be issued, `.cc:441`) takes the current
-phase (`.cc:198`). -/
+callback passes `kD2hPhase`, the push callback `kPushPhase`;
+every other failure (`Finish(error)` from the deadline, shutdown,
+spawn failure, or a copy that could not be issued in `StartPush`) takes the current
+phase (`CurrentPhaseLocked()`). -/
 def failedPhase (s : Send) : Ev → Phase
   | .wake false => .d2h
   | .h2hDone false => .push
   | _ => phase s
 
-/-- `SendLifecycleTest.DetailsSayAnUnpulledSendTimedOutAwaitingItsPull`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:513-534`): a registered send
+/-- `SendLifecycleTest.DetailsSayAnUnpulledSendTimedOutAwaitingItsPull`: a registered send
 that nobody pulled expires in `await_pull` and is reported failed. -/
 theorem trace_details_unpulled_send_awaits_pull :
     ((sys 1).run []).map (fun s => (phase s, failedPhase s .cancel)) =
@@ -1291,8 +1351,7 @@ theorem trace_details_unpulled_send_awaits_pull :
     ((sys 1).run [.cancel, .publish]).map (fun s => s.published) = some (some false) := by
   decide
 
-/-- `SendDrainTest.DetailsSayAnExpiredSendWasStillCopying`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:536-553`): the deadline fires
+/-- `SendDrainTest.DetailsSayAnExpiredSendWasStillCopying`: the deadline fires
 with a D2H copy in flight; the failure is latched in `d2h`, and the send still
 waits for the copy before it settles and is reported. -/
 theorem trace_details_expired_while_copying :
@@ -1304,10 +1363,9 @@ theorem trace_details_expired_while_copying :
       (fun s => (s.life.done, s.published)) = some (true, some false) := by
   decide
 
-/-- `SendDrainTest.DetailsCarryTheErrorOfAFailedCopy`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:555-568`): a D2H copy
+/-- `SendDrainTest.DetailsCarryTheErrorOfAFailedCopy`: a D2H copy
 completes with an error; the completion callback latches `d2h` explicitly
-(`.cc:488`) and the send is reported failed. -/
+(`self->FinishLocked(status_or.status(), kD2hPhase)`) and the send is reported failed. -/
 theorem trace_details_failed_copy :
     let pre := [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady]
     ((sys 1).run pre).map (fun s => failedPhase s (.wake false)) = some .d2h ∧
@@ -1315,11 +1373,10 @@ theorem trace_details_failed_copy :
       (fun s => (s.life.done, s.published)) = some (true, some false) := by
   decide
 
-/-- `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:570-597`): two layers; layer
+/-- `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun`: two layers; layer
 0's push fails while layer 1's copy is still running. `CurrentPhaseLocked` would
 say `d2h` (a future is not ready), but the push callback passes `kPushPhase`
-(`.cc:527`), so the failure is reported in `push`; the send still drains layer
+(`self->FinishLocked(push_res.status(), kPushPhase)`), so the failure is reported in `push`; the send still drains layer
 1's copy before it settles. -/
 theorem trace_details_failed_push_while_copies_run :
     let pre := [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hBegin, .d2hIssue true,
@@ -1333,20 +1390,20 @@ theorem trace_details_failed_push_while_copies_run :
   decide
 
 /-! The five data-connection-policy tests
-(`TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone`
-`transfer_send_session_test.cc:189-212`, `PooledPolicyKeepsIdlePeerConnections`
-`:214-234`, `PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`
-`:236-268`, `PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush`
-`:270-296`, `CreateRejectsUnknownDataConnReuseValue` `:298-313`) exercise
+(`TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone`,
+`TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnections`,
+`TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`,
+`TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush`,
+`TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue`) exercise
 `TPU_RAIDEN_DATA_CONN_REUSE` parsing and the transport's idle-connection
 counts, which are unmodelled: under `per_transfer` the last `EndSendOp` of a
 draining send closes connections in a window where `in_flight_ == 1`,
-`draining_` and `!done_` are all fixed (`.cc:276-287`, A7), so the model's
-atomic `endOp` is unchanged. Their lifecycle content is already replayed: the
-two `…CancelledMidPush` tests (`Finish(Cancelled)` with a push in flight keeps
-`Done()` false until the push completes, then the status stays `kCancelled`)
-are `trace_ok_after_cancel_keeps_failure`; `…BeforeDone` is a one-layer
-`trace_normal`. -/
+`draining_` and `!done_` are all fixed (`ReleaseDataConnectionsAfterSend`, A7),
+so the model's atomic `endOp` is unchanged. Their lifecycle content is already
+replayed: the two `…CancelledMidPush` tests (`Finish(Cancelled)` with a push in
+flight keeps `Done()` false until the push completes, then the status stays
+`kCancelled`) are `trace_ok_after_cancel_keeps_failure`; `…BeforeDone` is a
+one-layer `trace_normal`. -/
 
 end Send
 

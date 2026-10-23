@@ -11,55 +11,70 @@ state machine that manages `(req_id, uuid)` producer block generations across
 registration, multi-owner planning claims, claim abandonment, per-unit
 completion voting, and unclaimed cancellation tombstones.
 
-Pinned to upstream commit `2ed6f8f`.
+Citations are to the baseline commit in `verification/README.md` §Status.
+File aliases used in the source map below:
+`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`).
 
   ## C++ anchorage
 
-  1. **Per-unit producer registration (`RequestBlockRegistry::Register`,
-     `tpu_sync/kv_cache/reshard/request_block_registry.cc:118-300`):**
+  1. **Per-unit producer registration (`RequestBlockRegistry::Register` in
+     `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
      Records `request_blocks_[(req_id, unit)]` with `uuid` and normalized
      `block_ids` / `pool_spans`. Rejects if:
-     - `cancelled_` contains `(req_id, uuid)` (`:276-280`),
-     - `claimed_` contains `(req_id, uuid)` (`:281-285`), or
+     - `cancelled_` contains `(req_id, uuid)`
+       (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`),
+     - `claimed_` contains `(req_id, uuid)`
+       (`if (claimed_.find(lifecycle_key) != claimed_.end())`), or
      - `request_blocks_[(req_id, unit)]` already exists with a different payload
-       (`:286-294`; identical re-registration is an idempotent TTL refresh,
-       `:295-298`).
+       (`auto existing = request_blocks_.find(key);`; identical re-registration
+       is an idempotent TTL refresh, `existing->second.expires_at = now + ttl_s_;`).
 
-  2. **Claim linearization (`RequestBlockRegistry::LookupAndClaim`,
-     `tpu_sync/kv_cache/reshard/request_block_registry.cc:440-491`):**
-     Rejects if `cancelled_` contains `(req_id, uuid)` (`:448-452`), if
-     `claimed_units_` already holds a different source unit set (`:454-460`), or
-     if any requested `unit ∈ units` is missing from `request_blocks_` or has a
-     different `uuid` (`:462-470`). Otherwise marks `claimed_[(req_id, uuid)]`,
-     sets `claimed_units_[(req_id, uuid)] = units`, and inserts `claim_owner`
-     into `claimed_owners_[(req_id, uuid)]` (`:473-475`). If all `units` have
-     already voted in `completed_units_`, calls `RetireLocked` (`:476-489`).
+  2. **Claim linearization (`RequestBlockRegistry::LookupAndClaim` in
+     `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
+     Rejects if `cancelled_` contains `(req_id, uuid)`
+     (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`), if
+     `claimed_units_` already holds a different source unit set
+     (`if (existing_units_it != claimed_units_.end() &&`), or if any requested
+     `unit ∈ units` is missing from `request_blocks_` or has a different `uuid`
+     (`for (const RaidenId& unit : units)`). Otherwise marks
+     `claimed_[(req_id, uuid)]`, sets `claimed_units_[(req_id, uuid)] = units`,
+     and inserts `claim_owner` into `claimed_owners_[(req_id, uuid)]`
+     (`claimed_[lifecycle_key] = now + ttl_s_;` ..
+     `claimed_owners_[lifecycle_key].insert(claim_owner);`). If all `units` have
+     already voted in `completed_units_`, calls `RetireLocked`
+     (`if (completion_it != completed_units_.end())`).
 
-  3. **Owner-scoped claim rollback (`RequestBlockRegistry::AbandonClaim`,
-     `tpu_sync/kv_cache/reshard/request_block_registry.cc:493-509`):**
+  3. **Owner-scoped claim rollback (`RequestBlockRegistry::AbandonClaim` in
+     `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
      Removes `claim_owner` from `claimed_owners_[(req_id, uuid)]`; only when
      `claimed_owners_` becomes empty does it erase `claimed_`, `claimed_units_`,
-     and `claimed_owners_` (`:503-507`), allowing pipelined destination stages to
-     share one source snapshot claim (`request_block_registry.h:144-147`).
+     and `claimed_owners_` (`if (owner_it->second.empty())`), allowing pipelined
+     destination stages to share one source snapshot claim
+     (`RequestBlockRegistry` `claimed_owners_` in `request_block_registry.h`).
 
-  4. **Full-set completion voting (`RequestBlockRegistry::Complete`,
-     `tpu_sync/kv_cache/reshard/request_block_registry.cc:317-371`):**
-     Rejects pre-claim completion of a non-empty registration (`:335-341`).
-     Otherwise inserts `unit` into `completed_units_[(req_id, uuid)].units`
-     (`:356`), and when `claimed_units_` is present and every expected unit has
-     voted (`all_voted`, `:358-368`), calls `RetireLocked` (`:98-116`) to erase
-     all `request_blocks_` rows and lifecycle maps for `(req_id, uuid)`.
+  4. **Full-set completion voting (`RequestBlockRegistry::Complete` in
+     `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
+     Rejects pre-claim completion of a non-empty registration
+     (`if (!has_expected && has_registration &&`). Otherwise inserts `unit` into
+     `completed_units_[(req_id, uuid)].units`
+     (`completion.units.insert(unit);`), and when `claimed_units_` is present
+     and every expected unit has voted (`if (has_expected)` / `all_voted`),
+     calls `RequestBlockRegistry::RetireLocked` to erase all `request_blocks_`
+     rows and lifecycle maps for `(req_id, uuid)`.
 
-  5. **Cancellation tombstone (`RequestBlockRegistry::CancelIfUnclaimed`,
-     `tpu_sync/kv_cache/reshard/request_block_registry.cc:373-405`):**
-     Returns `true` immediately if already in `cancelled_` (`:385-387`), returns
+  5. **Cancellation tombstone (`RequestBlockRegistry::CancelIfUnclaimed` in
+     `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
+     Returns `true` immediately if already in `cancelled_`
+     (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`), returns
      `false` without modifying state if `claimed_` contains `(req_id, uuid)`
-     (`:388-390`), and otherwise records a tombstone in `cancelled_` while
-     erasing any unclaimed `request_blocks_` and lifecycle entries (`:391-404`).
+     (`if (claimed_.find(lifecycle_key) != claimed_.end())`), and otherwise
+     records a tombstone in `cancelled_` while erasing any unclaimed
+     `request_blocks_` and lifecycle entries
+     (`cancelled_[lifecycle_key] = now + ttl_s_;` .. `return true;`).
 
-  6. **TTL expiration (`PurgeExpiredRequestBlocksLocked` /
-     `PurgeExpiredLifecycleLocked`,
-     `tpu_sync/kv_cache/reshard/request_block_registry.cc:61-96`):**
+  6. **TTL expiration (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked` /
+     `RequestBlockRegistry::PurgeExpiredLifecycleLocked` in
+     `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
      Sweeps expired registrations, claims, and tombstones (Part V,
      `purgeExpiredAll_inv`, and Observations R7 & R8).
 
@@ -83,6 +98,49 @@ Pinned to upstream commit `2ed6f8f`.
        has voted (`complete_retires_iff_all_claimed_voted`).
   - `purgeExpiredAll_inv` & Observations R7 (`trace_r7_single_stage_votes_retire_multi_owner_claim`)
     and R8 (`trace_r8_split_ttl_purges_request_blocks_while_claim_active`).
+
+  ## Source map
+
+  <!-- source-map:begin -->
+  | File | Symbol / anchor | Lines |
+  |------|-----------------|-------|
+  | `reg.h` | `RequestBlockStatus` | `:82-87` |
+  | `reg.h` | `RequestBlockRegistry` (`struct Completions {`) | `:123-126` |
+  | `reg.h` | `RequestBlockRegistry` (`std::map<BlockKey, RequestBlockRegistration, BlockKeyLess> request_blocks_` .. `std::map<LifecycleKey, double> cancelled_`) | `:139-150` |
+  | `reg.cc` | `RequestBlockRegistry::PurgeExpiredRequestBlocksLocked` | `:61-69` |
+  | `reg.cc` | `RequestBlockRegistry::PurgeExpiredLifecycleLocked` | `:71-96` |
+  | `reg.cc` | `RequestBlockRegistry::RetireLocked` | `:98-116` |
+  | `reg.cc` | `RequestBlockRegistry::Register` | `:118-300` |
+  | `reg.cc` | `RequestBlockRegistry::Register` (`registration.expires_at = now + ttl_s_;`) | `:263` |
+  | `reg.cc` | `RequestBlockRegistry::Register` (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`) | `:276-280` |
+  | `reg.cc` | `RequestBlockRegistry::Register` (`if (claimed_.find(lifecycle_key) != claimed_.end())`) | `:281-285` |
+  | `reg.cc` | `RequestBlockRegistry::Register` (`auto existing = request_blocks_.find(key);` .. `request_blocks_[key] = std::move(registration);`) | `:286-298` |
+  | `reg.cc` | `RequestBlockRegistry::Release` | `:302-315` |
+  | `reg.cc` | `RequestBlockRegistry::Complete` | `:317-371` |
+  | `reg.cc` | `RequestBlockRegistry::Complete` (`if (!has_expected && has_registration &&`) | `:335-341` |
+  | `reg.cc` | `RequestBlockRegistry::Complete` (`if (!registration_matches && !unit_expected)`) | `:346-350` |
+  | `reg.cc` | `RequestBlockRegistry::Complete` (`if (has_expected)`) | `:358-369` |
+  | `reg.cc` | `RequestBlockRegistry::CancelIfUnclaimed` | `:373-405` |
+  | `reg.cc` | `RequestBlockRegistry::CancelIfUnclaimed` (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`) | `:385-387` |
+  | `reg.cc` | `RequestBlockRegistry::CancelIfUnclaimed` (`if (claimed_.find(lifecycle_key) != claimed_.end())`) | `:388-390` |
+  | `reg.cc` | `RequestBlockRegistry::CancelIfUnclaimed` (`cancelled_[lifecycle_key] = now + ttl_s_;` .. `return true;`) | `:391-404` |
+  | `reg.cc` | `RequestBlockRegistry::Status` | `:407-436` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` | `:439-491` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`) | `:448-452` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (existing_units_it != claimed_units_.end() &&`) | `:455-460` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`for (const RaidenId& unit : units)`) | `:462-470` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`claimed_[lifecycle_key] = now + ttl_s_;` .. `claimed_owners_[lifecycle_key].insert(claim_owner);`) | `:473-475` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (completion_it != completed_units_.end())`) | `:477-489` |
+  | `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:493-509` |
+  | `reg.cc` | `RequestBlockRegistry::AbandonClaim` (`if (owner_it->second.empty())`) | `:503-507` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:933-961` |
+  | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:963-1027` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1029-1052` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1054-1062` |
+  | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1278-1303` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1305-1332` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1334-1361` |
+  <!-- source-map:end -->
 -/
 
 namespace TpuSyncVerify.Transfer.Reshard.Registry
@@ -91,9 +149,9 @@ open TpuSyncVerify
 
 /-! ## Part I — Registry Generation State Machine (`RequestBlockRegistry`) -/
 
-/--Read-only status returned by `RequestBlockRegistry::Status`
-(`tpu_sync/kv_cache/reshard/request_block_registry.h:82-87`,
-`tpu_sync/kv_cache/reshard/request_block_registry.cc:407-436`). -/
+/-- Read-only status returned by `RequestBlockRegistry::Status`
+(`RequestBlockStatus` in `request_block_registry.h`,
+`RequestBlockRegistry::Status` in `request_block_registry.cc`). -/
 inductive BlockStatus where
   | unknown
   | registered
@@ -102,24 +160,31 @@ inductive BlockStatus where
   deriving DecidableEq, Repr
 
 /-- Per-`(req_id, uuid)` lifecycle state in `RequestBlockRegistry`
-(`tpu_sync/kv_cache/reshard/request_block_registry.h:139-150`). -/
+(`request_blocks_`, `claimed_`, `claimed_units_`, `claimed_owners_`,
+`completed_units_`, and `cancelled_` in `request_block_registry.h`). -/
 structure RegGen where
   /-- Registered producer units `(unit, nonEmptyBlocks)` in `request_blocks_`
-  for this `(req_id, uuid)` (`request_block_registry.cc:260-299`). -/
+  for this `(req_id, uuid)` (`RequestBlockRegistry::Register`
+  `request_blocks_[key] = std::move(registration);`). -/
   registeredUnits : List (Nat × Bool)
   /-- Claimed source unit set `claimed_units_[(req_id, uuid)]` when `claimed_`
-  is present (`request_block_registry.cc:473-474`). -/
+  is present (`RequestBlockRegistry::LookupAndClaim`
+  `claimed_[lifecycle_key] = now + ttl_s_;`). -/
   claimedUnits : Option (List Nat)
   /-- Active planning owners `claimed_owners_[(req_id, uuid)]`
-  (`request_block_registry.h:144-148`, `request_block_registry.cc:475`). -/
+  (`RequestBlockRegistry` `claimed_owners_` in `request_block_registry.h`,
+  `RequestBlockRegistry::LookupAndClaim`
+  `claimed_owners_[lifecycle_key].insert(claim_owner);`). -/
   claimOwners : List Nat
   /-- Producer units that have cast a terminal vote in
-  `completed_units_[(req_id, uuid)]` (`request_block_registry.cc:351-357`). -/
+  `completed_units_[(req_id, uuid)]` (`RequestBlockRegistry::Complete`
+  `completion.units.insert(unit);`). -/
   completedUnits : List Nat
   /-- Whether `cancelled_` holds a tombstone for `(req_id, uuid)`
-  (`request_block_registry.cc:385-391`). -/
+  (`RequestBlockRegistry::CancelIfUnclaimed`
+  `cancelled_[lifecycle_key] = now + ttl_s_;`). -/
   cancelled : Bool
-  /-- Monotonic flag recording whether `RetireLocked` (`request_block_registry.cc:98-116`)
+  /-- Monotonic flag recording whether `RequestBlockRegistry::RetireLocked`
   has fired to retire the generation. -/
   retired : Bool
   deriving DecidableEq, Repr
@@ -133,22 +198,21 @@ def RegGen.init : RegGen :=
   , cancelled := false
   , retired := false }
 
-/-- Look up `unit`'s registration (`request_blocks_.find({req_id, unit})`,
-`tpu_sync/kv_cache/reshard/request_block_registry.cc:286, 333, 463`). -/
+/-- Look up `unit`'s registration (`request_blocks_.find({req_id, unit})` in
+`RequestBlockRegistry::Register`, `Complete`, and `LookupAndClaim`). -/
 def RegGen.lookupUnit (s : RegGen) (unit : Nat) : Option Bool :=
   (s.registeredUnits.find? (fun p => p.1 == unit)).map Prod.snd
 
 /-- `RequestBlockRegistry::Status` precedence:
 `cancelled > claimed > registered > unknown`
-(`tpu_sync/kv_cache/reshard/request_block_registry.cc:417-434`). -/
+(`RequestBlockRegistry::Status` in `request_block_registry.cc`). -/
 def RegGen.status (s : RegGen) : BlockStatus :=
   if s.cancelled then .cancelled
   else if s.claimedUnits.isSome then .claimed
   else if !s.registeredUnits.isEmpty then .registered
   else .unknown
 
-/-- `RequestBlockRegistry::RetireLocked`
-(`tpu_sync/kv_cache/reshard/request_block_registry.cc:98-116`):
+/-- `RequestBlockRegistry::RetireLocked` (`request_block_registry.cc`):
 erases `request_blocks_`, `claimed_`, `claimed_units_`, `claimed_owners_`,
 `completed_units_`, and `cancelled_`. -/
 def RegGen.retireLocked (_s : RegGen) : RegGen :=
@@ -160,7 +224,7 @@ def RegGen.retireLocked (_s : RegGen) : RegGen :=
   , retired := true }
 
 /-- Whether every unit in `expected` has voted in `completed`
-(`all_voted`, `tpu_sync/kv_cache/reshard/request_block_registry.cc:359-365, 479-485`). -/
+(`all_voted` in `RequestBlockRegistry::Complete` and `LookupAndClaim`). -/
 def allVoted (expected completed : List Nat) : Bool :=
   expected.all (fun u => completed.contains u)
 
@@ -169,14 +233,16 @@ def insertNodup (x : Nat) (xs : List Nat) : List Nat :=
   if xs.contains x then xs else xs ++ [x]
 
 /-- Whether `cur` is either unclaimed or already claimed for the exact same
-source unit set `units` (`tpu_sync/kv_cache/reshard/request_block_registry.cc:454-460`). -/
+source unit set `units` (`RequestBlockRegistry::LookupAndClaim`
+`if (existing_units_it != claimed_units_.end() &&`). -/
 def compatibleClaim (cur : Option (List Nat)) (units : List Nat) : Bool :=
   match cur with
   | none => true
   | some existing => existing == units
 
 /-- Whether `unit` is in the claimed unit set `cur`
-(`tpu_sync/kv_cache/reshard/request_block_registry.cc:344-345`). -/
+(`RequestBlockRegistry::Complete`
+`expected_it->second.find(unit) != expected_it->second.end()`). -/
 def inClaimedUnits (cur : Option (List Nat)) (unit : Nat) : Bool :=
   match cur with
   | none => false
@@ -184,39 +250,36 @@ def inClaimedUnits (cur : Option (List Nat)) (unit : Nat) : Bool :=
 
 /-- Events of `RequestBlockRegistry` for a `(req_id, uuid)` generation. -/
 inductive Ev where
-  /-- `Register(req_id, uuid, unit, block_ids, pool_spans)`
-  (`request_block_registry.cc:118-300`). -/
+  /-- `RequestBlockRegistry::Register(req_id, uuid, unit, block_ids, pool_spans)`. -/
   | register (unit : Nat) (nonEmpty : Bool)
-  /-- `LookupAndClaim(req_id, uuid, units, claim_owner)`
-  (`request_block_registry.cc:440-491`). -/
+  /-- `RequestBlockRegistry::LookupAndClaim(req_id, uuid, units, claim_owner)`. -/
   | lookupAndClaim (owner : Nat) (units : List Nat)
-  /-- `AbandonClaim(req_id, uuid, claim_owner)`
-  (`request_block_registry.cc:493-509`). -/
+  /-- `RequestBlockRegistry::AbandonClaim(req_id, uuid, claim_owner)`. -/
   | abandonClaim (owner : Nat)
-  /-- `Complete(req_id, uuid, unit)`
-  (`request_block_registry.cc:317-371`). -/
+  /-- `RequestBlockRegistry::Complete(req_id, uuid, unit)`. -/
   | complete (unit : Nat)
-  /-- `CancelIfUnclaimed(req_id, uuid)`
-  (`request_block_registry.cc:373-405`). -/
+  /-- `RequestBlockRegistry::CancelIfUnclaimed(req_id, uuid)`. -/
   | cancelIfUnclaimed
-  /-- `Release(req_id, uuid)` (`request_block_registry.cc:302-315`). -/
+  /-- `RequestBlockRegistry::Release(req_id, uuid)`. -/
   | release
   deriving DecidableEq, Repr
 
 /-- Transition function of `RequestBlockRegistry`
-(`tpu_sync/kv_cache/reshard/request_block_registry.cc:98-509`). -/
+(`RequestBlockRegistry::Register`, `LookupAndClaim`, `AbandonClaim`, `Complete`,
+`CancelIfUnclaimed`, and `Release` in `request_block_registry.cc`). -/
 def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
   match e with
   | .register unit nonEmpty =>
-    -- Rejects if cancelled (`:276-280`) or already claimed (`:281-285`), or if
-    -- generation was already retired.
+    -- Rejects if cancelled (`cancelled_.find(lifecycle_key) != cancelled_.end()`)
+    -- or already claimed (`claimed_.find(lifecycle_key) != claimed_.end()`), or
+    -- if generation was already retired.
     if s.cancelled || s.claimedUnits.isSome || s.retired then
       none
     else
       match s.lookupUnit unit with
       | some curNonEmpty =>
-        -- Conflicting payload is rejected (`:289-294`); identical payload is an
-        -- idempotent refresh (`:295-298`).
+        -- Conflicting payload is rejected (`ExistingRegistrationMatches`);
+        -- identical payload is an idempotent refresh (`existing->second.expires_at = now + ttl_s_;`).
         if curNonEmpty != nonEmpty then none else some s
       | none =>
         some { s with registeredUnits := s.registeredUnits ++ [(unit, nonEmpty)] }
@@ -224,15 +287,15 @@ def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
     if s.cancelled || units.isEmpty then
       none
     else if !compatibleClaim s.claimedUnits units then
-      -- `:454-460`: already claimed for a different source unit set.
+      -- `existing_units_it != claimed_units_.end()`: already claimed for a different source unit set.
       none
     else if !units.all (fun u => (s.lookupUnit u).isSome) then
-      -- `:462-470`: missing producer block registration for a requested unit.
+      -- `for (const RaidenId& unit : units)`: missing producer block registration for a requested unit.
       none
     else
       let owners' := insertNodup owner s.claimOwners
       if allVoted units s.completedUnits then
-        -- `:476-489`: all claimed units had already voted (e.g. empty blocks).
+        -- `if (completion_it != completed_units_.end())`: all claimed units had already voted (e.g. empty blocks).
         some s.retireLocked
       else
         some { s with
@@ -244,7 +307,7 @@ def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
     else
       let owners' := s.claimOwners.filter (fun o => o != owner)
       if owners'.isEmpty then
-        -- `:503-507`: last owner abandoned; drop claim.
+        -- `if (owner_it->second.empty())`: last owner abandoned; drop claim.
         some { s with
           claimedUnits := none
           claimOwners := [] }
@@ -253,18 +316,18 @@ def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
   | .complete unit =>
     let regOpt := s.lookupUnit unit
     let hasExpected := s.claimedUnits.isSome
-    -- `:335-341`: non-empty producer registration cannot complete before claim.
+    -- `if (!has_expected && has_registration &&`: non-empty producer registration cannot complete before claim.
     if !hasExpected && regOpt == some true then
       none
     else if regOpt.isNone && !inClaimedUnits s.claimedUnits unit then
-      -- `:346-350`: idempotent no-op after retirement or for unknown unit.
+      -- `if (!registration_matches && !unit_expected)`: idempotent no-op after retirement or for unknown unit.
       some s
     else
       let completed' := insertNodup unit s.completedUnits
       match s.claimedUnits with
       | some expected =>
         if allVoted expected completed' then
-          -- `:358-368`: full claimed set has voted -> RetireLocked.
+          -- `if (has_expected)` / `if (all_voted)`: full claimed set has voted -> RetireLocked.
           some s.retireLocked
         else
           some { s with completedUnits := completed' }
@@ -272,13 +335,13 @@ def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
         some { s with completedUnits := completed' }
   | .cancelIfUnclaimed =>
     if s.cancelled then
-      -- `:385-387`: already cancelled -> returns true (idempotent).
+      -- `if (cancelled_.find(lifecycle_key) != cancelled_.end())`: already cancelled -> returns true (idempotent).
       some s
     else if s.claimedUnits.isSome then
-      -- `:388-390`: already claimed -> returns false without modifying state.
+      -- `if (claimed_.find(lifecycle_key) != claimed_.end())`: already claimed -> returns false without modifying state.
       some s
     else
-      -- `:391-404`: record tombstone and erase unclaimed registrations.
+      -- `cancelled_[lifecycle_key] = now + ttl_s_;`: record tombstone and erase unclaimed registrations.
       some { s with
         registeredUnits := []
         claimedUnits := none
@@ -295,7 +358,7 @@ def RegGen.sys : System RegGen Ev where
 /-! ## Part II — Core Safety Predicates and Inductive Invariant -/
 
 /-- **Safety Property 1 (`ClaimOwnersConsistent`,
-`request_block_registry.cc:473-475, 503-507`)**:
+`RequestBlockRegistry::LookupAndClaim` and `RequestBlockRegistry::AbandonClaim`)**:
 `claimedUnits` is `some units` if and only if `claimOwners` is non-empty, and
 every unit in `units` is registered in `registeredUnits`. -/
 def ClaimOwnersConsistent (s : RegGen) : Prop :=
@@ -304,7 +367,7 @@ def ClaimOwnersConsistent (s : RegGen) : Prop :=
     units ≠ [] ∧ ∀ u ∈ units, (s.lookupUnit u).isSome = true
 
 /-- **Safety Property 2 (`TombstoneClean`,
-`request_block_registry.cc:276-280, 391-404, 448-452`)**:
+`RequestBlockRegistry::Register`, `CancelIfUnclaimed`, and `LookupAndClaim`)**:
 Whenever `s.cancelled = true`, all registration and claim tables are empty
 (`registeredUnits = []`, `claimedUnits = none`, `claimOwners = []`,
 `completedUnits = []`). -/
@@ -316,7 +379,7 @@ def TombstoneClean (s : RegGen) : Prop :=
     s.completedUnits = []
 
 /-- **Safety Property 3 (`RetiredClean`,
-`request_block_registry.cc:98-116`)**:
+`RequestBlockRegistry::RetireLocked`)**:
 Whenever `s.retired = true`, `registeredUnits = []` and `claimedUnits = none`
 and `claimOwners = []`. -/
 def RetiredClean (s : RegGen) : Prop :=
@@ -326,7 +389,8 @@ def RetiredClean (s : RegGen) : Prop :=
     s.claimOwners = []
 
 /-- **Safety Property 4 (`PartialVotesNotAllVoted`,
-`request_block_registry.cc:358-368, 479-488`)**:
+`RequestBlockRegistry::Complete` and `RequestBlockRegistry::LookupAndClaim`
+`all_voted` check)**:
 While a claim `s.claimedUnits = some expected` is active (not yet retired),
 `allVoted expected s.completedUnits = false`. -/
 def PartialVotesNotAllVoted (s : RegGen) : Prop :=
@@ -538,7 +602,8 @@ theorem reachable_safe {s : RegGen} (hr : RegGen.sys.Reachable s) : Inv s := by
 /-! ## Part III — Named Protocol Guarantees -/
 
 /-- **Tombstone Blocks Late Registration & Claim (`TombstoneBlocksLateRegister`,
-`request_block_registry.cc:276-280, 448-452`)**:
+`RequestBlockRegistry::Register` and `RequestBlockRegistry::LookupAndClaim`
+`if (cancelled_.find(lifecycle_key) != cancelled_.end())`)**:
 Once a generation is cancelled (`s.cancelled = true`), both `register` and
 `lookupAndClaim` are unconditionally rejected (`none`). -/
 theorem tombstone_blocks_register_and_claim (s : RegGen) (hc : s.cancelled = true)
@@ -548,7 +613,8 @@ theorem tombstone_blocks_register_and_claim (s : RegGen) (hc : s.cancelled = tru
   simp [RegGen.step, hc]
 
 /-- **Active Claim Blocks Cancellation & Registration (`ClaimedNotCancelled`,
-`request_block_registry.cc:281-285, 388-390`)**:
+`RequestBlockRegistry::Register` and `RequestBlockRegistry::CancelIfUnclaimed`
+`if (claimed_.find(lifecycle_key) != claimed_.end())`)**:
 While `s.claimedUnits = some units`, `register` is rejected and
 `cancelIfUnclaimed` is a no-op that leaves `s` (and all its registered blocks
 and claims) unchanged. -/
@@ -566,7 +632,8 @@ theorem claimed_blocks_register_and_cancel {s : RegGen} {units : List Nat}
   simp [RegGen.step, hclaim, hnc]
 
 /-- **Multi-Owner Claim Survival (`MultiOwnerSurvival`,
-`request_block_registry.h:144-147`, `request_block_registry.cc:493-509`)**:
+`RequestBlockRegistry` `claimed_owners_` in `request_block_registry.h`,
+`RequestBlockRegistry::AbandonClaim` in `request_block_registry.cc`)**:
 If two distinct planning owners `o₁ ≠ o₂` hold claims on `s`, then
 `abandonClaim o₁` preserves `s'.claimedUnits = s.claimedUnits` (`o₂`'s claim
 survives). -/
@@ -588,7 +655,8 @@ theorem abandonClaim_preserves_when_other_owner_present {s : RegGen}
   refine ⟨_, rfl, rfl, List.contains_iff_mem.mpr hmem₂⟩
 
 /-- **Full-Set Voting Required to Retire Claimed Generation
-(`CompleteRequiresFullVotingSet`, `request_block_registry.cc:358-369`)**:
+(`CompleteRequiresFullVotingSet`, `RequestBlockRegistry::Complete`
+`if (has_expected)`)**:
 When `s.claimedUnits = some expected` (and `s.retired = false`), a `complete`
 step for an expected unit `unit ∈ expected` transitions to `s'.retired = true`
 if and only if every unit `u ∈ expected` has voted in
@@ -617,8 +685,11 @@ theorem complete_retires_iff_all_claimed_voted {s s' : RegGen} {expected : List 
 
 /-- Happy-path 2-unit producer registration, multi-owner pipelined claim,
 single-owner abandon (claim survives), and 2-unit completion voting that retires
-only on the second vote (`request_block_registry.cc:260-509`,
-`reshard_service_test.cc:1029-1052, 1278-1332`). -/
+only on the second vote (`RequestBlockRegistry` in `request_block_registry.cc`,
+`ReshardStackTest.CompletionVotesRetireAfterClaim`,
+`ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim`, and
+`ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` in
+`reshard_service_test.cc`). -/
 def registryHappyTrace : List Ev :=
   [ .register 0 true
   , .register 1 true
@@ -635,11 +706,11 @@ theorem trace_registry_multi_owner_and_voting :
   decide
 
 /-- Replay of `ReshardStackTest.CompletionVotesRetireAfterClaim`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1029-1052`):
-After the first of two claimed units votes (`complete 0`, `:1046-1048`), the
-generation is still `.claimed` and `retired = false` (`"0"` rows retired); when
-the second unit votes (`complete 1`, `:1049-1051`), `RetireLocked` fires
-(`retired = true`, `registeredUnits = []`, `"2"` rows retired). -/
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`):
+After the first of two claimed units votes (`complete 0`), the generation is
+still `.claimed` and `retired = false` (`"0"` rows retired); when the second
+unit votes (`complete 1`), `RetireLocked` fires (`retired = true`,
+`registeredUnits = []`, `"2"` rows retired). -/
 theorem trace_partial_vote_does_not_retire :
     (RegGen.sys.run (registryHappyTrace.take 6)).map
       (fun s => (s.status, s.claimedUnits, s.completedUnits, s.retired)) =
@@ -647,12 +718,12 @@ theorem trace_partial_vote_does_not_retire :
   decide
 
 /-- Replay of `ReshardStackTest.CancelTombstoneBlocksLateRegistration`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:933-961`) and
-`request_block_registry.cc:276-280, 385-404, 448-452`:
-1. Cancelling an unclaimed generation before any producer registers (`:936-945`)
-   or after partial registration (`:1004-1010`) records a `.cancelled` tombstone.
-2. Any late producer `register` (`:947-961`) or `lookupAndClaim` (`:1357-1361`)
-   against the cancelled `(req_id, uuid)` is rejected (`none`). -/
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`) and
+`RequestBlockRegistry::Register`, `CancelIfUnclaimed`, and `LookupAndClaim`:
+1. Cancelling an unclaimed generation before any producer registers or after
+   partial registration records a `.cancelled` tombstone.
+2. Any late producer `register` or `lookupAndClaim` against the cancelled
+   `(req_id, uuid)` is rejected (`none`). -/
 theorem trace_tombstone_blocks_late_register_and_claim :
     ((RegGen.sys.run [.cancelIfUnclaimed]).map
       (fun s => (s.status, RegGen.step s (.register 0 true))) =
@@ -667,15 +738,14 @@ theorem trace_tombstone_blocks_late_register_and_claim :
   decide
 
 /-- Replay of `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:963-1027`):
-1. Never registered (`RegGen.init`, `:995-997`) reads as `.unknown`.
-2. Registered and unclaimed (`[.register 0 true]`, `:999-1002`) reads as
-   `.registered`.
-3. Release-only cancel (`[.register 0 true, .cancelIfUnclaimed]`, `:1004-1010`)
-   erases the row and reads as `.cancelled`.
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`):
+1. Never registered (`RegGen.init`) reads as `.unknown`.
+2. Registered and unclaimed (`[.register 0 true]`) reads as `.registered`.
+3. Release-only cancel (`[.register 0 true, .cancelIfUnclaimed]`) erases the row
+   and reads as `.cancelled`.
 4. Claimed registration (`[.register 0 true, .register 1 true,
-   .lookupAndClaim 101 [0, 1]]`, `:1012-1021`) reads as `.claimed` and refuses
-   cancellation (staying `.claimed` with `cancelled = false`). -/
+   .lookupAndClaim 101 [0, 1]]`) reads as `.claimed` and refuses cancellation
+   (staying `.claimed` with `cancelled = false`). -/
 theorem trace_request_block_status_probe_lifecycle :
     RegGen.init.status = .unknown ∧
     (RegGen.sys.run [.register 0 true]).map RegGen.status = some .registered ∧
@@ -687,19 +757,18 @@ theorem trace_request_block_status_probe_lifecycle :
       (fun s => (s.status, s.cancelled)) = some (.claimed, false) := by
   decide
 
-/-- Replay of `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1278-1303`),
-`AbandonedStageLeavesTheSiblingClaimInPlace` (`:1305-1332`), and
-`AbandoningTheLastStageFreesTheClaim` (`:1334-1361`):
+/-- Replay of `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim`,
+`ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace`, and
+`ReshardStackTest.AbandoningTheLastStageFreesTheClaim`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`):
 1. Stage 0 (`100`) and Stage 1 (`101`) share one request claim on `[0, 1]`; when
-   Stage 1 abandons its claim (`abandonClaim 101`, `:1310-1326`), Stage 0's
-   claim remains in place (`status = .claimed`, `cancelIfUnclaimed` refused with
-   `cancelled = false`), and Stage 1 can rejoin (`lookupAndClaim 101 [0, 1]`,
-   `:1327-1331`).
-2. When both Stage 0 (`100`) and Stage 1 (`101`) abandon their claims
-   (`:1339-1350`), the last stage leaving frees the claim (`status = .registered`),
-   allowing `cancelIfUnclaimed` to succeed (`status = .cancelled`) and blocking
-   a late Stage 0 retry (`:1351-1361`). -/
+   Stage 1 abandons its claim (`abandonClaim 101`), Stage 0's claim remains in
+   place (`status = .claimed`, `cancelIfUnclaimed` refused with
+   `cancelled = false`), and Stage 1 can rejoin (`lookupAndClaim 101 [0, 1]`).
+2. When both Stage 0 (`100`) and Stage 1 (`101`) abandon their claims, the last
+   stage leaving frees the claim (`status = .registered`), allowing
+   `cancelIfUnclaimed` to succeed (`status = .cancelled`) and blocking a late
+   Stage 0 retry. -/
 theorem trace_pipelined_stages_claim_and_abandon :
     ((RegGen.sys.run
       [ .register 0 true, .register 1 true
@@ -720,9 +789,9 @@ theorem trace_pipelined_stages_claim_and_abandon :
   decide
 
 /-- Mutant 1: If `Complete` retired on the *first* unit vote instead of checking
-`all_voted` across `claimed_units_` (`request_block_registry.cc:359-368`),
-`unit 0` finishing its push would prematurely retire `unit 1`'s registered
-producer blocks while `unit 1` is still transferring. -/
+`all_voted` across `claimed_units_` (`RequestBlockRegistry::Complete`
+`if (has_expected)`), `unit 0` finishing its push would prematurely retire
+`unit 1`'s registered producer blocks while `unit 1` is still transferring. -/
 def stepCompletePremature (s : RegGen) (unit : Nat) : RegGen :=
   let _ := unit
   s.retireLocked
@@ -737,10 +806,10 @@ theorem mutant_premature_complete_retires_while_peer_active :
   decide
 
 /-- Mutant 2: If `AbandonClaim` erased `claimed_` unconditionally without
-checking `claimed_owners_.empty()` (`request_block_registry.cc:503-507`), one
-pipelined stage abandoning its claim would strip the claim out from under a
-concurrent stage `owner = 102`, allowing `CancelIfUnclaimed` to cancel the
-blocks mid-transfer. -/
+checking `claimed_owners_.empty()` (`RequestBlockRegistry::AbandonClaim`
+`if (owner_it->second.empty())`), one pipelined stage abandoning its claim would
+strip the claim out from under a concurrent stage `owner = 102`, allowing
+`CancelIfUnclaimed` to cancel the blocks mid-transfer. -/
 def stepAbandonUnconditional (s : RegGen) (owner : Nat) : RegGen :=
   { s with
     claimedUnits := none
@@ -755,8 +824,9 @@ theorem mutant_unconditional_abandon_exposes_sibling_owner_to_cancel :
       some true := by
   decide
 
-/-- **Observation R7 (`request_block_registry.h:124, 144-149`,
-`request_block_registry.cc:358-368`)**:
+/-- **Observation R7 (`RequestBlockRegistry::Completions` and `claimed_owners_`
+in `request_block_registry.h`, `RequestBlockRegistry::Complete` in
+`request_block_registry.cc`)**:
 Although `claimed_owners_` tracks multiple pipelined `claim_owner` strings for a
 shared source snapshot, `completed_units_[(req_id, uuid)].units` is keyed only
 by `(req_id, uuid)` (not `(req_id, uuid, claim_owner)`), and `Complete` calls
@@ -779,14 +849,15 @@ theorem trace_r7_single_stage_votes_retire_multi_owner_claim :
 /-! ## Part V — Wall-Clock TTL Expiration (`PurgeExpired*`) and Observation R8 -/
 
 /-- `RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`
-(`tpu_sync/kv_cache/reshard/request_block_registry.cc:61-69`):
+(`tpu_sync/kv_cache/reshard/request_block_registry.cc`):
 erases `request_blocks_` entries whose `registration.expires_at <= now` (set to
-`t_reg + ttl_s_` at `Register`, `:263`). -/
+`t_reg + ttl_s_` at `RequestBlockRegistry::Register`
+`registration.expires_at = now + ttl_s_;`). -/
 def RegGen.purgeExpiredRequestBlocks (s : RegGen) : RegGen :=
   { s with registeredUnits := [] }
 
 /-- `RequestBlockRegistry::PurgeExpiredLifecycleLocked`
-(`tpu_sync/kv_cache/reshard/request_block_registry.cc:71-96`):
+(`tpu_sync/kv_cache/reshard/request_block_registry.cc`):
 erases `claimed_`, `cancelled_`, `completed_units_`, `claimed_owners_`, and
 `claimed_units_` entries whose lifecycle `expires_at <= now`. -/
 def RegGen.purgeExpiredLifecycle (s : RegGen) : RegGen :=
@@ -797,8 +868,10 @@ def RegGen.purgeExpiredLifecycle (s : RegGen) : RegGen :=
     cancelled := false }
 
 /-- Combined TTL purge when `now` advances past both `registration.expires_at`
-and lifecycle `expires_at` (`request_block_registry.cc:61-96`,
-`reshard_service_test.cc:1023-1027, 1054-1062`). -/
+and lifecycle `expires_at` (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`
+and `PurgeExpiredLifecycleLocked` in `request_block_registry.cc`,
+`ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` and
+`ReshardStackTest.TtlPurgesExpiredRegistrations` in `reshard_service_test.cc`). -/
 def RegGen.purgeExpiredAll (s : RegGen) : RegGen :=
   s.purgeExpiredRequestBlocks.purgeExpiredLifecycle
 
@@ -808,14 +881,13 @@ theorem purgeExpiredAll_inv (s : RegGen) : Inv s.purgeExpiredAll where
   retiredClean := by intro _; exact ⟨rfl, rfl, rfl⟩
   partialVotes := by intro expected h; cases h
 
-/-- Replay of `ReshardStackTest.TtlPurgesExpiredRegistrations`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc:1054-1062`) and the TTL
+/-- Replay of `ReshardStackTest.TtlPurgesExpiredRegistrations` and the TTL
 tombstone lapse in `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`
-(`:1023-1027`):
-1. `TtlPurgesExpiredRegistrations` (`:1054-1062`): unit `0` registers, `now_`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`):
+1. `ReshardStackTest.TtlPurgesExpiredRegistrations`: unit `0` registers, `now_`
    advances past the 600 s TTL (`purgeExpiredAll`), and a subsequent
    `lookupAndClaim 101 [0]` fails (`none`, `"Missing producer block registration"`).
-2. `RequestBlockStatusProbeTracksLifecycle` (`:1023-1027`): after
+2. `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`: after
    `cancelIfUnclaimed` records a `.cancelled` tombstone, advancing `now_` past
    the TTL (`purgeExpiredAll`) purges the tombstone so `status` reads as
    `.unknown`. -/
@@ -830,18 +902,22 @@ theorem trace_ttl_purges_expired_registrations_and_tombstones :
       some (.cancelled, .unknown)) := by
   decide
 
-/-- **Observation R8 (`request_block_registry.cc:61-69, 263, 473`)**:
+/-- **Observation R8 (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`,
+`RequestBlockRegistry::Register` `registration.expires_at = now + ttl_s_;`, and
+`RequestBlockRegistry::LookupAndClaim` `claimed_[lifecycle_key] = now + ttl_s_;`
+in `request_block_registry.cc`)**:
 `Register` at time `t_0` sets `registration.expires_at = t_0 + ttl_s_` on
-`request_blocks_[(req_id, unit)]` (`:263`), whereas `LookupAndClaim` at time
-`t_1 > t_0` sets `claimed_[(req_id, uuid)] = t_1 + ttl_s_` (`:473`) **without**
-refreshing `registration.expires_at` on the claimed `request_blocks_` rows.
+`request_blocks_[(req_id, unit)]`, whereas `LookupAndClaim` at time `t_1 > t_0`
+sets `claimed_[(req_id, uuid)] = t_1 + ttl_s_` **without** refreshing
+`registration.expires_at` on the claimed `request_blocks_` rows.
 In the window `[t_0 + ttl_s_, t_1 + ttl_s_)`, `PurgeExpiredRequestBlocksLocked`
-(`:61-69`) erases `request_blocks_[(req_id, unit)]` while `claimed_` is still
-active (`s_split = s.purgeExpiredRequestBlocks`):
+erases `request_blocks_[(req_id, unit)]` while `claimed_` is still active
+(`s_split = s.purgeExpiredRequestBlocks`):
 1. `s_split.status` still reports `.claimed` (`claimedUnits = some [0]`), but
    `s_split.registeredUnits = []` (violating `ClaimOwnersConsistent`), and
 2. A second pipelined stage calling `lookupAndClaim 102 [0]` in that window fails
-   (`none`) with `"Missing producer block registration"` (`:463-468`). -/
+   (`none`) with `"Missing producer block registration"`
+   (`RequestBlockRegistry::LookupAndClaim` `for (const RaidenId& unit : units)`). -/
 theorem trace_r8_split_ttl_purges_request_blocks_while_claim_active :
     ((RegGen.sys.run [.register 0 true, .lookupAndClaim 101 [0]]).map
       (fun s =>

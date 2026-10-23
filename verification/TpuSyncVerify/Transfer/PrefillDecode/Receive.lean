@@ -14,10 +14,11 @@ with the transport's block accounting, the readiness predicate
 `failed_recving`. Layer data, memory contents and the producer are modelled in
 `Send.lean` and `Pipeline.lean`.
 
-Citations are to tpu-sync `2ed6f8f`. Unqualified `.h`/`.cc` are
-`tpu_sync/kv_cache/transfer_receive_session.{h,cc}`; `mgr.cc` is
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
-`tpu_sync/transport/block_transport.cc`.
+Citations are to the baseline commit in `verification/README.md` §Status.
+`recv.h`/`recv.cc` are `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`;
+`mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
+`tpu_sync/transport/block_transport.cc`. Exact line ranges for every symbol,
+sub-block, and test are in the generated `## Source map` table below.
 
 ## State
 
@@ -26,85 +27,88 @@ The settle protocol itself is `Transfer.Lifecycle`. On top of it:
 | Field             | C++                                        | Role |
 |-------------------|--------------------------------------------|------|
 | `numLayers`       | `base_->num_layers()`                      | fixed |
-| `issued`          | `h2d_futures_.size()` (`.h:296`)           | H2D copies handed to the device |
+| `issued`          | `h2d_futures_.size()`                      | H2D copies handed to the device |
 | `ready`           | futures in `h2d_futures_` with `IsReady()` | copies finished on the device |
-| `completed`       | `num_completed_layers_` (`.h:277`)         | callbacks that ran with an OK status |
-| `layersAccounted` | layers' worth of the per-shard threshold `total_blocks_ * num_layers` absorbed by the counters `blocks_received_per_shard_` (`.h:271-273`, `.cc:474-475`) | layers whose blocks the transport has reported |
-| `published`       | membership in `done_recving_` / `failed_recving_` (`mgr.cc:1030-1032`; a settled incumbent is also reported when displaced, `mgr.cc:514-518`, `:887-892`) | what `poll_stats()` shows the engine |
+| `completed`       | `num_completed_layers_`                    | callbacks that ran with an OK status |
+| `layersAccounted` | layers' worth of the per-shard threshold `total_blocks_ * num_layers` absorbed by the counters `blocks_received_per_shard_` (`RecordBlockShardsReceivedLocked`) | layers whose blocks the transport has reported |
+| `published`       | membership in `done_recving_` / `failed_recving_` (`CompleteReadWithDetails`; a settled incumbent is also reported when displaced in `EmplaceRecvSessionLocked` and `StartRead`) | what `poll_stats()` shows the engine |
 | `pushes`          | ghost                                      | incoming pushes between `TryBeginRecvOp` and `EndRecvOp` |
-| `pullPending`     | `handshake_pending_` (`.h:287`; set `.cc:333`, cleared `.cc:571`) | the StartRead pull handshake still holds its op |
+| `pullPending`     | `handshake_pending_` (set in `InitFromLoadPlan`, cleared in `ExecutePullRequest`'s `on_response`) | the StartRead pull handshake still holds its op |
 | `pending`         | ghost                                      | `ExecuteLayerH2d` calls between their first and second lock |
 | `retired`         | ghost                                      | H2D callbacks that have run, OK or not |
 
 Ghost fields have no single C++ variable. They record where each unit of
 `in_flight_` came from, which is what `Accounted` is about.
 
-`network_completed_` (`.h:278`) is not stored: it is exactly
+`network_completed_` is not stored: it is exactly
 `layersAccounted = numLayers` (`networkCompleted`), see
-`RecordBlockShardsReceivedLocked` `.cc:484-490`. The C++ counts per shard
-(`blocks_received_per_shard_[s]`, one `int64_t` per shard, `.h:271-275`): each
-incoming push stream adds its block count to every shard it carries
-(`.cc:476-483`), a shard completes at `total_blocks_ * num_layers`
-(`.cc:474-475`), and `network_completed_` is set when every shard has
-(`num_completed_shards_ == num_shards`, `.cc:484-490`). The model keeps the
-per-layer view: one `netAccount` per layer, which is the coarsening A4 justifies.
+`RecordBlockShardsReceivedLocked`. The C++ counts per shard
+(`blocks_received_per_shard_[s]`, one `int64_t` per shard): each incoming push
+stream adds its block count to every shard it carries
+(`received += static_cast<int64_t>(block_ids.size())`), a shard completes at
+`total_blocks_ * total_layers`, and `network_completed_` is set when every
+shard has (`num_completed_shards_ == static_cast<int32_t>(blocks_received_per_shard_.size())`).
+The model keeps the per-layer view: one `netAccount` per layer, which is the
+coarsening A4 justifies.
 
 ## Events
 
 | Event          | C++ |
 |----------------|-----|
-| `pushBegin`    | `TryBeginRecvOp` (`.h:117-122`) from `begin_incoming_push` (`mgr.cc:224-249`), called at `bt.cc:508` |
-| `pushEnd`      | `EndRecvOp` from `end_incoming_push` (`mgr.cc:250-296`), called at `bt.cc:633`. The hook takes the push's status and, when it is not OK, runs `DeferUnregisterOnSettle(); Finish(status)` first (`mgr.cc:267-270`, then `EndRecvOp()` `:271`; the transport's cleanup passes `InternalError("Incoming push failed")` on any early return, `bt.cc:510-517`) — in the model, `cancel` followed by `pushEnd`, see `trace_push_lease_pins_staging_on_cancel` |
-| `pullReply ok` | `on_response` of `ExecutePullRequest` (`.cc:536-572`): a transport failure keeps its status code, a producer rejection becomes `FailedPrecondition` (`.cc:547-556`); under `mu_` the error runs `FinishLocked` and `handshake_pending_` is cleared (`.cc:567-571`), then the `absl::Cleanup` (`.cc:538`) ends the op. Also the fault-injected `Finish(status); EndRecvOp()` in `StartRead` (`mgr.cc:945-951`) |
-| `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`.cc:647-659`), from `OnLayerReceived` (`bt.cc:790`, `mgr.cc:163-179`) |
-| `h2dIssue ok`  | `ExecuteLayerH2d` from the re-check on (`.cc:668-699`) |
+| `pushBegin`    | `TryBeginRecvOp` from `hooks.begin_incoming_push`, called in `BlockTransport::HandleIncomingPush` (`BeginIncomingPush`) |
+| `pushEnd`      | `EndRecvOp` from `hooks.end_incoming_push`, called in `BlockTransport::HandleIncomingPush` (`EndIncomingPush`). The hook takes the push's status and, when it is not OK, runs `DeferUnregisterOnSettle(); recv_session->Finish(status)` before `EndRecvOp()` (the transport's `absl::Cleanup end_incoming_push` passes `InternalError("Incoming push failed")` on any early return) — in the model, `cancel` followed by `pushEnd`, see `trace_push_lease_pins_staging_on_cancel` |
+| `pullReply ok` | `on_response` of `ExecutePullRequest`: a transport failure keeps its status code, a producer rejection (`response->status != 0`) becomes `FailedPrecondition`; under `mu_` the error runs `FinishLocked(pull_status)` and clears `handshake_pending_ = false`, then the `absl::Cleanup end_op` ends the op. Also the fault-injected `Finish(status); EndRecvOp()` in `StartRead` (`kKvCacheManagerApiStartReadSubmitPull`) |
+| `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`++in_flight_`), from `hooks.on_layer_received` (`BlockTransport::CompleteIncomingPush` → `OnLayerReceived`) |
+| `h2dIssue ok`  | `ExecuteLayerH2d` from the `done_ || draining_` re-check through `H2dSyncDispatch` and `h2d_futures_.push_back(future)` |
 | `h2dReady`     | the device finishes a copy: its future becomes `IsReady()` |
-| `h2dDone ok`   | H2D completion callback (`.cc:702-760`) |
-| `netAccount`   | `OnBlockShardsReceived` (`.cc:592-640`) via `bt.cc:630-631` / `mgr.cc:1473-1497`: accounts a stream's blocks per shard, may set `network_completed_`, and finishes the session if every layer is also complete (`RecordNetworkCompleteLocked`, `.cc:494-512`, called at `.cc:629-630`) |
-| `pollReady`    | `CompleteReadWithDetails` / `CompleteReadRaw` sees `IsReadyToComplete()` and calls `Finish()` (`mgr.cc:1015-1019`) |
-| `cancel`       | any `Finish(error)` from outside the session: deadline (`mgr.cc:1020-1027`), shutdown (`mgr.cc:381-385`), plan unregister (`mgr.cc:743`) |
-| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session into `done_recving_` or `failed_recving_` by its status and drops it (`mgr.cc:1030-1038`) |
+| `h2dDone ok`   | `ExecuteLayerH2d`'s `future.OnReady` H2D completion callback |
+| `netAccount`   | `OnBlockShardsReceived` via `BlockTransport::HandleIncomingPush` / `KVCacheManagerWithTransfer::OnBlockShardsReceived`: accounts a stream's blocks per shard (`RecordBlockShardsReceivedLocked`), may set `network_completed_`, and finishes the session if every layer is also complete (`RecordNetworkCompleteLocked`) |
+| `pollReady`    | `CompleteReadWithDetails` / `CompleteReadRaw` sees `IsReadyToComplete()` and calls `Finish()` |
+| `cancel`       | any `Finish(error)` from outside the session: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), plan unregister (`UnregisterActivePlan`) |
+| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`session->Done()`) into `done_recving_` or `failed_recving_` by its status and erases it from `active_recv_sessions_` |
 
 ## Assumptions
 
-* **A1 (one dispatch per layer).** `BlockTransport` fires `OnLayerReceived`
-  once per layer (`on_layer_received_called`, `bt.cc:743-745`), so
-  `ExecuteLayerH2d` is entered at most `numLayers` times. Encoded as the
+* **A1 (one dispatch per layer).** `BlockTransport::CompleteIncomingPush` fires
+  `OnLayerReceived` once per layer (`if (array_complete && !progress.on_layer_received_called)`),
+  so `ExecuteLayerH2d` is entered at most `numLayers` times. Encoded as the
   `h2dBegin` guard `issued + pending < numLayers`. The once-latch lives in the
-  `{uuid, layer}` entry of `layer_progress_`, which the transport erases once
-  every layer has been called (`bt.cc:765-779`); A1 therefore also assumes no
-  sender re-pushes a uuid after its entries were retired while the receive is
-  still live. `Transport.lean` models the table and proves A1
+  `{uuid, layer}` entry of `layer_progress_`, which `CompleteIncomingPush` erases
+  once every layer has been called (`if (all_layers_called)`); A1 therefore also
+  assumes no sender re-pushes a uuid after its entries were retired while the
+  receive is still live. `Transport.lean` models the table and proves A1
   (`Transport.OnceDispatched`) from exactly that assumption (its A4, honest
   senders); `Transport.trace_dup_after_retirement` is the re-push.
 * **A2 (registration).** The session has blocks to receive and is registered.
   `ReleaseStaging()` is only called from outside on registration failure:
-  `mgr.cc:565` and `:923` run before the session is seated, and if
-  `base_->RegisterActivePlan` (`:604-606`, called under `plan_lifecycle_mu_`
-  after the session was seated in `active_recv_sessions_` under an earlier `mu_`
-  lock at `:555-573`) fails, the cleanup `mu_` critical section (`:607-613`)
-  releases (`:611`) and erases (`:612`) the session together before the plan is
-  published, so it is not an event here.
+  in `RegisterActivePlan` and `StartRead` when `EmplaceRecvSessionLocked` fails
+  before the session is seated, and in `RegisterActivePlan` if
+  `base_->RegisterActivePlan` (called under `plan_lifecycle_mu_` after the
+  session was seated in `active_recv_sessions_` under an earlier `mu_` lock in
+  `if (hbm_receiver)`) fails, where the cleanup `mu_` critical section
+  (`if (!registered.ok())`) calls `ReleaseStaging()` and
+  `active_recv_sessions_.erase(recv)` together before the plan is published, so
+  it is not an event here.
 * **A3 (no double end).** Every op ends at most once, so `in_flight_` never
   underflows: `h2dDone` is only enabled while a callback is outstanding,
   `pushEnd` only while a push is open.
 * **A4 (transport ordering).** For the request that completes a layer,
-  `HandleIncomingPush` (dispatched from `HandleCustomRequest`, `bt.cc:479`)
-  calls `OnLayerReceived` (from `CompleteIncomingPush`, `bt.cc:619-622` →
-  `:784-792`) before `OnBlockShardsReceived` (`bt.cc:630-631`), on the same
-  thread, and `ExecuteLayerH2d` pushes the future into `h2d_futures_` before
-  returning (`.cc:696-699`). A layer's blocks are accounted as one event once
-  its copy is issued: guard `layersAccounted < issued`. With several streams
-  per layer (several senders, or one sender's push split by source NUMA node
-  into shard groups, each stream reporting only the shards it carried) the
-  per-shard counters grow before `OnLayerReceived`, but every shard can only
-  *reach* `total_blocks_ * num_layers` (`.cc:474-483`) once every stream has
-  reported, so the call that sets `network_completed_` (`.cc:484-490`) runs
-  after every layer's completing stream has reported, and each such report
-  follows that stream's own `OnLayerReceived` on the same thread; lumping each
-  layer's accounting into that event is sound for everything proved here. This
-  relies on streams reporting exactly their planned block count once (the
-  counters are plain sums compared with `>=`, `.cc:478-480`): over-reporting
+  `HandleIncomingPush` (dispatched from `HandleCustomRequest`) calls
+  `CompleteIncomingPush` → `OnLayerReceived` before `OnBlockShardsReceived`, on
+  the same thread, and `ExecuteLayerH2d` pushes the future into `h2d_futures_`
+  (`h2d_futures_.push_back(future)`) before returning. A layer's blocks are
+  accounted as one event once its copy is issued: guard
+  `layersAccounted < issued`. With several streams per layer (several senders,
+  or one sender's push split by source NUMA node into shard groups, each stream
+  reporting only the shards it carried) the per-shard counters grow before
+  `OnLayerReceived`, but every shard can only *reach* `total_blocks_ * num_layers`
+  in `RecordBlockShardsReceivedLocked` once every stream has reported, so the
+  call that sets `network_completed_` runs after every layer's completing stream
+  has reported, and each such report follows that stream's own `OnLayerReceived`
+  on the same thread; lumping each layer's accounting into that event is sound
+  for everything proved here. This relies on streams reporting exactly their
+  planned block count once (the counters in `RecordBlockShardsReceivedLocked`
+  are plain sums compared with `received >= per_shard_target`): over-reporting
   would complete a shard early, which is precisely the `netAccountUnordered`
   mutant. `Transport.lean` proves the coarsening (`Transport.NetworkSound`)
   from honest senders and shows the over-report
@@ -115,13 +119,13 @@ per-layer view: one `netAccount` per layer, which is the coarsening A4 justifies
 All proved on every reachable state (`reachable_safe`):
 
 * **Settle safety.** `done → inFlight = 0`: a settled session owns no work, so
-  its blocks and staging can be reused. This is what the comment at
-  `.cc:669-673` relies on ("A copy already handed to the device cannot be
+  its blocks and staging can be reused. This is what the comment in
+  `ExecuteLayerH2d` relies on ("A copy already handed to the device cannot be
   revoked; its in-flight count keeps the receive -- and its blocks -- owned
   until the copy ends").
 * **No retired callback.** `done → retired = issued`: the
-  `LOG(DFATAL) << "H2D callback for retired receive"` at `.cc:718-720` is
-  unreachable.
+  `LOG(DFATAL) << "H2D callback for retired receive"` in `ExecuteLayerH2d`'s
+  `future.OnReady` callback is unreachable.
 * **Staging integrity.** `hasStaging = !done`.
 * **Prompt settle.** `draining → inFlight = 0 → done`.
 * **Readiness is sound.** `IsReadyToComplete → ready = numLayers`: when the
@@ -147,6 +151,65 @@ coincide with "every layer's callback has run OK"; it does not.
 `num_completed_layers_` reaches `numLayers` (`trace_poll_before_callbacks`).
 That is harmless — `done` still waits for every callback through `in_flight_`
 — and the publication property above is the one that matters.
+
+## Source map
+
+Generated by `tools/resolve_anchors.py`.
+
+<!-- source-map:begin -->
+| File | Symbol / anchor | Lines |
+|---|---|---|
+| `recv.h` | `TransferReceiveSession::TryBeginRecvOp` | `:117-122` |
+| `recv.h` | `TransferReceiveSession` (`std::vector<int64_t> blocks_received_per_shard_` .. `std::vector<raiden::PjRtCopyFuture> h2d_futures_`) | `:273-296` |
+| `recv.cc` | `TransferReceiveSession::InitFromActivePlan` | `:136-206` |
+| `recv.cc` | `TransferReceiveSession::InitFromLoadPlan` | `:326-346` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:357-370` |
+| `recv.cc` | `TransferReceiveSession::Details` | `:383-399` |
+| `recv.cc` | `TransferReceiveSession::CurrentPhaseLocked` | `:401-404` |
+| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:406-417` |
+| `recv.cc` | `TransferReceiveSession::AllH2dDoneLocked` | `:443-448` |
+| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:450-456` |
+| `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` | `:465-492` |
+| `recv.cc` | `TransferReceiveSession::RecordNetworkCompleteLocked` | `:494-512` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` | `:514-590` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`auto on_response =`) | `:536-572` |
+| `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:592-640` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:642-763` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`++in_flight_;` .. `trigger_enqueue = true;`) | `:652-657` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:669-698` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:702-760` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_layer_received =`) | `:163-179` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:224-249` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:250-296` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_recv_sessions_)`) | `:381-385` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked` | `:511-527` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:529-617` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:717-754` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:850-954` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();`) | `:1011-1042` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::OnBlockShardsReceived` | `:1473-1497` |
+| `bt.cc` | `BlockTransport::HandleCustomRequest` | `:471-494` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:496-639` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:641-794` |
+| `send_drain_test.cc` | `RecvLifecycleTest.DetailsSayAReceiveTimedOutWaitingForData` | `:636-649` |
+| `send_drain_test.cc` | `RecvLifecycleTest.DetailsSayAFailedUploadFailedInH2dWhileDataArrives` | `:651-665` |
+| `send_drain_test.cc` | `RecvLifecycleTest.SingleFailedH2dReportsFailureAndReturnsStaging` | `:725-736` |
+| `send_drain_test.cc` | `RecvLifecycleTest.NetworkCompletionWaitsForH2d` | `:599-617` |
+| `send_drain_test.cc` | `RecvLifecycleTest.LateBlockAccountingAfterRetirementIsANoOp` | `:680-702` |
+| `send_drain_test.cc` | `RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline` | `:738-749` |
+| `send_drain_test.cc` | `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds` | `:751-778` |
+| `send_drain_test.cc` | `RecvDrainTest.FailedLayerWaitsForOtherH2dCopies` | `:831-857` |
+| `send_drain_test.cc` | `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging` | `:859-895` |
+| `send_drain_test.cc` | `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining` | `:948-971` |
+| `send_drain_test.cc` | `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing` | `:973-1000` |
+| `send_drain_test.cc` | `RecvLifecycleTest.FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline` | `:1002-1030` |
+| `control_test.cc` | `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds` | `:795-835` |
+| `control_test.cc` | `ControlHandshakeTest.RejectedPullReportsWhyAndWhichProducerRejectedIt` | `:849-867` |
+| `control_test.cc` | `ControlHandshakeTest.RefusedConnectionKeepsItsStatusCode` | `:869-894` |
+| `pool_reshard_test.cc` | `DemandStagingTest.UnregisteringIdleReceiverReleasesPlanAtOnce` | `:440-465` |
+| `pool_reshard_test.cc` | `DemandStagingTest.UnregisteringInFlightReceiverDefersUntilItSettles` | `:467-507` |
+| `pool_reshard_test.cc` | `DemandStagingTest.DemandStagedReceiverPlanUnregistersWhenItSettles` | `:569-592` |
+<!-- source-map:end -->
 -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode
@@ -173,23 +236,25 @@ namespace Recv
 flight until the transport starts pushing. -/
 def initPush (numLayers : Nat) : Recv := { numLayers }
 
-/-- A receiver created by `StartRead` (`InitFromLoadPlan`, `.cc:326-346`):
-`in_flight_ = 1` for the pull handshake (`.cc:338`; zero-block reads get
-`in_flight_ = 0` and are finished by `StartRead` at `mgr.cc:940-943` without a
-pull, excluded by A2). -/
+/-- A receiver created by `StartRead` (`InitFromLoadPlan`):
+`in_flight_ = load_plan.num_blocks > 0 ? 1 : 0` for the pull handshake
+(zero-block reads get `in_flight_ = 0` and are finished by `StartRead` at
+`if (num_blocks == 0) { session->Finish(); return; }` without a pull, excluded
+by A2). -/
 def initLoad (numLayers : Nat) : Recv :=
   { numLayers, life := { inFlight := 1 }, pullPending := true }
 
-/-- `network_completed_` (`.cc:484-490`): every shard's blocks accounted
-(agrees with `.h:278` for `numLayers > 0`; at `numLayers = 0`, C++'s
-`IsReadyToComplete` at `.cc:453-455` holds via its `num_completed_layers_ ==
-total_layers` disjunct while `network_completed_` stays `false`). -/
+/-- `network_completed_` (`RecordBlockShardsReceivedLocked`): every shard's
+blocks accounted (agrees with `TransferReceiveSession::network_completed_` for
+`numLayers > 0`; at `numLayers = 0`, C++'s `IsReadyToComplete` holds via its
+`num_completed_layers_ == static_cast<int32_t>(total_layers)` disjunct while
+`network_completed_` stays `false`). -/
 def networkCompleted (s : Recv) : Prop := s.layersAccounted = s.numLayers
 
-/-- `AllH2dDoneLocked` (`.cc:443-448`): every future in `h2d_futures_` is ready. -/
+/-- `AllH2dDoneLocked`: every future in `h2d_futures_` is ready. -/
 def allH2dDone (s : Recv) : Prop := s.ready = s.issued
 
-/-- `IsReadyToComplete` (`.cc:450-456`). -/
+/-- `IsReadyToComplete`. -/
 def isReadyToComplete (s : Recv) : Prop :=
   (networkCompleted s ∨ s.completed = s.numLayers) ∧ allH2dDone s
 
@@ -224,28 +289,30 @@ def pushEnd (s : Recv) : Option Recv :=
   if s.pushes = 0 then none
   else some { s with life := s.life.endOpLocked, pushes := s.pushes - 1 }
 
-/-- The pull handshake resolves: `Finish(pull_status)` if it failed
-(`.cc:567-571`), then the `absl::Cleanup` at `.cc:538` ends the op. -/
+/-- The pull handshake resolves (`ExecutePullRequest`'s `on_response`):
+`self->FinishLocked(pull_status)` if `!pull_status.ok()` and
+`self->handshake_pending_ = false`, then `absl::Cleanup end_op` calls
+`EndRecvOp()`. -/
 def pullReply (ok : Bool) (s : Recv) : Option Recv :=
   if s.pullPending = false then none
   else
     let l := if ok then s.life else s.life.finishLocked false
     some { s with life := l.endOpLocked, pullPending := false }
 
-/-- `ExecuteLayerH2d` up to the first unlock (`.cc:647-659`): refused once
-settled or draining, and only while `issued + pending < numLayers` (A1);
-otherwise `++in_flight_`. -/
+/-- `ExecuteLayerH2d` up to the first unlock: refused once settled or draining
+(`if (done_ || draining_) return absl::OkStatus();`), and only while
+`issued + pending < numLayers` (A1); otherwise `++in_flight_`. -/
 def h2dBegin (s : Recv) : Option Recv :=
   if s.issued + s.pending < s.numLayers then
     s.life.beginOp.map fun l => { s with life := l, pending := s.pending + 1 }
   else none
 
 /-- `ExecuteLayerH2d` from the re-check on. If the session finished in the
-window between the two locks, the op is released and no copy is issued
-(`.cc:674-678`). Otherwise the copy is dispatched: on failure
-`FinishLocked(status); EndRecvOpLocked()` (`.cc:688-693`); on success its
-future joins `h2d_futures_` (`.cc:696-699`) and the op stays in flight until
-the callback. -/
+window between the two locks (`if (done_ || draining_) { EndRecvOpLocked(); return absl::OkStatus(); }`),
+the op is released and no copy is issued. Otherwise the copy is dispatched via
+`H2dSyncDispatch`: on failure `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`;
+on success its future joins `h2d_futures_` (`h2d_futures_.push_back(future)`)
+and the op stays in flight until the callback. -/
 def h2dIssue (ok : Bool) (s : Recv) : Option Recv :=
   if s.pending = 0 then none
   else
@@ -261,11 +328,12 @@ def h2dIssue (ok : Bool) (s : Recv) : Option Recv :=
 def h2dReady (s : Recv) : Option Recv :=
   if s.ready < s.issued then some { s with ready := s.ready + 1 } else none
 
-/-- H2D completion callback (`.cc:702-760`), run once per ready future. The
-`absl::Cleanup` at `.cc:711` ends the op on every path. On a retired session
-the body returns early (`.cc:718-720`, DFATAL). On success
-`num_completed_layers_++`; the last layer finishes the session unless it is
-already draining (`.cc:725-732`). On failure `FinishLocked(status)` (`.cc:737`). -/
+/-- H2D completion callback (`ExecuteLayerH2d`'s `future.OnReady`), run once per
+ready future. `absl::Cleanup end_op` calls `EndRecvOp()` on every path. On a
+retired session (`if (self->done_)`) the body returns early (`LOG(DFATAL)`). On
+success `self->num_completed_layers_++`; the last layer calls
+`self->FinishLocked()` unless `!self->draining_` fails. On failure
+`self->FinishLocked(status_or.status(), kH2dPhase)`. -/
 def h2dDone (ok : Bool) (s : Recv) : Option Recv :=
   if s.retired < s.ready then
     let s := { s with retired := s.retired + 1 }
@@ -280,11 +348,12 @@ def h2dDone (ok : Bool) (s : Recv) : Option Recv :=
       some { s with life := (s.life.finishLocked false).endOpLocked }
   else none
 
-/-- `OnBlockShardsReceived` (`.cc:592-640`) for the stream that completes a layer
-(A4). Ignored once settled or draining (`.cc:605-607`). Otherwise the stream's
-blocks are accounted per shard (`.cc:476-483`); if every shard reaches the
-threshold (`.cc:484-490`) and every layer's callback has also run (`.cc:489`),
-the session finishes (`RecordNetworkCompleteLocked`, `.cc:506-510`). -/
+/-- `OnBlockShardsReceived` for the stream that completes a layer (A4). Ignored
+once settled or draining (`if (done_ || draining_) return absl::OkStatus();`).
+Otherwise `RecordBlockShardsReceivedLocked` accounts the stream's blocks per
+shard; if every shard reaches `per_shard_target` and
+`num_completed_layers_ == static_cast<int32_t>(total_layers)`,
+`RecordNetworkCompleteLocked` calls `FinishLocked()`. -/
 def netAccount (s : Recv) : Option Recv :=
   if s.life.done = true ∨ s.life.draining = true then none
   else if s.layersAccounted < s.issued then
@@ -295,7 +364,8 @@ def netAccount (s : Recv) : Option Recv :=
   else none
 
 /-- `CompleteReadWithDetails` / `CompleteReadRaw` polls a session that is not
-draining and finds it ready (`mgr.cc:1015-1019`). -/
+draining (`!session->IsDraining()`) and finds `session->IsReadyToComplete()`,
+calling `session->Finish()`. -/
 def pollReady (s : Recv) : Option Recv :=
   if s.life.draining = false ∧ isReadyToComplete s then
     some { s with life := s.life.finishLocked true }
@@ -306,7 +376,7 @@ def cancel (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false }
 
 /-- `CompleteReadWithDetails` / `CompleteReadRaw` publishes a settled session
-(`mgr.cc:1030-1038`). -/
+(`if (session->Done())`). -/
 def publish (s : Recv) : Option Recv :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }
@@ -865,16 +935,15 @@ theorem trace_poll_before_callbacks :
       (fun s => (s.published, s.completed)) = some (some true, 1) := by
   decide
 
-/-- `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:751-778`) and
-`RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging` (`:859-895`): the deadline
-fires while an H2D copy is in flight (or while the thread is inside
-`H2dSyncDispatch` at `.cc:682-687`, after the `.cc:674-679` re-check has passed
-— since `.cc:680-699` never re-reads `draining_`/`done_`, that deadline
-linearises after `h2dIssue`). The session drains but does not settle until the
-copy's callback ends the op, and is then published as failed. Both tests seat
-the session with `RecvTestManager::AddRecv` (push-plan `Create`, no pull), so
-their literal replay is `sysPush 1`; the `sysLoad 1` state after
+/-- `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds` and
+`RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`: the deadline fires while
+an H2D copy is in flight (or while the thread is inside `H2dSyncDispatch` in
+`ExecuteLayerH2d`, after the `if (done_ || draining_)` re-check has passed —
+since `ExecuteLayerH2d` never re-reads `draining_`/`done_` after the re-check,
+that deadline linearises after `h2dIssue`). The session drains but does not
+settle until the copy's callback ends the op, and is then published as failed.
+Both tests seat the session with `RecvTestManager::AddRecv` (push-plan `Create`,
+no pull), so their literal replay is `sysPush 1`; the `sysLoad 1` state after
 `pullReply true` is lifecycle-identical and the trace keeps the `StartRead`
 shape to show the deadline landing on a pulled receive. -/
 theorem trace_deadline_during_copy :
@@ -885,8 +954,9 @@ theorem trace_deadline_during_copy :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
-/-- The race the re-check at `.cc:668-679` closes: the session finishes between
-the two locks of `ExecuteLayerH2d`, so no copy is issued and the op is released. -/
+/-- The race the second `if (done_ || draining_)` check in `ExecuteLayerH2d`
+closes: the session finishes between the two locks of `ExecuteLayerH2d`, so no
+copy is issued and the op is released (`EndRecvOpLocked()`). -/
 theorem trace_finish_between_locks :
     ((sysPush 1).run [.h2dBegin, .cancel, .h2dIssue true]).map
       (fun s => (s.issued, s.life.done)) = some (0, true) := by
@@ -913,8 +983,10 @@ theorem trace_net_completion_waits_for_h2d :
 
 /-- `RecvLifecycleTest.LateBlockAccountingAfterRetirementIsANoOp`: a fast H2D
 callback finishes and retires the session before `OnBlockShardsReceived` runs; the
-late `netAccount` is ignored (`mgr.cc:1487-1490` once the poll has dropped the
-session, `.cc:605-607` while it is still seated). -/
+late `netAccount` is ignored (`KVCacheManagerWithTransfer::OnBlockShardsReceived`
+returns `OkStatus()` on `it == active_recv_sessions_.end()` once the poll has
+dropped the session, and `TransferReceiveSession::OnBlockShardsReceived` returns
+`OkStatus()` on `done_ || draining_` while it is still seated). -/
 theorem trace_late_net_account_after_retire :
     let pre := [.h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true, .publish]
     ((sysPush 1).run pre).map
@@ -937,16 +1009,13 @@ theorem trace_failed_h2d_waits_for_other_layer :
   decide
 
 /-- `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:948-971`) and
-`DemandStagingTest.UnregisteringInFlightReceiverDefersUntilItSettles`
-(`kv_cache_manager_with_transfer_pool_reshard_test.cc:467-507`):
+and `DemandStagingTest.UnregisteringInFlightReceiverDefersUntilItSettles`:
 an open incoming push lease (`pushBegin`) keeps staging pinned across `cancel`
 while rejecting new pushes, and releases staging when `pushEnd` completes.
 The `cancel, pushEnd` suffix is also what a failed push itself
-does (`end_incoming_push` finishes the session with the push's status, then
+does (`hooks.end_incoming_push` finishes the session with the push's status, then
 ends the op):
-`RecvLifecycleTest.FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:1002-1030`). -/
+`RecvLifecycleTest.FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline`. -/
 theorem trace_push_lease_pins_staging_on_cancel :
     ((sysPush 1).run [.pushBegin, .cancel]).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
@@ -955,8 +1024,7 @@ theorem trace_push_lease_pins_staging_on_cancel :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
-/-- `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:973-1000`):
+/-- `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`:
 even if the H2D copy and its callback finish inside `HandleIncomingPush` before
 `EndIncomingPush` runs, the open push lease (`pushes = 1`) keeps `done = false`
 and `hasStaging = true` until `pushEnd`. -/
@@ -969,17 +1037,13 @@ theorem trace_push_lease_outlives_h2d :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) := by
   decide
 
-/-- `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds`
-(`kv_cache_manager_with_transfer_control_test.cc:795-835`), plus the idle
-push-plan cases `RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:738-749`),
-`DemandStagingTest.UnregisteringIdleReceiverReleasesPlanAtOnce`
-(`kv_cache_manager_with_transfer_pool_reshard_test.cc:440-465`), and
-`DemandStagingTest.DemandStagedReceiverPlanUnregistersWhenItSettles`
-(`:569-592`): on `sysLoad 1`, a deadline while the pull handshake is still
-pending keeps staging pinned until `pullReply` ends the handshake op; on
-`sysPush 1` with no admitted push, cancelling or timing out settles and releases
-staging at once. -/
+/-- `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds`, plus the
+idle push-plan cases `RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline`,
+`DemandStagingTest.UnregisteringIdleReceiverReleasesPlanAtOnce`, and
+`DemandStagingTest.DemandStagedReceiverPlanUnregistersWhenItSettles`: on
+`sysLoad 1`, a deadline while the pull handshake is still pending keeps staging
+pinned until `pullReply` ends the handshake op; on `sysPush 1` with no admitted
+push, cancelling or timing out settles and releases staging at once. -/
 theorem trace_deadline_during_handshake :
     ((sysLoad 1).run [.cancel]).map
       (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
@@ -1035,11 +1099,11 @@ def netAccountUnordered (s : Recv) : Option Recv :=
         | .counterexample _ => true
         | _ => false)
 
-/-- Mutant for `NoOpLeak`: `ExecuteLayerH2d` returns early on `done_ || draining_`
-(`.cc:675-678`) without calling `EndRecvOpLocked()`. A cancel between the two
-locks leaks the op: `inFlight` stays positive with no enabled drain event, so
-the session never settles (`SettleSafe` holds vacuously, `NoOpLeak` catches
-it). -/
+/-- Mutant for `NoOpLeak`: `ExecuteLayerH2d` returns early on the second
+`if (done_ || draining_)` check without calling `EndRecvOpLocked()`. A cancel
+between the two locks leaks the op: `inFlight` stays positive with no enabled
+drain event, so the session never settles (`SettleSafe` holds vacuously,
+`NoOpLeak` catches it). -/
 def h2dIssueLeak (ok : Bool) (s : Recv) : Option Recv :=
   if s.pending = 0 then none
   else
@@ -1059,11 +1123,12 @@ def h2dIssueLeak (ok : Bool) (s : Recv) : Option Recv :=
 
 /-! ## Failure phase (`TransferDetails`)
 
-As on the send side: `FinishLocked(status, phase)` (`.cc:357-362`) latches
-`failed_phase_` from the explicit `kH2dPhase` in the H2D paths (`.cc:690`,
-`.cc:737`) and otherwise from `CurrentPhaseLocked` (`.cc:401-404`:
-`handshake_pending_` → `connect`, `network_completed_` → `h2d`, else
-`receive`); `Details()` (`.cc:383-399`) reports it (`mgr.cc:1033`). Not state;
+As on the send side: `FinishLocked(status, phase)` latches `failed_phase_` from
+the explicit `kH2dPhase` in the `ExecuteLayerH2d` paths (`FinishLocked(future_or.status(), kH2dPhase)`
+and `self->FinishLocked(status_or.status(), kH2dPhase)`) and otherwise from
+`CurrentPhaseLocked` (`handshake_pending_` → `connect`, `network_completed_` →
+`h2d`, else `receive`); `Details()` reports it (`CompleteReadWithDetails`:
+`transfer_details_[session->req_id()] = session->Details()`). Not state;
 `phase` evaluates `CurrentPhaseLocked` on the model (`pullPending` is
 `handshake_pending_`, `networkCompleted` is `network_completed_`). -/
 
@@ -1072,25 +1137,24 @@ inductive Phase
   | connect | receive | h2d
   deriving Repr, DecidableEq
 
-/-- `CurrentPhaseLocked` (`.cc:401-404`). -/
+/-- `CurrentPhaseLocked`. -/
 def phase (s : Recv) : Phase :=
   if s.pullPending then .connect
   else if s.layersAccounted = s.numLayers then .h2d
   else .receive
 
 /-- The phase `FinishLocked` latches when `e` fails in `s` while
-`s.life.statusOk = true` (first error wins, `.cc:359-362`): the H2D dispatch
-failure (`.cc:690`) and the H2D completion callback (`.cc:737`) pass
-`kH2dPhase`; the pull reply (`.cc:569`) and every external `Finish(error)` take
-the current phase. At `numLayers = 0`, `phase` says `h2d` where C++ says
+`s.life.statusOk = true` (first error wins: `if (!status.ok() && status_.ok())`):
+the H2D dispatch failure and the H2D completion callback pass `kH2dPhase`; the
+pull reply (`self->FinishLocked(pull_status)`) and every external `Finish(error)`
+take the current phase. At `numLayers = 0`, `phase` says `h2d` where C++ says
 `receive` (`network_completed_` is never set there, see `networkCompleted`). -/
 def failedPhase (s : Recv) : Ev → Phase
   | .h2dIssue false => .h2d
   | .h2dDone false => .h2d
   | _ => phase s
 
-/-- `RecvLifecycleTest.DetailsSayAReceiveTimedOutWaitingForData`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:636-649`): a push-plan
+/-- `RecvLifecycleTest.DetailsSayAReceiveTimedOutWaitingForData`: a push-plan
 receive with no traffic expires in `receive` and is reported failed. -/
 theorem trace_details_receive_timed_out_waiting_for_data :
     ((sysPush 1).run []).map (fun s => failedPhase s .cancel) = some .receive ∧
@@ -1098,11 +1162,11 @@ theorem trace_details_receive_timed_out_waiting_for_data :
       some (true, some false) := by
   decide
 
-/-- `RecvLifecycleTest.DetailsSayAFailedUploadFailedInH2dWhileDataArrives`
-(`kv_cache_manager_with_transfer_send_drain_test.cc:651-665`): layer 0's H2D
-copy fails before its blocks were accounted. `CurrentPhaseLocked` would say
-`receive` (`network_completed_` is false), but the callback passes `kH2dPhase`
-(`.cc:737`), so the failure is reported in `h2d`. -/
+/-- `RecvLifecycleTest.DetailsSayAFailedUploadFailedInH2dWhileDataArrives`:
+layer 0's H2D copy fails before its blocks were accounted. `CurrentPhaseLocked`
+would say `receive` (`network_completed_` is false), but the callback passes
+`kH2dPhase` (`self->FinishLocked(status_or.status(), kH2dPhase)`), so the
+failure is reported in `h2d`. -/
 theorem trace_details_failed_upload_in_h2d :
     let pre := [.h2dBegin, .h2dIssue true, .h2dReady]
     ((sysPush 1).run pre).map (fun s => (phase s, failedPhase s (.h2dDone false))) =
@@ -1111,15 +1175,15 @@ theorem trace_details_failed_upload_in_h2d :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
-/-- `ControlHandshakeTest.RejectedPullReportsWhyAndWhichProducerRejectedIt`
-(`kv_cache_manager_with_transfer_control_test.cc:849-867`) and
-`RefusedConnectionKeepsItsStatusCode` (`:869-894`): a pull the producer rejects,
-or whose connection is refused, fails in `connect` (`handshake_pending_` still
-set when `on_response` runs `FinishLocked`, `.cc:567-571`) and is reported
-failed. The two tests differ only in the status code and message carried by
-`TransferDetails` (`FailedPrecondition` with the producer's message vs. the
-transport's own code, `.cc:547-556`), which the model does not distinguish:
-both are `pullReply false`. -/
+/-- `ControlHandshakeTest.RejectedPullReportsWhyAndWhichProducerRejectedIt` and
+`ControlHandshakeTest.RefusedConnectionKeepsItsStatusCode`: a pull the producer
+rejects, or whose connection is refused, fails in `connect`
+(`handshake_pending_` still set when `on_response` runs
+`self->FinishLocked(pull_status)`) and is reported failed. The two tests differ
+only in the status code and message carried by `TransferDetails`
+(`FailedPrecondition` with the producer's message on `response->status != 0` vs.
+the transport's own `response.status().code()`), which the model does not
+distinguish: both are `pullReply false`. -/
 theorem trace_details_rejected_pull :
     ((sysLoad 1).run []).map (fun s => (phase s, failedPhase s (.pullReply false))) =
       some (.connect, .connect) ∧
