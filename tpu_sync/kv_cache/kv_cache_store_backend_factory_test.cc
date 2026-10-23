@@ -266,6 +266,9 @@ TEST(KVCacheStoreBackendFactoryTest, CustomBackendDefaultHostOffloadHooks) {
                           KVCacheStoreBackendFactory::Create(config));
   EXPECT_EQ(backend->name(), "CustomTestBackend");
 
+  EXPECT_FALSE(
+      backend->Insert({"h1"}, {RaidenBlockId()}, InsertOption::kAdmitStrict));
+
   BlockTracker save_tracker;
   EXPECT_THAT(
       backend->BeginWriteRemote(RaidenId{"dst", "0", "kv", 0}, {"h1"}, {0},

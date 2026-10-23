@@ -1473,10 +1473,10 @@ void KVCacheStore::LoadFromSecondaryBackend(
         // staging blocks, so each block is then published into the host-RAM
         // tier -- backends_[0], the HostOffloadBackend -- by inserting a
         // HOST_AND_HBM entry owned by this store into its LRU cache
-        // (InsertAllOrNothing below). That LRU cache is what Lookup() consults
-        // for local HOST hits. Publishing is a caching optimization and may
-        // fail without failing the Load. host_ram_backend is never null (see
-        // the DCHECK at entry).
+        // (Insert(..., InsertOption::kAdmitStrict) below). That LRU cache is
+        // what Lookup() consults for local HOST hits. Publishing is a caching
+        // optimization and may fail without failing the Load. host_ram_backend
+        // is never null (see the DCHECK at entry).
 
         std::vector<std::string> update_hashes;
         std::vector<RaidenBlockId> update_slices;
@@ -1500,16 +1500,17 @@ void KVCacheStore::LoadFromSecondaryBackend(
         // Admission is done per-block rather than as a single batch because
         // refusal is per-block (e.g. duplicate hashes from a concurrent
         // publisher). Admitting one-by-one preserves the usable prefix chain
-        // even if later blocks collide. Single-element InsertAllOrNothing
-        // validates, inserts, and verifies under the backend's own mutex.
-        // InsertAllOrNothing rather than Insert: Insert cannot report a
-        // refusal -- its all_inserted flag is cleared only when a hash was
-        // already present, never when LRUCache::Put silently drops a new key --
-        // so a refused staging block would go undetected and leak.
+        // even if later blocks collide. Single-element
+        // Insert(..., InsertOption::kAdmitStrict) validates, inserts, and
+        // verifies under the backend's own mutex.
+        // InsertOption::kAdmitStrict rather than kBestEffortUpdate:
+        // kBestEffortUpdate overwrites an existing hash in place and never
+        // rejects when LRUCache::Put silently drops a new key, so a refused
+        // staging block would go undetected and leak.
         std::vector<int> to_return;
         for (size_t i = 0; i < update_hashes.size(); ++i) {
-          if (!host_ram_backend->InsertAllOrNothing({update_hashes[i]},
-                                                    {update_slices[i]})) {
+          if (!host_ram_backend->Insert({update_hashes[i]}, {update_slices[i]},
+                                        InsertOption::kAdmitStrict)) {
             // The host-RAM tier declined ownership of this block. Its physical
             // block id must be returned HERE: block reclamation runs through
             // KVCacheStore::Evict, which discovers victims by asking the tier

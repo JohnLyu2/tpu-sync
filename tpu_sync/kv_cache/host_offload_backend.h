@@ -114,9 +114,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      BlockTracker* absl_nonnull save_tracker) override;
 
   // --- WriteRemote & registry overrides ------------------------------------
-  bool InsertAllOrNothing(absl::Span<const std::string> block_hashes,
-                          absl::Span<const RaidenBlockId> slices) override;
-
   tsl::Future<> RegisterBlocksAsync(
       absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> host_block_ids) override;

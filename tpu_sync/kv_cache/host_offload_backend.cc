@@ -1013,12 +1013,6 @@ HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
   return (*client)->PollWriteRemote(operation_id, wait_ms);
 }
 
-bool HostOffloadBackend::InsertAllOrNothing(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices) {
-  return Insert(block_hashes, slices, InsertOption::kAdmitStrict);
-}
-
 tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(
     absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> host_block_ids) {
