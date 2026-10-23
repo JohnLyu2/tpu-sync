@@ -59,7 +59,7 @@ installs: tpu-inference `7ed46a6`, vLLM `6185d73`.
 ## Building & Verifying
 
 Requires [elan](https://github.com/leanprover/elan); the toolchain pinned in
-[`lean-toolchain`](lean-toolchain) (Lean 4.34.0) is fetched automatically.
+[`lean-toolchain`](lean-toolchain) (Lean 4.33.0) is fetched automatically.
 
 ```sh
 cd verification

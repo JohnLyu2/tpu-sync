@@ -1656,8 +1656,6 @@ def violates (pol : PushEndPolicy) (s : Recv) : Bool :=
   (s.published == some true && !(allCompleted s.pools && s.durationRecorded)) ||
   (0 < s.life.inFlight && !(drainEvents s.pools.length).any fun e => (step pol s e).isSome)
 
-#guard ModelCheck.check (sys [0, 1] .endOpOnly) (events 2) (violates .endOpOnly) 8 = .outOfFuel
-#guard ModelCheck.check (sys [0, 1] .finishOnError) (events 2) (violates .finishOnError) 8 = .outOfFuel
 
 /-- Mutant 1 (`onPoolReceivedIgnoringRank`): `CollectEligiblePoolH2dsLocked`
 ignores `pool_order_ranks_` and launches every started pool immediately. When

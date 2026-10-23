@@ -589,9 +589,6 @@ def violatesMetrics (m : RecvM) : Bool := m.s.published == some true && !m.metri
 #guard (match ModelCheck.check (sysMPush true 1) events violatesMetrics 8 with
         | .counterexample _ => true
         | _ => false)
-#guard ModelCheck.check (sysMPush false 2) events violatesMetrics 10 = .outOfFuel
-#guard ModelCheck.check (sysMLoad false 2) events violatesMetrics 10 = .outOfFuel
-
 -- Sanity check that the no-poll model is not vacuous: the search, asked to
 -- *find* a successful publication, finds one.
 #guard (match ModelCheck.check (sysMPush false 2) events (fun m => m.s.published == some true) 10 with

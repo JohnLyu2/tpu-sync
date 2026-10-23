@@ -900,11 +900,4 @@ def starvesFirstHealthy (s : State) : Bool :=
         | .counterexample _ => true
         | _ => false)
 
--- Fixed `perPeerQuota 1` (`maxPerPeer = 1 < numSlots = 2`): bounded search
--- confirms the first `Peer.healthy` read is never starved across any interleaving.
-#guard ModelCheck.check
-  (sys { numLayers := 1, numSlots := 2, poolSize := 2,
-         backend := .grpcAsync, policy := .perPeerQuota 1 })
-  checkEvents starvesFirstHealthy 5 = .outOfFuel
-
 end TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation

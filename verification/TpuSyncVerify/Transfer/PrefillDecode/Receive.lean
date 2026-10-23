@@ -1071,9 +1071,6 @@ def violates (s : Recv) : Bool :=
     s.issued ≤ s.numLayers && s.layersAccounted ≤ s.issued) ||
   (0 < s.life.inFlight && !(drainEvents.any fun e => (step s e).isSome))
 
-#guard ModelCheck.check (sysLoad 2) events violates 10 = .outOfFuel
-#guard ModelCheck.check (sysPush 2) events violates 10 = .outOfFuel
-
 /-- Sanity check on the search itself: a `Finish` that settles at once, ignoring
 in-flight work, must be caught. -/
 def cancelEager (s : Recv) : Option Recv :=

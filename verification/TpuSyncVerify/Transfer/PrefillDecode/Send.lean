@@ -1234,8 +1234,6 @@ def violates (s : Send) : Bool :=
   (s.started && !s.pullStarted) ||
   ((s.d2hPending || 0 < s.d2hIssued) && !s.started)
 
-#guard ModelCheck.check (sys 2) events violates 12 = .outOfFuel
-
 /-- Sanity check on the search itself: a `Finish` that settles at once, ignoring
 in-flight work, must be caught. -/
 def cancelEager (s : Send) : Option Send :=

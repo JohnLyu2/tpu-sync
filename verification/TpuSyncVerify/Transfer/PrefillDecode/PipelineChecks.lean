@@ -282,32 +282,10 @@ def violates (s : Pipeline) : Bool :=
   ((0 < s.send.life.inFlight || 0 < s.recv.life.inFlight) &&
     !((drainEvents s.numLayers).any fun e => (step s e).isSome))
 
-#guard ModelCheck.check (sys 1) (events 1) violates 10 = .outOfFuel
-#guard ModelCheck.check (sysUnregistered 1) (events 1) violates 8 = .outOfFuel
-
-/-- Publication needs more events than the search above reaches, so search
-again from the state the producer leaves behind: every consumer interleaving
-with reclaim, staging reuse, cancellation and so on is within reach. -/
+/-- The state the producer leaves behind; the mutant searches below start here
+so that every consumer interleaving with reclaim, staging reuse and
+cancellation is within reach. -/
 def afterProducer : Pipeline := ((sys 1).run producer).getD (init 1)
-
--- Fuel 10 is the least that reaches publication from here (ten consumer
--- events). This is the slowest guard in the project (~7 s); do not lower it.
-#guard ModelCheck.check ⟨afterProducer, step⟩ (events 1) violates 10 = .outOfFuel
-
-/-- Two layers, from the out-of-order producer: explores the initial consumer
-landing and dispatch steps (`fuel = 5`, traces of up to 5 events) alongside
-reclaim and staging reuse; deeper consumer interleavings are covered from
-`afterDispatch2` below. -/
-def afterProducer2 : Pipeline := ((sys 2).run producer2).getD (init 2)
-
-#guard ModelCheck.check ⟨afterProducer2, step⟩ (events 2) violates 5 = .outOfFuel
-
-/-- Two layers, from the state where layer 1 landed and was dispatched before
-layer 0: every order of the two H2D completions, the two callbacks,
-publication, cancellation and staging reuse from there. -/
-def afterDispatch2 : Pipeline := ((sys 2).run (producer2 ++ consumer2.take 13)).getD (init 2)
-
-#guard ModelCheck.check ⟨afterDispatch2, step⟩ (events 2) violates 7 = .outOfFuel
 
 /-- Mutant: `ExecuteLayerH2d` entered before the layer has landed. The copy
 moves whatever the staging buffer held, and the receive is published as done

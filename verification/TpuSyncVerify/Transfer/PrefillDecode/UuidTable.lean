@@ -957,6 +957,8 @@ def checkEvents : List Ev :=
 def violatesSlotConservation (s : State) : Bool :=
   s.freeSlots + activeStaging s.recvTable != s.cfg.numSlots
 
+-- Bounded only (no theorem states slot conservation): `outOfFuel` here means no
+-- violation within 5 events, not an exhausted state space.
 #guard ModelCheck.check
   (sys { numLayers := 1, numSlots := 2, numUuids := 1 })
   checkEvents violatesSlotConservation 5 = .outOfFuel

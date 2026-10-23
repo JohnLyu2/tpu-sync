@@ -15,8 +15,8 @@ from `init`, `run`/`runFrom` replay an event list, and
 Consequences we rely on:
 
 * a concrete scenario is a theorem about `run` proved by `decide`;
-* a bounded search (`#guard ModelCheck.check … = .outOfFuel`) and the
-  inductive proof talk about the same system;
+* a bounded search (`#guard ModelCheck.check … = .safe`, or a mutant's
+  `.counterexample`) and the inductive proof talk about the same system;
 * a mutant is `⟨init, fun s e => match e with | .x => mutated s | e => step s e⟩`.
 
 Events carry their outcome (`h2dDone (ok : Bool)`, `acquireReply ok`) rather
@@ -127,14 +127,16 @@ Every module ends with evidence that the proof is not vacuous:
 
 * traces that reach the interesting states (publication, a deadline during
   a copy, the race a re-check closes) and traces that are refused;
-* a bounded search for `violates` from the initial state, expected
-  `.outOfFuel` for an infinite-fuel-needed system or `.safe` when the state
-  space is finite and exhausted — only `.safe` is a verification result;
+* where the state space is finite, an exhaustive search for `violates`
+  (`#guard … = .safe`). A depth-bounded search that ends in `.outOfFuel` is
+  not a verification result and is kept only where no theorem covers the
+  property (then the `#guard` carries a `-- Bounded only` comment saying so);
+  it is never placed beside a proved `reachable_safe` for the same system;
 * at least one mutant per load-bearing guard, shown to produce a
   counterexample.
 
-`decide` on traces of ~20 events is instant; BFS at fuel 10 on the pipeline
-is a few seconds. Keep `#guard`s under ~5 s (one documented exception in `PipelineChecks.lean`, ~7 s) so `lake build` stays quick.
+`decide` on traces of ~20 events is instant; a mutant BFS at fuel 6–8 is
+under a second. Keep `#guard`s under ~5 s so `lake build` stays quick.
 
 ## Naming
 

@@ -1300,6 +1300,9 @@ def stepHardened (c : Cfg) (s : S) : Ev → Option S
 def searchHardened (c : Cfg) (fuel : Nat) : ModelCheck.Result Ev :=
   ModelCheck.check ⟨init c, stepHardened c⟩ (events c) (violates c) fuel
 
+-- Bounded only: with dishonest senders the state space is unbounded (still
+-- `outOfFuel` at fuel 40), so these say "no violation within 12 events", which
+-- is the only evidence for the hardening; the honest configs are proved above.
 #guard searchHardened (cfgChunk 2 1 1 false) 12 = .outOfFuel
 #guard searchHardened (cfgChunk 2 1 2 false) 12 = .outOfFuel
 #guard searchHardened (cfgDeclared 2 1 1 false) 12 = .outOfFuel

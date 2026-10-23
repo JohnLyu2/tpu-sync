@@ -2535,8 +2535,6 @@ def checkSafe (s : Pipeline) : Bool :=
 
 def violates (s : Pipeline) : Bool := !checkSafe s
 
-#guard ModelCheck.check (sys [0, 1] [1, 1]) (allEvents 2) violates 3 = .outOfFuel
-#guard ModelCheck.check (sysUnarmed [0, 1] [1, 2]) (allEvents 2) violates 3 = .outOfFuel
 
 /-! ## Mutants (`docs/transfer/reshard.md`)
 

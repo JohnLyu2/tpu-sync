@@ -1499,8 +1499,6 @@ def violates (pol : UnregisterPolicy) (s : Send) : Bool :=
   (s.published == some true && !(s.remainingPushes == 0 && allPushed s.pools)) ||
   (0 < s.life.inFlight && !(drainEvents s.pools.length).any fun e => (step pol s e).isSome)
 
-#guard ModelCheck.check (sys [2, 1] .shipping) (events 2) (violates .shipping) 8 = .outOfFuel
-#guard ModelCheck.check (sys [2, 1] .onSettle) (events 2) (violates .onSettle) 8 = .outOfFuel
 
 /-- Mutant 1 (`initOvercountedSlots`, cf. `ReshardSendSession::Create`):
 initializing `remaining_pool_peer_pushes_` to `pools.size() * total_peers` (4

@@ -1437,7 +1437,6 @@ def checkEvents : List RegEv :=
 def violatesHoldLeases (s : RegState) : Bool :=
   !ActiveSessionsHoldLeases s || (s.arena.totalSlots != s.arena.numSlots)
 
-#guard ModelCheck.check (RegState.sys .reserveBeforeLease 2) checkEvents violatesHoldLeases 8 = .outOfFuel
 #guard (match ModelCheck.check (RegState.sys .leaseBeforeReserve 2) checkEvents violatesHoldLeases 8 with
   | .counterexample _ => true | _ => false)
 
