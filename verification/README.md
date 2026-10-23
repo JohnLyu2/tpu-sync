@@ -20,7 +20,7 @@ This directory refers to findings by number only.
 ## Status & What's Covered
 
 The formal models (`TpuSyncVerify/`) and design docs (`docs/`) are pinned to
-tpu-sync baseline commit **`2ed6f8f`** (upstream `main` merged 2026-10-22).
+tpu-sync baseline commit **`c15ead5`** (upstream `main` merged 2026-10-23).
 Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest `Suite.TestName`s; exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables generated and
