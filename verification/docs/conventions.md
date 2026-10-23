@@ -116,11 +116,13 @@ the proofs.
      line-offset shift, body identical), `modified` (body changed between the
      two commits — inspect the Lean model), or `FAIL` (anchor renamed/removed),
      and `docs/upstream_rechecks.md` logs what changed.
-3. **Findings are frozen at confirmation (`findings/`).** In `findings/README.md`
-   and `findings/filed_bugs.md`, each finding's body (`## Fn.`) is an immutable
+3. **Findings are frozen at confirmation.** The bug-hunt reports live outside
+   `verification/`, in the fork's `findings/README.md` and
+   `findings/filed_bugs.md`; each finding's body (`## Fn.`) is an immutable
    historical record pinned to the commit where the finding was confirmed or
-   fixed; only the `Summary` table and `History` section in `findings/README.md`
-   are updated when upstream lands a fix.
+   fixed, and only that README's `Summary` table and `History` section are
+   updated when upstream lands a fix. Documents here cite findings by number
+   (F1–F10, C1, R-A/R-B) and never link into `findings/`.
 
 ## Assumptions
 

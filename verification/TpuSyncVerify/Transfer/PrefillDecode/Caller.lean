@@ -13,7 +13,8 @@ request's HBM any more (`PrefillHbmSafe`, `DecodeHbmSafe`), and it *assumes*
 models the other direction of the same contract — what the engine must do
 *with* a publication — for the production caller of the prefill-to-decode
 path: vLLM's scheduler driving `tpu-sync` through tpu-inference's
-`TPUConnector`. Finding **C1** (`findings/README.md`) is the trace where a
+`TPUConnector`. Finding **C1** (bug-hunt report in the fork's `findings/`,
+see `verification/README.md`) is the trace where a
 publication never becomes a free.
 
 Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py` at

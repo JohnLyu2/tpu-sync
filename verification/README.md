@@ -2,16 +2,20 @@
 
 TPU Sync moves KV-cache blocks across TPU HBM, host DRAM staging pools, and
 network peers using asynchronous callbacks and lock-scoped state machines. This
-directory contains two components:
+directory contains the **Lean 4 formalization (`TpuSyncVerify/`)**: models of
+the C++ session state machines, staging allocators, and multi-node transfer
+pipelines, with proofs of end-to-end data correctness, HBM and host-staging
+memory safety, lifecycle termination, and cross-peer fault isolation; the
+code-to-model reference docs (`docs/`); and the tools that keep the citations
+honest (`tools/`). It is self-contained: everything it refers to is either in
+this directory or in `tpu_sync/`.
 
-1. **Lean 4 Formalization (`TpuSyncVerify/`):** Models the C++ session state
-   machines, staging allocators, and multi-node transfer pipelines in Lean 4.
-   The suite proves end-to-end data correctness, HBM and host-staging memory
-   safety, lifecycle termination, and cross-peer fault isolation.
-2. **Formal-Backed Code-Reasoning Agent (`agents/tpu-sync-lean-helper/`):** Uses
-   the Lean models to explain concurrency and lifecycle behavior and to check
-   proposed C++ changes against the proved theorems and executable model checker
-   ([`tools/run_lean.sh`](tools/run_lean.sh)).
+The bug-hunt reports the models produced (findings **F1–F10**, **C1**,
+**R-A/R-B**, with their C++ reproducers and candidate patches), the Typst
+slides, and the `tpu-sync-lean-helper` code-reasoning agent that answers
+questions against these models live outside this directory, at the root of
+the fork repository (`findings/`, `slides/`, `agents/` in github.com/JohnLyu2/tpu-sync).
+This directory refers to findings by number only.
 
 ## Status & What's Covered
 
@@ -21,12 +25,11 @@ Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest `Suite.TestName`s; exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables generated and
 verified from the C++ source tree by
-[`tools/resolve_anchors.py`](tools/resolve_anchors.py). Individual bug-hunt
-reports in [`findings/README.md`](findings/README.md) (`## Fn.`) and
-[`findings/filed_bugs.md`](findings/filed_bugs.md) are frozen at the commit
-where each finding was confirmed. The two external callers that `Caller.lean`
-and finding C1 cite are pinned separately, to the pair `examples/*_disagg/setup.sh`
-installs: tpu-inference `7ed46a6`, vLLM `6185d73`.
+[`tools/resolve_anchors.py`](tools/resolve_anchors.py). The two external
+callers that `Caller.lean` and finding C1 cite are pinned separately, to the
+pair `examples/*_disagg/setup.sh` installs: tpu-inference `7ed46a6`, vLLM
+`6185d73`. (The bug-hunt reports themselves are frozen at the commit where each
+finding was confirmed; see the fork's `findings/README.md`.)
 
 | Subsystem | What Is Modeled & Proved | Lean Models | Design & Proof Doc |
 |---|---|---|---|
@@ -46,15 +49,9 @@ installs: tpu-inference `7ed46a6`, vLLM `6185d73`.
   [`TpuSyncVerify.lean`](TpuSyncVerify.lean), with shared transition-system and
   bounded model-checking infrastructure in
   [`TpuSyncVerify/Common/`](TpuSyncVerify/Common/).
-- **Code-reasoning agent (`agents/tpu-sync-lean-helper/`):** Agent definition
-  ([`agent.json`](agents/tpu-sync-lean-helper/agent.json),
-  [`config.yaml`](agents/tpu-sync-lean-helper/config.yaml)) and ad hoc Lean
-  counterfactual runner ([`tools/run_lean.sh`](tools/run_lean.sh)).
-- **Bug-hunt findings & reproducers (`findings/`):** Defects, observations, C++
-  reproducer tests, and patches uncovered during formal modeling — see
-  [findings/README.md](findings/README.md).
-- **Presentation (`slides/`):** Typst slide deck
-  ([`slides/prefill_decode.typ`](slides/prefill_decode.typ)).
+- **Tools (`tools/`):** [`resolve_anchors.py`](tools/resolve_anchors.py)
+  (source-map resolution and drift check) and the ad hoc Lean counterfactual
+  runner [`run_lean.sh`](tools/run_lean.sh) used by the code-reasoning agent.
 
 ## Building & Verifying
 

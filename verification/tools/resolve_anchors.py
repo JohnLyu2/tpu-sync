@@ -543,9 +543,7 @@ class FileLoader:
             return ALIASES[tok]
         if tok.startswith(("tpu_sync/", "verification/")):
             return tok
-        if tok.startswith("findings/"):
-            return os.path.join("verification", tok)
-        for sub in ("tpu_sync", "verification/findings"):
+        for sub in ("tpu_sync",):
             for root, _, files in os.walk(os.path.join(self.repo, sub)):
                 if tok in files:
                     return os.path.relpath(os.path.join(root, tok), self.repo)

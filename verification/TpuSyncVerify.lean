@@ -45,8 +45,8 @@ subsystem of `tpu_sync/` they describe:
   path (`Receive`, `Send`, `Pipeline`, `Coverage`, `PoolStaging`, `Registry`,
   `Coordinator`) of `docs/transfer/reshard.md`.
 * `Controller` — `RaidenController` (`tpu_sync/core/controller`).
-  `Controller.ReadRemote` is the exhaustive check behind finding F2 in
-  `findings/`.
+  `Controller.ReadRemote` is the exhaustive check behind finding F2 (bug-hunt
+  reports live in the fork, see `README.md`).
 
 Every module states which tpu-sync commit its citations were checked against.
 -/

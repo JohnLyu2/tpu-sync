@@ -203,7 +203,7 @@ Both shapes are confirmed by unit tests (`RAIDEN_REMOTE_READ_DEADLINE_S=1`): sha
 - For shape B, mirror `WriteRemote`: let the deadline mark the read failed, but defer `Settle` (and therefore the caller's block reuse) until the in-flight transfer's `OnReady` fires — at the cost that a hung pull holds the caller — or add real cancellation of the in-flight transfer.
 - Make `lease_id` `std::atomic<uint64_t>` (or guard it with `mu`).
 
-Reproducers: `BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` (A) and `BugHuntTest.ReadRemoteSettlesDeadlineWhilePullStillInFlight` (B) in [`raiden_controller_bughunt_test.cc`](raiden_controller_bughunt_test.cc); model `TpuSyncVerify/Controller/ReadRemote.lean`; naive fix in [`candidate_fixes.patch`](candidate_fixes.patch).
+Reproducers: `BugHuntTest.ReadRemoteDoesNotStartPullAfterDeadlineSettled` (A) and `BugHuntTest.ReadRemoteSettlesDeadlineWhilePullStillInFlight` (B) in [`raiden_controller_bughunt_test.cc`](raiden_controller_bughunt_test.cc); model `verification/TpuSyncVerify/Controller/ReadRemote.lean`; naive fix in [`candidate_fixes.patch`](candidate_fixes.patch).
 
 
 ---
