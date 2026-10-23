@@ -1,9 +1,14 @@
 {
   "_comment": [
-    "Recorded on physical TPU v5e-8 (2x4 mesh, 8 chips), --iters=1000.",
+    "Recorded on the GitHub Actions runner the gate runs on",
+    "(linux-x86-ct5lp-224-8tpu, TPU v5e-8, 2x4) with --record --iters=500.",
     "",
-    "Re-record with:  bazel run //tpu_sync/benchmarks:h2d_d2h_benchmark_gating --",
-    "                   --record --framework=torch --iters=<large>",
+    "Floors only hold on the machine they were recorded on, so record them there",
+    "and nowhere else: dispatch the Record H2D/D2H Baselines workflow",
+    "(h2d_d2h_record_torch workload) and copy the JSON it prints over this file.",
+    "Numbers from a Cloud TPU VM, Borg or another cluster don't apply here: a Cloud",
+    "TPU v5e-8 VM measured ~6% faster than this runner, enough to fail every run.",
+    "",
     "Use a large --iters when recording: the floor depends on a MAD estimate, which",
     "needs many samples to be stable. At --iters=20 these same floors came out up to",
     "30% different run to run. Record mode rewrites this file in place and preserves",
@@ -32,9 +37,10 @@
     "            than a plain stddev because it is outlier-resistant: one slow sample",
     "            cannot drag the floor down and quietly weaken the gate.",
     "",
-    "            These floors sit ~1-1.3% below their baselines because physical v5e-8",
-    "            hardware provides stable, low-variance PCIe saturation: one robust sigma",
-    "            is ~0.3-0.4% of the median."
+    "            These floors sit 5-12% below their baselines: the runner's run-to-run",
+    "            spread is wider than a dedicated VM's (one robust sigma is ~1.5-3.4% of",
+    "            the median), so on it the gate catches large bandwidth regressions,",
+    "            not 1-2% ones."
   ],
   "sigma_k": 3.5,
   "iters": 20,
@@ -51,10 +57,10 @@
         128
       ],
       "shard_axis": 2,
-      "baseline_d2h": 903.9,
-      "baseline_h2d": 854.2,
-      "floor_d2h": 894.8,
-      "floor_h2d": 843.3
+      "baseline_d2h": 854.0,
+      "baseline_h2d": 789.1,
+      "floor_d2h": 776.3,
+      "floor_h2d": 723.5
     },
     {
       "dtype": "float32",
@@ -66,10 +72,10 @@
         128
       ],
       "shard_axis": 2,
-      "baseline_d2h": 898.8,
-      "baseline_h2d": 853.6,
-      "floor_d2h": 887.2,
-      "floor_h2d": 843.7
+      "baseline_d2h": 856.5,
+      "baseline_h2d": 780.7,
+      "floor_d2h": 811.9,
+      "floor_h2d": 688.5
     }
   ]
 }
