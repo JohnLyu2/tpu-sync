@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/transport/lib/peregrine_transport_adapter.h"
+#include "tpu_sync/transport/lib/adapter/peregrine_transport_adapter.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -36,7 +35,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
+#include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {

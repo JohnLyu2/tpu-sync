@@ -31,22 +31,40 @@ cc_library(
 )
 
 cc_library(
-    name = "transport_adapter",
-    hdrs = ["transport_adapter.h"],
+    name = "chunk_serializer",
+    srcs = ["chunk_serializer.cc"],
+    hdrs = ["chunk_serializer.h"],
     deps = [
-        "@com_google_absl//absl/functional:any_invocable",
+        ":chunk",
+        ":chunk_cc_fbs",
+        "@com_github_google_flatbuffers//:flatbuffers",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:transport_metrics",
-        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_test(
+    name = "chunk_serializer_test",
+    srcs = ["chunk_serializer_test.cc"],
+    deps = [
+        ":chunk",
+        ":chunk_serializer",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
 cc_library(
     name = "transport_metrics_exporter",
-    srcs = ["transport_metrics_exporter.cc"],
-    hdrs = ["transport_metrics_exporter.h"],
+    srcs = ["metrics/transport_metrics_exporter.cc"],
+    hdrs = ["metrics/transport_metrics_exporter.h"],
     deps = [
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
@@ -57,7 +75,7 @@ cc_library(
 
 cc_test(
     name = "transport_metrics_exporter_test",
-    srcs = ["transport_metrics_exporter_test.cc"],
+    srcs = ["metrics/transport_metrics_exporter_test.cc"],
     deps = [
         ":transport_metrics_exporter",
         "//tpu_sync/telemetry:metrics_backend",
@@ -69,9 +87,22 @@ cc_test(
 )
 
 cc_library(
+    name = "transport_adapter",
+    hdrs = ["adapter/transport_adapter.h"],
+    deps = [
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:transport_metrics",
+        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_library(
     name = "peregrine_transport_adapter",
-    srcs = ["peregrine_transport_adapter.cc"],
-    hdrs = ["peregrine_transport_adapter.h"],
+    srcs = ["adapter/peregrine_transport_adapter.cc"],
+    hdrs = ["adapter/peregrine_transport_adapter.h"],
     deps = [
         ":transport_adapter",
         "@com_google_absl//absl/memory",
@@ -89,7 +120,7 @@ cc_library(
 
 cc_test(
     name = "peregrine_transport_adapter_test",
-    srcs = ["peregrine_transport_adapter_test.cc"],
+    srcs = ["adapter/peregrine_transport_adapter_test.cc"],
     deps = [
         ":peregrine_transport_adapter",
         ":transport_adapter",
@@ -107,8 +138,8 @@ cc_test(
 
 cc_library(
     name = "socket_transport_adapter",
-    srcs = ["socket_transport_adapter.cc"],
-    hdrs = ["socket_transport_adapter.h"],
+    srcs = ["adapter/socket_transport_adapter.cc"],
+    hdrs = ["adapter/socket_transport_adapter.h"],
     copts = [
         "-fno-strict-aliasing",
         "-fexceptions",
@@ -144,7 +175,7 @@ cc_library(
 
 cc_test(
     name = "socket_transport_adapter_test",
-    srcs = ["socket_transport_adapter_test.cc"],
+    srcs = ["adapter/socket_transport_adapter_test.cc"],
     copts = [
         "-fno-strict-aliasing",
         "-fexceptions",
@@ -186,37 +217,6 @@ cc_library(
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings:string_view",
-    ],
-)
-
-cc_library(
-    name = "chunk_serializer",
-    srcs = ["chunk_serializer.cc"],
-    hdrs = ["chunk_serializer.h"],
-    deps = [
-        ":chunk",
-        ":chunk_cc_fbs",
-        "@com_github_google_flatbuffers//:flatbuffers",
-        "@com_google_absl//absl/container:inlined_vector",
-        "@com_google_absl//absl/log:check",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/types:span",
-    ],
-)
-
-cc_test(
-    name = "chunk_serializer_test",
-    srcs = ["chunk_serializer_test.cc"],
-    deps = [
-        ":chunk",
-        ":chunk_serializer",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:status_matchers",
-        "@com_google_absl//absl/types:span",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -296,6 +296,7 @@ cc_test(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:status_matchers",

@@ -43,6 +43,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
+#include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
@@ -117,10 +118,9 @@ bool AllZero(absl::Span<const uint8_t> data) {
 }
 
 void RandomNonZero(absl::Span<uint8_t> data) {
-  thread_local std::mt19937 gen(std::random_device{}());
-  std::uniform_int_distribution<int> dist(1, 255);
+  thread_local absl::BitGen bitgen;
   for (uint8_t& b : data) {
-    b = static_cast<uint8_t>(dist(gen));
+    b = absl::Uniform<uint8_t>(absl::IntervalClosedClosed, bitgen, 0x01, 0xff);
   }
 }
 

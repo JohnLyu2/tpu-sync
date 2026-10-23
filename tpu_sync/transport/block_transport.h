@@ -37,12 +37,12 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/adapter/socket_transport_adapter.h"
+#include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
+#include "tpu_sync/transport/lib/metrics/transport_metrics_exporter.h"
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/socket_transport_adapter.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
-#include "tpu_sync/transport/lib/transport_metrics_exporter.h"
 
 namespace tpu_raiden {
 namespace transport {

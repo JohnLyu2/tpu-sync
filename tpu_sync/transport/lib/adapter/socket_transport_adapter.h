@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_SOCKET_TRANSPORT_ADAPTER_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_SOCKET_TRANSPORT_ADAPTER_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_ADAPTER_SOCKET_TRANSPORT_ADAPTER_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_ADAPTER_SOCKET_TRANSPORT_ADAPTER_H_
 
 #include <atomic>
 #include <cstddef>
@@ -32,8 +32,8 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -169,4 +169,4 @@ class SocketTransportAdapter : public TransportAdapter {
 }  // namespace transport
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_SOCKET_TRANSPORT_ADAPTER_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_ADAPTER_SOCKET_TRANSPORT_ADAPTER_H_
