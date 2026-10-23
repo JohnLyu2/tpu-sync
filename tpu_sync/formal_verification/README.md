@@ -3,16 +3,40 @@
 TPU Sync is a KV-cache orchestration, host-memory offload and cross-node
 transfer library for TPUs. Its data paths run on asynchronous callbacks and
 lock-scoped state machines across TPU HBM, host DRAM staging pools, and network
-peers.
+peers. This directory holds Lean 4 models of those data paths and
+machine-checked proofs about them.
 
-This directory models those paths in Lean 4. It contains the **formalization
-(`TpuSyncVerify/`)**: models of the C++ session state machines, staging
-allocators, and multi-node transfer pipelines, with proofs of end-to-end data
-correctness, HBM and host-staging memory safety, lifecycle termination, and
-cross-peer fault isolation; the code-to-model reference docs (`docs/`); and the
-tooling that resolves and checks the source maps (`tools/`).
+## What is modelled
 
-## Status & What's Covered
+| Subsystem | What Is Modeled & Proved | Lean Models | Design & Proof Doc |
+|---|---|---|---|
+| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, cross-peer fault isolation, and the transport's receiver-side stream accounting | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
+| **Engine Caller Contract** | The engine above `poll_stats()` — vLLM's scheduler through tpu-inference's connector — and what it must do with a publication: the other direction of the HBM-lifetime contract the transfer models assume | [`TpuSyncVerify/Transfer/PrefillDecode/Caller.lean`](TpuSyncVerify/Transfer/PrefillDecode/Caller.lean) | [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries |
+| **Pool Resharding** | Multi-pool send/receive sessions, rank-ordered H2D waves, sub-block byte-interval coverage, `PoolStagingStorage` arena leases, block registry, and two-stage coordinator barriers | [`TpuSyncVerify/Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/) | [reshard.md](docs/transfer/reshard.md) |
+| **Controller & Remote Leases** | Remote read lease lifecycle and `NoWriteAfterRelease` safety via exhaustive state-space exploration | [`TpuSyncVerify/Controller/ReadRemote.lean`](TpuSyncVerify/Controller/ReadRemote.lean) | [read_remote.md](docs/controller/read_remote.md) |
+
+## Layout
+
+```text
+TpuSyncVerify.lean            imports every model
+TpuSyncVerify/
+  Common/                     transition-system core, list lemmas, bounded model checker
+  Transfer/Session.lean       settle protocol shared by every transfer session
+  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller
+  Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator
+  Controller/ReadRemote.lean  controller remote-read lease
+docs/
+  conventions.md              how the models are written (one executable step, ghost
+                              fields, replay traces, mutants) and how the C++ is cited
+  transfer/, controller/      per-subsystem C++ <-> Lean docs: states, events,
+                              assumptions, proved theorems
+tools/
+  resolve_anchors.py          resolves and checks the source-map tables
+  run_lean.sh                 evaluates ad hoc Lean snippets against the built models
+lakefile.toml, lake-manifest.json, lean-toolchain
+```
+
+## How the C++ is cited
 
 Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest names (`Suite.TestName`); exact line spans live in per-file
@@ -22,26 +46,6 @@ last resolved at commit **`c15ead5`**;
 them against the working tree. The two external callers that `Caller.lean`
 cites are pinned separately, to the pair `examples/*_disagg/setup.sh`
 installs: tpu-inference `7ed46a6`, vLLM `6185d73`.
-
-| Subsystem | What Is Modeled & Proved | Lean Models | Design & Proof Doc |
-|---|---|---|---|
-| **Prefill-to-Decode Transfer** | Send/receive session settle protocol, multi-request buffer recycling, block gather & DMA coalescing, UUID drain, cross-peer fault isolation, and the transport's receiver-side stream accounting | [`TpuSyncVerify/Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean), [`TpuSyncVerify/Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/) | [prefill_decode.md](docs/transfer/prefill_decode.md) |
-| **Engine Caller Contract** | The engine above `poll_stats()` — vLLM's scheduler through tpu-inference's connector — and what it must do with a publication: the other direction of the HBM-lifetime contract the transfer models assume | [`TpuSyncVerify/Transfer/PrefillDecode/Caller.lean`](TpuSyncVerify/Transfer/PrefillDecode/Caller.lean) | [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries |
-| **Pool Resharding** | Multi-pool send/receive sessions, rank-ordered H2D waves, sub-block byte-interval coverage, `PoolStagingStorage` arena leases, block registry, and two-stage coordinator barriers | [`TpuSyncVerify/Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/) | [reshard.md](docs/transfer/reshard.md) |
-| **Controller & Remote Leases** | Remote read lease lifecycle and `NoWriteAfterRelease` safety via exhaustive state-space exploration | [`TpuSyncVerify/Controller/ReadRemote.lean`](TpuSyncVerify/Controller/ReadRemote.lean) | [read_remote.md](docs/controller/read_remote.md) |
-
-## Where to Look
-
-- [docs/conventions.md](docs/conventions.md) — how the models are written
-  (one executable `step`, ghost fields, replay traces, mutants), the citation
-  format, and the proof conventions.
-- [`TpuSyncVerify.lean`](TpuSyncVerify.lean) imports every model;
-  [`TpuSyncVerify/Common/`](TpuSyncVerify/Common/) holds the shared
-  transition-system and bounded model-checking infrastructure.
-- [`tools/resolve_anchors.py`](tools/resolve_anchors.py) resolves and checks
-  the source-map tables; [`tools/run_lean.sh`](tools/run_lean.sh) evaluates ad
-  hoc Lean snippets (counterfactual mutants, bounded searches) against the
-  built models.
 
 ## Building & Verifying
 
