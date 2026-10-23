@@ -776,7 +776,11 @@ def main():
         rel = os.path.relpath(src, ver_root)
         with open(src, "r", encoding="utf-8") as f:
             has_begin = "<!-- source-map:begin -->" in f.read()
-        if not has_begin and rel in NO_MAP_FILES:
+        # A module split into a directory (`X.lean` umbrella + `X/Part.lean`
+        # files) keeps its source map in the umbrella; the parts carry no map
+        # and are only checked for stray citations.
+        is_part = os.path.isfile(os.path.dirname(src) + ".lean")
+        if not has_begin and (rel in NO_MAP_FILES or is_part):
             if rel not in ("docs/conventions.md", "docs/upstream_rechecks.md"):
                 totals["stray"] += check_stray_citations(src, rel)
             continue
