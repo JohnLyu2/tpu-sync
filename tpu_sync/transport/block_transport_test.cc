@@ -64,8 +64,8 @@
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
+#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 
 namespace tpu_raiden {
 namespace transport {

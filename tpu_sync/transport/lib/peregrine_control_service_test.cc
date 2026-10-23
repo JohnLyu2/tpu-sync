@@ -22,7 +22,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/flags/flag.h"
-#include "grpcpp/channel.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
@@ -32,10 +31,10 @@
 #include "peregrine/src/internal/control/message.pb.h"
 #include "peregrine/src/internal/control/message_internal.pb.h"
 #include "peregrine/src/internal/control/service.grpc.pb.h"
+#include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
+#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
