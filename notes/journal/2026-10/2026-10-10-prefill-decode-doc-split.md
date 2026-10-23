@@ -11,7 +11,7 @@ audit. Restructured (verbatim moves, no rewrites except the `Modules` table):
 | Was in `prefill_decode.md` | Now |
 |---|---|
 | §"Executable trace witnesses (`trace_*`) & bounded searches", §"Test suite correspondence" (the table said 52 tests; the true count by distinct test names in the trace docstrings is 56 = 50 C++ + 6 E2E, as the slides say — corrected in `prefill_decode.md` on the same day) | **Deleted** (first moved to a `prefill_decode_tests.md`, then dropped the same day on the user's "delete what is not helpful" call). Every row duplicated a `trace_*` docstring or a `#guard` line; the nine test attributions and three notes that existed only in the table (`FailedSendWithoutWorkSettlesImmediately`, `FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm`, `ExpiredSendKeepsItsStagingUntilTheCopyEnds`, `SendSessionImplementsTransferSessionInterface`, `FailureCannotOverrideAnEarlierSuccess`, `StatusIsFrozenOnceSessionIsDrainingOrDone`, `ZeroLayerSessionCompletesAndReleasesStagingWithoutHang`, `OutOfOrderLayersSettleAfterEveryH2d`, the `run_all.sh` E2E, the `CompleteH2h` no-witness note, the `MockMetricsBackend` note, the issue-#888 comment range) were folded into the owning docstrings in `Send.lean`, `PipelineChecks.lean`, `PeerIsolation.lean` first. "Is test X modelled" is now `grep -rn X TpuSyncVerify`. |
-| §"C++ observations (non-bugs at `50b0774`)" | `verification/findings/README.md` §"Observations on the prefill-to-decode path (non-bugs at `50b0774`)", before §"Fix validation". |
+| §"C++ observations (non-bugs at `50b0774`)" | `findings/README.md` §"Observations on the prefill-to-decode path (non-bugs at `50b0774`)", before §"Fix validation". |
 | §"Upstream re-checks" | `verification/docs/upstream_rechecks.md` (corpus-wide; README §"Maintenance after an upstream sync" now points there). |
 | §"Modules" (4-column table + composition paragraph, 5.3 KB) | Condensed to a 3-column map (2.5 KB); the long per-module description lives in each module's header docstring. |
 
@@ -45,4 +45,4 @@ name the old section titles; they are dated and were left as written.
 ## Related
 - `verification/docs/transfer/prefill_decode.md`
 - `verification/docs/upstream_rechecks.md`
-- `verification/findings/README.md` §Observations
+- `findings/README.md` §Observations

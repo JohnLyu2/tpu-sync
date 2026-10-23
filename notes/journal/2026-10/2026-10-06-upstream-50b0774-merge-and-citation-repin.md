@@ -74,14 +74,14 @@ inside the poll, +22 after `:1454`; `block_transport.cc` +23…+31 (A4 region
 ## Corrections made while re-pinning (supersedes earlier notes)
 
 [FACT] The F1/F2 reproducers are **not** bazel targets `bughunt_f1_test` /
-`bughunt_f2_test`. They are `verification/findings/kv_cache_store_pin_race_test.cc`
+`bughunt_f2_test`. They are `findings/kv_cache_store_pin_race_test.cc`
 (`KVCacheStorePinRaceTest.EvictAndReinsertBetweenLookupAndPinReturnsStaleHostBlockId`)
-and `verification/findings/raiden_controller_bughunt_test.cc` (`BugHuntTest.
+and `findings/raiden_controller_bughunt_test.cc` (`BugHuntTest.
 ReadRemoteDoesNotStartPullAfterDeadlineSettled`, `…TransferBuffersErrorPathDoesNotLeakAutoStagingBlocks`,
 `…TransferBuffersDispatchesNoWorkerWhenAnyWorkerIsUnmatched`), built as
 `//tpu_sync/kv_cache:kv_cache_store_pin_race_test` and
 `//tpu_sync/core/controller:raiden_controller_bughunt_test` via
-`verification/findings/build_targets.patch`. **F2 shape B has no C++ test** — it
+`findings/build_targets.patch`. **F2 shape B has no C++ test** — it
 is Lean-only (`ReadRemote.shipping_inFlight`). Supersedes the table in
 `bughunt-repro-status-at-01ffa3d.md`. Why misled: the empirical note was
 written from the findings' *descriptions* (shape A/B, F1–F4) and the names were
@@ -102,8 +102,8 @@ nobody opened the file at `:439, 463` (that is `KVCacheStore::Create`).
 — host staging is `StagingBlockAllocator` in `kv_cache_manager_with_transfer.{h,cc}`
 over `tpu_sync/core/host_memory_allocator.{h,cc}`. Both `AGENTS.md` files had
 `tpu_sync/kv_cache/transfer_*` and `tpu_sync/raiden_controller.cc`; fixed today.
-There are no `verification/findings/F1-…md` … `F4-…md` files; the reports are
-sections of `verification/findings/README.md` plus `filed_bugs.md`.
+There are no `findings/F1-…md` … `F4-…md` files; the reports are
+sections of `findings/README.md` plus `filed_bugs.md`.
 
 [FACT] The R-A…R-F labels in `controller-read-remote-and-kv-store-pinning-concurrency-traps.md`
 are the note's own and do **not** match `findings/README.md` §"Refuted or

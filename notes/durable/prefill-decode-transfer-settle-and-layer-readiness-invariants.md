@@ -31,7 +31,7 @@ receive before its last H2D callbacks run. The
 outcome is unaffected (`done` still waits through `in_flight_`); only the
 per-transfer metrics are skipped (`Recv.trace_poll_skips_metrics`). Not
 a bug — do not re-open it as one; the audit is `ReceivePoll.lean` and
-`verification/findings/README.md` §"Observations on the prefill-to-decode path (non-bugs at `50b0774`)".
+`findings/README.md` §"Observations on the prefill-to-decode path (non-bugs at `50b0774`)".
 
 [FACT] Consumer-side staging admission is first-come-first-served with no
 per-peer bound: `StartRead` takes a slot before the handshake and keeps it
@@ -39,8 +39,8 @@ until `Lifecycle.settleLocked` (`FinishLocked` / `EndRecvOpLocked` →
 `ReleaseStagingLocked`), so one producer that accepts and never answers pins the
 pool and every other producer's reads are *rejected* (`failed_recving_`), not
 delayed. Owner-acknowledged (their test is parked as `DISABLED_`); confirmed
-and fixed as F5, canonical `verification/findings/README.md` §F5, patch
-`verification/findings/per_peer_staging_admission.patch`, guarantee
+and fixed as F5, canonical `findings/README.md` §F5, patch
+`findings/per_peer_staging_admission.patch`, guarantee
 `PeerIsolation.reachable_quota_admits_healthy` (cap `c` reserves
 `numSlots − c` slots for other peers; nothing more). Two shortcuts are
 already ruled out, do not re-derive them: allocating staging lazily after the

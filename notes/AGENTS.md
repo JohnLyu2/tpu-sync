@@ -14,7 +14,7 @@ conventions: `../AGENTS.md`.
   every copy made so far went stale within a week.
 - Upstream-sync facts (what changed in cited code, what was re-pinned) go in
   `verification/docs/upstream_rechecks.md` and
-  `verification/findings/README.md` §"History"; the journal records the delta
+  `findings/README.md` §"History"; the journal records the delta
   of understanding, corrections and tooling lessons, with a link.
 - `loose-ends/parked.md` is the only backlog.
 - Version stamps: every note names the tpu-sync commit its claims were read at.
@@ -41,4 +41,4 @@ conventions: `../AGENTS.md`.
   start a new one. Canonical: `verification/docs/conventions.md`.
 - `controller-read-remote-and-kv-store-pinning-concurrency-traps.md` — the four
   confirmed defects and the look-alikes already refuted. Canonical:
-  `verification/findings/README.md`.
+  `findings/README.md`.

@@ -3,9 +3,9 @@
 Session `f92271cf`, continued from 2026-10-06. Code read at tpu-sync `50b0774`;
 upstream `main` checked at `ebcc7af`.
 
-Canonical: `verification/findings/README.md` §F5 (evidence, mechanism, fix,
+Canonical: `findings/README.md` §F5 (evidence, mechanism, fix,
 validation output), `verification/docs/transfer/prefill_decode.md` §3 (knob ↔
-Lean policy) and §Outcome, `verification/findings/per_peer_staging_admission.patch`.
+Lean policy) and §Outcome, `findings/per_peer_staging_admission.patch`.
 Commit `e30ccc2`. This entry holds only what those do not say.
 
 ## Why this was the next upstream contribution

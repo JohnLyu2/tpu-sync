@@ -3,7 +3,7 @@
 Load this when a question starts "what does the engine do when…" on the
 prefill-to-decode path, or before filing C1.
 
-Canonical: `verification/findings/README.md` §C1, §Callers;
+Canonical: `findings/README.md` §C1, §Callers;
 `verification/docs/transfer/prefill_decode.md` §Upper boundary;
 `notes/empirical/prefill-decode-caller-tpu-inference-raiden-connector.md`.
 

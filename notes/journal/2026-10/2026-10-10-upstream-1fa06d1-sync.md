@@ -69,7 +69,7 @@ properties do not depend on shard count).
 
 ## Related
 - `verification/docs/upstream_rechecks.md`
-- `verification/findings/README.md` §F4, §History
+- `findings/README.md` §F4, §History
 - `verification/tools/repin_citations.py`
 - `2026-10-10-prefill-decode-doc-split.md`
 - `../../loose-ends/parked.md` (per-shard refinement entry)

@@ -1,7 +1,7 @@
 # 2026-10-09 — Lean-helper agent: citation re-audit of `prefill_decode.md` and first timing runs
 
 Read at tpu-sync `50b0774`. Canonical facts: `verification/docs/transfer/prefill_decode.md`
-(amended into the unpushed routing-index commit) and `verification/agents/tpu-sync-lean-helper/`.
+(amended into the unpushed routing-index commit) and `agents/tpu-sync-lean-helper/`.
 This entry holds the audit history and interpretation.
 
 [OBS 2026-10-09] Two audit passes of the routing doc against `50b0774` (a first pass by hand,

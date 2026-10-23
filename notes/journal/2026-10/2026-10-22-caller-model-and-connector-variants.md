@@ -7,8 +7,8 @@ for C1, or when a question starts "what must a connector do with a
 Canonical: `verification/TpuSyncVerify/Transfer/PrefillDecode/Caller.lean`
 (module header: scope, event table, B1–B3, properties);
 `verification/docs/transfer/prefill_decode.md` §Modules, §Upper boundary;
-`verification/findings/README.md` §C1 (**Lean** bullet, test re-run);
-`verification/findings/tpu_inference_connector_c1_test.py` §4.
+`findings/README.md` §C1 (**Lean** bullet, test re-run);
+`findings/tpu_inference_connector_c1_test.py` §4.
 
 [OBS 2026-10-22] Scope decision, from the plan the user approved: do not
 model vLLM; model the boundary contract both ways with the connector as the

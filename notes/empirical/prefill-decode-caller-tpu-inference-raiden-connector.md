@@ -1,6 +1,6 @@
 # The prefill-to-decode caller: tpu-inference `tpu_raiden_connector`, and what it does with `poll_stats`
 
-Canonical: `verification/findings/README.md` §C1 and §Callers (third caller
+Canonical: `findings/README.md` §C1 and §Callers (third caller
 paragraph); `verification/docs/transfer/prefill_decode.md` §Upper boundary. This
 note holds where the sources are, what the reading settled, and what not to
 re-investigate.

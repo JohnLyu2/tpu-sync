@@ -1,8 +1,8 @@
 # Controller `ReadRemote` and KV-store pinning: confirmed defects, refuted look-alikes
 
-Canonical: `verification/findings/README.md` (F1–F4 with evidence levels,
+Canonical: `findings/README.md` (F1–F4 with evidence levels,
 reproducers, candidate fixes, §"Refuted or closed", §History),
-`verification/findings/filed_bugs.md`, `verification/docs/controller/read_remote.md`
+`findings/filed_bugs.md`, `verification/docs/controller/read_remote.md`
 and `verification/TpuSyncVerify/Controller/ReadRemote.lean`. This note is what
 to carry into the next audit of `RaidenController`, `KVCacheStore`,
 `HostOffloadBackend` or `KVCacheStoreService`.
@@ -37,18 +37,18 @@ reachable only through the public API (`KVCacheStore::ReadRemote`, bound as
 `read_remote` in the torch/jax modules) — no in-tree production caller — so
 F1/F2/F3 are latent until a client calls it. F4's orphaned-copy half is
 reachable from production `Fetch`/`WriteRemote`
-(`verification/findings/README.md` §F4 Reachability).
+(`findings/README.md` §F4 Reachability).
 
 ## Do not re-investigate
 
-Settled, with evidence, in `verification/findings/README.md` §"Refuted or closed" — use its
+Settled, with evidence, in `findings/README.md` §"Refuted or closed" — use its
 labels: R-A premature `IsReadyToComplete` (transport ordering A4); R-B stale
 same-uuid push (not reachable from vLLM); R-C `RequestBlockRegistry` lifecycle;
 R-D `WriteRemote` landing blocks at the deadline (`DeadlineLoop` defers them);
 R-E local `Load` eviction mid-copy (pinned before `Load`); R-F Fetch-source
 unpin before the pull ends.
 
-Settled in the transfer-path model (`verification/findings/README.md` §"Observations on the prefill-to-decode path" and the `trace_*` docstrings in `Receive.lean` / `ReceivePoll.lean`): an
+Settled in the transfer-path model (`findings/README.md` §"Observations on the prefill-to-decode path" and the `trace_*` docstrings in `Receive.lean` / `ReceivePoll.lean`): an
 `ExecuteLayerH2d` early return leaking an op (`EndRecvOpLocked` runs on that
 path; `Recv.trace_finish_between_locks`); a second `FinishLocked` from
 `CompleteReadWithDetails` / `.pollReady`

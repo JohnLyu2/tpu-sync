@@ -55,5 +55,5 @@ function — then `Publication` would carry `(Bool, Phase)`.
 ## Related
 - `verification/docs/upstream_rechecks.md`
 - `verification/TpuSyncVerify/Transfer/PrefillDecode/Send.lean` (A7, `Phase`)
-- `verification/findings/README.md` §F5, §F6, §History
+- `findings/README.md` §F5, §F6, §History
 - `2026-10-10-upstream-1fa06d1-sync.md`

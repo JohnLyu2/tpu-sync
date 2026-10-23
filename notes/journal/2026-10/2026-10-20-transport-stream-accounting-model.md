@@ -6,7 +6,7 @@ can corrupt a receive.
 
 Canonical: `verification/TpuSyncVerify/Transfer/PrefillDecode/Transport.lean`
 (module header), `verification/docs/transfer/prefill_decode.md` §Boundary
-assumptions and §Counterfactual mutants, `verification/findings/README.md` §R-B
+assumptions and §Counterfactual mutants, `findings/README.md` §R-B
 (sharpened 2026-10-20) and §Observations. Claims below are at `0ac16d1`.
 
 [FACT] `Transport.lean` models the `{uuid, layer}` progress table

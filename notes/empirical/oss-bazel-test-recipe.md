@@ -1,6 +1,6 @@
 # Running tpu-sync's hardware-free C++ tests from the fork (OSS build)
 
-Canonical for *what* the tests show: `verification/findings/README.md`
+Canonical for *what* the tests show: `findings/README.md`
 (§F5 validation, §"Fix validation"). This note is the recipe for getting them
 to build and run at all, which no `verification/` document owns.
 

@@ -16,7 +16,7 @@ recorded in the repo `AGENTS.md` (`../../../AGENTS.md`) and in
 `notes/AGENTS.md` (`../../AGENTS.md`).
 
 [FACT] Three further decisions: durable/empirical notes become thin pointers +
-interpretation (not full copies); `verification/slides/*.pdf` is ignored (the
+interpretation (not full copies); `slides/*.pdf` is ignored (the
 `.typ` sources are tracked); the code map lives in the root `AGENTS.md` only.
 Agent-facing files (`AGENTS.md`, `notes/`) are always committed separately
 from `verification/` so the two can be split later.

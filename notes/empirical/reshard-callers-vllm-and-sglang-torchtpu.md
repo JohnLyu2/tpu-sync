@@ -1,6 +1,6 @@
 # Caller repositories for the reshard control plane, and what they do with it
 
-Canonical: `verification/findings/README.md` §Callers (the per-finding
+Canonical: `findings/README.md` §Callers (the per-finding
 reachability table and the line-pinned description of each caller's retry and
 topology policy). This note holds only where the clones are, what the reading
 settled, and what not to re-investigate.

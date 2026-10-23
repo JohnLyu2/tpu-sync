@@ -7,7 +7,7 @@ assumptions, properties and proofs, replay/search/mutants, naming) and
 working method distilled from using them.
 
 **Verified against:** `verification/` at `09b1650` (14 modules,
-`leanprover/lean4:v4.34.0`).
+`leanprover/lean4:v4.33.0`).
 
 ## Working method
 

@@ -4,7 +4,7 @@ Session `f92271cf`, continued 2026-10-22. Code at tpu-sync `2ed6f8f`
 (32 commits past `0ac16d1`), merge `3d2e822`, re-pin `91d9656`.
 
 Canonical: `verification/docs/upstream_rechecks.md` (2026-10-22 row: what
-changed in cited code, what was done), `verification/findings/README.md`
+changed in cited code, what was done), `findings/README.md`
 §F1, §F7, §History, `verification/TpuSyncVerify/Transfer/Reshard/Receive.lean`
 (`PushEndPolicy` docstring). This entry holds the interpretation.
 
