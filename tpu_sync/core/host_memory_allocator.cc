@@ -20,6 +20,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +29,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 #include "absl/base/nullability.h"
@@ -38,13 +42,37 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
-#include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/core/xla_compat.h"
+#include "xla/pjrt/pjrt_client.h"
 
 namespace tpu_raiden {
 namespace {
 thread_local const xla::PjRtDevice* g_current_device = nullptr;
+
+// DmaMap otherwise faults in large anonymous buffers on the calling thread.
+// Prepare disjoint ranges first; new threads inherit the caller's NUMA policy.
+// This is only a hint: unsupported advice or unavailable workers leave DmaMap
+// responsible for faulting in the remaining pages before returning the buffer.
+void PopulateHostMemory(void* ptr, size_t size) {
+#ifdef MADV_POPULATE_WRITE
+  constexpr size_t kWorkers = 4;
+  if (size < (8UL << 20)) return;
+  const size_t chunk = ((size + kWorkers - 1) / kWorkers + 4095) & ~4095UL;
+  std::array<std::jthread, kWorkers> workers;
+  try {
+    for (size_t i = 0; i < kWorkers; ++i) {
+      const size_t offset = i * chunk;
+      workers[i] = std::jthread([ptr, offset, size, chunk]() {
+        (void)madvise(static_cast<uint8_t*>(ptr) + offset,
+                      std::min(chunk, size - offset), MADV_POPULATE_WRITE);
+      });
+    }
+  } catch (const std::system_error&) {
+    // The jthread destructors join any workers already started.
+  }
+#endif
+}
 
 // Reserves [offset, offset + length) of the segment file, extending it if
 // needed, so /dev/shm exhaustion surfaces here as an error instead of a
@@ -205,6 +233,7 @@ absl::StatusOr<HostBufferAllocation> XlaHostMemoryAllocator::Allocate(
         absl::StrCat("mmap failed for size: ", aligned_size));
   }
 
+  PopulateHostMemory(ptr, aligned_size);
   auto status = raiden::PjRtClientDmaMap(client_, ptr, aligned_size);
   if (!status.ok()) {
     munmap(ptr, aligned_size);

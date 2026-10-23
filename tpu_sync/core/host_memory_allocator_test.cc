@@ -112,20 +112,22 @@ TEST(HostMemoryAllocatorTest, AllocationWithTpuClient) {
   TF_ASSERT_OK_AND_ASSIGN(auto allocator,
                           HostMemoryAllocator::Create(manager->client()));
 
-  // Allocate 4096 bytes
-  TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
-                          allocator->Allocate(4096));
-  EXPECT_NE(alloc.ptr, nullptr);
-  EXPECT_EQ(alloc.size, 4096);
-  EXPECT_NE(alloc.owner, nullptr);
-
-  // Verify 64-byte alignment
-  EXPECT_EQ(reinterpret_cast<uintptr_t>(alloc.ptr) % 64, 0);
-
-  // Write and read back to verify it's usable memory
-  std::memset(alloc.ptr, 0xCD, 4096);
-  for (size_t i = 0; i < 4096; ++i) {
-    EXPECT_EQ(alloc.ptr[i], 0xCD);
+  // Exercise both ordinary allocation and parallel population with an uneven
+  // final range. Every byte must be usable when Allocate returns.
+  for (size_t size : {size_t{4096}, (size_t{8} << 20) + 1}) {
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(size));
+    ASSERT_NE(alloc.ptr, nullptr);
+    EXPECT_EQ(alloc.size, size);
+    ASSERT_NE(alloc.owner, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(alloc.ptr) % 64, 0);
+    for (size_t i = 0; i < size; ++i) {
+      ASSERT_EQ(alloc.ptr[i], 0);
+    }
+    std::memset(alloc.ptr, 0xCD, size);
+    for (size_t i = 0; i < size; ++i) {
+      ASSERT_EQ(alloc.ptr[i], 0xCD);
+    }
   }
 }
 
