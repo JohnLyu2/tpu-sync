@@ -314,7 +314,7 @@ TEST(HostOffloadBackendTest, LookupUnboundedByAvailableSpace) {
   EXPECT_EQ(lookup_res.size(), 2);
 }
 
-TEST(HostOffloadBackendTest, InsertAndLockRollbackOnCapacityExceeded) {
+TEST(HostOffloadBackendTest, InsertAndPinRollbackOnCapacityExceeded) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   std::vector<std::string> hashes = {"h1", "h2", "h3"};
   RaidenId id{"job", "0", "data", 0};
@@ -344,10 +344,8 @@ TEST(HostOffloadBackendTest, InsertAndLockRollbackOnCapacityExceeded) {
   EXPECT_EQ(backend.GetPinCount("h2"), 1);
 }
 
-TEST(HostOffloadBackendTest, InsertAndLockRebindsStaleHbmEntry) {
-  // A save that fails and gives up leaves the entry in HBM pointing at a device
-  // block the caller has since reused. Re-offering the same hash must adopt the
-  // new device block: the recorded one no longer holds this block's bytes.
+TEST(HostOffloadBackendTest, InsertAndPinRebindsStaleHbmEntry) {
+  // Re-inserting an HBM-only hash with kInsertAndPin updates its device block.
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
 
@@ -366,9 +364,9 @@ TEST(HostOffloadBackendTest, InsertAndLockRebindsStaleHbmEntry) {
   EXPECT_EQ(lookup_res[0].second.status, BlockStatus::HBM);
 }
 
-TEST(HostOffloadBackendTest, InsertAndLockKeepsHostResidentEntry) {
-  // The opposite case: a HOST entry holds real bytes, so a re-offer must pin it
-  // in place and leave its host block alone rather than adopt the caller's.
+TEST(HostOffloadBackendTest, InsertAndPinKeepsHostResidentEntry) {
+  // Re-inserting a HOST entry with kInsertAndPin pins it and preserves its
+  // existing host block.
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
 
@@ -1173,8 +1171,7 @@ TEST(HostOffloadBackendWriteRemoteTest, AlreadyPresentIgnoresNonHostBlocks) {
   EXPECT_TRUE(present.empty());
 }
 
-TEST(HostOffloadBackendWriteRemoteTest,
-     InsertAllOrNothingInsertsTheWholeBatch) {
+TEST(HostOffloadBackendWriteRemoteTest, AdmitStrictInsertsTheWholeBatch) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
 
@@ -1190,11 +1187,8 @@ TEST(HostOffloadBackendWriteRemoteTest,
               UnorderedElementsAre(::testing::Key("a"), ::testing::Key("b")));
 }
 
-// The whole point of kAdmitStrict: one duplicate refuses the batch.
-// kBestEffortUpdate would instead rebind the duplicate in place and succeed,
-// which for a remote write orphans the old host block and lets the source
-// free blocks the destination does not have.
-TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
+// kAdmitStrict rejects the entire batch if any hash is already present.
+TEST(HostOffloadBackendWriteRemoteTest, AdmitStrictRefusesADuplicate) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
   backend.Insert({"a"}, {RaidenBlockId(id, 1, BlockStatus::HOST)});
@@ -1203,7 +1197,7 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
                               {RaidenBlockId(id, 2, BlockStatus::HOST),
                                RaidenBlockId(id, 3, BlockStatus::HOST)},
                               InsertOption::kAdmitStrict));
-  // "b" must not have landed: nothing, not almost-everything.
+  // "b" is not inserted when the batch is rejected.
   TF_ASSERT_OK_AND_ASSIGN(
       auto present_b,
       backend.Lookup({"b"}, LookupOptions::HostResidentSubset()));
@@ -1211,9 +1205,8 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
   EXPECT_EQ(backend.GetSize(), 1);
 }
 
-// available_space(), not capacity(): pinned entries cannot be evicted to make
-// room, so a cache full of them has no space no matter how large it is.
-TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRespectsPinnedSpace) {
+// kAdmitStrict rejects the batch when all capacity is pinned.
+TEST(HostOffloadBackendWriteRemoteTest, AdmitStrictRespectsPinnedSpace) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
   ASSERT_TRUE(backend.Insert({"pinned_a", "pinned_b"},

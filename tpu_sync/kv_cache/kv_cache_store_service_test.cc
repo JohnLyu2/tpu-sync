@@ -1506,17 +1506,13 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
                      /*store_server_ip=*/"127.0.0.1");
   auto* backend = store.backend().get();
 
-  // Unpinned, so it can be displaced. Insert also withdraws whatever it
-  // evicts, and this first one evicts nothing.
+  // Insert "demoted" as an unpinned active entry and register it globally.
   ASSERT_TRUE(backend->Insert({"demoted"},
                               {RaidenBlockId(src_id, 10, BlockStatus::HOST)}));
   ABSL_ASSERT_OK(registry->Register({{"demoted", src_id, 10}}));
 
-  // Insert(kInsertAndPin), not Insert(kBestEffortUpdate): it discards what Put
-  // displaces, on purpose -- the displaced entry becomes a candidate that still
-  // holds its host block. So this demotes "demoted" and withdraws nothing,
-  // which is exactly the state the refusal below must not mistake for a dead
-  // entry.
+  // Insert with kInsertAndPin so "demoted" moves to eviction candidates
+  // without being unregistered from the global registry.
   ASSERT_TRUE(backend->Insert({"newcomer"},
                               {RaidenBlockId(src_id, 11, BlockStatus::HOST)},
                               InsertOption::kInsertAndPin));
