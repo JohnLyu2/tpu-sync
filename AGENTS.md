@@ -11,8 +11,8 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 
 ## Project triggers
 
-- "verify lean" / "build proofs" — `cd verification && lake build` (toolchain pinned in `verification/lean-toolchain`).
-- "sync upstream" / "re-pin" — merge upstream into `main` with a merge commit (never squash/rebase), run `python3 verification/tools/repin_citations.py <old> <new> [--apply]`, review `CHECK` lines by hand, update the baseline commit in preambles/docs, run `lake build`, and log in `verification/docs/upstream_rechecks.md` (see `verification/docs/conventions.md`).
+- "verify lean" / "build proofs" — `cd verification && lake build && python3 tools/resolve_anchors.py --check` (toolchain pinned in `verification/lean-toolchain`).
+- "sync upstream" / "re-pin" — merge upstream into `main` with a merge commit (never squash/rebase), run `python3 verification/tools/resolve_anchors.py --diff <old> <new>`, inspect any `MODIFIED` or `FAIL` anchors, run `python3 verification/tools/resolve_anchors.py --apply --check`, update the baseline commit in `verification/README.md` §Status, run `lake build`, and log in `verification/docs/upstream_rechecks.md` (see `verification/docs/conventions.md`).
 
 ## Code map
 
@@ -21,10 +21,10 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 - TCP block transport: `tpu_sync/transport/block_transport.{h,cc}`
 - KV-cache store, host offload, store RPC service/client: `tpu_sync/kv_cache/{kv_cache_store,host_offload_backend,kv_cache_store_service,kv_cache_store_client}.{h,cc}`
 - Raiden controller and remote leases: `tpu_sync/core/controller/raiden_controller.{h,cc}`
-- Lean models `verification/TpuSyncVerify/` (`Common/`, `Transfer/`, `Controller/`); docs `verification/docs/`; bug-hunt reports, reproducers and patches `verification/findings/`; tools `verification/tools/{repin_citations.py,run_lean.sh}`; Lean-backed Q&A and code-reasoning subagent `verification/agents/tpu-sync-lean-helper/`
+- Lean models `verification/TpuSyncVerify/` (`Common/`, `Transfer/`, `Controller/`); docs `verification/docs/`; bug-hunt reports, reproducers and patches `verification/findings/`; tools `verification/tools/{resolve_anchors.py,repin_citations.py,run_lean.sh}`; Lean-backed Q&A and code-reasoning subagent `verification/agents/tpu-sync-lean-helper/`
 
 ## Conventions
 
-- Citation baseline: stated once in `verification/README.md` §Status; every file under `verification/` names the commit it cites. Notes carry their own version stamp.
+- Citation baseline: stated once in `verification/README.md` §Status. Lean modules and `docs/*.md` cite C++ symbols (`Class::Method`), code fragments, and GTest `Suite.TestName`s in prose and keep exact line spans inside `<!-- source-map:begin --> ... <!-- source-map:end -->` tables resolved by `verification/tools/resolve_anchors.py`. Findings (`verification/findings/`) are frozen at their confirmation commit. Notes carry their own version stamp.
 - Fork footprint is additive-only (`AGENTS.md`, `notes/`, `verification/`, plus the fork callout at the top of `README.md`); never edit other upstream files, so syncs stay conflict-free.
 - Commit agent-facing files (`AGENTS.md`, `notes/`) separately from `verification/` changes.

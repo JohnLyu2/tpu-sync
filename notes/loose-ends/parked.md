@@ -38,12 +38,12 @@ Each entry uses the 5-field `better-than-fish` format so any future session can 
 **References:** ../journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md
 
 ## Citation drift check in CI (future-work F3)
-**Status:** parked 2026-10-06
-**Context:** `verification/tools/repin_citations.py OLD NEW` already classifies every `file:line` citation in the Lean modules and `docs/` as same/shift/grown/CHECK against `git diff -U0`. Run as a dry run with OLD = the commit each module says it cites and NEW = HEAD, "no `shift`/`grown`/`CHECK` lines" is the drift check described in `verification/README.md` §"Maintenance after an upstream sync". Known blind spots (wrapped citation lists, bare backticked continuations, per-column unqualified `.h`/`.cc`) are listed in the journal entry.
-**Why parked:** the re-pin itself was the priority; CI on the fork does not exist yet.
-**To resume:** (0) first fix the defect found 2026-10-22 (`../journal/2026-10/2026-10-22-upstream-2ed6f8f-sync-and-repin-tool-defect.md`): a bare `` `:N` `` inherits the file of the nearest earlier explicit cite on the line even across a sentence boundary — restrict inheritance to the same backtick group / parenthesis and emit `CHECK` otherwise, never rewrite inside ``` fences, and treat foreign-pin files (`sched.py`, `scheduler.py`, `conn.py`, `base.py`, `tpu_raiden_connector.py`, `utils.py`, `kvcfg.py`) as external; add the two mechanical post-checks from that entry as `--audit`; (1) make the script read the pinned commit from each module's preamble instead of the command line (regex `tpu-sync \`([0-9a-f]{7})\``); (2) add `--check` returning non-zero on any non-`same`; (3) teach it the two continuation forms; (4) wire `lake build` + `repin_citations.py --check` into a GitHub Actions workflow on `main`.
-**Effort estimate:** ~1 hr
-**References:** ../journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md, `verification/README.md` §"Maintenance after an upstream sync"
+**Status:** partially done 2026-10-23 (`verification/tools/resolve_anchors.py --check`); GitHub Actions workflow still parked (originally parked 2026-10-06)
+**Context:** All 20 Lean modules under `verification/TpuSyncVerify/` and the three subsystem docs (`docs/transfer/prefill_decode.md`, `docs/transfer/reshard.md`, `docs/controller/read_remote.md`) now cite C++ symbols (`Class::Method`), code fragments, and GTest `Suite.TestName`s in prose and keep exact line spans in a single generated `<!-- source-map:begin --> ... <!-- source-map:end -->` table per file (649 anchors total), resolved directly from the C++ source tree by `verification/tools/resolve_anchors.py`. `resolve_anchors.py --check` verifies zero drift, zero unresolvable anchors, and zero stray `file:line` / bare `:N` / `line N` citations in prose (`repin_citations.py` is now retired/legacy).
+**Why parked:** CI on the fork does not exist yet.
+**To resume:** wire `lake build` + `python3 verification/tools/resolve_anchors.py --check` into a GitHub Actions workflow on `main`.
+**Effort estimate:** ~30 min
+**References:** ../journal/2026-10/2026-10-22-upstream-2ed6f8f-sync-and-repin-tool-defect.md, `verification/docs/conventions.md` §"Source citations and upstream sync"
 
 ## Per-peer staging admission follow-ups: wait-at-cap, self-sizing share, constructor/Python knob
 **Status:** parked 2026-10-07
