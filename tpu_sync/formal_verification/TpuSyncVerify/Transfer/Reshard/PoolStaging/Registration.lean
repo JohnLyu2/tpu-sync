@@ -1,6 +1,6 @@
 import TpuSyncVerify.Transfer.Reshard.PoolStaging.ArenaLemmas
 
-/-! # `PoolStaging`: receive registration lifecycle and risk R5
+/-! # `PoolStaging`: receive registration lifecycle (`RegistrationPolicy`)
 
 Part of `TpuSyncVerify.Transfer.Reshard.PoolStaging`. -/
 
@@ -195,7 +195,7 @@ theorem trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot :
 
 /-- Under `RegistrationPolicy.reserveBeforeLease`
 (`PoolStagingRecvRegistrationTest.ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease`),
-the R5 duplicate-UUID race is rejected at step 2 (`.beginArm 2 7 [5]`) because
+the duplicate-UUID race is rejected at step 2 (`.beginArm 2 7 [5]`) because
 `uuid = 7` is already claimed by Call 1. -/
 theorem r5_blocked_by_reserveBeforeLease :
     (RegState.sys .reserveBeforeLease 2).run r5CounterexampleEvents = none := by

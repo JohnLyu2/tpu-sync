@@ -64,7 +64,7 @@ lakefile.toml, lake-manifest.json, lean-toolchain
 Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest names (`Suite.TestName`); exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables. Those spans were
-last resolved at commit **`c15ead5`**;
+last resolved at commit **`c9bc124`**;
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py) `--check` re-verifies
 them against the working tree. The two external callers that `Caller.lean`
 cites are pinned separately, to the pair `examples/*_disagg/setup.sh`

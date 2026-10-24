@@ -20,7 +20,7 @@ launch across same-rank pools, cancellation between the two locks of
 duration metric recording
 (`PoolReshardRecvTest.FinishPoolReshardRecvRecordsDurationMetric` /
 `PoolReshardRecvTest.FinishPoolReshardRecvDoesNotRecordMetricOnFailure`), and
-the R1 comparison between `PushEndPolicy.endOpOnly` and
+the comparison between `PushEndPolicy.endOpOnly` and
 `PushEndPolicy.finishOnError`. -/
 
 /-- Two pools with order ranks `[0, 1]` (FA at rank 0, state class at rank 1 on
@@ -195,7 +195,7 @@ theorem trace_duration_metric_on_success_and_failure :
       some (some false, false, true)) := by
   decide
 
-/-- R1: `hooks.end_incoming_push` on a failed push
+/-- `hooks.end_incoming_push` on a failed push
 (`KVCacheManagerWithTransfer::InitializeBaseHooks`). Under the `.endOpOnly`
 mutant the hook ends the op without finishing the session, leaving
 `draining = false`, `done = false`, `hasStaging = true`, and
@@ -210,7 +210,7 @@ theorem trace_r1_failed_incoming_push :
       (fun r => (r.life.draining, r.life.done, r.life.hasStaging, r.planUnregistered)) =
       some (false, false, true, false) ∧
     (sys [0] .endOpOnly).run [.pushBegin, .pushEnd false, .publish] = none ∧
-    -- Fix (`finishOnError`): `[.pushBegin, .pushEnd false]` settles at once and publishes failure.
+    -- Shipping (`finishOnError`): `[.pushBegin, .pushEnd false]` settles at once and publishes failure.
     ((sys [0] .finishOnError).run [.pushBegin, .pushEnd false, .publish]).map
       (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
       some (true, false, true, some false) := by
