@@ -6,9 +6,9 @@ conventions: `../AGENTS.md`.
 
 ## Project conventions
 
-- Facts live in `tpu_sync/formal_verification/` (docs, findings, Lean docstrings). A `durable/`
+- Facts live in `tpu_sync/formal_verification/` (docs, Lean docstrings) and `findings/`. A `durable/`
   or `empirical/` note is a thin pointer: a `Canonical:` line naming the
-  `tpu_sync/formal_verification/` document that owns the facts, then only what that document
+  `tpu_sync/formal_verification/` or `findings/` document that owns the facts, then only what that document
   does not say — interpretation, "do not re-investigate" guidance, the
   correction trail. Never copy a fact table or a citation list into a note;
   every copy made so far went stale within a week.
@@ -26,9 +26,9 @@ conventions: `../AGENTS.md`.
   (`StagingBlockAllocator` in `tpu_sync/core/staging_arena.*`,
   `journal/2026-10/2026-10-16-upstream-0ac16d1-sync.md`); since 2026-10-22 the
   pin is `2ed6f8f` (`journal/2026-10/2026-10-22-upstream-2ed6f8f-sync-and-repin-tool-defect.md`);
-  from 2026-10-23 (afternoon) it is `c15ead5` (`notes/upstream-rechecks.md`
-  row 2026-10-23: no cited symbol changed; `tpu_sync/transport/lib/` reorganised
-  into `adapter/`, `psp/`, `metrics/`).
+  2026-10-23 (afternoon) is at `c15ead5` (`notes/upstream-rechecks.md`
+  row 2026-10-23); from 2026-10-24 it is `c9bc124` (`notes/upstream-rechecks.md`
+  rows 2026-10-24: `86d4506` adds the Peregrine receive path `OnRecvComplete` / `is_peregrine` in `block_transport.cc`, socket path unchanged).
 - Markers as in the skill: `[FACT]` source-grounded or Lean-proved (`durable/`);
   `[EMP]` reproducible result with a "Verified against" stamp (`empirical/`);
   `[OBS YYYY-MM-DD]` and `[HYP]` (`journal/YYYY-MM/`); `[OPEN]` with a parked

@@ -2,7 +2,7 @@
 
 Canonical for *what* the tests show: `findings/README.md`
 (§F5 validation, §"Fix validation"). This note is the recipe for getting them
-to build and run at all, which no `verification/` document owns.
+to build and run at all, which no `tpu_sync/formal_verification/` document owns.
 
 **Verified against:** tpu-sync `50b0774`, 2026-10-07, six runs in one day
 (cold build, four incremental builds, one unfixed-tree run). Bazel 8.6.0

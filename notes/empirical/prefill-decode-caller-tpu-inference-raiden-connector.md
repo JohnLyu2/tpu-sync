@@ -1,7 +1,7 @@
 # The prefill-to-decode caller: tpu-inference `tpu_raiden_connector`, and what it does with `poll_stats`
 
 Canonical: `findings/README.md` §C1 and §Callers (third caller
-paragraph); `verification/docs/transfer/prefill_decode.md` §Upper boundary. This
+paragraph); `tpu_sync/formal_verification/docs/transfer/prefill_decode.md` §Upper boundary. This
 note holds where the sources are, what the reading settled, and what not to
 re-investigate.
 
@@ -32,9 +32,9 @@ on both nodes, never implements `get_block_ids_with_load_errors`, and its own
 leak their blocks until restart.
 
 [FACT] Since 2026-10-22 the pair is modelled:
-`verification/TpuSyncVerify/Transfer/PrefillDecode/Caller.lean` (the engine
+`tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Caller.lean` (the engine
 above `poll_stats()`; `Contract` is the `base.py:357-393` text as a `Prop` on
-the connector; `contract_safe`; C1 as `trace_c1_*`; leaks absorbing). The
+the connector; `contract_safe`; C1 as `trace_current_connector_*`; leaks absorbing). The
 scheduler transcription it rests on is asserted against the real scheduler by
 §4 of the C1 test file (17/17). What the model does not cover is its B1–B3.
 

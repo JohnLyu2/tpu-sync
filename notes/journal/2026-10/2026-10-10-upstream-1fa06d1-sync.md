@@ -79,7 +79,7 @@ re-pin found no modelling defect and ~40 precision fixes, all applied: one
 wrong suite name (`RecvLifecycleTest.OutOfOrderLayersSettleAfterEveryH2d`),
 three `prefill_decode.md` sub-citations the re-pin had shifted by +22
 (`ReleaseStagingLocked`/`FinishLocked`/`EndRecvOpLocked`), `findings` §F3 not
-re-pinned (+35), a Blaze `//third_party/...` target and a non-existent
+re-pinned (+35), an internal build target and a non-existent
 `tools/run_cc_tests.sh` in `docs/controller/read_remote.md` (removed: public
 repo rule), the **test count: 56 (50 C++ + 6 E2E), not 52** — the old table
 undercounted and the slides had it right — and a set of docstring statements

@@ -1,12 +1,12 @@
 # Lean step models in TpuSyncVerify: how they are built, how to start one
 
-Canonical: `verification/docs/conventions.md` (one executable `step`,
+Canonical: `tpu_sync/formal_verification/docs/conventions.md` (one executable `step`,
 transcribe-don't-paraphrase, ghost fields, module layout, citations,
 assumptions, properties and proofs, replay/search/mutants, naming) and
-`verification/TpuSyncVerify/Common/{System,ModelCheck}.lean`. This note is the
+`tpu_sync/formal_verification/TpuSyncVerify/Common/{System,ModelCheck}.lean`. This note is the
 working method distilled from using them.
 
-**Verified against:** `verification/` at `09b1650` (14 modules,
+**Verified against:** `tpu_sync/formal_verification/` at `09b1650` (14 modules,
 `leanprover/lean4:v4.33.0`).
 
 ## Working method

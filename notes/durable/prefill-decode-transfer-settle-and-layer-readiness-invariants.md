@@ -1,8 +1,8 @@
 # Prefill-to-decode transfer: settle protocol and layer readiness
 
-Canonical: `verification/docs/transfer/prefill_decode.md` (model, properties →
+Canonical: `tpu_sync/formal_verification/docs/transfer/prefill_decode.md` (model, properties →
 theorems, correspondence, observations, upstream re-checks) and the module
-docstrings under `verification/TpuSyncVerify/Transfer/`. The facts and their
+docstrings under `tpu_sync/formal_verification/TpuSyncVerify/Transfer/`. The facts and their
 citations live there; this note is what to keep in mind when touching the code.
 
 **Verified against:** tpu-sync `50b0774` (the canonical doc's baseline).

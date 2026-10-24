@@ -2,8 +2,8 @@
 
 Canonical: `findings/README.md` (F1–F4 with evidence levels,
 reproducers, candidate fixes, §"Refuted or closed", §History),
-`findings/filed_bugs.md`, `verification/docs/controller/read_remote.md`
-and `verification/TpuSyncVerify/Controller/ReadRemote.lean`. This note is what
+`findings/filed_bugs.md`, `tpu_sync/formal_verification/docs/controller/read_remote.md`
+and `tpu_sync/formal_verification/TpuSyncVerify/Controller/ReadRemote.lean`. This note is what
 to carry into the next audit of `RaidenController`, `KVCacheStore`,
 `HostOffloadBackend` or `KVCacheStoreService`.
 

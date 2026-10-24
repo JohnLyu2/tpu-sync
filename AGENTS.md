@@ -3,8 +3,8 @@
 notes at: notes/
 
 Two corpora, one home per fact. `tpu_sync/formal_verification/` is the human-facing deliverable
-(Lean models, docs, findings, tools); `notes/` is the agent research notebook
-kept with the `better-than-fish` skill. Facts live in `tpu_sync/formal_verification/`; notes
+(Lean models, docs, tools), alongside fork-only `findings/`, `agents/`, and `slides/` at the repo root; `notes/` is the agent research notebook
+kept with the `better-than-fish` skill. Facts live in `tpu_sync/formal_verification/` and `findings/`; notes
 point at them and hold only interpretation, corrections, hypotheses and parked
 work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 `notes/sessions.md`, and `notes/loose-ends/parked.md`.
@@ -12,7 +12,7 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 ## Project triggers
 
 - "verify lean" / "build proofs" — `cd tpu_sync/formal_verification && lake build && python3 tools/resolve_anchors.py --check` (toolchain pinned in `tpu_sync/formal_verification/lean-toolchain`).
-- "sync upstream" / "re-pin" — merge upstream into `main` with a merge commit (never squash/rebase), run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff <old> <new>`, inspect any `MODIFIED` or `FAIL` anchors, run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --apply --check`, update the baseline commit in `tpu_sync/formal_verification/README.md` §Status, run `lake build`, and log in `notes/upstream-rechecks.md` (see `tpu_sync/formal_verification/docs/conventions.md`).
+- "sync upstream" / "re-pin" — merge upstream into `main` with a merge commit (never squash/rebase), run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff <old> <new>`, inspect any `MODIFIED` or `FAIL` anchors, run `python3 tpu_sync/formal_verification/tools/resolve_anchors.py --apply --check`, update the baseline commit in `tpu_sync/formal_verification/README.md` §"How the C++ is cited", run `lake build`, and log in `notes/upstream-rechecks.md` (see `tpu_sync/formal_verification/docs/conventions.md`).
 
 ## Code map
 
@@ -25,6 +25,6 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 
 ## Conventions
 
-- Citation baseline: stated once in `tpu_sync/formal_verification/README.md` §Status. Lean modules and `docs/*.md` cite C++ symbols (`Class::Method`), code fragments, and GTest `Suite.TestName`s in prose and keep exact line spans inside `<!-- source-map:begin --> ... <!-- source-map:end -->` tables resolved by `tpu_sync/formal_verification/tools/resolve_anchors.py`. Findings (`findings/`) are frozen at their confirmation commit. Notes carry their own version stamp.
-- Fork footprint is additive-only (`AGENTS.md`, `notes/`, the new directory `tpu_sync/formal_verification/`, `findings/`, `agents/`, `slides/`, plus the fork callout at the top of `README.md`); never edit other upstream files, so syncs stay conflict-free. Nothing under `tpu_sync/formal_verification/` may link into `findings/`, `agents/` or `slides/` (it is copied elsewhere verbatim); cite findings by number.
+- Citation baseline: stated once in `tpu_sync/formal_verification/README.md` §"How the C++ is cited". Lean modules and `docs/*.md` cite C++ symbols (`Class::Method`), code fragments, and GTest `Suite.TestName`s in prose and keep exact line spans inside `<!-- source-map:begin --> ... <!-- source-map:end -->` tables resolved by `tpu_sync/formal_verification/tools/resolve_anchors.py`. Findings (`findings/`) are frozen at their confirmation commit. Notes carry their own version stamp.
+- Fork footprint is additive-only (`AGENTS.md`, `notes/`, the new directory `tpu_sync/formal_verification/`, `findings/`, `agents/`, `slides/`, plus the fork callout at the top of `README.md`); never edit other upstream files, so syncs stay conflict-free. Nothing under `tpu_sync/formal_verification/` may link into or mention `findings/`, `agents/`, `slides/` or this fork (`tpu_sync/formal_verification/docs/conventions.md` §"Describe the code as it is").
 - Commit agent-facing files (`AGENTS.md`, `notes/`) separately from `tpu_sync/formal_verification/` changes.
