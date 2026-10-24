@@ -59,9 +59,9 @@ request `idx`:
 | `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseDynamicBlocks` | `:579-587` |
 | `tpu_sync/kv_cache/transfer_send_session.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:183-186` |
 | `tpu_sync/kv_cache/transfer_receive_session.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:348-350` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:462-509` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:850-954` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:956-1097` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:486-533` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:874-978` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` |
 <!-- source-map:end -->
 -/
 

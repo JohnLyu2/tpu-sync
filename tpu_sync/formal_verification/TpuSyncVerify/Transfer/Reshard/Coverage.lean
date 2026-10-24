@@ -81,10 +81,10 @@ What this module proves:
 | `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:267-349` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
 | `bt.cc` | `BlockTransport::HandleIncomingPush` (`if (expected_size > 0)`) | `:604-608` |
-| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:641-794` |
-| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:1011-1041` |
-| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2643-2686` |
-| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2688-2705` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:691-887` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:1104-1134` |
+| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2655-2698` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2700-2717` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:227-255` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:278-289` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:291-302` |

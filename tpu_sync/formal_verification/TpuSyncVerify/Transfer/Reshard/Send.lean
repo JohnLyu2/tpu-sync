@@ -191,11 +191,11 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:476-481` |
 | `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:668-706` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_pool_reshard_sends_)`) | `:386-390` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:640-677` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:987-1006` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3223-3507` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`) | `:3402-3434` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_pool_reshard_sends_)`) | `:410-414` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:664-701` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1011-1030` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3235-3519` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`) | `:3414-3446` |
 | `utils.h` | `StridedSpanFitsBlock` | `:322-333` |
 | `utils.h` | `StridedSpanFitsRegions` | `:335-349` |
 | `pool_layout.cc` | `RegionCoversOffset` | `:66-87` |

@@ -84,13 +84,13 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:614-666` |
 | `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:668-706` |
 | `bt.cc` | `BlockTransport::HandleIncomingPush` (`if (expected_size > 0)`) | `:604-608` |
-| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:641-794` |
-| `bt.cc` | `BlockTransport::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:685-784` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:691-887` |
+| `bt.cc` | `BlockTransport::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:736-864` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:224-249` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:640-677` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:679-715` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:987-1006` |
-| `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:694-700` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:664-701` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:703-739` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1011-1030` |
+| `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:696-702` |
 | `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:432-543` |
 | `utils.h` | `ValidateCommonPoolReshardPlan` (`if (plan.transfer_pool_indices().empty())` .. `if (group.expected_pushes() <= 0)`) | `:367-377` |
 <!-- source-map:end -->

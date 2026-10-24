@@ -29,9 +29,9 @@ tpu-inference `7ed46a6`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |------|-----------------|-------|
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:956-1097` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();` .. `send_sessions_.erase(it++);`) | `:964-982` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();` .. `active_recv_sessions_.erase(it++);`) | `:1011-1038` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();` .. `send_sessions_.erase(it++);`) | `:988-1006` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();` .. `active_recv_sessions_.erase(it++);`) | `:1035-1062` |
 <!-- source-map:end -->
 
 ## What is modelled
