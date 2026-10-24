@@ -1,7 +1,7 @@
 # Pool-reshard transfer: model and results
 
-Canonical code-to-model reference for the pool-addressed resharding KV-cache
-transfer subsystem under `TpuSyncVerify/Transfer/Reshard/`, sibling to
+The reference map from the pool-addressed resharding KV-cache transfer C++ to
+its Lean models under `TpuSyncVerify/Transfer/Reshard/`, sibling to
 [prefill_decode.md](prefill_decode.md). Line
 spans in the routing index below are resolved from the C++ source tree by
 `python3 tpu_sync/formal_verification/tools/resolve_anchors.py`.
