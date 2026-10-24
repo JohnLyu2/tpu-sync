@@ -638,10 +638,61 @@ absl::Status BlockTransport::HandleIncomingPush(
   return absl::OkStatus();
 }
 
+// ---------------------------------------------------------------------------
+// Peregrine receive path.
+// ---------------------------------------------------------------------------
+absl::Status BlockTransport::OnRecvComplete(
+    const lib::PostMetadata& post,
+    absl::Span<const lib::RequestMetadata> requests) {
+  // Today the sender issues one Post per block array and describes it entirely
+  // in the post metadata; per-request metadata is not interpreted yet.
+  if (!requests.empty()) {
+    return absl::UnimplementedError(
+        "OnRecvComplete does not interpret per-request metadata yet");
+  }
+  const uint64_t uuid = post.uuid;
+  if (post.local_id == 0xFFFF'FFFF) {
+    return absl::InvalidArgumentError(
+        "OnRecvComplete requires an explicit layer/pool index in post "
+        "metadata");
+  }
+  // Shards this Post carried: every shard for a legacy push, one NUMA group's
+  // subset for a push split by source NUMA node.
+  ABSL_ASSIGN_OR_RETURN(
+      const std::vector<int> shards,
+      ShardsFromMask(post.shard_mask, block_delegate_->num_shards()));
+
+  ABSL_ASSIGN_OR_RETURN(
+      IncomingPushSpec push_spec,
+      ResolveIncomingPushSpec(block_delegate_, post.local_id,
+                              /*is_explicit_dst_push=*/true, uuid));
+
+  ABSL_RETURN_IF_ERROR(block_delegate_->BeginIncomingPush(uuid));
+  absl::Status status = CompleteIncomingPush(
+      uuid, post.local_id, post.remote_id, /*num_streams=*/1,
+      post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
+      /*is_peregrine=*/true);
+  if (!status.ok()) {
+    block_delegate_->EndIncomingPush(uuid, status).IgnoreError();
+    return status;
+  }
+  return block_delegate_->EndIncomingPush(uuid);
+}
+
+size_t BlockTransport::AccumulateLandedShards(
+    LayerProgress::SenderStreams& streams, size_t shards, size_t full_shards) {
+  streams.landed_shards += shards == 0 ? full_shards : shards;
+  const size_t pushes = streams.landed_shards / full_shards;
+  streams.landed += pushes;
+  streams.landed_shards %= full_shards;
+  return pushes;
+}
+
 absl::Status BlockTransport::CompleteIncomingPush(
     uint64_t uuid, uint32_t local_id, uint32_t remote_id, size_t num_streams,
     size_t landed_shards,
-    const std::optional<PoolPushProgressSpec>& pool_progress_spec) {
+    const std::optional<PoolPushProgressSpec>& pool_progress_spec,
+    bool is_peregrine) {
   // Unified receive accounting: one progress map and one increment path for
   // both contracts; only the expectation source and the completion callback
   // differ. Plan-declared mode counts every sender's streams against the
@@ -684,6 +735,8 @@ absl::Status BlockTransport::CompleteIncomingPush(
     }
     progress.completed_chunks++;
     bool array_complete = false;
+    const size_t full_shards =
+        std::max<size_t>(1, block_delegate_->num_shards());
     if (plan_declared) {
       // The plan counts pushes that each carry every shard. A sender that
       // split its push by source NUMA node spreads those shards over several
@@ -691,13 +744,8 @@ absl::Status BlockTransport::CompleteIncomingPush(
       // set back into one plan push. The sum reaches the plan's count only
       // once every sender's streams have all landed, so a partial group can
       // never complete the pool early.
-      const size_t full_shards =
-          std::max<size_t>(1, block_delegate_->num_shards());
-      auto& streams = progress.sender_streams[remote_id];
-      streams.landed_shards +=
-          landed_shards == 0 ? full_shards : landed_shards;
-      streams.landed += streams.landed_shards / full_shards;
-      streams.landed_shards %= full_shards;
+      AccumulateLandedShards(progress.sender_streams[remote_id], landed_shards,
+                             full_shards);
       size_t plan_pushes = 0;
       for (const auto& [sender, sender_streams] : progress.sender_streams) {
         plan_pushes += sender_streams.landed;
@@ -708,6 +756,32 @@ absl::Status BlockTransport::CompleteIncomingPush(
                          " pushes for UUID ", uuid));
       }
       array_complete = plan_pushes == expected_chunks;
+    } else if (is_peregrine) {
+      const size_t senders = expected_senders.value_or(1);
+      if (senders == 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "block array ", l, " expected 0 senders for UUID ", uuid));
+      }
+      auto& streams = progress.sender_streams[remote_id];
+      if (progress.sender_streams.size() > senders) {
+        return absl::AlreadyExistsError(
+            absl::StrCat("block array ", l, " received pushes from more than ",
+                         senders, " senders for UUID ", uuid));
+      }
+      const size_t pushes =
+          AccumulateLandedShards(streams, landed_shards, full_shards);
+      if (streams.landed > 1 ||
+          (streams.landed == 1 && streams.landed_shards > 0)) {
+        return absl::AlreadyExistsError(
+            absl::StrCat("block array ", l,
+                         " received more than one push from "
+                         "sender ",
+                         remote_id, " for UUID ", uuid));
+      }
+      if (pushes > 0 && streams.landed == pushes) {
+        ++progress.senders_complete;
+      }
+      array_complete = progress.senders_complete >= senders;
     } else if (expected_senders.has_value()) {
       auto& streams = progress.sender_streams[remote_id];
       if (streams.landed == 0) {
@@ -781,13 +855,32 @@ absl::Status BlockTransport::CompleteIncomingPush(
     }
   }
 
+  // Telemetry-only hook: a failure must not block layer completion below.
+  if (is_peregrine && !plan_declared) {
+    if (absl::Status s = block_delegate_->OnRecvProgress(uuid); !s.ok()) {
+      LOG(WARNING) << "OnRecvProgress failed for uuid " << uuid << ": " << s;
+    }
+  }
   if (trigger_completion) {
     ABSL_RETURN_IF_ERROR(
         FaultInjectStatus(hooks::kBlockTransportRecvLayerDone));
     if (plan_declared) {
       ABSL_RETURN_IF_ERROR(block_delegate_->OnPoolReceived(l, uuid));
     } else {
-      ABSL_RETURN_IF_ERROR(block_delegate_->OnLayerReceived(l, uuid));
+      absl::Status layer_status = block_delegate_->OnLayerReceived(l, uuid);
+      bool all_layers_dispatched = false;
+      if (is_peregrine) {
+        absl::MutexLock lock(progress_mu_);
+        size_t& dispatched = layers_dispatched_[uuid];
+        if (++dispatched >= block_delegate_->num_layers()) {
+          layers_dispatched_.erase(uuid);
+          all_layers_dispatched = true;
+        }
+      }
+      ABSL_RETURN_IF_ERROR(layer_status);
+      if (all_layers_dispatched) {
+        ABSL_RETURN_IF_ERROR(block_delegate_->OnRecvNetworkComplete(uuid));
+      }
     }
   }
   return absl::OkStatus();
@@ -1440,6 +1533,7 @@ void BlockTransport::ForgetPushProgress(uint64_t uuid) {
       ++it;
     }
   }
+  layers_dispatched_.erase(uuid);
 }
 
 absl::Status BlockTransport::PushBuffer(absl::string_view peer,
