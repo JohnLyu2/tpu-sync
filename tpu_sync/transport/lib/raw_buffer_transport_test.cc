@@ -58,7 +58,6 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
-#include "peregrine/src/api/v1/conn_pool.h"
 #include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -77,7 +76,6 @@ namespace tpu_raiden::transport::lib {
 namespace {
 
 using ::peregrine::v1::ConnectToPeer;
-using ::peregrine::v1::ConnPool;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::WriteExact;
 
@@ -322,8 +320,6 @@ class RawBufferTransportTest : public ::testing::TestWithParam<bool> {
   };
   std::vector<ServerEntry> servers_;
 };
-
-using ConnPoolTest = RawBufferTransportTest;
 
 TEST_P(RawBufferTransportTest, PullBufferCorrectness) {
   // Set up src/dst buffers.
@@ -637,108 +633,6 @@ TEST_P(RawBufferTransportTest, RejectsWrappingAndOutOfBoundsPushAndPull) {
       /*dst_offset_bytes=*/wrap_offset, /*size_bytes=*/kWrapSize);
   EXPECT_FALSE(pull_res.ok());
   EXPECT_THAT(pull_res.message(), ::testing::HasSubstr("out of bounds"));
-}
-
-TEST_P(ConnPoolTest, MultiIpPoolingIsolation) {
-  // Set up src/dst buffers.
-  RawMockDelegate src(1024);
-
-  // Create a transport to serve as the peer.
-  RawBufferTransport listener(&src, 0);
-  auto channel = StartControlServer(&listener);
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-  // Create a ConnPool.
-  ConnPool pool;
-  const std::string addr = GetIpPort(listener);
-  const bool require_psp = absl::GetFlag(FLAGS_require_psp_tcp);
-
-  // 1. Borrow connection with local_ip = "127.0.0.1"
-  const auto fd1_or = pool.Borrow(addr, "127.0.0.1", require_psp, channel);
-  ASSERT_OK(fd1_or) << fd1_or.status().message();
-  const int fd1 = fd1_or.value();
-
-  // Return it. It should be pooled under "127.0.0.1->peer1".
-  pool.Return(/*ok=*/true, fd1, addr, "127.0.0.1");
-
-  // 2. Borrow connection with local_ip = "127.0.0.2"
-  // This should NOT reuse fd1 because it's a different local IP.
-  const auto fd2_or = pool.Borrow(addr, "127.0.0.2", require_psp, channel);
-  ASSERT_OK(fd2_or) << fd2_or.status().message();
-  const int fd2 = fd2_or.value();
-  EXPECT_NE(fd1, fd2);
-
-  // Return it. It should be pooled under "127.0.0.2->peer1".
-  pool.Return(/*ok=*/true, fd2, addr, "127.0.0.2");
-
-  // 3. Borrow connection with local_ip = "127.0.0.1" again.
-  // This SHOULD reuse fd1.
-  const auto fd3_or = pool.Borrow(addr, "127.0.0.1", require_psp, channel);
-  ASSERT_OK(fd3_or) << fd3_or.status().message();
-  const int fd3 = fd3_or.value();
-  EXPECT_EQ(fd1, fd3);
-  pool.Return(/*ok=*/true, fd3, addr, "127.0.0.1");
-
-  // 4. Borrow connection with local_ip = "127.0.0.2" again.
-  // This SHOULD reuse fd2.
-  const auto fd4_or = pool.Borrow(addr, "127.0.0.2", require_psp, channel);
-  ASSERT_OK(fd4_or) << fd4_or.status().message();
-  const int fd4 = fd4_or.value();
-  EXPECT_EQ(fd2, fd4);
-  pool.Return(/*ok=*/true, fd4, addr, "127.0.0.2");
-
-  // Close the pool.
-  pool.Close();
-}
-
-TEST_P(ConnPoolTest, CloseIdleClosesOnlyThatPeersIdleConnections) {
-  RawMockDelegate src(1024);
-  RawBufferTransport listener_a(&src, 0);
-  RawBufferTransport listener_b(&src, 0);
-  auto channel_a = StartControlServer(&listener_a);
-  auto channel_b = StartControlServer(&listener_b);
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-  ConnPool pool;
-  const std::string peer_a = GetIpPort(listener_a);
-  const std::string peer_b = GetIpPort(listener_b);
-  const bool require_psp = absl::GetFlag(FLAGS_require_psp_tcp);
-
-  // Two idle connections to A under two local IPs (two pool keys that both
-  // end in "->A") and one to B.
-  const auto a1 = pool.Borrow(peer_a, "127.0.0.1", require_psp, channel_a);
-  ABSL_ASSERT_OK(a1) << a1.status().message();
-  const auto a2 = pool.Borrow(peer_a, "127.0.0.2", require_psp, channel_a);
-  ABSL_ASSERT_OK(a2) << a2.status().message();
-  const auto b1 = pool.Borrow(peer_b, "127.0.0.1", require_psp, channel_b);
-  ABSL_ASSERT_OK(b1) << b1.status().message();
-  pool.Return(/*ok=*/true, *a1, peer_a, "127.0.0.1");
-  pool.Return(/*ok=*/true, *a2, peer_a, "127.0.0.2");
-  pool.Return(/*ok=*/true, *b1, peer_b, "127.0.0.1");
-  EXPECT_EQ(pool.IdleCount(peer_a), 2u);
-  EXPECT_EQ(pool.IdleCount(peer_b), 1u);
-
-  // A borrowed connection is not idle: it survives the close.
-  const auto a3 = pool.Borrow(peer_a, "127.0.0.1", require_psp, channel_a);
-  ABSL_ASSERT_OK(a3) << a3.status().message();
-  EXPECT_EQ(*a3, *a1);
-  EXPECT_EQ(pool.IdleCount(peer_a), 1u);
-
-  EXPECT_EQ(pool.CloseIdle(peer_a), 1u);
-  EXPECT_EQ(pool.IdleCount(peer_a), 0u);
-  EXPECT_EQ(pool.IdleCount(peer_b), 1u);
-  EXPECT_GE(fcntl(*a3, F_GETFD), 0);
-  EXPECT_EQ(pool.CloseIdle(peer_a), 0u);
-
-  // The survivor pools again on return, and the next borrow reuses it.
-  pool.Return(/*ok=*/true, *a3, peer_a, "127.0.0.1");
-  EXPECT_EQ(pool.IdleCount(peer_a), 1u);
-  const auto a4 = pool.Borrow(peer_a, "127.0.0.1", require_psp, channel_a);
-  ABSL_ASSERT_OK(a4) << a4.status().message();
-  EXPECT_EQ(*a4, *a3);
-  pool.Return(/*ok=*/true, *a4, peer_a, "127.0.0.1");
-
-  pool.Close();
 }
 
 TEST_P(RawBufferTransportTest, PushBuffersCoalescedCorrectness) {
@@ -1723,12 +1617,6 @@ TEST_P(RawBufferTransportTest, HighConcurrencyColdConnectNoBacklogStall) {
 
 INSTANTIATE_TEST_SUITE_P(
     PspAndPlainTcp, RawBufferTransportTest, ::testing::Bool(),
-    [](const ::testing::TestParamInfo<bool>& info) {
-      return info.param ? "PSP" : "PlainTcp";
-    });
-
-INSTANTIATE_TEST_SUITE_P(
-    PspAndPlainTcp, ConnPoolTest, ::testing::Bool(),
     [](const ::testing::TestParamInfo<bool>& info) {
       return info.param ? "PSP" : "PlainTcp";
     });
