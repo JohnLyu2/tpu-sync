@@ -294,6 +294,30 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                      " failed: ", reshard_session->GetStatus().message()))
                : absl::OkStatus();
   };
+  hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_sessions_.find(uuid);
+      if (it == active_recv_sessions_.end()) {
+        return absl::OkStatus();
+      }
+      recv_session = it->second;
+    }
+    return recv_session->OnRecvProgress(*this);
+  };
+  hooks.on_recv_network_complete = [this](uint64_t uuid) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_sessions_.find(uuid);
+      if (it == active_recv_sessions_.end()) {
+        return absl::OkStatus();
+      }
+      recv_session = it->second;
+    }
+    return recv_session->OnRecvNetworkComplete(*this);
+  };
   base_->SetTransferEventHooks(std::move(hooks));
 }
 

@@ -100,6 +100,7 @@ cc_test(
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport/lib:chunk",
         "//tpu_sync/transport/lib:chunk_serializer",
+        "//tpu_sync/transport/lib:transport_adapter",
         "//tpu_sync/transport/lib/psp:psp_syscall_mock",
         "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
