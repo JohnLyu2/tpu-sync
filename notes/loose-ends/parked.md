@@ -86,3 +86,10 @@ Each entry uses the 5-field `better-than-fish` format so any future session can 
 **Effort estimate:** as above.
 **References:** ../journal/2026-10/2026-10-20-caller-side-c1-and-transport-followups.md, ../journal/2026-10/2026-10-22-caller-model-and-connector-variants.md, findings/README.md §Callers, §C1, verification/TpuSyncVerify/Transfer/PrefillDecode/Caller.lean, ../empirical/prefill-decode-caller-tpu-inference-raiden-connector.md, ../empirical/reshard-callers-vllm-and-sglang-torchtpu.md
 
+
+## Re-check `86d4506` (BlockTransport Peregrine backend 3/N) against `Transport.lean` and Receive A1/A4
+**Status:** open 2026-10-24 — must close before CL 2b (first CL whose source map cites `CompleteIncomingPush`)
+**Context:** upstream `86d4506` rewrote `BlockTransport::CompleteIncomingPush` (+93 lines), `LayerProgress`, and `KVCacheManagerWithTransfer::InitializeBaseHooks` (+24). 14 anchors `modified` in `--diff b82eb2f c9bc124`; spans re-applied, bodies not yet read. See `../upstream-rechecks.md` 2026-10-24.
+**To resume:** `git diff b82eb2f c9bc124 -- tpu_sync/transport/block_transport.{h,cc} tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; check (1) `completed_chunks == expected_chunks` still triggers `OnLayerReceived`/`OnBlockShardsReceived` exactly once per layer (Transport.lean's accounting, Receive A1), (2) ordering of `OnLayerReceived` before `OnBlockShardsReceived` for the completing stream (Receive A4), (3) what `OnRecvNetworkComplete` does in the new hook and whether the session models need an event or it folds into `networkComplete`. Then bump README's last-resolved commit, re-run `--check`, log the result.
+**Effort estimate:** 30–60 min reading; half a day if a new event is needed.
+**References:** ../upstream-rechecks.md, tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Transport.lean, tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive.lean
