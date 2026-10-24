@@ -2,6 +2,8 @@ import TpuSyncVerify.Common.System
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Common.ListAux
 import TpuSyncVerify.Transfer.Session
+import TpuSyncVerify.Transfer.PrefillDecode.Receive
+import TpuSyncVerify.Transfer.PrefillDecode.ReceivePoll
 -- The remaining Transfer models and the Controller model land in follow-up
 -- changes and are imported here as they arrive.
 
