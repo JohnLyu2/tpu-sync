@@ -17,7 +17,7 @@ F3 is a reading-level finding (data race, no test); F2 shape B is Lean-only
 (`ReadRemote.shipping_inFlight`). With `candidate_fixes.patch` applied the same
 tests pass, except that the F2 fix is the naive one and closes shape A only.
 
-[EMP] `lake build` of `tpu_sync/formal_verification/` is clean: 14 modules, no `sorry`, no
+[EMP] `lake build` of `tpu_sync/formal_verification/` is clean: 23 top-level modules (74 `.lean` files), no `sorry`, no
 extra axioms, `leanprover/lean4:v4.33.0` (`tpu_sync/formal_verification/README.md` §"Building & Verifying").
 
 ## Correction trail

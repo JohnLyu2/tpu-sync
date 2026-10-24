@@ -6,8 +6,7 @@ assumptions, properties and proofs, replay/search/mutants, naming) and
 `tpu_sync/formal_verification/TpuSyncVerify/Common/{System,ModelCheck}.lean`. This note is the
 working method distilled from using them.
 
-**Verified against:** `tpu_sync/formal_verification/` at `09b1650` (14 modules,
-`leanprover/lean4:v4.33.0`).
+**Verified against:** `tpu_sync/formal_verification/` at `c9bc124` (23 top-level modules across 74 `.lean` files, `leanprover/lean4:v4.33.0`).
 
 ## Working method
 
@@ -30,10 +29,9 @@ hazard, then `ModelCheck.check` yields the counterexample for the report and
 
 [FACT] Validation runs in both directions at `lake build`: the transfer path's
 C++ unit tests and E2E tests are replayed as `decide` traces (positive — the
-model is not over-constrained; `prefill_decode.md` §"Test suite
-correspondence"), and critical guards are removed one at a time in mutant
+model is not over-constrained; each `trace_*` docstring names the test it replays and each module's `## Source map` table resolves its span), and critical guards are removed one at a time in mutant
 configurations to confirm a property breaks (negative — the proofs are not
-vacuous; `prefill_decode.md` §"Counterfactual mutants").
+vacuous; `prefill_decode.md` and `reshard.md` §"Counterfactual mutants").
 
 ## Why this matters
 

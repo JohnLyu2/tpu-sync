@@ -7,7 +7,7 @@ and `tpu_sync/formal_verification/TpuSyncVerify/Controller/ReadRemote.lean`. Thi
 to carry into the next audit of `RaidenController`, `KVCacheStore`,
 `HostOffloadBackend` or `KVCacheStoreService`.
 
-**Verified against:** tpu-sync `2ed6f8f` (2026-10-22). Fixed upstream since
+**Verified against:** tpu-sync `c9bc124` (2026-10-24). Fixed upstream since
 this note was written: F4 (`72255dd`, 2026-10-07) and **F1 (`b3ea4dc`,
 2026-10-21: one `Lookup(..., pin_found = true)` under one backend lock,
 partial pins released on refusal — the fix `candidate_fixes.patch` proposed;

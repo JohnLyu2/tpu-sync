@@ -29,7 +29,10 @@ The warm output base is per clone: deleting the clone orphans it.
 
 [EMP] Hardware-free targets that link `StagingBlockAllocator` /
 `TransferReceiveSession`, all green at `50b0774` with and without
-`per_peer_staging_admission.patch`:
+`per_peer_staging_admission.patch` (note: since `5afe1ef` / `1fa06d1`, the
+transfer and session targets below moved from `//tpu_sync/core:` to
+`//tpu_sync/kv_cache:`, while `//tpu_sync/core:staging_arena_test` and
+`//tpu_sync/core:pool_reshard_send_slots_test` live in `//tpu_sync/core:`):
 `//tpu_sync/core:kv_cache_manager_with_transfer_control_test` (~48 s),
 `:transfer_send_session_test`, `:kv_cache_manager_with_transfer_send_drain_test`,
 `:kv_cache_manager_with_transfer_pool_reshard_test`,

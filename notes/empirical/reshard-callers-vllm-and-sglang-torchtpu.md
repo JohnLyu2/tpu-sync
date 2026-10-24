@@ -44,10 +44,15 @@ Do not re-investigate:
 - "Does sglang share a uuid between the FA transfer and its SWA twin?" — no
   (`pp_swa.twin_uuid` derives a distinct one).
 
-Open (parked): whether the Peregrine `BlockTransport` backend (`5adb0f4`,
-`b43de27`, not in the fork yet) has the socket adapter's per-uuid failure
-latch; without it, F10's early unregister would let a sibling post reach the
-wire with full-block fallback extents on full-mirror staging.
+Open (parked, checked through `c9bc124` in `../loose-ends/parked.md`): whether
+the Peregrine `BlockTransport` backend (`5adb0f4`, `b43de27`, `86d4506`;
+`tpu_sync/transport/lib/adapter/peregrine_transport_adapter.{h,cc}`) has the
+socket adapter's per-uuid failure latch once wired in (at `c9bc124`,
+`BlockTransport` still constructs `SocketTransportAdapter` and
+`PeregrineTransportAdapter::Post` refuses `kBlockPush` with
+`UnimplementedError`); without a latch, F10's early unregister would let a
+sibling post reach the wire with full-block fallback extents on full-mirror
+staging.
 
 ## See also
 
