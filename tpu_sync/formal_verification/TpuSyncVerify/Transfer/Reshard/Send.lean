@@ -19,7 +19,7 @@ In the source-map table below, `reshard_send.h` and `reshard_send.cc` are
 `tpu_sync/core/pool_reshard_send_slots.cc`; `mgr.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_base.cc`; `utils.h` is
-`tpu_sync/core/utils.h`; `pool_layout.cc` is `tpu_sync/core/pool_layout.cc`;
+`tpu_sync/core/utils.h`; `pool_layout.cc` is `tpu_sync/kv_cache/pool_layout.cc`;
 `reshard_send_test.cc` is `tpu_sync/kv_cache/reshard_send_session_test.cc`; and
 `pool_reshard_test.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`.
