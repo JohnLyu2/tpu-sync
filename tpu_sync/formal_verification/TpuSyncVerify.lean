@@ -9,6 +9,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 import TpuSyncVerify.Transfer.PrefillDecode.MultiRequest
 import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering
 import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
+import TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation
+import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 -- The remaining Transfer models and the Controller model land in follow-up
 -- changes and are imported here as they arrive.
 
