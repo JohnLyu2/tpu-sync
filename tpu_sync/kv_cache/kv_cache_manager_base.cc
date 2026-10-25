@@ -54,7 +54,6 @@
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/pjrt/semaphore.h"
 #include "xla/shape.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/stream.h"
@@ -442,15 +441,8 @@ KVCacheManagerBase::KVCacheManagerBase(
   const auto& first_handle = layer_buffers[0][0];
   const xla::Shape& shape = first_handle.shape;
 
-  is_blocked_layout_ = (shape.dimensions().size() == 5);
-
   // max_physical_size_ will be set to the max across all layers below.
   max_physical_size_ = 0;
-
-  if (!first_handle.is_common_buffer && first_handle.c_hold) {
-    c_api_ = first_handle.c_hold->c_api;
-    extension_ = first_handle.c_hold->extension;
-  }
 
   int num_host_blocks = host_blocks_to_allocate.value_or(64);
   host_block_manager_ = std::make_unique<LogicalBlockManager>(num_host_blocks);
@@ -459,7 +451,6 @@ KVCacheManagerBase::KVCacheManagerBase(
   } else if (!shape.dimensions().empty()) {
     major_dim_size_ = shape.dimensions(0);
   }
-  semaphore_ = std::make_unique<xla::Semaphore>(std::max<int>(4, parallelism));
 
   std::vector<LayerInfoBase> layers;
   layers.reserve(num_layers_);
@@ -611,7 +602,6 @@ KVCacheManagerBase::KVCacheManagerBase(
       host_allocator_(host_allocator) {
   int total_blocks = host_blocks_to_allocate.value_or(0);
   host_block_manager_ = std::make_unique<LogicalBlockManager>(total_blocks);
-  semaphore_ = std::make_unique<xla::Semaphore>(std::max<int>(4, parallelism));
 
   // Each array's own stride, so a heterogeneous host-side mirror allocates
   // each buffer at the width that will address it.  Arrays past the end of
@@ -1468,21 +1458,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2hReadExplicit(
     tpu_raiden::transport::BlockReceivedCallback on_block_received) {
   // Copy the transport pointer under lock and execute SyncPull unlocked to
   // avoid blocking concurrent transfers.
-  tpu_raiden::transport::BlockTransport* transport_server = nullptr;
-  {
-    // TODO: Initialize server_ eagerly in every constructor and remove the
-    // post-construction InitTransportServer() call sites. Then remove the lock.
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
-  if (!transport_server) {
+  tpu_raiden::transport::BlockTransport* transport = transport_server();
+  if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
   ABSL_ASSIGN_OR_RETURN(
       std::vector<int> allocated_ids,
-      transport_server->SyncPull({peer}, src_block_ids, local_block_ids,
-                                 explicit_dst_ptrs, parallelism, major_order,
-                                 on_block_received, kLeaseAuthorizedPullUuid));
+      transport->SyncPull({peer}, src_block_ids, local_block_ids,
+                          explicit_dst_ptrs, parallelism, major_order,
+                          on_block_received, kLeaseAuthorizedPullUuid));
   return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
 }
 
@@ -2261,12 +2245,10 @@ absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools,
     // Prefer the device buffer size; fall back to the host mirror; validate
     // internal consistency only (-1) when neither is known yet.
     int64_t storage_bytes = -1;
-    bool device_backed = false;
     if (pool.storage_index < buffer_holds_.size() &&
         buffer_holds_[pool.storage_index].physical_size > 0) {
       storage_bytes =
           static_cast<int64_t>(buffer_holds_[pool.storage_index].physical_size);
-      device_backed = true;
     } else {
       const size_t host_size = GetHostSize(pool.storage_index, 0);
       if (host_size > 0) {
@@ -2284,7 +2266,6 @@ absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools,
                        ": staging_blocks_per_request must be "
                        ">= 0"));
     }
-    (void)device_backed;
   }
   // Host staging is sized at the uniform layer-0 slice by the constructors,
   // which can under-cover heterogeneous device storages. Per storage this
@@ -2898,23 +2879,6 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
   return local_futures;
 }
 
-absl::Status KVCacheManagerBase::OnSingleBlockReceived(int block_id,
-                                                       size_t size_bytes) {
-  RecvCallback cb;
-  {
-    absl::MutexLock l(recv_mu_);
-    auto it = recv_callbacks_.find(block_id);
-    if (it != recv_callbacks_.end()) {
-      cb = std::move(it->second);
-      recv_callbacks_.erase(it);
-    }
-  }
-  if (cb) {
-    return cb(block_id, size_bytes);
-  }
-  return absl::OkStatus();
-}
-
 void KVCacheManagerBase::RegisterBlockReadinessCallback(
     size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
     transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
@@ -2995,12 +2959,8 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
               << "): uuid=" << request.uuid() << ", numa=" << numa;
     }
 
-    transport::BlockTransport* transport_server = nullptr;
-    {
-      absl::MutexLock lock(server_init_mu_);
-      transport_server = server_.get();
-    }
-    if (!transport_server) {
+    transport::BlockTransport* transport = transport_server();
+    if (!transport) {
       LOG(ERROR)
           << "Transport server is not running during resharded push for uuid "
           << request.uuid();
@@ -3020,7 +2980,7 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
 
       if (src_block_ids.empty()) continue;
 
-      transport_server
+      transport
           ->AsyncPush({peer}, src_block_ids, dst_block_ids, /*parallelism=*/1,
                       transport::MajorOrder::kLayerMajor, request.uuid(),
                       /*layer_idx=*/-1)
@@ -3200,13 +3160,9 @@ absl::Status KVCacheManagerBase::UnregisterActivePlanDirect(uint64_t uuid) {
   }
   // Receive-progress counters key on the uuid; drop them with the plan so a
   // finished, failed, or timed-out uuid can be safely reused.
-  transport::BlockTransport* transport_server = nullptr;
-  {
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
-  if (transport_server != nullptr) {
-    transport_server->ForgetPushProgress(uuid);
+  transport::BlockTransport* transport = transport_server();
+  if (transport != nullptr) {
+    transport->ForgetPushProgress(uuid);
   }
   VLOG(1) << "UnregisterActivePlan: Removed plan for UUID " << uuid;
   return absl::OkStatus();

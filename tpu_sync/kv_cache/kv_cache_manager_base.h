@@ -37,10 +37,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/c/pjrt_c_api.h"
-#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/pjrt/semaphore.h"
 #include "xla/stream_executor/stream.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -86,9 +83,6 @@ struct BlockMetadata {
   std::string address;
   xla::PjRtClient* pjrt_client = nullptr;
 };
-
-using RecvCallback =
-    std::function<absl::Status(int block_id, size_t size_bytes)>;
 
 namespace kv_cache {
 
@@ -856,12 +850,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  protected:
-  const PJRT_Api* c_api_ = nullptr;
-  const PJRT_RawBuffer_Extension* extension_ = nullptr;
   size_t max_physical_size_ = 0;
   int64_t staging_num_slots_ = 0;
   int64_t staging_max_major_per_slot_ = 0;
-  bool is_blocked_layout_ = false;
 
   std::unique_ptr<LogicalBlockManager> host_block_manager_;
 
@@ -931,7 +922,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return host_block_manager_->Allocate(num_blocks, /*lock=*/true);
   }
 
-  absl::Status OnSingleBlockReceived(int block_id, size_t size_bytes) override;
+  // Per-block receive completion is tracked by the transfer sessions, not here.
+  absl::Status OnSingleBlockReceived(int block_id, size_t size_bytes) override {
+    return absl::OkStatus();
+  }
 
   virtual absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchD2hChunks(
       const std::vector<int64_t>& src_offsets,
@@ -1018,11 +1012,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                              std::optional<uint64_t> uuid);
 
   HostBufferAllocator host_allocator_ = nullptr;
-  std::unique_ptr<xla::Semaphore> semaphore_;
-
-  absl::Mutex recv_mu_;
-  absl::flat_hash_map<int, RecvCallback> recv_callbacks_
-      ABSL_GUARDED_BY(recv_mu_);
 
   mutable absl::Mutex plans_mu_;
   struct RegisteredPlan {

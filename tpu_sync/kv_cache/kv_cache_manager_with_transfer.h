@@ -125,7 +125,6 @@ class KVCacheManagerWithTransfer {
  public:
   friend class TransferReceiveSession;
   friend class ReshardReceiveSession;
-  friend class ReshardSendSession;
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -298,13 +297,13 @@ class KVCacheManagerWithTransfer {
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferReceiveSession>>
-      active_recv_sessions_;
+      active_recv_sessions_ ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardReceiveSession>>
-      active_pool_reshard_recvs_;
+      active_pool_reshard_recvs_ ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
-      active_pool_reshard_sends_;
+      active_pool_reshard_sends_ ABSL_GUARDED_BY(mu_);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 
@@ -328,11 +327,11 @@ class KVCacheManagerWithTransfer {
   // on the main thread, but accessed asynchronously in control worker threads
   // handling pull connections.
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSendSession>>
-      send_sessions_;
-  absl::flat_hash_set<uint64_t> pending_acks_;
-  absl::flat_hash_set<std::string> done_sending_;
-  absl::flat_hash_set<std::string> done_recving_;
-  absl::flat_hash_set<std::string> failed_recving_;
+      send_sessions_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<uint64_t> pending_acks_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<std::string> done_sending_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<std::string> done_recving_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<std::string> failed_recving_ ABSL_GUARDED_BY(mu_);
   // CompleteReadResult::details not yet reported.
   absl::flat_hash_map<std::string, TransferDetails> transfer_details_
       ABSL_GUARDED_BY(mu_);
@@ -341,6 +340,7 @@ class KVCacheManagerWithTransfer {
   std::atomic<bool> stopping_{false};
   std::unique_ptr<ControlPlaneHandler> control_handler_;
   std::unique_ptr<ControlPlaneBackend> control_backend_;
+  std::shared_ptr<MetricsCollector> metrics_collector_ = nullptr;
 
  private:
   class ControlPlaneHandlerImpl;
@@ -360,8 +360,6 @@ class KVCacheManagerWithTransfer {
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);
   uint64_t MaxPullStreamBlocks() const;
-
-  std::shared_ptr<MetricsCollector> metrics_collector_ = nullptr;
 };
 
 }  // namespace tpu_raiden
