@@ -9,9 +9,9 @@ machine-checked proofs about them.
 ## What is modelled
 
 The shared infrastructure (`Common/`), the transfer-session lifecycle model
-(`Transfer/Session.lean`) and the prefill-to-decode receive session
-(`Transfer/PrefillDecode/Receive*.lean`, `ReceivePoll.lean`) are in; the rest
-of the models below arrive in follow-up changes.
+(`Transfer/Session.lean`) and the prefill-to-decode receive and send sessions
+(`Transfer/PrefillDecode/{Receive,Send}*.lean`, `ReceivePoll.lean`) are in; the
+rest of the models below arrive in follow-up changes.
 
 **Prefill-to-decode transfer** — `docs/transfer/prefill_decode.md` *(landing in follow-up changes)*
 - C++: `TransferSendSession`, `TransferReceiveSession`,
@@ -49,7 +49,7 @@ TpuSyncVerify.lean            imports every model
 TpuSyncVerify/
   Common/                     transition-system core, list lemmas, bounded model checker
   Transfer/Session.lean       settle protocol shared by every transfer session
-  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller (receive session in; rest follow-up)
+  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller (sessions in; rest follow-up)
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator (follow-up)
   Controller/ReadRemote.lean  controller remote-read lease (follow-up)
 docs/
