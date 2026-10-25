@@ -5,6 +5,8 @@ import TpuSyncVerify.Transfer.Session
 import TpuSyncVerify.Transfer.PrefillDecode.Receive
 import TpuSyncVerify.Transfer.PrefillDecode.ReceivePoll
 import TpuSyncVerify.Transfer.PrefillDecode.Send
+import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
+import TpuSyncVerify.Transfer.PrefillDecode.MultiRequest
 -- The remaining Transfer models and the Controller model land in follow-up
 -- changes and are imported here as they arrive.
 

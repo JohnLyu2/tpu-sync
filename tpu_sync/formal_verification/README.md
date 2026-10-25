@@ -9,14 +9,14 @@ machine-checked proofs about them.
 ## What is modelled
 
 The shared infrastructure (`Common/`), the transfer-session lifecycle model
-(`Transfer/Session.lean`) and the prefill-to-decode receive and send sessions
-(`Transfer/PrefillDecode/{Receive,Send}*.lean`, `ReceivePoll.lean`) are in; the
-rest of the models below arrive in follow-up changes.
+and the prefill-to-decode sessions and pipeline are in; the transport, caller,
+resharding and controller models below arrive in follow-up changes.
 
-**Prefill-to-decode transfer** — `docs/transfer/prefill_decode.md` *(landing in follow-up changes)*
+**Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
 - C++: `TransferSendSession`, `TransferReceiveSession`,
   `KVCacheManagerWithTransfer`, the receiver side of `BlockTransport`.
-- Lean: `Transfer/Session.lean`, `Transfer/PrefillDecode/`.
+- Lean: [`Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean),
+  [`Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/).
 - Proved: data correctness on publication, HBM and staging safety,
   drain-to-settle termination, cross-peer isolation.
 
@@ -49,14 +49,14 @@ TpuSyncVerify.lean            imports every model
 TpuSyncVerify/
   Common/                     transition-system core, list lemmas, bounded model checker
   Transfer/Session.lean       settle protocol shared by every transfer session
-  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller (sessions in; rest follow-up)
+  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller (transport, caller follow-up)
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator (follow-up)
   Controller/ReadRemote.lean  controller remote-read lease (follow-up)
 docs/
   conventions.md              how the models are written (one executable step, ghost
                               fields, replay traces, mutants) and how the C++ is cited
   transfer/, controller/      per-subsystem C++ <-> Lean docs: states, events,
-                              assumptions, proved theorems (follow-up)
+                              assumptions, proved theorems (reshard, controller follow-up)
 tools/
   resolve_anchors.py          resolves and checks the source-map tables
 lakefile.toml, lake-manifest.json, lean-toolchain
@@ -67,7 +67,7 @@ lakefile.toml, lake-manifest.json, lean-toolchain
 Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest names (`Suite.TestName`); exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables. Those spans were
-last resolved at commit **`c15ead5`**;
+last resolved at commit **`c9bc124`**;
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py) `--check` re-verifies
 them against the working tree. The two external callers that `Caller.lean`
 cites are pinned separately, to the pair `examples/*_disagg/setup.sh`
