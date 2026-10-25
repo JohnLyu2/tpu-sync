@@ -7,6 +7,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.ReceivePoll
 import TpuSyncVerify.Transfer.PrefillDecode.Send
 import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
 import TpuSyncVerify.Transfer.PrefillDecode.MultiRequest
+import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering
+import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
 -- The remaining Transfer models and the Controller model land in follow-up
 -- changes and are imported here as they arrive.
 
