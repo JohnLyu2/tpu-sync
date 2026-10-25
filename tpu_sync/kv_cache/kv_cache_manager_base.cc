@@ -452,11 +452,8 @@ KVCacheManagerBase::KVCacheManagerBase(
     major_dim_size_ = shape.dimensions(0);
   }
 
-  std::vector<LayerInfoBase> layers;
-  layers.reserve(num_layers_);
   buffer_holds_.reserve(num_layers_);
   layer_row_bytes_.reserve(num_layers_);
-  size_t total_host_dram_bytes = 0;
 
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     const auto& dst_buffers = layer_buffers[layer_idx];
@@ -464,7 +461,6 @@ KVCacheManagerBase::KVCacheManagerBase(
       throw std::runtime_error("Number of shards mismatch across layers");
     }
 
-    LayerInfoBase layer_info;
     LayerDeviceInfo device_info;
     // Store the per-layer on-device buffer size.  For uniform models
     // every layer has the same value; for hybrid (HMA) models they
@@ -500,76 +496,31 @@ KVCacheManagerBase::KVCacheManagerBase(
     }
     layer_row_bytes_.push_back(row_byte_size(device_info.physical_size));
 
-    layer_info.shards.reserve(num_shards_);
     device_info.holds.reserve(num_shards_);
-
     for (size_t i = 0; i < num_shards_; ++i) {
       const auto& dst_buffer = dst_buffers[i];
-      ShardBufferInfoBase shard_info;
-      shard_info.device = dst_buffer.device;
-
-      shard_info.device_size = dst_buffer.GetOnDeviceSizeInBytes();
-      if (shard_info.device_size < device_info.physical_size) {
+      if (dst_buffer.GetOnDeviceSizeInBytes() < device_info.physical_size) {
         throw std::runtime_error(
             "Device buffer shard size smaller than physical size");
       }
-
-      // Allocate this layer's host buffer at its OWN row size.
-      size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
-      if (host_allocator) {
-        const xla::PjRtDevice* target_dev = dst_buffer.device;
-        auto host_alloc = host_allocator(alloc_size, target_dev);
-        if (!host_alloc.ok()) {
-          throw std::runtime_error(
-              absl::StrCat("Host allocator failed for size: ", alloc_size,
-                           ", error: ", host_alloc.status().ToString()));
-        }
-        HostBufferAllocation allocation = *std::move(host_alloc);
-        if (alloc_size > 0 && allocation.ptr == nullptr) {
-          throw std::runtime_error(absl::StrCat(
-              "Host allocator returned null buffer for size: ", alloc_size));
-        }
-        if (allocation.size < alloc_size) {
-          throw std::runtime_error(absl::StrCat(
-              "Host allocator returned undersized buffer. Requested: ",
-              alloc_size, ", allocated: ", allocation.size));
-        }
-        shard_info.host_ptr = allocation.ptr;
-        shard_info.host_size = allocation.size;
-        shard_info.host_owner = std::move(allocation.owner);
-      } else {
-        void* ptr = nullptr;
-        if (alloc_size > 0) {
-          if (posix_memalign(&ptr, 64, alloc_size) != 0) {
-            throw std::runtime_error(absl::StrCat(
-                "Failed to allocate host buffer of size: ", alloc_size));
-          }
-          std::memset(ptr, 0, alloc_size);
-        }
-        shard_info.owned_host_buffer =
-            std::unique_ptr<uint8_t[], void (*)(void*)>(
-                static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
-        shard_info.host_ptr = shard_info.owned_host_buffer.get();
-        shard_info.host_size = alloc_size;
-        VLOG(1) << "KVCacheManagerBase: allocated host buffer for layer "
-                << layer_idx << ", shard " << i << " at "
-                << (void*)shard_info.host_ptr << ", size "
-                << shard_info.host_size;
-      }
-
-      total_host_dram_bytes += shard_info.host_size;
       device_info.holds.push_back(dst_buffer);
-      layer_info.shards.push_back(std::move(shard_info));
     }
-    layers.push_back(std::move(layer_info));
     buffer_holds_.push_back(std::move(device_info));
   }
+  absl::StatusOr<HostLayers> host_layers = AllocateHostLayers(
+      num_layers_, num_shards_, /*num_layers_to_allocate=*/num_layers_,
+      num_host_blocks, buffer_holds_, host_allocator);
+  if (!host_layers.ok()) {
+    // Constructors cannot return a status; a failed host allocation surfaces
+    // the way it always has.
+    throw std::runtime_error(std::string(host_layers.status().message()));
+  }
   layers_ = StagingArena(
-      std::move(layers),
+      std::move(host_layers->layers),
       host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
   {
     absl::MutexLock lock(allocated_host_dram_bytes_mu_);
-    allocated_host_dram_bytes_ = total_host_dram_bytes;
+    allocated_host_dram_bytes_ = host_layers->host_bytes;
   }
 
   constexpr size_t kPoolSize = 4;
@@ -616,32 +567,72 @@ KVCacheManagerBase::KVCacheManagerBase(
     layer_row_bytes_.push_back(slice_byte_sizes[layer_idx]);
   }
 
-  std::vector<LayerInfoBase> layers;
-  layers.reserve(num_layers_);
-  size_t total_host_dram_bytes = 0;
-  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+  absl::StatusOr<HostLayers> host_layers = AllocateHostLayers(
+      num_layers_, num_shards_, /*num_layers_to_allocate=*/num_layers_,
+      /*num_host_blocks=*/total_blocks, /*device_layers=*/{}, host_allocator);
+  if (!host_layers.ok()) {
+    throw std::runtime_error(std::string(host_layers.status().message()));
+  }
+  layers_ = StagingArena(
+      std::move(host_layers->layers),
+      host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
+  {
+    absl::MutexLock lock(allocated_host_dram_bytes_mu_);
+    allocated_host_dram_bytes_ = host_layers->host_bytes;
+  }
+  constexpr size_t kPoolSize = 4;
+  dma_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
+  push_pool_ = std::make_shared<NumaThreadPool>(kPoolSize);
+  pull_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
+  InitShardLocalRanks();
+  InitBackgroundWorker();
+  UpdateAllocatedOccupancyMetric();
+}
+
+absl::StatusOr<KVCacheManagerBase::HostLayers>
+KVCacheManagerBase::AllocateHostLayers(
+    size_t num_layers, size_t num_shards, size_t num_layers_to_allocate,
+    int num_host_blocks, absl::Span<const LayerDeviceInfo> device_layers,
+    const HostBufferAllocator& host_allocator) const {
+  if (num_layers_to_allocate > num_layers) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("num_layers_to_allocate (", num_layers_to_allocate,
+                     ") exceeds num_layers (", num_layers, ")"));
+  }
+  HostLayers host_layers;
+  host_layers.layers.reserve(num_layers_to_allocate);
+  for (size_t layer_idx = 0; layer_idx < num_layers_to_allocate; ++layer_idx) {
     LayerInfoBase layer_info;
-    layer_info.shards.reserve(num_shards_);
+    layer_info.shards.reserve(num_shards);
 
-    for (size_t i = 0; i < num_shards_; ++i) {
+    for (size_t shard_idx = 0; shard_idx < num_shards; ++shard_idx) {
       ShardBufferInfoBase shard_info;
+      if (layer_idx < device_layers.size() &&
+          shard_idx < device_layers[layer_idx].holds.size()) {
+        const raiden::BufferHoldAndAlias& hold =
+            device_layers[layer_idx].holds[shard_idx];
+        shard_info.device = hold.device;
+        shard_info.device_size = hold.GetOnDeviceSizeInBytes();
+      }
 
-      int num_host_blocks = host_blocks_to_allocate.value_or(0);
+      // Allocate this layer's host buffer at its OWN row size.
       size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
       if (host_allocator) {
-        auto host_alloc = host_allocator(alloc_size, nullptr);
+        absl::StatusOr<HostBufferAllocation> host_alloc =
+            host_allocator(alloc_size, shard_info.device);
         if (!host_alloc.ok()) {
-          throw std::runtime_error(
+          return absl::Status(
+              host_alloc.status().code(),
               absl::StrCat("Host allocator failed for size: ", alloc_size,
                            ", error: ", host_alloc.status().ToString()));
         }
         HostBufferAllocation allocation = *std::move(host_alloc);
         if (alloc_size > 0 && allocation.ptr == nullptr) {
-          throw std::runtime_error(absl::StrCat(
+          return absl::InternalError(absl::StrCat(
               "Host allocator returned null buffer for size: ", alloc_size));
         }
         if (allocation.size < alloc_size) {
-          throw std::runtime_error(absl::StrCat(
+          return absl::InternalError(absl::StrCat(
               "Host allocator returned undersized buffer. Requested: ",
               alloc_size, ", allocated: ", allocation.size));
         }
@@ -652,7 +643,7 @@ KVCacheManagerBase::KVCacheManagerBase(
         void* ptr = nullptr;
         if (alloc_size > 0) {
           if (posix_memalign(&ptr, 64, alloc_size) != 0) {
-            throw std::runtime_error(absl::StrCat(
+            return absl::ResourceExhaustedError(absl::StrCat(
                 "Failed to allocate host buffer of size: ", alloc_size));
           }
           std::memset(ptr, 0, alloc_size);
@@ -662,27 +653,18 @@ KVCacheManagerBase::KVCacheManagerBase(
                 static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
         shard_info.host_ptr = shard_info.owned_host_buffer.get();
         shard_info.host_size = alloc_size;
+        VLOG(1) << "KVCacheManagerBase: allocated host buffer for layer "
+                << layer_idx << ", shard " << shard_idx << " at "
+                << (void*)shard_info.host_ptr << ", size "
+                << shard_info.host_size;
       }
 
-      total_host_dram_bytes += shard_info.host_size;
+      host_layers.host_bytes += shard_info.host_size;
       layer_info.shards.push_back(std::move(shard_info));
     }
-    layers.push_back(std::move(layer_info));
+    host_layers.layers.push_back(std::move(layer_info));
   }
-  layers_ = StagingArena(
-      std::move(layers),
-      host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
-  {
-    absl::MutexLock lock(allocated_host_dram_bytes_mu_);
-    allocated_host_dram_bytes_ = total_host_dram_bytes;
-  }
-  constexpr size_t kPoolSize = 4;
-  dma_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
-  push_pool_ = std::make_shared<NumaThreadPool>(kPoolSize);
-  pull_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
-  InitShardLocalRanks();
-  InitBackgroundWorker();
-  UpdateAllocatedOccupancyMetric();
+  return host_layers;
 }
 
 void KVCacheManagerBase::InitBackgroundWorker() {

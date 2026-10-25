@@ -1094,6 +1094,30 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Initializes per-shard local_rank label strings at construction time.
   void InitShardLocalRanks();
 
+  // Host staging buffers produced by AllocateHostLayers().
+  struct HostLayers {
+    std::vector<LayerInfoBase> layers;
+    // Sum of every allocated shard's host_size.
+    size_t host_bytes = 0;
+  };
+
+  // Allocates the host staging mirror: one host buffer per (layer, shard) for
+  // the first |num_layers_to_allocate| of the manager's |num_layers| layers,
+  // |num_shards| shards each, sized at |num_host_blocks| x
+  // layer_block_byte_size(layer) bytes (so layer_row_bytes_ must already be
+  // populated). Shard (l, s) is allocated through |host_allocator| for the
+  // device of |device_layers|[l].holds[s] when present (host-only managers
+  // pass no device layers), or from zeroed posix_memalign memory without an
+  // allocator, and records that device and its on-device size for H2D/D2H
+  // bounds checks. Fails kInvalidArgument when |num_layers_to_allocate|
+  // exceeds |num_layers|, and with the allocator's status (kResourceExhausted
+  // for posix_memalign, kInternal for a bad allocator result) when an
+  // allocation fails; buffers allocated before the failure are released.
+  absl::StatusOr<HostLayers> AllocateHostLayers(
+      size_t num_layers, size_t num_shards, size_t num_layers_to_allocate,
+      int num_host_blocks, absl::Span<const LayerDeviceInfo> device_layers,
+      const HostBufferAllocator& host_allocator) const;
+
   mutable absl::Mutex backends_mu_;
   absl::flat_hash_map<std::string, std::shared_ptr<backends::KVBackend>>
       backends_ ABSL_GUARDED_BY(backends_mu_);
