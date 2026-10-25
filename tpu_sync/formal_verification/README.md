@@ -9,8 +9,9 @@ machine-checked proofs about them.
 ## What is modelled
 
 The shared infrastructure (`Common/`), the transfer-session lifecycle model
-and the prefill-to-decode sessions and pipeline are in; the transport, caller,
-resharding and controller models below arrive in follow-up changes.
+and the prefill-to-decode subsystem (`Transfer/PrefillDecode/`, including the
+transport and engine caller models) are in; the resharding and controller
+models below arrive in follow-up changes.
 
 **Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
 - C++: `TransferSendSession`, `TransferReceiveSession`,
@@ -20,10 +21,10 @@ resharding and controller models below arrive in follow-up changes.
 - Proved: data correctness on publication, HBM and staging safety,
   drain-to-settle termination, cross-peer isolation.
 
-**Engine caller contract** — `docs/transfer/prefill_decode.md` §Boundaries *(follow-up)*
+**Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries
 - Python: vLLM's scheduler through tpu-inference's connector, above
   `poll_stats()`.
-- Lean: `Transfer/PrefillDecode/Caller.lean`.
+- Lean: [`Transfer/PrefillDecode/Caller.lean`](TpuSyncVerify/Transfer/PrefillDecode/Caller.lean).
 - Proved: a connector that forwards every publication leaks no held block and
   never decodes on unwritten KV.
 
@@ -49,7 +50,7 @@ TpuSyncVerify.lean            imports every model
 TpuSyncVerify/
   Common/                     transition-system core, list lemmas, bounded model checker
   Transfer/Session.lean       settle protocol shared by every transfer session
-  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller (transport, caller follow-up)
+  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator (follow-up)
   Controller/ReadRemote.lean  controller remote-read lease (follow-up)
 docs/
