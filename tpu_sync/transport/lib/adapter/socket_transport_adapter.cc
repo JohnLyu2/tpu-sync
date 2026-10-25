@@ -64,9 +64,9 @@ namespace lib {
 
 namespace {
 
+using ::peregrine::v1::IsEnvVarEnabled;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
-using ::peregrine::v1::SourceBindEnabled;
 using ::peregrine::v1::SourceIpRoutesToPeer;
 using ::peregrine::v1::WriteExact;
 using ::peregrine::v1::WriteVExact;
@@ -75,6 +75,10 @@ using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
+
+bool IsSourceBindEnabled() {
+  return IsEnvVarEnabled("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
+}
 
 SocketTransportAdapter::Config ReadConfigFromEnv() {
   SocketTransportAdapter::Config config;
@@ -241,7 +245,7 @@ std::vector<std::string> SourceIpsRoutingToPeer(
 // own NIC (`routable_source_ips` empty).
 std::string SelectSourceIp(absl::Span<const std::string> routable_source_ips,
                            size_t i) {
-  if (!SourceBindEnabled() || routable_source_ips.empty()) return "";
+  if (!IsSourceBindEnabled() || routable_source_ips.empty()) return "";
   return routable_source_ips[i % routable_source_ips.size()];
 }
 
@@ -251,7 +255,7 @@ absl::flat_hash_map<std::string, std::vector<std::string>>
 RoutableSourceIpsByPeer(absl::Span<const std::string> source_ips,
                         absl::Span<const std::string> peers) {
   absl::flat_hash_map<std::string, std::vector<std::string>> by_peer;
-  if (!SourceBindEnabled()) return by_peer;
+  if (!IsSourceBindEnabled()) return by_peer;
   for (const std::string& peer : peers) {
     if (by_peer.contains(peer)) continue;
     by_peer[peer] = SourceIpsRoutingToPeer(source_ips, peer);

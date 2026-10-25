@@ -197,9 +197,8 @@ class RawBufferTransport final {
 
   // Client-side source address for an outbound connection to `peer`, or ""
   // to let the kernel choose by route. Non-empty only when source binding
-  // is enabled (SourceBindEnabled), round-robining across the entries of
-  // `local_ips_` that route to `peer` through their own NIC
-  // (SourceIpRoutesToPeer).
+  // is enabled, round-robining across the entries of `local_ips_` that route
+  // to `peer` through their own NIC (SourceIpRoutesToPeer).
   std::string SourceIpForPeer(absl::string_view peer) const;
 
   // Processes a single peer request from the given `client_fd`. These requests
