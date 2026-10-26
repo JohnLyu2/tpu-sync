@@ -197,6 +197,42 @@ py_test(
 )
 
 py_test(
+    name = "weight_synchronizer_parity_test",
+    size = "medium",
+    srcs = ["weight_synchronizer_parity_test.py"],
+    tags = [
+        "cpu:4",
+        "no_oss",
+        "requires-mem:16g",
+    ],
+    deps = [
+        "//tpu_sync/api/jax:weight_synchronizer_jax_py",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@pypi//numpy",
+    ],
+)
+
+py_test(
+    name = "weight_synchronizer_parity_torch_test",
+    size = "medium",
+    srcs = ["weight_synchronizer_parity_test.py"],
+    args = ["--framework=torch"],
+    main = "weight_synchronizer_parity_test.py",
+    tags = [
+        "cpu:4",
+        "no_oss",
+        "requires-mem:16g",
+    ],
+    deps = [
+        "//tpu_sync/api/torch:weight_synchronizer_torch_py",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@pypi//numpy",
+    ],
+)
+
+py_test(
     name = "weight_sync_tp_mismatch_test",
     size = "medium",
     srcs = ["weight_sync_tp_mismatch_test.py"],

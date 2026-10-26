@@ -224,6 +224,13 @@ class WeightSynchronizer:
   ) -> torch.Tensor:
     """Returns a zero-copy Host CPU PyTorch Tensor view of staging buffer.
 
+    The view keeps the native synchronizer, with its ports, threads and host
+    staging memory, alive for as long as the view or any tensor sharing its
+    storage exists, even after `shutdown()`. Do not hand the view to
+    asynchronous consumers (for example raw-transfer copies) that can outlive
+    the caller's references: the final release then tears the synchronizer
+    down on that consumer's thread.
+
     Args:
       layer_idx: Target layer index to fetch.
       shard_idx: Target shard index to fetch.
@@ -376,5 +383,10 @@ class WeightSynchronizer:
     return flush_cloud_logging(phase, uuid, req_id)
 
   def shutdown(self) -> None:
-    """Releases and shuts down the underlying C++ synchronizer instance."""
+    """Drops this wrapper's reference to the C++ synchronizer instance.
+
+    The native synchronizer, with its ports, threads and host staging memory,
+    is destroyed once its last reference is gone, including any view returned
+    by `get_host_buffer()`. Until then it keeps running.
+    """
     self._impl = None

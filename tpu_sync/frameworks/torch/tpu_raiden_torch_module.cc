@@ -20,8 +20,9 @@
 #include <utility>
 #include <vector>
 
-#include "ATen/ops/from_blob.h"
+#include "ATen/core/TensorBody.h"
 #include "nanobind/nanobind.h"
+#include "nanobind/ndarray.h"
 #include "nanobind/operators.h"
 #include "nanobind/stl/optional.h"
 #include "nanobind/stl/pair.h"
@@ -797,8 +798,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::call_guard<nb::gil_scoped_release>())
       .def(
           "get_host_buffer",
-          [](WeightSynchronizer& self, size_t layer_idx,
-             size_t shard_idx) -> at::Tensor {
+          [](WeightSynchronizer& self, size_t layer_idx, size_t shard_idx)
+              -> nb::ndarray<uint8_t, nb::pytorch, nb::c_contig> {
             const uint8_t* ptr = self.GetHostBufferPtr(layer_idx, shard_idx);
             if (!ptr) {
               throw std::runtime_error("Invalid layer or shard index");
@@ -807,8 +808,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
             if (size == 0) {
               size = self.slice_byte_size() + 256 * 1024;
             }
-            return at::from_blob(const_cast<uint8_t*>(ptr),
-                                 {static_cast<int64_t>(size)}, at::kByte);
+            // The tensor aliases staging memory owned by `self`, its owner.
+            // nanobind drops it under the GIL on whichever thread frees the
+            // storage, and leaks it once the interpreter cannot be entered.
+            size_t shape[1] = {size};
+            return nb::ndarray<uint8_t, nb::pytorch, nb::c_contig>(
+                const_cast<uint8_t*>(ptr), 1, shape, nb::find(&self));
           },
           nb::arg("layer_idx") = 0, nb::arg("shard_idx") = 0)
       .def_prop_ro("local_port", &WeightSynchronizer::local_port)
