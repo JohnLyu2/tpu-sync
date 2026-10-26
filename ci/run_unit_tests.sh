@@ -80,6 +80,8 @@ apt-get update -qq
 # predates parts of the C++20 library this code uses, so 12 is installed
 # alongside it and clang selects it automatically.
 apt-get install -y -qq clang-18 libstdc++-12-dev >/dev/null
+# Required by the peregrine module.
+apt-get install -y -qq libibverbs-dev >/dev/null
 ln -sf /usr/bin/clang-18 /usr/bin/clang
 ln -sf /usr/bin/clang++-18 /usr/bin/clang++
 export CC=clang-18

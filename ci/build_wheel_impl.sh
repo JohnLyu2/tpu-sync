@@ -108,6 +108,8 @@ apt-get update -qq
 # one the container ships (libstdc++.so.6.0.30), so nothing new is required at
 # load time.
 apt-get install -y -qq clang-18 libstdc++-12-dev >/dev/null
+# Required by the peregrine module.
+apt-get install -y -qq libibverbs-dev >/dev/null
 ln -sf /usr/bin/clang-18 /usr/bin/clang
 ln -sf /usr/bin/clang++-18 /usr/bin/clang++
 # Bazel's auto-configured C++ toolchain takes the compiler from CC and falls
