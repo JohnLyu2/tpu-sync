@@ -1,8 +1,7 @@
 # Pool-reshard transfer: model and results
 
 The reference map from the pool-addressed resharding KV-cache transfer C++ to
-its Lean models under `TpuSyncVerify/Transfer/Reshard/`, sibling to
-[prefill_decode.md](prefill_decode.md).
+its Lean models under `TpuSyncVerify/Transfer/Reshard/`.
 
 Each module's docstring owns its state table, event table, assumptions,
 properties and `## Source map`; this page routes between them. It says what is
