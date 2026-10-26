@@ -789,12 +789,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   size_t GetAllocatedHostDramBytes() const;
 
   // Synchronous on-chip H2D offload (bypasses background worker thread queue).
+  // |host_layer_idx| is the host layer buffer the copy reads; it requires a
+  // single |layer_idx| and defaults to that device layer's own host buffer.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
       const std::vector<int64_t>& src_offsets_major_dim = {},
       const std::vector<int64_t>& dst_offsets_major_dim = {},
       const std::vector<int64_t>& copy_sizes_major_dim = {},
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
 
   // Synchronous on-chip D2H offload (bypasses background worker thread queue).
@@ -899,9 +902,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::string worker_id_;
   TransferEventHooks transfer_hooks_;
 
+  // One shard copy between device layer |layer_idx| (buffer_holds_) and host
+  // layer buffer |host_layer_idx| (layers_). The two index spaces coincide
+  // while every device layer has a host buffer of its own.
   struct CopyWork {
     size_t layer_idx;
     size_t shard_idx;
+    size_t host_layer_idx;
   };
 
   absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchH2dWork(

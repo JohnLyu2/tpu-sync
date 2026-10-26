@@ -765,6 +765,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
     const std::vector<int64_t>& dst_offsets_major_dim,
     const std::vector<int64_t>& copy_sizes_major_dim,
     std::optional<int64_t> slot_idx, std::optional<size_t> target_layer_idx,
+    std::optional<size_t> host_layer_idx,
     std::optional<size_t> target_shard_idx) {
   const absl::Time h2d_start = absl::Now();
   VLOG(1) << "KVCacheManagerBase::H2dSyncDispatch called. Thread: "
@@ -775,7 +776,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
                                            : "all")
           << ", target_shard: "
           << (target_shard_idx.has_value() ? std::to_string(*target_shard_idx)
-                                           : "all");
+                                           : "all")
+          << ", host_layer: "
+          << (host_layer_idx.has_value() ? std::to_string(*host_layer_idx)
+                                         : "same");
 
   if (buffer_holds_.empty()) {
     return absl::FailedPreconditionError(
@@ -788,6 +792,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
   }
   if (target_shard_idx.has_value() && *target_shard_idx >= num_shards_) {
     return absl::OutOfRangeError("layer or shard index out of range");
+  }
+  if (host_layer_idx.has_value() && !target_layer_idx.has_value()) {
+    return absl::InvalidArgumentError(
+        "host_layer_idx requires a single target layer");
   }
   std::vector<int64_t> src_c, dst_c, sizes_c;
   CoalesceMajorDimCopies(src_offsets_major_dim, dst_offsets_major_dim,
@@ -815,7 +823,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
           node = GetPjRtDeviceNumaNode(device);
         }
       }
-      grouped_work[node].push_back({layer_idx, shard_idx});
+      grouped_work[node].push_back(
+          {layer_idx, shard_idx, host_layer_idx.value_or(layer_idx)});
     }
   }
 
@@ -949,7 +958,9 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
           node = GetPjRtDeviceNumaNode(device);
         }
       }
-      grouped_work[node].push_back({layer_idx, shard_idx});
+      // D2H writes a layer into its own host buffer.
+      grouped_work[node].push_back(
+          {layer_idx, shard_idx, /*host_layer_idx=*/layer_idx});
     }
   }
 
@@ -2689,7 +2700,14 @@ KVCacheManagerBase::DispatchH2dWork(
           << works.size() << ", Thread: " << std::this_thread::get_id();
   std::vector<raiden::PjRtCopyFuture> local_futures;
   for (const auto& work : works) {
-    const auto& layer_info = layers_[work.layer_idx];
+    // Device side of the copy is layer_idx's buffer; host side is host layer
+    // buffer host_layer_idx, whose device_size bounds copies through it.
+    if (work.host_layer_idx >= layers_.size()) {
+      return absl::OutOfRangeError(
+          absl::StrCat("host layer ", work.host_layer_idx,
+                       " out of range: ", layers_.size(), " host layers"));
+    }
+    const auto& layer_info = layers_[work.host_layer_idx];
     const auto& shard_hold =
         buffer_holds_[work.layer_idx].holds[work.shard_idx];
     const auto& shard_info = layer_info.shards[work.shard_idx];
@@ -2698,8 +2716,8 @@ KVCacheManagerBase::DispatchH2dWork(
     size_t host_size = 0;
     if (slot_idx.has_value()) {
       TF_ASSIGN_OR_RETURN(KVCacheHostSpan span,
-                          HostSpan(work.layer_idx, work.shard_idx, *slot_idx,
-                                   staging_max_major_per_slot_));
+                          HostSpan(work.host_layer_idx, work.shard_idx,
+                                   *slot_idx, staging_max_major_per_slot_));
       base_host_ptr = span.ptr;
       host_size = span.nbytes;
     } else {
@@ -2708,6 +2726,7 @@ KVCacheManagerBase::DispatchH2dWork(
     }
     VLOG(1) << "DispatchH2dWork: Layer: " << work.layer_idx
             << ", Shard: " << work.shard_idx
+            << ", host layer: " << work.host_layer_idx
             << ", base_host_ptr: " << (void*)base_host_ptr
             << ", host_size: " << host_size;
 
@@ -2781,7 +2800,14 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
           << works.size() << ", Thread: " << std::this_thread::get_id();
   std::vector<raiden::PjRtCopyFuture> local_futures;
   for (const auto& work : works) {
-    const auto& layer_info = layers_[work.layer_idx];
+    // Device side of the copy is layer_idx's buffer; host side is host layer
+    // buffer host_layer_idx, whose device_size bounds copies through it.
+    if (work.host_layer_idx >= layers_.size()) {
+      return absl::OutOfRangeError(
+          absl::StrCat("host layer ", work.host_layer_idx,
+                       " out of range: ", layers_.size(), " host layers"));
+    }
+    const auto& layer_info = layers_[work.host_layer_idx];
     const auto& shard_hold =
         buffer_holds_[work.layer_idx].holds[work.shard_idx];
     const auto& shard_info = layer_info.shards[work.shard_idx];
@@ -2790,8 +2816,8 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
     size_t host_size = 0;
     if (slot_idx.has_value()) {
       TF_ASSIGN_OR_RETURN(KVCacheHostSpan span,
-                          HostSpan(work.layer_idx, work.shard_idx, *slot_idx,
-                                   staging_max_major_per_slot_));
+                          HostSpan(work.host_layer_idx, work.shard_idx,
+                                   *slot_idx, staging_max_major_per_slot_));
       dst_host_ptr = span.ptr;
       host_size = span.nbytes;
     } else {
@@ -2800,6 +2826,7 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
     }
     VLOG(1) << "DispatchD2hWork: Layer: " << work.layer_idx
             << ", Shard: " << work.shard_idx
+            << ", host layer: " << work.host_layer_idx
             << ", dst_host_ptr: " << (void*)dst_host_ptr
             << ", host_size: " << host_size;
 
@@ -3493,6 +3520,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dAsyncDispatch(
                sizes = copy_sizes_major_dim, slot_idx, target_layer_idx,
                target_shard_idx]() mutable {
     return this->H2dSyncDispatch(src, dst, sizes, slot_idx, target_layer_idx,
+                                 /*host_layer_idx=*/std::nullopt,
                                  target_shard_idx);
   };
   task.promise = std::move(promise);
@@ -3519,7 +3547,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2d(
   }
   return H2dSyncDispatch(src_offsets_major_dim, dst_offsets_major_dim,
                          copy_sizes_major_dim, slot_idx, target_layer_idx,
-                         target_shard_idx);
+                         /*host_layer_idx=*/std::nullopt, target_shard_idx);
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hAsyncDispatch(

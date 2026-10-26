@@ -914,6 +914,7 @@ class TestH2dKVCacheManager : public TestKVCacheManager {
       const std::vector<int64_t>& copy_sizes_major_dim = {},
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt) override {
     h2d_called_ = true;
     last_h2d_src_offsets_ = src_offsets_major_dim;
@@ -1318,6 +1319,7 @@ class TestBackgroundKVCacheManager : public TestKVCacheManager {
       const std::vector<int64_t>& dst_offsets_major_dim,
       const std::vector<int64_t>& copy_sizes_major_dim,
       std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+      std::optional<size_t> host_layer_idx,
       std::optional<size_t> shard_idx) override {
     absl::MutexLock lock(mu_);
     execution_order_.push_back("H2dSyncDispatch");

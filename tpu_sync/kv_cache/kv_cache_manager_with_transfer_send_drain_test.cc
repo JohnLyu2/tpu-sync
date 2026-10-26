@@ -265,6 +265,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
         const std::vector<int64_t>& dst_offsets_major_dim,
         const std::vector<int64_t>& copy_sizes_major_dim,
         std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+        std::optional<size_t> host_layer_idx,
         std::optional<size_t> shard_idx) override {
       if (owner_->block_dispatch_.load()) {
         owner_->dispatch_entered_.Notify();

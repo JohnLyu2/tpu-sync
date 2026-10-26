@@ -713,7 +713,8 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
       injected.ok()
           ? base_->H2dSyncDispatch(copy_spec.src_offsets, copy_spec.dst_offsets,
                                    copy_spec.sizes, /*slot_idx=*/std::nullopt,
-                                   /*layer_idx=*/layer_idx)
+                                   /*layer_idx=*/layer_idx,
+                                   /*host_layer_idx=*/layer_idx)
           : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
   if (!future_or.ok()) {
     absl::MutexLock lock(mu_);
