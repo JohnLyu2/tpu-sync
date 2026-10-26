@@ -13,6 +13,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation
 import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 import TpuSyncVerify.Transfer.PrefillDecode.Transport
 import TpuSyncVerify.Transfer.PrefillDecode.Caller
+import TpuSyncVerify.Transfer.Reshard.Receive
 -- The remaining Transfer models and the Controller model land in follow-up
 -- changes and are imported here as they arrive.
 
