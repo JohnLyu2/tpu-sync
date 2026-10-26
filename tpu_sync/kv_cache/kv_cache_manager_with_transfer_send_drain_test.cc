@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -54,6 +55,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
 namespace {
@@ -191,6 +193,16 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
                int32_t blocks_per_layer = 1,
                std::optional<std::chrono::steady_clock::time_point> deadline =
                    std::nullopt) {
+    ::tpu_sync::rpc::StartTransferRequest plan;
+    plan.set_uuid(uuid);
+    plan.set_use_block_chunks(true);
+    auto* entry = (*plan.mutable_shard_push_schedules())[0].add_entries();
+    entry->set_dst_shard_idx(0);
+    entry->set_src_block_id(0);
+    entry->set_dst_block_id(0);
+    entry->set_size_bytes(base()->block_bytes(0));
+    entry->set_count(blocks_per_layer);
+    CHECK_OK(RegisterActivePlan(uuid, plan, /*is_sender=*/false));
     absl::MutexLock lock(mu_);
     active_recv_sessions_[uuid] = *TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
@@ -198,6 +210,14 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {
+    if (base()->num_host_layers() < base()->num_layers()) {
+      std::vector<transport::BlockChunk> chunks =
+          base()->GetBlockChunks(layer, /*shard_idx=*/0, /*block_ids=*/{0},
+                                 base()->block_bytes(layer), uuid);
+      if (chunks.empty()) {
+        return absl::CancelledError("GetBlockChunks returned no chunks");
+      }
+    }
     return base()->OnLayerReceived(layer, uuid);
   }
 
@@ -217,9 +237,21 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     return copies_.size();
   }
 
+  // Host layer buffer the `index`-th copy issued reads from; -1 when the copy
+  // named none.
+  int64_t copy_source(size_t index) {
+    absl::MutexLock lock(copies_mu_);
+    return copy_sources_.at(index);
+  }
+
   size_t free_slots() { return staging_allocator_->num_free_slots(); }
   StagingBlockAllocator* staging_allocator() {
     return staging_allocator_.get();
+  }
+
+  const StagingLayerManager& staging_layer_manager(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    return active_recv_sessions_.at(uuid)->staging_layer_manager();
   }
 
   bool has_recv(uint64_t uuid) {
@@ -274,6 +306,9 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
       auto [promise, future] = xla::MakePromise<>();
       absl::MutexLock lock(owner_->copies_mu_);
       owner_->copies_.push_back(std::move(promise));
+      owner_->copy_sources_.push_back(
+          host_layer_idx.has_value() ? static_cast<int64_t>(*host_layer_idx)
+                                     : -1);
       return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
     }
 
@@ -283,9 +318,24 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
 
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_;
+  std::vector<int64_t> copy_sources_;
   std::atomic<bool> block_dispatch_{false};
   absl::Notification dispatch_entered_;
   absl::Notification release_dispatch_;
+};
+
+// Sets environment variable |name| to |value| until destroyed. The staging
+// geometry is read once when a manager is constructed, so the guard only has
+// to outlive construction.
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    setenv(name, value, /*overwrite=*/1);
+  }
+  ~ScopedEnv() { unsetenv(name_); }
+
+ private:
+  const char* name_;
 };
 
 class DispatchReleaseGuard {
@@ -1092,6 +1142,207 @@ TEST(RecvLifecycleTest,
       peer, /*src_block_ids=*/{0}, /*dst_block_ids=*/{3}, /*uuid=*/42);
   EXPECT_FALSE(rejected.ok());
   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
+}
+
+// StagingLayerManager: TPU_RAIDEN_NUM_STAGING_LAYERS=4 leaves four host layer
+// buffers for a 64-layer cache. Layers lease them in arrival order, a fifth
+// layer waits for a release, and a released buffer goes to the waiting layer
+// whichever layer freed it.
+TEST(RecvLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
+  constexpr size_t kNumLayers = 64;
+  constexpr size_t kNumStagingLayers = 4;
+  const size_t full_dram_bytes =
+      RecvTestManager(kNumLayers).base()->GetAllocatedHostDramBytes();
+  ASSERT_GT(full_dram_bytes, 0);
+
+  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
+  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0);
+  kv_cache::KVCacheManagerBase* base = consumer.base();
+  EXPECT_EQ(base->num_host_layers(), kNumStagingLayers);
+  EXPECT_EQ(base->GetAllocatedHostDramBytes(),
+            full_dram_bytes / (kNumLayers / kNumStagingLayers));
+  EXPECT_NE(base->GetHostPointer(kNumStagingLayers - 1, 0), nullptr);
+  EXPECT_EQ(base->GetHostPointer(kNumStagingLayers, 0), nullptr);
+
+  consumer.AddRecv("req_staging_layers", /*uuid=*/104);
+  const StagingLayerManager& staging_manager =
+      consumer.staging_layer_manager(104);
+  EXPECT_EQ(staging_manager.num_free(), kNumStagingLayers);
+
+  // The transport addresses layer 0's bytes before the layer completes: the
+  // chunk lands in the buffer leased to layer 0 on that first touch.
+  const size_t block_bytes = base->block_bytes(0);
+  std::vector<transport::BlockChunk> chunks = base->GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, /*block_ids=*/{0}, block_bytes,
+      /*uuid=*/104);
+  ASSERT_EQ(chunks.size(), 1);
+  ASSERT_THAT(staging_manager.Lookup(0), Optional(0u));
+  EXPECT_EQ(chunks[0].ptr, base->GetHostPointer(0, 0));
+
+  // Layers 0..3 lease the four buffers in arrival order and upload from them.
+  for (size_t layer = 0; layer < kNumStagingLayers; ++layer) {
+    ASSERT_THAT(consumer.ReceiveLayer(layer, /*uuid=*/104),
+                ::absl_testing::IsOk());
+    EXPECT_THAT(staging_manager.Lookup(layer), Optional(layer));
+    EXPECT_EQ(consumer.copy_source(layer), static_cast<int64_t>(layer));
+  }
+  EXPECT_EQ(consumer.copies_issued(), kNumStagingLayers);
+  EXPECT_EQ(staging_manager.num_free(), 0);
+
+  // Layer 4 finds every buffer leased and waits.
+  absl::Notification layer4_started;
+  absl::Notification layer4_done;
+  absl::Status layer4_status;
+  std::thread layer4_thread([&] {
+    layer4_started.Notify();
+    layer4_status = consumer.ReceiveLayer(/*layer=*/4, /*uuid=*/104);
+    layer4_done.Notify();
+  });
+  layer4_started.WaitForNotification();
+  EXPECT_FALSE(
+      layer4_done.WaitForNotificationWithTimeout(absl::Milliseconds(50)));
+  EXPECT_EQ(consumer.copies_issued(), kNumStagingLayers);
+
+  // Completing layer 1's upload frees its buffer, which layer 4 takes.
+  consumer.FinishCopy(1, absl::OkStatus());
+  ASSERT_TRUE(layer4_done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+  layer4_thread.join();
+  EXPECT_THAT(layer4_status, ::absl_testing::IsOk());
+  EXPECT_EQ(staging_manager.Lookup(1), std::nullopt);
+  EXPECT_THAT(staging_manager.Lookup(4), Optional(1u));
+  EXPECT_EQ(consumer.copy_source(4), 1);
+
+  // Stream the remaining layers through the manager: each takes the buffer of
+  // the upload completed just before it.
+  for (size_t layer = 5; layer < kNumLayers; ++layer) {
+    const size_t finished_layer = layer == 5 ? 0 : layer - 4;
+    const size_t freed_slot = *staging_manager.Lookup(finished_layer);
+    consumer.FinishCopy(finished_layer, absl::OkStatus());
+    ASSERT_THAT(consumer.ReceiveLayer(layer, /*uuid=*/104),
+                ::absl_testing::IsOk());
+    EXPECT_THAT(staging_manager.Lookup(layer), Optional(freed_slot));
+    EXPECT_EQ(consumer.copy_source(layer), static_cast<int64_t>(freed_slot));
+  }
+  for (size_t layer = kNumLayers - kNumStagingLayers; layer < kNumLayers;
+       ++layer) {
+    consumer.FinishCopy(layer, absl::OkStatus());
+  }
+  EXPECT_EQ(staging_manager.num_free(), kNumStagingLayers);
+
+  Reports reports = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(reports), Contains("req_staging_layers"));
+  EXPECT_THAT(FailedRecving(reports), IsEmpty());
+  EXPECT_FALSE(consumer.has_recv(104));
+}
+
+TEST(RecvLifecycleTest,
+     StagingLayerManagerReleasesAllResourcesAcrossFailureModes) {
+  constexpr size_t kNumLayers = 16;
+  constexpr size_t kNumStagingLayers = 4;
+  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
+  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0);
+  kv_cache::KVCacheManagerBase* base = consumer.base();
+  const size_t block_bytes = base->block_bytes(0);
+
+  // 1. H2D failure while a 5th layer is blocked in
+  //    StagingLayerManager::Acquire: failing layer 0 shuts down the manager
+  //    before releasing slot 0 so layer 4 wakes with cancellation instead of
+  //    issuing another H2D copy, and the host staging allocation stays pinned
+  //    until layers 1..3 finish.
+  consumer.AddRecv("req_h2d_fail_with_waiter", /*uuid=*/201);
+  const StagingLayerManager& manager1 = consumer.staging_layer_manager(201);
+  // Calling OnLayerReceived before GetBlockChunks leased a buffer is rejected.
+  EXPECT_THAT(base->OnLayerReceived(/*layer_idx=*/0, /*uuid=*/201),
+              ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+  for (size_t layer = 0; layer < kNumStagingLayers; ++layer) {
+    ASSERT_THAT(consumer.ReceiveLayer(layer, /*uuid=*/201),
+                ::absl_testing::IsOk());
+  }
+  EXPECT_EQ(consumer.copies_issued(), kNumStagingLayers);
+  EXPECT_EQ(manager1.num_free(), 0);
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  absl::Notification layer4_started;
+  absl::Notification layer4_done;
+  absl::Status layer4_status;
+  std::thread layer4_thread([&] {
+    layer4_started.Notify();
+    layer4_status = consumer.ReceiveLayer(/*layer=*/4, /*uuid=*/201);
+    layer4_done.Notify();
+  });
+  layer4_started.WaitForNotification();
+  EXPECT_FALSE(
+      layer4_done.WaitForNotificationWithTimeout(absl::Milliseconds(50)));
+
+  consumer.FinishCopy(0, absl::InternalError("H2D error on layer 0"));
+  ASSERT_TRUE(layer4_done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+  layer4_thread.join();
+  EXPECT_THAT(layer4_status,
+              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  // Layer 4 was cancelled in GetBlockChunks and did not start a 5th H2D copy.
+  EXPECT_EQ(consumer.copies_issued(), kNumStagingLayers);
+  // Layers 1..3 are still in flight, so the staging block remains pinned.
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  for (size_t layer = 1; layer < kNumStagingLayers; ++layer) {
+    consumer.FinishCopy(layer, absl::OkStatus());
+  }
+  EXPECT_EQ(manager1.num_free(), kNumStagingLayers);
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  Reports reports1 = consumer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(reports1), Contains("req_h2d_fail_with_waiter"));
+  EXPECT_FALSE(consumer.has_recv(201));
+
+  // 2. Network push failure after GetBlockChunks leased a staging slot (before
+  //    OnLayerReceived is ever reached): EndIncomingPush fails the session and
+  //    releases both the layer lease and the staging block.
+  consumer.AddRecv("req_push_abort_after_chunk", /*uuid=*/202);
+  const StagingLayerManager& manager2 = consumer.staging_layer_manager(202);
+  ASSERT_THAT(base->BeginIncomingPush(/*uuid=*/202), ::absl_testing::IsOk());
+  std::vector<transport::BlockChunk> chunks = base->GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, /*block_ids=*/{0}, block_bytes,
+      /*uuid=*/202);
+  ASSERT_EQ(chunks.size(), 1);
+  EXPECT_EQ(manager2.num_free(), kNumStagingLayers - 1);
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FailRecv(/*uuid=*/202, absl::UnavailableError("socket closed"));
+  // Still pinned while the incoming push is in flight.
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+  EXPECT_THAT(base->EndIncomingPush(/*uuid=*/202),
+              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(manager2.num_free(), kNumStagingLayers);
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  Reports reports2 = consumer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(reports2), Contains("req_push_abort_after_chunk"));
+  EXPECT_FALSE(consumer.has_recv(202));
+
+  // 3. StagingLayerManager::Acquire deadline exceeded while all 4 buffers are
+  //    held by in-flight H2D copies: the timeout fails the session, keeps
+  //    staging pinned until the in-flight copies complete, and then releases
+  //    all slots.
+  consumer.AddRecv(
+      "req_staging_timeout", /*uuid=*/203, /*blocks_per_layer=*/1,
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(80));
+  const StagingLayerManager& manager3 = consumer.staging_layer_manager(203);
+  const size_t base_copies = consumer.copies_issued();
+  for (size_t layer = 0; layer < kNumStagingLayers; ++layer) {
+    ASSERT_THAT(consumer.ReceiveLayer(layer, /*uuid=*/203),
+                ::absl_testing::IsOk());
+  }
+  EXPECT_EQ(manager3.num_free(), 0);
+  EXPECT_THAT(consumer.ReceiveLayer(/*layer=*/4, /*uuid=*/203),
+              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  for (size_t i = 0; i < kNumStagingLayers; ++i) {
+    consumer.FinishCopy(base_copies + i, absl::OkStatus());
+  }
+  EXPECT_EQ(manager3.num_free(), kNumStagingLayers);
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  Reports reports3 = consumer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(reports3), Contains("req_staging_timeout"));
+  EXPECT_FALSE(consumer.has_recv(203));
 }
 }  // namespace
 }  // namespace tpu_raiden

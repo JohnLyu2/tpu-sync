@@ -184,6 +184,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
         end_incoming_push;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
+    // Returns the host layer buffer the receive session of |uuid| leased to
+    // |layer_idx|, leasing one if needed and blocking while every buffer is in
+    // use.
+    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
+        acquire_recv_staging;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -785,6 +790,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   uint8_t* GetBlockHostPointer(size_t layer_idx, size_t shard_idx,
                                int block_id) override;
 
+  // Returns the number of allocated host layer buffers (equals num_layers()
+  // unless bounded via TPU_RAIDEN_NUM_STAGING_LAYERS).
+  size_t num_host_layers() const { return layers_.size(); }
+
   // Returns the total number of bytes allocated in host DRAM.
   size_t GetAllocatedHostDramBytes() const;
 
@@ -1116,10 +1125,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // device of |device_layers|[l].holds[s] when present (host-only managers
   // pass no device layers), or from zeroed posix_memalign memory without an
   // allocator, and records that device and its on-device size for H2D/D2H
-  // bounds checks. Fails kInvalidArgument when |num_layers_to_allocate|
-  // exceeds |num_layers|, and with the allocator's status (kResourceExhausted
-  // for posix_memalign, kInternal for a bad allocator result) when an
-  // allocation fails; buffers allocated before the failure are released.
+  // bounds checks.
+  // With fewer buffers than layers any layer may be staged in any buffer, so
+  // every buffer is sized for the widest row and records the largest on-device
+  // size. Fails kInvalidArgument when |num_layers_to_allocate| exceeds
+  // |num_layers|, and with the allocator's status (kResourceExhausted for
+  // posix_memalign, kInternal for a bad allocator result) when an allocation
+  // fails; buffers allocated before the failure are released.
   absl::StatusOr<HostLayers> AllocateHostLayers(
       size_t num_layers, size_t num_shards, size_t num_layers_to_allocate,
       int num_host_blocks, absl::Span<const LayerDeviceInfo> device_layers,

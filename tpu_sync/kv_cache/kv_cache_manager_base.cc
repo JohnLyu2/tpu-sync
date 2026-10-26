@@ -45,6 +45,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -414,6 +415,20 @@ std::vector<transport::ShardInfo> BuildDefaultShards(size_t num_shards) {
   return shards;
 }
 
+// TPU_RAIDEN_NUM_STAGING_LAYERS: number of host layer buffers to allocate.
+// Unset, unparsable, zero, or >= |num_layers| keeps the full per-layer mirror.
+size_t ResolveEnvNumStagingLayers(size_t num_layers) {
+  const char* raw_env = std::getenv("TPU_RAIDEN_NUM_STAGING_LAYERS");
+  size_t requested = 0;
+  if (raw_env == nullptr || !absl::SimpleAtoi(raw_env, &requested) ||
+      requested == 0 || requested >= num_layers) {
+    return num_layers;
+  }
+  LOG(INFO) << "KVCacheManagerBase: allocating " << requested << "/"
+            << num_layers << " host staging layer buffers";
+  return requested;
+}
+
 }  // namespace
 
 KVCacheManagerBase::KVCacheManagerBase(
@@ -508,7 +523,8 @@ KVCacheManagerBase::KVCacheManagerBase(
     buffer_holds_.push_back(std::move(device_info));
   }
   absl::StatusOr<HostLayers> host_layers = AllocateHostLayers(
-      num_layers_, num_shards_, /*num_layers_to_allocate=*/num_layers_,
+      num_layers_, num_shards_,
+      /*num_layers_to_allocate=*/ResolveEnvNumStagingLayers(num_layers_),
       num_host_blocks, buffer_holds_, host_allocator);
   if (!host_layers.ok()) {
     // Constructors cannot return a status; a failed host allocation surfaces
@@ -568,7 +584,8 @@ KVCacheManagerBase::KVCacheManagerBase(
   }
 
   absl::StatusOr<HostLayers> host_layers = AllocateHostLayers(
-      num_layers_, num_shards_, /*num_layers_to_allocate=*/num_layers_,
+      num_layers_, num_shards_,
+      /*num_layers_to_allocate=*/ResolveEnvNumStagingLayers(num_layers_),
       /*num_host_blocks=*/total_blocks, /*device_layers=*/{}, host_allocator);
   if (!host_layers.ok()) {
     throw std::runtime_error(std::string(host_layers.status().message()));
@@ -599,6 +616,24 @@ KVCacheManagerBase::AllocateHostLayers(
         absl::StrCat("num_layers_to_allocate (", num_layers_to_allocate,
                      ") exceeds num_layers (", num_layers, ")"));
   }
+  // With fewer buffers than layers any layer may be staged in any buffer, so
+  // size every buffer for the widest row and bounds-check it against the
+  // largest device buffer.
+  const bool shared_buffers = num_layers_to_allocate < num_layers;
+  int64_t shared_row_bytes = 0;
+  size_t shared_device_size = 0;
+  if (shared_buffers) {
+    for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+      shared_row_bytes =
+          std::max(shared_row_bytes, layer_block_byte_size(layer_idx));
+    }
+    for (const LayerDeviceInfo& device_layer : device_layers) {
+      for (const raiden::BufferHoldAndAlias& hold : device_layer.holds) {
+        shared_device_size =
+            std::max(shared_device_size, hold.GetOnDeviceSizeInBytes());
+      }
+    }
+  }
   HostLayers host_layers;
   host_layers.layers.reserve(num_layers_to_allocate);
   for (size_t layer_idx = 0; layer_idx < num_layers_to_allocate; ++layer_idx) {
@@ -612,11 +647,15 @@ KVCacheManagerBase::AllocateHostLayers(
         const raiden::BufferHoldAndAlias& hold =
             device_layers[layer_idx].holds[shard_idx];
         shard_info.device = hold.device;
-        shard_info.device_size = hold.GetOnDeviceSizeInBytes();
+        shard_info.device_size =
+            std::max(hold.GetOnDeviceSizeInBytes(), shared_device_size);
       }
 
-      // Allocate this layer's host buffer at its OWN row size.
-      size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
+      // Allocate this layer's host buffer at its OWN row size, or at the
+      // widest row when the buffer may stage any layer.
+      size_t alloc_size =
+          num_host_blocks * (shared_buffers ? shared_row_bytes
+                                            : layer_block_byte_size(layer_idx));
       if (host_allocator) {
         absl::StatusOr<HostBufferAllocation> host_alloc =
             host_allocator(alloc_size, shard_info.device);
@@ -1468,7 +1507,7 @@ void KVCacheManagerBase::SetExternalHostBuffer(
   size_t idx = 0;
   size_t old_total = 0;
   size_t new_total = 0;
-  for (size_t l = 0; l < num_layers_; ++l) {
+  for (size_t l = 0; l < layers_.size(); ++l) {
     for (size_t sh = 0; sh < num_shards_; ++sh) {
       if (idx < buffer_holds.size()) {
         void* host_ptr = buffer_holds[idx].GetHostPointer();
@@ -1758,6 +1797,11 @@ size_t KVCacheManagerBase::block_bytes(size_t block_array_idx) const {
 uint8_t* KVCacheManagerBase::GetBlockArrayHostPointer(size_t block_array_idx,
                                                       size_t shard_idx) {
   if (!explicit_pools_) {
+    // When fewer host buffers exist than layers, a layer's bytes sit in a
+    // leased buffer rather than at its own layer index.
+    if (layers_.size() < num_layers_) {
+      return nullptr;
+    }
     return GetHostPointer(block_array_idx, shard_idx);
   }
   if (block_array_idx >= pools_.size()) {
@@ -3256,7 +3300,19 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       }
     }
   } else {
-    base_host_ptr = GetHostPointer(layer_idx, shard_idx);
+    // When fewer host layer buffers exist than layers, a receiving transfer's
+    // layer lives in the buffer its session leased to that layer.
+    size_t host_layer_idx = layer_idx;
+    if (has_plan && !plan_snapshot->is_sender && layers_.size() < num_layers_ &&
+        transfer_hooks_.acquire_recv_staging != nullptr) {
+      absl::StatusOr<size_t> slot =
+          transfer_hooks_.acquire_recv_staging(uuid, layer_idx);
+      if (!slot.ok()) {
+        return {};
+      }
+      host_layer_idx = *slot;
+    }
+    base_host_ptr = GetHostPointer(host_layer_idx, shard_idx);
   }
   // Host base of `block_id`: identity on full mirrors, leased slot otherwise.
   // `host_block` is the (possibly plan-remapped) host block id for full

@@ -15,9 +15,11 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_TRANSFER_RECEIVE_SESSION_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_TRANSFER_RECEIVE_SESSION_H_
 
+#include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <future>  // NOLINT(build/c++11)
 #include <memory>
 #include <optional>
@@ -46,6 +48,49 @@ class StartTransferRequest;
 }  // namespace tpu_sync
 
 namespace tpu_raiden {
+
+// Manages the host layer staging slots of a receive session when fewer host
+// layer buffers are allocated than layers. A layer leases the slot at the head
+// of the free queue when its first bytes arrive, keeps it until its H2D copy
+// completes, and Release() returns the slot to the tail; Acquire() blocks while
+// every slot is leased. Layers may arrive and complete in any order.
+// Thread-safe.
+class StagingLayerManager {
+ public:
+  // Initializes the manager with free slots [0, |num_slots|).
+  explicit StagingLayerManager(size_t num_slots = 0);
+
+  // Returns the slot leased to |unit|, leasing the head free slot if |unit|
+  // has none. Waits until |deadline| for a release when every slot is leased;
+  // fails kDeadlineExceeded on timeout and kCancelled after Shutdown() or once
+  // |*cancelled| is set.
+  absl::StatusOr<size_t> Acquire(size_t unit,
+                                 std::chrono::steady_clock::time_point deadline,
+                                 const std::atomic<bool>* cancelled = nullptr);
+
+  // Returns the slot leased to |unit|, if any.
+  std::optional<size_t> Lookup(size_t unit) const;
+
+  // Ends |unit|'s lease, returning its slot to the tail of the free queue and
+  // waking one waiter. Returns the released slot; nullopt if |unit| held none.
+  std::optional<size_t> Release(size_t unit);
+
+  // Ends every lease.
+  void ReleaseAll();
+
+  // Fails every current and future Acquire() with kCancelled.
+  void Shutdown();
+
+  size_t num_free() const;
+
+ private:
+  mutable absl::Mutex mu_;
+  // Free slots in release order: Acquire() pops the head, Release() pushes
+  // the tail.
+  std::deque<size_t> free_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<size_t, size_t> leases_ ABSL_GUARDED_BY(mu_);
+  bool shutdown_ ABSL_GUARDED_BY(mu_) = false;
+};
 
 // Encapsulates the per-transfer state and execution lifecycle of a consumer
 // receive operation (pull/push H2D receives), including host staging
@@ -158,9 +203,21 @@ class TransferReceiveSession
                                      absl::Span<const int> shard_ids);
 
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
-  // callback.
+  // callback. When fewer host layer buffers exist than layers, the copy reads
+  // the host layer buffer leased to |layer_idx| and the callback releases the
+  // lease.
   absl::Status ExecuteLayerH2d(KVCacheManagerWithTransfer& manager,
                                size_t layer_idx);
+
+  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
+  // has none and blocking while every buffer is in use. A timeout fails the
+  // receive. Callable from any thread; concurrent calls for the same layer
+  // (one per shard stream) observe one lease.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);
+
+  const StagingLayerManager& staging_layer_manager() const {
+    return staging_layer_manager_;
+  }
 
   std::string req_id() const {
     absl::MutexLock lock(mu_);
@@ -182,8 +239,11 @@ class TransferReceiveSession
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
-        blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0,
-                                   0) {}
+        blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
+        staging_layer_manager_(base != nullptr && base->num_host_layers() <
+                                                      base->num_layers()
+                                   ? base->num_host_layers()
+                                   : 0) {}
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
                          uint64_t uuid, std::string req_id,
@@ -197,7 +257,11 @@ class TransferReceiveSession
         total_blocks_(total_blocks),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
         deadline_(deadline),
-        start_time_(std::chrono::steady_clock::now()) {
+        start_time_(std::chrono::steady_clock::now()),
+        staging_layer_manager_(base != nullptr && base->num_host_layers() <
+                                                      base->num_layers()
+                                   ? base->num_host_layers()
+                                   : 0) {
     if (acquire_staging) {
       absl::StatusOr<StagingAllocation> acquired =
           staging_allocator_->Acquire(1);
@@ -311,6 +375,11 @@ class TransferReceiveSession
   // Generation of the plan this receive belongs to; settlement cleanup
   // only touches that registration.
   uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;
+  // staging_layer_manager_ synchronizes itself; cancelled_ mirrors draining_
+  // so waiters in staging_layer_manager_.Acquire() can bail out without taking
+  // mu_.
+  StagingLayerManager staging_layer_manager_;
+  std::atomic<bool> cancelled_{false};
 };
 
 }  // namespace tpu_raiden

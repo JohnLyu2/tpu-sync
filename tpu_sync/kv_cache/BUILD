@@ -580,6 +580,7 @@ cc_test(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:staging_arena",
         "//tpu_sync/fault_injection:hooks",
+        "//tpu_sync/transport:block_transport_delegate",
         "@com_google_absl//absl/base:log_severity",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/log:check",
