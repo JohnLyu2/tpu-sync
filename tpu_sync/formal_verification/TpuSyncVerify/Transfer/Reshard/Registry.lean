@@ -75,7 +75,8 @@ File aliases used in the source map below:
      `RequestBlockRegistry::PurgeExpiredLifecycleLocked` in
      `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
      Sweeps expired registrations, claims, and tombstones (Part V,
-     `purgeExpiredAll_inv`, and Observations R7 & R8).
+     `purgeExpiredAll_inv`, `trace_single_stage_votes_retire_multi_owner_claim`,
+     and `trace_split_ttl_purges_request_blocks_while_claim_active`).
 
   ## Main results
 
@@ -95,8 +96,8 @@ File aliases used in the source map below:
        while `claimedUnits = some expected`, `allVoted expected completedUnits = false`,
        and `Complete` retires the generation only when every unit in `claimedUnits`
        has voted (`complete_retires_iff_all_claimed_voted`).
-  - `purgeExpiredAll_inv` & Observations R7 (`trace_r7_single_stage_votes_retire_multi_owner_claim`)
-    and R8 (`trace_r8_split_ttl_purges_request_blocks_while_claim_active`).
+  - `purgeExpiredAll_inv`, `trace_single_stage_votes_retire_multi_owner_claim`,
+    and `trace_split_ttl_purges_request_blocks_while_claim_active`.
 
   ## Source map
 
@@ -823,7 +824,7 @@ theorem mutant_unconditional_abandon_exposes_sibling_owner_to_cancel :
       some true := by
   decide
 
-/-- **Observation R7 (`RequestBlockRegistry::Completions` and `claimed_owners_`
+/-- **Multi-owner completion voting (`RequestBlockRegistry::Completions` and `claimed_owners_`
 in `request_block_registry.h`, `RequestBlockRegistry::Complete` in
 `request_block_registry.cc`)**:
 Although `claimed_owners_` tracks multiple pipelined `claim_owner` strings for a
@@ -833,7 +834,7 @@ by `(req_id, uuid)` (not `(req_id, uuid, claim_owner)`), and `Complete` calls
 stage `101` and stage `102` both hold active claims (`claimOwners = [102, 101]`),
 stage `101`'s source units voting `.complete 0` and `.complete 1` immediately
 retires the generation and erases `102`'s claim and source blocks. -/
-theorem trace_r7_single_stage_votes_retire_multi_owner_claim :
+theorem trace_single_stage_votes_retire_multi_owner_claim :
     (RegGen.sys.run
       [ .register 0 true
       , .register 1 true
@@ -845,7 +846,7 @@ theorem trace_r7_single_stage_votes_retire_multi_owner_claim :
       some (true, none, [], []) := by
   decide
 
-/-! ## Part V — Wall-Clock TTL Expiration (`PurgeExpired*`) and Observation R8 -/
+/-! ## Part V — Wall-Clock TTL Expiration (`PurgeExpired*`) -/
 
 /-- `RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`
 (`tpu_sync/kv_cache/reshard/request_block_registry.cc`):
@@ -901,7 +902,7 @@ theorem trace_ttl_purges_expired_registrations_and_tombstones :
       some (.cancelled, .unknown)) := by
   decide
 
-/-- **Observation R8 (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`,
+/-- **Split TTL expiration (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`,
 `RequestBlockRegistry::Register` `registration.expires_at = now + ttl_s_;`, and
 `RequestBlockRegistry::LookupAndClaim` `claimed_[lifecycle_key] = now + ttl_s_;`
 in `request_block_registry.cc`)**:
@@ -917,7 +918,7 @@ erases `request_blocks_[(req_id, unit)]` while `claimed_` is still active
 2. A second pipelined stage calling `lookupAndClaim 102 [0]` in that window fails
    (`none`) with `"Missing producer block registration"`
    (`RequestBlockRegistry::LookupAndClaim` `for (const RaidenId& unit : units)`). -/
-theorem trace_r8_split_ttl_purges_request_blocks_while_claim_active :
+theorem trace_split_ttl_purges_request_blocks_while_claim_active :
     ((RegGen.sys.run [.register 0 true, .lookupAndClaim 101 [0]]).map
       (fun s =>
         let s_split := s.purgeExpiredRequestBlocks

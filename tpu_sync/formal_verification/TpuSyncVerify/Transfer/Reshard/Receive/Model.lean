@@ -56,7 +56,7 @@ structure Pool where
 shipping code, mirrors the `TransferReceiveSession` branch by calling
 `reshard_session->Finish(status)` before `reshard_session->EndRecvOp()` when
 the incoming push failed; `endOpOnly` is the mutant that calls `EndRecvOp()`
-unconditionally (`trace_r1_failed_incoming_push` shows what that leaks). -/
+unconditionally (`trace_failed_incoming_push` shows what that leaks). -/
 inductive PushEndPolicy where
   | finishOnError
   | endOpOnly

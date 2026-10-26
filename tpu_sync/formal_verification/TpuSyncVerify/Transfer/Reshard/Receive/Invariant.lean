@@ -540,7 +540,7 @@ theorem reachable_safe {ranks : List Nat} {pol : PushEndPolicy} {s : Recv}
     (h : (sys ranks pol).Reachable s) : Safe pol s :=
   inv_safe pol (reachable_inv h)
 
-/-- Audit R3: at callback granularity `pollReady` (`IsReadyToComplete` in
+/-- At callback granularity `pollReady` (`IsReadyToComplete` in
 `CompleteReadWithDetails`) is disabled on every reachable state, because
 `FinishPoolH2d` sets `network_completed_ = true` immediately before
 `Finish(terminal_status)`. -/

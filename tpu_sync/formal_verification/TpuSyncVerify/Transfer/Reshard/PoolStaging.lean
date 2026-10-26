@@ -84,7 +84,7 @@ line ranges for every symbol, sub-block, and test are in the generated
   - `reachable_reserveBeforeLease_safe`: under the shipping `reserveBeforeLease`
     protocol (claiming `uuid` before acquiring staging leases), every reachable
     state keeps active session leases live and pairwise slot-disjoint.
-  - `trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`: constructive
+  - `trace_duplicate_uuid_frees_survivor_lease_and_aliases_slot`: constructive
     counterexample trace under the `leaseBeforeReserve` mutant showing a
     rejected duplicate-UUID arm freeing the survivor's lease
     and a third session (`uuid = 8`) receiving the same physical slot `0`.

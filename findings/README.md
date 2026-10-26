@@ -1344,11 +1344,13 @@ clone reset. Results, verbatim:
   longer carries finding numbers, filing status, reproducer or patch
   pointers, or fixed-defect history — it describes the code as it is, and this
   file is the only home of that tracking. Consequences for cross-references:
-  `reshard.md`'s table is now "Observations (`R2a`–`R8`)" — the rows for R1
-  (F7) and R5 (F6), both fixed upstream, are gone; their pre-fix behaviour
-  remains in Lean only as the mutants `PushEndPolicy.endOpOnly`
-  (`trace_r1_failed_incoming_push`) and `RegistrationPolicy.leaseBeforeReserve`
-  (`trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot`). The C1
+  `reshard.md` and `TpuSyncVerify/Transfer/Reshard/` dropped the `R1`–`R8`
+  labels and `trace_r*` prefixes (`trace_failed_incoming_push`,
+  `trace_duplicate_uuid_frees_survivor_lease_and_aliases_slot`,
+  `trace_partial_arm_orphans_armed_receiver`,
+  `trace_dispatch_failure_orphans_receivers_and_claim`,
+  `trace_single_stage_votes_retire_multi_owner_claim`,
+  `trace_split_ttl_purges_request_blocks_while_claim_active`). The C1
   traces in `Caller.lean` were renamed `trace_c1_*` →
   `trace_current_connector_*`. `read_remote.md` lost its "Reproducers and
   patches" and "Upstream fix" status rows. The sync log moved to

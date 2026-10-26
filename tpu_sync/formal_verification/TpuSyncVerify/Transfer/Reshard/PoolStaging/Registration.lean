@@ -172,7 +172,7 @@ Under the unreserved mutant `.leaseBeforeReserve`:
    while Call 1 (`uuid = 7`) is still in `activeSessions`!
 4. Call 3 (`uuid = 8`, `blocks = [12]`) then arms and acquires **slot 0**, the
    exact physical staging slot that Call 1 (`uuid = 7`) was using. -/
-def r5CounterexampleEvents : List RegEv :=
+def duplicateUuidCounterexampleEvents : List RegEv :=
   [ .beginArm 1 7 [5]
   , .beginArm 2 7 [5]
   , .acquireArmLease 1
@@ -183,8 +183,8 @@ def r5CounterexampleEvents : List RegEv :=
   , .acquireArmLease 3
   , .finishArm 3 ]
 
-theorem trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot :
-    ((RegState.sys .leaseBeforeReserve 2).run r5CounterexampleEvents).map
+theorem trace_duplicate_uuid_frees_survivor_lease_and_aliases_slot :
+    ((RegState.sys .leaseBeforeReserve 2).run duplicateUuidCounterexampleEvents).map
       (fun s =>
         ( s.hasActiveUuid 7
         , s.arena.lookupLease 7
@@ -197,8 +197,8 @@ theorem trace_r5_duplicate_uuid_frees_survivor_lease_and_aliases_slot :
 (`PoolStagingRecvRegistrationTest.ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease`),
 the duplicate-UUID race is rejected at step 2 (`.beginArm 2 7 [5]`) because
 `uuid = 7` is already claimed by Call 1. -/
-theorem r5_blocked_by_reserveBeforeLease :
-    (RegState.sys .reserveBeforeLease 2).run r5CounterexampleEvents = none := by
+theorem duplicate_uuid_blocked_by_reserveBeforeLease :
+    (RegState.sys .reserveBeforeLease 2).run duplicateUuidCounterexampleEvents = none := by
   decide
 
 

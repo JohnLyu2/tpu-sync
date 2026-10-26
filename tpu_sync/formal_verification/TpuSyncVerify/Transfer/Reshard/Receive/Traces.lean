@@ -204,7 +204,7 @@ mutant the hook ends the op without finishing the session, leaving
 `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline` —
 `pushEnd false` immediately drains and settles the session, releasing the pool
 staging lease and unregistering the plan. -/
-theorem trace_r1_failed_incoming_push :
+theorem trace_failed_incoming_push :
     -- `.endOpOnly` mutant: after `[.pushBegin, .pushEnd false]`, session is still open and holds staging/plan.
     ((sys [0] .endOpOnly).run [.pushBegin, .pushEnd false]).map
       (fun r => (r.life.draining, r.life.done, r.life.hasStaging, r.planUnregistered)) =

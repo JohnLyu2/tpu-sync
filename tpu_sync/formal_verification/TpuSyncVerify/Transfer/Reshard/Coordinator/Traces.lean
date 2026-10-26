@@ -1,7 +1,7 @@
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Hardened
 
-/-! # `Coordinator`: risk R2a & R2b counterexamples, happy-path trace, and mutants
+/-! # `Coordinator`: failure-cleanup counterexamples, happy-path trace, and mutants
 
 Part of `TpuSyncVerify.Transfer.Reshard.Coordinator`. -/
 
@@ -11,16 +11,16 @@ open TpuSyncVerify
 
 open TpuSyncVerify.Transfer.Reshard.Registry
 
-/-! ## Part V — Risk R2a & R2b Counterexamples, Happy-Path Trace, and Mutants -/
+/-! ## Part V — Failure-Cleanup Counterexamples, Happy-Path Trace, and Mutants -/
 
-/-- **Risk R2a Counterexample Trace (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : arm_status)`)**:
+/-- **Partial-arm failure counterexample trace (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : arm_status)`)**:
 Two source units `[0, 1]` and two destination units `[10, 11]`.
 During Stage 1 (receiver arming), `dst_unit 10` succeeds (`armDstResult 10 true`),
 creating an active `ReshardReceiveSession` holding a `PoolStagingLease`, while
 `dst_unit 11` fails (`armDstResult 11 false`).
 At `finishArmBarrier`, the shipping coordinator calls `AbandonClaim` and returns
 `arm_status` (`.aborted`) **without disarming `dst_unit 10`**. -/
-def r2aPartialArmFailureTrace : List Ev :=
+def partialArmFailureTrace : List Ev :=
   [ .registerProducer 0
   , .registerProducer 1
   , .startPlan true
@@ -28,11 +28,11 @@ def r2aPartialArmFailureTrace : List Ev :=
   , .armDstResult 11 false
   , .finishArmBarrier ]
 
-/-- Under `.shipping`, `r2aPartialArmFailureTrace` ends in `.aborted` with
+/-- Under `.shipping`, `partialArmFailureTrace` ends in `.aborted` with
 `dst_unit 10` still holding `sessionArmed = true` and `stagingLeaseHeld = true`
 (orphaned until `timeout_s_`). -/
-theorem trace_r2a_partial_arm_orphans_armed_receiver :
-    ((CoordState.sys .shipping [0, 1] [10, 11] 101).run r2aPartialArmFailureTrace).map
+theorem trace_partial_arm_orphans_armed_receiver :
+    ((CoordState.sys .shipping [0, 1] [10, 11] 101).run partialArmFailureTrace).map
       (fun s =>
         ( s.phase
         , s.dstStates.map (fun d => (d.unit, d.sessionArmed, d.stagingLeaseHeld))
@@ -40,7 +40,7 @@ theorem trace_r2a_partial_arm_orphans_armed_receiver :
       some (.aborted, [(10, true, true), (11, false, false)], none) := by
   decide
 
-/-- **Risk R2b Counterexample Trace (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : sender_status)`)**:
+/-- **Sender-dispatch failure counterexample trace (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : sender_status)`)**:
 Two source units `[0, 1]` and two destination units `[10, 11]`.
 Both `dst_unit 10` and `dst_unit 11` arm in Stage 1 (`finishArmBarrier` transitions
 to `.dispatching`). During Stage 2 (sender dispatch), `src_unit 0` succeeds
@@ -49,7 +49,7 @@ to `.dispatching`). During Stage 2 (sender dispatch), `src_unit 0` succeeds
 At `finishSendBarrier`, the shipping coordinator returns `sender_status`
 (`.aborted`) **without disarming `dst_units` AND without calling
 `registry_->AbandonClaim(args.req_id, uuid, claim_owner)`**! -/
-def r2bDispatchFailureTrace : List Ev :=
+def dispatchFailureTrace : List Ev :=
   [ .registerProducer 0
   , .registerProducer 1
   , .startPlan true
@@ -60,13 +60,13 @@ def r2bDispatchFailureTrace : List Ev :=
   , .sendSrcResult 1 false
   , .finishSendBarrier ]
 
-/-- Under `.shipping`, `r2bDispatchFailureTrace` ends in `.aborted` with:
+/-- Under `.shipping`, `dispatchFailureTrace` ends in `.aborted` with:
 1. Both `dst_unit 10` and `dst_unit 11` orphaned with `sessionArmed = true` and
    `stagingLeaseHeld = true` (waiting for `src_unit 1`'s push until `timeout_s_`);
 2. `s.reg.claimedUnits = some [0, 1]` and `s.reg.claimOwners = [101]` leaked in
    `RequestBlockRegistry` (blocking `CancelIfUnclaimed` until `ttl_s_`). -/
-theorem trace_r2b_dispatch_failure_orphans_receivers_and_claim :
-    ((CoordState.sys .shipping [0, 1] [10, 11] 101).run r2bDispatchFailureTrace).map
+theorem trace_dispatch_failure_orphans_receivers_and_claim :
+    ((CoordState.sys .shipping [0, 1] [10, 11] 101).run dispatchFailureTrace).map
       (fun s =>
         ( s.phase
         , s.dstStates.map (fun d => (d.unit, d.sessionArmed, d.stagingLeaseHeld))
@@ -76,19 +76,19 @@ theorem trace_r2b_dispatch_failure_orphans_receivers_and_claim :
       some (.aborted, [(10, true, true), (11, true, true)], some [0, 1], [101], some false) := by
   rfl
 
-/-- Under `.disarmAndAbandonOnFailure`, both `r2aPartialArmFailureTrace` and
-`r2bDispatchFailureTrace` clean up all receiver sessions, staging leases, and
+/-- Under `.disarmAndAbandonOnFailure`, both `partialArmFailureTrace` and
+`dispatchFailureTrace` clean up all receiver sessions, staging leases, and
 registry claims on abort. -/
-theorem trace_r2_hardened_policy_cleans_up_both_r2a_and_r2b :
+theorem trace_hardened_policy_cleans_up_partial_arm_and_dispatch_failure :
     (((CoordState.sys .disarmAndAbandonOnFailure [0, 1] [10, 11] 101).run
-        r2aPartialArmFailureTrace).map
+        partialArmFailureTrace).map
       (fun s =>
         ( s.phase
         , s.dstStates.map (fun d => (d.sessionArmed, d.stagingLeaseHeld))
         , s.reg.claimedUnits )) =
       some (.aborted, [(false, false), (false, false)], none)) ∧
     (((CoordState.sys .disarmAndAbandonOnFailure [0, 1] [10, 11] 101).run
-        r2bDispatchFailureTrace).map
+        dispatchFailureTrace).map
       (fun s =>
         ( s.phase
         , s.dstStates.map (fun d => (d.sessionArmed, d.stagingLeaseHeld))
@@ -208,7 +208,7 @@ def violatesCoordInv (s : CoordState) : Bool :=
    (s.armFailed || !allReported s.dstUnits s.armResults)) ||
   s.dstStates.any (fun d => d.stagingLeaseHeld != d.sessionArmed)
 
-/-- Executable check for R2a/R2b orphan freedom in `.aborted`. -/
+/-- Executable check for orphan freedom in `.aborted`. -/
 def violatesNoOrphans (s : CoordState) : Bool :=
   violatesCoordInv s ||
   (s.phase == .aborted &&

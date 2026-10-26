@@ -43,14 +43,14 @@ ranges for every symbol, sub-block, and test are in the generated
        preventing `CancelIfUnclaimed` and conflicting `Register` calls.
      * `LeaseMatchesSession`: Every destination unit holds a `PoolStagingLease`
        if and only if its `ReshardReceiveSession` is currently armed.
-  2. **Risk R2a & R2b Constructive Counterexamples under `.shipping`**:
-     * `trace_r2a_partial_arm_orphans_armed_receiver`
+  2. **Failure-Cleanup Counterexample Traces under `.shipping`**:
+     * `trace_partial_arm_orphans_armed_receiver`
        (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : arm_status)`): When `dst_unit 10` succeeds in arming
        and `dst_unit 11` fails, `ExecutePoolReshard` calls `AbandonClaim` and
        aborts without disarming `dst_unit 10`, leaving `dst_unit 10`'s
        `ReshardReceiveSession` and `PoolStagingLease` orphaned until
        `timeout_s_`.
-     * `trace_r2b_dispatch_failure_orphans_receivers_and_claim`
+     * `trace_dispatch_failure_orphans_receivers_and_claim`
        (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : sender_status)`): When all `dst_units` arm and
        `src_unit 0` succeeds but `src_unit 1` fails during Stage 2 dispatch,
        `ExecutePoolReshard` returns `sender_status` without disarming
