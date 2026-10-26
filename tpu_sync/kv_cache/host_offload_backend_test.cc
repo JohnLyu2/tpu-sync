@@ -695,8 +695,16 @@ TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsSparseNodeIds) {
   workers.push_back(GeometryWorker("w0", /*node_id=*/0, {4096}, 2));
   workers.push_back(GeometryWorker("w2", /*node_id=*/2, {4096}, 2));
 
-  EXPECT_THAT(HostOffloadBackendTest::ComposeKVTransferSpec(workers).status(),
-              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+  // The message states the contract and what was registered: a worker that
+  // registered under a rank counted across data-parallel replicas (the
+  // typical cause) is otherwise hard to tell from a missing worker.
+  EXPECT_THAT(
+      HostOffloadBackendTest::ComposeKVTransferSpec(workers).status(),
+      ::absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          ::testing::AllOf(::testing::HasSubstr("dense range [0, 2)"),
+                           ::testing::HasSubstr("got [0, 2]"),
+                           ::testing::HasSubstr("data-parallel replicas"))));
 }
 
 TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsDuplicateNodeIds) {

@@ -132,7 +132,13 @@ class KVCacheManager:
       host_blocks_to_allocate: Legacy/unified total blocks to allocate in host
         pool.
       parallelism: Number of parallel network copies per layer.
-      node_id: Unique identifier for this host/node in the distributed mesh.
+      node_id: This worker's index among the workers of its store: the
+        workers registering with one controller must cover the dense range
+        [0, expected_worker_count) (checked when the store has a global
+        registry). Peer stores pair transfers on it -- worker k of one store
+        reads from worker k of another -- so it must name the same KV shard
+        in every store: the rank within the engine (TP x PCP x PP), not a
+        rank counted across data-parallel replicas.
       listener_port: Sockets server port for incoming C++ KVCacheListener
         commands.
       raiden_worker_port: Port for the gRPC Raiden Worker service.

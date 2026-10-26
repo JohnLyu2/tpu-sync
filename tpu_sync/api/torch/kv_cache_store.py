@@ -192,7 +192,10 @@ class KVCacheStore:
         store_server_ip.
       expected_worker_count: When > 0, constructor blocks until that many
         workers have registered with the controller (times out and throws after
-        RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
+        RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s). With a global
+        registry, their node_ids must then form the dense range
+        [0, expected_worker_count) (see KVCacheManager's node_id); the
+        constructor raises otherwise.
       kv_pool_group: KV pool group this store's KVTransferSpec is published
         under in global registry; empty falls back to raiden_id.job_name.
       secondary_backend_configs: Optional sequence of BackendConfig instances

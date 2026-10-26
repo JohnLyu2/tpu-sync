@@ -1402,7 +1402,11 @@ absl::StatusOr<KVTransferSpecConfig> HostOffloadBackend::ComposeKVTransferSpec(
     if (node_ids[i] != static_cast<int64_t>(i)) {
       return absl::InvalidArgumentError(absl::StrCat(
           "worker node ids must form the dense range [0, ", workers.size(),
-          "); got [", absl::StrJoin(node_ids, ", "), "]"));
+          "); got [", absl::StrJoin(node_ids, ", "),
+          "]. A worker's node_id is its index among the workers of its own "
+          "store (peer stores pair transfers on it: worker k reads from the "
+          "peer's worker k), not a rank counted across data-parallel "
+          "replicas or across stores"));
     }
   }
   KVTransferSpecConfig spec;
