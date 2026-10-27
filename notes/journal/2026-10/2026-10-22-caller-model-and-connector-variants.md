@@ -66,13 +66,27 @@ connector names a request in the wrong set (`_free_blocks` on an unfinished
 request). Without those fields a connector could satisfy the contract and
 crash the real scheduler while the model said safe.
 
-[HYP] The multi-worker aggregator (B1) is the most likely place for a
-sibling of C1 on multi-host D: `KVOutputAggregator` releases
-`finished_recving` only when every worker has reported, and
-`get_finished_count = len(kv_ip)`. A worker whose `poll_stats()` never sees
-the request (e.g. it was never `start_read` on that worker's sub-manager)
-would hold the whole request forever even with the fixed connector. Not
-checked; parked.
+[HYP → FACT 2026-10-27] The multi-worker aggregator (B1) is modelled in
+`Transfer/Caller/MultiWorker.lean` (`mwAggSend`, `mwAggRecv`, `expectedP`,
+`expectedD`). Checked against `tpu_inference/distributed/tpu_raiden_connector.py`
+(`:398-402`, `:579-613`) and `vllm_torchtpu/distributed/kv_transfer/tpu_connector.py`
+(`:2566-2585`, `:6113-6137` `_sync_stage3_tp_submit_states`):
+- Under `connectorFixed` with `expectedP = 2`, `expectedD = 2` (guaranteed on
+  `vllm-torchtpu` by `_sync_stage3_tp_submit_states` broadcasting `"failed"`,
+  `"uncertain"`, or `"accepted"` across TP ranks so every worker rank either
+  fails immediately or arms its 180 s native deadline), `mw_contract_safe` /
+  `mw_fixed_safe` proves that no reachable state ever frees HBM while any worker
+  on that node is still in flight (`mwEarlyFree = false`, discharging **A4**
+  across workers when one worker fails early and triggers `loadError` while a
+  sibling worker's H2D is still live), decodes unwritten KV
+  (`mwDecodesUnwritten = false`), or leaks blocks on P or D (`mwLeakP = false`,
+  `mwLeakD = false`).
+- Under `connectorCurrent` (`tpu-inference`), if one worker fails and the other
+  succeeds, theaggregator count sticks at `1 < 2` and leaks
+  (`trace_mw_current_partial_failure_leaks` — the multi-worker manifestation of C1).
+- Even under `connectorFixed`, if `get_finished_count()` exceeds the number of
+  participating workers (`expectedP = 3` or `expectedD = 3` with 2 workers), the
+  count sticks at `2 < 3` and leaks (`trace_mw_overcounted_expected_leaks`).
 
 [OBS 2026-10-22] Upstream check after the model: no fix for C1 anywhere;
 but the unmerged tpu-inference branch `fix/pd-disagg-kv-pull-hang`
