@@ -87,6 +87,14 @@ them. No event re-derives `done` or `draining` by hand.
 uses it under another, the model has two events (`h2dBegin` / `h2dIssue`), and
 the state between them is a ghost counter.
 
+**One lock scope per event, or say why not.** `step` applies an event
+atomically; the C++ has only critical sections. A module's **Lock scopes**
+table (after the events table; `Receive.lean` is the template) lists, per
+event, the `mu_` scopes it stands for and, when there are several, what another
+thread can do between them and why that interleaving ends in a state the model
+also reaches. Where the argument fails, split the event; where it holds only
+because of code outside the model, it is an assumption.
+
 **Ghost fields.** A ghost field has no single C++ variable behind it. It
 records where each unit of a counter came from (`pending`, `retired`,
 `chaining`, …) or a fact about the environment (`reused`). Ghosts are what let
