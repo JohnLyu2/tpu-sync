@@ -715,15 +715,6 @@ std::vector<std::string> HostOffloadBackend::GetEvictableKeys(size_t count) {
   return lru_cache_.GetEvictableKeys(count);
 }
 
-std::vector<int> HostOffloadBackend::Evict(
-    const std::vector<std::string>& block_hashes,
-    std::vector<std::string>* evicted_hashes) {
-  std::vector<int> host_ids_to_deallocate;
-  Delete(block_hashes, DeleteOptions::EvictHostResident(&host_ids_to_deallocate,
-                                                        evicted_hashes));
-  return host_ids_to_deallocate;
-}
-
 absl::StatusOr<std::shared_ptr<KVCacheStoreClient>>
 HostOffloadBackend::GetKVCacheStoreClient(const RaidenId& remote_id) {
   std::shared_ptr<global_registry::GlobalRegistryClient> registry;

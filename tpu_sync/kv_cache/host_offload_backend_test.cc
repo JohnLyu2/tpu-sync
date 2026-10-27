@@ -126,7 +126,7 @@ TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
 
   // A hash evicted after the snapshot must be skipped, not resurrected --
   // republishing it would advertise a block that is gone.
-  backend.Evict({"h2"});
+  backend.Delete({"h2"}, DeleteOptions::EvictHostResident(nullptr));
   const int base_pins = backend.GetPinCount("h1");
   TF_ASSERT_OK_AND_ASSIGN(
       auto pinned,

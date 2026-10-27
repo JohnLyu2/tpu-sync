@@ -92,10 +92,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   std::vector<std::string> GetEvictableKeys(size_t count) override;
 
-  std::vector<int> Evict(
-      const std::vector<std::string>& block_hashes,
-      std::vector<std::string>* evicted_hashes = nullptr) override;
-
   // --- Global Memory Pooling & RPC Methods ---
   // Loads KV cache blocks from local host DRAM (if `remote_id` is empty or
   // matches this backend's id) or from the specified peer. See KVCacheStoreBackend

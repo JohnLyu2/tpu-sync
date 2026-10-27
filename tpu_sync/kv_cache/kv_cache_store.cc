@@ -1780,9 +1780,11 @@ size_t KVCacheStore::Evict(const std::vector<std::string>& block_hashes) {
   // The backend handles thread-safe eviction and unregisters erased blocks
   // from the global registry outside its lock. We do not hold store mutex_
   // across this call to avoid blocking concurrent operations on network I/O.
+  std::vector<int> host_ids_to_deallocate;
   std::vector<std::string> evicted_hashes;
-  const std::vector<int> host_ids_to_deallocate =
-      backend()->Evict(block_hashes, &evicted_hashes);
+  backend()->Delete(block_hashes,
+                    DeleteOptions::EvictHostResident(&host_ids_to_deallocate,
+                                                     &evicted_hashes));
 
   if (host_ids_to_deallocate.empty()) {
     return 0;

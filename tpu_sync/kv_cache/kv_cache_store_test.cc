@@ -2422,7 +2422,9 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
     for (const auto& hash : evictable) {
       EXPECT_EQ(store.backend()->GetPinCount(hash), 0);
     }
-    EXPECT_FALSE(store.backend()->Evict(evictable).empty())
+    EXPECT_GT(store.backend()->Delete(
+                  evictable, DeleteOptions::EvictHostResident(nullptr)),
+              0)
         << "Evict found nothing to free while the registry was stalled";
 
     // Letting the registry answer releases the rest.

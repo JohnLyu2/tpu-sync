@@ -277,18 +277,6 @@ class KVCacheStoreBackend {
   // Retrieves evictable keys from the backend.
   virtual std::vector<std::string> GetEvictableKeys(size_t count) { return {}; }
 
-  // Evicts keys from the backend and returns deallocated host block IDs.
-  // If `evicted_hashes` is non-null, it is populated with the block hashes that
-  // were actually evicted.
-  virtual std::vector<int> Evict(
-      const std::vector<std::string>& block_hashes,
-      std::vector<std::string>* evicted_hashes = nullptr) {
-    std::vector<int> deallocated_host_block_ids;
-    Delete(block_hashes, DeleteOptions::EvictHostResident(
-                             &deallocated_host_block_ids, evicted_hashes));
-    return deallocated_host_block_ids;
-  }
-
   // --- Remote write (WriteRemote) & registry helpers -----------------------
   //
   // Default implementations return UnimplementedError so backends that do not
