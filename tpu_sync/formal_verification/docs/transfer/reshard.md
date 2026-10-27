@@ -40,7 +40,7 @@ statement column is the one-line form, the module docstring has the exact one.
 | Sender slot conservation and active-until-finalizing invariant | `Send.reachable_safe` (`ActiveOrDraining`, `Publication`) | While `!finalizing_`, `remaining_pool_peer_pushes_` equals $\sum_p \text{remainingSlots}_p$, and `ExecutePush`'s caller op keeps `0 < inFlight` until `finalizing_` is latched; `done_sending` requires every active pool to have completed all peer pushes. |
 | Deferred plan unregistration and poll-finish equivalence | `Recv.PlanIntegrity`, `Recv.reachable_pollReady_disabled`, `Send.PlanIntegrity`, `Send.reachable_onSettle_plan_iff_done` | On the receiver, `(planUnregistered → done) ∧ (published ≠ none → planUnregistered)` and `IsReadyToComplete() && !IsDraining()` is disabled in every reachable state because `FinishPoolH2d` sets `network_completed_` and calls `Finish` in the same step; on the sender, `done → planUnregistered` under both policies, strengthened to `planUnregistered = done` under `UnregisterPolicy.onSettle`. |
 | Two-phase Arm-then-Dispatch barrier and producer block registry | `Coordinator.reachable_coord_inv`, `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Pipeline.NoUnarmedPush`, `Registry.reachable_safe`, `Registry.tombstone_blocks_register_and_claim`, `Registry.claimed_blocks_register_and_cancel`, `Registry.abandonClaim_preserves_when_other_owner_present`, `Registry.complete_retires_iff_all_claimed_voted`, `Registry.purgeExpiredAll_inv` | No sender is dispatched and no stream lands until every destination unit has armed its `ReshardReceiveSession`; producer blocks remain claimed in `RequestBlockRegistry` throughout arming, blocking `CancelIfUnclaimed` and duplicate `Register`; abandoning one owner's claim preserves sibling owners' claims; `Complete` retires a generation iff every claimed source unit has voted; and cancelling an unclaimed generation leaves a tombstone blocking late registration and claims. |
-| Engine caller contract above `poll_stats()` | `Caller.contract_safe`, `Caller.fixed_contract`, `Caller.earlyLoadError_fail_eq_finish`, `Caller.earlyLoadError_fail_holds_blocks`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing` | A connector that forwards every publication (`connectorFixed`, matching `vllm-torchtpu`'s Stage-3 `tpu_connector.py`) leaks no held block on either node and never lets decode read unwritten KV; staging `invalid_block_ids` early on an uncertain post-arm RPC error under `Policy.fail` defers the block free until the native receiver settles (`dHeld = true`). |
+| Engine caller contract above `poll_stats()` (single- and multi-worker) | `Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.fixed_contract`, `Caller.earlyLoadError_fail_eq_finish`, `Caller.earlyLoadError_fail_holds_blocks`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing` | A connector that forwards every publication (`connectorFixed`, matching `vllm-torchtpu`'s Stage-3 `tpu_connector.py`) never frees HBM while any worker on that node is still in flight (`mwEarlyFree = false`), leaks no held block on either node, and never lets decode read unwritten KV, both for a single worker and across workers aggregated by `KVOutputAggregator`; staging `invalid_block_ids` early on an uncertain post-arm RPC error under `Policy.fail` defers the block free until the native receiver settles (`dHeld = true`). |
 
 ## Modules
 
@@ -64,7 +64,7 @@ and `PoolStagingLease` lifecycles.
 | `Reshard/PoolStaging.lean` | `PoolStagingStorage` bounded slot arena, per-`(storage, uuid)` lease idempotency & cross-UUID disjointness, and receive registration order (`RegistrationPolicy.reserveBeforeLease` vs. the `.leaseBeforeReserve` mutant) | `PoolStaging.acquireLease_idempotent`, `PoolStaging.no_slot_aliasing_between_distinct_uuids`, `PoolStaging.allocateMissing_slot_sum`, `PoolStaging.reachable_reserveBeforeLease_safe`, `PoolStaging.trace_duplicate_uuid_frees_survivor_lease_and_aliases_slot`, `PoolStaging.trace_pool_staging_recv_registration_tests` |
 | `Reshard/Registry.lean` | `RequestBlockRegistry` generation lifecycle: per-unit `Register`, multi-owner `LookupAndClaim`, `AbandonClaim`, full-set `Complete` voting, `CancelIfUnclaimed` tombstones, and TTL expiration (`purgeExpiredAll` vs. split `purgeExpiredRequestBlocks`) | `Registry.reachable_safe`, `Registry.tombstone_blocks_register_and_claim`, `Registry.claimed_blocks_register_and_cancel`, `Registry.abandonClaim_preserves_when_other_owner_present`, `Registry.complete_retires_iff_all_claimed_voted`, `Registry.purgeExpiredAll_inv`, `Registry.trace_single_stage_votes_retire_multi_owner_claim`, `Registry.trace_split_ttl_purges_request_blocks_while_claim_active` |
 | `Reshard/Coordinator.lean` | Two-stage `ReshardCoordinator::ExecutePoolReshard` composed with `RequestBlockRegistry` and per-destination receiver sessions (`CleanupPolicy.shipping` vs. `disarmAndAbandonOnFailure`) | `Coordinator.reachable_coord_inv`, `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Coordinator.trace_partial_arm_orphans_armed_receiver`, `Coordinator.trace_dispatch_failure_orphans_receivers_and_claim` |
-| `Transfer/Caller.lean` | Serving engine above `poll_stats()` shared with `PrefillDecode` (`vllm-torchtpu` `tpu_connector.py` @ `9725110` and `tpu-inference` `tpu_raiden_connector.py` @ `7ed46a6` on vLLM `6185d73`): `connectorFixed` models Stage-3 reshard outcome forwarding and `earlyLoadError_fail_holds_blocks` models `_stage3_fail_uncertain_loads_early` | `Caller.contract_safe`, `Caller.fixed_contract`, `Caller.earlyLoadError_fail_eq_finish`, `Caller.earlyLoadError_fail_holds_blocks`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing` |
+| `Transfer/Caller.lean` | Serving engine above `poll_stats()` shared with `PrefillDecode` (`vllm-torchtpu` `tpu_connector.py` @ `9725110` and `tpu-inference` `tpu_raiden_connector.py` @ `7ed46a6` on vLLM `6185d73`): `connectorFixed` models Stage-3 reshard outcome forwarding, `MultiWorker.lean` models `KVOutputAggregator` across worker ranks, and `earlyLoadError_fail_holds_blocks` models `_stage3_fail_uncertain_loads_early` | `Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.fixed_contract`, `Caller.earlyLoadError_fail_eq_finish`, `Caller.earlyLoadError_fail_holds_blocks`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing`, `Caller.trace_mw_staggered_*` |
 
 ## Boundaries
 
@@ -99,16 +99,18 @@ publication, and the connector/scheduler block lifecycle above `poll_stats()`
 (`Transfer/Caller.lean`: when the engine may recycle is `.recycleSrc` /
 `.nextRequest` in `Reshard/MultiRequest.lean`; what the engine owes a
 publication is `Caller.Contract`, satisfied by `connectorFixed` for
-`vllm-torchtpu`'s Stage-3 connector, including its early `invalid_block_ids`
-path `_stage3_fail_uncertain_loads_early` via `earlyLoadError_fail_holds_blocks`).
+`vllm-torchtpu`'s Stage-3 connector both for a single worker and across
+workers aggregated by `KVOutputAggregator` in `Caller/MultiWorker.lean`,
+including its early `invalid_block_ids` path
+`_stage3_fail_uncertain_loads_early` via `earlyLoadError_fail_holds_blocks`).
 
 Not modelled: Python submit-worker threading and topology-admission tables in
-the external connector above `ReshardService`, `KVOutputAggregator` multi-worker
-counting (`Caller` B1–B3), and disjointness of source and destination units
-(`src_units ∩ dst_units = ∅`), which is treated as a caller/planner
-precondition (`BuildStartTransferForTarget` sets `is_sender = true` when a unit
-appears in both lists, which `WorkerServiceImpl::StartTransfer` dispatches only
-to `PoolReshardPush`).
+the external connector above `ReshardService`, partial-prefix load failures and
+preemption/prefix caching (`Caller` B1–B3), and disjointness of source and
+destination units (`src_units ∩ dst_units = ∅`), which is treated as a
+caller/planner precondition (`BuildStartTransferForTarget` sets
+`is_sender = true` when a unit appears in both lists, which
+`WorkerServiceImpl::StartTransfer` dispatches only to `PoolReshardPush`).
 
 ### Transport and staging boundary (below the session callbacks)
 
@@ -279,16 +281,19 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 
 *External, the production reshard caller pair (`Transfer/Caller.lean`):*
 vllm-torchtpu `src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py` @
-`9725110` and vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73`
+`9725110`, vLLM `vllm/distributed/kv_transfer/kv_connector/utils.py`, and
+vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73`
 (`TPURaidenConnectorWorker.get_finished`, `_poll_finished`,
 `_apply_stage3_submit_outcome`, `_stage3_fail_uncertain_loads_early`,
-`get_block_ids_with_load_errors`; scheduler `_handle_invalid_blocks`,
-`_update_from_kv_xfer_finished`, `finish_requests`,
-`_update_waiting_for_remote_kv`, `kv_load_failure_policy`) →
-`Caller.contract_safe`, `Caller.fixed_contract`,
+`get_block_ids_with_load_errors`, `_sync_stage3_tp_submit_states`,
+`get_finished_count`; `KVOutputAggregator.aggregate_kv_connector_output`;
+scheduler `_handle_invalid_blocks`, `_update_from_kv_xfer_finished`,
+`finish_requests`, `_update_waiting_for_remote_kv`, `kv_load_failure_policy`) →
+`Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.fixed_contract`,
 `Caller.earlyLoadError_fail_eq_finish`,
 `Caller.earlyLoadError_fail_holds_blocks`,
-`Caller.trace_fixed_early_uncertain_load_error`, `Caller.trace_fixed_*`.
+`Caller.trace_fixed_early_uncertain_load_error`, `Caller.trace_fixed_*`,
+`Caller.trace_mw_staggered_*`.
 
 ## Where the rest lives
 
