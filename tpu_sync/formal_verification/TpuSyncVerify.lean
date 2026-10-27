@@ -3,6 +3,7 @@ import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Common.ListAux
 import TpuSyncVerify.Common.Coverage
 import TpuSyncVerify.Transfer.Session
+import TpuSyncVerify.Transfer.Caller
 import TpuSyncVerify.Transfer.PrefillDecode.Receive
 import TpuSyncVerify.Transfer.PrefillDecode.ReceivePoll
 import TpuSyncVerify.Transfer.PrefillDecode.Send
@@ -15,7 +16,6 @@ import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
 import TpuSyncVerify.Transfer.PrefillDecode.Pipeline.Coverage
 import TpuSyncVerify.Transfer.PrefillDecode.MultiRequestCoverage
 import TpuSyncVerify.Transfer.PrefillDecode.Transport
-import TpuSyncVerify.Transfer.PrefillDecode.Caller
 import TpuSyncVerify.Transfer.Reshard.Receive
 import TpuSyncVerify.Transfer.Reshard.Send
 import TpuSyncVerify.Transfer.Reshard.Pipeline
@@ -36,6 +36,7 @@ modelled, the directory layout, and how the C++ is cited.
 
 * `Common` — transition-system core, list lemmas, bounded model checker, branch coverage.
 * `Transfer` — `Session` (settle protocol shared by every transfer session),
+  `Caller` (serving engine above `poll_stats()` shared by both transfer paths),
   `PrefillDecode/`, `Reshard/`.
 * `Controller` — `ReadRemote` (and its branch coverage, `ReadRemoteCoverage`).
 -/

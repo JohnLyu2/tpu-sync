@@ -4,20 +4,36 @@ import TpuSyncVerify.Common.ModelCheck
 /-!
 # The engine above `poll_stats()`: connector and scheduler block lifecycle
 
-`Pipeline.lean` ends at the `poll_stats()` boundary: it proves that once
-tpu-sync publishes a request's send or receive outcome (`send.published`,
+Both transfer pipelines (`PrefillDecode/Pipeline.lean` and
+`Reshard/Pipeline.lean`, together with their `MultiRequest.lean` lifts) end at
+the `poll_stats()` boundary (`KVCacheManagerWithTransfer::CompleteReadWithDetails`):
+once tpu-sync publishes a request's send or receive outcome (`send.published`,
 `recv.published : Option Bool` — `some true` for `done_sending` /
 `done_recving`, `some false` for `failed_recving`) no copy touches the
-request's HBM any more (`PrefillHbmSafe`, `DecodeHbmSafe`), and it *assumes*
-(**A4**) that the engine frees that HBM only after publication. This module
-models the other direction of the same contract — what the engine must do
-*with* a publication — for the production caller of the prefill-to-decode
-path: vLLM's scheduler driving `tpu-sync` through tpu-inference's
-`TPUConnector`. The `trace_current_connector_*` theorems are the traces
-where, with the connector as it is, a publication never becomes a free.
+request's HBM any more (`PrefillHbmSafe` / `DecodeHbmSafe` and `SrcHbmSafe` /
+`DstHbmSafe`), and the pipeline models *assume* (**A4**) that the engine frees
+that HBM only after publication. This module models the other direction of the
+same contract — what the engine must do *with* a publication — for the two
+production vLLM connectors that drive `tpu-sync`:
+
+1. **Prefill-to-decode (`tpu-inference`):** vLLM's scheduler driving `tpu-sync`
+   through `tpu_raiden_connector.py` (`connectorCurrent`). The
+   `trace_current_connector_*` theorems are the traces where, with the
+   connector as it is, a publication never becomes a free.
+2. **Pool reshard (`vllm-torchtpu` Stage-3):** vLLM's scheduler driving
+   `tpu-sync` through `tpu_connector.py`, whose accepted-transfer steady state
+   forwards both `done_sending | sender_failures | cancelled_sends` and
+   `done_recving | failed_recving` and stages failed receive blocks into
+   `_failed_block_ids` (`connectorFixed`), and whose `"fail"`-policy early
+   uncertain-load path (`_stage3_fail_uncertain_loads_early`) stages
+   `invalid_block_ids` on the RPC error pass while deferring `done_recving`
+   (and the block free) until the native receiver settles
+   (`earlyLoadError_fail_eq_finish`, `earlyLoadError_fail_holds_blocks`).
 
 Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py` at
-tpu-inference `7ed46a6`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
+tpu-inference `7ed46a6`; `vllm_conn.py` =
+`src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py` at vllm-torchtpu
+`9725110`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
 `base.py` = `vllm/distributed/kv_transfer/kv_connector/v1/base.py`,
 `mixin.py` = `vllm/v1/worker/kv_connector_model_runner_mixin.py`,
 `kvcfg.py` = `vllm/config/kv_transfer.py`, all at vLLM `6185d73` (the pair
@@ -30,29 +46,57 @@ tpu-inference `7ed46a6`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
 | File | Symbol / anchor | Lines |
 |------|-----------------|-------|
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`absl::MutexLock lock(mu_);`) | `:986` |
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();` .. `send_sessions_.erase(it++);`) | `:988-1006` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();` .. `active_pool_reshard_sends_.erase(it++);`) | `:1011-1026` |
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();` .. `active_recv_sessions_.erase(it++);`) | `:1035-1062` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_recvs_.begin();` .. `active_pool_reshard_recvs_.erase(it++);`) | `:1067-1093` |
 <!-- source-map:end -->
+
+## Lock scopes
+
+On the C++ side, `KVCacheManagerWithTransfer::CompleteReadWithDetails` sweeps
+all four session maps (`send_sessions_`, `active_pool_reshard_sends_`,
+`active_recv_sessions_`, `active_pool_reshard_recvs_`) and drains
+`done_sending_`, `done_recving_`, and `failed_recving_` into `completions` inside
+a single `KVCacheManagerWithTransfer::mu_` critical section
+(`absl::MutexLock lock(mu_);`). Above `poll_stats()`, the worker-side
+connector (`get_finished`, `get_block_ids_with_load_errors`) and vLLM's
+scheduler (`update_from_output`, `schedule`, `finish_requests`) run on the
+single-threaded Python scheduler / model-runner loop, so each `Ev`
+(`pOutcome`, `dOutcome`, `promote`, `finish`) is one atomic scheduler step.
 
 ## What is modelled
 
-One request, both nodes. On the prefill node (P) the request has finished its
-one output token and the connector has asked vLLM to keep its KV blocks until
-the send is reported (`request_finished` returns `delay_free_blocks = True`,
-`conn.py:438`); on the decode node (D) the request has been allocated blocks
-and parked in `WAITING_FOR_REMOTE_KVS` with the pull issued (`conn.py:322-378`,
-`conn.py:606`). Nothing before that point touches a transfer-held block, so the
-model starts there (`init`).
+One request, both nodes. On the prefill/producer node (P) the request has
+finished its one output token and the connector has asked vLLM to keep its KV
+blocks until the send is reported (`request_finished` returns
+`delay_free_blocks = True`, `conn.py:438`); on the decode/consumer node (D) the
+request has been allocated blocks and parked in `WAITING_FOR_REMOTE_KVS` with
+the transfer issued (`conn.py:322-378`, `conn.py:606`;
+`vllm_conn.py` `_apply_stage3_submit_outcome`). Nothing before that point touches
+a transfer-held block, so the model starts there (`init`).
 
 Below the engine sits tpu-sync, abstracted to the two publications of
-`Pipeline.lean`: `sendPub` is `send.published` and `recvPub` is
-`recv.published`. Each is set once, by `pOutcome ok` / `dOutcome ok`, with
-`ok = false` covering a failed push or pull *and* a send nobody pulled before
-`timeout_s` (`KVCacheManagerWithTransfer::CompleteReadWithDetails` in `mgr.cc`:
-both `(failed ? failed_recving_ : done_sending_)` and timed-out sends go to
-`failed_recving_`; the connector passes `TPU_P2P_WAIT_PULL_TIMEOUT`, 180 s, as
-`timeout_s`, `conn.py:529`). Which value is published is nondeterministic here;
-`Pipeline.lean` says when each is possible.
+`PrefillDecode/Pipeline.lean` and `Reshard/Pipeline.lean`: `sendPub` is
+`send.published` and `recvPub` is `recv.published`. In
+`KVCacheManagerWithTransfer::CompleteReadWithDetails` (`mgr.cc`), all four
+session loops — `for (auto it = send_sessions_.begin();` ..
+`send_sessions_.erase(it++);` and
+`for (auto it = active_pool_reshard_sends_.begin();` ..
+`active_pool_reshard_sends_.erase(it++);` on P, and
+`for (auto it = active_recv_sessions_.begin();` ..
+`active_recv_sessions_.erase(it++);` and
+`for (auto it = active_pool_reshard_recvs_.begin();` ..
+`active_pool_reshard_recvs_.erase(it++);` on D — write into the same three
+lists (`done_sending_`, `done_recving_`, `failed_recving_`). Each publication is
+set once, by `pOutcome ok` / `dOutcome ok`, with `ok = false` covering a failed
+push or pull *and* a send nobody pulled before `timeout_s` (both
+`(failed ? failed_recving_ : done_sending_)` and timed-out sends go to
+`failed_recving_`; the connectors pass `TPU_P2P_WAIT_PULL_TIMEOUT`, 180 s, as
+`timeout_s`, `conn.py:529`, `vllm_conn.py` `get_p2p_wait_pull_timeout()`). Which
+value is published is nondeterministic here; the `Pipeline.lean` modules say
+when each is possible.
 
 Between tpu-sync and the scheduler sits the **connector**, the object under
 test. Per request and per step it sees at most one of the three
@@ -69,7 +113,7 @@ draining it. Four connectors are instantiated:
 | Connector | `onSend ok` | `onRecv ok` | Is |
 |-----------|-------------|-------------|----|
 | `connectorCurrent` | `finishedSending := ok` | `finishedRecving := ok` | `conn.py:632-656`: the third list is logged and dropped (`conn.py:640-647`), `get_block_ids_with_load_errors` is not overridden |
-| `connectorFixed` | `finishedSending := true` | `finishedRecving := true, loadError := !ok` | the proposed fix: forward every outcome, failed receives through vLLM's load-failure channel |
+| `connectorFixed` | `finishedSending := true` | `finishedRecving := true, loadError := !ok` | the proposed fix for `conn.py`, and the shipping Stage-3 Reshard connector in `vllm_conn.py` (`get_finished` / `_poll_finished`): forward every outcome, failed receives through vLLM's load-failure channel |
 | `connectorNaive` | `finishedSending := true` | `finishedRecving := true` | the fix the connector's comment warns against: a failed receive reported as done |
 | `connectorLoadErrorOnly` | `finishedSending := true` | `finishedRecving := ok, loadError := !ok` | the other half-fix: the failure channel without the completion |
 
@@ -113,13 +157,12 @@ The P side keeps only `pHeld`; its connector signal is read for
 ## Properties
 
 * `leakP`: the send is published and P still holds the blocks.
-* `leakD`: the receive is published and D's request is either parked in
-  `WAITING_FOR_REMOTE_KVS` with its blocks and no promotion possible, or
-  finished with its blocks still deferred. Both are *absorbing* for every
-  connector and policy (`leakP_absorbing`, `leakD_absorbing`): nothing in the
-  engine can free them afterwards, because the only events that could are the
-  publications, and each happens once. That is what makes them leaks rather
-  than delays.
+* `leakD`: the receive is published and D either keeps the request parked with
+  its blocks and nothing to promote it, or has finished it with the free
+  deferred. Both are *absorbing* for every connector and policy
+  (`leakP_absorbing`, `leakD_absorbing`): nothing in the engine can free them
+  afterwards, because the only events that could are the publications, and each
+  happens once. That is what makes them leaks rather than delays.
 * `decodesUnwritten`: D's request proceeds to decode while the receive is not
   published as done. In the real system this is the `AssertionError` the
   connector's comment says kills the EngineCore (`conn.py:641-644`).
@@ -137,6 +180,17 @@ each has a trace: `trace_current_connector_p`, `trace_current_connector_d_abort_
 (why the comment's fear was justified), `trace_loadErrorOnly_fail`,
 `trace_loadErrorOnly_recompute` (why the failure channel alone is not enough).
 Bounded search exhausts the state space for each configuration.
+
+On the Reshard path under `Policy.fail`, `vllm-torchtpu`'s
+`_stage3_fail_uncertain_loads_early` (`vllm_conn.py` `_apply_stage3_submit_outcome`)
+stages `_failed_block_ids` as soon as a post-arm `coordinate_transfer` RPC fails
+("uncertain"), while withholding `done_recving` until the native receiver
+settles (`vllm_conn.py` `get_finished` / `_poll_finished`).
+`earlyLoadError_fail_eq_finish` and `earlyLoadError_fail_holds_blocks` show that
+this early `applyLoadError .fail` produces the exact same state as `finish`
+(marking the request `.finished` with `dHeld = true` so destination HBM is not
+freed while the receiver is still armed), and the subsequent `dOutcome false` on
+`connectorFixed` frees `dHeld = false`.
 
 ## Assumptions
 
@@ -156,7 +210,7 @@ Bounded search exhausts the state space for each configuration.
   which event frees a transfer-held block.
 -/
 
-namespace TpuSyncVerify.Transfer.PrefillDecode.Caller
+namespace TpuSyncVerify.Transfer.Caller
 
 /-- What the worker-side connector tells the scheduler about one request in
 one step: membership in the two sets `get_finished()` returns and whether the
@@ -181,8 +235,9 @@ def connectorCurrent : Connector where
   onSend ok := { finishedSending := ok }
   onRecv ok := { finishedRecving := ok }
 
-/-- The proposed fix: every outcome is forwarded; a failed receive goes through
-both of vLLM's channels. -/
+/-- The proposed fix for `conn.py` and the shipping Stage-3 Reshard connector in
+`vllm_conn.py` (`get_finished` / `_poll_finished`): every outcome is forwarded;
+a failed receive goes through both of vLLM's channels. -/
 def connectorFixed : Connector where
   onSend _ := { finishedSending := true }
   onRecv ok := { finishedRecving := true, loadError := !ok }
@@ -713,6 +768,28 @@ theorem fixed_safe {policy : Policy} {s : S}
     (hr : (sys ⟨connectorFixed, policy⟩).Reachable s) : Safe s :=
   contract_safe fixed_contract hr
 
+/-- On a waiting request, staging an early `invalid_block_ids` under
+`Policy.fail` (`vllm-torchtpu`'s `_stage3_fail_uncertain_loads_early` in
+`vllm_conn.py` `_apply_stage3_submit_outcome`) produces the exact same scheduler
+state as an API-layer abort (`finish`): the request is marked `.finished` with
+its block free deferred (`dHeld := s.dHeld && !s.dFinRecv`) until
+`finished_recving` arrives. -/
+theorem earlyLoadError_fail_eq_finish {s : S} (hw : s.dStatus = .waitingRemoteKv) :
+    some (applyLoadError .fail s) = finish s := by
+  simp [applyLoadError, finish, hw]
+
+/-- While the receive is unpublished (`s.recvPub = none`), an early
+`applyLoadError .fail` on a waiting request preserves `Inv` and keeps
+`dHeld = s.dHeld` (so destination HBM is never freed while the armed
+`ReshardReceiveSession` is still live). -/
+theorem earlyLoadError_fail_holds_blocks {s : S}
+    (h : Inv s) (hn : s.recvPub = none) (hw : s.dStatus = .waitingRemoteKv) :
+    Inv (applyLoadError .fail s) ∧ (applyLoadError .fail s).dHeld = s.dHeld := by
+  have hfin : s.dFinRecv = false := (h.d_none hn).2.1
+  have hstep : finish s = some (applyLoadError .fail s) :=
+    (earlyLoadError_fail_eq_finish hw).symm
+  exact ⟨inv_finish h hstep, by simp [applyLoadError, hw, hfin]⟩
+
 /-! ## Replay and search -/
 
 def allEvents : List Ev :=
@@ -835,6 +912,18 @@ theorem trace_fixed_abort_before :
       some ⟨true, .finished, false, false, false⟩ := by
   decide
 
+/-- Stage-3 Reshard connector under `Policy.fail` with
+`_stage3_fail_uncertain_loads_early`: an `"uncertain"` post-arm RPC error stages
+`invalid_block_ids` on the first pass (`applyLoadError .fail init`), finishing
+the request while holding `dHeld = true`, and the later native receiver failure
+(`.dOutcome false`) releases `dHeld = false`. -/
+theorem trace_fixed_early_uncertain_load_error :
+    let s₁ := applyLoadError .fail init
+    view s₁ = ⟨true, .finished, true, false, false⟩ ∧
+    (step (fixed .fail) s₁ (.dOutcome false)).map view =
+      some ⟨true, .finished, false, false, false⟩ := by
+  decide
+
 /-! ### The two half-fixes -/
 
 /-- Reporting a failed receive as `done_recving` alone: the scheduler promotes
@@ -869,4 +958,4 @@ theorem trace_loadErrorOnly_recompute :
 #guard leaked (loadErrorOnly .fail) = true
 #guard leaked (loadErrorOnly .recompute) = true
 
-end TpuSyncVerify.Transfer.PrefillDecode.Caller
+end TpuSyncVerify.Transfer.Caller
