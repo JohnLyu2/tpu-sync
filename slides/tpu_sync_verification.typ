@@ -439,6 +439,38 @@
 ]
 
 // ---------------------------------------------------------------------------
+#slide[Modeling actions: how big is one event?][
+  #set par(leading: 0.62em)
+  #let mono(body) = align(left, text(font: "DejaVu Sans Mono", size: 14pt, body))
+  A Lean event is atomic, so each event stands for *one critical section* of the session's lock `mu_`. When a function releases `mu_` partway through, other threads can run in the gap, so the Lean model may split the function there.
+
+  #v(0.4em)
+  *Example: `TransferReceiveSession::ExecuteLayerH2d`* — runs once layer $l$ has fully arrived in decode host staging, and copies it into decode HBM.
+  #set list(spacing: 0.45em)
+  #text(size: 13.5pt)[
+  - `in_flight_` counts work in progress; staging is freed only when it reaches 0.
+  - `draining_` is set once the receive finishes, for any reason; no new work may start after that.
+  ]
+
+  #v(1.2em)
+  #align(center, text(size: 14pt, diagram(
+    spacing: (3em, 1.1em),
+    node-stroke: 0.7pt + accent,
+    node-shape: rect,
+    node-inset: 10pt,
+    node-corner-radius: 3pt,
+    label-size: 14pt,
+    node((0, 0), mono[lock(mu\_)\ if draining\_: return\ ++in\_flight\_]),
+    node((2, 0), mono[lock(mu\_)\ if draining\_:\ #h(1.2em)\-\-in\_flight\_; return\ start the copy]),
+    edge((0, 0), (2, 0), "-->", [unlocked], label-side: left),
+    node((0, 1), [`h2dBegin l`], stroke: none, fill: codebg),
+    node((2, 1), [`h2dIssue l`], stroke: none, fill: codebg),
+    node((1, 1), text(fill: accent)[#sym.arrow.t another thread may\ finish the receive here], stroke: none),
+  )))
+
+]
+
+// ---------------------------------------------------------------------------
 #slide[Example: how steps update memories & catch bugs][
   #let cell-kv = box(fill: rgb("#e6f4ea"), stroke: 0.7pt + rgb("#137333"), inset: (x: 6pt, y: 2.5pt), radius: 3pt)[#text(fill: rgb("#137333"), weight: "bold", size: 10.5pt)[`kv l`]]
   #let cell-blank = box(fill: rgb("#f1f3f4"), stroke: 0.7pt + rgb("#5f6368"), inset: (x: 6pt, y: 2.5pt), radius: 3pt)[#text(fill: rgb("#5f6368"), size: 10.5pt)[`blank`]]
