@@ -156,3 +156,47 @@ unchanged).
    pairings and `DoneGuarantees…` are racy and now say which order they take;
    `ServePull` never calls `ValidateAndBeginPull` (the `beginPull` is the
    model's precondition, said so).
+
+## Pipeline (`728cae5b`) — interpretation
+
+Canonical: `Pipeline/Coverage.lean` §Result, `prefill_decode.md` §"Branch
+coverage by the replayed tests" (the three-model table).
+
+- [FACT] 75 branches at one layer; paired E2E/control tests reach 25; the 50
+  gaps are 3 environment + 17 session-covered + 30 session-gap, none
+  unaccounted. The composed model's leaves carry the inner session leaf, so
+  the `#guard` can check that every pipeline gap is explained one level down
+  — the first coverage result that is a *partition* rather than a list.
+- [FACT] Every memory move in the reachable set writes the right layer's KV:
+  `PublicationCorrect` is visible in the branch set itself (and the
+  `dispatchEarly` mutant's `h2dReady junk` is the counter-check).
+- [FACT] The E2E tests exercise exactly the happy paths and the handshake
+  rejections. Nothing at pipeline level fails a copy, a push, or a dispatch;
+  all of that lives in the session unit tests (or in their gap tables).
+- [HYP] The three environment branches (`reclaim`, both reseats) are the
+  multi-request story; `MultiRequest.lean` has no coverage yet and the only
+  test that drives them is the single-host disagg E2E script. If coverage is
+  extended there, those three are the ones to pair.
+- Tooling: the shared search keyed `seen` by list membership; the one-layer
+  pipeline took 80 s, two layers would not finish. `Std.HashSet` + `deriving
+  Hashable` on the five state types: 3 s and 20 s. The two-layer result is
+  documented but not a `#guard` (budget ~5 s per guard).
+
+## Corrections (Pipeline round)
+
+1. Independent audit: "28 of 75, 47 gaps" was wrong — `coveredByPaired`
+   counts branches along the traces, and the two two-layer E2E rows take 4
+   branches outside the one-layer universe the guard searches; the class
+   counts (3+18+30 = 51) already contradicted the prose and I had not added
+   them. Correct: 25 in-universe, 29 along traces, 50 gaps. The guard now
+   pins both numbers. Rule: when the universe and the traces run on different
+   instances, count coverage *inside the universe* and say what falls outside.
+2. Same audit: two control rows omitted the client's ack read; the
+   deadline-rejection control test was in neither list (it polls: `[cancel,
+   publish]` on the producer); `trace_normal` cited the two-layer Python
+   tests; `keep` drops a pruned successor's branch in the search but not in
+   `witnessP` (now said); the mutant's borrowed tag has a placeholder (said).
+3. Second audit: "every model state type derives `Hashable`" overclaimed
+   (five do); two of the six non-E2E two-layer branches are session-covered,
+   not gap-table; "runs" → "rows"; `Reshard/Coverage.lean` is byte coverage,
+   disambiguated.
