@@ -103,6 +103,42 @@ Interpretation, not in the docstring:
   (`in_flight_ == 1 && unregister_on_settle_`) drops the plan one scope before
   `done_`; no op is left that could use it. Noted in the table, nothing to do.
 
+## `Send` and `Transport` (`dc32446e`, next commit) — same day, continued
+
+[FACT] `Send.lean` "Lock scopes": **no model change.** `wake`, `h2hIssue`,
+`sendNext`, `h2hDone` all end in `EndSendOp` from an `absl::Cleanup`; the
+tail paragraph transferred verbatim with `release_due` (A7) added to the
+readers of `in_flight_`. New facts the table pins: `h2hDone`'s
+`remaining_h2h_layers_.fetch_sub` is lock-free and nothing else reads it, so a
+step between it and `Finish()` is the model's step *before* `h2hDone` (a
+`cancel` there wins, matching `finishOnceLocked`); `start`'s deciding scope
+is `StartPush`'s locked section, and a `Finish` between the acquisition and
+it releases the staging through `FinishLocked` at `in_flight_ == 0`; the
+sender's first-wins `FinishLocked` means **no late-error flip** on the send
+side — `publish`'s set and details cannot disagree. State-table precision:
+`d2hIssued = d2h_layer_futures_.size()` only until `ReleaseStagingBlocksLocked`
+clears it. Ten source-map rows.
+
+[FACT] `Transport.lean` "Lock scopes": `stream` is the one deliberately
+coarse event in the trio — two mutexes, ~8 scopes. Interpretation: a
+`Finish` landing between the push lease and the delegate calls leaves a
+**state outside `step`'s reach** (layer latched in `layer_progress_` with
+neither a pending copy nor its blocks) that nevertheless satisfies `Safe`
+(`dispatched` only grew; `blocks` did not; session draining with an error).
+The session half of that interleaving is exact in `Receive.lean`
+(`pushBegin`, `cancel`, `pushEnd`). Not worth splitting the event: the three
+properties are about the table, and the table's own mutation is one scope
+(A1). Also pinned: `ForgetPushProgress` (erases entries under `progress_mu_`)
+is reached only via `UnregisterActivePlanDirect`, i.e. draining-with-last-op
+or settled, when nothing passes `TryBeginRecvOp`.
+
+[HYP] Pattern across the three: every multi-scope event is "decide under the
+lock, then an `absl::Cleanup` tail that only decrements `in_flight_`", and
+the commuting argument is always the same two lines. If the Reshard sessions
+follow it too, the remaining audits are mostly transcription; the
+interesting rows will be where a scope reads something *not* under the
+session lock (`ReadRemote`'s `lease_id` — F3 — is exactly such a row).
+
 ## Corrections
 
 None from the user. My own: the first draft of the section said "the only

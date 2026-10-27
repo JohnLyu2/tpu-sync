@@ -103,12 +103,12 @@ Each entry uses the 5-field `better-than-fish` format so any future session can 
 **Effort estimate:** flags 10 min; triage 1–4 h; controller annotations 2–4 h plus whatever the build flags.
 **References:** ../journal/2026-10/2026-10-26-faithfulness-feedback-and-receive-lock-scope-audit.md, findings/README.md §F3
 
-## Lock-scope audit for the remaining models (`Send`, `Transport`, `Pipeline`, Reshard, `ReadRemote`)
-**Status:** parked 2026-10-26
+## Lock-scope audit for the remaining models (`Pipeline`, Reshard, `ReadRemote`, …)
+**Status:** parked 2026-10-26; **updated 2026-10-27** — `Send` (`dc32446e`) and `Transport` done, no model change in either (journal 2026-10-26 §"Send and Transport").
 **Context:** `Receive.lean` now has a "Lock scopes" table (conventions.md §"One lock scope per event, or say why not") — per event, the `mu_` scopes it transcribes and why interleavings between them are covered. Result there: no model change; the load-bearing argument is the `EndRecvOp`-tail commutation (gap differs only in `in_flight_`, whose deciding readers are the two settle checks). 82 events remain across 12 models: `Pipeline` 13, `Send` 12, `Reshard/Receive` 9, `Reshard/Pipeline` 7, `UuidTable` 7, `Reshard/Send` 6, `Registry` 6, `Reshard/Coordinator` 6, `ReadRemote` 5, `Transport` 4, `Caller` 4, `PeerIsolation` 3. Environment and ghost events cost minutes; session events ~15–20 min each.
 **Why parked:** `Receive` is what the rest builds on and is the next upstream landing (step 2b); the others can follow the template.
-**To resume:** `Send.lean` first (12 events, 21 `mu_` scopes in `transfer_send_session.cc`, same `absl::Cleanup end_op` shape — the tail paragraph should transfer); then `Transport.lean` (`progress_mu_`, 4 events) before the step 2b/2c landings; `ReadRemote` (5 events; `RemoteReadState::mu` only guards `settled`, so expect the table to say "no scope" for `lease_id` reads — that *is* F3); Reshard last. Output per module: the section after the events table plus source-map rows for each cited scope. Where the commuting argument fails, split the event; where it holds only by code outside the model, number it as an assumption.
-**Effort estimate:** `Send` + `Transport` ~1 day; Reshard + Controller ~1 day.
+**To resume:** `Send` and `Transport` are done (the `EndSendOp`-tail paragraph did transfer; `Transport.stream` is the one deliberately coarse event, documented as such). Next `ReadRemote` (5 events; `RemoteReadState::mu` only guards `settled`, so expect the table to say "no scope" for `lease_id` reads — that *is* F3); Reshard last. Output per module: the section after the events table plus source-map rows for each cited scope. Where the commuting argument fails, split the event; where it holds only by code outside the model, number it as an assumption.
+**Effort estimate:** `Send` + `Transport` took ~1 h together (template amortises); Reshard + Controller + `Pipeline` ~1 day.
 **References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive.lean §Lock scopes, tpu_sync/formal_verification/docs/conventions.md, ../journal/2026-10/2026-10-26-faithfulness-feedback-and-receive-lock-scope-audit.md
 
 ## TSan run of the controller and receive/send test targets (F3 → CONFIRMED (test))
