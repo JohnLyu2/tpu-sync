@@ -157,7 +157,7 @@ structure S where
   deadlineFired : Bool := false
   shutdown : Bool := false
   reused : Bool := false
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 inductive Ev where
   | acquireReply (ok : Bool)

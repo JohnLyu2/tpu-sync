@@ -47,7 +47,7 @@ TpuSyncVerify/
   Transfer/Session.lean       settle protocol shared by every transfer session
   Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator
-  Controller/ReadRemote.lean  controller remote-read lease
+  Controller/ReadRemote.lean  controller remote-read lease (+ ReadRemoteCoverage.lean)
 docs/
   conventions.md              how the models are written (one executable step, ghost
                               fields, replay traces, mutants) and how the C++ is cited

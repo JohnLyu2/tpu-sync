@@ -23,6 +23,7 @@ import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
 import TpuSyncVerify.Transfer.Reshard.Coordinator
 import TpuSyncVerify.Controller.ReadRemote
+import TpuSyncVerify.Controller.ReadRemoteCoverage
 
 /-!
 # TpuSyncVerify
@@ -34,5 +35,5 @@ modelled, the directory layout, and how the C++ is cited.
 * `Common` — transition-system core, list lemmas, bounded model checker, branch coverage.
 * `Transfer` — `Session` (settle protocol shared by every transfer session),
   `PrefillDecode/`, `Reshard/`.
-* `Controller` — `ReadRemote`.
+* `Controller` — `ReadRemote` (and its branch coverage, `ReadRemoteCoverage`).
 -/

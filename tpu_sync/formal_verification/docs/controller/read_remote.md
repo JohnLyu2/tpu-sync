@@ -50,6 +50,22 @@ deterministic test. The deferred-settle design's cost
 is that a hung pull holds the caller until it resolves; a complete fix needs
 cancellation, or settle-with-error while the blocks stay quarantined.
 
+## Branch coverage by the replayed tests
+
+`ReadRemoteCoverage.lean` ([conventions.md](../conventions.md) §Coverage):
+the whole state space of the shipping implementation has 11 branches; the
+seven `ReadRemotePullTest` cases (four traces, the `trace_*` theorems minus
+their final ghost `callerReuse`, which no test performs) reach 5, the two
+counterexample traces two more. Five of the six gaps need the deadline thread
+to fire, which no upstream test lets happen (`RemoteReadDeadline()` defaults
+to 150 s, every case ends within seconds, and no test delays the source or
+the worker): the deadline settling an unanswered read, a late acquire failure
+or teardown-cancel after it, the deadline waking on a settled read, and a
+pull completing after it; the sixth is the caller's reuse itself. The model
+has no lock windows, so every gap is drivable with a short
+`RAIDEN_REMOTE_READ_DEADLINE_S` (read once per process) and a slowed source
+hook or worker mock — the fixture that reproduces shapes A and B.
+
 ## Source map & test suite correspondence (`tpu-raiden` C++ → Lean)
 
 The `ReadRemote` implementation in `tpu_sync/core/controller/raiden_controller.cc`
@@ -78,5 +94,5 @@ map to `ReadRemote.lean` as follows (line ranges resolved by
 | `ctrl_test.cc` | `ReadRemotePullTest.AcquireNotFoundFailsFastWithoutTransfer` | `:797-815` | `trace_acquire_fails_fast` | Source returns `NOT_FOUND` (`acquireReply false`); settles immediately with `pullIssued = false` |
 | `ctrl_test.cc` | `ReadRemotePullTest.TransferFailureStillReleasesTheLease` | `:817-833` | `trace_full_success` | Pull future resolves with error (`pullDone`), releases lease, and settles |
 | `ctrl_test.cc` | `ReadRemotePullTest.RevokedVerdictFailsTheRead` | `:835-855` | `trace_full_success` | Pull completes (`pullDone`), lease release returns `REVOKED`, settles with `FailedPrecondition` |
-| `ctrl_test.cc` | `ReadRemotePullTest.ControllerTeardownMidReadIsSafe` | `:857-882` | `trace_teardown_before_acquire`, `trace_teardown_during_pull` | Controller destroyed either before `acquireReply` (skips pull, settles `Cancelled`) or during `pullInFlight` (finishes pull via shared state and settles) |
+| `ctrl_test.cc` | `ReadRemotePullTest.ControllerTeardownMidReadIsSafe` | `:857-882` | `trace_teardown_before_acquire`, `trace_teardown_during_pull`, `trace_full_success` | Controller destroyed before `acquireReply` (skips pull, settles `Cancelled`), during `pullInFlight` (finishes pull via shared state and settles), or after the read completed; the test accepts `Ok` or `Cancelled` and does not distinguish the last two |
 <!-- source-map:end -->
