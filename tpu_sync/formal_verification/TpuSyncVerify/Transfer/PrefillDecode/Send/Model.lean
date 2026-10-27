@@ -28,7 +28,7 @@ structure Send where
   h2hOk : Nat := 0
   published : Option Bool := none
   underflow : Bool := false
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Send
 

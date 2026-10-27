@@ -73,7 +73,10 @@ umbrella file and a directory of parts:
 * `X/Frame.lean` — frame lemmas for other modules.
 * `X/Traces.lean` — traces, searches, mutants.
 * `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
-  below); `Receive` and `Send` so far.
+  below); `Receive`, `Send` and `Pipeline` so far (`Pipeline/Coverage.lean`
+  imports the traces in `PipelineChecks.lean`, so `TpuSyncVerify.lean` imports
+  it directly). Not to be confused with `Reshard/Coverage.lean`, which is the
+  reshard model's sub-block byte coverage, a model of the C++.
 
 Modules with their own internal numbering (`BlockOrdering`, `PoolStaging`)
 name their parts after their sections instead.
@@ -201,10 +204,21 @@ the model the tests exercise. `Common/Coverage.lean` holds the machinery and
   production source) listed as `notReplayable` with the reason, not paired
   with the nearest trace;
 * one `#guard` that pins the counts, the uncovered set and the classification,
-  so a new branch, a dropped trace or a new paired test fails `lake build`.
+  so a new branch, a dropped trace or a new paired test fails `lake build`;
+* for a model that composes others (`Pipeline` over `Send` and `Receive`),
+  leaves that carry the inner model's leaf (`Pipeline.Leaf.send (l : Send.Leaf)`),
+  so a gap can be looked up in the inner table: the `#guard` then checks that
+  every gap is an environment event, covered at the inner level, or in the
+  inner gap table — nothing falls between the tables.
 
 A leaf no reachable branch carries is a C++ assertion or a dead arm; say which
-and why (the receive model has one of each; the send model none).
+and why (the receive model has one of each; the send model none). A search
+that does not fit the budget (the two-layer `Pipeline`, ~20 s) is not a
+`#guard`: state its result and how to re-run it (`tools/run_lean.sh`).
+
+The search keys states by `Hashable`: every state type a coverage search runs
+on, and its component types (`Lifecycle`, `Cell`, `Send`, `Recv`, `Pipeline`),
+derive it.
 
 ## Citing the C++
 

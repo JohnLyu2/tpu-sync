@@ -22,7 +22,7 @@ structure Recv where
   pullPending : Bool := false
   pending : Nat := 0
   retired : Nat := 0
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Recv
 

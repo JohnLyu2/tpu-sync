@@ -16,7 +16,7 @@ inductive Cell where
   | blank
   | kv (layer : Nat)
   | junk
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 structure Pipeline where
   numLayers : Nat
@@ -46,7 +46,7 @@ structure Pipeline where
   registered : Bool := true
   /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout`. -/
   pullWaiting : Bool := false
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Pipeline
 

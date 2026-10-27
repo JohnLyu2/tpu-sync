@@ -90,7 +90,7 @@ structure Lifecycle where
   done : Bool := false
   statusOk : Bool := true
   hasStaging : Bool := true
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Lifecycle
 

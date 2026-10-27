@@ -181,6 +181,30 @@ Each mutant removes a specific C++ guard or ordering constraint and yields a
 | `Transport` with `Cfg.honest = false` (`trace_dup_chunk_publishes_missing_layer`, `trace_dup_after_retirement`) | `Transport` A4, honest senders: the chunk-count contract has no over-count rejection, every accepted stream is counted, and `layer_progress_` is erased on `all_layers_called` while the receive is live | `NetworkSound` / `CompleteOnSuccess`: success published with a layer never copied (chunk-count, before retirement); `OnceDispatched`: a layer copied twice after retirement on either contract (`trace_dup_copy_fails_late`: a failing duplicate fails the receive) |
 | `Transport.stepHardened` (candidate fix, not a mutant) | adds the missing over-count rejection to the chunk-count contract and a per-layer once-latch in `ExecuteLayerH2d` | none within the search depth on the dishonest instances (`searchHardened … = .outOfFuel`); honest traces unchanged (`trace_hardened_honest`) |
 
+## Branch coverage by the replayed tests
+
+How much of each model's `step` the upstream tests exercise
+([conventions.md](../conventions.md) §Coverage; one `#guard` per model pins
+the numbers). A branch is a leaf of an event's decision tree with the step's
+effect on the lifecycle; the denominator is the exhaustive reachable set of
+the small instances; the numerator is the branches along traces paired with
+an upstream test. Each module's `Coverage.lean` tabulates its gaps with a
+schedule reaching each and a class: **test** (a harness can drive it — a
+missing upstream test), **window** (an interleaving no harness hook reaches),
+**ordering** (left open by the model), or a stub the harness lacks.
+
+| Model | Instances | Branches | Reached by paired tests | Gaps | Of which |
+|---|---|---|---|---|---|
+| `Receive` | 1–2 layers, push and `StartRead` | 37 (+2 unreachable leaves: the retired-callback assertion, the dead `FinishLocked()` arm of `RecordNetworkCompleteLocked`) | 18 (20 tests) | 19 | 10 test (8 drivable, 2 need a replying producer stub), 5 window, 4 ordering |
+| `Send` | 0–2 layers | 43 (every leaf live) | 26 (29 tests; 9 more tests not replayable: external `Finish(OkStatus())`, pulls rejected before the claim) | 17 | 7 test, 10 window |
+| `Pipeline` | 1 layer, registered and unregistered (two paired two-layer rows reach 4 branches outside it) | 75; every memory move writes the right layer's KV | 25 (13 end-to-end and control-plane tests) | 50 | 3 environment (`reclaim`, reseats), 17 covered by session unit tests, 30 in the session gap tables, none unaccounted |
+
+What the tests miss, in one sentence per model: no upstream test fails an
+H2D or D2H dispatch or a push; no consumer-side unit test completes a
+handshake; the end-to-end tests exercise exactly the happy paths and the
+handshake rejections, every failure or window branch being accounted for at
+the session level.
+
 ## C++ → Lean routing index
 
 Per C++ symbol: the Lean module that owns it, the model events or definitions

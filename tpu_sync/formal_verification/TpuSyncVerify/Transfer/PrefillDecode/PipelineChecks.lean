@@ -63,10 +63,8 @@ def consumer : List Ev :=
 /-- Producer then consumer: both sides published as done, the data in decode
 HBM (`KVCacheManagerWithTransferTest.LocalOrchestratedTransfer` /
 `KVCacheManagerWithTransferTest.TreeBroadcastCorrectness8Nodes` /
-`KVCacheManagerWithTransferTest.MultiIpOrchestratedTransfer`, and
-`test_e2e_transfer_polling` / `test_parallel_pull` in
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py` and
-`tpu_sync/api/torch/kv_cache_manager_transfer_test.py`). Only
+`KVCacheManagerWithTransferTest.MultiIpOrchestratedTransfer`, all one layer;
+the Python end-to-end tests run two layers, `trace_layers_out_of_order`). Only
 `LocalOrchestratedTransfer` installs a `MockMetricsBackend` and expects the
 transfer-duration histogram (`ObserveHistogram(telemetry::metric_names::kTransferDurationMs, ...)`)
 exactly once, an implicit, timing-dependent witness that the last H2D callback
@@ -357,5 +355,55 @@ theorem trace_reseat_at_finish :
       (fun s => (s.send.life.done, s.recv.published, s.decodeHbm)) =
     some (false, some true, [.junk]) := by
   decide
+
+/-! ## Which traces stand for an upstream test
+
+`paired` lists the traces above that replay an upstream test, with the system
+the test runs on; `Pipeline/Coverage.lean` measures which branches of `step`
+they reach. Two kinds of pairing, both weaker than a session test's: the
+end-to-end tests (`KVCacheManagerWithTransferTest.*`, the Python
+`test_e2e_transfer_polling` / `test_parallel_pull`) run the real system and
+assert only the outcome, so their trace is one admissible schedule among
+many; the control-plane tests have a producer `TestManager` (zero layers) and
+a raw client socket, so their consumer-side events (`pullReply true` for the
+ack, `pullReply false` for a rejection or timeout) stand for what the client
+reads, not for a `TransferReceiveSession`; the producer's zero-layer
+`StartPush` on its worker thread is left out (see `Send/Traces.lean`), and the
+rejected-after-deadline test is its producer's deadline sweep and poll. -/
+
+/-- (upstream test, initial state, trace). -/
+def paired : List (String × Pipeline × List Ev) :=
+  [("KVCacheManagerWithTransferTest.LocalOrchestratedTransfer", init 1, producer ++ consumer),
+   ("KVCacheManagerWithTransferTest.TreeBroadcastCorrectness8Nodes", init 1, producer ++ consumer),
+   ("KVCacheManagerWithTransferTest.MultiIpOrchestratedTransfer", init 1, producer ++ consumer),
+   ("jax test_e2e_transfer_polling / torch test_e2e_transfer_polling (num_layers = 2)", init 2,
+     producer2 ++ consumer2),
+   ("jax test_parallel_pull / torch test_parallel_pull (num_layers = 2)", init 2,
+     producer2 ++ consumer2),
+   ("ControlHandshakeTest.RegisteredPullIsAcknowledged", init 1,
+     [.send .beginPull, .recv (.pullReply true)]),
+   ("ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement", init 1, [.send .beginPull]),
+   ("ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected", init 1,
+     [.send .cancel, .send .publish]),
+   ("ControlHandshakeTest.PullWithoutRegistrationIsRejected", initUnregistered 1,
+     [.pullWait, .recv (.pullReply false)]),
+   ("ControlHandshakeTest.PullAheadOfRegistrationIsAcknowledgedOnceRegistered", initUnregistered 1,
+     [.pullWait, .notifyForRead, .send .beginPull, .recv (.pullReply true)]),
+   ("ControlHandshakeTest.ShutdownUnblocksPendingPull", initUnregistered 1,
+     [.pullWait, .recv (.pullReply false)])]
+
+/-- Traces no upstream test replays. -/
+def modelOnly : List (String × Pipeline × List Ev) :=
+  [("producer long gone before the consumer lands the layer", init 1,
+     producer ++ [.reclaim, .reseatPrefillStaging] ++ consumer),
+   ("settled receive takes no push; its staging reseated", init 1,
+     [.recv .cancel, .recv (.pullReply false), .recv .publish, .reseatDecodeStaging]),
+   ("unregistered pull: grace wait, timeout, consumer publishes failure", initUnregistered 1,
+     [.pullWait, .recv (.pullReply false), .recv .publish]),
+   ("pull ahead of registration, then the full one-layer transfer", initUnregistered 1,
+     [.pullWait, .notifyForRead] ++ producer ++ consumer),
+   ("shutdown during the grace wait, both sides settle and publish", initUnregistered 1,
+     [.pullWait, .send .cancel, .recv .cancel, .recv (.pullReply false), .send .publish,
+      .recv .publish])]
 
 end TpuSyncVerify.Transfer.PrefillDecode.Pipeline

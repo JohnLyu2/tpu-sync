@@ -12,6 +12,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation
 import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering
 import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
+import TpuSyncVerify.Transfer.PrefillDecode.Pipeline.Coverage
 import TpuSyncVerify.Transfer.PrefillDecode.Transport
 import TpuSyncVerify.Transfer.PrefillDecode.Caller
 import TpuSyncVerify.Transfer.Reshard.Receive
