@@ -240,3 +240,31 @@ Canonical: `Controller/ReadRemoteCoverage.lean` §Result,
    the test, unobserved" was false (it never wakes before exit); env var is
    `RAIDEN_REMOTE_READ_DEADLINE_S` (I had written a `TPU_RAIDEN_…` name),
    integer seconds, read once per process.
+
+## MultiRequest (`f44e707c`) — interpretation
+
+Canonical: `MultiRequestCoverage.lean` §Result, `prefill_decode.md` coverage
+table row.
+
+- [FACT] Unbounded state space → no universe; measured by leaves added
+  (3): the corruption arm is dead by theorem, the two recycles are reached
+  only by the `run_all.sh` replays. **No upstream test overwrites a buffer an
+  earlier request released while that request is still observable.** The
+  whole multi-request story — the thing the slides' Theorems 1–3 are about —
+  has no in-suite test behind it; its evidence is the Lean proof plus a demo
+  script.
+- [HYP] Cheapest test that would change this: a `RecvTestManager` case that
+  registers a second receive on the first's staging slot after the first
+  publishes, then completes a late callback of the first and checks the
+  second's buffer — the `reseatAtFinish` mutant as a C++ test. Belongs in the
+  upstream test PR.
+
+## Corrections (MultiRequest round)
+
+1. Independent audit: `nextRequest` recycles three buffers, not four
+   (`decodeHbm`, the published result, is kept — junking it would contradict
+   `system_attention_safe`); "no test recycles a buffer to a later request"
+   was too strong (two tests hand released resources to later requests with
+   the earlier one finished) — tightened to "overwrites … while still
+   observable", tests named; stale "no coverage there yet" in
+   `Pipeline/Coverage.lean`.
