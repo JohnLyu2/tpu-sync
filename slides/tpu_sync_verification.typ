@@ -1,7 +1,7 @@
 #import "lib.typ": *
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, node, edge
 
-#show: deck.with(short: [Formal Verification of TPU Sync · prefill → decode transfer])
+#show: deck.with(short: [Formal Verification of TPU Sync])
 
 #title-slide([Formal Verification of TPU Sync])
 
@@ -29,7 +29,7 @@
       #v(0.5em)
       #case(hl: true)[prefill → decode][Both workers have the same layout. Each chip sends its part to the matching chip on the other side; the transfers are independent of each other.]
       #v(0.4em)
-      #case[reshard][The workers have different layouts. Each destination chip needs parts from several source chips, so a schedule computes who sends what to whom.]
+      #case(hl: true)[reshard][The workers have different layouts. Each destination chip needs parts from several source chips, so a schedule computes who sends what to whom.]
     ],
     card[KV cache storage][
       Keeps finished requests' KV blocks so later requests with the same prefix can reuse them instead of recomputing.
@@ -260,24 +260,26 @@
   To mechanize this top-to-bottom proof in Lean, we model the top three levels of TPU Sync's transfer stack and abstract byte chunks into whole transformer layers:
 
   #v(0.2em)
+  #show table: set text(size: 13pt)
   #table(
     columns: (auto, auto, 1fr, auto),
-    fill: (_, y) => if y in (1, 2) { accent.lighten(90%) } else if y == 3 { accent.lighten(95%) } else { none },
+    inset: (x: 8pt, y: 4.5pt),
+    fill: (_, y) => if y in (1, 2, 3) { accent.lighten(90%) } else { none },
     table.header[Component][Unit of data][What it does][In the Lean model],
     [*Manager & Engine*\ `KVCacheManagerWithTransfer`],
     [Whole request],
-    [Polls settled sessions (`CompleteReadRaw` / `poll_stats()`), publishes `done_sending` / `done_recving`, frees prefill HBM, runs decode attention.],
-    [*Modeled*],
+    [Polls settled sessions (`CompleteReadRaw` / `poll_stats()`), publishes `done_sending` / `done_recving`; the serving engine frees prefill HBM and runs decode attention.],
+    [*Modeled*\ `MultiRequest`, `Caller`],
 
     [*Transfer Sessions*\ `TransferSendSession`\ `TransferReceiveSession`],
     [Transformer\ layer],
     [Issues D2H and H2D copies per transformer layer, chains H2H pushes one layer at a time, tracks `in_flight_` / `draining_` / `done_`, owns host staging.],
-    [*Modeled*],
+    [*Modeled*\ `Send`, `Receive`],
 
     [*Block Transport*\ `BlockTransport`],
     [KV block →\ layer],
-    [Counts arrived KV blocks for each transformer layer and notifies the receive session (`begin/end_incoming_push`, `OnLayerReceived(l)` when all blocks of layer $l$ land, `OnBlockShardsReceived`).],
-    [*Callbacks &*\ `BlockOrdering`],
+    [Counts arrived KV blocks and streams per transformer layer and notifies the receive session (`begin/end_incoming_push`, `OnLayerReceived(l)`, `OnBlockShardsReceived`).],
+    [*Modeled*\ `Transport`, `BlockOrdering`],
 
     [*Raw Buffer Transport*\ `RawBufferTransport`],
     [Byte chunk /\ TCP socket],
@@ -286,7 +288,7 @@
   )
 
   #v(0.2em)
-  Because every session decision (`StartPush`, `SendNextLayer(l)`, `OnLayerReceived(l)`, `ExecuteLayerH2d(l)`) acts on a complete *transformer layer*, `Pipeline` tracks one slot per layer while `BlockOrdering` refines each layer into blocks.
+  Because every session decision (`StartPush`, `SendNextLayer(l)`, `OnLayerReceived(l)`, `ExecuteLayerH2d(l)`) acts on a complete *transformer layer*, `Pipeline` tracks one slot per layer, while `Transport` and `BlockOrdering` refine each layer into network streams and blocks.
 ]
 
 // ---------------------------------------------------------------------------
@@ -332,6 +334,9 @@
       ],
     )
   ]
+
+  #v(0.2em)
+  #text(size: 13pt)[Around this core: `Caller` models the serving engine above `MultiRequest` (vLLM scheduler + connector), and `Transport` / `BlockOrdering` refine `Receive`'s network callbacks into streams and blocks.]
 ]
 
 // ---------------------------------------------------------------------------
@@ -389,7 +394,7 @@
     ],
     [
       *Explicit two-step transitions:*\
-      Splits lock–unlock–relock sequences (e.g. `h2dBegin l` #sym.arrow.r `h2dIssue l`) so events can interleave in the gap.
+      Splits lock–unlock–relock sequences (e.g. `h2dBegin l` #sym.arrow.r `h2dIssue l`) so events can interleave in the gap; every event is audited against the `mu_` scopes it stands for.
     ],
     [
       *Async timeouts, polls & buffer reuse:*\
@@ -471,7 +476,7 @@
 
 // ---------------------------------------------------------------------------
 #slide[Validating the model: translating unit tests to Lean][
-  To check that the Lean model faithfully captures the production C++ behavior (without over-constraining valid runs), we replay all 64 `tpu-sync` unit and E2E tests inside the model before proving general theorems:
+  To check that the Lean model faithfully captures the production C++ behavior (without over-constraining valid runs), we replay all 71 `tpu-sync` unit and E2E tests inside the model before proving general theorems:
 
   #v(0.25em)
   #let pill(title, sub) = block(
@@ -485,7 +490,7 @@
   #grid(
     columns: (1fr, auto, 1fr, auto, 1fr),
     column-gutter: 0.6em,
-    pill[1 · Production test][Tests *one* fixed schedule in C++ or Python (`64` tests total)],
+    pill[1 · Production test][Tests *one* fixed schedule in C++ or Python (`71` tests total)],
     align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
     pill[2 · Lean trace (`by decide`)][Executes that exact scenario step-by-step inside the Lean model],
     align(center + horizon)[#text(size: 20pt, fill: accent.lighten(30%))[#sym.arrow.r]],
@@ -524,7 +529,7 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Validating the model: 64 production tests covered in Lean][
+#slide[Validating the model: 71 production tests covered in Lean][
   #v(0.15em)
   #let cat(title, count, mod, bullets) = block(
     fill: luma(247), stroke: 0.5pt + luma(222), radius: 4pt,
@@ -546,15 +551,15 @@
     columns: (1fr, 1fr),
     column-gutter: 0.9em,
     row-gutter: 0.65em,
-    cat[1 · Session drain & leases][33 C++][`Send` / `Receive`][
-      - Mid-copy failures & deadlines wait for all in-flight DMA copies
+    cat[1 · Session drain & leases][40 C++][`Send` / `Receive`][
+      - Mid-copy failures, deadlines & push failures wait for all in-flight DMA copies
       - Incoming TCP push leases pin host staging; first `Finish` wins
     ],
-    cat[2 · Control handshake][8 C++][`Send` / `Pipeline`][
+    cat[2 · Control handshake][10 C++][`Send` / `Receive` / `Pipeline`][
       - Pulls arriving ahead of `NotifyForRead` wait and succeed once registered
-      - Rejects duplicate or unregistered pulls; shutdown unblocks waiters
+      - Rejects duplicate, expired or unregistered pulls; shutdown unblocks waiters
     ],
-    cat[3 · Block gather & reordering][7 C++ · 3 E2E][`BlockOrdering`][
+    cat[3 · Block gather & reordering][5 C++ · 3 E2E][`BlockOrdering`][
       - Rejects empty, duplicate, or unregistered block IDs on pull
       - Proves DMA coalescing & dual-permutation `BuildLoadCopyPlan`
     ],
@@ -566,7 +571,7 @@
       - Models TCP worker-pool blocking (Issue \#888) vs. async gRPC
       - Per-peer staging quota stops a wedged peer from starving others
     ],
-    cat[6 · Multi-layer & multi-request][2 C++ · 3 E2E][`Pipeline` / `MultiRequest`][
+    cat[6 · Multi-layer & multi-request][3 C++ · 2 E2E][`Pipeline` / `MultiRequest`][
       - Out-of-order layer completion across D2H, H2H, and H2D stages
       - Continuous HBM & host staging recycling across concurrent requests
     ],
@@ -619,7 +624,7 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Lean-backed AI agent (`tpu-sync-lean-helper`)][
+#slide[Lean-backed AI agent (`raiden-lean-helper`)][
   #v(0.3em)
   #set text(size: 14.5pt)
   #set par(leading: 0.65em)
