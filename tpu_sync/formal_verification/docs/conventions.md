@@ -73,7 +73,7 @@ umbrella file and a directory of parts:
 * `X/Frame.lean` — frame lemmas for other modules.
 * `X/Traces.lean` — traces, searches, mutants.
 * `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
-  below); so far `Receive` only.
+  below); `Receive` and `Send` so far.
 
 Modules with their own internal numbering (`BlockOrdering`, `PoolStaging`)
 name their parts after their sections instead.
@@ -176,8 +176,8 @@ they all run on every `lake build`.
 
 **Coverage: which branches of `step` the replayed tests reach.** Replaying
 every upstream test says the model is not vacuous; it does not say how much of
-the model the tests exercise. `Receive/Coverage.lean` is the template for
-measuring that:
+the model the tests exercise. `Common/Coverage.lean` holds the machinery and
+`Receive/Coverage.lean` is the template for measuring that:
 
 * a `Leaf` per leaf of each event's decision tree, named for the C++ path it
   stands for, and an `Effect` read off the before/after lifecycle (drains,
@@ -192,12 +192,19 @@ measuring that:
   set by running `paired`, and the difference tabulated in the docstring with
   the shortest schedule reaching each branch (`witness`) and a class:
   **test** (a harness can drive it — a missing upstream test), **window** (an
-  interleaving no harness hook reaches), or an ordering the model leaves open;
+  interleaving no harness hook reaches), or an ordering the model leaves open
+  (data arriving before a pull reply). Check first whether an "open" order is
+  in fact fixed by code outside the model: the two callbacks on one D2H
+  future run in reverse registration order, which the send pairing had to
+  establish;
+* tests whose stimulus is not an event of the model (a synthetic call with no
+  production source) listed as `notReplayable` with the reason, not paired
+  with the nearest trace;
 * one `#guard` that pins the counts, the uncovered set and the classification,
   so a new branch, a dropped trace or a new paired test fails `lake build`.
 
 A leaf no reachable branch carries is a C++ assertion or a dead arm; say which
-and why (the receive model has one of each).
+and why (the receive model has one of each; the send model none).
 
 ## Citing the C++
 

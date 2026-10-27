@@ -3,6 +3,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Send.Invariant
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Frame
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Traces
+import TpuSyncVerify.Transfer.PrefillDecode.Send.Coverage
 
 /-!
 # Send session
@@ -221,6 +222,27 @@ outstanding, so a shutdown or deadline in that window leaves the status OK
 there is no `failed_sending_`. (3) The D2H loop's `if (draining_) return;` in
 `StartPush` also skips `SendNextLayer(0)`, which is fine because every later
 `SendNextLayer` re-checks `draining_`.
+
+## Coverage
+
+`Coverage.lean` measures how much of `step` the replayed upstream tests
+exercise, as `Receive/Coverage.lean` does (branch = leaf of an event's
+decision tree × effect on the lifecycle; the reachable set is exhaustive for
+zero, one and two layers: 43 branches, every leaf live). The 29 upstream tests
+paired with traces (15 distinct) reach 26 of the 43; nine more send-lifecycle
+tests are not replayable — six because their stimulus is an external
+`Finish(OkStatus())`, the consumer-Ack path A5 excludes, three because the
+pull is rejected before `pull_started_`. The 17 gaps are tabulated there with
+a schedule reaching each and classified: 7 missing upstream tests (no test
+fails a D2H dispatch or a push; the expired-then-failed copy; the
+`DoneGuarantees…` completions in the other order) and 10 lock-window
+interleavings inside `StartPush`'s loop, `SendNextLayer` or the push-pool task
+that no harness hook reaches. Pairing fixed one fact the traces had left open:
+the two callbacks on a layer's D2H future run in reverse registration order on
+the setting thread (`xla::Future::OnReady` → `AsyncValue::AndThen`), so a copy
+the test completes runs `SendNextLayer`'s before `StartPush`'s. The `#guard` at
+the end of `Coverage.lean` fails if a branch, a trace or a classification
+changes.
 
 ## Source map
 

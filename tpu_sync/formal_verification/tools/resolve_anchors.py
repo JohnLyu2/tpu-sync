@@ -116,6 +116,7 @@ PROSE_LINE_CITE = re.compile(r"\blines?\s+\d+(?:\s*[-\u2013]\s*\d+)?\b", re.IGNO
 RAW_STR_OPEN = re.compile(r'R"([A-Za-z0-9_{}\[\]#<>%:;.?*+\-/^&|~!=,\']*)\(')
 
 NO_MAP_FILES = {
+    "TpuSyncVerify/Common/Coverage.lean",
     "TpuSyncVerify/Common/ListAux.lean",
     "TpuSyncVerify/Common/ModelCheck.lean",
     "TpuSyncVerify/Common/System.lean",

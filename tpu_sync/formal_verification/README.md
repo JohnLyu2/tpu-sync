@@ -43,7 +43,7 @@ machine-checked proofs about them.
 ```text
 TpuSyncVerify.lean            imports every model
 TpuSyncVerify/
-  Common/                     transition-system core, list lemmas, bounded model checker
+  Common/                     transition-system core, list lemmas, bounded model checker, branch coverage
   Transfer/Session.lean       settle protocol shared by every transfer session
   Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator

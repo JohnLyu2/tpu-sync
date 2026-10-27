@@ -1,4 +1,4 @@
-import TpuSyncVerify.Common.ModelCheck
+import TpuSyncVerify.Common.Coverage
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Traces
 
 /-! # `Recv`: branch coverage of `step` by the replayed tests
@@ -6,14 +6,16 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive.Traces
 Part of `TpuSyncVerify.Transfer.PrefillDecode.Receive`.
 
 `step` is a small decision tree per event. A **branch** is one leaf of that tree
-(`Leaf`) together with what the step did to the lifecycle (`Effect`: started
-draining, settled, recorded the first error). `stepT` is `step` with the leaf
-attached; `stepT_step` proves it is the same function, so coverage is measured
-on the proved `step` and never on a second transcription.
+(`Leaf`) together with what the step did to the lifecycle (`Coverage.Effect`:
+started draining, settled, recorded the first error). `stepT` is `step` with
+the leaf attached; `stepT_step` proves it is the same function, so coverage is
+measured on the proved `step` and never on a second transcription. The
+machinery is `Common/Coverage.lean`.
 
 The denominator is the set of branches reachable from `initPush`/`initLoad`
-(`reachableBranches`, an exhaustive search); the numerator is the set of branches
-along the traces that replay an upstream C++ test (`paired` in `Traces.lean`).
+(`Coverage.reachableBranches`, an exhaustive search); the numerator is the set
+of branches along the traces that replay an upstream C++ test (`paired` in
+`Traces.lean`).
 A branch no replayed test reaches is either a missing upstream test or a
 transition only the environment can cause; each is listed and classified in
 `#guard`s at the end so a new branch, a dropped trace or a new test fails
@@ -22,6 +24,7 @@ transition only the environment can cause; each is listed and classified in
 namespace TpuSyncVerify.Transfer.PrefillDecode
 
 open TpuSyncVerify.Transfer (Lifecycle)
+open TpuSyncVerify.Coverage (Effect Instr insertNew sameSet)
 
 namespace Recv
 
@@ -70,20 +73,9 @@ inductive Leaf
   | publish
   deriving Repr, DecidableEq
 
-/-- What a step did to the lifecycle, read off the two states. -/
-structure Effect where
-  /-- `draining_` went `false → true`. -/
-  drains : Bool
-  /-- `done_` went `false → true` (staging released). -/
-  settles : Bool
-  /-- `status_` went OK → error. -/
-  errors : Bool
-  deriving Repr, DecidableEq
-
 def effect (s s' : Recv) : Effect :=
-  { drains := !s.life.draining && s'.life.draining,
-    settles := !s.life.done && s'.life.done,
-    errors := s.life.statusOk && !s'.life.statusOk }
+  Effect.of s.life.draining s.life.done s.life.statusOk
+    s'.life.draining s'.life.done s'.life.statusOk
 
 abbrev Branch := Leaf × Effect
 
@@ -119,71 +111,16 @@ def stepT (s : Recv) : Ev → Option (Recv × Leaf)
 theorem stepT_step (s : Recv) (e : Ev) : (stepT s e).map (·.1) = step s e := by
   cases e <;> simp [stepT, step, Option.map_map, Function.comp_def]
 
-/-! ## Running with branches -/
+/-- The instrumented model: a third concurrent push adds states but no branch
+(`pushes` only matters as `0`, `1` or "another one is open"), so states with
+more than two open pushes are not expanded, which keeps the state space
+finite. -/
+def instr : Instr Recv Ev Leaf Effect := { stepT, effect, keep := fun s => s.pushes ≤ 2 }
 
-/-- Replay `tr` from `s`, collecting the branch of every step; stops at the
-first refused event (its branches so far are still reported). -/
-def runT (s : Recv) : List Ev → List Branch
-  | [] => []
-  | e :: es =>
-    match stepT s e with
-    | none => []
-    | some (s', l) => (l, effect s s') :: runT s' es
-
-private def insertNew (acc : List Branch) (b : Branch) : List Branch :=
-  if acc.contains b then acc else b :: acc
-
-/-- Union of branches along a list of (initial state, trace) pairs. -/
-def coveredBy (runs : List (Recv × List Ev)) : List Branch :=
-  (runs.flatMap fun (s, tr) => runT s tr).foldl insertNew []
-
-/-- Every branch reachable from `init`, by breadth-first search over states
-(the same search as `ModelCheck.check`, collecting branches instead of looking
-for a bad state). States with more than `maxPushes` open push leases are not
-expanded: a third concurrent push adds states but no branch (`pushes` only
-matters as `0`, `1` or "another one is open"), and with it the state space is
-finite. Returns `none` if `fuel` ran out before the search exhausted it. -/
-def reachableBranches (init : Recv) (events : List Ev) (fuel : Nat) (maxPushes : Nat := 2) :
-    Option (List Branch) :=
-  go [init] [init] [] fuel
-where
-  go (frontier seen : List Recv) (acc : List Branch) : Nat → Option (List Branch)
-    | 0 => none
-    | fuel + 1 =>
-      let next := frontier.flatMap fun s =>
-        events.filterMap fun e =>
-          (stepT s e).bind fun (s', l) =>
-            if s'.pushes ≤ maxPushes then some (s', (l, effect s s')) else none
-      let acc := next.foldl (fun acc p => insertNew acc p.2) acc
-      let fresh := (next.map (·.1)).foldl
-        (fun (fr : List Recv) s' => if seen.contains s' ∨ fr.contains s' then fr else s' :: fr) []
-      if fresh.isEmpty then some acc else go fresh (seen ++ fresh) acc fuel
-
-/-- Shortest trace from `init` whose last step takes branch `b`. -/
-def witness (init : Recv) (events : List Ev) (b : Branch) (fuel : Nat := 16) :
-    Option (List Ev) :=
-  go [(init, [])] [init] fuel
-where
-  go (frontier : List (Recv × List Ev)) (seen : List Recv) : Nat → Option (List Ev)
-    | 0 => none
-    | fuel + 1 =>
-      let next := frontier.flatMap fun (s, tr) =>
-        events.filterMap fun e =>
-          (stepT s e).map fun (s', l) => (s', e :: tr, (l, effect s s'))
-      match next.find? (fun p => p.2.2 = b) with
-      | some (_, tr, _) => some tr.reverse
-      | none =>
-        let fresh := next.foldl
-          (fun (fr : List (Recv × List Ev)) (s', tr, _) =>
-            if s'.pushes > 2 ∨ seen.contains s' ∨ fr.any (·.1 = s') then fr else (s', tr) :: fr) []
-        if fresh.isEmpty then none else go fresh (seen ++ fresh.map (·.1)) fuel
-
-/-- The four systems the traces run on, and the union of their reachable
-branches (`none` if any search did not exhaust its state space). -/
+/-- The four systems the traces run on. -/
 def inits : List Recv := [initPush 1, initPush 2, initLoad 1, initLoad 2]
 
-def allBranches (fuel : Nat := 64) : Option (List Branch) :=
-  inits.foldlM (fun acc i => (reachableBranches i events fuel).map (·.foldl insertNew acc)) []
+def allBranches : Option (List Branch) := Coverage.allBranches instr inits events
 
 /-! ## Result
 
@@ -207,7 +144,7 @@ Two leaves of `Leaf` are in no reachable branch:
 
 The 20 upstream tests in `paired` (13 named traces) reach **18 of 37**; the
 four `modelOnly` traces add 4 more. The 19 the tests miss, each with the
-shortest schedule that reaches it (`witness`) and what it would take:
+shortest schedule that reaches it (`Coverage.witness`) and what it would take:
 
 | Branch | Shortest schedule | Class |
 |---|---|---|
@@ -245,8 +182,10 @@ producer stub that answers on command (2). -/
 /-- `(leaf, drains, settles, errors)`. -/
 def br (l : Leaf) (drains settles errors : Bool) : Branch := (l, ⟨drains, settles, errors⟩)
 
-def coveredByPaired : List Branch := coveredBy (paired.map fun (_, s, tr) => (s, tr))
-def coveredByAll : List Branch := coveredBy ((paired ++ modelOnly).map fun (_, s, tr) => (s, tr))
+def coveredByPaired : List Branch :=
+  Coverage.coveredBy instr (paired.map fun (_, s, tr) => (s, tr))
+def coveredByAll : List Branch :=
+  Coverage.coveredBy instr ((paired ++ modelOnly).map fun (_, s, tr) => (s, tr))
 
 /-- The table above, as the `#guard`s check it. -/
 def expectedUncovered : List Branch :=
@@ -261,8 +200,6 @@ def expectedUncovered : List Branch :=
    br .h2dDoneFail false true true, br .h2dDoneFail false true false,
    br .h2dDoneFail false false false, br .h2dDoneFail false false true,
    br .h2dDoneLastDraining false false false]
-
-private def sameSet (a b : List Branch) : Bool := a.all b.contains ∧ b.all a.contains
 
 /-- Leaves in no reachable branch: a C++ assertion and a dead arm (see above). -/
 def unreachableLeaves : List Leaf := [.h2dDoneRetired, .netAccountCompletes]
@@ -290,7 +227,7 @@ def coverageChecks : Bool :=
            br .h2dIssueReleased false true false, br .pollReady true false false]) ∧
     univ.all (fun b => !unreachableLeaves.contains b.1) ∧
     liveLeaves.all (fun l => univ.any (·.1 = l)) ∧
-    expectedUncovered.all (fun b => inits.any fun i => (witness i events b).isSome)
+    expectedUncovered.all (fun b => inits.any fun i => (Coverage.witness instr i events b).isSome)
 
 #guard coverageChecks
 
