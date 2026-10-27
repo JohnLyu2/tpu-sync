@@ -69,7 +69,7 @@ blocks are the caller's to refill.
 
 ## Lock scopes
 
-Two mutexes participate:
+Two mutexes participate in the post-launch protocol:
 `Lifetime::mu` (`lifetime->mu`), guarding `Lifetime::ctrl` (`ABSL_GUARDED_BY(mu)`),
 and `RemoteReadState::mu` (`state->mu`), guarding only `RemoteReadState::settled`
 (`ABSL_GUARDED_BY(mu)`). The five setup fields of `RemoteReadState`
@@ -80,16 +80,19 @@ called outside `state->mu` in `Settle`, at most once because only the caller
 that flips `settled` from `false` to `true` under `state->mu` reaches it).
 `RemoteReadState::lease_id` (`uint64_t lease_id = 0`) is plain and unguarded:
 the acquire callback writes `state->lease_id = acquire_resp->lease_id()` before
-acquiring `lifetime->mu`, and the deadline thread reads `state->lease_id`
+acquiring `lifetime->mu`, `PullAndRelease`'s `transfer.OnReady` callback reads it
+without a lock on the same thread after `acquireReply` to send the commit
+`ReleaseReadLease` RPC, and the deadline thread reads `state->lease_id`
 without a lock after releasing `state->mu` (`if (state->lease_id != 0)`).
-`lease_id` is not in `S` (it drives only the best-effort source
-`ReleaseReadLease`, not destination settlement).
+`lease_id` is not in `S` (on `pullDone`, `S.settled : Bool` abstracts the
+commit verdict status; on `deadline`, `state->Settle(DeadlineExceededError(...))`
+runs unconditionally regardless of `lease_id`).
 
 | Event | Scopes | Between them |
 |---|---|---|
 | `acquireReply ok` | `ok = false`: one `state->mu` scope in `Settle`; `ok = true` with `lifetime->ctrl == nullptr`: one `lifetime->mu` scope containing `Settle`'s `state->mu` scope; `ok = true` with `lifetime->ctrl != nullptr` (`shipping`): one `lifetime->mu` scope around `PullAndRelease`, and **no `state->mu` scope** (`settled` is not read before `TransferBuffers`) | the missing `state->mu` check on the `ok = true`, live-controller branch is why `shipping` sets `pullIssued = true` unconditionally and why Shape A (`lateIssue`) is reachable. `checkSettledBeforePull` and `deferSettleWhilePullInFlight` add a `state->mu` check of `settled` before issuing the pull |
 | `shutdown` | one `lifetime_->mu` scope in `RaidenController::Cleanup` (`lifetime_->ctrl = nullptr;`) | serialised with `acquireReply true` by `lifetime->mu` |
-| `deadline` | 1–2 `state->mu` scopes on the detached thread (`if (state->settled) return;`, 1 scope when already settled; otherwise followed by `state->Settle(DeadlineExceededError(...))`), with the unguarded `state->lease_id` read and fire-and-forget `ReleaseReadLease` between them; neither scope reads whether a pull is in flight (`RemoteReadState` has no in-flight counter) | only `settled` can change between the two `state->mu` scopes (if `acquireReply` or `pullDone` calls `Settle` in the gap), in which case the second scope is a no-op at `if (settled) return;` — the model's `deadline` after the settling event (`settled := s.settled || settleNow`) |
+| `deadline` | 1–2 `state->mu` scopes on the detached thread (`if (state->settled) return;`, 1 scope when already settled; otherwise followed by `state->Settle(DeadlineExceededError(...))`), with the unguarded `state->lease_id` reads and fire-and-forget `ReleaseReadLease` between them; neither scope reads whether a pull is in flight (`RemoteReadState` has no in-flight counter) | on `state->mu`, only `settled` is guarded (monotonic `false → true`), and `Settle` re-checks `if (settled) return;` in the second scope; any event (`acquireReply`, `shutdown`, or `pullDone`) interleaved between the two scopes orders before the second scope (`settled := s.settled || settleNow`) |
 | `pullDone` | `transfer.OnReady` resolves when the pull finishes on the workers, issues `ReleaseReadLease`, and in its gRPC callback runs one `state->mu` scope (`state->Settle(...)`) on every path | between `transfer.OnReady` and `Settle`, the DMA into destination blocks has already ended (`pullInFlight = false`), so a `deadline` or `callerReuse` in that gap cannot violate `NoWriteAfterRelease` (it is equivalent to `pullDone` followed by `deadline`) |
 | `callerReuse` | none (caller, after `promise->Set` resolves `future`) | `promise->Set` runs immediately after the single transition `settled : false → true` in `Settle` |
 

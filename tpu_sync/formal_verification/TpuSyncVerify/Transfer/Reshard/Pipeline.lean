@@ -71,31 +71,37 @@ documented in `Send.lean` and `Receive.lean` §"Lock scopes". The pipeline-level
 events and cross-component guards map to C++ synchronization as follows:
 * **`armRecv`, `send (.d2hIssue p true)`, and `recv .pushBegin`:** Phase 1 of
   `ReshardCoordinator::ExecutePoolReshard` calls
-  `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, which creates the
-  `ReshardReceiveSession` (`RegisterActivePlanDirect` + `AcquireStagingLeases`)
-  and inserts it into `active_pool_reshard_recvs_` under 1
+  `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, which checks any
+  incumbent under 1 `KVCacheManagerWithTransfer::mu_` scope, creates the
+  `ReshardReceiveSession` (`RegisterActivePlanDirect` + `AcquireStagingLeases`),
+  and inserts it into `active_pool_reshard_recvs_` under a second
   `KVCacheManagerWithTransfer::mu_` scope (`armed = true`). The Stage 1
-  `for (std::thread& t : armers) t.join();` barrier orders `armRecv` before
-  Stage 2 sender dispatch (`send (.d2hIssue p true)`), and
-  `hooks.begin_incoming_push` requires the `active_pool_reshard_recvs_` entry to
-  be present under `KVCacheManagerWithTransfer::mu_` (`recv .pushBegin`).
+  `for (std::thread& t : armers) t.join();` barrier orders
+  `PoolReshardRegisterRecv` before Stage 2 sender dispatch
+  (`send (.d2hIssue p true)`) so no push arrives in the window between
+  `RegisterActivePlanDirect` and `active_pool_reshard_recvs_` insertion, and
+  `hooks.begin_incoming_push` then finds the `active_pool_reshard_recvs_` entry
+  under `KVCacheManagerWithTransfer::mu_` (`recv .pushBegin`).
 * **`landStream p` and `recv (.onPoolReceived p)`:** In
   `BlockTransport::HandleIncomingPush`, the socket write into `dstStaging[p]`
   (`if (expected_size > 0)`) runs while the caller holds a
   `ReshardReceiveSession` `in_flight_` op from `pushBegin`
   (`hooks.begin_incoming_push`), and `BlockTransport::CompleteIncomingPush`
-  increments `progress.completed_chunks++` under 1 `BlockTransport::progress_mu_`
-  scope (`landStream p`). When that increment reaches `expected_chunks`, the
-  same `progress_mu_` scope latches `trigger_completion = true` and
-  `CompleteIncomingPush` invokes `block_delegate_->OnPoolReceived`
-  (`recv (.onPoolReceived p)`) outside `progress_mu_` before releasing the
-  stream's op in `pushEnd` (`hooks.end_incoming_push`).
+  (`if (plan_declared)`) accumulates landed shards (`plan_pushes`) under 1
+  `BlockTransport::progress_mu_` scope (`landStream p`). When `plan_pushes`
+  reaches `expected_chunks`, the same `progress_mu_` scope latches
+  `trigger_completion = true` and `CompleteIncomingPush` invokes
+  `block_delegate_->OnPoolReceived` (`hooks.on_pool_received`, which looks up
+  `active_pool_reshard_recvs_` under `KVCacheManagerWithTransfer::mu_` and calls
+  `ReshardReceiveSession::OnPoolReceived`, `recv (.onPoolReceived p)`) outside
+  `progress_mu_` before releasing the stream's op in `pushEnd`
+  (`hooks.end_incoming_push`).
 * **`reclaim`, `reseatSrcStaging`, `reseatDstStaging`:** External engine /
   allocator actions gated by `send.published ≠ none` (`CompleteReadWithDetails`
   under `KVCacheManagerWithTransfer::mu_`) and by `hasStaging = false` (after
   `ReshardSendSession::SettleLocked` or
   `ReshardReceiveSession::ReleaseStagingLocked` has released the
-  `PoolStagingLease` under `mu_`).
+  `PoolStagingLease` under session `mu_` and `KVCacheManagerBase::staging_mu_`).
 
 ## Source map
 
@@ -110,6 +116,7 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:476-481` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
 | `reshard_recv.h` | `ReshardReceiveSession` (`absl::flat_hash_map<size_t, int> pool_order_ranks_`) | `:189` |
+| `reshard_recv.cc` | `ReshardReceiveSession::Create` | `:351-390` |
 | `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:420-459` |
 | `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:461-465` |
 | `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:541-552` |
@@ -120,10 +127,13 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `bt.cc` | `BlockTransport::HandleIncomingPush` (`if (expected_size > 0)`) | `:604-608` |
 | `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:691-887` |
 | `bt.cc` | `BlockTransport::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:736-864` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_pool_received =`) | `:180-202` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:224-249` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:250-296` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:664-701` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:703-739` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1011-1030` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_recvs_.begin();`) | `:1067-1097` |
 | `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:696-702` |
 | `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:432-543` |
 | `utils.h` | `ValidateCommonPoolReshardPlan` (`if (plan.transfer_pool_indices().empty())` .. `if (group.expected_pushes() <= 0)`) | `:367-377` |

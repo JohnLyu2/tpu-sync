@@ -12,7 +12,9 @@ registration, multi-owner planning claims, claim abandonment, per-unit
 completion voting, and unclaimed cancellation tombstones.
 
 File aliases used in the source map below:
-`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`).
+`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`)
+and `reshard_service_test.cc`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`).
 
   ## C++ anchorage
 
@@ -86,13 +88,17 @@ File aliases used in the source map below:
   Every event in `Ev` (`register`, `lookupAndClaim`, `abandonClaim`, `complete`,
   `cancelIfUnclaimed`, `release`) is **one `absl::MutexLock lock(*mu_)` critical
   section** in `RequestBlockRegistry::Register`, `LookupAndClaim`,
-  `AbandonClaim`, `Complete`, `CancelIfUnclaimed`, and `Release`, which also
-  runs the TTL purge helpers (`PurgeExpiredRequestBlocksLocked`,
-  `PurgeExpiredLifecycleLocked`) on entry. `Register` validates its arguments
-  before taking `mu_` and, when `pool_spans` is non-empty, takes `mu_` once more
-  beforehand only to snapshot `directory_->PoolManifestLocked(unit)`, touching
-  none of the registry maps. Each model transition is therefore a 1:1 atomic
-  `mu_` scope with no multi-scope folding.
+  `AbandonClaim`, `Complete`, `CancelIfUnclaimed`, and `Release` (`Register`,
+  `Release`, `Complete`, and `LookupAndClaim` run both
+  `PurgeExpiredRequestBlocksLocked` and `PurgeExpiredLifecycleLocked` on entry;
+  `CancelIfUnclaimed` runs `PurgeExpiredLifecycleLocked`; `AbandonClaim` runs
+  neither). `Register` validates its arguments before taking `mu_` and, when
+  `pool_spans` is non-empty, takes `mu_` once more beforehand only to snapshot
+  `directory_->PoolManifestLocked(unit)`, touching none of the registry maps
+  (`retired` in `RegGen` is a single-generation monotonicity latch assuming no
+  re-registration of the same `(req_id, uuid)` after `RetireLocked` erases its
+  entries). Each model transition is therefore a 1:1 atomic `mu_` scope with no
+  multi-scope folding.
 
   ## Main results
 
@@ -127,6 +133,7 @@ File aliases used in the source map below:
   | `reg.cc` | `RequestBlockRegistry::PurgeExpiredLifecycleLocked` | `:71-96` |
   | `reg.cc` | `RequestBlockRegistry::RetireLocked` | `:98-116` |
   | `reg.cc` | `RequestBlockRegistry::Register` | `:118-300` |
+  | `reg.cc` | `RequestBlockRegistry::Register` (`manifest = directory_->PoolManifestLocked(unit);`) | `:149` |
   | `reg.cc` | `RequestBlockRegistry::Register` (`registration.expires_at = now + ttl_s_;`) | `:263` |
   | `reg.cc` | `RequestBlockRegistry::Register` (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`) | `:276-280` |
   | `reg.cc` | `RequestBlockRegistry::Register` (`if (claimed_.find(lifecycle_key) != claimed_.end())`) | `:281-285` |
