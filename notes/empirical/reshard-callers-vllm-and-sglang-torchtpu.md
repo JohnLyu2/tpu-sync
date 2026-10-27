@@ -2,13 +2,18 @@
 
 Canonical: `findings/README.md` §Callers (the per-finding
 reachability table and the line-pinned description of each caller's retry and
-topology policy). This note holds only where the clones are, what the reading
-settled, and what not to re-investigate.
+topology policy); `tpu_sync/formal_verification/TpuSyncVerify/Transfer/Caller.lean`
+and `tpu_sync/formal_verification/docs/transfer/reshard.md` §Boundaries (the
+`poll_stats()` → connector → vLLM scheduler boundary shared with
+`PrefillDecode`, where `connectorFixed` models `vllm-torchtpu`'s Stage-3
+outcome forwarding and `earlyLoadError_fail_holds_blocks` models
+`_stage3_fail_uncertain_loads_early`). This note holds only where the clones
+are, what the reading settled, and what not to re-investigate.
 
-**Verified against:** tpu-sync `0ac16d1` (fork `main`) with upstream `main` at
-`449b591`; `vllm-project/vllm-torchtpu` `9725110` (2026-10-20);
+**Verified against:** tpu-sync `c9bc124` (fork `main`);
+`vllm-project/vllm-torchtpu` `9725110` (2026-10-20);
 `sgl-project/sglang-torchtpu` `9a6eef1` (2026-10-20).
-**Last verified:** 2026-10-20
+**Last verified:** 2026-10-27
 
 [EMP] The two open-source engines that call `tpu-sync`'s reshard control plane
 (`register_request_blocks` / `coordinate_transfer` / `complete_request_blocks`
@@ -43,6 +48,21 @@ Do not re-investigate:
   counts for pipeline decode).
 - "Does sglang share a uuid between the FA transfer and its SWA twin?" — no
   (`pp_swa.twin_uuid` derives a distinct one).
+- "Does vllm-torchtpu free destination HBM on a cancellation or scheduler abort
+  while a `ReshardReceiveSession` is still armed?" — no: `tpu_connector.py:6006-6031`
+  (`cancelled_registration` / `unsent_connection_failure`) is strictly pre-arm;
+  a scheduler abort of a submitted load (`finished_req_ids`, `:6339-6353`) is
+  parked in `_stage3_finished_loads_pending_cleanup` and `done_recving` is
+  withheld until the native receiver terminal or `expired_uncertain` (`:6400-6414`,
+  `:6525-6535`). Under `_stage3_fail_uncertain_loads_early` (`:2717, 6039-6040`),
+  staging `_failed_block_ids` on the `"uncertain"` RPC error pass transitions the
+  scheduler to `FINISHED_ERROR` with `dHeld = true` (`Caller.earlyLoadError_fail_holds_blocks`),
+  still deferring `_free_blocks` until `done_recving` arrives on the terminal pass.
+- "Does vllm-torchtpu drop `failed_recving` (like tpu-inference C1) or free
+  producer blocks before `cancel_request_blocks_if_unclaimed` / native send
+  terminal?" — no (`:6365-6378, 6462-6463, 6545-6571`: `recv_finished = _done_recving | _failed_recving`,
+  `newly_failed` blocks staged into `_failed_block_ids`, and producer
+  `done_sending` emitted only from `native_terminal_sends | cancelled_sends`).
 
 Open (parked, checked through `c9bc124` in `../loose-ends/parked.md`): whether
 the Peregrine `BlockTransport` backend (`5adb0f4`, `b43de27`, `86d4506`;

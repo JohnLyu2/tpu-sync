@@ -4,7 +4,7 @@ Load this before touching `Caller.lean`, before filing or reviewing a fix
 for C1, or when a question starts "what must a connector do with a
 `poll_stats()` outcome".
 
-Canonical: `verification/TpuSyncVerify/Transfer/PrefillDecode/Caller.lean`
+Canonical: `verification/TpuSyncVerify/Transfer/Caller.lean` (moved from `Transfer/PrefillDecode/Caller.lean` on 2026-10-27 to cover both transfer paths)
 (module header: scope, event table, B1–B3, properties);
 `verification/docs/transfer/prefill_decode.md` §Modules, §Upper boundary;
 `findings/README.md` §C1 (**Lean** bullet, test re-run);
