@@ -1135,6 +1135,47 @@ It matches and pins atomically (`pin_found = true`,
 `kv_cache_store_service.cc:461-474`); the pins are released by a scope cleanup
 after `transfer_future.Await()` returns (`:490`, `:542`).
 
+### R-G. Reshard settle sweep in `CompleteReadWithDetails` is generation-less: API hazard only (read, `c9bc124`)
+
+The manager's settle sweep collects `(uuid, generation)` pairs under `mu_` and,
+after dropping `mu_` (`kv_cache_manager_with_transfer.cc:1105`), calls
+`UnregisterSettledPlan(uuid, generation)` and
+`base_->ReleasePoolStagingLeases(uuid)` for each (`:1108-1113`). For the
+prefill-to-decode receiver the generation is real
+(`TransferReceiveSession::TakePendingUnregister`,
+`transfer_receive_session.cc:438`) and `UnregisterSettledPlan` skips a plan
+whose uuid now belongs to a newer registration (`:785-790`). For reshard it is
+always 0: `ReshardReceiveSession::TakePendingUnregister` hard-codes it
+(`reshard_receive_session.cc:512-520`; the header says "0 for pool-reshard
+plans") and a failed `ReshardSendSession` is pushed as `(uuid, 0)` (`:1024`).
+`ReleasePoolStagingLeases` is uuid-keyed with no generation at all
+(`kv_cache_manager_base.cc:2147-2163`).
+
+Consequence, if reached: a new same-uuid `PoolReshardPush` /
+`PoolReshardRegisterRecv` that passes the `AlreadyExists` check after the old
+entry is erased (`:673-686`, `:712-727`, erasures at `:1026` / `:1093`) and
+acquires its leases in `Create` (`reshard_receive_session.cc:381`,
+`reshard_send_session.cc:231`) before the post-`mu_` loop runs has those
+leases freed under it — the F6 aliasing shape, reached from the sweep instead
+of from a duplicate registration — and, because generation 0 skips the guard,
+`UnregisterSettledPlan(uuid, 0)` drops the newcomer's plan as well.
+
+Why it is an API hazard and not a finding: (1) the sweep's release is a
+backstop — both reshard sessions already release their own leases on settle
+(`reshard_receive_session.cc:461-465`, `reshard_send_session.cc:473`), so the
+call only bites when *another* session holds the uuid; (2) that needs a
+same-uuid re-coordination inside a microsecond window, and the only reshard
+caller mints a random 63-bit uuid per transfer
+(`tpu_sync/rpc/raiden_controller.py:760`, `:1072`) — the same precondition and
+verdict as R-B and the F10 aliasing half in the Callers table; (3) on the
+receive side the new `Create` registers its plan before leasing, so while the
+old plan is still registered the retry fails with `AlreadyExists`
+(`kv_cache_manager_base.cc:3175`) rather than leasing, narrowing the window
+further. Not modelled in Lean: the statement ("a uuid-keyed release with no
+generation frees another holder's slots under uuid reuse") is a one-line
+reading of `ReleasePoolStagingLeases`, and `Reshard/PoolStaging/Registration.lean`
+already carries the F6 witness for the same slot-aliasing consequence.
+
 ### Open / not yet checked
 
 - `KVCacheStoreClient::Fetch` sets no RPC deadline
@@ -1356,3 +1397,8 @@ clone reset. Results, verbatim:
   patches" and "Upstream fix" status rows. The sync log moved to
   `notes/upstream-rechecks.md`. Finding bodies above are frozen and still say
   "tracked as R1/R5 in `reshard.md`" as of their confirmation date.
+- 2026-10-27: **R-G** added (read, `c9bc124`): the reshard settle sweep in
+  `CompleteReadWithDetails` passes generation 0 and releases leases by uuid
+  only; closed as an API hazard with the same precondition as R-B and the F10
+  aliasing half (same-uuid re-coordination, which no caller does). Not
+  modelled in Lean.
