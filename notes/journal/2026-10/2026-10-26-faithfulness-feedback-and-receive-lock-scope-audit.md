@@ -1,8 +1,10 @@
-# 2026-10-26 — "more faithful" feedback triaged; `Receive` lock-scope audit
+# 2026-10-26 — "more faithful" feedback triaged; `Receive`, `Send`, `Transport` lock-scope audits
 
-Version stamp: fork `3500ab27`; corpus baseline `c9bc124` (C++ cited at that
-commit; `transfer_receive_session.cc` and `kv_cache_manager_with_transfer.cc`
-unchanged since).
+Version stamp: fork `3500ab27`..`5efb58a9` (audit follow-up on top); corpus
+baseline `c9bc124`. Canonical for the per-event scope tables:
+`tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/{Receive,Send,Transport}.lean`
+§"Lock scopes" and `tpu_sync/formal_verification/docs/conventions.md` §"One
+lock scope per event, or say why not".
 
 ## The feedback
 
@@ -13,7 +15,7 @@ recommended keeping the current granularity plus `GUARDED_BY` on session and
 controller fields, TSan on the test targets, and trace validation of the
 receive/send sessions.
 
-## Checked against the repo
+## Checked against the repo (not in `formal_verification/`)
 
 - [FACT] The sessions are already annotated: `transfer_receive_session.h` 36
   `ABSL_GUARDED_BY`/`LOCKS_REQUIRED`, `transfer_send_session.h` 24,
@@ -60,87 +62,72 @@ What is in neither list: the premise itself. `GUARDED_BY` proves each field
 access holds the lock; it does not prove a modelled event is one lock scope.
 That residual is a reading audit per event, and it is what I did.
 
-## `Receive` lock-scope audit (`3500ab27`)
+## Lock-scope audits of `Receive`, `Send`, `Transport` — interpretation
 
-[FACT] New "Lock scopes" section in `Receive.lean` (canonical; 11 new
-source-map rows; conventions.md §"One lock scope per event, or say why not").
-Result: **no model change**. Per event: `pushBegin`, `pushEnd`, `h2dBegin`,
-`netAccount`, `cancel` are one `mu_` scope each; `h2dReady` is a device event;
-`pullReply` and `h2dDone` are two scopes (decide, then `EndRecvOp` from an
-`absl::Cleanup` declared before the lock, so it runs after the unlock);
-`h2dIssue` is two (re-check, `push_back`) with the device dispatch unlocked
-between; `pollReady` is three (`IsDraining`, `IsReadyToComplete`, `Finish`);
-`publish` is four on a settled session.
+[FACT] **No model change** in any of the three (canonical tables in the three
+`.lean` files; +25 source-map rows total, 680 anchors).
 
-Interpretation, not in the docstring:
-
-- The `EndRecvOp`-tail argument is the load-bearing one and generalises: the
-  gap state differs from the model's post-state only in `in_flight_`, whose
-  only deciding readers are the two settle checks, so a step in the gap
-  commutes. `Send.lean` and the Reshard sessions have the same `absl::Cleanup
-  end_op` shape; the same paragraph should transfer almost verbatim.
-- `h2dIssue`'s gap is exactly why A4 carries the odd-looking clause
+- **The `EndRecvOp`/`EndSendOp`-tail argument** is the load-bearing one and
+  transferred from `Receive` to `Send` verbatim (with A7's `release_due` added
+  to the readers of `in_flight_`). The gap state differs from the model's
+  post-state only in `in_flight_`, whose only deciding readers are the settle
+  checks, so a step in the gap commutes.
+- **`h2dIssue`'s gap** (`Receive`) is why A4 carries the clause
   "`ExecuteLayerH2d` pushes the future into `h2d_futures_` before returning".
-  Whoever wrote A4 saw this gap; the audit just names it.
-- [OBS 2026-10-26] **Late errors.** `FinishLocked` records a non-OK status
-  *before* `if (draining_) return;`, so a `Finish(error)` after a settled-OK
-  session flips `status_`. The model mirrors it (`Lifecycle.finishLocked`
-  docstring: "flips `statusOk` even if already draining"; `cancel` unguarded).
-  Two in-tree producers: the deadline sweep (`IsReadyToComplete()` false, then
-  the last H2D callback settles OK, then `Finish(DeadlineExceeded)` — reported
-  `failed_recving_` with the data landed; deadline semantics, defensible), and
-  `UnregisterActivePlan` (`!Done()` under the manager `mu_`, `Finish` outside
-  it) racing the poll — it can land between `GetStatus()` and `Details()`, so a
-  `done_recving_` entry carries error details. That last one is the single
-  outcome found that no interleaving of model steps produces; it lives in
-  `transfer_details_`, outside `Recv`'s state. [HYP] Not a finding worth
-  filing on its own: it needs the caller to unregister a plan in the same
-  microseconds its receive settles, and the caller asking to unregister is not
-  waiting on the result. Worth one sentence in the F2/F3 report's "fix" if an
-  owner touches `FinishLocked`: `if (draining_) return;` first, or
+  Whoever wrote A4 saw the gap; the audit names it.
+- [OBS 2026-10-26] **Late errors (`Receive` vs `Send`).** The receiver's
+  `FinishLocked` records a non-OK status *before* `if (draining_) return;`, so
+  a `Finish(error)` after a settled-OK session flips `status_` (the model
+  mirrors it: `cancel` unguarded). `UnregisterActivePlan` (`!Done()` under the
+  manager `mu_`, `Finish` outside it) racing the poll between `GetStatus()`
+  and `Details()` is the single outcome found that no interleaving of model
+  steps produces — a `done_recving_` entry with error details in
+  `transfer_details_` (outside `Recv`'s state). The sender's first-wins
+  `FinishLocked` (`if (draining_ || done_) return;`) has no such flip.
+  [HYP] Not a finding worth filing on its own: it needs the caller to
+  unregister a plan in the same microseconds its receive settles, and the
+  caller asking to unregister is not waiting on the result. Worth one sentence
+  if an owner touches `FinishLocked`: `if (draining_) return;` first, or
   `status_` sticky once `done_`.
-- The unmodelled `UnregisterSettledPlan` pre-claim in the H2D callback
-  (`in_flight_ == 1 && unregister_on_settle_`) drops the plan one scope before
-  `done_`; no op is left that could use it. Noted in the table, nothing to do.
-
-## `Send` and `Transport` (`dc32446e`, next commit) — same day, continued
-
-[FACT] `Send.lean` "Lock scopes": **no model change.** `wake`, `h2hIssue`,
-`sendNext`, `h2hDone` all end in `EndSendOp` from an `absl::Cleanup`; the
-tail paragraph transferred verbatim with `release_due` (A7) added to the
-readers of `in_flight_`. New facts the table pins: `h2hDone`'s
-`remaining_h2h_layers_.fetch_sub` is lock-free and nothing else reads it, so a
-step between it and `Finish()` is the model's step *before* `h2hDone` (a
-`cancel` there wins, matching `finishOnceLocked`); `start`'s deciding scope
-is `StartPush`'s locked section, and a `Finish` between the acquisition and
-it releases the staging through `FinishLocked` at `in_flight_ == 0`; the
-sender's first-wins `FinishLocked` means **no late-error flip** on the send
-side — `publish`'s set and details cannot disagree. State-table precision:
-`d2hIssued = d2h_layer_futures_.size()` only until `ReleaseStagingBlocksLocked`
-clears it. Ten source-map rows.
-
-[FACT] `Transport.lean` "Lock scopes": `stream` is the one deliberately
-coarse event in the trio — two mutexes, ~8 scopes. Interpretation: a
-`Finish` landing between the push lease and the delegate calls leaves a
-**state outside `step`'s reach** (layer latched in `layer_progress_` with
-neither a pending copy nor its blocks) that nevertheless satisfies `Safe`
-(`dispatched` only grew; `blocks` did not; session draining with an error).
-The session half of that interleaving is exact in `Receive.lean`
-(`pushBegin`, `cancel`, `pushEnd`). Not worth splitting the event: the three
-properties are about the table, and the table's own mutation is one scope
-(A1). Also pinned: `ForgetPushProgress` (erases entries under `progress_mu_`)
-is reached only via `UnregisterActivePlanDirect`, i.e. draining-with-last-op
-or settled, when nothing passes `TryBeginRecvOp`.
-
-[HYP] Pattern across the three: every multi-scope event is "decide under the
-lock, then an `absl::Cleanup` tail that only decrements `in_flight_`", and
-the commuting argument is always the same two lines. If the Reshard sessions
-follow it too, the remaining audits are mostly transcription; the
-interesting rows will be where a scope reads something *not* under the
-session lock (`ReadRemote`'s `lease_id` — F3 — is exactly such a row).
+- **`Transport.stream` is the one deliberately coarse event** in the trio (two
+  mutexes). A `Finish` after the push lease and before the delegate calls ends
+  leaves a state outside `step`'s reach (latched layer whose stream added no
+  `blocks`) that satisfies `Safe`; the session half is exact in `Receive.lean`.
+  Not worth splitting: the properties are about the table, and its mutation is
+  one scope (A1).
+- [HYP] Pattern across the three: every multi-scope session event is "decide
+  under the lock, then an `absl::Cleanup` tail that only decrements
+  `in_flight_`", and the commuting argument is always the same two lines. If
+  the Reshard sessions follow it too, the remaining audits are mostly
+  transcription; the interesting rows will be where a scope reads something
+  *not* under the session lock (`ReadRemote`'s `lease_id` — F3 — is such a
+  row).
 
 ## Corrections
 
-None from the user. My own: the first draft of the section said "the only
-readers of `in_flight_` are the settle checks" — the callback's pre-claim also
-reads it; reworded to "the only decisions that read".
+1. Draft of `Receive.lean` said "the only readers of `in_flight_` are the
+   settle checks" — the H2D callback's unregister pre-claim also reads it;
+   reworded to "the only decisions that read".
+2. User-requested audit of `3500ab27`..`1fdb60cb`:
+   - `Receive.lean` `h2dIssue` said "no stream of this layer reports before
+     `ExecuteLayerH2d` returns" — false when a layer has multiple streams
+     (earlier streams report before `ExecuteLayerH2d` is entered); what is true
+     is that *the stream that completed this layer* is on the same thread and
+     calls `OnBlockShardsReceived` after `ExecuteLayerH2d` returns. Also added
+     why `Finish(error)` during dispatch commutes with `push_back`
+     (`push_back` does not check `draining_`, `FinishLocked` does not read
+     `h2d_futures_`), `StartRead`'s fault-injected `pullReply` scopes, and
+     dropped "three" on `pollReady` (`req_id()` for the log is a fourth,
+     read-only scope).
+   - `Send.lean` `sendNext` said "two scopes" unconditionally — for the last
+     layer `SendNextLayer(l + 1)` returns at `l >= num_layers()` before its
+     lock, leaving only `EndSendOp`.
+   - `Transport.lean` `stream` argued `NetworkSound` holds on a mid-stream
+     `Finish` because "`dispatched` can only have grown" — hand-wave when
+     `Finish` precedes `ExecuteLayerH2d` (no copy is issued); the real reason
+     is that `OnBlockShardsReceived` also returns at `done_ || draining_`,
+     leaving `blocks < c.target` (`networkCompleted = false`). Also split the
+     two mid-stream `Finish` positions (before vs after `ExecuteLayerH2d`).
+   - Trimmed this journal entry to stop duplicating the per-event tables in the
+     `.lean` files (`notes/AGENTS.md` rule 1) and updated `sessions.md` to cover
+     `Send` and `Transport`.
