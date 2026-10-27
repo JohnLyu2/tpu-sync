@@ -200,3 +200,43 @@ coverage by the replayed tests" (the three-model table).
    (five do); two of the six non-E2E two-layer branches are session-covered,
    not gap-table; "runs" → "rows"; `Reshard/Coverage.lean` is byte coverage,
    disambiguated.
+
+## ReadRemote (`71426548`) — interpretation
+
+Canonical: `Controller/ReadRemoteCoverage.lean` §Result,
+`docs/controller/read_remote.md` §"Branch coverage".
+
+- [FACT] 11 branches, whole state space; `ReadRemotePullTest` reaches 5; of
+  the 6 gaps, 5 need the deadline thread to fire and the 6th is the ghost
+  `callerReuse`. No upstream test lets the deadline fire: default 150 s
+  (`DefaultLeaseTtl() + 30 s`), every case ends in seconds, and the detached
+  thread is killed with the process. **F2's shapes A and B live entirely in
+  the region the suite never enters**, and the region is one stimulus wide:
+  time. That is the sharpest "where there is no evidence" statement coverage
+  has produced so far, and it is exactly where the fork's two bug-hunt
+  reproducers sit (`findings/raiden_controller_bughunt_test.cc`, which the
+  deliverable cannot cite).
+- [FACT] `Leaf × Effect` with `Effect = settles` cannot see shape A's issuing
+  step: `acquireIssuesPull` is the same branch whether or not the read is
+  settled, because issuing does not settle. The coverage number is honest
+  about that in prose; the property/search is what catches it. Lesson for
+  the recipe: the effect should record what the *property* talks about —
+  here "issued after settled" — or the bug's own step counts as covered.
+- [HYP] The `callerReuse` cut generalises: any ghost event that models the
+  *environment's* next move (reseats, reclaim, callerReuse) is enabled by the
+  tests but never performed by them. `Pipeline` classed them "environment";
+  `ReadRemote` classes it "ghost". Same thing; pick one word in conventions
+  when the next model comes.
+
+## Corrections (ReadRemote round)
+
+1. Self: the first table was written by hand before the search ran — three
+   of five rows were wrong (`shutdown` / `acquireIssuesPull` have no settling
+   variant; `acquireFailed` / `acquireAfterShutdown` have no-effect variants
+   instead). Rule, again: enumerate first, then write the table.
+2. Independent audit: `callerReuse` paired as test-reached was an over-claim
+   (cut: 6 → 5 covered, gaps 5 → 6); the teardown test admits three
+   outcomes, not two (paired with all three); "the deadline thread runs after
+   the test, unobserved" was false (it never wakes before exit); env var is
+   `RAIDEN_REMOTE_READ_DEADLINE_S` (I had written a `TPU_RAIDEN_…` name),
+   integer seconds, read once per process.
