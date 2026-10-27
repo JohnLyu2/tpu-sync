@@ -429,6 +429,21 @@ size_t ResolveEnvNumStagingLayers(size_t num_layers) {
   return requested;
 }
 
+// Rejects an all-layer dispatch (|target_layer_idx| unset) when fewer host
+// layer buffers than device layers are allocated: an all-layer dispatch maps
+// each layer to its own host buffer index and has no leased |host_layer_idx|.
+absl::Status CheckAllLayersHaveHostBuffers(
+    absl::string_view direction, std::optional<size_t> target_layer_idx,
+    size_t num_host_layers, size_t num_layers) {
+  if (!target_layer_idx.has_value() && num_host_layers < num_layers) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        direction, " of every layer needs a host buffer per layer, but only ",
+        num_host_layers, " of ", num_layers,
+        " are allocated (TPU_RAIDEN_NUM_STAGING_LAYERS)"));
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 KVCacheManagerBase::KVCacheManagerBase(
@@ -836,6 +851,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
     return absl::InvalidArgumentError(
         "host_layer_idx requires a single target layer");
   }
+  ABSL_RETURN_IF_ERROR(CheckAllLayersHaveHostBuffers(
+      "H2d", target_layer_idx, layers_.size(), num_layers_));
   std::vector<int64_t> src_c, dst_c, sizes_c;
   CoalesceMajorDimCopies(src_offsets_major_dim, dst_offsets_major_dim,
                          copy_sizes_major_dim, src_c, dst_c, sizes_c);
@@ -977,6 +994,8 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
   if (target_shard_idx.has_value() && *target_shard_idx >= num_shards_) {
     return absl::OutOfRangeError("layer or shard index out of range");
   }
+  ABSL_RETURN_IF_ERROR(CheckAllLayersHaveHostBuffers(
+      "D2h", target_layer_idx, layers_.size(), num_layers_));
   std::vector<int64_t> src_c, dst_c, sizes_c;
   CoalesceMajorDimCopies(src_offsets, dst_offsets, copy_sizes, src_c, dst_c,
                          sizes_c);
@@ -3593,6 +3612,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dAsyncDispatch(
     const std::vector<int64_t>& copy_sizes_major_dim,
     std::optional<int64_t> slot_idx, std::optional<size_t> target_layer_idx,
     std::optional<size_t> target_shard_idx) {
+  ABSL_RETURN_IF_ERROR(CheckAllLayersHaveHostBuffers(
+      "H2d", target_layer_idx, layers_.size(), num_layers_));
   auto [promise, future] = xla::MakePromise();
   AsyncTask task;
   task.work = [this, src = src_offsets_major_dim, dst = dst_offsets_major_dim,
@@ -3635,6 +3656,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hAsyncDispatch(
     const std::vector<int64_t>& copy_sizes_major_dim,
     std::optional<int64_t> slot_idx, std::optional<size_t> target_layer_idx,
     std::optional<size_t> target_shard_idx) {
+  ABSL_RETURN_IF_ERROR(CheckAllLayersHaveHostBuffers(
+      "D2h", target_layer_idx, layers_.size(), num_layers_));
   auto [promise, future] = xla::MakePromise();
   AsyncTask task;
   task.work = [this, src = src_offsets_major_dim, dst = dst_offsets_major_dim,
