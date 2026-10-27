@@ -263,7 +263,7 @@ def test_consumer_blocks_after_failed_pull_and_abort(tpu_sync_report, expect_fre
 
 # --------------------------------------------------------------------------
 # 4. The connector variants of the Lean model (TpuSyncVerify/Transfer/
-#    PrefillDecode/Caller.lean), consumer side, against the real scheduler.
+#    Caller.lean), consumer side, against the real scheduler.
 #
 # Each variant is the Signal the Lean `Connector.onRecv false` produces for a
 # failed pull, rendered as the KVConnectorOutput the worker would hand the
