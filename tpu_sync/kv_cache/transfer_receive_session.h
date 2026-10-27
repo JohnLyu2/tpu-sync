@@ -19,7 +19,6 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <future>  // NOLINT(build/c++11)
 #include <memory>
 #include <optional>
@@ -48,49 +47,6 @@ class StartTransferRequest;
 }  // namespace tpu_sync
 
 namespace tpu_raiden {
-
-// Manages the host layer staging slots of a receive session when fewer host
-// layer buffers are allocated than layers. A layer leases the slot at the head
-// of the free queue when its first bytes arrive, keeps it until its H2D copy
-// completes, and Release() returns the slot to the tail; Acquire() blocks while
-// every slot is leased. Layers may arrive and complete in any order.
-// Thread-safe.
-class StagingLayerManager {
- public:
-  // Initializes the manager with free slots [0, |num_slots|).
-  explicit StagingLayerManager(size_t num_slots = 0);
-
-  // Returns the slot leased to |unit|, leasing the head free slot if |unit|
-  // has none. Waits until |deadline| for a release when every slot is leased;
-  // fails kDeadlineExceeded on timeout and kCancelled after Shutdown() or once
-  // |*cancelled| is set.
-  absl::StatusOr<size_t> Acquire(size_t unit,
-                                 std::chrono::steady_clock::time_point deadline,
-                                 const std::atomic<bool>* cancelled = nullptr);
-
-  // Returns the slot leased to |unit|, if any.
-  std::optional<size_t> Lookup(size_t unit) const;
-
-  // Ends |unit|'s lease, returning its slot to the tail of the free queue and
-  // waking one waiter. Returns the released slot; nullopt if |unit| held none.
-  std::optional<size_t> Release(size_t unit);
-
-  // Ends every lease.
-  void ReleaseAll();
-
-  // Fails every current and future Acquire() with kCancelled.
-  void Shutdown();
-
-  size_t num_free() const;
-
- private:
-  mutable absl::Mutex mu_;
-  // Free slots in release order: Acquire() pops the head, Release() pushes
-  // the tail.
-  std::deque<size_t> free_ ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<size_t, size_t> leases_ ABSL_GUARDED_BY(mu_);
-  bool shutdown_ ABSL_GUARDED_BY(mu_) = false;
-};
 
 // Encapsulates the per-transfer state and execution lifecycle of a consumer
 // receive operation (pull/push H2D receives), including host staging

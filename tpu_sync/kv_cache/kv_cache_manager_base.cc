@@ -944,6 +944,7 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
                                       const std::vector<int64_t>& copy_sizes,
                                       std::optional<int64_t> slot_idx,
                                       std::optional<size_t> target_layer_idx,
+                                      std::optional<size_t> host_layer_idx,
                                       std::optional<size_t> target_shard_idx,
                                       int64_t device_id) {
   VLOG(1) << "KVCacheManagerBase::DispatchD2hChunks called. Thread: "
@@ -952,6 +953,9 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
           << ", target_layer: "
           << (target_layer_idx.has_value() ? std::to_string(*target_layer_idx)
                                            : "all")
+          << ", host_layer: "
+          << (host_layer_idx.has_value() ? std::to_string(*host_layer_idx)
+                                         : "same")
           << ", target_shard: "
           << (target_shard_idx.has_value() ? std::to_string(*target_shard_idx)
                                            : "all")
@@ -965,6 +969,10 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
       ValidateOffsetsAndSizes(src_offsets, dst_offsets, copy_sizes));
   if (target_layer_idx.has_value() && *target_layer_idx >= num_layers_) {
     return absl::OutOfRangeError("layer or shard index out of range");
+  }
+  if (host_layer_idx.has_value() && !target_layer_idx.has_value()) {
+    return absl::InvalidArgumentError(
+        "host_layer_idx requires a single target layer");
   }
   if (target_shard_idx.has_value() && *target_shard_idx >= num_shards_) {
     return absl::OutOfRangeError("layer or shard index out of range");
@@ -997,9 +1005,8 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
           node = GetPjRtDeviceNumaNode(device);
         }
       }
-      // D2H writes a layer into its own host buffer.
       grouped_work[node].push_back(
-          {layer_idx, shard_idx, /*host_layer_idx=*/layer_idx});
+          {layer_idx, shard_idx, host_layer_idx.value_or(layer_idx)});
     }
   }
 
@@ -1077,12 +1084,13 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hSyncDispatch(
     const std::vector<int64_t>& dst_offsets_major_dim,
     const std::vector<int64_t>& copy_sizes_major_dim,
     std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
-    std::optional<size_t> shard_idx) {
+    std::optional<size_t> host_layer_idx, std::optional<size_t> shard_idx) {
   const absl::Time d2h_start = absl::Now();
   ABSL_ASSIGN_OR_RETURN(
       auto logical_futures,
       DispatchD2hChunks(src_offsets_major_dim, dst_offsets_major_dim,
-                        copy_sizes_major_dim, slot_idx, layer_idx, shard_idx));
+                        copy_sizes_major_dim, slot_idx, layer_idx,
+                        host_layer_idx, shard_idx));
   return JoinAndRecordTelemetry(
       *this, absl::MakeSpan(logical_futures), d2h_start,
       telemetry::metric_names::kD2hTransferTimeMs,
@@ -3300,13 +3308,24 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       }
     }
   } else {
-    // When fewer host layer buffers exist than layers, a receiving transfer's
-    // layer lives in the buffer its session leased to that layer.
+    // When fewer host layer buffers exist than layers, a transfer's layer
+    // lives in the buffer its session leased to that layer.
     size_t host_layer_idx = layer_idx;
-    if (has_plan && !plan_snapshot->is_sender && layers_.size() < num_layers_ &&
-        transfer_hooks_.acquire_recv_staging != nullptr) {
+    if (layers_.size() < num_layers_) {
+      if (uuid == 0) {
+        return {};
+      }
       absl::StatusOr<size_t> slot =
-          transfer_hooks_.acquire_recv_staging(uuid, layer_idx);
+          absl::NotFoundError("no staging hook configured");
+      if ((!has_plan || plan_snapshot->is_sender) &&
+          transfer_hooks_.lookup_send_staging != nullptr) {
+        slot = transfer_hooks_.lookup_send_staging(uuid, layer_idx);
+      }
+      if (absl::IsNotFound(slot.status()) &&
+          (!has_plan || !plan_snapshot->is_sender) &&
+          transfer_hooks_.acquire_recv_staging != nullptr) {
+        slot = transfer_hooks_.acquire_recv_staging(uuid, layer_idx);
+      }
       if (!slot.ok()) {
         return {};
       }
@@ -3367,8 +3386,12 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     for (int64_t block_id : block_ids) {
       if (accumulated_bytes >= total_bytes) break;
       size_t size = std::min(block_size_bytes, total_bytes - accumulated_bytes);
+      uint8_t* ptr =
+          (base_host_ptr != nullptr && block_id >= 0)
+              ? base_host_ptr + static_cast<size_t>(block_id) * block_size_bytes
+              : nullptr;
       chunks.push_back(
-          {GetBlockHostPointer(layer_idx, shard_idx, block_id), size,
+          {ptr, size,
            RemoteAddress(dst_addrs, static_cast<int64_t>(shard_idx),
                          dst_block_id, /*dst_offset=*/0,
                          static_cast<int64_t>(size))});
@@ -3618,6 +3641,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hAsyncDispatch(
                sizes = copy_sizes_major_dim, slot_idx, target_layer_idx,
                target_shard_idx]() mutable {
     return this->D2hSyncDispatch(src, dst, sizes, slot_idx, target_layer_idx,
+                                 /*host_layer_idx=*/std::nullopt,
                                  target_shard_idx);
   };
   task.promise = std::move(promise);
@@ -3644,7 +3668,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2h(
   }
   return D2hSyncDispatch(src_offsets_major_dim, dst_offsets_major_dim,
                          copy_sizes_major_dim, slot_idx, target_layer_idx,
-                         target_shard_idx);
+                         /*host_layer_idx=*/std::nullopt, target_shard_idx);
 }
 
 size_t KVCacheManagerBase::GetAllocatedHostDramBytes() const {

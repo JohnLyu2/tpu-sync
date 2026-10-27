@@ -189,6 +189,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     // use.
     std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
         acquire_recv_staging;
+    // Returns the host layer buffer the send session of |uuid| leased to
+    // |layer_idx|, or an error if |layer_idx| holds no lease.
+    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
+        lookup_send_staging;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -810,12 +814,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> shard_idx = std::nullopt);
 
   // Synchronous on-chip D2H offload (bypasses background worker thread queue).
+  // |host_layer_idx| is the host layer buffer the copy writes; it requires a
+  // single |layer_idx| and defaults to that device layer's own host buffer.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
       const std::vector<int64_t>& src_offsets_major_dim = {},
       const std::vector<int64_t>& dst_offsets_major_dim = {},
       const std::vector<int64_t>& copy_sizes_major_dim = {},
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
 
   // Per-layer device buffer holds bundled with the layer's on-device size.
@@ -949,6 +956,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       const std::vector<int64_t>& copy_sizes,
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt, int64_t device_id = -1);
 
   // Updates the allocated buffer occupancy metrics.

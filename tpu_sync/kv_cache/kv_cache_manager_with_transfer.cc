@@ -472,6 +472,20 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
     }
     return recv_session->AcquireStagingSlot(layer_idx);
   };
+  hooks.lookup_send_staging =
+      [this](uint64_t uuid, size_t layer_idx) -> absl::StatusOr<size_t> {
+    std::shared_ptr<TransferSendSession> send_session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = send_sessions_.find(uuid);
+      if (it == send_sessions_.end()) {
+        return absl::NotFoundError(
+            absl::StrCat("Send session ", uuid, " not found"));
+      }
+      send_session = it->second;
+    }
+    return send_session->LookupStagingSlot(layer_idx);
+  };
   base_->SetTransferEventHooks(std::move(hooks));
 }
 

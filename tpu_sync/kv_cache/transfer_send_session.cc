@@ -46,6 +46,7 @@
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
@@ -99,7 +100,8 @@ TransferSendSession::TransferSendSession(
       uuid_(uuid),
       deadline_(deadline),
       register_start_(register_start),
-      data_connection_reuse_(data_connection_reuse) {}
+      data_connection_reuse_(data_connection_reuse),
+      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
 
 std::optional<TransferSendSession::DuplicateBlock>
 TransferSendSession::PopulateRegisteredBlocks(
@@ -182,6 +184,7 @@ void TransferSendSession::RegisterLayerReadinessCallback(
 }
 
 void TransferSendSession::ReleaseStagingBlocksLocked() {
+  staging_layer_manager_.ReleaseAll();
   staging_.Reset();
   d2h_layer_futures_.clear();
 }
@@ -191,6 +194,54 @@ void TransferSendSession::ReleaseStagingBlocks() {
   ReleaseStagingBlocksLocked();
 }
 
+absl::StatusOr<size_t> TransferSendSession::AcquireStagingSlot(
+    size_t layer_idx) {
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      return !status_.ok() ? status_
+                           : absl::CancelledError("Send session is draining");
+    }
+  }
+  absl::StatusOr<size_t> slot =
+      staging_layer_manager_.Acquire(layer_idx, deadline_, &cancelled_);
+  if (!slot.ok()) {
+    // A timeout (or a manager with no buffers) fails the send while it waits
+    // for host staging; a cancellation means the send is already draining.
+    if (!absl::IsCancelled(slot.status())) {
+      absl::MutexLock lock(mu_);
+      FinishLocked(slot.status(), kStagingPhase);
+    }
+    return slot.status();
+  }
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      staging_layer_manager_.Release(layer_idx);
+      return !status_.ok() ? status_
+                           : absl::CancelledError("Send session is draining");
+    }
+  }
+  return *slot;
+}
+
+absl::StatusOr<size_t> TransferSendSession::LookupStagingSlot(
+    size_t layer_idx) const {
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      return !status_.ok() ? status_
+                           : absl::CancelledError("Send session is draining");
+    }
+  }
+  std::optional<size_t> slot = staging_layer_manager_.Lookup(layer_idx);
+  if (!slot.has_value()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "No staging slot leased for layer ", layer_idx, " (uuid=", uuid_, ")"));
+  }
+  return *slot;
+}
+
 void TransferSendSession::FinishLocked(const absl::Status& status,
                                        std::optional<absl::string_view> phase) {
   if (draining_ || done_) return;
@@ -198,6 +249,8 @@ void TransferSendSession::FinishLocked(const absl::Status& status,
   if (!status.ok()) {
     failed_phase_ = phase.has_value() ? *phase : CurrentPhaseLocked();
   }
+  cancelled_.store(true, std::memory_order_relaxed);
+  staging_layer_manager_.Shutdown();
   draining_ = true;
   if (in_flight_ == 0) {
     ReleaseStagingBlocksLocked();
@@ -424,12 +477,15 @@ void TransferSendSession::StartPush(
 
   // 1. Arm the H2H chain on layer 0's future before any copy is issued, so
   // pushes start as copies complete while this (pull worker) thread is still
-  // issuing the later layers.
+  // issuing the later layers. When fewer host layer buffers exist than layers
+  // the loop below blocks in AcquireStagingSlot until an earlier layer's push
+  // frees its buffer, which is only possible because the chain is running.
   SendNextLayer(0);
 
-  // 2. Issue D2H copies layer-by-layer. Each copy is counted against the
-  // send before it starts and released by its own completion, so the
-  // staging it writes stays owned for as long as it runs.
+  // 2. Issue D2H copies layer-by-layer, each into the host layer buffer its
+  // layer leases (layer l's own buffer on a full mirror). Each copy is
+  // counted against the send before it starts and released by its own
+  // completion, so the staging it writes stays owned for as long as it runs.
   //
   // Layers whose copy is never issued (the send failed or expired first)
   // resolve with the send's status so the H2H chain and the readiness
@@ -449,11 +505,19 @@ void TransferSendSession::StartPush(
     }
   };
   for (size_t l = 0; l < total_layers; ++l) {
+    absl::StatusOr<size_t> host_layer_idx = AcquireStagingSlot(l);
+    if (!host_layer_idx.ok()) {
+      Finish(host_layer_idx.status());
+      return;
+    }
     {
       absl::MutexLock session_lock(mu_);
       // The send expired or failed while its copies were being issued:
       // what was issued drains, nothing more starts.
-      if (draining_) return;
+      if (draining_) {
+        staging_layer_manager_.Release(l);
+        return;
+      }
       ++in_flight_;
     }
     LOG(INFO) << "StartPush (D2H start) layer " << l << ": uuid=" << uuid_
@@ -464,7 +528,7 @@ void TransferSendSession::StartPush(
         injected.ok()
             ? base_->D2hSyncDispatch(d2h_copy.src_offsets, d2h_copy.dst_offsets,
                                      d2h_copy.sizes, /*slot_idx=*/std::nullopt,
-                                     /*layer_idx=*/l)
+                                     /*layer_idx=*/l, *host_layer_idx)
             : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
     if (!future.ok()) {
       // A copy that cannot even be issued fails the transfer; the worker
@@ -472,9 +536,15 @@ void TransferSendSession::StartPush(
       // those of the layers after it, are failed by `fail_unissued_layers`.
       LOG(ERROR) << "StartPush: failed to issue D2H for layer " << l << ": "
                  << future.status();
-      absl::MutexLock lock(mu_);
-      FinishLocked(future.status());
-      EndSendOpLocked();  // this copy never started
+      staging_layer_manager_.Release(l);
+      {
+        absl::MutexLock lock(mu_);
+        FinishLocked(future.status());
+      }
+      // Earlier layers may already have been pushed, so this can be the
+      // send's last op: EndSendOp (unlike EndSendOpLocked) first closes the
+      // idle data connections under kPerTransfer.
+      EndSendOp();  // this copy never started
       return;
     }
     raiden::PjRtCopyFuture layer_future = *std::move(future);
@@ -516,14 +586,18 @@ void TransferSendSession::SendNextLayer(size_t l) {
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
-      absl::MutexLock lock(self->mu_);
-      self->FinishLocked(status_or.status(), kD2hPhase);
+      {
+        absl::MutexLock lock(self->mu_);
+        self->FinishLocked(status_or.status(), kD2hPhase);
+      }
+      self->staging_layer_manager_.Release(l);
       return;
     }
     {
       absl::MutexLock session_lock(self->mu_);
       // The send expired or failed while the copy ran: nothing is pushed.
       if (self->draining_) {
+        self->staging_layer_manager_.Release(l);
         return;
       }
     }
@@ -537,6 +611,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
       {
         absl::MutexLock lock(self->mu_);
         if (self->draining_) {
+          self->staging_layer_manager_.Release(l);
           return;
         }
         remote_data_endpoints = self->remote_data_endpoints_;
@@ -555,10 +630,16 @@ void TransferSendSession::SendNextLayer(size_t l) {
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();
-              absl::MutexLock lock(self->mu_);
-              self->FinishLocked(push_res.status(), kPushPhase);
+              {
+                absl::MutexLock lock(self->mu_);
+                self->FinishLocked(push_res.status(), kPushPhase);
+              }
+              self->staging_layer_manager_.Release(l);
               return;
             }
+            // The push has read the layer out of its host buffer: return
+            // the buffer so a later layer can D2H into it.
+            self->staging_layer_manager_.Release(l);
 
             LOG(INFO) << "StartPush (H2H complete layer " << l
                       << "): uuid=" << self->uuid_ << ", numa="
