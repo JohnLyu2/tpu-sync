@@ -3,6 +3,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive.Invariant
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Frame
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Traces
+import TpuSyncVerify.Transfer.PrefillDecode.Receive.Coverage
 
 /-!
 # Receive session
@@ -220,6 +221,25 @@ coincide with "every layer's callback has run OK"; it does not.
 `num_completed_layers_` reaches `numLayers` (`trace_poll_before_callbacks`).
 That is harmless — `done` still waits for every callback through `in_flight_`
 — and the publication property above is the one that matters.
+
+## Coverage
+
+`Coverage.lean` measures how much of `step` the replayed upstream tests
+exercise. A branch is a leaf of an event's decision tree together with its
+effect on the lifecycle (drains / settles / records the first error); the
+reachable set is computed by exhausting the one- and two-layer state spaces
+(37 branches; two further leaves are unreachable — the retired-callback
+`LOG(DFATAL)`, an assertion the invariant discharges, and the `FinishLocked()`
+arm of `RecordNetworkCompleteLocked`, dead because the last H2D callback always
+finishes first). The 20 upstream tests paired with traces (13 named) reach 18
+of the 37; the 19 they miss
+are tabulated there with the shortest schedule reaching each and classified as
+a missing upstream test (10 — 8 drivable by `RecvTestManager` today, among
+them every `H2dSyncDispatch` failure, 2 needing a control-plane producer stub
+that answers), a lock-window or poll-timing interleaving no harness hook
+reaches (5), or a data-before-reply ordering the model leaves open (4). The
+`#guard` at the end of `Coverage.lean`
+fails if a branch, a trace or a classification changes.
 
 ## Source map
 

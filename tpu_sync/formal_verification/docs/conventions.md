@@ -72,6 +72,8 @@ umbrella file and a directory of parts:
 * `X/Progress.lean` — the drain measure and settlement.
 * `X/Frame.lean` — frame lemmas for other modules.
 * `X/Traces.lean` — traces, searches, mutants.
+* `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
+  below); so far `Receive` only.
 
 Modules with their own internal numbering (`BlockOrdering`, `PoolStaging`)
 name their parts after their sections instead.
@@ -171,6 +173,31 @@ second boolean version of `Safe` for the checker — the two drift apart.
 **Keep checks fast.** `decide` on a 20-event trace is instant and a mutant
 search at fuel 6–8 takes under a second. Keep every `#guard` under about 5 s;
 they all run on every `lake build`.
+
+**Coverage: which branches of `step` the replayed tests reach.** Replaying
+every upstream test says the model is not vacuous; it does not say how much of
+the model the tests exercise. `Receive/Coverage.lean` is the template for
+measuring that:
+
+* a `Leaf` per leaf of each event's decision tree, named for the C++ path it
+  stands for, and an `Effect` read off the before/after lifecycle (drains,
+  settles, records the first error); a branch is the pair;
+* `stepT`, which is `step` with the leaf attached, and `stepT_step` proving
+  `(stepT s e).map (·.1) = step s e`, so coverage is measured on the proved
+  `step` and not on a second transcription;
+* the traces as named `def`s, listed in `paired` (with the upstream test each
+  replays) and `modelOnly`;
+* the reachable branch set by exhausting the small state spaces
+  (`reachableBranches` returns `none` if it did not exhaust them), the covered
+  set by running `paired`, and the difference tabulated in the docstring with
+  the shortest schedule reaching each branch (`witness`) and a class:
+  **test** (a harness can drive it — a missing upstream test), **window** (an
+  interleaving no harness hook reaches), or an ordering the model leaves open;
+* one `#guard` that pins the counts, the uncovered set and the classification,
+  so a new branch, a dropped trace or a new paired test fails `lake build`.
+
+A leaf no reachable branch carries is a C++ assertion or a dead arm; say which
+and why (the receive model has one of each).
 
 ## Citing the C++
 
