@@ -1,10 +1,12 @@
-# 2026-10-26 — "more faithful" feedback triaged; `Receive`, `Send`, `Transport` lock-scope audits
+# 2026-10-26 — "more faithful" feedback triaged; per-event lock-scope audit across all 12 C++-backed models
 
-Version stamp: fork `3500ab27`..`5efb58a9` (audit follow-up on top); corpus
-baseline `c9bc124`. Canonical for the per-event scope tables:
-`tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/{Receive,Send,Transport}.lean`
-§"Lock scopes" and `tpu_sync/formal_verification/docs/conventions.md` §"One
-lock scope per event, or say why not".
+Version stamp: fork `3500ab27`..`3a67f1d1`; corpus baseline `c9bc124`. Canonical
+for the per-event scope tables: `## Lock scopes` in
+`tpu_sync/formal_verification/TpuSyncVerify/Controller/ReadRemote.lean`,
+`tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/{Receive,Send,Transport,Pipeline,UuidTable,PeerIsolation}.lean`,
+and `tpu_sync/formal_verification/TpuSyncVerify/Transfer/Reshard/{Receive,Send,Pipeline,Registry,Coordinator}.lean`,
+plus `tpu_sync/formal_verification/docs/conventions.md` §"One lock scope per
+event, or say why not".
 
 ## The feedback
 
@@ -62,16 +64,26 @@ What is in neither list: the premise itself. `GUARDED_BY` proves each field
 access holds the lock; it does not prove a modelled event is one lock scope.
 That residual is a reading audit per event, and it is what I did.
 
-## Lock-scope audits of `Receive`, `Send`, `Transport` — interpretation
+## Lock-scope audits across the 12 C++-backed models — interpretation
 
-[FACT] **No model change** in any of the three (canonical tables in the three
-`.lean` files; +25 source-map rows total, 680 anchors).
+[FACT] **No model change** in any of the 12 (canonical tables in the `.lean`
+files; +41 source-map rows total, 696 anchors).
 
-- **The `EndRecvOp`/`EndSendOp`-tail argument** is the load-bearing one and
-  transferred from `Receive` to `Send` verbatim (with A7's `release_due` added
-  to the readers of `in_flight_`). The gap state differs from the model's
-  post-state only in `in_flight_`, whose only deciding readers are the settle
-  checks, so a step in the gap commutes.
+- **The `EndRecvOp`/`EndSendOp`/`EndOp`-tail argument** is the load-bearing one
+  and transferred from `Receive` to `Send` and the Reshard sessions. Two
+  Reshard-specific twists: (1) in `ReshardReceiveSession::FinishPoolH2d`,
+  `ExecuteEligiblePoolH2ds` runs *before* the outer `self->EndRecvOp()`, so a
+  chained pool's H2D dispatch (or synchronous `Finish(error)`) happens while the
+  completing callback's `in_flight_` count is still +1 — that commutes with
+  folding `EndRecvOp()` into `h2dDone` because either way `in_flight_ > 0`
+  prevents settlement until the outer `EndRecvOp()` runs; (2) in
+  `ReshardSendSession::EndOp()`, the fallback `plan_unregistered_` check at the
+  top unconditionally locks `mu_` before the `in_flight_` decrement scope, making
+  every `EndOp()` 2–3 scopes.
+- **Confirmed hypothesis on `ReadRemote`:** `RemoteReadState::mu` guards only
+  `settled`, while `lease_id` is written in `acquireReply` and read in
+  `deadline` outside `state->mu` — the exact scope gap of `race_on_lease_id`
+  (F3).
 - **`h2dIssue`'s gap** (`Receive`) is why A4 carries the clause
   "`ExecuteLayerH2d` pushes the future into `h2d_futures_` before returning".
   Whoever wrote A4 saw the gap; the audit names it.
@@ -89,19 +101,12 @@ That residual is a reading audit per event, and it is what I did.
   caller asking to unregister is not waiting on the result. Worth one sentence
   if an owner touches `FinishLocked`: `if (draining_) return;` first, or
   `status_` sticky once `done_`.
-- **`Transport.stream` is the one deliberately coarse event** in the trio (two
-  mutexes). A `Finish` after the push lease and before the delegate calls ends
-  leaves a state outside `step`'s reach (latched layer whose stream added no
-  `blocks`) that satisfies `Safe`; the session half is exact in `Receive.lean`.
-  Not worth splitting: the properties are about the table, and its mutation is
-  one scope (A1).
-- [HYP] Pattern across the three: every multi-scope session event is "decide
-  under the lock, then an `absl::Cleanup` tail that only decrements
-  `in_flight_`", and the commuting argument is always the same two lines. If
-  the Reshard sessions follow it too, the remaining audits are mostly
-  transcription; the interesting rows will be where a scope reads something
-  *not* under the session lock (`ReadRemote`'s `lease_id` — F3 — is such a
-  row).
+- **`Transport.stream` is the one deliberately coarse event** (two mutexes). A
+  `Finish` after the push lease and before the delegate calls ends leaves a
+  state outside `step`'s reach (latched layer whose stream added no `blocks`)
+  that satisfies `Safe`; the session half is exact in `Receive.lean`. Not worth
+  splitting: the properties are about the table, and its mutation is one scope
+  (A1).
 
 ## Corrections
 
@@ -131,6 +136,26 @@ That residual is a reading audit per event, and it is what I did.
    - Trimmed this journal entry to stop duplicating the per-event tables in the
      `.lean` files (`notes/AGENTS.md` rule 1) and updated `sessions.md` to cover
      `Send` and `Transport`.
+3. Two user-requested audits of the remaining 9 models (`3a67f1d1`):
+   - `Reshard/Send.lean`: `EndOp()` always takes 2–3 `mu_` scopes (its fallback
+     `plan_unregistered_` check unconditionally locks `mu_` before the
+     `in_flight_` scope), so `d2hDone` is 3–6 scopes; also aligned pre-existing
+     A4 wording (`Finish(error)` when `finalizing_ == true` still sets
+     `aborted_ = true` and runs `MaybeUnregisterPlanEarlyLocked()` before
+     returning at `if (finalizing_) return;`).
+   - `Reshard/Receive.lean`: tightened scope-count ranges on `pushEnd` (2–4 +
+     1–2 read-only `GetStatus()` scopes), `h2dIssue` (1–7), `h2dDone` (2–6),
+     and `publish` (3–4), and added the commuting argument for
+     `FinishPoolH2d` calling `ExecuteEligiblePoolH2ds` before the outer
+     `self->EndRecvOp()`.
+   - `Reshard/Coordinator.lean` (`sendSrcResult` is recorded by the worker's
+     `ReshardService::HandleControllerCommand`, plus `kController` futures mode),
+     `Reshard/Registry.lean` (`Ev` name, `Register`'s manifest-snapshot `mu_`
+     scope), `PrefillDecode/PeerIsolation.lean` (`sessStep idx e`, nested
+     `StagingBlockAllocator::mu_` release), `PrefillDecode/UuidTable.lean`
+     (`ReleaseStaging()`), `PrefillDecode/Pipeline.lean` (`recv (.pullReply ok)`
+     1–3 scopes), `Controller/ReadRemote.lean` (`deadline` 1–2 `state->mu`
+     scopes).
 
 ## Reply drafted to the commenter
 
