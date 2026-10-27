@@ -41,7 +41,9 @@ receive/send sessions.
 - [FACT] `ReadRemote` replay from existing logs is not possible yet: the F2
   write-ups do not preserve `RAIDEN_LEASE` lines, the existing probes cover 3
   of the 5 `ReadRemote.Ev` events (`acquireReply`, `deadline`, `pullDone`;
-  none for `shutdown`), and they sit outside `mu`.
+  none for `shutdown`), and they sit outside `state->mu` (2 of the 7 are inside
+  `lifetime->mu`, and error returns in `pullDone` / `lifetime->ctrl == nullptr`
+  do not emit `"release"`).
 - [OBS 2026-10-26] No Bazel on this machine (recorded 2026-10-20); every
   build-side item (the `-Wthread-safety` build, TSan, replay) is gated on a
   build host.
@@ -67,7 +69,7 @@ That residual is a reading audit per event, and it is what I did.
 ## Lock-scope audits across the 12 C++-backed models — interpretation
 
 [FACT] **No model change** in any of the 12 (canonical tables in the `.lean`
-files; +41 source-map rows total, 696 anchors).
+files; +91 source-map rows total, 746 anchors).
 
 - **The `EndRecvOp`/`EndSendOp`/`EndOp`-tail argument** is the load-bearing one
   and transferred from `Receive` to `Send` and the Reshard sessions. Two
@@ -156,6 +158,54 @@ files; +41 source-map rows total, 696 anchors).
      (`ReleaseStaging()`), `PrefillDecode/Pipeline.lean` (`recv (.pullReply ok)`
      1–3 scopes), `Controller/ReadRemote.lean` (`deadline` 1–2 `state->mu`
      scopes).
+4. Third full-audit pass across all 12 models (three parallel read-only
+   subagents):
+   - `PrefillDecode/Pipeline.lean`: `recv (.pullReply ok)` had been described as
+     1–3 scopes with `DeferUnregisterOnSettle` (which is `pushEnd` /
+     `hooks.end_incoming_push`, not `pullReply`); fixed to `Receive.lean`'s two
+     scopes (`handshake_pending_ = false` with `FinishLocked` on failure, then
+     `EndRecvOp`).
+   - `PrefillDecode/Transport.lean`: in `stream`'s "Between them" column, noted
+     that a `pending` copy is absent only when `Finish` precedes
+     `H2dSyncDispatch`, and added the OK-`Finish` case (`h2dDone` or `publish`
+     running before `OnBlockShardsReceived` on the last layer's completing
+     stream, where `published = true` and `CompleteOnSuccess` holds because every
+     layer was dispatched and its copy finished).
+   - `PrefillDecode/Send.lean`: noted in `start` that a `Finish` *during*
+     `AcquireWithTimeout` drops the local `StagingAllocation` at
+     `if (draining_ || done_)` before `staging_` is assigned, and clarified A6
+     that a `Finish` between `d2h_layer_futures_.push_back` and
+     `SendNextLayer(0)`'s lock matches `cancel` ordered between `d2hBegin` and
+     `d2hIssue true`.
+   - `PrefillDecode/Receive.lean`: noted `MaybeUnregisterSettledRecv` /
+     `GetStatus()` scopes in `pushEnd`, `h2dIssue`, and `netAccount`, the
+     1-scope early return in `ExecuteLayerH2d` when already `done_ || draining_`,
+     `ExecutePullRequest`'s initial `mu_` scope (and `handshake_pending_ = true`
+     on the `StartRead` fault-injected path), and `IsReadyToComplete()` /
+     `DeferUnregisterOnSettle()` scopes before `Finish(error)` in `cancel`.
+   - `PrefillDecode/UuidTable.lean` & `PeerIsolation.lean`: changed
+     `ABSL_GUARDED_BY(mu_)` to "guarded by `mu_`" on the unannotated
+     `KVCacheManagerWithTransfer` session/report maps and noted nested session
+     and allocator `mu_` scopes during `Create`.
+   - `Controller/ReadRemote.lean`: noted that `PullAndRelease`'s
+     `transfer.OnReady` also reads `state->lease_id` unlocked on the same thread
+     after `acquireReply` for the commit `ReleaseReadLease` RPC, and refined the
+     `deadline` gap explanation (`settled` is the only field guarded by
+     `state->mu`, so any interleaved event orders before the second `state->mu`
+     scope).
+   - `Reshard/{Receive,Send,Pipeline,Registry,Coordinator}.lean`: fixed
+     `PoolReshardSend` → `PoolReshardPush` in `Coordinator.lean` and
+     `Coordinator/Model.lean` and `if (entries.empty()) continue;` →
+     `if (pool_src_block_ids.empty())` in `Reshard/Send.lean`; added the third
+     `!finished && !status.ok()` branch in `Reshard/Receive` `h2dDone` and 1–4
+     scope range in `cancel`, tightened `Reshard/Receive` A4 (and `reshard.md`),
+     noted `UnregisterActivePlan`'s return domain (`OkStatus` / `NotFoundError`)
+     and `!manager_->IsShuttingDown()` guard in `Reshard/Send`, noted the two
+     `KVCacheManagerWithTransfer::mu_` scopes of `PoolReshardRegisterRecv` and
+     `plan_pushes == expected_chunks` in `Reshard/Pipeline`, noted which
+     `RequestBlockRegistry` methods run which TTL purge helpers in
+     `Reshard/Registry`, and added 50 source-map rows across the modules (746
+     anchors total).
 
 ## Reply drafted to the commenter
 
