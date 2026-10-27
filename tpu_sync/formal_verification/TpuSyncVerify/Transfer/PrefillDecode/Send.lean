@@ -52,7 +52,7 @@ The settle protocol is `Transfer.Lifecycle`. On top of it:
 | `pullStarted`| `pull_started_` (`TransferSendSession`)         | `ValidateAndBeginPull` claimed the offer |
 | `started`    | `StartPush` passed its locked section (`host_block_ids.assign` .. `dst_ints_.assign`) | staging acquired, copies may start |
 | `d2hPending` | ghost                                           | the D2H loop is between `++in_flight_` and `D2hSyncDispatch`'s outcome |
-| `d2hIssued`  | `d2h_layer_futures_.size()` (`TransferSendSession`) | copies handed to the device |
+| `d2hIssued`  | `d2h_layer_futures_.size()` (`TransferSendSession`) until the settle clears it (`ReleaseStagingBlocksLocked`) | copies handed to the device |
 | `d2hReady`   | futures with `IsReady()`                        | copies finished |
 | `d2hRetired` | ghost                                           | copies whose `layer_future.OnReady` in `StartPush` has ended their op |
 | `queued`     | ghost                                           | `SendNextLayer(l)` calls that took their op (`++in_flight_`) |
@@ -86,6 +86,52 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
 | `h2hDone ok`   | the `H2hWriteDirectAsync` push callback: failure finishes the session (`self->FinishLocked(push_res.status(), kPushPhase)`); the last OK push (`remaining_h2h_layers_.fetch_sub(1) == 1`) finishes it OK (`self->Finish()`); the op ends either way |
 | `cancel`       | any `Finish(error)` from outside the data path: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), pull-worker spawn failure (`HandlePullStream`'s `counter_cleanup`), staging acquisition failure (`!acquire_status.ok()`), bad arguments in `StartPush` (`src_block_ids.empty() || ...`), pull-worker exceptions (`HandlePullStream`'s `catch`) |
 | `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`session->Done()`) into `done_sending_` or `failed_recving_` by its status and erases it from `send_sessions_` |
+
+## Lock scopes
+
+`step` applies each event atomically; the C++ has only critical sections of
+the session's `mu_` (see `docs/conventions.md`, "One lock scope per event").
+Every mutable field of `TransferSendSession` is `ABSL_GUARDED_BY(mu_)` except
+`remaining_h2h_layers_`, an atomic whose only reader is its own `fetch_sub`;
+`base_`, `staging_allocator_`, `req_id_`, `uuid_`, `deadline_`,
+`register_start_` and `data_connection_reuse_` are `const`. Every `EndSendOp` below is one scope
+under the default connection policy and the A7 window under `per_transfer`.
+Scopes per event:
+
+| Event          | `mu_` scopes | Between them |
+|----------------|--------------|--------------|
+| `beginPull`    | one, `ValidateAndBeginPull` | — (`deadline_` is `const`) |
+| `start`        | one deciding scope, `StartPush`'s locked section (`if (draining_ || done_) return;` through `dst_ints_.assign`); before it, `remote_data_endpoints_ =` and the scopes of `AcquireStagingWithRetry` write only `remote_data_endpoints_` and `staging_` | a `Finish` between the acquisition and the locked section settles the idle session and releases what was acquired (`FinishLocked` runs `ReleaseStagingBlocksLocked()` at `in_flight_ == 0`); the locked section then returns — the model's `cancel` before `start`, which `start` refuses. A failed acquisition or bad arguments are `Finish(error)`, i.e. `cancel` |
+| `d2hBegin`     | one, the loop's `session_lock` (`if (draining_) return; ++in_flight_;`) | — |
+| `d2hIssue`     | success: one scope, `d2h_layer_futures_.push_back(layer_future)`, after the unlocked `D2hSyncDispatch`, then `layer_future.OnReady` registered outside the lock and, for the last layer, `SendNextLayer(0)`'s own scope (A6); failure: one scope, `FinishLocked(future.status()); EndSendOpLocked();` | a `Finish` during the dispatch finds the op `d2hBegin` took and cannot settle; the future is recorded regardless of `draining_`, as the model's `d2hIssue` does, and the copy drains through `d2hEnd` (`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`). A future already ready when `OnReady` is registered runs its callback inline, the model's `d2hReady` then `d2hEnd` |
+| `d2hReady`     | none (device) | — |
+| `d2hEnd`       | one, `EndSendOp` | — |
+| `wake`         | `ok = false`: two, `FinishLocked(status_or.status(), kD2hPhase)` then `EndSendOp` from the `absl::Cleanup end_op`; `ok = true` on a draining session: two, the `if (self->draining_)` check then the same tail; otherwise one, the check, after which `std::move(end_op).Cancel()` carries the op into the unlocked `push_pool()->Schedule` | a `Finish` after the check and before the pool task runs is seen by the task's own `if (self->draining_)`: the model's `wake true`, `cancel`, `h2hIssue` ending the op |
+| `h2hIssue`     | draining: two, the task's `if (self->draining_)` check then `EndSendOp` from its `end_op`; otherwise one, the check through `++self->in_flight_`, then the unlocked `H2hWriteDirectAsync` | a `Finish` between `++self->in_flight_` and the issue does not stop the push — neither does the model's `h2hIssue` re-check — and the push's callback then retires it (`Finish()` on the last OK push is ignored once draining) |
+| `sendNext`     | two: `SendNextLayer(l + 1)`'s scope (`if (draining_ || l >= d2h_layer_futures_.size()) return;` .. `++in_flight_;`), then `EndSendOp` from the pool task's `end_op` | an `EndSendOp` tail, below |
+| `h2hDone`      | `ok = false`: two, `FinishLocked(push_res.status(), kPushPhase)` then `EndSendOp` from `end_op`; `ok = true`: the lock-free `remaining_h2h_layers_.fetch_sub(1)`, then `Finish()` (one scope) if it was the last, then `EndSendOp` | nothing else reads `remaining_h2h_layers_`, so a step between the `fetch_sub` and `Finish()` is the model's step ordered before `h2hDone` (a `cancel` there wins, as `cancel` then `h2hDone true` does in the model, `finishOnceLocked` ignoring the later OK); after `Finish()`, an `EndSendOp` tail |
+| `cancel`       | one, `Finish(error)`; the sweep decides `!IsDraining()` in an earlier scope (`deadline()` is `const`) | the sender's `FinishLocked` ignores every call after the first (`if (draining_ || done_) return;`), so a `Finish` whose condition went stale is a no-op in both — the model's `cancel` after `finish` (`trace_cancel_after_ok_finish`, `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess`) |
+| `publish`      | `Done()`, then `GetStatus()`, `Details()` | nothing changes on a settled sender (`TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone`); unlike the receiver, no late error can split the set from the details |
+
+**`EndSendOp` tails.** `wake`, `h2hIssue`, `sendNext` and `h2hDone` all end
+in `EndSendOp` from an `absl::Cleanup` that runs after the deciding scope's
+lock is released. Between the two the C++ state differs from the model's
+post-state in one way: `in_flight_` still counts the op. The only decisions
+that read `in_flight_` are the settle checks in `FinishLocked` and
+`EndSendOpLocked` (and A7's `release_due`), so a step taken in the gap decides
+as it would after the whole event, except that a `Finish` in the gap leaves the
+settle to the tail instead of performing it, with the same `draining_`, `done_`
+and `status_` at the end. Every such interleaving therefore ends in the state
+the model reaches by taking the event and then the other step; the ghost
+counters (`d2hRetired`, `woken`, `pooled`, `chaining`, `h2hRetired`) are
+sound for the same reason.
+
+**Where the scope decides before the model's guard.** `d2hIssue` records a
+future and `h2hIssue` issues a push without re-reading `draining_`; the model
+does the same, so a `cancel` between `d2hBegin` and `d2hIssue`, or between
+`h2hIssue`'s scope and the transport call, is admitted in the same order. The
+only place the model is coarser than one scope by design is A6, the fold of
+`SendNextLayer(0)` into the last `d2hIssue`.
 
 ## Assumptions
 
@@ -198,11 +244,21 @@ Generated by `tools/resolve_anchors.py`.
 | `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `dst_ints_.assign`) | `:380-403` |
 | `send.cc` | `TransferSendSession::StartPush` (`for (size_t l = 0; l < total_layers; ++l)`) | `:417-454` |
 | `send.cc` | `TransferSendSession::StartPush` (`layer_future.OnReady`) | `:450-453` |
+| `send.cc` | `TransferSendSession::StartPush` (`remote_data_endpoints_ = remote_data_endpoints;`) | `:377` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::MutexLock session_lock(mu_);` .. `++in_flight_;`) | `:419-423` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (!future.ok())`) | `:435-444` |
+| `send.cc` | `TransferSendSession::StartPush` (`d2h_layer_futures_.push_back(layer_future);`) | `:448` |
 | `send.cc` | `TransferSendSession::SendNextLayer` | `:459-547` |
 | `send.cc` | `TransferSendSession::SendNextLayer` (`if (l >= base_->num_layers())` .. `++in_flight_;`) | `:462-474` |
 | `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future->OnReady`) | `:477-546` |
 | `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->push_pool()->Schedule`) | `:500-545` |
 | `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:518-540` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!status_or.ok())`) | `:484-490` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`absl::MutexLock session_lock(self->mu_);` .. `std::move(end_op).Cancel();`) | `:492-499` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`remote_data_endpoints = self->remote_data_endpoints_;` .. `++self->in_flight_;`) | `:510-513` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!push_res.ok())`) | `:523-529` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;`) | `:535` |
+| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:183-186` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : send_sessions_)`) | `:400-404` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:486-533` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();`) | `:988-1010` |
