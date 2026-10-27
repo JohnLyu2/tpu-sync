@@ -472,7 +472,42 @@
   - *Write-after-release (Step `5` before `3`):* `land l` arrives after `reseat` released `decodeStaging`, tripping `wroteReleased` and corrupting the buffer to #cell-junk.
 ]
 
+// ---------------------------------------------------------------------------
+#slide[Model boundary: the serving engine above `poll_stats()`][
+  #v(0.6em)
+  #set text(size: 17pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 0.9em)
 
+  #text(fill: muted)[vLLM scheduler + tpu-inference connector]
+
+  #v(0.9em)
+  The proofs initially assumed:
+  - Decode reads a request's KV from HBM only after `poll_stats()` reports `done_recving`.
+  - Prefill frees a request's HBM only after its send is reported finished.
+  - Every reported outcome, success or failure, leads the engine to free that request's blocks.
+
+  #v(0.9em)
+  We then modeled the engine to check these assumptions, and found that the shipping connector drops failed outcomes, so KV blocks leak on both nodes; we reproduced it and reported it.
+
+  #v(0.9em)
+  The engine model still assumes one connector worker per node; multi-host decode, where several workers' reports are combined, isn't modeled yet.
+]
+
+// ---------------------------------------------------------------------------
+#slide[Model boundary: the network transport][
+  #v(0.6em)
+  #set text(size: 17pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 0.9em)
+
+  `BlockTransport`'s stream accounting is modeled: it counts the KV streams arriving for each layer and tells the session when the layer has fully arrived.
+
+  #v(0.9em)
+  Below it, the proofs assume:
+  - each prefill sender sends no more streams per layer than it declared;
+  - each stream lands in staging as one unit. Socket reads, wire framing and timeouts aren't modeled.
+]
 
 // ---------------------------------------------------------------------------
 #slide[Validating the model: translating unit tests to Lean][
