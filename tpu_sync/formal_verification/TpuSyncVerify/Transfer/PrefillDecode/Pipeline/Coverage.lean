@@ -169,7 +169,8 @@ miss partition as:
   — the engine freeing prefill HBM and the allocator handing a released slot
   to the next request. No single-request test does either; the multi-request
   end-to-end (`examples/single_host_disagg/run_all.sh`) does, and
-  `MultiRequest.lean` models it (no coverage there yet).
+  `MultiRequest.lean` models it (`MultiRequestCoverage.lean`: no test
+  reaches either recycle).
 * **covered at session level** (17: 9 `Send`, 8 `Recv`): the session branch
   inside the pipeline branch is reached by a session unit test
   (`Send.coveredByPaired` / `Recv.coveredByPaired`). The pipeline adds no C++

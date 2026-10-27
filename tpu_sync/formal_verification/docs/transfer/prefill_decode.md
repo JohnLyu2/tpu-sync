@@ -198,12 +198,14 @@ missing upstream test), **window** (an interleaving no harness hook reaches),
 | `Receive` | 1–2 layers, push and `StartRead` | 37 (+2 unreachable leaves: the retired-callback assertion, the dead `FinishLocked()` arm of `RecordNetworkCompleteLocked`) | 18 (20 tests) | 19 | 10 test (8 drivable, 2 need a replying producer stub), 5 window, 4 ordering |
 | `Send` | 0–2 layers | 43 (every leaf live) | 26 (29 tests; 9 more tests not replayable: external `Finish(OkStatus())`, pulls rejected before the claim) | 17 | 7 test, 10 window |
 | `Pipeline` | 1 layer, registered and unregistered (two paired two-layer rows reach 4 branches outside it) | 75; every memory move writes the right layer's KV | 25 (13 end-to-end and control-plane tests) | 50 | 3 environment (`reclaim`, reseats), 17 covered by session unit tests, 30 in the session gap tables, none unaccounted |
+| `MultiRequest` | — (unbounded; new leaves only) | 3 new: `recyclePrefill`, `nextRequest`, and the write-after-release corruption arm, dead by `not_isRecycleEv_and_wroteReleased_eq_false` | 0 | 2 | both reached only by the two traces replaying `examples/single_host_disagg/run_all.sh`, a script, not a test: no upstream test overwrites a buffer an earlier request released while that request is still observable |
 
 What the tests miss, in one sentence per model: no upstream test fails an
 H2D or D2H dispatch or a push; no consumer-side unit test completes a
 handshake; the end-to-end tests exercise exactly the happy paths and the
 handshake rejections, every failure or window branch being accounted for at
-the session level.
+the session level; no test in the suite recycles a released buffer under an
+earlier request.
 
 ## C++ → Lean routing index
 

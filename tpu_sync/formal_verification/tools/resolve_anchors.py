@@ -118,6 +118,7 @@ RAW_STR_OPEN = re.compile(r'R"([A-Za-z0-9_{}\[\]#<>%:;.?*+\-/^&|~!=,\']*)\(')
 NO_MAP_FILES = {
     "TpuSyncVerify/Common/Coverage.lean",
     "TpuSyncVerify/Controller/ReadRemoteCoverage.lean",
+    "TpuSyncVerify/Transfer/PrefillDecode/MultiRequestCoverage.lean",
     "TpuSyncVerify/Common/ListAux.lean",
     "TpuSyncVerify/Common/ModelCheck.lean",
     "TpuSyncVerify/Common/System.lean",

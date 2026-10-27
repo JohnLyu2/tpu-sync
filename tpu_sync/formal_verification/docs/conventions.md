@@ -73,7 +73,8 @@ umbrella file and a directory of parts:
 * `X/Frame.lean` — frame lemmas for other modules.
 * `X/Traces.lean` — traces, searches, mutants.
 * `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
-  below); `Receive`, `Send`, `Pipeline` and `Controller/ReadRemoteCoverage.lean`
+  below); `Receive`, `Send`, `Pipeline`, `MultiRequestCoverage.lean` (new
+  leaves only: its state space is unbounded) and `Controller/ReadRemoteCoverage.lean`
   so far (`Pipeline/Coverage.lean`
   imports the traces in `PipelineChecks.lean`, so `TpuSyncVerify.lean` imports
   it directly). Not to be confused with `Reshard/Coverage.lean`, which is the
@@ -215,7 +216,10 @@ the model the tests exercise. `Common/Coverage.lean` holds the machinery and
 A leaf no reachable branch carries is a C++ assertion or a dead arm; say which
 and why (the receive model has one of each; the send model none). A search
 that does not fit the budget (the two-layer `Pipeline`, ~20 s) is not a
-`#guard`: state its result and how to re-run it (`tools/run_lean.sh`).
+`#guard`: state its result and how to re-run it (`tools/run_lean.sh`). A
+model with an unbounded state space (`MultiRequest` spawns a request per
+recycle) measures only the leaves it adds to the model it composes, by trace
+and by theorem.
 
 The search keys states by `Hashable`: every state type a coverage search runs
 on, and its component types (`Lifecycle`, `Cell`, `Send`, `Recv`, `Pipeline`,
