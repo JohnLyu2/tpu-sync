@@ -63,6 +63,40 @@ is published (`PublicationCorrect`). Conversely, a mutant that omits the rank
 gate allows pool 1 (rank 1) to finish H2D before pool 0 (rank 0), and pool 0's
 subsequent H2D clobbers `dstHbm[1]` to `.junk`.
 
+## Lock scopes
+
+Sender events (`send e`) and receiver events (`recv e`) inherit the
+`ReshardSendSession::mu_` and `ReshardReceiveSession::mu_` critical sections
+documented in `Send.lean` and `Receive.lean` §"Lock scopes". The pipeline-level
+events and cross-component guards map to C++ synchronization as follows:
+* **`armRecv`, `send (.d2hIssue p true)`, and `recv .pushBegin`:** Phase 1 of
+  `ReshardCoordinator::ExecutePoolReshard` calls
+  `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, which creates the
+  `ReshardReceiveSession` (`RegisterActivePlanDirect` + `AcquireStagingLeases`)
+  and inserts it into `active_pool_reshard_recvs_` under 1
+  `KVCacheManagerWithTransfer::mu_` scope (`armed = true`). The Stage 1
+  `for (std::thread& t : armers) t.join();` barrier orders `armRecv` before
+  Stage 2 sender dispatch (`send (.d2hIssue p true)`), and
+  `hooks.begin_incoming_push` requires the `active_pool_reshard_recvs_` entry to
+  be present under `KVCacheManagerWithTransfer::mu_` (`recv .pushBegin`).
+* **`landStream p` and `recv (.onPoolReceived p)`:** In
+  `BlockTransport::HandleIncomingPush`, the socket write into `dstStaging[p]`
+  (`if (expected_size > 0)`) runs while the caller holds a
+  `ReshardReceiveSession` `in_flight_` op from `pushBegin`
+  (`hooks.begin_incoming_push`), and `BlockTransport::CompleteIncomingPush`
+  increments `progress.completed_chunks++` under 1 `BlockTransport::progress_mu_`
+  scope (`landStream p`). When that increment reaches `expected_chunks`, the
+  same `progress_mu_` scope latches `trigger_completion = true` and
+  `CompleteIncomingPush` invokes `block_delegate_->OnPoolReceived`
+  (`recv (.onPoolReceived p)`) outside `progress_mu_` before releasing the
+  stream's op in `pushEnd` (`hooks.end_incoming_push`).
+* **`reclaim`, `reseatSrcStaging`, `reseatDstStaging`:** External engine /
+  allocator actions gated by `send.published ≠ none` (`CompleteReadWithDetails`
+  under `KVCacheManagerWithTransfer::mu_`) and by `hasStaging = false` (after
+  `ReshardSendSession::SettleLocked` or
+  `ReshardReceiveSession::ReleaseStagingLocked` has released the
+  `PoolStagingLease` under `mu_`).
+
 ## Source map
 
 Line ranges are populated and checked by `tpu_sync/formal_verification/tools/resolve_anchors.py`.

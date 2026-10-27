@@ -78,6 +78,22 @@ File aliases used in the source map below:
      `purgeExpiredAll_inv`, `trace_single_stage_votes_retire_multi_owner_claim`,
      and `trace_split_ttl_purges_request_blocks_while_claim_active`).
 
+  ## Lock scopes
+
+  Every mutable map of `RequestBlockRegistry` (`request_blocks_`, `claimed_`,
+  `claimed_units_`, `claimed_owners_`, `completed_units_`, and `cancelled_`) is
+  `ABSL_GUARDED_BY(mu_)` (the controller mutex shared with `WorkUnitDirectory`).
+  Every event in `Ev` (`register`, `lookupAndClaim`, `abandonClaim`, `complete`,
+  `cancelIfUnclaimed`, `release`) is **one `absl::MutexLock lock(*mu_)` critical
+  section** in `RequestBlockRegistry::Register`, `LookupAndClaim`,
+  `AbandonClaim`, `Complete`, `CancelIfUnclaimed`, and `Release`, which also
+  runs the TTL purge helpers (`PurgeExpiredRequestBlocksLocked`,
+  `PurgeExpiredLifecycleLocked`) on entry. `Register` validates its arguments
+  before taking `mu_` and, when `pool_spans` is non-empty, takes `mu_` once more
+  beforehand only to snapshot `directory_->PoolManifestLocked(unit)`, touching
+  none of the registry maps. Each model transition is therefore a 1:1 atomic
+  `mu_` scope with no multi-scope folding.
+
   ## Main results
 
   - `reachable_safe` (`Inv`): proves inductively across all reachable registry

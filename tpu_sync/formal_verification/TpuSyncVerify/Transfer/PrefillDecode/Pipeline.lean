@@ -84,6 +84,25 @@ the pessimistic choice: a source that is overwritten at any point during the
 copy may be read after the overwrite. Corruption is never undone, so a model
 that reads at issue time admits no violation this one does not.
 
+## Lock scopes
+
+The session events are
+those of `Send.lean` and `Receive.lean` and inherit their lock-scope tables:
+indexing `d2hReady l`, `h2hDone l ok`, `h2dBegin l`, `h2dIssue l ok` and
+`h2dReady l` by layer, and adding the per-layer guard `d2hReadyL[woken]` to
+`send (.wake ok)`, only refines which future or callback the event names
+(`d2h_layer_futures_[l]`, `OnLayerReceived(l)`), not its scopes. The events and
+cross-node guards this module adds:
+
+| Event | Scopes | Between them |
+|---|---|---|
+| `notifyForRead` | one producer-manager `mu_` scope in `NotifyForRead` (`send_sessions_.try_emplace(uuid, session)`), then `cv_.SignalAll()` outside `mu_` | a `HandlePullStream` call that acquires `mu_` between the unlock and `SignalAll` already sees the entry in `send_sessions_` and skips the wait |
+| `pullWait` | the producer-manager `mu_` scope in `HandlePullStream` up to `cv_.WaitWithTimeout(&mu_, left)`, which atomically releases `mu_` to sleep | while asleep (`pullWaiting = true`), `send_sessions_` has no entry (`registered = false`) or, after `notifyForRead`, the thread has not yet re-acquired `mu_` to run `ValidateAndBeginPull` |
+| `send .beginPull` | `ValidateAndBeginPull`'s session `mu_` scope, nested inside `HandlePullStream`'s producer-manager `mu_` scope once `send_sessions_.find(req.uuid)` succeeds | no gap between waking from `WaitWithTimeout` with the entry present and `ValidateAndBeginPull`: both run in the same iteration under the producer manager's `mu_` |
+| `recv (.pullReply ok)` | `Receive.lean`'s 1–3 consumer-session `mu_` scopes (`EndRecvOp` on `ok = true`; optional `DeferUnregisterOnSettle` + `Finish` + `EndRecvOp` on `ok = false`); `ok = true` additionally requires `send.pullStarted = true` | RPC causality, not a shared lock: `HandlePullStream` returns `.status = 0` only after `ValidateAndBeginPull` (`send .beginPull`) succeeded; any exception or timeout returns `.status = -1` (`ok = false`, clearing `pullWaiting`) |
+| `land l` | unlocked payload write (`ForEachPayload` in `HandleIncomingPush`) between `BeginIncomingPush` (`recv .pushBegin`, which holds a push lease `pushes > 0`) and `CompleteIncomingPush` → `OnLayerReceived` (`h2dBegin l`) | the push lease keeps `in_flight_ > 0` on the receive session throughout `ForEachPayload`, so `decodeStaging` cannot be released (`reseatDecodeStaging` is disabled) while `land l` writes it, and `h2dBegin l` cannot run until `ForEachPayload` returns |
+| `reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging` | none (caller engine or `StagingBlockAllocator`, outside session `mu_`) | enabled only after `send.published ≠ none` or `hasStaging = false`, which `Send.lean` and `Receive.lean` establish under their session locks |
+
 ## Assumptions
 
 * **A1 (layers move whole).** Blocks are not modelled: a layer is copied as a

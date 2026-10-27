@@ -40,6 +40,20 @@ ranges for every symbol, sub-block, and test are in the generated
      `grpc_control_plane_backend.cc`), the worker issues an async RPC
      and returns immediately, holding no worker while waiting on the wire.
 
+## Lock scopes
+
+* **`startRead peer`:** Executes inside the `KVCacheManagerWithTransfer::mu_`
+  scope of `StartRead(remote_endpoint)`, which calls
+  `TransferReceiveSession::Create` → `AllocateStagingForLoad` (acquiring one slot
+  under `StagingBlockAllocator::mu_`) and `EmplaceRecvSessionLocked`.
+* **`dispatchPull idx` and `sessStep idx e`:** `dispatchPull` models a
+  `push_pool_` worker thread picking up the scheduled task from
+  `ExecutePullRequest`; each `sessStep` event (`e : Recv.Ev`) has the
+  `TransferReceiveSession::mu_` scopes documented in `Receive.lean` §"Lock
+  scopes" (when `sessStep` settles a session, `ReleaseStagingLocked` →
+  `StagingBlockAllocator::ReleaseSlot` runs inside that settling `mu_` scope,
+  returning the slot to `freeSlots` under `StagingBlockAllocator::mu_`).
+
 ## What this module proves
 
 1. **Resource conservation (`reachable_inv`):**
