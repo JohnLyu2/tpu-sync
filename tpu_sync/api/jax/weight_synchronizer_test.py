@@ -645,6 +645,60 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(m_reset["total_h2h_bandwidth_gbps"], 0.0)
     self.assertEqual(m_reset["push_resharded_call_count"], 0)
 
+  def test_local_d2h_and_h2d_record_metrics(self):
+    """Explicit d2h()/h2d() calls show up in get_metrics()."""
+    # Tile-aligned shapes, so the on-device size has no layout padding.
+    shapes = [(256, 1024), (512, 2048)]
+    arrs = [
+        jax.device_put(jnp.full(shape, 3.0, dtype=self.dtype), self.sharding)
+        for shape in shapes
+    ]
+    for arr in arrs:
+      arr.block_until_ready()
+    logical_bytes = sum(arr.nbytes for arr in arrs)
+    ws = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+    self.addCleanup(ws.shutdown)
+
+    m0 = ws.get_metrics()
+    self.assertEqual(m0["d2h_call_count"], 0)
+    self.assertEqual(m0["last_d2h_bytes"], 0)
+    self.assertEqual(m0["last_h2d_bytes"], 0)
+    self.assertEqual(m0["h2d_bandwidth_gbps"], 0.0)
+
+    ws.d2h()
+    m1 = ws.get_metrics()
+    self.assertEqual(m1["d2h_call_count"], 1)
+    self.assertGreaterEqual(m1["last_d2h_bytes"], logical_bytes)
+    self.assertEqual(m1["total_d2h_bytes"], m1["last_d2h_bytes"])
+    self.assertGreater(m1["last_d2h_time_ms"], 0.0)
+    self.assertGreater(m1["d2h_bandwidth_gbps"], 0.0)
+
+    ws.h2d()
+    m2 = ws.get_metrics()
+    # H2D writes back exactly the bytes D2H read.
+    self.assertEqual(m2["last_h2d_bytes"], m1["last_d2h_bytes"])
+    self.assertEqual(m2["total_h2d_bytes"], m2["last_h2d_bytes"])
+    self.assertGreater(m2["last_h2d_time_ms"], 0.0)
+    self.assertEqual(m2["total_h2d_time_ms"], m2["last_h2d_time_ms"])
+    self.assertGreater(m2["h2d_bandwidth_gbps"], 0.0)
+
+    ws.d2h()
+    ws.h2d()
+    m3 = ws.get_metrics()
+    self.assertEqual(m3["d2h_call_count"], 2)
+    self.assertEqual(m3["total_d2h_bytes"], 2 * m1["last_d2h_bytes"])
+    self.assertEqual(m3["total_h2d_bytes"], 2 * m2["last_h2d_bytes"])
+
+    ws.reset_metrics()
+    m_reset = ws.get_metrics()
+    self.assertEqual(m_reset["d2h_call_count"], 0)
+    self.assertEqual(m_reset["total_h2d_bytes"], 0)
+    self.assertEqual(m_reset["total_h2d_time_ms"], 0.0)
+
   def test_push_to_local_shard_when_global_shard_indices_collide(self):
     ws_source = WeightSynchronizer.test_only_create_cpu_instance(
         num_layers=1,

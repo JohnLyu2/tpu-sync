@@ -36,6 +36,21 @@ py_test(
 )
 
 py_library(
+    name = "weight_sync_common",
+    srcs = ["weight_sync_common.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "weight_sync_common_test",
+    srcs = ["weight_sync_common_test.py"],
+    deps = [
+        ":weight_sync_common",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
+)
+
+py_library(
     name = "weight_synchronizer_manager",
     srcs = ["weight_synchronizer_manager.py"],
     visibility = ["//visibility:public"],
