@@ -131,3 +131,19 @@ That residual is a reading audit per event, and it is what I did.
    - Trimmed this journal entry to stop duplicating the per-event tables in the
      `.lean` files (`notes/AGENTS.md` rule 1) and updated `sessions.md` to cover
      `Send` and `Transport`.
+
+## Reply drafted to the commenter
+
+Hey, thanks so much for writing this up — this is super helpful, and I think your instinct on where to draw the line is spot on.
+
+Splitting every step into per-field reads and writes (or trying to bake the C++ memory model into Lean) would completely blow up the Proofs/state space for very little extra insight, so keeping the Lean models at the protocol level and closing the gap from the C++ side makes a lot more sense.
+
+Going through your three points actually turned up a few fun things:
+
+1. **Weak memory / atomics:** We went and checked all the paths we’re modelling, and practically everything is guarded by plain mutexes — there isn't any lock-free trickery in there (just one atomic countdown counter that gets initialized before any async callbacks are registered). So we can happily skip weak-memory modelling with a clear conscience.
+2. **`GUARDED_BY` and TSan:** This was a funny discovery. It turned out the codebase *already* had Clang `GUARDED_BY` annotations on almost everything — except for that exact `lease_id` field, where someone had annotated the boolean right next to it and missed `lease_id`! Even funnier: the build config never actually turned on `-Wthread-safety`, so the compiler had been silently ignoring all the annotations. Turning the flag on and adding a TSan test run is a very easy win.
+3. **One event vs. one critical section:** Your note also prompted us to check the subtle thing that `GUARDED_BY` *doesn't* catch. `GUARDED_BY` proves you hold the lock whenever you touch a field, but the Lean model assumes each *event* is one atomic step. In a few places in the real code, a single logical event actually grabs and releases the mutex two or three times (usually: check state and decide under the lock, release the lock to fire a callback or clean up a handle, then re-lock to decrement an "in-flight" counter). We went through every event across the models and audited those multi-lock steps to make sure the little cleanup tails commute with anything that could sneak in between.
+4. **Trace replay:** Love this idea, especially since our Lean `step` functions are already executable (`#eval`), so building a trace checker on top of them is very doable. One neat catch we noticed while sketching it out: if we log events from C++ tests, the log line (or at least a sequence number) has to be recorded *before* releasing the mutex — otherwise two threads can run their critical sections in order `A` then `B`, get preempted right after unlocking, and write to the trace log in order `B` then `A`, making the Lean checker reject a totally valid run.
+
+Really appreciate you taking a look at this — it gave us a very clean checklist to tighten up the bridge between the proofs and the C++!
+
