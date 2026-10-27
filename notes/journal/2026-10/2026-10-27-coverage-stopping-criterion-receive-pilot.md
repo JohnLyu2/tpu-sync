@@ -89,3 +89,70 @@ project.
    sessions); "13 distinct traces" → 13 named (12 distinct sequences);
    "three lease tests" → four; `RecvBase::H2dSyncDispatch` "can" → "could be
    made to" return an error.
+
+## Send (`85f91676`) — interpretation
+
+Canonical: `Send/Coverage.lean` §Result, `Send.lean` §Coverage,
+`Common/Coverage.lean` (machinery now shared; `Receive` ported, numbers
+unchanged).
+
+- [FACT] 43 branches, every leaf live, paired tests reach 26; 17 gaps = 7
+  test / 10 window. Compared with `Receive`, `Send` has more lock windows
+  (the push-pool task and `SendNextLayer`'s `++in_flight_`→`OnReady` gap add
+  positions no harness hook reaches) and no dead arm.
+- [FACT] **D2H-future callbacks run LIFO.** `xla::Future::OnReady` is
+  `AsyncValue::AndThen`: waiters are prepended and run from the head on the
+  setting thread; a callback on an already-available value runs at
+  registration (`xla/tsl/concurrency/async_value.{h,cc}`,
+  `EnqueueWaiterListNode` / `RunWaiters`, read in the pinned xla under the
+  bazel cache). `StartPush` registers `d2hEnd` inside its loop,
+  `SendNextLayer(0)` registers `wake` after it, so a test-completed copy runs
+  `wake` then `d2hEnd`; a copy complete at registration (FakeSendBase
+  non-manual) runs `d2hEnd` first. Four traces had the wrong order; the model
+  itself never fixed it (A3 says any interleaving maps onto one it admits,
+  which is still true — but the *tests* pick one, and coverage needs to know
+  which). Also holds in production through `PjRtCopyFuture::OnReady`, whose
+  first call materialises the joined future that later calls attach to.
+- [FACT] Six send tests drive `Finish(OkStatus())` from outside
+  (`TestManager::Decide(false)`, `session->Finish(absl::OkStatus())`). The
+  only production source is `AckSend`, which A5 excludes as dead, so these
+  tests exercise a stimulus production never produces; the old docstrings had
+  paired three of them "by analogy" with `cancel`-based traces. Now
+  `notReplayable`. If an owner ever wires the Ack, A5 falls and `Send` needs
+  a `finishOk` event — and these six tests become its replays.
+- [FACT] `DetailsSayAFailedPushFailedInPushWhileCopiesRun`'s injected failure
+  (`hooks::kRaidenManagerBaseH2hWrite`) is reported synchronously inside the
+  pool task, before `SendNextLayer(l + 1)`: the test reaches `sendNextRefused`
+  deterministically, which I had classified as a window.
+- [HYP] Pattern across both models: the harness can drive every *external*
+  stimulus (cancel, failed copy/push/dispatch, completion order between
+  different futures) but no *internal* one (a `Finish` landing between two
+  lock scopes of one event, or between a future's readiness and its callback).
+  The window class is therefore exactly the per-event lock-scope audit's
+  residual, seen from the test side; W4's schedule interpreter will have the
+  same blind spot unless the C++ grows a test hook at those points.
+
+## Corrections (Send round)
+
+1. Independent audit #1 (eight findings, all applied): `DetailsSayAFailedPush…`
+   trace order (above); control-plane `TestManager` has zero layers, so the
+   three acknowledged-pull tests are `init 0, [beginPull, start]`
+   (`startZeroLayers`), not `init 1, [beginPull]`; a late `StartPush` on a
+   finished send is `cancel` (no effect) per the model's own mapping of a
+   refused acquisition, so three paired tests cover it; "no test reaches it"
+   was false for two windows that `…CancelledMidPush` / `DoneGuarantees…` reach
+   by chance (`WaitForH2hCalls` returns before the task tail); the
+   `PullAfterRegistrationDeadlineIsRejected` test polls and so is paired, not
+   `notReplayable`; three refusal-only control tests and
+   `SendDeadlineTest.ExpiredSendSessionFails…` were in neither list; "six not
+   replayable" vs seven rows; the callback order was "undetermined" — resolved
+   by reading xla, which dissolved the "order" class I had invented.
+2. Independent audit #2: my scripted edit of `Send.lean` spliced on the first
+   occurrence of "`## Source map`", a prose mention near the top, and
+   appended the whole docstring body a second time with stale numbers.
+   Neither `lake build` nor `resolve_anchors.py --check` notices a duplicated
+   docstring. Rule: never splice on a string that can occur in prose; diff
+   the file against HEAD before committing. Plus: the zero-layer control
+   pairings and `DoneGuarantees…` are racy and now say which order they take;
+   `ServePull` never calls `ValidateAndBeginPull` (the `beginPull` is the
+   model's precondition, said so).
