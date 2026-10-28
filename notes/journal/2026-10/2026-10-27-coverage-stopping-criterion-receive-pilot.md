@@ -268,3 +268,55 @@ table row.
    the earlier one finished) — tightened to "overwrites … while still
    observable", tests named; stale "no coverage there yet" in
    `Pipeline/Coverage.lean`.
+
+## W2 guard inventory, Receive and Send (`5f1d205c`) — interpretation
+
+Canonical: `Receive/Guards.lean`, `Send/Guards.lean` (tables, mutants,
+`#guard`s), the umbrellas' §"Coverage and guards", `PublishedQuiet` in both
+`Model.lean`s.
+
+- [FACT] Scope chosen narrower than the plan: only guards that transcribe a
+  C++ check (not ghost-counter guards), judged against `Safe` minus the
+  ghost equations, with a second `#guard` (`survivesFull`) that survivors
+  also survive the full `Safe`. Receive: 10 mutated, 5 load-bearing, 5
+  survive. Send: 11 mutated, 5 load-bearing, 7 survive. Every survivor has a
+  purpose outside the properties — wasted-work avoidance (a `Finish` stops
+  new work at every lock it passes, so each check is one line of a 2–3-line
+  defence), metrics/accounting, or the first-`Finish`-wins design choice,
+  which no safety property can see. No C++ redundancy to propose beyond the
+  known ones.
+- [FACT] **The finding: a property gap in both session modules.** Dropping
+  `Done()` before publishing survived the `Safe` each module had.
+  `Publication` constrains only `some true`; `ok_draining` makes an early OK
+  publication harmless; an early *failed* publication was unconstrained — the
+  engine reclaiming prefill HBM or refilling decode HBM under a copy still
+  in flight. That promise existed only in `Pipeline.PrefillHbmSafe` /
+  `DecodeHbmSafe`. `Send.PublishedQuiet` and `Recv.PublishedQuiet`
+  (`published ≠ none → nothing dispatching or unretired`) added, proved from
+  `published_done` + `done_idle` + `Accounted` in four lines each, appended
+  last in `Safe` so positional projections elsewhere are untouched. The
+  mutant now dies in 3–5 events. This is the proof-side analogue of
+  ReadRemote's `Effect = settles` blind spot: the module stated the easy
+  half of its promise.
+- [HYP] Pattern for the recipe (`conventions.md` does not yet say it): a
+  killed check whose killer is a *one-directional* property is suspicious —
+  check the other direction. Both `Publication`s were one-directional and
+  both hid the same gap.
+- Tooling: `decide` on a fuel-64 search exceeds the kernel's recursion
+  depth; schedule pins are `#guard`s, not theorems. `Guards.lean` and
+  `Coverage.lean` share a namespace, so list names must differ
+  (`guardInits`).
+
+## Corrections (W2 round)
+
+1. Independent audit: Send survivor count "six" was seven (S3′ is its own
+   row); "survivors also survive full `Safe`" was checked ad hoc, not pinned
+   → `survivesFull` guards; `endOpEager` also sets `draining` (kept for
+   `Consistent`, now said, kill independent of it); S3′'s cover is S4's
+   `trySendNext` refusal, not S5; G2's schedule unpinned; `Finish()` vs
+   `FinishLocked()` on the sender's last push; and the audit's observation
+   that Receive's G8 was killed only through the OK half is what produced
+   `Recv.PublishedQuiet` — I had added it on the sender only.
+2. Committed by the concurrent session as `5f1d205c` (file set verified
+   identical to the audited tree); this journal entry is the record that
+   commit lacked.
