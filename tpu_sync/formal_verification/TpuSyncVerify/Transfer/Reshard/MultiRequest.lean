@@ -56,6 +56,30 @@ The top-level system theorems establish for **every** transfer `idx` (under both
    `CompleteReadWithDetails` (`HandedOff`), enabling both `.recycleSrc idx`
    and `.nextRequest idx`.
 
+## Assumptions
+
+* **A1 — Cross-transfer destination page disjointness (`dstHbm` per transfer):**
+  Each transfer `r ∈ ms.reqs` owns its own `dstHbm` vector while in flight, and
+  aliased-page rank ordering (`writePoolHbm`, `AliasedPageCorrect`) is enforced
+  within each `ReshardReceiveSession` (`CollectEligiblePoolH2dsLocked`). Across
+  concurrent transfers, destination physical pages are disjoint:
+  - On any shared storage (`PoolSpec::storage_index`), all pools declared for
+    bounded pool staging agree on `block_stride_bytes` and `num_blocks`
+    (`KVCacheManagerBase::ConfigurePoolStaging`), and `ComputePoolBlockCopyExtents`
+    places every region of block $b$ of pool $P$ at device offset
+    $\text{base\_offset\_bytes} + b \cdot \text{block\_stride\_bytes} + \text{region\_offset} \in [b \cdot S, (b + 1) \cdot S)$
+    when each pool's sub-page offset fits within one storage page $S = \text{block\_stride\_bytes}$
+    (`PoolSpec::Validate`). Two pool blocks $b$ and $b'$ on the same storage
+    therefore overlap in device HBM bytes only when $b = b'$.
+  - On the host staging side, `KVCacheManagerBase::AcquirePoolStagingLease`
+    allocates disjoint host arena slots to distinct concurrent `uuid`s
+    (`PoolStaging.no_slot_aliasing_between_distinct_uuids`).
+  - Above `tpu_sync`, the serving engine's unified KV-cache block allocator
+    draws block IDs from a single `[0, num_blocks)` free pool shared across all
+    KV-cache groups (full-attention and state/linear-attention groups alike) and
+    excludes shared prefix-cached blocks from `dst_device_block_ids`, so two
+    concurrent transfers never target the same uncached destination `block_id` $b$.
+
 ## Lock scopes
 
 * **`reqStep idx e`:** Delegates to `Pipeline.step` on `ms.reqs[idx]` (whose
