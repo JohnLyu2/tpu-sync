@@ -736,7 +736,7 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
   EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.1"));
 }
 
-TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
+TEST(SocketTransportAdapterTest, EnableSourceIpBindEnv) {
   auto cleanup = absl::MakeCleanup(
       [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
 

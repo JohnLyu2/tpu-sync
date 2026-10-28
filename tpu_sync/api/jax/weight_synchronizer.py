@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Union
 import jax
 
 from tpu_sync.api import common
+from tpu_sync.api import weight_sync_common
 
 # Import Nanobind binary library directly E2E!
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
@@ -191,6 +192,13 @@ class WeightSynchronizer:
   def get_host_buffer(self, layer_idx: int = 0, shard_idx: int = 0) -> any:
     """Returns a zero-copy Host-side CPU NumPy ndarray view of the C++ staging buffer.
 
+    The view keeps the native synchronizer, with its ports, threads and host
+    staging memory, alive for as long as the view or any array sharing its
+    memory exists, even after `shutdown()`. Do not hand the view to
+    asynchronous consumers (for example raw-transfer copies) that can outlive
+    the caller's references: the final release then tears the synchronizer
+    down on that consumer's thread.
+
     Args:
       layer_idx: Target layer index to fetch.
       shard_idx: Target shard index to fetch.
@@ -255,65 +263,7 @@ class WeightSynchronizer:
 
   def get_metrics(self) -> dict[str, float | int]:
     """Returns a dictionary of internal performance metrics."""
-    m = self._impl.get_metrics()
-    d2h_time_s = max(m.last_d2h_time_ms / 1000.0, 1e-9)
-    h2h_time_s = max(m.last_h2h_time_ms / 1000.0, 1e-9)
-    tiling_time_s = max(m.last_tiling_time_ms / 1000.0, 1e-9)
-    detiling_time_s = max(m.last_detiling_time_ms / 1000.0, 1e-9)
-
-    d2h_bytes_gb = m.last_d2h_bytes / 1e9
-    h2h_bytes_gb = m.last_h2h_bytes / 1e9
-    tiled_bytes_gb = m.last_tiled_bytes / 1e9
-    detiled_bytes_gb = m.last_detiled_bytes / 1e9
-
-    total_h2h_time_s = max(m.total_h2h_time_ms / 1000.0, 1e-9)
-    total_h2h_bytes_gb = m.total_h2h_bytes / 1e9
-
-    return {
-        "last_d2h_time_ms": m.last_d2h_time_ms,
-        "last_h2h_time_ms": m.last_h2h_time_ms,
-        "last_staging_time_ms": m.last_staging_time_ms,
-        "last_tiling_time_ms": m.last_tiling_time_ms,
-        "last_detiling_time_ms": m.last_detiling_time_ms,
-        "last_total_push_resharded_time_ms": (
-            m.last_total_push_resharded_time_ms
-        ),
-        "last_d2h_bytes": m.last_d2h_bytes,
-        "last_h2h_bytes": m.last_h2h_bytes,
-        "last_tiled_bytes": m.last_tiled_bytes,
-        "last_detiled_bytes": m.last_detiled_bytes,
-        "total_d2h_time_ms": m.total_d2h_time_ms,
-        "total_h2h_time_ms": m.total_h2h_time_ms,
-        "total_staging_time_ms": m.total_staging_time_ms,
-        "total_tiling_time_ms": m.total_tiling_time_ms,
-        "total_detiling_time_ms": m.total_detiling_time_ms,
-        "total_push_resharded_time_ms": m.total_push_resharded_time_ms,
-        "total_d2h_bytes": m.total_d2h_bytes,
-        "total_h2h_bytes": m.total_h2h_bytes,
-        "total_tiled_bytes": m.total_tiled_bytes,
-        "total_detiled_bytes": m.total_detiled_bytes,
-        "d2h_call_count": m.d2h_call_count,
-        "push_resharded_call_count": m.push_resharded_call_count,
-        "d2h_bandwidth_gbps": (
-            d2h_bytes_gb / d2h_time_s if m.last_d2h_bytes > 0 else 0.0
-        ),
-        "h2h_bandwidth_gbps": (
-            h2h_bytes_gb / h2h_time_s if m.last_h2h_bytes > 0 else 0.0
-        ),
-        "total_h2h_bandwidth_gbps": (
-            total_h2h_bytes_gb / total_h2h_time_s
-            if m.total_h2h_bytes > 0
-            else 0.0
-        ),
-        "tiling_bandwidth_gbps": (
-            tiled_bytes_gb / tiling_time_s if m.last_tiled_bytes > 0 else 0.0
-        ),
-        "detiling_bandwidth_gbps": (
-            detiled_bytes_gb / detiling_time_s
-            if m.last_detiled_bytes > 0
-            else 0.0
-        ),
-    }
+    return weight_sync_common.metrics_to_dict(self._impl.get_metrics())
 
   def reset_metrics(self) -> None:
     """Resets all recorded internal metrics."""
@@ -342,5 +292,10 @@ class WeightSynchronizer:
     return _weight_synchronizer.flush_cloud_logging(phase, uuid, req_id)
 
   def shutdown(self) -> None:
-    """Releases and shuts down the underlying C++ synchronizer instance."""
+    """Drops this wrapper's reference to the C++ synchronizer instance.
+
+    The native synchronizer, with its ports, threads and host staging memory,
+    is destroyed once its last reference is gone, including any view returned
+    by `get_host_buffer()`. Until then it keeps running.
+    """
     self._impl = None

@@ -37,10 +37,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/c/pjrt_c_api.h"
-#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/pjrt/semaphore.h"
 #include "xla/stream_executor/stream.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -86,9 +83,6 @@ struct BlockMetadata {
   std::string address;
   xla::PjRtClient* pjrt_client = nullptr;
 };
-
-using RecvCallback =
-    std::function<absl::Status(int block_id, size_t size_bytes)>;
 
 namespace kv_cache {
 
@@ -190,6 +184,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
         end_incoming_push;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
+    // Returns the host layer buffer the receive session of |uuid| leased to
+    // |layer_idx|, leasing one if needed and blocking while every buffer is in
+    // use.
+    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
+        acquire_recv_staging;
+    // Returns the host layer buffer the send session of |uuid| leased to
+    // |layer_idx|, or an error if |layer_idx| holds no lease.
+    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
+        lookup_send_staging;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -791,25 +794,35 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   uint8_t* GetBlockHostPointer(size_t layer_idx, size_t shard_idx,
                                int block_id) override;
 
+  // Returns the number of allocated host layer buffers (equals num_layers()
+  // unless bounded via TPU_RAIDEN_NUM_STAGING_LAYERS).
+  size_t num_host_layers() const { return layers_.size(); }
+
   // Returns the total number of bytes allocated in host DRAM.
   size_t GetAllocatedHostDramBytes() const;
 
   // Synchronous on-chip H2D offload (bypasses background worker thread queue).
+  // |host_layer_idx| is the host layer buffer the copy reads; it requires a
+  // single |layer_idx| and defaults to that device layer's own host buffer.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
       const std::vector<int64_t>& src_offsets_major_dim = {},
       const std::vector<int64_t>& dst_offsets_major_dim = {},
       const std::vector<int64_t>& copy_sizes_major_dim = {},
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
 
   // Synchronous on-chip D2H offload (bypasses background worker thread queue).
+  // |host_layer_idx| is the host layer buffer the copy writes; it requires a
+  // single |layer_idx| and defaults to that device layer's own host buffer.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
       const std::vector<int64_t>& src_offsets_major_dim = {},
       const std::vector<int64_t>& dst_offsets_major_dim = {},
       const std::vector<int64_t>& copy_sizes_major_dim = {},
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
 
   // Per-layer device buffer holds bundled with the layer's on-device size.
@@ -856,12 +869,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  protected:
-  const PJRT_Api* c_api_ = nullptr;
-  const PJRT_RawBuffer_Extension* extension_ = nullptr;
   size_t max_physical_size_ = 0;
   int64_t staging_num_slots_ = 0;
   int64_t staging_max_major_per_slot_ = 0;
-  bool is_blocked_layout_ = false;
 
   std::unique_ptr<LogicalBlockManager> host_block_manager_;
 
@@ -908,9 +918,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::string worker_id_;
   TransferEventHooks transfer_hooks_;
 
+  // One shard copy between device layer |layer_idx| (buffer_holds_) and host
+  // layer buffer |host_layer_idx| (layers_). The two index spaces coincide
+  // while every device layer has a host buffer of its own.
   struct CopyWork {
     size_t layer_idx;
     size_t shard_idx;
+    size_t host_layer_idx;
   };
 
   absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchH2dWork(
@@ -931,7 +945,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return host_block_manager_->Allocate(num_blocks, /*lock=*/true);
   }
 
-  absl::Status OnSingleBlockReceived(int block_id, size_t size_bytes) override;
+  // Per-block receive completion is tracked by the transfer sessions, not here.
+  absl::Status OnSingleBlockReceived(int block_id, size_t size_bytes) override {
+    return absl::OkStatus();
+  }
 
   virtual absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchD2hChunks(
       const std::vector<int64_t>& src_offsets,
@@ -939,6 +956,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       const std::vector<int64_t>& copy_sizes,
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt, int64_t device_id = -1);
 
   // Updates the allocated buffer occupancy metrics.
@@ -1018,11 +1036,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                              std::optional<uint64_t> uuid);
 
   HostBufferAllocator host_allocator_ = nullptr;
-  std::unique_ptr<xla::Semaphore> semaphore_;
-
-  absl::Mutex recv_mu_;
-  absl::flat_hash_map<int, RecvCallback> recv_callbacks_
-      ABSL_GUARDED_BY(recv_mu_);
 
   mutable absl::Mutex plans_mu_;
   struct RegisteredPlan {
@@ -1104,6 +1117,33 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   // Initializes per-shard local_rank label strings at construction time.
   void InitShardLocalRanks();
+
+  // Host staging buffers produced by AllocateHostLayers().
+  struct HostLayers {
+    std::vector<LayerInfoBase> layers;
+    // Sum of every allocated shard's host_size.
+    size_t host_bytes = 0;
+  };
+
+  // Allocates the host staging mirror: one host buffer per (layer, shard) for
+  // the first |num_layers_to_allocate| of the manager's |num_layers| layers,
+  // |num_shards| shards each, sized at |num_host_blocks| x
+  // layer_block_byte_size(layer) bytes (so layer_row_bytes_ must already be
+  // populated). Shard (l, s) is allocated through |host_allocator| for the
+  // device of |device_layers|[l].holds[s] when present (host-only managers
+  // pass no device layers), or from zeroed posix_memalign memory without an
+  // allocator, and records that device and its on-device size for H2D/D2H
+  // bounds checks.
+  // With fewer buffers than layers any layer may be staged in any buffer, so
+  // every buffer is sized for the widest row and records the largest on-device
+  // size. Fails kInvalidArgument when |num_layers_to_allocate| exceeds
+  // |num_layers|, and with the allocator's status (kResourceExhausted for
+  // posix_memalign, kInternal for a bad allocator result) when an allocation
+  // fails; buffers allocated before the failure are released.
+  absl::StatusOr<HostLayers> AllocateHostLayers(
+      size_t num_layers, size_t num_shards, size_t num_layers_to_allocate,
+      int num_host_blocks, absl::Span<const LayerDeviceInfo> device_layers,
+      const HostBufferAllocator& host_allocator) const;
 
   mutable absl::Mutex backends_mu_;
   absl::flat_hash_map<std::string, std::shared_ptr<backends::KVBackend>>

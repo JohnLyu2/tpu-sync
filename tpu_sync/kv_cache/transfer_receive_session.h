@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_TRANSFER_RECEIVE_SESSION_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_TRANSFER_RECEIVE_SESSION_H_
 
+#include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
@@ -63,14 +64,16 @@ class TransferReceiveSession
       const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
-      std::chrono::steady_clock::time_point deadline);
+      std::chrono::steady_clock::time_point deadline,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
       std::string req_id, int32_t total_blocks,
       std::chrono::steady_clock::time_point deadline,
-      bool acquire_staging = false);
+      bool acquire_staging = false,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
   CreateFromActivePlan(
@@ -79,7 +82,8 @@ class TransferReceiveSession
       const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
       std::chrono::steady_clock::time_point deadline,
       absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
-          host_block_of);
+          host_block_of,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   ~TransferReceiveSession() override { ReleaseStaging(); }
 
@@ -142,11 +146,11 @@ class TransferReceiveSession
 
   // Peregrine receive hook: records first-packet timing the first time any
   // Post for this session lands.
-  absl::Status OnRecvProgress(KVCacheManagerWithTransfer& manager);
+  absl::Status OnRecvProgress();
 
   // Peregrine receive hook: marks the network phase complete and records
   // last-packet timing once every layer's Posts have landed on this receiver.
-  absl::Status OnRecvNetworkComplete(KVCacheManagerWithTransfer& manager);
+  absl::Status OnRecvNetworkComplete();
 
   // Handles a transport report that |shard_ids| of |block_ids| landed. Each
   // shard's progress is tracked separately; a shard completes once it has
@@ -158,9 +162,21 @@ class TransferReceiveSession
                                      absl::Span<const int> shard_ids);
 
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
-  // callback.
+  // callback. When fewer host layer buffers exist than layers, the copy reads
+  // the host layer buffer leased to |layer_idx| and the callback releases the
+  // lease.
   absl::Status ExecuteLayerH2d(KVCacheManagerWithTransfer& manager,
                                size_t layer_idx);
+
+  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
+  // has none and blocking while every buffer is in use. A timeout fails the
+  // receive. Callable from any thread; concurrent calls for the same layer
+  // (one per shard stream) observe one lease.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);
+
+  const StagingLayerManager& staging_layer_manager() const {
+    return staging_layer_manager_;
+  }
 
   std::string req_id() const {
     absl::MutexLock lock(mu_);
@@ -178,26 +194,37 @@ class TransferReceiveSession
  private:
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
-                         uint64_t uuid = 0)
+                         uint64_t uuid,
+                         std::shared_ptr<MetricsCollector> metrics_collector)
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
-        blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0,
-                                   0) {}
+        metrics_collector_(std::move(metrics_collector)),
+        blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
+        staging_layer_manager_(base != nullptr && base->num_host_layers() <
+                                                      base->num_layers()
+                                   ? base->num_host_layers()
+                                   : 0) {}
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
                          uint64_t uuid, std::string req_id,
                          int32_t total_blocks,
                          std::chrono::steady_clock::time_point deadline,
-                         bool acquire_staging = false)
+                         bool acquire_staging,
+                         std::shared_ptr<MetricsCollector> metrics_collector)
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
+        metrics_collector_(std::move(metrics_collector)),
         req_id_(std::move(req_id)),
         total_blocks_(total_blocks),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
         deadline_(deadline),
-        start_time_(std::chrono::steady_clock::now()) {
+        start_time_(std::chrono::steady_clock::now()),
+        staging_layer_manager_(base != nullptr && base->num_host_layers() <
+                                                      base->num_layers()
+                                   ? base->num_host_layers()
+                                   : 0) {
     if (acquire_staging) {
       absl::StatusOr<StagingAllocation> acquired =
           staging_allocator_->Acquire(1);
@@ -258,8 +285,7 @@ class TransferReceiveSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ResetShardProgressLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   bool RecordNetworkCompleteLocked(
-      MetricsCollector* absl_nullable metrics, bool all_complete,
-      std::string* session_req_id,
+      bool all_complete, std::string* session_req_id,
       std::chrono::steady_clock::time_point* session_start_time)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
@@ -267,6 +293,7 @@ class TransferReceiveSession
   kv_cache::KVCacheManagerBase* base_ = nullptr;
   StagingBlockAllocator* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
+  std::shared_ptr<MetricsCollector> metrics_collector_;
   std::string req_id_ ABSL_GUARDED_BY(mu_);
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   CopyPlan load_plan_ ABSL_GUARDED_BY(mu_);
@@ -311,6 +338,11 @@ class TransferReceiveSession
   // Generation of the plan this receive belongs to; settlement cleanup
   // only touches that registration.
   uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;
+  // staging_layer_manager_ synchronizes itself; cancelled_ mirrors draining_
+  // so waiters in staging_layer_manager_.Acquire() can bail out without taking
+  // mu_.
+  StagingLayerManager staging_layer_manager_;
+  std::atomic<bool> cancelled_{false};
 };
 
 }  // namespace tpu_raiden

@@ -117,6 +117,7 @@ cc_test(
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:block_transport_delegate",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",
@@ -192,6 +193,42 @@ py_test(
         "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
+        "@pypi//numpy",
+    ],
+)
+
+py_test(
+    name = "weight_synchronizer_parity_test",
+    size = "medium",
+    srcs = ["weight_synchronizer_parity_test.py"],
+    tags = [
+        "cpu:4",
+        "no_oss",
+        "requires-mem:16g",
+    ],
+    deps = [
+        "//tpu_sync/api/jax:weight_synchronizer_jax_py",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@pypi//numpy",
+    ],
+)
+
+py_test(
+    name = "weight_synchronizer_parity_torch_test",
+    size = "medium",
+    srcs = ["weight_synchronizer_parity_test.py"],
+    args = ["--framework=torch"],
+    main = "weight_synchronizer_parity_test.py",
+    tags = [
+        "cpu:4",
+        "no_oss",
+        "requires-mem:16g",
+    ],
+    deps = [
+        "//tpu_sync/api/torch:weight_synchronizer_torch_py",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/testing:absltest",
         "@pypi//numpy",
     ],
 )

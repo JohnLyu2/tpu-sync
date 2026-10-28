@@ -11,9 +11,10 @@
 #                   (vllm-torchtpu-torchtpu-nightly) with the candidate layered
 #                   over the base image (TORCHTPU_NIGHTLY_LEG=tpu-sync), every
 #                   lane, waited for.
-#   sglang_canary   A dispatch of sglang-torchtpu's "Nightly Test (TPU - Remote
-#                   Wheel)" workflow with wheel=tpu-sync-torch==<candidate>:
-#                   feature validation and perf, waited for.
+#   sglang_canary   sglang-torchtpu's weekly scheduled "Nightly Test (TPU -
+#                   Remote Wheel)" run (or a dispatch with
+#                   wheel=tpu-sync-torch==<candidate> when SGLANG_GITHUB_TOKEN
+#                   is set): feature validation and perf, waited for.
 #   record          Both green: lkg.version and verified_commits.csv updated in
 #                   a pull request labeled "pull ready", which Copybara imports
 #                   into Piper (the source of truth) and exports back to main;
@@ -31,8 +32,11 @@
 # Secrets (repository settings):
 #   BUILDKITE_API_TOKEN   Buildkite token of the "vllm" organization with
 #                         read_builds and write_builds.
-#   SGLANG_GITHUB_TOKEN   GitHub token with actions:write (and contents:read) on
-#                         sgl-project/sglang-torchtpu, to dispatch and read runs.
+#   SGLANG_GITHUB_TOKEN   (optional) GitHub token with actions:write (and
+#                         contents:read) on sgl-project/sglang-torchtpu, to
+#                         dispatch runs. When unset, sglang_canary finds and
+#                         waits on sglang-torchtpu's Monday 12:00 UTC scheduled
+#                         run read-only using GOLDEN_COMMIT_TOKEN / GITHUB_TOKEN.
 #   GOLDEN_COMMIT_TOKEN   GitHub token with contents:write and
 #                         pull_requests:write on this repository. The record
 #                         pull request is opened with it so that CI runs on it
@@ -186,6 +190,7 @@ jobs:
       run_url: ${{ steps.start.outputs.sglang_run_url }}
       run_id: ${{ steps.start.outputs.sglang_run_id }}
     env:
+      GITHUB_TOKEN: ${{ secrets.GOLDEN_COMMIT_TOKEN || github.token }}
       SGLANG_GITHUB_TOKEN: ${{ secrets.SGLANG_GITHUB_TOKEN }}
       VERSION: ${{ needs.resolve.outputs.version }}
     steps:

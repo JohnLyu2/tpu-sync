@@ -34,6 +34,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
@@ -68,6 +69,20 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   void SetManualH2h(bool manual) {
     absl::MutexLock lock(mu_);
     manual_h2h_ = manual;
+  }
+
+  // Makes D2hSyncDispatch fail with |status| for |layer_idx|.
+  void FailD2hDispatchAtLayer(size_t layer_idx, absl::Status status) {
+    absl::MutexLock lock(mu_);
+    fail_d2h_layer_ = layer_idx;
+    fail_d2h_status_ = std::move(status);
+  }
+
+  // Runs |hook| with the layer index at the start of every D2hSyncDispatch
+  // call, before the copy is issued or failed and without holding |mu_|.
+  void SetD2hDispatchHook(std::function<void(size_t)> hook) {
+    absl::MutexLock lock(mu_);
+    d2h_dispatch_hook_ = std::move(hook);
   }
 
   void CompleteD2h(size_t index, absl::Status status = absl::OkStatus()) {
@@ -111,9 +126,21 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
       const std::vector<int64_t>& dst_offsets_major_dim,
       const std::vector<int64_t>& copy_sizes_major_dim,
       std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+      std::optional<size_t> host_layer_idx,
       std::optional<size_t> shard_idx) override {
+    std::function<void(size_t)> hook;
+    {
+      absl::MutexLock lock(mu_);
+      hook = d2h_dispatch_hook_;
+    }
+    if (hook && layer_idx.has_value()) {
+      hook(*layer_idx);
+    }
     absl::MutexLock lock(mu_);
     ++d2h_calls_;
+    if (fail_d2h_layer_.has_value() && layer_idx == fail_d2h_layer_) {
+      return fail_d2h_status_;
+    }
     auto [promise, future] = xla::MakePromise<>();
     if (manual_d2h_) {
       d2h_promises_.push_back(std::move(promise));
@@ -146,6 +173,9 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   bool manual_h2h_ ABSL_GUARDED_BY(mu_) = false;
   int d2h_calls_ ABSL_GUARDED_BY(mu_) = 0;
   int h2h_calls_ ABSL_GUARDED_BY(mu_) = 0;
+  std::optional<size_t> fail_d2h_layer_ ABSL_GUARDED_BY(mu_);
+  absl::Status fail_d2h_status_ ABSL_GUARDED_BY(mu_);
+  std::function<void(size_t)> d2h_dispatch_hook_ ABSL_GUARDED_BY(mu_);
   std::vector<xla::Promise<>> d2h_promises_ ABSL_GUARDED_BY(mu_);
   std::vector<std::function<void(absl::StatusOr<std::vector<int>>)>>
       h2h_callbacks_ ABSL_GUARDED_BY(mu_);
@@ -645,6 +675,125 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
   EXPECT_FALSE(session->HasStaging());
   EXPECT_FALSE(
       session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+}
+
+// A D2H dispatch failure fails the send, and the layers whose copy was never
+// issued resolve with that failure instead of leaving waiters hanging. The
+// copy issued before the failure keeps the send draining until it ends.
+TEST(TransferSendSessionTest,
+     D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies) {
+  FakeSendBase base(/*num_layers=*/3, /*host_blocks=*/4);
+  base.SetManualD2h(true);
+  base.FailD2hDispatchAtLayer(/*layer_idx=*/1,
+                              absl::ResourceExhaustedError("no DMA queue"));
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_dispatch_fail", /*uuid=*/307,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  // Layer 0 was issued, layer 1 failed to issue, layer 2 was never tried.
+  EXPECT_EQ(base.d2h_calls(), 2);
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_THAT(session->GetStatus(),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  EXPECT_FALSE(session->Done());
+  EXPECT_TRUE(session->HasStaging());
+
+  // A reader gating on the never-issued layer 2 is told about the failure.
+  absl::Mutex cb_mu;
+  std::optional<absl::Status> layer2_status;
+  session->RegisterLayerReadinessCallback(
+      /*layer_idx=*/2, [&](absl::Status status) {
+        absl::MutexLock lock(cb_mu);
+        layer2_status = std::move(status);
+      });
+  {
+    absl::MutexLock lock(cb_mu);
+    auto called = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(cb_mu) {
+      return layer2_status.has_value();
+    };
+    ASSERT_TRUE(
+        cb_mu.AwaitWithTimeout(absl::Condition(&called), absl::Seconds(2)));
+    EXPECT_THAT(*layer2_status, StatusIs(absl::StatusCode::kResourceExhausted));
+  }
+
+  // The issued copy of layer 0 still pins the staging; its completion settles
+  // the send without starting any push.
+  base.CompleteD2h(0, absl::OkStatus());
+  EXPECT_THAT(session->AwaitForDone(),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 1);
+  EXPECT_EQ(base.h2h_calls(), 0);
+}
+
+// The H2H chain runs while StartPush is still issuing copies, so a later
+// layer's dispatch can fail after earlier layers were already pushed. When
+// that failed dispatch releases the send's last op, the send must still close
+// its idle data connections under kPerTransfer before it is done.
+TEST(TransferSendSessionTest,
+     PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend) {
+  ScopedDataConnReuseEnv env("per_transfer");
+  FakeSendBase base(/*num_layers=*/3, /*host_blocks=*/4);
+  base.SetManualD2h(true);
+  base.SetManualH2h(true);
+  base.FailD2hDispatchAtLayer(/*layer_idx=*/2,
+                              absl::ResourceExhaustedError("no DMA queue"));
+  absl::Notification layer2_dispatching;
+  absl::Notification layer2_may_fail;
+  base.SetD2hDispatchHook([&](size_t layer_idx) {
+    if (layer_idx != 2) return;
+    layer2_dispatching.Notify();
+    layer2_may_fail.WaitForNotification();
+  });
+  FakeSendBase receiver(/*num_layers=*/1, /*host_blocks=*/4);
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  ABSL_ASSERT_OK(SeedIdleDataConnection(*base.transport_server(), peer));
+  ASSERT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_failed_dispatch_ends_send", /*uuid=*/308,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  std::future<void> push = std::async(std::launch::async, [&]() {
+    session->StartPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0});
+  });
+
+  // Layers 0 and 1 are copying, and layer 2's copy is counted but its
+  // dispatch is held back.
+  ASSERT_TRUE(
+      layer2_dispatching.WaitForNotificationWithTimeout(absl::Seconds(2)));
+
+  // Layer 0 is copied and pushed while layer 2 is still being dispatched.
+  base.CompleteD2h(0);
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+  base.CompleteH2h(0, std::vector<int>{0});
+
+  // The send is cancelled while layer 1 copies, so layer 1 is never pushed
+  // and the held-back dispatch of layer 2 is the send's last op.
+  session->Finish(absl::CancelledError("consumer cancelled"));
+  base.CompleteD2h(1);
+  EXPECT_FALSE(session->Done());
+
+  layer2_may_fail.Notify();
+  ASSERT_EQ(push.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 0u);
+  EXPECT_EQ(base.h2h_calls(), 1);
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
 }  // namespace

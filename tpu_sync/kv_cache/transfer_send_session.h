@@ -100,12 +100,14 @@ class TransferSendSession
   void ValidateAndBeginPull(const std::vector<int64_t>& requested_block_ids,
                             std::chrono::steady_clock::time_point now);
 
-  // Returns true if |block_id| is registered in this session and |layer_idx|
-  // has an issued D2H future.
+  // Returns true if |block_id| is registered in this session and StartPush has
+  // created |layer_idx|'s D2H future (its copy may not have been issued yet).
   bool OwnsBlockWithReadyFuture(int block_id, size_t layer_idx) const;
 
-  // Registers |cb| to be invoked when |layer_idx|'s D2H copy completes, or
-  // invokes |cb(OkStatus())| immediately if no copy is pending for |layer_idx|.
+  // Registers |cb| to be invoked with |layer_idx|'s D2H copy status once the
+  // copy completes, or with the send's failure if the copy is never issued.
+  // Invokes |cb(OkStatus())| immediately if the session holds no future for
+  // |layer_idx| (StartPush has not run, or the send has settled).
   void RegisterLayerReadinessCallback(
       size_t layer_idx,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
@@ -127,6 +129,20 @@ class TransferSendSession
   static CopySpec BuildCoalescedCopySpec(
       const std::vector<int64_t>& src_block_ids,
       const std::vector<int64_t>& dst_block_ids);
+
+  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
+  // has none and blocking while every buffer is in use. There is one buffer
+  // per layer on a full host mirror, so the lease is then layer_idx itself
+  // and never waits. A timeout fails the send in the staging phase.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);
+
+  // Returns the host layer buffer currently leased to |layer_idx|, or
+  // kFailedPrecondition if |layer_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const;
+
+  const StagingLayerManager& staging_layer_manager() const {
+    return staging_layer_manager_;
+  }
 
   const std::string& req_id() const { return req_id_; }
   uint64_t uuid() const { return uuid_; }
@@ -225,6 +241,8 @@ class TransferSendSession
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);
   std::atomic<size_t> remaining_h2h_layers_{0};
+  std::atomic<bool> cancelled_{false};
+  StagingLayerManager staging_layer_manager_;
 };
 
 }  // namespace tpu_raiden

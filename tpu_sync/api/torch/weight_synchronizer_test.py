@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 import socket
 
@@ -24,6 +25,24 @@ from tpu_sync.api.torch.weight_synchronizer import (
     WeightSynchronizer,
 )
 from tpu_sync.rpc import raiden_service_pb2
+
+# Slice size for CPU-only synchronizers whose host buffer contents are unused.
+_SMALL_SLICE_BYTES = 1024 * 1024
+
+# Seconds to wait for a TCP handshake with a listener on loopback. A closed port
+# is refused immediately, so this only bounds a hung handshake.
+_CONNECT_TIMEOUT_SECS = 5.0
+
+
+def _listener_accepts_connections(port: int) -> bool:
+  """Returns whether a TCP listener accepts connections on 127.0.0.1:port."""
+  try:
+    with socket.create_connection(
+        ("127.0.0.1", port), timeout=_CONNECT_TIMEOUT_SECS
+    ):
+      return True
+  except ConnectionRefusedError:
+    return False
 
 
 class WeightSynchronizerTorchTest(parameterized.TestCase):
@@ -608,6 +627,54 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertLess(buf0.numel(), 1024 * 1024 * 4)
     self.assertGreaterEqual(buf1.numel(), 1024 * 1024 * 4)
 
+  def test_host_buffer_release_without_gil_tears_down_synchronizer(self):
+    """Dropping the last view's storage without the GIL frees the synchronizer.
+
+    Tensor.set_() swaps out the view's storage inside ATen dispatch with the
+    GIL released (gil_scoped_release in THPVariable_set_), so the deleter of
+    the get_host_buffer() storage has to take the GIL itself before it drops
+    the storage's reference to the synchronizer. The synchronizer's listener,
+    which its destructor closes, shows whether it is still alive.
+    """
+    ws = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=1,
+        num_shards=1,
+        slice_byte_size=_SMALL_SLICE_BYTES,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    listener_port = ws.listener_port
+    self.assertTrue(
+        _listener_accepts_connections(listener_port),
+        "Positive control failed: the listener of a live synchronizer on"
+        f" 127.0.0.1:{listener_port} refused a connection.",
+    )
+    view = ws.get_host_buffer(layer_idx=0, shard_idx=0)
+    ws.shutdown()
+    del ws
+    gc.collect()
+    self.assertTrue(
+        _listener_accepts_connections(listener_port),
+        "Synchronizer destroyed while a get_host_buffer() view is alive: its"
+        f" listener on 127.0.0.1:{listener_port} refused connections after"
+        " shutdown().",
+    )
+
+    view.set_()
+
+    self.assertEqual(
+        view.numel(),
+        0,
+        "set_() did not replace the storage of the get_host_buffer() view,"
+        " so the release without the GIL was not exercised.",
+    )
+    self.assertFalse(
+        _listener_accepts_connections(listener_port),
+        "Releasing the last get_host_buffer() storage inside set_(), with the"
+        " GIL released, did not destroy the synchronizer: its listener on"
+        f" 127.0.0.1:{listener_port} still accepts connections.",
+    )
+
   def test_metrics_accumulation_bandwidth_and_reset(self):
     ws_source = WeightSynchronizer.test_only_create_cpu_instance(
         num_layers=1,
@@ -692,6 +759,55 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertEqual(m_reset["total_h2h_time_ms"], 0.0)
     self.assertEqual(m_reset["total_h2h_bandwidth_gbps"], 0.0)
     self.assertEqual(m_reset["push_resharded_call_count"], 0)
+
+  def test_local_d2h_and_h2d_record_metrics(self):
+    """Explicit d2h()/h2d() calls show up in get_metrics()."""
+    # Tile-aligned shapes, so the on-device size has no layout padding.
+    shapes = [(256, 1024), (512, 2048)]
+    tensors = [
+        [torch.full(shape, 3.0, dtype=torch.float32, device=self.device)]
+        for shape in shapes
+    ]
+    logical_bytes = sum(t[0].numel() * t[0].element_size() for t in tensors)
+    ws = WeightSynchronizer(
+        tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+
+    m0 = ws.get_metrics()
+    self.assertEqual(m0["d2h_call_count"], 0)
+    self.assertEqual(m0["last_d2h_bytes"], 0)
+    self.assertEqual(m0["last_h2d_bytes"], 0)
+    self.assertEqual(m0["h2d_bandwidth_gbps"], 0.0)
+
+    ws.d2h()
+    m1 = ws.get_metrics()
+    self.assertEqual(m1["d2h_call_count"], 1)
+    self.assertGreaterEqual(m1["last_d2h_bytes"], logical_bytes)
+    self.assertEqual(m1["total_d2h_bytes"], m1["last_d2h_bytes"])
+    self.assertGreater(m1["last_d2h_time_ms"], 0.0)
+    self.assertGreater(m1["d2h_bandwidth_gbps"], 0.0)
+
+    ws.h2d()
+    m2 = ws.get_metrics()
+    # H2D writes back exactly the bytes D2H read.
+    self.assertEqual(m2["last_h2d_bytes"], m1["last_d2h_bytes"])
+    self.assertEqual(m2["total_h2d_bytes"], m2["last_h2d_bytes"])
+    self.assertGreater(m2["last_h2d_time_ms"], 0.0)
+    self.assertEqual(m2["total_h2d_time_ms"], m2["last_h2d_time_ms"])
+    self.assertGreater(m2["h2d_bandwidth_gbps"], 0.0)
+
+    ws.d2h()
+    ws.h2d()
+    m3 = ws.get_metrics()
+    self.assertEqual(m3["d2h_call_count"], 2)
+    self.assertEqual(m3["total_d2h_bytes"], 2 * m1["last_d2h_bytes"])
+    self.assertEqual(m3["total_h2d_bytes"], 2 * m2["last_h2d_bytes"])
+
+    ws.reset_metrics()
+    m_reset = ws.get_metrics()
+    self.assertEqual(m_reset["d2h_call_count"], 0)
+    self.assertEqual(m_reset["total_h2d_bytes"], 0)
+    self.assertEqual(m_reset["total_h2d_time_ms"], 0.0)
 
 
 if __name__ == "__main__":

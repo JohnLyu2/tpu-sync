@@ -60,7 +60,18 @@ class HostMemoryAllocator;
 namespace weight_sync {
 
 struct WeightSyncMetrics {
+  // `last_*` fields describe the most recently completed operation and are
+  // overwritten by the next one; `total_*` fields accumulate over all
+  // operations since the last ResetMetrics().
+
+  // Duration of the most recent completed D2H: from issuing the copy of the
+  // first layer until every layer of every shard is in host staging (including
+  // host detiling). Recorded by D2h() and by PushWeightsResharded() when it
+  // performs the D2H.
   double last_d2h_time_ms = 0.0;
+  // Duration of the most recent completed H2D: from H2d() (or the auto-H2D of
+  // a received transfer) until every copied layer is on device (including host
+  // tiling).
   double last_h2d_time_ms = 0.0;
   double last_h2h_time_ms = 0.0;
   double last_staging_time_ms = 0.0;
@@ -68,6 +79,8 @@ struct WeightSyncMetrics {
   double last_detiling_time_ms = 0.0;
   double last_total_push_resharded_time_ms = 0.0;
 
+  // D2H/H2D bytes are the on-device bytes copied, not the (larger) capacity of
+  // the host staging buffers.
   size_t last_d2h_bytes = 0;
   size_t last_h2d_bytes = 0;
   size_t last_h2h_bytes = 0;
@@ -450,6 +463,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   // True if RegisterH2dStartHook() or RegisterH2dEndHook() has been called.
   bool HasH2dHooks() const ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+  // Returns the on-device bytes of all shards of `layer_idx`, i.e. what one
+  // D2H or H2D of the layer copies.
+  size_t LayerDeviceBytes(size_t layer_idx) const;
   // Runs the start hook, copies all layers of |uuid| to device and waits,
   // then runs the end hook with the copy status, which is returned. Holds
   // |h2d_hook_mu_| throughout so hooked H2Ds never overlap.

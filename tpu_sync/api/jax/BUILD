@@ -86,6 +86,7 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         "//tpu_sync/api:common",
+        "//tpu_sync/api:weight_sync_common",
         "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
         "//tpu_sync/frameworks/jax:jax_test_utils",
         "@jax//jax",

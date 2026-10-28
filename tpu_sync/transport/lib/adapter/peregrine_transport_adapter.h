@@ -32,7 +32,7 @@ class PeregrineTransportAdapter : public TransportAdapter {
   // Creates a TCP Peregrine transport listening on `bind_ip`:`port` (0 =
   // kernel-assigned).
   static absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> Create(
-      absl::string_view bind_ip, int port, int num_conns_per_peer);
+      absl::string_view bind_ip, int port, int num_parallel_connections);
 
   ~PeregrineTransportAdapter() override = default;
 

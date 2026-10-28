@@ -20,8 +20,9 @@
 #include <utility>
 #include <vector>
 
-#include "ATen/ops/from_blob.h"
+#include "ATen/core/TensorBody.h"
 #include "nanobind/nanobind.h"
+#include "nanobind/ndarray.h"
 #include "nanobind/operators.h"
 #include "nanobind/stl/optional.h"
 #include "nanobind/stl/pair.h"
@@ -797,8 +798,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::call_guard<nb::gil_scoped_release>())
       .def(
           "get_host_buffer",
-          [](WeightSynchronizer& self, size_t layer_idx,
-             size_t shard_idx) -> at::Tensor {
+          [](WeightSynchronizer& self, size_t layer_idx, size_t shard_idx)
+              -> nb::ndarray<uint8_t, nb::pytorch, nb::c_contig> {
             const uint8_t* ptr = self.GetHostBufferPtr(layer_idx, shard_idx);
             if (!ptr) {
               throw std::runtime_error("Invalid layer or shard index");
@@ -807,8 +808,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
             if (size == 0) {
               size = self.slice_byte_size() + 256 * 1024;
             }
-            return at::from_blob(const_cast<uint8_t*>(ptr),
-                                 {static_cast<int64_t>(size)}, at::kByte);
+            // The tensor aliases staging memory owned by `self`, its owner.
+            // nanobind drops it under the GIL on whichever thread frees the
+            // storage, and leaks it once the interpreter cannot be entered.
+            size_t shape[1] = {size};
+            return nb::ndarray<uint8_t, nb::pytorch, nb::c_contig>(
+                const_cast<uint8_t*>(ptr), 1, shape, nb::find(&self));
           },
           nb::arg("layer_idx") = 0, nb::arg("shard_idx") = 0)
       .def_prop_ro("local_port", &WeightSynchronizer::local_port)
@@ -1394,7 +1399,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
               bool has_transfer_pool_tags,
               const std::vector<std::string>& transfer_pool_tags,
               const std::vector<int64_t>& dst_block_counts,
-              const std::vector<int64_t>& dst_skip_bytes) {
+              const std::vector<int64_t>& dst_skip_bytes,
+              const std::vector<int64_t>& dst_window_blocks) {
              tpu_raiden::kv_cache::reshard::StartTransferArgs args;
              for (const auto& unit : src_units) {
                args.src_units.push_back(
@@ -1418,6 +1424,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
              args.transfer_pool_tags = transfer_pool_tags;
              args.dst_block_counts = dst_block_counts;
              args.dst_skip_bytes = dst_skip_bytes;
+             args.dst_window_blocks = dst_window_blocks;
              nb::gil_scoped_release release;
              absl::StatusOr<bool> result = self.client->StartTransfer(args);
              ::tpu_raiden::kv_cache::reshardpb2::ThrowIfError(result.status());
@@ -1459,6 +1466,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // Capability marker for the vLLM connector's version-skew probe: present
   // and true iff start_transfer accepts the dst_skip_bytes clip.
   m.attr("reshard_client_supports_dst_skip_bytes") = true;
+  // Present and true iff start_transfer accepts the per-tag
+  // dst_window_blocks bounded-staging window (chained sub-transfers).
+  m.attr("reshard_client_supports_dst_window_blocks") = true;
   // Present and true iff get_request_block_status (the read-only registry
   // lifecycle probe) is bound.
   m.attr("reshard_client_supports_request_block_status") = true;

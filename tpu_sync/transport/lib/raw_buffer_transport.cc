@@ -87,9 +87,9 @@ namespace tpu_raiden::transport::lib {
 
 using ::peregrine::v1::GetAddrPortPair;
 using ::peregrine::v1::Histogram;
+using ::peregrine::v1::IsEnvVarEnabled;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
-using ::peregrine::v1::SourceBindEnabled;
 using ::peregrine::v1::SourceIpRoutesToPeer;
 using ::peregrine::v1::TestOnlyRateLimiter;
 using ::peregrine::v1::WriteExact;
@@ -101,6 +101,25 @@ namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
 
 namespace {
+// Whether to pin the client-side source address of outbound data connections
+// (env TPU_RAIDEN_ENABLE_SOURCE_IP_BIND is "1", "true", "yes" or "on").
+//
+// Binding a source IP only steers egress onto a particular NIC when the host
+// has a policy routing rule for that address (`ip rule from <src> ...`). That
+// setup exists on multi-NIC deployments where peer addresses are not covered
+// by specific routes and would otherwise all leave via the control-plane NIC.
+//
+// Without such a rule the kernel still routes by destination, so the bound
+// address disagrees with the interface the packet leaves on, and cloud
+// anti-spoofing filters drop it. bind() itself succeeds and only the data path
+// breaks, so the failure surfaces as a hang rather than an error. Callers must
+// therefore only bind a source when the kernel's own route lookup confirms
+// that the source's NIC is the egress for that peer (SourceIpRoutesToPeer).
+// Binding stays opt-in because the policy routing that makes it useful is a
+// property of the host.
+bool IsSourceBindEnabled() {
+  return IsEnvVarEnabled("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
+}
 
 constexpr MetricLabel kPullResponseLabels[] = {
     {.key = metric_labels::kDirection,
@@ -867,7 +886,7 @@ absl::Status RawBufferTransport::PullBuffer(
 }
 
 std::string RawBufferTransport::SourceIpForPeer(absl::string_view peer) const {
-  if (!SourceBindEnabled()) return "";
+  if (!IsSourceBindEnabled()) return "";
   std::vector<std::string> routable;
   for (const std::string& local_ip : local_ips_) {
     const absl::StatusOr<bool> routes = SourceIpRoutesToPeer(local_ip, peer);

@@ -28,8 +28,9 @@ keys to $GITHUB_OUTPUT):
            or --version, and the main commit its nightly was built from.
   vllm     Start the vllm-torchtpu canary build for the version and wait for
            it (or wait for an existing build with --build-number).
-  sglang   Dispatch the sglang-torchtpu remote-wheel workflow for the version
-           and wait for it (or wait for an existing run with --run-id).
+  sglang   Find the scheduled sglang-torchtpu remote-wheel run for the version
+           (or dispatch one with SGLANG_GITHUB_TOKEN, or use --run-id) and wait
+           for it.
   record   Write lkg.version and append the row to verified_commits.csv.
   bump     Rewrite the tpu-sync-torch pin in a downstream checkout.
 
@@ -89,6 +90,10 @@ BUILDKITE_UNFINISHED_STATES = frozenset({
 # nightly image and runs feature validation and perf against it.
 DEFAULT_SGLANG_REPO = "sgl-project/sglang-torchtpu"
 DEFAULT_SGLANG_WORKFLOW = "nightly-test-tpu-remote-wheel.yml"
+# Without SGLANG_GITHUB_TOKEN, sglang-torchtpu's scheduled Monday 12:00 UTC run
+# (which installs the newest tpu-sync-torch --pre wheel from PyPI) is matched to
+# the 08:00 UTC nightly wheel stamped within this window before the run started.
+SGLANG_SCHEDULE_WINDOW = datetime.timedelta(hours=24)
 
 LKG_FILE = "lkg.version"
 VERIFIED_FILE = "verified_commits.csv"
@@ -474,24 +479,60 @@ def pick_dispatched_run(runs, dispatched_at, known_ids=()):
   return max(matches, key=lambda run: run["created_at"])
 
 
+def pick_scheduled_sglang_run(
+    runs, stamp, branch="main", window=SGLANG_SCHEDULE_WINDOW
+):
+  """Picks the scheduled remote-wheel run that tested a nightly wheel version.
+
+  When SGLANG_GITHUB_TOKEN is not set, sglang-torchtpu's scheduled Monday
+  12:00 UTC run (which installs the newest tpu-sync-torch pre-release on PyPI)
+  is matched to the nightly wheel stamped before the run started and within
+  |window| (before the next daily nightly is published).
+
+  Args:
+    runs: Runs of the remote-wheel workflow, as the GitHub API lists them.
+    stamp: The UTC time stamped into the tpu-sync-torch .dev version.
+    branch: The sglang-torchtpu branch the scheduled run ran on.
+    window: How long after |stamp| a scheduled run may have started.
+
+  Returns:
+    The newest matching scheduled run, as the GitHub API lists it, or None.
+  """
+  matches = []
+  for run in runs:
+    if run.get("event") != "schedule" or run.get("head_branch") != branch:
+      continue
+    created = _parse_github_time(run["created_at"])
+    if stamp <= created <= stamp + window:
+      matches.append(run)
+  if not matches:
+    return None
+  return max(matches, key=lambda run: run["created_at"])
+
+
 def cmd_sglang(args):
-  """The sglang subcommand: dispatch the workflow, or find its run, and wait."""
-  token = _require_token("SGLANG_GITHUB_TOKEN")
+  """The sglang subcommand: find or dispatch the workflow run, and wait."""
+  dispatch_token = os.environ.get("SGLANG_GITHUB_TOKEN", "").strip() or None
+  read_token = (
+      dispatch_token or os.environ.get("GITHUB_TOKEN", "").strip() or None
+  )
   runs_path = f"/repos/{args.repo}/actions/workflows/{args.workflow}/runs"
   deadline = _now() + datetime.timedelta(minutes=args.timeout_minutes)
   if args.run_id:
-    run = _github(f"/repos/{args.repo}/actions/runs/{args.run_id}", token=token)
-  else:
+    run = _github(
+        f"/repos/{args.repo}/actions/runs/{args.run_id}", token=read_token
+    )
+  elif dispatch_token:
     before = _github(
         runs_path,
-        token=token,
+        token=dispatch_token,
         params={"event": "workflow_dispatch", "per_page": 20},
     ).get("workflow_runs", [])
     known_ids = {run["id"] for run in before}
     dispatched_at = _now()
     _github(
         f"/repos/{args.repo}/actions/workflows/{args.workflow}/dispatches",
-        token=token,
+        token=dispatch_token,
         method="POST",
         payload={
             "ref": args.ref,
@@ -507,7 +548,7 @@ def cmd_sglang(args):
       time.sleep(15)
       runs = _github(
           runs_path,
-          token=token,
+          token=dispatch_token,
           params={"event": "workflow_dispatch", "per_page": 20},
       ).get("workflow_runs", [])
       run = pick_dispatched_run(runs, dispatched_at, known_ids)
@@ -516,13 +557,37 @@ def cmd_sglang(args):
       ):
         raise Error(f"no run of {args.workflow} appeared after the dispatch")
     _log(f"run {run['id']}: {run['html_url']}")
+  else:
+    stamp = dev_stamp(args.version)
+    if stamp is None:
+      raise Error(
+          f"SGLANG_GITHUB_TOKEN is not set and {args.version} is not a"
+          " .devYYYYMMDDHHMMSS nightly version; pass --run-id or set"
+          " SGLANG_GITHUB_TOKEN"
+      )
+    runs = _github(
+        runs_path,
+        token=read_token,
+        params={"event": "schedule", "branch": args.ref, "per_page": 20},
+    ).get("workflow_runs", [])
+    run = pick_scheduled_sglang_run(runs, stamp, branch=args.ref)
+    if run is None:
+      raise Error(
+          f"no scheduled run of {args.workflow} on {args.repo} ({args.ref})"
+          f" within {SGLANG_SCHEDULE_WINDOW} after {stamp.isoformat()}"
+          f" ({args.version}); pass --run-id or set SGLANG_GITHUB_TOKEN to"
+          " dispatch one"
+      )
+    _log(f"matched scheduled run {run['id']}: {run['html_url']}")
   emit({"sglang_run_id": run["id"], "sglang_run_url": run["html_url"]})
   if args.no_wait:
     return
   while run["status"] != "completed":
     _log(f"run {run['id']}: {run['status']}")
     _wait(deadline, f"GitHub Actions run {run['html_url']}")
-    run = _github(f"/repos/{args.repo}/actions/runs/{run['id']}", token=token)
+    run = _github(
+        f"/repos/{args.repo}/actions/runs/{run['id']}", token=read_token
+    )
   emit({"sglang_run_conclusion": run["conclusion"]})
   if run["conclusion"] != "success":
     raise Error(
@@ -731,9 +796,7 @@ def build_parser():
 
   p = sub.add_parser(
       "sglang",
-      help=(
-          "run the sglang-torchtpu remote-wheel workflow (SGLANG_GITHUB_TOKEN)"
-      ),
+      help="run or find the sglang-torchtpu remote-wheel workflow",
   )
   p.add_argument("--version", required=True)
   p.add_argument("--repo", default=DEFAULT_SGLANG_REPO)
@@ -751,7 +814,9 @@ def build_parser():
   )
   p.add_argument("--timeout-minutes", type=int, default=340)
   p.add_argument(
-      "--no-wait", action="store_true", help="dispatch the run and return"
+      "--no-wait",
+      action="store_true",
+      help="find or dispatch the run and return",
   )
   p.set_defaults(func=cmd_sglang)
 

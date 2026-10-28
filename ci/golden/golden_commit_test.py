@@ -15,9 +15,11 @@
 """Tests for golden_commit.py: the pure functions behind each subcommand."""
 
 import datetime
+import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 from ci.golden import golden_commit
 
@@ -149,6 +151,132 @@ class SglangTest(unittest.TestCase):
     self.assertIsNone(
         golden_commit.pick_dispatched_run(runs[:1], dispatched_at)
     )
+
+  def test_pick_scheduled_sglang_run_matches_schedule_after_stamp_within_window(
+      self,
+  ):
+    stamp = datetime.datetime(2026, 10, 13, 8, 31, 50, tzinfo=_UTC)
+    runs = [
+        _run(20, "2026-10-13T08:00:00Z", event="schedule"),
+        _run(21, "2026-10-13T12:00:00Z", event="workflow_dispatch"),
+        _run(22, "2026-10-13T12:00:00Z", branch="release", event="schedule"),
+        _run(23, "2026-10-13T12:00:00Z", event="schedule"),
+        _run(24, "2026-10-13T12:05:00Z", event="schedule"),
+        _run(25, "2026-10-14T09:00:00Z", event="schedule"),
+    ]
+    picked = golden_commit.pick_scheduled_sglang_run(runs, stamp)
+    self.assertEqual(picked["id"], 24)
+    self.assertIsNone(
+        golden_commit.pick_scheduled_sglang_run([runs[0], runs[-1]], stamp)
+    )
+
+  def test_cmd_sglang_matches_scheduled_run_without_sglang_token(self):
+    scheduled_in_progress = {
+        **_run(42, "2026-10-13T12:00:00Z", event="schedule"),
+        "status": "in_progress",
+        "conclusion": None,
+    }
+    scheduled_completed = {
+        **scheduled_in_progress,
+        "status": "completed",
+        "conclusion": "success",
+    }
+    args = golden_commit.build_parser().parse_args(
+        ["sglang", "--version", "0.0.1.dev20261013083150"]
+    )
+    with (
+        mock.patch.dict(
+            os.environ, {"GITHUB_TOKEN": "gh-read-token"}, clear=True
+        ),
+        mock.patch.object(
+            golden_commit,
+            "_github",
+            side_effect=[
+                {"workflow_runs": [scheduled_in_progress]},
+                scheduled_completed,
+            ],
+        ) as gh_mock,
+        mock.patch.object(golden_commit, "_wait") as wait_mock,
+    ):
+      golden_commit.cmd_sglang(args)
+    self.assertEqual(
+        gh_mock.call_args_list,
+        [
+            mock.call(
+                "/repos/sgl-project/sglang-torchtpu/actions/workflows/"
+                "nightly-test-tpu-remote-wheel.yml/runs",
+                token="gh-read-token",
+                params={"event": "schedule", "branch": "main", "per_page": 20},
+            ),
+            mock.call(
+                "/repos/sgl-project/sglang-torchtpu/actions/runs/42",
+                token="gh-read-token",
+            ),
+        ],
+    )
+    wait_mock.assert_called_once()
+
+  def test_cmd_sglang_run_id_polls_without_sglang_token(self):
+    failed_run = {
+        **_run(99, "2026-10-13T12:00:00Z", event="schedule"),
+        "status": "completed",
+        "conclusion": "failure",
+    }
+    args = golden_commit.build_parser().parse_args([
+        "sglang",
+        "--version",
+        "0.0.1.dev20261013083150",
+        "--run-id",
+        "99",
+    ])
+    with (
+        mock.patch.dict(
+            os.environ, {"GITHUB_TOKEN": "gh-read-token"}, clear=True
+        ),
+        mock.patch.object(
+            golden_commit, "_github", return_value=failed_run
+        ) as gh_mock,
+    ):
+      with self.assertRaisesRegex(golden_commit.Error, "runs/99 ended failure"):
+        golden_commit.cmd_sglang(args)
+    gh_mock.assert_called_once_with(
+        "/repos/sgl-project/sglang-torchtpu/actions/runs/99",
+        token="gh-read-token",
+    )
+
+  def test_cmd_sglang_raises_when_no_scheduled_run_and_no_token(self):
+    args = golden_commit.build_parser().parse_args(
+        ["sglang", "--version", "0.0.1.dev20261013083150"]
+    )
+    with (
+        mock.patch.dict(os.environ, {}, clear=True),
+        mock.patch.object(
+            golden_commit,
+            "_github",
+            return_value={
+                "workflow_runs": [
+                    _run(1, "2026-10-06T12:00:00Z", event="schedule")
+                ]
+            },
+        ) as gh_mock,
+    ):
+      with self.assertRaisesRegex(
+          golden_commit.Error,
+          r"no scheduled run of nightly-test-tpu-remote-wheel\.yml.*"
+          r"0\.0\.1\.dev20261013083150",
+      ):
+        golden_commit.cmd_sglang(args)
+    gh_mock.assert_called_once()
+
+    release_args = golden_commit.build_parser().parse_args(
+        ["sglang", "--version", "0.1.0"]
+    )
+    with mock.patch.dict(os.environ, {}, clear=True):
+      with self.assertRaisesRegex(
+          golden_commit.Error,
+          r"0\.1\.0 is not a \.devYYYYMMDDHHMMSS nightly version",
+      ):
+        golden_commit.cmd_sglang(release_args)
 
 
 class RecordGoldenTest(unittest.TestCase):

@@ -60,6 +60,9 @@ namespace tpu_raiden {
 namespace kv_cache {
 namespace {
 
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
+
 class TestKVCacheManager : public KVCacheManagerBase {
  public:
   TestKVCacheManager(size_t num_layers, size_t num_shards,
@@ -864,6 +867,7 @@ class TestD2hKVCacheManager : public TestKVCacheManager {
       const std::vector<int64_t>& copy_sizes_major_dim = {},
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt) override {
     d2h_called_ = true;
     last_src_offsets_ = src_offsets_major_dim;
@@ -878,6 +882,7 @@ class TestD2hKVCacheManager : public TestKVCacheManager {
       const std::vector<int64_t>& copy_sizes,
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt,
       int64_t device_id = -1) override {
     dispatch_d2h_chunks_called_ = true;
@@ -914,6 +919,7 @@ class TestH2dKVCacheManager : public TestKVCacheManager {
       const std::vector<int64_t>& copy_sizes_major_dim = {},
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt) override {
     h2d_called_ = true;
     last_h2d_src_offsets_ = src_offsets_major_dim;
@@ -1318,6 +1324,7 @@ class TestBackgroundKVCacheManager : public TestKVCacheManager {
       const std::vector<int64_t>& dst_offsets_major_dim,
       const std::vector<int64_t>& copy_sizes_major_dim,
       std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+      std::optional<size_t> host_layer_idx,
       std::optional<size_t> shard_idx) override {
     absl::MutexLock lock(mu_);
     execution_order_.push_back("H2dSyncDispatch");
@@ -1330,6 +1337,7 @@ class TestBackgroundKVCacheManager : public TestKVCacheManager {
       const std::vector<int64_t>& dst_offsets_major_dim,
       const std::vector<int64_t>& copy_sizes_major_dim,
       std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+      std::optional<size_t> host_layer_idx,
       std::optional<size_t> shard_idx) override {
     absl::MutexLock lock(mu_);
     execution_order_.push_back("D2hSyncDispatch");
@@ -2368,6 +2376,179 @@ TEST(KVCacheManagerTest,
                           manager.D2h({5}, {0}, {1}));
   EXPECT_FALSE(d2h_sync_err.Await().ok());
   EXPECT_FALSE(d2h_sync_err.PollError().ok());
+}
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    const char* prev = std::getenv(name);
+    if (prev != nullptr) {
+      prev_ = prev;
+    }
+    setenv(name, value, /*overwrite=*/1);
+  }
+
+  ~ScopedEnvVar() {
+    if (prev_.has_value()) {
+      setenv(name_, prev_->c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv(name_);
+    }
+  }
+
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+ private:
+  const char* name_;
+  std::optional<std::string> prev_;
+};
+
+struct BoundedStagingTestRig {
+  static constexpr size_t kBlockBytes = 128;
+
+  std::unique_ptr<xla::PjRtClient> client;
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::unique_ptr<KVCacheManagerBase> manager;
+
+  void Init() {
+    TF_ASSERT_OK_AND_ASSIGN(client,
+                            xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+    TF_ASSERT_OK_AND_ASSIGN(
+        xla::PjRtMemorySpace * memory_space,
+        client->addressable_devices()[0]->default_memory_space());
+
+    std::vector<std::vector<raiden::RaidenBufferHandle>> layer_handles(2);
+    for (size_t layer = 0; layer < 2; ++layer) {
+      std::vector<uint8_t> init_data(kBlockBytes,
+                                     static_cast<uint8_t>(0xA0 + layer));
+      TF_ASSERT_OK_AND_ASSIGN(
+          std::unique_ptr<xla::PjRtBuffer> buf,
+          client->BufferFromHostBuffer(
+              init_data.data(), xla::U8, {1, static_cast<int64_t>(kBlockBytes)},
+              /*byte_strides=*/std::nullopt,
+              xla::PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
+              /*on_done_with_host_buffer=*/nullptr, memory_space,
+              /*device_layout=*/nullptr));
+      TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                              raiden::RaidenBufferHandle::Acquire(buf.get()));
+      pjrt_buffers.push_back(std::move(buf));
+      layer_handles[layer].push_back(std::move(handle));
+    }
+
+    manager = std::make_unique<KVCacheManagerBase>(
+        layer_handles, /*local_port=*/std::nullopt,
+        /*host_blocks_to_allocate=*/1,
+        /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
+        /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
+        /*logical_slice_byte_size=*/kBlockBytes);
+  }
+};
+
+TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
+  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "1");
+  ScopedEnvVar async_env("RAIDEN_ENABLE_ASYNC_DISPATCH", "1");
+
+  BoundedStagingTestRig rig;
+  ASSERT_NO_FATAL_FAILURE(rig.Init());
+  ASSERT_EQ(rig.manager->num_host_layers(), 1);
+
+  uint8_t* host_ptr =
+      rig.manager->GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  ASSERT_NE(host_ptr, nullptr);
+  std::memset(host_ptr, 0x55, BoundedStagingTestRig::kBlockBytes);
+
+  // Sync and async all-layer dispatches (`layer_idx` unset) fail immediately
+  // without issuing layer 0's copy or queueing a background task.
+  EXPECT_THAT(rig.manager->H2dSyncDispatch({0}, {0}, {1}),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+  EXPECT_THAT(rig.manager->H2dSyncDispatch(),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+  EXPECT_THAT(rig.manager->D2hSyncDispatch({0}, {0}, {1}),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+  EXPECT_THAT(rig.manager->D2hSyncDispatch(),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+  EXPECT_THAT(rig.manager->H2d({0}, {0}, {1}),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+  EXPECT_THAT(rig.manager->D2h({0}, {0}, {1}),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+
+  // Host buffer 0 was never overwritten by a partial D2H of layer 0, and
+  // device layer 0 was never overwritten by a partial H2D of 0x55.
+  EXPECT_EQ(std::vector<uint8_t>(host_ptr,
+                                 host_ptr + BoundedStagingTestRig::kBlockBytes),
+            std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0x55));
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture layer0_d2h,
+                          rig.manager->D2h({0}, {0}, {1},
+                                           /*slot_idx=*/std::nullopt,
+                                           /*layer_idx=*/0));
+  ABSL_ASSERT_OK(layer0_d2h.Await());
+  EXPECT_EQ(std::vector<uint8_t>(host_ptr,
+                                 host_ptr + BoundedStagingTestRig::kBlockBytes),
+            std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0xA0));
+}
+
+TEST(KVCacheManagerTest, SingleLayerDispatchWithBoundedStagingSucceeds) {
+  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "1");
+  ScopedEnvVar async_env("RAIDEN_ENABLE_ASYNC_DISPATCH", "1");
+
+  BoundedStagingTestRig rig;
+  ASSERT_NO_FATAL_FAILURE(rig.Init());
+  ASSERT_EQ(rig.manager->num_host_layers(), 1);
+
+  uint8_t* host_ptr =
+      rig.manager->GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  ASSERT_NE(host_ptr, nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture layer1_d2h,
+      rig.manager->D2hSyncDispatch({0}, {0}, {1}, /*slot_idx=*/std::nullopt,
+                                   /*layer_idx=*/1, /*host_layer_idx=*/0));
+  ABSL_ASSERT_OK(layer1_d2h.Await());
+  EXPECT_EQ(std::vector<uint8_t>(host_ptr,
+                                 host_ptr + BoundedStagingTestRig::kBlockBytes),
+            std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0xA1));
+
+  std::memset(host_ptr, 0xB0, BoundedStagingTestRig::kBlockBytes);
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture layer0_h2d,
+                          rig.manager->H2d({0}, {0}, {1},
+                                           /*slot_idx=*/std::nullopt,
+                                           /*layer_idx=*/0));
+  ABSL_ASSERT_OK(layer0_h2d.Await());
+
+  std::memset(host_ptr, 0xB1, BoundedStagingTestRig::kBlockBytes);
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture layer1_h2d,
+      rig.manager->H2dSyncDispatch({0}, {0}, {1}, /*slot_idx=*/std::nullopt,
+                                   /*layer_idx=*/1, /*host_layer_idx=*/0));
+  ABSL_ASSERT_OK(layer1_h2d.Await());
+
+  // Clear host_ptr and read back both device layers into host buffer 0.
+  std::memset(host_ptr, 0, BoundedStagingTestRig::kBlockBytes);
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture verify_layer0,
+                          rig.manager->D2h({0}, {0}, {1},
+                                           /*slot_idx=*/std::nullopt,
+                                           /*layer_idx=*/0));
+  ABSL_EXPECT_OK(verify_layer0.Await());
+  EXPECT_EQ(std::vector<uint8_t>(host_ptr,
+                                 host_ptr + BoundedStagingTestRig::kBlockBytes),
+            std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0xB0));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture verify_layer1,
+      rig.manager->D2hSyncDispatch({0}, {0}, {1}, /*slot_idx=*/std::nullopt,
+                                   /*layer_idx=*/1, /*host_layer_idx=*/0));
+  ABSL_EXPECT_OK(verify_layer1.Await());
+  EXPECT_EQ(std::vector<uint8_t>(host_ptr,
+                                 host_ptr + BoundedStagingTestRig::kBlockBytes),
+            std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0xB1));
 }
 
 }  // namespace

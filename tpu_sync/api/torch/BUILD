@@ -106,6 +106,7 @@ py_library(
         # buildcleaner: keep
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
         "//tpu_sync/api:common",
+        "//tpu_sync/api:weight_sync_common",
     ],
 )
 

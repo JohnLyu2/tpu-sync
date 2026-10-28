@@ -38,6 +38,8 @@ namespace tpu_raiden::transport::lib {
 namespace {
 
 using ::peregrine::Op;
+using ::peregrine::Options;
+using ::peregrine::TransportType;
 
 absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   if (on_complete) {
@@ -58,13 +60,17 @@ int PortOf(absl::string_view endpoint) {
 
 absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>>
 PeregrineTransportAdapter::Create(absl::string_view bind_ip, int port,
-                                  int num_conns_per_peer) {
+                                  int num_parallel_connections) {
   const std::string endpoint = absl::StrContains(bind_ip, ':')
                                    ? absl::StrCat("[", bind_ip, "]:", port)
                                    : absl::StrCat(bind_ip, ":", port);
   std::unique_ptr<::peregrine::Transport> transport =
-      ::peregrine::CreateTransport(endpoint, ::peregrine::TransportType::kTcp,
-                                   num_conns_per_peer);
+      ::peregrine::CreateTransport(
+          endpoint, Options{
+                        .transport_type = TransportType::kTcp,
+                        .num_parallel_connections = num_parallel_connections,
+                        .recv_post_callback = nullptr,
+                    });
   if (transport == nullptr) {
     return absl::UnavailableError(
         absl::StrCat("Failed to create Peregrine transport on ", endpoint));

@@ -25,6 +25,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
@@ -3460,6 +3461,252 @@ TEST_F(WeightSynchronizerTest,
   EXPECT_THAT(endpoints[0].shards, ::testing::ElementsAre(8, 9));
   EXPECT_EQ(endpoints[1].endpoint, absl::StrCat("10.34.3.60:", port));
   EXPECT_THAT(endpoints[1].shards, ::testing::ElementsAre(10, 11));
+}
+
+// One single-shard layer of a device-backed synchronizer. An empty `tiles`
+// keeps the CPU buffer's default (untiled) layout; otherwise the handle is
+// relabeled with a row-major tiled layout so that D2H detiles and H2D tiles on
+// the host, as on TPU.
+struct DeviceLayerSpec {
+  xla::PrimitiveType type;
+  std::vector<int64_t> dims;
+  std::vector<xla::Tile> tiles;
+};
+
+// A synchronizer whose layers are backed by XLA:CPU device buffers. Members are
+// destroyed bottom-up, so `ws` goes before the buffers and client it uses.
+struct DeviceBackedSynchronizer {
+  std::unique_ptr<xla::PjRtClient> client;
+  std::vector<std::vector<uint8_t>> placeholders;
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::unique_ptr<WeightSynchronizerBase> ws;
+  // Sum of the on-device sizes of every layer, i.e. the bytes one full D2H or
+  // H2D moves.
+  size_t total_device_bytes = 0;
+};
+
+void CreateDeviceBackedSynchronizer(absl::Span<const DeviceLayerSpec> specs,
+                                    bool auto_h2d,
+                                    DeviceBackedSynchronizer* out) {
+  TF_ASSERT_OK_AND_ASSIGN(out->client,
+                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      out->client->addressable_devices()[0]->default_memory_space());
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers;
+  for (const DeviceLayerSpec& spec : specs) {
+    const xla::Shape shape = xla::ShapeUtil::MakeShape(spec.type, spec.dims);
+    std::vector<uint8_t>& placeholder = out->placeholders.emplace_back(
+        xla::ShapeUtil::ByteSizeOf(shape), uint8_t{0x5A});
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<xla::PjRtBuffer> buffer,
+        out->client->BufferFromHostBuffer(
+            placeholder.data(), spec.type, spec.dims,
+            /*byte_strides=*/std::nullopt,
+            xla::PjRtClient::HostBufferSemantics::
+                kImmutableUntilTransferCompletes,
+            /*on_done_with_host_buffer=*/nullptr, memory_space,
+            /*device_layout=*/nullptr));
+    TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                            raiden::RaidenBufferHandle::Acquire(buffer.get()));
+    if (!spec.tiles.empty()) {
+      std::vector<int64_t> minor_to_major(spec.dims.size());
+      for (size_t i = 0; i < minor_to_major.size(); ++i) {
+        minor_to_major[i] = static_cast<int64_t>(minor_to_major.size() - 1 - i);
+      }
+      handle.shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+          spec.type, spec.dims, minor_to_major, spec.tiles);
+    }
+    out->total_device_bytes += handle.GetOnDeviceSizeInBytes();
+    out->pjrt_buffers.push_back(std::move(buffer));
+    layer_buffers.push_back({std::move(handle)});
+  }
+  TF_ASSERT_OK_AND_ASSIGN(
+      out->ws,
+      WeightSynchronizerBase::Create(
+          layer_buffers, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+          /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+          /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/std::vector<std::string>{}, auto_h2d));
+}
+
+// A tiny untiled layer followed by a large tiled one. Layer 0 finishes its D2H
+// almost immediately, while layer 1 must copy 16 MiB and then detile it on the
+// host, so "time until layer 0 is on host" and "time until every layer is on
+// host" are far apart.
+std::vector<DeviceLayerSpec> SmallUntiledThenLargeTiledLayers() {
+  return {
+      {xla::U8, {4096}, {}},
+      {xla::F32, {2048, 2048}, {xla::Tile({8, 128})}},
+  };
+}
+
+// Host staging buffers carry extra scratchpad bytes beyond the device size.
+// Byte metrics must count the bytes actually copied, not the staging capacity.
+constexpr size_t kHostScratchpadBytes = 256 * 1024;
+
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedD2hMetricsCoverEveryLayer) {
+  absl::SetFlag(&FLAGS_raiden_weight_sync_host_buffer_scratchpad_size,
+                kHostScratchpadBytes);
+  ASSERT_OK(telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                .InitializeFromBackendNames({"buffered"}));
+  absl::Cleanup reset_backends = [] {
+    telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
+  };
+
+  const std::vector<DeviceLayerSpec> specs = SmallUntiledThenLargeTiledLayers();
+  DeviceBackedSynchronizer source;
+  ASSERT_NO_FATAL_FAILURE(
+      CreateDeviceBackedSynchronizer(specs, /*auto_h2d=*/false, &source));
+  // The push D2Hs every layer in full; the wire only needs to carry a prefix of
+  // each layer for this test.
+  constexpr size_t kSentBytesPerLayer = 4096;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dest,
+      WeightSynchronizerBase::Create(specs.size(), /*num_shards=*/1,
+                                     kSentBytesPerLayer, /*local_port=*/0));
+  ASSERT_TRUE(dest->local_port().has_value());
+  const std::string dest_peer = absl::StrCat("127.0.0.1:", *dest->local_port());
+
+  constexpr uint64_t kUuid = 91001;
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(false);
+  request.set_uuid(kUuid);
+  auto& schedule = (*request.mutable_shard_push_schedules())[0];
+  for (size_t l = 0; l < specs.size(); ++l) {
+    auto* entry = schedule.add_entries();
+    entry->set_dst_peer(dest_peer);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(kSentBytesPerLayer);
+    entry->set_count(1);
+    entry->set_layer_idx(static_cast<int32_t>(l));
+  }
+  ASSERT_OK(dest->RegisterExpectedChunks(kUuid, specs.size()));
+  // Drop samples recorded by earlier tests.
+  telemetry::RaidenMetricStore::GetGlobalMetricStore()
+      .GetAndResetMetricSamples();
+
+  ASSERT_OK(source.ws->PushWeightsResharded(request));
+  ASSERT_OK(dest->WaitForTransferCompletion(kUuid));
+
+  const WeightSyncMetrics m = source.ws->GetMetrics();
+  // Layer 1 was detiled as part of its D2H, so the D2H of the whole push lasts
+  // at least as long as that detile. A metric that stops at layer 0 is shorter.
+  ASSERT_GT(m.last_detiling_time_ms, 0.0);
+  EXPECT_GE(m.last_d2h_time_ms, m.last_detiling_time_ms);
+  EXPECT_LE(m.last_d2h_time_ms, m.last_total_push_resharded_time_ms);
+  EXPECT_DOUBLE_EQ(m.total_d2h_time_ms, m.last_d2h_time_ms);
+  // Bytes are the device bytes copied, not the staging buffer capacity.
+  EXPECT_EQ(m.last_d2h_bytes, source.total_device_bytes);
+  EXPECT_EQ(m.total_d2h_bytes, source.total_device_bytes);
+  EXPECT_EQ(m.d2h_call_count, 1);
+
+  // The struct metric and the exported histogram describe the same interval.
+  auto samples = telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                     .GetAndResetMetricSamples();
+  const std::vector<double>& d2h_samples = samples[absl::StrCat(
+      "tpu_raiden_", telemetry::metric_names::kWeightSyncD2hTransferTimeMs)];
+  ASSERT_THAT(d2h_samples, ::testing::SizeIs(1));
+  EXPECT_DOUBLE_EQ(m.last_d2h_time_ms, d2h_samples[0]);
+}
+
+TEST_F(WeightSynchronizerTest, ExplicitD2hRecordsMetrics) {
+  absl::SetFlag(&FLAGS_raiden_weight_sync_host_buffer_scratchpad_size,
+                kHostScratchpadBytes);
+  DeviceBackedSynchronizer s;
+  ASSERT_NO_FATAL_FAILURE(CreateDeviceBackedSynchronizer(
+      SmallUntiledThenLargeTiledLayers(), /*auto_h2d=*/false, &s));
+
+  const WeightSyncMetrics m0 = s.ws->GetMetrics();
+  EXPECT_EQ(m0.d2h_call_count, 0);
+  EXPECT_EQ(m0.last_d2h_bytes, 0);
+  EXPECT_DOUBLE_EQ(m0.last_d2h_time_ms, 0.0);
+
+  absl::Time start = absl::Now();
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h, s.ws->D2h());
+  ASSERT_OK(d2h.Await());
+  const double wall_ms = absl::ToDoubleMilliseconds(absl::Now() - start);
+
+  // Read right after Await(): the metrics are recorded before the returned
+  // future completes, so callers never observe stale values.
+  const WeightSyncMetrics m1 = s.ws->GetMetrics();
+  EXPECT_EQ(m1.d2h_call_count, 1);
+  EXPECT_EQ(m1.last_d2h_bytes, s.total_device_bytes);
+  EXPECT_EQ(m1.total_d2h_bytes, s.total_device_bytes);
+  ASSERT_GT(m1.last_detiling_time_ms, 0.0);
+  EXPECT_GE(m1.last_d2h_time_ms, m1.last_detiling_time_ms);
+  EXPECT_LE(m1.last_d2h_time_ms, wall_ms);
+  EXPECT_DOUBLE_EQ(m1.total_d2h_time_ms, m1.last_d2h_time_ms);
+
+  TF_ASSERT_OK_AND_ASSIGN(d2h, s.ws->D2h());
+  ASSERT_OK(d2h.Await());
+  const WeightSyncMetrics m2 = s.ws->GetMetrics();
+  EXPECT_EQ(m2.d2h_call_count, 2);
+  EXPECT_EQ(m2.last_d2h_bytes, s.total_device_bytes);
+  EXPECT_EQ(m2.total_d2h_bytes, 2 * s.total_device_bytes);
+  EXPECT_DOUBLE_EQ(m2.total_d2h_time_ms,
+                   m1.last_d2h_time_ms + m2.last_d2h_time_ms);
+}
+
+TEST_F(WeightSynchronizerTest, ExplicitH2dRecordsMetrics) {
+  absl::SetFlag(&FLAGS_raiden_weight_sync_host_buffer_scratchpad_size,
+                kHostScratchpadBytes);
+  DeviceBackedSynchronizer s;
+  ASSERT_NO_FATAL_FAILURE(CreateDeviceBackedSynchronizer(
+      SmallUntiledThenLargeTiledLayers(), /*auto_h2d=*/false, &s));
+
+  const WeightSyncMetrics m0 = s.ws->GetMetrics();
+  EXPECT_EQ(m0.last_h2d_bytes, 0);
+  EXPECT_DOUBLE_EQ(m0.last_h2d_time_ms, 0.0);
+
+  absl::Time start = absl::Now();
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d, s.ws->H2d());
+  ASSERT_OK(h2d.Await());
+  const double wall_ms = absl::ToDoubleMilliseconds(absl::Now() - start);
+
+  const WeightSyncMetrics m1 = s.ws->GetMetrics();
+  EXPECT_EQ(m1.last_h2d_bytes, s.total_device_bytes);
+  EXPECT_EQ(m1.total_h2d_bytes, s.total_device_bytes);
+  // Layer 1 is tiled on the host inside H2d(), so its tiling is part of it.
+  ASSERT_GT(m1.last_tiling_time_ms, 0.0);
+  EXPECT_GE(m1.last_h2d_time_ms, m1.last_tiling_time_ms);
+  EXPECT_LE(m1.last_h2d_time_ms, wall_ms);
+  EXPECT_DOUBLE_EQ(m1.total_h2d_time_ms, m1.last_h2d_time_ms);
+
+  TF_ASSERT_OK_AND_ASSIGN(h2d, s.ws->H2d());
+  ASSERT_OK(h2d.Await());
+  const WeightSyncMetrics m2 = s.ws->GetMetrics();
+  EXPECT_EQ(m2.last_h2d_bytes, s.total_device_bytes);
+  EXPECT_EQ(m2.total_h2d_bytes, 2 * s.total_device_bytes);
+  EXPECT_DOUBLE_EQ(m2.total_h2d_time_ms,
+                   m1.last_h2d_time_ms + m2.last_h2d_time_ms);
+
+  s.ws->ResetMetrics();
+  const WeightSyncMetrics m_reset = s.ws->GetMetrics();
+  EXPECT_EQ(m_reset.last_h2d_bytes, 0);
+  EXPECT_EQ(m_reset.total_h2d_bytes, 0);
+  EXPECT_DOUBLE_EQ(m_reset.total_h2d_time_ms, 0.0);
+}
+
+TEST_F(WeightSynchronizerTest, AutoH2dOnDataReceivedRecordsH2dBytes) {
+  absl::SetFlag(&FLAGS_raiden_weight_sync_host_buffer_scratchpad_size,
+                kHostScratchpadBytes);
+  DeviceBackedSynchronizer s;
+  ASSERT_NO_FATAL_FAILURE(CreateDeviceBackedSynchronizer(
+      SmallUntiledThenLargeTiledLayers(), /*auto_h2d=*/true, &s));
+
+  constexpr uint64_t kUuid = 91002;
+  ASSERT_OK(s.ws->OnLayerDataReceived(0, kUuid));
+  ASSERT_OK(s.ws->OnLayerDataReceived(1, kUuid));
+  ASSERT_OK(s.ws->OnDataReceived(kUuid));
+
+  const WeightSyncMetrics m = s.ws->GetMetrics();
+  EXPECT_EQ(m.last_h2d_bytes, s.total_device_bytes);
+  EXPECT_EQ(m.total_h2d_bytes, s.total_device_bytes);
+  EXPECT_GT(m.last_h2d_time_ms, 0.0);
+  EXPECT_DOUBLE_EQ(m.total_h2d_time_ms, m.last_h2d_time_ms);
 }
 
 }  // namespace

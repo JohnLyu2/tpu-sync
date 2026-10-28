@@ -104,7 +104,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           layer_buffers.empty() ? 0
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip,
-          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses()),
+          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses(),
+          /*socket_only_transport=*/true),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),
@@ -265,7 +266,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           shards.size() == num_shards ? std::move(shards)
                                       : BuildDefaultShards(num_shards),
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
-          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics)),
+          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics),
+          /*socket_only_transport=*/true),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),
@@ -548,7 +550,42 @@ bool HasTiledLayout(const xla::Shape& shape) {
   return shape.has_layout() && !shape.layout().tiles().empty();
 }
 
+// Returns `copy` with `on_success` run once it completes successfully. When
+// `copy` completes through its xla::Future (every copy issued by this file),
+// `on_success` runs before the returned future becomes ready, so a caller that
+// awaits the result observes everything `on_success` did. A failed copy skips
+// `on_success`.
+raiden::PjRtCopyFuture RunOnCopySuccess(raiden::PjRtCopyFuture copy,
+                                        absl::AnyInvocable<void()> on_success) {
+  if (!copy.IsValid()) {
+    // Nothing in flight, e.g. no device buffers: the copy is already done.
+    on_success();
+    return copy;
+  }
+  if (copy.future.IsValid()) {
+    copy.future = copy.future.Map(
+        [on_success = std::move(on_success)]() mutable { on_success(); });
+    return copy;
+  }
+  // PjRt-event-only completion: `on_success` runs from the event callback.
+  copy.OnReady(
+      [on_success = std::move(on_success)](
+          const absl::StatusOr<raiden::BufferHolders>& result) mutable {
+        if (result.ok()) on_success();
+      });
+  return copy;
+}
+
 }  // namespace
+
+size_t WeightSynchronizerBase::LayerDeviceBytes(size_t layer_idx) const {
+  if (layer_idx >= layers_.size()) return 0;
+  size_t bytes = 0;
+  for (const auto& shard : layers_[layer_idx].shards) {
+    bytes += shard.device_size;
+  }
+  return bytes;
+}
 
 absl::StatusOr<WeightSynchronizerBase::ShardScratchpad*>
 WeightSynchronizerBase::GetTiledScratchpad(size_t shard_idx) {
@@ -786,6 +823,20 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
   VLOG(1) << "Done with scheduling H2d across " << num_layers_ << " layers x "
           << num_shards_ << " shards (uuid=" << uuid << ") in "
           << absl::ToDoubleMilliseconds(absl::Now() - start_time) << " ms.";
+  size_t h2d_bytes = 0;
+  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+    h2d_bytes += LayerDeviceBytes(layer_idx);
+  }
+  // `this` outlives in-flight copies; see the telemetry callback below.
+  joined = RunOnCopySuccess(std::move(joined), [this, start_time, h2d_bytes]() {
+    const double h2d_time_ms =
+        absl::ToDoubleMilliseconds(absl::Now() - start_time);
+    absl::MutexLock lock(metrics_mu_);
+    metrics_.last_h2d_time_ms = h2d_time_ms;
+    metrics_.total_h2d_time_ms += h2d_time_ms;
+    metrics_.last_h2d_bytes = h2d_bytes;
+    metrics_.total_h2d_bytes += h2d_bytes;
+  });
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
     // Tiling runs on the shard pool after this returns, so sample its metric
@@ -975,6 +1026,21 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
   VLOG(1) << "Done with scheduling D2h across " << num_layers_
           << " layers (uuid=" << uuid << ").";
   raiden::PjRtCopyFuture joined = raiden::JoinPjRtCopyFutures(layer_futures);
+  size_t d2h_bytes = 0;
+  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+    d2h_bytes += LayerDeviceBytes(layer_idx);
+  }
+  // `this` outlives in-flight copies, as for the detile callbacks above.
+  joined = RunOnCopySuccess(std::move(joined), [this, start_time, d2h_bytes]() {
+    const double d2h_time_ms =
+        absl::ToDoubleMilliseconds(absl::Now() - start_time);
+    absl::MutexLock lock(metrics_mu_);
+    metrics_.last_d2h_time_ms = d2h_time_ms;
+    metrics_.total_d2h_time_ms += d2h_time_ms;
+    metrics_.last_d2h_bytes = d2h_bytes;
+    metrics_.total_d2h_bytes += d2h_bytes;
+    metrics_.d2h_call_count++;
+  });
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
     joined.OnReady([start_time, max_detile_ms](const auto& result) {
@@ -1390,7 +1456,6 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 
   size_t total_h2h_bytes = 0;
   size_t total_d2h_bytes = 0;
-  double first_d2h_time_ms = 0.0;
   absl::Time last_d2h_done_time = d2h_start;
   absl::Duration d2h_wait_duration = absl::ZeroDuration();
 
@@ -1452,9 +1517,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     std::vector<transport::BufferPushTask> group_tasks;
 
     for (size_t l = group_start; l < group_end; ++l) {
-      for (size_t s = 0; s < num_shards_; ++s) {
-        total_d2h_bytes += GetHostSize(l, s);
-      }
+      total_d2h_bytes += LayerDeviceBytes(l);
       if (!request.skip_d2h() && !already_completed) {
         absl::Time d2h_wait_start =
             ABSL_PREDICT_FALSE(diag_vlog) ? absl::Now() : absl::InfinitePast();
@@ -1471,10 +1534,6 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
           d2h_wait_duration += (absl::Now() - d2h_wait_start);
         }
         last_d2h_done_time = absl::Now();
-        if (l == 0) {
-          first_d2h_time_ms =
-              absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
-        }
       }
       const auto& layer_tasks = tasks_by_layer[l];
       if (!layer_tasks.empty() && tile_ready[l] != nullptr) {
@@ -1540,6 +1599,9 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 
   double total_push_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - push_start);
+  // Every layer's D2H has completed by `last_d2h_done_time`.
+  const double d2h_time_ms =
+      absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
   double last_detiling_time_ms = 0.0;
   {
     absl::MutexLock lock(metrics_mu_);
@@ -1552,9 +1614,9 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     metrics_.total_push_resharded_time_ms += total_push_time_ms;
 
     if (!request.skip_d2h() && !already_completed) {
-      metrics_.last_d2h_time_ms = first_d2h_time_ms;
+      metrics_.last_d2h_time_ms = d2h_time_ms;
       metrics_.last_d2h_bytes = total_d2h_bytes;
-      metrics_.total_d2h_time_ms += first_d2h_time_ms;
+      metrics_.total_d2h_time_ms += d2h_time_ms;
       metrics_.total_d2h_bytes += total_d2h_bytes;
       metrics_.d2h_call_count++;
     }
@@ -1569,11 +1631,9 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
     if (!request.skip_d2h() && !already_completed && !buffer_holds_.empty()) {
-      double total_d2h_time_ms =
-          absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
       store.ObserveHistogram(
           telemetry::metric_names::kWeightSyncD2hTransferTimeMs, {},
-          total_d2h_time_ms);
+          d2h_time_ms);
       if (last_detiling_time_ms > 0.0) {
         store.ObserveHistogram(
             telemetry::metric_names::kWeightSyncDetilingTimeMs, {},
@@ -1887,9 +1947,11 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
 
   std::vector<raiden::PjRtCopyFuture> futures_to_await;
   futures_to_await.reserve(layer_futures_map.size());
+  size_t h2d_bytes = 0;
   for (auto& [layer_idx, layer_future] : layer_futures_map) {
     TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture copy_future, layer_future.get());
     futures_to_await.push_back(std::move(copy_future));
+    h2d_bytes += LayerDeviceBytes(layer_idx);
   }
   if (!futures_to_await.empty()) {
     raiden::PjRtCopyFuture joined_future =
@@ -1903,6 +1965,8 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
     absl::MutexLock lock(metrics_mu_);
     metrics_.last_h2d_time_ms = h2d_time_ms;
     metrics_.total_h2d_time_ms += h2d_time_ms;
+    metrics_.last_h2d_bytes = h2d_bytes;
+    metrics_.total_h2d_bytes += h2d_bytes;
     last_tiling_time_ms = metrics_.last_tiling_time_ms;
   }
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
