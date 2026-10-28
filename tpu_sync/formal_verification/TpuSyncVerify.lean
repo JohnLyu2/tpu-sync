@@ -15,7 +15,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.Transport
 import TpuSyncVerify.Transfer.PrefillDecode.Caller
 import TpuSyncVerify.Transfer.Reshard.Receive
 import TpuSyncVerify.Transfer.Reshard.Send
-import TpuSyncVerify.Transfer.Reshard.Pipeline.Preservation
+import TpuSyncVerify.Transfer.Reshard.Pipeline
+import TpuSyncVerify.Transfer.Reshard.Coverage
 -- The remaining Transfer models and the Controller model land in follow-up
 -- changes and are imported here as they arrive.
 
