@@ -4,6 +4,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Send.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Frame
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Traces
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Coverage
+import TpuSyncVerify.Transfer.PrefillDecode.Send.Guards
 
 /-!
 # Send session
@@ -210,6 +211,13 @@ All proved on every reachable state (`reachable_safe`):
 * **Pull claim (`PullClaimed`).** `(started → pullStarted) ∧ ((d2hPending ∨ 0 < d2hIssued) → started)`:
   `StartPush` never runs unless `ValidateAndBeginPull` claimed `pull_started_`,
   and no D2H copy is pending or issued unless `StartPush` started.
+* **Published is quiet (`PublishedQuiet`).** `published ≠ none → d2hPending = false ∧ d2hRetired = d2hIssued`:
+  once `poll_stats()` has reported the send, as `done_sending` or as failed,
+  no D2H copy is dispatching or still reading prefill HBM, so the engine may
+  reclaim it. The sender's promise to the engine at the session level (the
+  pipeline restates it as `PrefillHbmSafe`); added when the guard inventory
+  (`Send/Guards.lean`) found that dropping `Done()` before publishing
+  violated nothing the module stated.
 * **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and
@@ -225,7 +233,7 @@ there is no `failed_sending_`. (3) The D2H loop's `if (draining_) return;` in
 `StartPush` also skips `SendNextLayer(0)`, which is fine because every later
 `SendNextLayer` re-checks `draining_`.
 
-## Coverage
+## Coverage and guards
 
 `Coverage.lean` measures how much of `step` the replayed upstream tests
 exercise, as `Receive/Coverage.lean` does (branch = leaf of an event's
@@ -245,6 +253,17 @@ the setting thread (`xla::Future::OnReady` → `AsyncValue::AndThen`), so a copy
 the test completes runs `SendNextLayer`'s before `StartPush`'s. The `#guard` at
 the end of `Coverage.lean` fails if a branch, a trace or a classification
 changes.
+
+`Guards.lean` asks the other question: which of the C++ checks `step`
+transcribes do the properties need? Each is dropped or weakened and searched
+exhaustively against `Safe` without the ghost-counter equations. Five are
+load-bearing (the loop's `if (draining_) return`, the last-push
+`FinishLocked()`, `Done()` before publishing, `draining_` in the settle
+condition, `in_flight_ == 0` in `FinishLocked`); seven survive — the first
+lines of a two- or three-line defence against working for a dead send, and
+the first-`Finish`-wins rule, which no safety property can see. The
+`Done()`-before-publishing check survived the `Safe` the module had;
+`PublishedQuiet` is the property that was missing.
 
 ## Source map
 

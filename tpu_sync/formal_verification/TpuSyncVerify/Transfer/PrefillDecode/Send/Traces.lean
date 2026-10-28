@@ -314,7 +314,7 @@ def events : List Ev :=
    .cancel, .publish]
 
 instance (s : Send) : Decidable (Safe s) := by
-  unfold Safe SettleSafe Drained StagingIntegrity SettlesPromptly NoUnderflow Publication CountersOrdered NoOpLeak PullClaimed
+  unfold Safe SettleSafe Drained StagingIntegrity SettlesPromptly NoUnderflow Publication CountersOrdered NoOpLeak PullClaimed PublishedQuiet
   infer_instance
 
 /-- Executable negation of `Safe`, by construction: the bounded searches and the

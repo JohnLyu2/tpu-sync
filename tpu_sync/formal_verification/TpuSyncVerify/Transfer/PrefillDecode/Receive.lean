@@ -4,6 +4,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Frame
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Traces
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Coverage
+import TpuSyncVerify.Transfer.PrefillDecode.Receive.Guards
 
 /-!
 # Receive session
@@ -213,6 +214,13 @@ All proved on every reachable state (`reachable_safe`):
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and
   release its staging in a finite number of steps (`reachable_can_settle`).
+* **Published is quiet (`PublishedQuiet`).** `published ≠ none → pending = 0 ∧ retired = issued`:
+  once `poll_stats()` has reported the receive, as `done_recving` or as
+  `failed_recving`, no H2D copy is dispatching or still writing decode HBM, so
+  the engine may reuse it. The receiver's promise to the engine at the session
+  level (the pipeline restates it as `DecodeHbmSafe`); added when the guard
+  inventory (`Guards.lean`) found that dropping `Done()` before publishing a
+  *failed* receive violated nothing the module stated.
 
 Note on the readiness predicate. One might expect `IsReadyToComplete` to
 coincide with "every layer's callback has run OK"; it does not.
@@ -222,7 +230,7 @@ coincide with "every layer's callback has run OK"; it does not.
 That is harmless — `done` still waits for every callback through `in_flight_`
 — and the publication property above is the one that matters.
 
-## Coverage
+## Coverage and guards
 
 `Coverage.lean` measures how much of `step` the replayed upstream tests
 exercise. A branch is a leaf of an event's decision tree together with its
@@ -240,6 +248,20 @@ that answers), a lock-window or poll-timing interleaving no harness hook
 reaches (5), or a data-before-reply ordering the model leaves open (4). The
 `#guard` at the end of `Coverage.lean`
 fails if a branch, a trace or a classification changes.
+
+`Guards.lean` asks the other question: which of the C++ checks `step`
+transcribes do the properties need? Each is dropped or weakened and searched
+exhaustively against `Safe` without the ghost-counter equations. Five are
+load-bearing (`TryBeginRecvOp`'s refusal, `ExecuteLayerH2d`'s first check,
+`Done()` before publishing — whose failed-receive half survived the `Safe`
+the module had, `PublishedQuiet` being the property that was missing —
+`draining_` in `EndRecvOpLocked`'s settle condition, `in_flight_ == 0` in
+`FinishLocked`); five survive — the
+`draining_` half of the first check and the whole re-check in
+`ExecuteLayerH2d` (wasted DMA, not safety), the `!draining_` on the last
+layer's finish and the `done_ || draining_` in `OnBlockShardsReceived`
+(metrics and accounting), and the poll's `!IsDraining()` (a no-op without
+it).
 
 ## Source map
 

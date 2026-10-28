@@ -253,7 +253,7 @@ def events : List Ev :=
    .netAccount, .pollReady, .cancel, .publish]
 
 instance (s : Recv) : Decidable (Safe s) := by
-  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ReadinessSound Publication CountersOrdered NoOpLeak
+  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ReadinessSound Publication CountersOrdered NoOpLeak PublishedQuiet
   infer_instance
 
 /-- Executable negation of `Safe`, by construction: the bounded searches and the

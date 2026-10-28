@@ -68,13 +68,20 @@ theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
 
 theorem inv_safe {s : Send} (h : Inv s) : Safe s := by
   have hnl := inv_noOpLeak h
-  obtain ⟨hl, hacc, hu, hcnt, hpc, _, _, hpub⟩ := h
+  obtain ⟨hl, hacc, hu, hcnt, hpc, _, hpd, hpub⟩ := h
   unfold Accounted at hacc
   unfold CountersOrdered at hcnt
-  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, hu, hpub, hcnt, hnl, hpc⟩
-  intro hd
-  have h0 := hl.done_idle hd
-  cases hp : s.d2hPending <;> simp [hp] at hacc ⊢ <;> omega
+  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, hu, hpub, hcnt, hnl, hpc, ?_⟩
+  · intro hd
+    have h0 := hl.done_idle hd
+    cases hp : s.d2hPending <;> simp [hp] at hacc ⊢ <;> omega
+  · intro hp
+    have hd : s.life.done = true := by
+      cases hpb : s.published with
+      | none => exact absurd hpb hp
+      | some b => exact hpd b hpb
+    have h0 := hl.done_idle hd
+    cases hdp : s.d2hPending <;> simp [hdp] at hacc ⊢ <;> omega
 
 /-! ### Helpers for the step proof -/
 

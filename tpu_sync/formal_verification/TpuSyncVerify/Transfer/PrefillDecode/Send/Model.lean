@@ -224,10 +224,16 @@ while `inFlight > 0`, some event in `drainEvents` is enabled. -/
 def NoOpLeak (s : Send) : Prop :=
   0 < s.life.inFlight → ∃ e ∈ drainEvents, (step s e).isSome = true
 
+/-- The sender's promise to the engine: once `poll_stats()` has reported the
+send (`done_sending` or `failed_recving`), no D2H copy is dispatching or
+still reading prefill HBM, so the caller may reclaim it. -/
+def PublishedQuiet (s : Send) : Prop :=
+  s.published ≠ none → s.d2hPending = false ∧ s.d2hRetired = s.d2hIssued
+
 /-- Everything we want to know about a reachable send session. -/
 def Safe (s : Send) : Prop :=
   SettleSafe s ∧ Drained s ∧ StagingIntegrity s ∧ SettlesPromptly s ∧ NoUnderflow s ∧
-    Publication s ∧ CountersOrdered s ∧ NoOpLeak s ∧ PullClaimed s
+    Publication s ∧ CountersOrdered s ∧ NoOpLeak s ∧ PullClaimed s ∧ PublishedQuiet s
 
 
 end Send
