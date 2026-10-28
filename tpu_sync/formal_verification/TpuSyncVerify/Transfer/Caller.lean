@@ -33,7 +33,8 @@ the two production vLLM connectors that drive `tpu-sync`:
    uncertain-load path (`_stage3_fail_uncertain_loads_early`) stages
    `invalid_block_ids` on the RPC error pass while deferring `done_recving`
    (and the block free) until the native receiver settles
-   (`earlyLoadError_fail_eq_finish`, `earlyLoadError_fail_holds_blocks`).
+   (`earlyLoadError_fail_eq_finish`, `earlyLoadError_fail_holds_blocks`,
+   `mw_earlyLoadError_fail_eq_finish`, `mw_earlyLoadError_fail_holds_blocks`).
 
 Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py` at
 tpu-inference `7ed46a6`; `tpu_connector.py` =
@@ -68,11 +69,14 @@ all four session maps (`send_sessions_`, `active_pool_reshard_sends_`,
 a single `KVCacheManagerWithTransfer::mu_` critical section
 (`absl::MutexLock lock(mu_);`). Above `poll_stats()`, the worker-side
 connector (`get_finished`, `get_block_ids_with_load_errors`),
-`KVOutputAggregator.aggregate_kv_connector_output`, and vLLM's scheduler
+`KVOutputAggregator.aggregate`, and vLLM's scheduler
 (`update_from_output`, `schedule`, `finish_requests`) run on the
 single-threaded Python scheduler / model-runner loop, so each `Ev`
 (`pOutcome`, `dOutcome`, `promote`, `finish`) or `MWEv` (`pWorker`,
-`dWorker`, `promote`, `finish`) is one atomic scheduler step.
+`dWorker`, `promote`, `finish`) is one atomic scheduler step (and by
+`applySend_staggered_eq_batch` / `applyRecv_staggered_eq_batch`, two workers
+reporting in the same `KVOutputAggregator.aggregate` pass produce the exact
+same scheduler state as two back-to-back `pWorker` / `dWorker` steps).
 
 ## What is modelled
 
@@ -221,11 +225,13 @@ On the Reshard path under `Policy.fail`, `vllm-torchtpu`'s
 post-arm `coordinate_transfer` RPC fails ("uncertain"), while withholding
 `done_recving` until the native receiver settles (`tpu_connector.py`
 `get_finished` / `_poll_finished`). `earlyLoadError_fail_eq_finish` and
-`earlyLoadError_fail_holds_blocks` show that this early `applyLoadError .fail`
-produces the exact same state as `finish` (marking the request `.finished` with
-`dHeld = true` so destination HBM is not freed while the receiver is still
-armed), and the subsequent `dOutcome false` on `connectorFixed` frees
-`dHeld = false`.
+`earlyLoadError_fail_holds_blocks` (and their 2-worker counterparts
+`mw_earlyLoadError_fail_eq_finish` and `mw_earlyLoadError_fail_holds_blocks`)
+show that this early `applyLoadError .fail` produces the exact same state as
+`finish` / `mwFinish` (marking the request `.finished` with `dHeld = true` so
+destination HBM is not freed while any receiver rank is still armed), and the
+subsequent terminal `dOutcome false` / `dWorker` publications on
+`connectorFixed` free `dHeld = false`.
 
 ## Assumptions
 

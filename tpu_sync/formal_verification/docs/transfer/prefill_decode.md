@@ -108,7 +108,7 @@ scheduler queues, external block allocators, engine-side timeouts). An engine
 that frees HBM before `poll_stats()` publishes violates `Pipeline` A4, which
 `wroteReleased` makes visible. tpu-sync has no caller-invoked cancel on this
 path: a session ends only on its own deadline, a transport error, manager
-shutdown or plan unregister. `Caller.lean` leaves out (its B1–B3) partial-prefix
+shutdown or plan unregister. `Caller.lean` leaves out (its B2–B3) partial-prefix
 load failures and preemption, prefix caching and chunked prefill.
 
 ### Transport boundary (below the session callbacks)
@@ -151,6 +151,7 @@ control flow, or an external contract.
 | Pipeline A1 — whole-layer cells | A layer moves as one unit. | Discharged: `BlockOrdering.BlockPipeline.step_pipe` (lockstep simulation over blocks). |
 | Pipeline A2 — delivery after the push callback | The model lands a layer at or after its push callback; C++ lands it before the ack. Sound because the push pins staging. | Soundness argument in `Pipeline.lean`. |
 | Transport A1–A4 — one lock, contract latched by the first stream, uniform declaration, honest senders | `Transport.lean` §Assumptions. | Stated there; A2 rests on controller-side ordering outside this repository, A4 is the one the C++ does not enforce and the traces drop. |
+| Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`), whole-transfer failure, no preemption/prefix caching/chunked prefill | `Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_staggered_eq_batch`; `trace_mw_overcounted_expected_leaks` shows what breaks when `get_finished_count()` exceeds participating workers); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
 
 ## Shipping C++ vs. modelled design alternatives
 
@@ -309,14 +310,15 @@ tpu-inference `tpu_inference/distributed/tpu_raiden_connector.py` @ `7ed46a6`,
 vLLM `vllm/distributed/kv_transfer/kv_connector/utils.py`, and
 vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73` (`TPUConnectorWorker.get_finished`,
 `get_block_ids_with_load_errors`, `request_finished`, `update_state_after_alloc`,
-`get_finished_count`; `KVOutputAggregator.aggregate_kv_connector_output`;
+`get_finished_count`; `KVOutputAggregator.aggregate`;
 scheduler `_handle_invalid_blocks`, `_update_from_kv_xfer_finished`,
 `finish_requests`, `_update_waiting_for_remote_kv`, `kv_load_failure_policy`) →
-`Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.leakP_absorbing`,
+`Caller.contract_safe`, `Caller.mw_contract_safe`,
+`Caller.applyRecv_staggered_eq_batch`, `Caller.leakP_absorbing`,
 `Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing`,
 `trace_current_connector_*`, `trace_mw_current_partial_failure_leaks`,
 `trace_naive_decodes`, `trace_loadErrorOnly_*`, `trace_fixed_*`,
-`trace_mw_staggered_*`.
+`trace_mw_staggered_*`, `trace_mw_overcounted_expected_leaks`.
 
 ## Where the rest lives
 

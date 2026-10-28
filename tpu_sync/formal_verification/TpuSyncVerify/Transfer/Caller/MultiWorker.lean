@@ -19,7 +19,11 @@ and two consumer workers (`w ∈ {false, true}`) and the scheduler:
 * **Eagerly unioned load errors (`invalid_block_ids`).**
   Any worker `w` whose connector emits `loadError = true` passes
   `loadError = true` straight through to `applyLoadError policy` on that step,
-  without waiting for `dRecvCount` to reach `expectedD`.
+  without waiting for `dRecvCount` to reach `expectedD`. Because
+  `applyLoadError policy` is idempotent (`applyLoadError_idem`), two workers
+  reporting in separate steps produce the exact same scheduler state as a
+  same-step `KVOutputAggregator.aggregate` batch (`applySend_staggered_eq_batch`,
+  `applyRecv_staggered_eq_batch`).
 
 Main results:
 
@@ -34,7 +38,9 @@ Main results:
    (`mwEarlyFree = false`, discharging the pipeline models' **A4** assumption
    across workers), leaks blocks on P or D (`mwLeakP = false`, `mwLeakD = false`),
    or decodes unwritten KV (`mwDecodesUnwritten = false`), across all staggered
-   worker completion and failure orders under either failure policy.
+   or batched worker completion and failure orders under either failure policy.
+   `mw_earlyLoadError_fail_eq_finish` and `mw_earlyLoadError_fail_holds_blocks`
+   extend the single-worker uncertain-load theorems to a 2-worker consumer.
 3. Concrete traces for staggered asymmetric outcomes
    (`trace_mw_staggered_fail_then_ok_fail`,
    `trace_mw_staggered_fail_then_ok_recompute`,
@@ -396,6 +402,36 @@ theorem mw_inv_safe {s : MWS} (h : MWInv s) : MWSafe s := by
           simp [this]
         | some b1 => right; simp
 
+/-! ## Same-step batch vs. cross-step staggered `KVOutputAggregator.aggregate` -/
+
+/-- `applyLoadError policy` is idempotent: once a request's `invalid_block_ids`
+has been handled (`dFailRecv := true` under `.recompute`, or
+`dStatus := .finished` under `.fail`), a second worker's `loadError = true` on
+the same or a later pass is a no-op. -/
+theorem applyLoadError_idem (policy : Policy) (s : S) :
+    applyLoadError policy (applyLoadError policy s) = applyLoadError policy s := by
+  cases policy <;> simp only [applyLoadError] <;> split <;> simp
+
+/-- Delivering a non-completing producer pass (`finishedSending = false`)
+followed by the completing pass (`finishedSending = true`) yields the exact
+same scheduler state `S` as a single batched `KVOutputAggregator.aggregate`
+pass (`finishedSending = true`). -/
+theorem applySend_staggered_eq_batch (s : S) :
+    applySend { finishedSending := true }
+      (applySend { finishedSending := false } s) =
+    applySend { finishedSending := true } s := rfl
+
+/-- Delivering worker 0's partial aggregator pass (`finishedRecving = false`,
+`loadError = le₀`) followed by worker 1's completing pass
+(`finishedRecving = true`, `loadError = le₁`) yields the exact same scheduler
+state `S` as a single batched `KVOutputAggregator.aggregate` pass with
+`finishedRecving = true` and `loadError = (le₀ || le₁)`. -/
+theorem applyRecv_staggered_eq_batch (policy : Policy) (le₀ le₁ : Bool) (s : S) :
+    applyRecv policy { finishedRecving := true, loadError := le₁ }
+      (applyRecv policy { finishedRecving := false, loadError := le₀ } s) =
+    applyRecv policy { finishedRecving := true, loadError := le₀ || le₁ } s := by
+  cases le₀ <;> cases le₁ <;> simp [applyRecv, applyLoadError_idem]
+
 theorem mw_inv_pWorker {c : MWCfg} (hc : Contract c.conn) (hp : c.expectedP = 2)
     {s s' : MWS} {w ok : Bool} (h : MWInv s) (hs : mwPWorker c w ok s = some s') : MWInv s' := by
   have hsend := hc.send_total ok
@@ -412,30 +448,16 @@ theorem mw_inv_pWorker {c : MWCfg} (hc : Contract c.conn) (hp : c.expectedP = 2)
         simp only [mwAggSend, hsend, hp, hpc, hn0, hp1, optCount, ite_true,
           applySend, toS, withS, Option.some.injEq] at hs
         subst hs
-        exact {
-          p_cnt := by simp
-          p_held := by simp [hph_true]
-          d_cnt := by simpa using h.d_cnt
-          d_partial := by simpa using h.d_partial
-          d_wait := by simpa using h.d_wait
-          d_fail := by simpa using h.d_fail
-          d_fin := by simpa using h.d_fin
-          d_rec := by simpa using h.d_rec
-          d_dec := by simpa using h.d_dec }
+        exact { p_cnt := by simp, p_held := by simp [hph_true],
+                d_cnt := h.d_cnt, d_partial := h.d_partial, d_wait := h.d_wait,
+                d_fail := h.d_fail, d_fin := h.d_fin, d_rec := h.d_rec, d_dec := h.d_dec }
       | some b1 =>
         simp only [mwAggSend, hsend, hp, hpc, hn0, hp1, optCount, ite_true,
           applySend, toS, withS, Option.some.injEq] at hs
         subst hs
-        exact {
-          p_cnt := by simp
-          p_held := by simp
-          d_cnt := by simpa using h.d_cnt
-          d_partial := by simpa using h.d_partial
-          d_wait := by simpa using h.d_wait
-          d_fail := by simpa using h.d_fail
-          d_fin := by simpa using h.d_fin
-          d_rec := by simpa using h.d_rec
-          d_dec := by simpa using h.d_dec }
+        exact { p_cnt := by simp, p_held := by simp,
+                d_cnt := h.d_cnt, d_partial := h.d_partial, d_wait := h.d_wait,
+                d_fail := h.d_fail, d_fin := h.d_fin, d_rec := h.d_rec, d_dec := h.d_dec }
     · simp at hs
   | true =>
     simp only [mwPWorker] at hs
@@ -447,37 +469,23 @@ theorem mw_inv_pWorker {c : MWCfg} (hc : Contract c.conn) (hp : c.expectedP = 2)
         simp only [mwAggSend, hsend, hp, hpc, hn1, hp0, optCount, ite_true,
           applySend, toS, withS, Option.some.injEq] at hs
         subst hs
-        exact {
-          p_cnt := by simp
-          p_held := by simp [hph_true]
-          d_cnt := by simpa using h.d_cnt
-          d_partial := by simpa using h.d_partial
-          d_wait := by simpa using h.d_wait
-          d_fail := by simpa using h.d_fail
-          d_fin := by simpa using h.d_fin
-          d_rec := by simpa using h.d_rec
-          d_dec := by simpa using h.d_dec }
+        exact { p_cnt := by simp, p_held := by simp [hph_true],
+                d_cnt := h.d_cnt, d_partial := h.d_partial, d_wait := h.d_wait,
+                d_fail := h.d_fail, d_fin := h.d_fin, d_rec := h.d_rec, d_dec := h.d_dec }
       | some b0 =>
         simp only [mwAggSend, hsend, hp, hpc, hn1, hp0, optCount, ite_true,
           applySend, toS, withS, Option.some.injEq] at hs
         subst hs
-        exact {
-          p_cnt := by simp
-          p_held := by simp
-          d_cnt := by simpa using h.d_cnt
-          d_partial := by simpa using h.d_partial
-          d_wait := by simpa using h.d_wait
-          d_fail := by simpa using h.d_fail
-          d_fin := by simpa using h.d_fin
-          d_rec := by simpa using h.d_rec
-          d_dec := by simpa using h.d_dec }
+        exact { p_cnt := by simp, p_held := by simp,
+                d_cnt := h.d_cnt, d_partial := h.d_partial, d_wait := h.d_wait,
+                d_fail := h.d_fail, d_fin := h.d_fin, d_rec := h.d_rec, d_dec := h.d_dec }
     · simp at hs
 
 theorem mw_inv_dWorker {c : MWCfg} (hc : Contract c.conn) (hd : c.expectedD = 2)
     {s s' : MWS} {w ok : Bool} (h : MWInv s) (hs : mwDWorker c w ok s = some s') : MWInv s' := by
   have hfr := hc.recv_total ok
-  have hle : ok = false → (c.conn.onRecv ok).loadError = true := by
-    intro hok; subst hok; exact hc.recv_failure_reported
+  have hok_of_nle : (c.conn.onRecv ok).loadError = false → ok = true := by
+    cases ok <;> simp [hc.recv_failure_reported]
   have hdc := h.d_cnt
   have hpc := h.p_cnt
   have hph := h.p_held
@@ -494,149 +502,69 @@ theorem mw_inv_dWorker {c : MWCfg} (hc : Contract c.conn) (hd : c.expectedD = 2)
         | inl hw =>
           cases hl : (c.conn.onRecv ok).loadError with
           | false =>
-            have hok : ok = true := by
-              cases ok
-              · exact absurd (hle rfl) (by simp [hl])
-              · rfl
-            subst hok
+            have hok := hok_of_nle hl; subst hok
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
               applyRecv, toS, withS, Option.some.injEq] at hs
             subst hs
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp [hw, hdh, hfin]
-              d_wait := by simp
-              d_fail := by simp
-              d_fin := by simp
-              d_rec := by simp [hw]
-              d_dec := by simp [hw] }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp [hw, hdh, hfin], d_wait := by simp,
+                    d_fail := by simp, d_fin := by simp,
+                    d_rec := by simp [hw], d_dec := by simp [hw] }
           | true =>
-            cases hpol : c.policy with
-            | recompute =>
+            cases hpol : c.policy <;>
               simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
-                applyRecv, applyLoadError, hpol, hw, toS, withS, Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp [hdh, hfin]
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
-            | fail =>
-              simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
-                applyRecv, applyLoadError, hpol, hw, toS, withS, Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp [hdh, hfin]
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
+                applyRecv, applyLoadError, hpol, hw, toS, withS, Option.some.injEq] at hs <;>
+              subst hs <;>
+              exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                      d_partial := by simp [hdh, hfin], d_wait := by simp,
+                      d_fail := by simp, d_fin := by simp,
+                      d_rec := by simp, d_dec := by simp }
         | inr hf =>
           cases hl : (c.conn.onRecv ok).loadError <;>
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
               applyRecv, applyLoadError, hf, toS, withS, Option.some.injEq] at hs <;>
             subst hs <;>
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp [hdh, hfin]
-              d_wait := by simp
-              d_fail := by simp
-              d_fin := by simp
-              d_rec := by simp
-              d_dec := by simp }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp [hdh, hfin], d_wait := by simp,
+                    d_fail := by simp, d_fin := by simp,
+                    d_rec := by simp, d_dec := by simp }
       | some b1 =>
         -- Worker 0 is the second consumer worker to publish (`dRecvCount : 1 → 2 = expectedD`).
         cases hst with
         | inl hw =>
-          have hb1_fail : b1 = false → s.dFailRecv = true := by
-            intro hb1
-            exact h.d_fail (Or.inr (by simp [hr1, hb1])) hw
+          have hb1_fail : b1 = false → s.dFailRecv = true :=
+            fun hb1 => h.d_fail (Or.inr (by simp [hr1, hb1])) hw
           cases hl : (c.conn.onRecv ok).loadError with
           | false =>
-            have hok : ok = true := by
-              cases ok
-              · exact absurd (hle rfl) (by simp [hl])
-              · rfl
-            subst hok
+            have hok := hok_of_nle hl; subst hok
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
               applyRecv, applyFinishedRecving, hw, toS, withS, Option.some.injEq] at hs
             subst hs
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp
-              d_wait := by simp
-              d_fail := by
-                intro hfail _
-                rcases hfail with h0 | h1
-                · simp at h0
-                · simp only [Option.some.injEq] at h1
-                  exact hb1_fail h1
-              d_fin := by simp
-              d_rec := by simp
-              d_dec := by simp }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp, d_wait := by simp,
+                    d_fail := by
+                      intro hfail _; rcases hfail with h0 | h1
+                      · simp at h0
+                      · simp only [Option.some.injEq] at h1; exact hb1_fail h1
+                    d_fin := by simp, d_rec := by simp, d_dec := by simp }
           | true =>
-            cases hpol : c.policy with
-            | recompute =>
+            cases hpol : c.policy <;>
               simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
                 applyRecv, applyLoadError, applyFinishedRecving, hpol, hw, toS, withS,
-                Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
-            | fail =>
-              simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
-                applyRecv, applyLoadError, applyFinishedRecving, hpol, hw, toS, withS,
-                Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
+                Option.some.injEq] at hs <;>
+              subst hs <;>
+              exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                      d_partial := by simp, d_wait := by simp, d_fail := by simp,
+                      d_fin := by simp, d_rec := by simp, d_dec := by simp }
         | inr hf =>
           cases hl : (c.conn.onRecv ok).loadError <;>
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn0, hr1, optCount, ite_true,
               applyRecv, applyLoadError, applyFinishedRecving, hf, toS, withS,
               Option.some.injEq] at hs <;>
             subst hs <;>
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp
-              d_wait := by simp
-              d_fail := by simp
-              d_fin := by simp
-              d_rec := by simp
-              d_dec := by simp }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp, d_wait := by simp, d_fail := by simp,
+                    d_fin := by simp, d_rec := by simp, d_dec := by simp }
     · simp at hs
   | true =>
     simp only [mwDWorker] at hs
@@ -650,149 +578,69 @@ theorem mw_inv_dWorker {c : MWCfg} (hc : Contract c.conn) (hd : c.expectedD = 2)
         | inl hw =>
           cases hl : (c.conn.onRecv ok).loadError with
           | false =>
-            have hok : ok = true := by
-              cases ok
-              · exact absurd (hle rfl) (by simp [hl])
-              · rfl
-            subst hok
+            have hok := hok_of_nle hl; subst hok
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
               applyRecv, toS, withS, Option.some.injEq] at hs
             subst hs
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp [hw, hdh, hfin]
-              d_wait := by simp
-              d_fail := by simp
-              d_fin := by simp
-              d_rec := by simp [hw]
-              d_dec := by simp [hw] }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp [hw, hdh, hfin], d_wait := by simp,
+                    d_fail := by simp, d_fin := by simp,
+                    d_rec := by simp [hw], d_dec := by simp [hw] }
           | true =>
-            cases hpol : c.policy with
-            | recompute =>
+            cases hpol : c.policy <;>
               simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
-                applyRecv, applyLoadError, hpol, hw, toS, withS, Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp [hdh, hfin]
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
-            | fail =>
-              simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
-                applyRecv, applyLoadError, hpol, hw, toS, withS, Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp [hdh, hfin]
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
+                applyRecv, applyLoadError, hpol, hw, toS, withS, Option.some.injEq] at hs <;>
+              subst hs <;>
+              exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                      d_partial := by simp [hdh, hfin], d_wait := by simp,
+                      d_fail := by simp, d_fin := by simp,
+                      d_rec := by simp, d_dec := by simp }
         | inr hf =>
           cases hl : (c.conn.onRecv ok).loadError <;>
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
               applyRecv, applyLoadError, hf, toS, withS, Option.some.injEq] at hs <;>
             subst hs <;>
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp [hdh, hfin]
-              d_wait := by simp
-              d_fail := by simp
-              d_fin := by simp
-              d_rec := by simp
-              d_dec := by simp }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp [hdh, hfin], d_wait := by simp,
+                    d_fail := by simp, d_fin := by simp,
+                    d_rec := by simp, d_dec := by simp }
       | some b0 =>
         -- Worker 1 is the second consumer worker to publish (`dRecvCount : 1 → 2 = expectedD`).
         cases hst with
         | inl hw =>
-          have hb0_fail : b0 = false → s.dFailRecv = true := by
-            intro hb0
-            exact h.d_fail (Or.inl (by simp [hr0, hb0])) hw
+          have hb0_fail : b0 = false → s.dFailRecv = true :=
+            fun hb0 => h.d_fail (Or.inl (by simp [hr0, hb0])) hw
           cases hl : (c.conn.onRecv ok).loadError with
           | false =>
-            have hok : ok = true := by
-              cases ok
-              · exact absurd (hle rfl) (by simp [hl])
-              · rfl
-            subst hok
+            have hok := hok_of_nle hl; subst hok
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
               applyRecv, applyFinishedRecving, hw, toS, withS, Option.some.injEq] at hs
             subst hs
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp
-              d_wait := by simp
-              d_fail := by
-                intro hfail _
-                rcases hfail with h0 | h1
-                · simp only [Option.some.injEq] at h0
-                  exact hb0_fail h0
-                · simp at h1
-              d_fin := by simp
-              d_rec := by simp
-              d_dec := by simp }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp, d_wait := by simp,
+                    d_fail := by
+                      intro hfail _; rcases hfail with h0 | h1
+                      · simp only [Option.some.injEq] at h0; exact hb0_fail h0
+                      · simp at h1
+                    d_fin := by simp, d_rec := by simp, d_dec := by simp }
           | true =>
-            cases hpol : c.policy with
-            | recompute =>
+            cases hpol : c.policy <;>
               simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
                 applyRecv, applyLoadError, applyFinishedRecving, hpol, hw, toS, withS,
-                Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
-            | fail =>
-              simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
-                applyRecv, applyLoadError, applyFinishedRecving, hpol, hw, toS, withS,
-                Option.some.injEq] at hs
-              subst hs
-              exact {
-                p_cnt := by simpa using hpc
-                p_held := by simpa using hph
-                d_cnt := by simp
-                d_partial := by simp
-                d_wait := by simp
-                d_fail := by simp
-                d_fin := by simp
-                d_rec := by simp
-                d_dec := by simp }
+                Option.some.injEq] at hs <;>
+              subst hs <;>
+              exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                      d_partial := by simp, d_wait := by simp, d_fail := by simp,
+                      d_fin := by simp, d_rec := by simp, d_dec := by simp }
         | inr hf =>
           cases hl : (c.conn.onRecv ok).loadError <;>
             simp only [mwAggRecv, hfr, hl, hd, hdc, hn1, hr0, optCount, ite_true,
               applyRecv, applyLoadError, applyFinishedRecving, hf, toS, withS,
               Option.some.injEq] at hs <;>
             subst hs <;>
-            exact {
-              p_cnt := by simpa using hpc
-              p_held := by simpa using hph
-              d_cnt := by simp
-              d_partial := by simp
-              d_wait := by simp
-              d_fail := by simp
-              d_fin := by simp
-              d_rec := by simp
-              d_dec := by simp }
+            exact { p_cnt := hpc, p_held := hph, d_cnt := by simp,
+                    d_partial := by simp, d_wait := by simp, d_fail := by simp,
+                    d_fin := by simp, d_rec := by simp, d_dec := by simp }
     · simp at hs
 
 theorem mw_inv_promote {s s' : MWS} (h : MWInv s) (hs : mwPromote s = some s') : MWInv s' := by
@@ -806,28 +654,16 @@ theorem mw_inv_promote {s s' : MWS} (h : MWInv s) (hs : mwPromote s = some s') :
       constructor <;> intro hn
       · have := (h.d_partial (Or.inl hn)).2.2; rw [hfin] at this; cases this
       · have := (h.d_partial (Or.inr hn)).2.2; rw [hfin] at this; cases this
+    have hnp : ¬(s.recvPub0 = none ∨ s.recvPub1 = none) :=
+      fun hp => hp.elim hboth.1 hboth.2
     split at hu
-    · rename_i hfail
-      simp only [Option.some.injEq] at hu
-      subst hu
-      exact {
-        p_cnt := by simpa using h.p_cnt
-        p_held := by simpa using h.p_held
-        d_cnt := by simpa using h.d_cnt
-        d_partial := by
-          intro hpart
-          rcases hpart with hn0 | hn1
-          · exact absurd hn0 hboth.1
-          · exact absurd hn1 hboth.2
-        d_wait := by simp
-        d_fail := by simp
-        d_fin := by simp
-        d_rec := by simp
-        d_dec := by simp }
+    · simp only [Option.some.injEq] at hu; subst hu
+      exact { p_cnt := h.p_cnt, p_held := h.p_held, d_cnt := h.d_cnt,
+              d_partial := fun hp => absurd hp hnp, d_wait := by simp,
+              d_fail := by simp, d_fin := by simp, d_rec := by simp, d_dec := by simp }
     · rename_i hfail
       simp only [toS] at hfail
-      simp only [Option.some.injEq] at hu
-      subst hu
+      simp only [Option.some.injEq] at hu; subst hu
       have hok : s.recvPub0 = some true ∧ s.recvPub1 = some true := by
         cases hr0 : s.recvPub0 with
         | none => exact absurd hr0 hboth.1
@@ -836,85 +672,42 @@ theorem mw_inv_promote {s s' : MWS} (h : MWInv s) (hs : mwPromote s = some s') :
           | none => exact absurd hr1 hboth.2
           | some b1 =>
             cases b0
-            · have := h.d_fail (Or.inl hr0) hw
-              simp [this] at hfail
+            · have := h.d_fail (Or.inl hr0) hw; simp [this] at hfail
             · cases b1
-              · have := h.d_fail (Or.inr hr1) hw
-                simp [this] at hfail
+              · have := h.d_fail (Or.inr hr1) hw; simp [this] at hfail
               · exact ⟨rfl, rfl⟩
-      exact {
-        p_cnt := by simpa using h.p_cnt
-        p_held := by simpa using h.p_held
-        d_cnt := by simpa using h.d_cnt
-        d_partial := by
-          intro hpart
-          rcases hpart with hn0 | hn1
-          · exact absurd hn0 hboth.1
-          · exact absurd hn1 hboth.2
-        d_wait := by simp
-        d_fail := by simp
-        d_fin := by simp
-        d_rec := by simp
-        d_dec := by simpa using hok }
+      exact { p_cnt := h.p_cnt, p_held := h.p_held, d_cnt := h.d_cnt,
+              d_partial := fun hp => absurd hp hnp, d_wait := by simp,
+              d_fail := by simp, d_fin := by simp, d_rec := by simp,
+              d_dec := by simpa using hok }
   · simp at hu
 
 theorem mw_inv_finish {s s' : MWS} (h : MWInv s) (hs : mwFinish s = some s') : MWInv s' := by
   simp only [mwFinish, finish, Option.map_eq_some_iff] at hs
   rcases hs with ⟨u, hu, rfl⟩
   split at hu
-  · rename_i hw
-    simp only [toS] at hw
-    simp only [Option.some.injEq] at hu
-    subst hu
-    exact {
-      p_cnt := by simpa using h.p_cnt
-      p_held := by simpa using h.p_held
-      d_cnt := by simpa using h.d_cnt
-      d_partial := by
-        intro hpart
-        obtain ⟨_, hdh, hfin⟩ := h.d_partial hpart
-        simp [hdh, hfin]
-      d_wait := by simp
-      d_fail := by simp
-      d_fin := by
-        intro hne0 hne1 _
-        have := h.d_wait hne0 hne1 hw
-        simp [this]
-      d_rec := by simp
-      d_dec := by simp }
-  · rename_i hd
-    simp only [toS] at hd
-    simp only [Option.some.injEq] at hu
-    subst hu
+  · rename_i hw; simp only [toS] at hw
+    simp only [Option.some.injEq] at hu; subst hu
+    exact { p_cnt := h.p_cnt, p_held := h.p_held, d_cnt := h.d_cnt,
+            d_partial := fun hp => by
+              obtain ⟨_, hdh, hfin⟩ := h.d_partial hp; simp [hdh, hfin]
+            d_wait := by simp, d_fail := by simp,
+            d_fin := fun h0 h1 _ => by have := h.d_wait h0 h1 hw; simp [this]
+            d_rec := by simp, d_dec := by simp }
+  · rename_i hd; simp only [toS] at hd
+    simp only [Option.some.injEq] at hu; subst hu
     obtain ⟨hr0, hr1⟩ := h.d_dec hd
-    exact {
-      p_cnt := by simpa using h.p_cnt
-      p_held := by simpa using h.p_held
-      d_cnt := by simpa using h.d_cnt
-      d_partial := by simp [hr0, hr1]
-      d_wait := by simp
-      d_fail := by simp
-      d_fin := by simp
-      d_rec := by simp
-      d_dec := by simp }
-  · rename_i hr
-    simp only [toS] at hr
-    simp only [Option.some.injEq] at hu
-    subst hu
+    exact { p_cnt := h.p_cnt, p_held := h.p_held, d_cnt := h.d_cnt,
+            d_partial := by simp [hr0, hr1], d_wait := by simp, d_fail := by simp,
+            d_fin := by simp, d_rec := by simp, d_dec := by simp }
+  · rename_i hr; simp only [toS] at hr
+    simp only [Option.some.injEq] at hu; subst hu
     have hheld := h.d_rec hr
-    exact {
-      p_cnt := by simpa using h.p_cnt
-      p_held := by simpa using h.p_held
-      d_cnt := by simpa using h.d_cnt
-      d_partial := by
-        intro hpart
-        have := (h.d_partial hpart).1
-        simp [hr] at this
-      d_wait := by simp
-      d_fail := by simp
-      d_fin := by intro _ _ _; simpa using hheld
-      d_rec := by simp
-      d_dec := by simp }
+    exact { p_cnt := h.p_cnt, p_held := h.p_held, d_cnt := h.d_cnt,
+            d_partial := fun hp => by have := (h.d_partial hp).1; simp [hr] at this
+            d_wait := by simp, d_fail := by simp,
+            d_fin := fun _ _ _ => by simpa using hheld
+            d_rec := by simp, d_dec := by simp }
   · simp at hu
 
 theorem mw_step_inv {c : MWCfg} (hc : Contract c.conn)
@@ -939,6 +732,33 @@ theorem mw_contract_safe {c : MWCfg} (hc : Contract c.conn)
 theorem mw_fixed_safe {policy : Policy} {s : MWS}
     (hr : (mwSys ⟨connectorFixed, policy, 2, 2⟩).Reachable s) : MWSafe s :=
   mw_contract_safe fixed_contract rfl rfl hr
+
+/-- **Multi-worker early uncertain-load failure under `Policy.fail`:**
+In `vllm-torchtpu` (`tpu_connector.py` `_apply_stage3_submit_outcome` and
+`_sync_stage3_tp_submit_states`), when `tp_rank == 0` gets an `"uncertain"`
+post-arm `coordinate_transfer` error with `_stage3_fail_uncertain_loads_early`
+enabled (`Policy.fail`), `tp_rank == 0` stages `_failed_block_ids` on that pass
+(`KVOutputAggregator.aggregate` forwards `loadError = true` with
+`finishedRecving = false`) while `_sync_stage3_tp_submit_states` broadcasts
+`"uncertain"` to all `tp_rank != 0` so every rank withholds `done_recving`
+until its native receiver or 180 s deadline settles. On any waiting `MWS`
+state, this early `applyLoadError .fail` equals `mwFinish s`, preserves
+`MWInv`, and keeps `dHeld = true` while any worker is still unpublished. -/
+theorem mw_earlyLoadError_fail_eq_finish {s : MWS} (hw : s.dStatus = .waitingRemoteKv) :
+    some (withS s (applyLoadError .fail (toS s))) = mwFinish s := by
+  simp [mwFinish, finish, applyLoadError, toS, hw]
+
+theorem mw_earlyLoadError_fail_holds_blocks {s : MWS}
+    (h : MWInv s) (hw : s.dStatus = .waitingRemoteKv)
+    (hpart : s.recvPub0 = none ∨ s.recvPub1 = none) :
+    let s' := withS s (applyLoadError .fail (toS s))
+    MWInv s' ∧ s'.dStatus = .finished ∧ s'.dHeld = true ∧ s'.dFinRecv = false := by
+  have hfin : mwFinish s = some (withS s (applyLoadError .fail (toS s))) :=
+    (mw_earlyLoadError_fail_eq_finish hw).symm
+  have hinv' : MWInv (withS s (applyLoadError .fail (toS s))) :=
+    mw_inv_finish h hfin
+  obtain ⟨_, hdh, hfr⟩ := hinv'.d_partial hpart
+  exact ⟨hinv', by simp [applyLoadError, toS, hw], hdh, hfr⟩
 
 /-! ## Bounded search and concrete multi-worker traces -/
 

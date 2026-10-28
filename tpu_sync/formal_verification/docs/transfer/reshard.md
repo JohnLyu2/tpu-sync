@@ -102,14 +102,20 @@ publication is `Caller.Contract`, satisfied by `connectorFixed` for
 `vllm-torchtpu`'s Stage-3 connector both for a single worker and across
 workers aggregated by `KVOutputAggregator` in `Caller/MultiWorker.lean`,
 including its early `invalid_block_ids` path
-`_stage3_fail_uncertain_loads_early` via `earlyLoadError_fail_holds_blocks`).
+`_stage3_fail_uncertain_loads_early` via `earlyLoadError_fail_holds_blocks`
+and `mw_earlyLoadError_fail_holds_blocks`).
 
 Not modelled: Python submit-worker threading and topology-admission tables in
 the external connector above `ReshardService`, partial-prefix load failures and
-preemption/prefix caching (`Caller` B1–B3), and disjointness of source and
-destination units (`src_units ∩ dst_units = ∅`), which is treated as a
-caller/planner precondition (`BuildStartTransferForTarget` sets
-`is_sender = true` when a unit appears in both lists, which
+preemption/prefix caching (`Caller` B2–B3), disjointness of destination device
+pages across concurrent transfers (`MultiRequest` A1: all pools sharing a
+`storage_index` use a uniform `block_stride_bytes` in `ConfigurePoolStaging` so
+blocks $b \neq b'$ occupy disjoint device byte ranges $[b \cdot S, (b+1) \cdot S)$,
+and the engine's unified `[0, num_blocks)` block pool hands out distinct
+uncached `dst_device_block_ids` across all cache groups to concurrent transfers),
+and disjointness of source and destination units (`src_units ∩ dst_units = ∅`),
+which is treated as a caller/planner precondition (`BuildStartTransferForTarget`
+sets `is_sender = true` when a unit appears in both lists, which
 `WorkerServiceImpl::StartTransfer` dispatches only to `PoolReshardPush`).
 
 ### Transport and staging boundary (below the session callbacks)
@@ -137,6 +143,7 @@ the full statements and arguments are in the module docstrings.
 | Assumption | One-line statement | Status |
 |---|---|---|
 | Pipeline / MultiRequest engine contract | Destination reads `dstHbm` only after `done_recving`; producer reclaims `srcHbm` only after transfer settlement. | External contract; encoded as the guards of `.recycleSrc` / `.nextRequest` in `Reshard/MultiRequest.lean`. The other direction is `Transfer/Caller.lean`. |
+| MultiRequest A1 — cross-transfer destination page disjointness | Destination device pages (`dstHbm`) of distinct concurrent transfers are disjoint, guaranteed by the allocator. | All pools sharing a `storage_index` have a uniform `block_stride_bytes` (`ConfigurePoolStaging`) and fit inside `[b * stride, (b + 1) * stride)` (`PoolSpec::Validate`), so blocks $b \neq b'$ never overlap in device bytes; the engine's unified `[0, num_blocks)` block pool hands out distinct uncached `dst_device_block_ids` across all cache groups to concurrent transfers, and host arena slots are disjoint across `uuid`s (`PoolStaging.no_slot_aliasing_between_distinct_uuids`). |
 | Receive A1 — at-most-once `OnPoolReceived` per declared pool | `CompleteIncomingPush` fires `OnPoolReceived(l, uuid)` only when `plan_pushes == expected_chunks`, and `RecordPoolReceivedLocked` rejects undeclared or duplicate pool indices. | Discharged: `Pipeline.StreamAccountingSafe`, `Coverage.stream_count_matches`, `CoveragePipeline.step_pipe`. |
 | Receive A2 — registration before visibility | `RegisterActivePlanDirect` and `AcquireStagingLeases` in `ReshardReceiveSession::Create` succeed before insertion into `active_pool_reshard_recvs_`, rolling back both on failure. | Discharged: `PoolStaging.reachable_reserveBeforeLease_safe`, `Coordinator.no_push_before_all_armed`. |
 | Receive A3 / Send A3 — no double end and single `StartPoolPush` lock step | Each admitted push and each H2D/D2H op ends at most once; `StartPoolPush`'s two `done_ \|\| finalizing_` checks inspect only immutable plan fields in between and fold into `d2hDone`. | C++ callback and control-flow discipline. |
@@ -144,6 +151,7 @@ the full statements and arguments are in the module docstrings.
 | Send A1 — non-empty schedule with positive peer counts per active pool | `ReshardSendSession::Create` rejects `remaining_pool_peer_pushes <= 0`, and `ExecutePush` skips pools with zero scheduled entries on this sender, matching `CountPoolReshardSendSlots`. | Discharged: `Coverage.senderStreams_pos_iff`, `Send.validPools`. |
 | Send A2 — `ExecutePush` starts before external `Finish` | `PoolReshardPush` inserts the session into `active_pool_reshard_sends_` and immediately invokes `ExecutePush`, which takes its caller op (`++in_flight_`). | C++ init discipline (`KVCacheManagerWithTransfer::PoolReshardPush`). |
 | Send A4 — per-transfer connection-release window in `EndOp` | Under `DataConnectionReuse::kPerTransfer`, the last op (`in_flight_ == 1 && finalizing_`) drops `mu_` in `EndOp` to call `ReleaseDataConnectionsAfterSend` before `--in_flight_` and `SettleLocked()`; nothing modelled changes in the window. | Soundness argument in `Send.lean`. |
+| Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`), whole-transfer failure, no preemption/prefix caching | `Transfer/Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_staggered_eq_batch`, `mw_earlyLoadError_fail_holds_blocks`; enforced across TP ranks by `_sync_stage3_tp_submit_states`); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
 
 ## Shipping C++ vs. modelled design alternatives
 
@@ -286,14 +294,17 @@ vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73`
 (`TPURaidenConnectorWorker.get_finished`, `_poll_finished`,
 `_apply_stage3_submit_outcome`, `_stage3_fail_uncertain_loads_early`,
 `get_block_ids_with_load_errors`, `_sync_stage3_tp_submit_states`,
-`get_finished_count`; `KVOutputAggregator.aggregate_kv_connector_output`;
+`get_finished_count`; `KVOutputAggregator.aggregate`;
 scheduler `_handle_invalid_blocks`, `_update_from_kv_xfer_finished`,
 `finish_requests`, `_update_waiting_for_remote_kv`, `kv_load_failure_policy`) →
-`Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.fixed_contract`,
+`Caller.contract_safe`, `Caller.mw_contract_safe`,
+`Caller.applyRecv_staggered_eq_batch`, `Caller.fixed_contract`,
 `Caller.earlyLoadError_fail_eq_finish`,
 `Caller.earlyLoadError_fail_holds_blocks`,
+`Caller.mw_earlyLoadError_fail_eq_finish`,
+`Caller.mw_earlyLoadError_fail_holds_blocks`,
 `Caller.trace_fixed_early_uncertain_load_error`, `Caller.trace_fixed_*`,
-`Caller.trace_mw_staggered_*`.
+`Caller.trace_mw_staggered_*`, `Caller.trace_mw_overcounted_expected_leaks`.
 
 ## Where the rest lives
 
