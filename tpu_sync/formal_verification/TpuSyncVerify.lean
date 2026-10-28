@@ -19,6 +19,7 @@ import TpuSyncVerify.Transfer.Reshard.Pipeline
 import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
+import TpuSyncVerify.Transfer.Reshard.Coordinator
 -- The remaining Transfer models and the Controller model land in follow-up
 -- changes and are imported here as they arrive.
 
