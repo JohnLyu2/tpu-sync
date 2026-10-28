@@ -39,6 +39,11 @@ header_only_cc_info(
     ],
 )
 
+_X86_MARCH_COPTS = select({
+    "@platforms//cpu:x86_64": ["-march=x86-64-v2"],
+    "//conditions:default": [],
+})
+
 cc_library(
     name = "weight_synchronizer_torch",
     srcs = ["weight_synchronizer.cc"],
@@ -46,8 +51,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -57,22 +61,15 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         ":torch_utils",
-        "@com_google_absl//absl/container:btree",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
-        "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
     ],
@@ -87,8 +84,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -100,7 +96,6 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:xla_raw_transfer_headers",
     ],
 )
 
@@ -111,8 +106,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -170,8 +164,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -211,8 +204,7 @@ nanobind_extension(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -251,8 +243,7 @@ nanobind_extension(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -264,9 +255,7 @@ nanobind_extension(
         "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:block_transport",
-        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -281,8 +270,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
@@ -313,8 +301,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
@@ -348,8 +335,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
@@ -382,8 +368,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     deps = [
         "@torch_tpu//shims/torch:aten_headers",
@@ -402,8 +387,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     deps = [
         ":torch_tpu_utils_mock",
@@ -422,8 +406,7 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
@@ -461,31 +444,23 @@ cc_library(
     copts = [
         "-std=c++20",
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         ":torch_utils_mock",
-        "@com_google_absl//absl/container:btree",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/log",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
-        "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
     ],
@@ -528,6 +503,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
+        "@torch_tpu//csrc/api:tensor_buffer",
     ],
 )
 
@@ -641,11 +617,8 @@ py_test(
     ],
     deps = [
         ":_torch_raw_transfer",
-        "//pyglib/contrib/g3_multiprocessing",
         "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",
     ],
@@ -664,11 +637,8 @@ py_test(
     ],
     deps = [
         ":_torch_raw_transfer",
-        "//pyglib/contrib/g3_multiprocessing",
         "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",
     ],
@@ -721,12 +691,8 @@ py_test(
         "requires-net:external",
     ],
     deps = [
-        ":_torch_raw_transfer",
-        ":_tpu_raiden_torch",
         "//tpu_sync/api/torch:raw_transfer",
         "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",
     ],
@@ -744,12 +710,8 @@ py_test(
         "requires-net:external",
     ],
     deps = [
-        ":_torch_raw_transfer",
-        ":_tpu_raiden_torch",
         "//tpu_sync/api/torch:raw_transfer",
         "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",
     ],
