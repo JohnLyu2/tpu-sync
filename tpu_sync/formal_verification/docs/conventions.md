@@ -45,9 +45,9 @@ machinery in `Common/`. Each model file has these sections, in this order:
 
 1. **Module docstring** — what is modelled; abbreviations for cited files; the
    **State** table (field → C++ → role); the **Events** table (event → C++
-   symbol or code fragment); the **Source map** (see [Citing the
-   C++](#citing-the-c)); **Assumptions**; **Properties**, each stated in words
-   with the C++ promise it corresponds to.
+   symbol or code fragment); the **Lock scopes** table; the **Source map** (see
+   [Citing the C++](#citing-the-c)); **Assumptions**; **Properties**, each
+   stated in words with the C++ promise it corresponds to.
 2. `structure S` and `init`.
 3. `inductive Ev`; one `def` per event (named so it does not collide with a
    field of `S`, or dot notation breaks); `step`; `sys`.
@@ -94,13 +94,16 @@ them. No event re-derives `done` or `draining` by hand.
 uses it under another, the model has two events (`h2dBegin` / `h2dIssue`), and
 the state between them is a ghost counter.
 
-**One lock scope per event, or say why not.** `step` applies an event
-atomically; the C++ has only critical sections. A module's **Lock scopes**
-table (after the events table; `Receive.lean` is the template) lists, per
-event, the `mu_` scopes it stands for and, when there are several, what another
-thread can do between them and why that interleaving ends in a state the model
-also reaches. Where the argument fails, split the event; where it holds only
-because of code outside the model, it is an assumption.
+**Lock scopes.** A Lean `step` runs as a single atomic transition, whereas the
+C++ only holds locks over individual critical sections. Each module's **Lock
+scopes** table (right after the events table) shows which C++ lock acquisitions
+each event represents. Most events map to a single `absl::MutexLock(&mu_)` or a
+single atomic read/write. When an event covers two lock scopes—or checks an
+unlocked atomic before taking `mu_`—the table explains why nothing another
+thread can do in the gap leads to a state outside the model (or cites the
+assumption that prevents it). Where an interleaving between two lock scopes
+matters, the model splits them into two events (as in **One event per race
+window** above).
 
 **Ghost fields.** A ghost field has no single C++ variable behind it. It
 records where each unit of a counter came from (`pending`, `retired`,

@@ -66,42 +66,15 @@ subsequent H2D clobbers `dstHbm[1]` to `.junk`.
 ## Lock scopes
 
 Sender events (`send e`) and receiver events (`recv e`) inherit the
-`ReshardSendSession::mu_` and `ReshardReceiveSession::mu_` critical sections
-documented in `Send.lean` and `Receive.lean` §"Lock scopes". The pipeline-level
-events and cross-component guards map to C++ synchronization as follows:
-* **`armRecv`, `send (.d2hIssue p true)`, and `recv .pushBegin`:** Phase 1 of
-  `ReshardCoordinator::ExecutePoolReshard` calls
-  `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, which checks any
-  incumbent under 1 `KVCacheManagerWithTransfer::mu_` scope, creates the
-  `ReshardReceiveSession` (`RegisterActivePlanDirect` + `AcquireStagingLeases`),
-  and inserts it into `active_pool_reshard_recvs_` under a second
-  `KVCacheManagerWithTransfer::mu_` scope (`armed = true`). The Stage 1
-  `for (std::thread& t : armers) t.join();` barrier orders
-  `PoolReshardRegisterRecv` before Stage 2 sender dispatch
-  (`send (.d2hIssue p true)`) so no push arrives in the window between
-  `RegisterActivePlanDirect` and `active_pool_reshard_recvs_` insertion, and
-  `hooks.begin_incoming_push` then finds the `active_pool_reshard_recvs_` entry
-  under `KVCacheManagerWithTransfer::mu_` (`recv .pushBegin`).
-* **`landStream p` and `recv (.onPoolReceived p)`:** In
-  `BlockTransport::HandleIncomingPush`, the socket write into `dstStaging[p]`
-  (`if (expected_size > 0)`) runs while the caller holds a
-  `ReshardReceiveSession` `in_flight_` op from `pushBegin`
-  (`hooks.begin_incoming_push`), and `BlockTransport::CompleteIncomingPush`
-  (`if (plan_declared)`) accumulates landed shards (`plan_pushes`) under 1
-  `BlockTransport::progress_mu_` scope (`landStream p`). When `plan_pushes`
-  reaches `expected_chunks`, the same `progress_mu_` scope latches
-  `trigger_completion = true` and `CompleteIncomingPush` invokes
-  `block_delegate_->OnPoolReceived` (`hooks.on_pool_received`, which looks up
-  `active_pool_reshard_recvs_` under `KVCacheManagerWithTransfer::mu_` and calls
-  `ReshardReceiveSession::OnPoolReceived`, `recv (.onPoolReceived p)`) outside
-  `progress_mu_` before releasing the stream's op in `pushEnd`
-  (`hooks.end_incoming_push`).
-* **`reclaim`, `reseatSrcStaging`, `reseatDstStaging`:** External engine /
-  allocator actions gated by `send.published ≠ none` (`CompleteReadWithDetails`
-  under `KVCacheManagerWithTransfer::mu_`) and by `hasStaging = false` (after
-  `ReshardSendSession::SettleLocked` or
-  `ReshardReceiveSession::ReleaseStagingLocked` has released the
-  `PoolStagingLease` under session `mu_` and `KVCacheManagerBase::staging_mu_`).
+`ReshardSendSession::mu_` and `ReshardReceiveSession::mu_` scopes from
+`Send.lean` and `Receive.lean`. The pipeline-level events and cross-component
+guards map to C++ synchronization as follows:
+
+| Event | Scopes | Between them |
+|---|---|---|
+| `armRecv` | 2 `KVCacheManagerWithTransfer::mu_` scopes in `PoolReshardRegisterRecv`: incumbent check, then `ReshardReceiveSession::Create` (`RegisterActivePlanDirect` + `AcquireStagingLeases`) outside manager `mu_`, then insertion into `active_pool_reshard_recvs_` | Stage 1's `for (std::thread& t : armers) t.join();` barrier in `ExecutePoolReshard` completes before Stage 2 dispatches any sender (`send (.d2hIssue p true)`), so no push arrives before `active_pool_reshard_recvs_` is populated (`recv .pushBegin` requires `armed = true`) |
+| `landStream p` | unlocked socket write (`if (expected_size > 0)`) in `HandleIncomingPush` while holding a `pushBegin` lease (`pushes > 0`), followed by 1 `BlockTransport::progress_mu_` scope in `CompleteIncomingPush` (`if (plan_declared)`) | the `pushBegin` lease keeps `in_flight_ > 0` on the receive session so `dstStaging` cannot be released (`reseatDstStaging` is disabled) during the write; when `plan_pushes` reaches `expected_chunks`, the same `progress_mu_` scope latches `trigger_completion = true` before `OnPoolReceived` (`recv (.onPoolReceived p)`) and `EndIncomingPush` (`pushEnd`) run |
+| `reclaim`, `reseatSrcStaging`, `reseatDstStaging` | 0 (caller engine or `KVCacheManagerBase::staging_mu_`, outside session `mu_`) | enabled only after `send.published ≠ none` or `hasStaging = false`, which `Send.lean` and `Receive.lean` establish under their session locks |
 
 ## Source map
 

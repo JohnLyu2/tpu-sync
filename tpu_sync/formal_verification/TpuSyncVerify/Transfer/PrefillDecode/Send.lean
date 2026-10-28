@@ -3,8 +3,6 @@ import TpuSyncVerify.Transfer.PrefillDecode.Send.Invariant
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Frame
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Traces
-import TpuSyncVerify.Transfer.PrefillDecode.Send.Coverage
-import TpuSyncVerify.Transfer.PrefillDecode.Send.Guards
 
 /-!
 # Send session
@@ -91,49 +89,45 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
 
 ## Lock scopes
 
-`step` applies each event atomically; the C++ has only critical sections of
-the session's `mu_` (see `docs/conventions.md`, "One lock scope per event").
 Every mutable field of `TransferSendSession` is `ABSL_GUARDED_BY(mu_)` except
-`remaining_h2h_layers_`, an atomic whose only reader is its own `fetch_sub`;
-`base_`, `staging_allocator_`, `req_id_`, `uuid_`, `deadline_`,
-`register_start_` and `data_connection_reuse_` are `const`. Every `EndSendOp` below is one scope
-under the default connection policy and the A7 window under `per_transfer`.
-Scopes per event:
+`remaining_h2h_layers_`, an atomic read only by its own `fetch_sub`; `base_`,
+`staging_allocator_`, `req_id_`, `uuid_`, `deadline_`, `register_start_` and
+`data_connection_reuse_` are `const`. Every `EndSendOp` below is one `mu_` scope
+under the default `pooled` connection policy and the A7 window under
+`per_transfer`.
 
 | Event          | `mu_` scopes | Between them |
 |----------------|--------------|--------------|
-| `beginPull`    | one, `ValidateAndBeginPull` | — (`deadline_` is `const`) |
-| `start`        | one deciding scope, `StartPush`'s locked section (`if (draining_ || done_) return;` through `dst_ints_.assign`); before it, `remote_data_endpoints_ =` and the scopes of `AcquireStagingWithRetry` write only `remote_data_endpoints_` and `staging_` | a `Finish` during `AcquireWithTimeout` hits `if (draining_ || done_)` in `AcquireStagingWithRetry` and drops the local `StagingAllocation` before `staging_` is assigned; one between `staging_ = *std::move(acquired)` and `StartPush`'s locked section settles the idle session and releases `staging_` (`FinishLocked` runs `ReleaseStagingBlocksLocked()` at `in_flight_ == 0`); the locked section then returns — both are the model's `cancel` before `start`, which `start` refuses. A failed acquisition or bad arguments are `Finish(error)`, i.e. `cancel` |
-| `d2hBegin`     | one, the loop's `session_lock` (`if (draining_) return; ++in_flight_;`) | — |
-| `d2hIssue`     | success: one scope, `d2h_layer_futures_.push_back(layer_future)`, after the unlocked `D2hSyncDispatch`, then `layer_future.OnReady` registered outside the lock and, for the last layer, `SendNextLayer(0)`'s own scope (A6); failure: one scope, `FinishLocked(future.status()); EndSendOpLocked();` | a `Finish` during the dispatch finds the op `d2hBegin` took and cannot settle; the future is recorded regardless of `draining_`, as the model's `d2hIssue` does, and the copy drains through `d2hEnd` (`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`). A future already ready when `OnReady` is registered runs its callback inline, the model's `d2hReady` then `d2hEnd` |
-| `d2hReady`     | none (device) | — |
-| `d2hEnd`       | one, `EndSendOp` | — |
-| `wake`         | `ok = false`: two, `FinishLocked(status_or.status(), kD2hPhase)` then `EndSendOp` from the `absl::Cleanup end_op`; `ok = true` on a draining session: two, the `if (self->draining_)` check then the same tail; otherwise one, the check, after which `std::move(end_op).Cancel()` carries the op into the unlocked `push_pool()->Schedule` | a `Finish` after the check and before the pool task runs is seen by the task's own `if (self->draining_)`: the model's `wake true`, `cancel`, `h2hIssue` ending the op |
-| `h2hIssue`     | draining: two, the task's `if (self->draining_)` check then `EndSendOp` from its `end_op`; otherwise one, the check through `++self->in_flight_`, then the unlocked `H2hWriteDirectAsync` | a `Finish` between `++self->in_flight_` and the issue does not stop the push — neither does the model's `h2hIssue` re-check — and the push's callback then retires it (`Finish()` on the last OK push is ignored once draining); splitting the task here (`chaining`) is also what admits a push callback that runs before `SendNextLayer(l + 1)`, including inline (`h2hIssue`, `h2hDone`, `sendNext`) |
-| `sendNext`     | `l + 1 < num_layers`: two, `SendNextLayer(l + 1)`'s scope (`if (draining_ || l >= d2h_layer_futures_.size()) return;` .. `++in_flight_;`), then `EndSendOp` from the pool task's `end_op`; for the last layer `SendNextLayer` returns before its lock (`if (l >= base_->num_layers()) return;`), leaving only `EndSendOp` | an `EndSendOp` tail, below |
-| `h2hDone`      | `ok = false`: two, `FinishLocked(push_res.status(), kPushPhase)` then `EndSendOp` from `end_op`; `ok = true`: the lock-free `remaining_h2h_layers_.fetch_sub(1)`, then `Finish()` (one scope) if it was the last, then `EndSendOp` | nothing else reads `remaining_h2h_layers_`, so a step between the `fetch_sub` and `Finish()` is the model's step ordered before `h2hDone` (a `cancel` there wins, as `cancel` then `h2hDone true` does in the model, `finishOnceLocked` ignoring the later OK); after `Finish()`, an `EndSendOp` tail |
-| `cancel`       | one, `Finish(error)`; the sweep decides `!IsDraining()` in an earlier scope (`deadline()` is `const`) | the sender's `FinishLocked` ignores every call after the first (`if (draining_ || done_) return;`), so a `Finish` whose condition went stale is a no-op in both — the model's `cancel` after `finish` (`trace_cancel_after_ok_finish`, `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess`) |
-| `publish`      | `Done()`, then `GetStatus()`, `Details()` | nothing changes on a settled sender (`TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone`); unlike the receiver, no late error can split the set from the details |
+| `beginPull`    | 1: `ValidateAndBeginPull` | — (`deadline_` is `const`) |
+| `start`        | 1 deciding scope: `StartPush`'s locked section (`if (draining_ || done_) return;` through `dst_ints_.assign`), preceded by `remote_data_endpoints_ =` and the scopes of `AcquireStagingWithRetry` (which touch only `remote_data_endpoints_` and `staging_`) | a `Finish` during `AcquireWithTimeout` hits `if (draining_ || done_)` in `AcquireStagingWithRetry` and drops the local `StagingAllocation` before `staging_` is assigned; a `Finish` between `staging_ = *std::move(acquired)` and `StartPush`'s locked section settles the idle session and releases `staging_` (`FinishLocked` runs `ReleaseStagingBlocksLocked()` at `in_flight_ == 0`), after which the locked section returns — both match `cancel` before `start`. A failed acquisition or bad arguments call `Finish(error)` (`cancel`) |
+| `d2hBegin`     | 1: the loop's `session_lock` (`if (draining_) return; ++in_flight_;`) | — |
+| `d2hIssue`     | on success, 1 scope (`d2h_layer_futures_.push_back(layer_future)`) after the unlocked `D2hSyncDispatch`, then `layer_future.OnReady` outside `mu_` and, for the last layer, `SendNextLayer(0)`'s scope (A6); on failure, 1 scope (`FinishLocked(future.status()); EndSendOpLocked();`) | a `Finish` during `D2hSyncDispatch` finds the op `d2hBegin` took and cannot settle; the future is pushed regardless of `draining_` (matching `d2hIssue`), and the copy drains through `d2hEnd` (`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`). If `layer_future` is already ready when `OnReady` is registered, the callback runs inline (`d2hReady` then `d2hEnd`) |
+| `d2hReady`     | 0 (device) | — |
+| `d2hEnd`       | 1: `EndSendOp` | — |
+| `wake`         | on `ok = false` or `draining_`: 2 (`FinishLocked` or the `if (self->draining_)` check, then `EndSendOp` from `absl::Cleanup end_op`); otherwise 1 (`if (self->draining_)` check, then `std::move(end_op).Cancel()` carries the op into the unlocked `push_pool()->Schedule`) | a `Finish` after the check and before the pool task runs is caught by the task's own `if (self->draining_)` check (`wake true`, `cancel`, `h2hIssue` ending the op) |
+| `h2hIssue`     | when draining: 2 (the task's `if (self->draining_)` check, then `EndSendOp` from `end_op`); otherwise 1 (the check through `++self->in_flight_`, followed by the unlocked `H2hWriteDirectAsync`) | a `Finish` between `++self->in_flight_` and `H2hWriteDirectAsync` does not stop the push (matching `h2hIssue`), and the push callback later retires the op (`Finish()` on the last OK push is a no-op once draining). Splitting the pool task into `h2hIssue` and `sendNext` via `chaining` also admits a push callback that runs before `SendNextLayer(l + 1)`, including inline (`h2hIssue`, `h2hDone`, `sendNext`) |
+| `sendNext`     | for `l + 1 < num_layers`: 2 (`SendNextLayer(l + 1)`'s scope from `if (draining_ || l >= d2h_layer_futures_.size()) return;` to `++in_flight_;`, then `EndSendOp` from the pool task's `end_op`); for the last layer, `SendNextLayer` returns before its lock (`if (l >= base_->num_layers()) return;`), leaving only `EndSendOp` | an `EndSendOp` tail, below |
+| `h2hDone`      | on `ok = false`: 2 (`FinishLocked(push_res.status(), kPushPhase)`, then `EndSendOp` from `end_op`); on `ok = true`: lock-free `remaining_h2h_layers_.fetch_sub(1)`, then `Finish()` (1 scope) if it was the last layer, then `EndSendOp` | nothing else reads `remaining_h2h_layers_`, so any step between `fetch_sub` and `Finish()` orders before `h2hDone` (a `cancel` in that gap wins, matching `cancel` then `h2hDone true` because `finishOnceLocked` ignores the later OK); after `Finish()`, an `EndSendOp` tail |
+| `cancel`       | 1: `Finish(error)` (for the deadline sweep, `!IsDraining()` is checked in an earlier scope; `deadline()` is `const`) | `TransferSendSession::FinishLocked` ignores every call after the first (`if (draining_ || done_) return;`), so a stale sweep is a no-op (`trace_cancel_after_ok_finish`, `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess`) |
+| `publish`      | under manager `mu_`: `Done()`, `GetStatus()`, `Details()` | nothing changes on a settled sender (`TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone`), so no late error can split the published set from `transfer_details_` |
 
-**`EndSendOp` tails.** `wake`, `h2hIssue`, `sendNext` and `h2hDone` all end
-in `EndSendOp` from an `absl::Cleanup` that runs after the deciding scope's
-lock is released. Between the two the C++ state differs from the model's
-post-state in one way: `in_flight_` still counts the op. The only decisions
-that read `in_flight_` are the settle checks in `FinishLocked` and
-`EndSendOpLocked` (and A7's `release_due`), so a step taken in the gap decides
-as it would after the whole event, except that a `Finish` in the gap leaves the
-settle to the tail instead of performing it, with the same `draining_`, `done_`
-and `status_` at the end. Every such interleaving therefore ends in the state
-the model reaches by taking the event and then the other step; the ghost
-counters (`d2hRetired`, `woken`, `pooled`, `chaining`, `h2hRetired`) are
-sound for the same reason.
+**`EndSendOp` tails.** `wake`, `h2hIssue`, `sendNext` and `h2hDone` all run
+`EndSendOp` from an `absl::Cleanup` after releasing the deciding scope's lock.
+Between the two scopes, `in_flight_` still counts the op. Because only the
+settle checks in `FinishLocked` and `EndSendOpLocked` (and A7's `release_due`)
+read `in_flight_`, any step in the gap makes the same decision as after
+`EndSendOp`, except that a `Finish` in the gap leaves the final settle to
+`EndSendOp` with the same resulting `draining_`, `done_` and `status_`. Every
+such interleaving therefore reaches the same state as running the whole event
+first, keeping the ghost counters (`d2hRetired`, `woken`, `pooled`, `chaining`,
+`h2hRetired`) sound.
 
-**Where the scope decides before the model's guard.** `d2hIssue` records a
-future and `h2hIssue` issues a push without re-reading `draining_`; the model
-does the same, so a `cancel` between `d2hBegin` and `d2hIssue`, or between
-`h2hIssue`'s scope and the transport call, is admitted in the same order. The
-only place the model is coarser than one scope by design is A6, the fold of
-`SendNextLayer(0)` into the last `d2hIssue`.
+**Unchecked dispatches.** Neither `d2hIssue` (when pushing the future) nor
+`h2hIssue` (when calling `H2hWriteDirectAsync`) re-reads `draining_`; the model
+matches this directly, so a `cancel` between `d2hBegin` and `d2hIssue`, or
+between `h2hIssue`'s lock and the transport call, is admitted in the same order.
+The only multi-scope fold across distinct operations is A6 (`SendNextLayer(0)`
+folded into the last `d2hIssue`).
 
 ## Assumptions
 
@@ -211,13 +205,6 @@ All proved on every reachable state (`reachable_safe`):
 * **Pull claim (`PullClaimed`).** `(started → pullStarted) ∧ ((d2hPending ∨ 0 < d2hIssued) → started)`:
   `StartPush` never runs unless `ValidateAndBeginPull` claimed `pull_started_`,
   and no D2H copy is pending or issued unless `StartPush` started.
-* **Published is quiet (`PublishedQuiet`).** `published ≠ none → d2hPending = false ∧ d2hRetired = d2hIssued`:
-  once `poll_stats()` has reported the send, as `done_sending` or as failed,
-  no D2H copy is dispatching or still reading prefill HBM, so the engine may
-  reclaim it. The sender's promise to the engine at the session level (the
-  pipeline restates it as `PrefillHbmSafe`); added when the guard inventory
-  (`Send/Guards.lean`) found that dropping `Done()` before publishing
-  violated nothing the module stated.
 * **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and
@@ -232,38 +219,6 @@ outstanding, so a shutdown or deadline in that window leaves the status OK
 there is no `failed_sending_`. (3) The D2H loop's `if (draining_) return;` in
 `StartPush` also skips `SendNextLayer(0)`, which is fine because every later
 `SendNextLayer` re-checks `draining_`.
-
-## Coverage and guards
-
-`Coverage.lean` measures how much of `step` the replayed upstream tests
-exercise, as `Receive/Coverage.lean` does (branch = leaf of an event's
-decision tree × effect on the lifecycle; the reachable set is exhaustive for
-zero, one and two layers: 43 branches, every leaf live). The 29 upstream tests
-paired with traces (15 distinct) reach 26 of the 43; nine more send-lifecycle
-tests are not replayable — six because their stimulus is an external
-`Finish(OkStatus())`, the consumer-Ack path A5 excludes, three because the
-pull is rejected before `pull_started_`. The 17 gaps are tabulated there with
-a schedule reaching each and classified: 7 missing upstream tests (no test
-fails a D2H dispatch or a push; the expired-then-failed copy; the
-`DoneGuarantees…` completions in the other order) and 10 lock-window
-interleavings inside `StartPush`'s loop, `SendNextLayer` or the push-pool task
-that no harness hook reaches. Pairing fixed one fact the traces had left open:
-the two callbacks on a layer's D2H future run in reverse registration order on
-the setting thread (`xla::Future::OnReady` → `AsyncValue::AndThen`), so a copy
-the test completes runs `SendNextLayer`'s before `StartPush`'s. The `#guard` at
-the end of `Coverage.lean` fails if a branch, a trace or a classification
-changes.
-
-`Guards.lean` asks the other question: which of the C++ checks `step`
-transcribes do the properties need? Each is dropped or weakened and searched
-exhaustively against `Safe` without the ghost-counter equations. Five are
-load-bearing (the loop's `if (draining_) return`, the last-push
-`FinishLocked()`, `Done()` before publishing, `draining_` in the settle
-condition, `in_flight_ == 0` in `FinishLocked`); seven survive — the first
-lines of a two- or three-line defence against working for a dead send, and
-the first-`Finish`-wins rule, which no safety property can see. The
-`Done()`-before-publishing check survived the `Safe` the module had;
-`PublishedQuiet` is the property that was missing.
 
 ## Source map
 
@@ -328,17 +283,17 @@ Generated by `tools/resolve_anchors.py`.
 | `pool_reshard_test.cc` | `SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` | `:369-378` |
 | `control_test.cc` | `ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected` | `:311-333` |
 | `control_test.cc` | `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement` | `:370-382` |
-| `transfer_send_session_test.cc` | `FakeSendBase::CompleteH2h` | `:82-89` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone` | `:189-212` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:214-234` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush` | `:236-268` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush` | `:270-296` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:298-313` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface` | `:315-345` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator` | `:380-423` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm` | `:425-452` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `:454-511` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang` | `:550-569` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone` | `:592-622` |
+| `transfer_send_session_test.cc` | `FakeSendBase::CompleteH2h` | `:83-90` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone` | `:190-213` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:215-235` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush` | `:237-269` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush` | `:271-297` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:299-314` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface` | `:316-346` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator` | `:381-424` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm` | `:426-453` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `:455-512` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang` | `:551-570` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone` | `:593-623` |
 <!-- source-map:end -->
 -/

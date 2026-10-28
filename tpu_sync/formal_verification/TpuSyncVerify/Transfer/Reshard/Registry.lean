@@ -85,20 +85,13 @@ and `reshard_service_test.cc`
   Every mutable map of `RequestBlockRegistry` (`request_blocks_`, `claimed_`,
   `claimed_units_`, `claimed_owners_`, `completed_units_`, and `cancelled_`) is
   `ABSL_GUARDED_BY(mu_)` (the controller mutex shared with `WorkUnitDirectory`).
-  Every event in `Ev` (`register`, `lookupAndClaim`, `abandonClaim`, `complete`,
-  `cancelIfUnclaimed`, `release`) is **one `absl::MutexLock lock(*mu_)` critical
-  section** in `RequestBlockRegistry::Register`, `LookupAndClaim`,
-  `AbandonClaim`, `Complete`, `CancelIfUnclaimed`, and `Release` (`Register`,
-  `Release`, `Complete`, and `LookupAndClaim` run both
-  `PurgeExpiredRequestBlocksLocked` and `PurgeExpiredLifecycleLocked` on entry;
-  `CancelIfUnclaimed` runs `PurgeExpiredLifecycleLocked`; `AbandonClaim` runs
-  neither). `Register` validates its arguments before taking `mu_` and, when
-  `pool_spans` is non-empty, takes `mu_` once more beforehand only to snapshot
-  `directory_->PoolManifestLocked(unit)`, touching none of the registry maps
-  (`retired` in `RegGen` is a single-generation monotonicity latch assuming no
-  re-registration of the same `(req_id, uuid)` after `RetireLocked` erases its
-  entries). Each model transition is therefore a 1:1 atomic `mu_` scope with no
-  multi-scope folding.
+
+  | Event | `mu_` scopes | Between them |
+  |---|---|---|
+  | `register` | 1 deciding `RequestBlockRegistry::mu_` scope (`PurgeExpiredRequestBlocksLocked`, `PurgeExpiredLifecycleLocked`, `cancelled_` / `claimed_` checks, `request_blocks_` insertion); when `pool_spans` is non-empty, `Register` takes `mu_` once beforehand only to snapshot `directory_->PoolManifestLocked(unit)` | the manifest snapshot touches none of the registry maps (`retired` in `RegGen` is a single-generation latch assuming no re-registration of the same `(req_id, uuid)` after `RetireLocked`) |
+  | `lookupAndClaim`, `complete`, `release` | 1 `RequestBlockRegistry::mu_` scope (each runs `PurgeExpiredRequestBlocksLocked` and `PurgeExpiredLifecycleLocked` on entry) | — |
+  | `cancelIfUnclaimed` | 1 `RequestBlockRegistry::mu_` scope (runs `PurgeExpiredLifecycleLocked` on entry) | — |
+  | `abandonClaim` | 1 `RequestBlockRegistry::mu_` scope | — |
 
   ## Main results
 

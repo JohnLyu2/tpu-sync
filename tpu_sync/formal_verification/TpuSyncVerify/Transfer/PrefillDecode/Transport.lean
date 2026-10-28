@@ -108,27 +108,27 @@ completion behaviour (A4 in `Receive.lean` restates this over shards).
 
 ## Lock scopes
 
-Per `docs/conventions.md` ("One lock scope per event"). This module's `stream`
-is the one deliberately coarse event in the prefill-to-decode models: it
-spans two mutexes. In order, `TryBeginRecvOp` (session `mu_`), the payload
-(unlocked), the `expected_senders` lookup (`progress_mu_`), the unlocked
-`ExpectedPushSenders` (A2), the table update with the latch and the retirement
-erase (`progress_mu_`, A1), then on the same thread `OnLayerReceived` →
-`ExecuteLayerH2d` (session scopes, audited in `Receive.lean`),
-`OnBlockShardsReceived` (one session scope, plus `MaybeUnregisterSettledRecv`)
-and `EndIncomingPush` → `EndRecvOp` (one session scope, plus
-`MaybeUnregisterSettledRecv` and `GetStatus()`); a rejection returns early and
-the `absl::Cleanup end_incoming_push` runs `EndIncomingPush(InternalError(...))`,
-which runs `DeferUnregisterOnSettle()` and `Finish(status)` before `EndRecvOp()`.
+`stream` is the one deliberately coarse event in the prefill-to-decode models:
+it spans both `BlockTransport::progress_mu_` and `TransferReceiveSession::mu_`.
+In order on the push thread: `TryBeginRecvOp` (session `mu_`), the payload
+write (unlocked), the `expected_senders` lookup (`progress_mu_`), the unlocked
+`ExpectedPushSenders` check (A2), the `layer_progress_` update with the
+once-latch and retirement erase (`progress_mu_`, A1), then `OnLayerReceived` →
+`ExecuteLayerH2d` (session `mu_` scopes, audited in `Receive.lean`),
+`OnBlockShardsReceived` (session `mu_`, plus `MaybeUnregisterSettledRecv`), and
+`EndIncomingPush` → `EndRecvOp` (session `mu_`, plus `MaybeUnregisterSettledRecv`
+and `GetStatus()`). If `CompleteIncomingPush` rejects the push, the
+`absl::Cleanup end_incoming_push` runs `EndIncomingPush(InternalError(...))`,
+which calls `DeferUnregisterOnSettle()` and `Finish(status)` before `EndRecvOp()`.
 `h2dDone`, `publish` and `cancel` are `Receive.lean`'s `h2dDone`, `pollReady`
-and `cancel`, with the same scopes and the same arguments.
+and `cancel`.
 
 | Event | Scopes | Between them |
 |---|---|---|
-| `stream l s` | as above; the three properties read only `layer_progress_` (one `progress_mu_` scope), `in_flight_` and `num_completed_layers_` (session scopes) | other streams: their table updates are serialised by `progress_mu_` in some order, and that order is the model's interleaving of `stream` events; their delegate calls touch only the session, which `Receive.lean` covers. A `Finish(error)` after the lease and before the delegate calls ends: `ExecuteLayerH2d` (if not yet entered, or between its two locks) and `OnBlockShardsReceived` both return at `if (done_ || draining_)`, and `EndRecvOp` returns the lease, while the table keeps whatever latch the `progress_mu_` scope set. That state is outside `step`'s reach (a latched layer whose stream added no `blocks`, and no `pending` copy if `Finish` preceded `H2dSyncDispatch`), and satisfies `Safe`: `OnceDispatched` holds by the latch, `OnBlockShardsReceived`'s early return left `blocks` short of `c.target` so `networkCompleted` is false (`NetworkSound` holds vacuously), and `published` is false (`statusOk = false`). An OK `Finish()` (from `h2dDone` or `publish` if the last layer's H2D copy completes before `OnBlockShardsReceived`) likewise makes `OnBlockShardsReceived` return at `if (done_ || draining_)`, leaving `blocks < c.target` (`NetworkSound` vacuous) while `CompleteOnSuccess` holds because every layer was dispatched (`dispatched = 1`) and its copy already completed (`pending = 0`). The session half of these cases is exact in `Receive.lean` (`pushBegin, cancel, pushEnd` — or `pushBegin, h2dBegin, cancel, h2dIssue, pushEnd` — and `pushBegin, h2dBegin, h2dIssue true, ..., pushEnd`) |
-| `h2dDone l ok` | two (`Receive.lean`) | an `EndRecvOp` tail |
-| `publish` | `IsDraining()`, `IsReadyToComplete()`, `Finish()` (`Receive.lean`, `pollReady`) | monotone readiness; OK `Finish()` on a draining session is a no-op |
-| `cancel` | one | guarded here by `!draining` where `Receive.lean`'s is not; a stale sweep is the no-op above |
+| `stream l s` | `progress_mu_` and session `mu_` scopes above | concurrent streams serialize their `layer_progress_` updates on `progress_mu_` in the order of the model's `stream` events, and their session calls are covered by `Receive.lean`. If `Finish(error)` lands after `TryBeginRecvOp` and before the delegate calls finish, `ExecuteLayerH2d` and `OnBlockShardsReceived` return at `if (done_ || draining_)` and `EndRecvOp` releases the lease while `layer_progress_` keeps its latch; `Safe` still holds (`OnceDispatched` by the latch, `NetworkSound` vacuously because `blocks < c.target`, and `published = false`). Likewise, if an OK `Finish()` lands before `OnBlockShardsReceived`, every layer has already been dispatched and completed its H2D copy (`CompleteOnSuccess`), and `blocks < c.target` keeps `NetworkSound` vacuous |
+| `h2dDone l ok` | 2 (`Receive.lean`) | an `EndRecvOp` tail (`Receive.lean`) |
+| `publish` | `IsDraining()`, `IsReadyToComplete()`, `Finish()` (`Receive.lean`, `pollReady`) | monotone readiness; an OK `Finish()` on a draining session is a no-op |
+| `cancel` | 1: `Finish(error)` | guarded here by `!draining`; a stale sweep is a no-op |
 
 `BlockTransport::ForgetPushProgress` erases a uuid's entries under
 `progress_mu_` from `KVCacheManagerBase::UnregisterActivePlanDirect`, reached

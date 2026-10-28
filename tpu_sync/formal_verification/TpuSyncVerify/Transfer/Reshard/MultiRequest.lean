@@ -84,22 +84,10 @@ The top-level system theorems establish for **every** transfer `idx` (under both
 
 ## Lock scopes
 
-* **`reqStep idx e`:** Delegates to `Pipeline.step` on `ms.reqs[idx]` (whose
-  `ReshardSendSession::mu_`, `ReshardReceiveSession::mu_`,
-  `BlockTransport::progress_mu_`, and `KVCacheManagerWithTransfer::mu_` scopes
-  are documented in `Pipeline.lean` §"Lock scopes") and checks `wroteReleased`
-  against the pre-state release flags (`send.published`, `send.life.hasStaging`,
-  `recv.life.hasStaging`, `recv.published`).
-* **`recycleSrc idx` and `nextRequest idx`:** Stand for the caller and staging
-  arena reusing buffers after the release boundary — after
-  `ReshardSendSession::SettleLocked` (`ReshardSendSession::ReleaseLeasesLocked`)
-  and `ReshardReceiveSession::ReleaseStagingLocked` have released the
-  `PoolStagingLease` under session `mu_` and `KVCacheManagerBase::staging_mu_`,
-  and after `KVCacheManagerWithTransfer::CompleteReadWithDetails` has published
-  the session outcome under `KVCacheManagerWithTransfer::mu_` — and spawning a
-  fresh transfer via `ReshardCoordinator::ExecutePoolReshard`
-  (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv` and
-  `KVCacheManagerWithTransfer::PoolReshardPush`).
+| Event | Scopes | Between them |
+|---|---|---|
+| `reqStep idx e` | `Pipeline.step` scopes on `ms.reqs[idx]` (`Pipeline.lean` §"Lock scopes") | `wroteReleased` checks `ms.reqs[idx]`'s post-step buffers against its pre-state release flags (`send.published`, `send.life.hasStaging`, `recv.life.hasStaging`, `recv.published`) |
+| `recycleSrc idx`, `nextRequest idx` | 0 (caller engine and `PoolStagingStorage` after release, then `ReshardCoordinator::ExecutePoolReshard` to spawn a fresh transfer) | enabled only after `SettleLocked` / `ReleaseLeasesLocked` and `ReleaseStagingLocked` have released the `PoolStagingLease` under session `mu_` and `staging_mu_`, and after `CompleteReadWithDetails` has published the session outcome under manager `mu_` |
 
 ## Source map
 

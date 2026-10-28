@@ -42,20 +42,11 @@ ranges for every symbol, sub-block, and test are in the generated
 
 ## Lock scopes
 
-* **`startRead peer`:** Executes inside the `KVCacheManagerWithTransfer::mu_`
-  scope of `StartRead(remote_endpoint)`, which calls
-  `TransferReceiveSession::Create` (acquiring the new session's `mu_` in
-  `AllocateStagingForLoad` — nesting `StagingBlockAllocator::mu_` for one slot —
-  and in `InitFromLoadPlan`) and `EmplaceRecvSessionLocked`, followed outside
-  manager `mu_` by `ExecutePullRequest`'s setup `mu_` scope before scheduling on
-  `push_pool()`.
-* **`dispatchPull idx` and `sessStep idx e`:** `dispatchPull` models a
-  `push_pool_` worker thread picking up the scheduled task from
-  `ExecutePullRequest`; each `sessStep` event (`e : Recv.Ev`) has the
-  `TransferReceiveSession::mu_` scopes documented in `Receive.lean` §"Lock
-  scopes" (when `sessStep` settles a session, `ReleaseStagingLocked` →
-  `StagingBlockAllocator::ReleaseSlot` runs inside that settling `mu_` scope,
-  returning the slot to `freeSlots` under `StagingBlockAllocator::mu_`).
+| Event | Scopes | Between them |
+|---|---|---|
+| `startRead peer` | 1 outer `KVCacheManagerWithTransfer::mu_` scope in `StartRead(remote_endpoint)` (calling `TransferReceiveSession::Create` — which acquires session `mu_` and `StagingBlockAllocator::mu_` in `AllocateStagingForLoad` and `InitFromLoadPlan` — and `EmplaceRecvSessionLocked`), followed outside manager `mu_` by `ExecutePullRequest`'s initial session `mu_` scope before `push_pool()->Schedule` | `in_flight_ = 1` (`handshake_pending_ = true`) is set during `InitFromLoadPlan` before the session enters `active_recv_sessions_`, so any `cancel` before `ExecutePullRequest` still sees `in_flight_ = 1` and cannot release the staging slot early |
+| `dispatchPull idx` | 1 `push_pool_` worker thread picking up the scheduled task from `ExecutePullRequest` | on `tcpBlocking`, the worker blocks inside `SendPullRequestBlocking` until `pullReply`; on `grpcAsync`, `SendPullRequest` starts an async RPC and returns immediately |
+| `sessStep idx e` | `TransferReceiveSession::mu_` scopes of `e : Recv.Ev` (`Receive.lean`) | when `sessStep` settles a session, `ReleaseStagingLocked` → `StagingBlockAllocator::ReleaseSlot` runs inside that settling `mu_` scope, returning the slot to `freeSlots` under `StagingBlockAllocator::mu_` |
 
 ## What this module proves
 

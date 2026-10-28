@@ -72,44 +72,20 @@ ranges for every symbol, sub-block, and test are in the generated
   `ReshardCoordinator::StartPoolReshard` brackets `ExecutePoolReshard` with two
   `ReshardCoordinator::status_mu_` scopes (`transfer_status_[args.req_id]`), and
   `ExecutePoolReshard` reads `directory_->LocalMetadata` under `*directory_->mu_`
-  (shared with `RequestBlockRegistry::mu_`) on entry; its local stage vectors
+  (shared with `RequestBlockRegistry::mu_`) on entry. Stage-result vectors
   (`arm_replies` / `arm_status`, `sender_status`) are synchronized across worker
-  threads by the two `std::thread::join` barriers
-  (`for (std::thread& t : armers) t.join();` and
-  `for (std::thread& t : senders) t.join();`), while shared registry and
-  receiver state are synchronized under `RequestBlockRegistry::mu_`
-  (`Registry.lean`) and each destination's `KVCacheManagerWithTransfer::mu_`:
-  * **`registerProducer srcUnit`:** 1 `RequestBlockRegistry::mu_` scope
-    (`RequestBlockRegistry::Register`).
-  * **`startPlan planOk`:** 1 `RequestBlockRegistry::mu_` scope in
-    `BuildPoolReshardPlan` (`RequestBlockRegistry::LookupAndClaim`), plus a
-    second `RequestBlockRegistry::mu_` scope (`AbandonClaim`) if `planOk = false`
-    (`if (!plan_or.ok())` after claiming; a failure before `LookupAndClaim` takes
-    only `AbandonClaim`'s 1 no-op scope).
-  * **`armDstResult dstUnit ok`:** One `armers` worker thread invoking
-    `PoolReshardRegisterRecv` on `dstUnit` (`ReshardReceiveSession::Create` +
-    `active_pool_reshard_recvs_` insertion under 2
-    `KVCacheManagerWithTransfer::mu_` scopes) and writing its own
-    `arm_replies[i]` / `arm_status[i]` slot before exiting.
-  * **`finishArmBarrier`:** `for (std::thread& t : armers) t.join();` establishes
-    happens-before over all `arm_status[i]` writes; on `!status.ok()`,
-    `registry_->AbandonClaim(...)` runs in 1 `RequestBlockRegistry::mu_` scope.
-  * **`sendSrcResult srcUnit ok`:** One `senders` worker thread (or, under
-    `WorkerDelivery::Mode::kController`, one `SubmitTransferProgram` future
-    awaited in order) invoking `PoolReshardPush` on `srcUnit` and writing its own
-    `sender_status[i]` slot on failure. On `ok = true`, the model atomically
-    folds the sender RPC return, the receiver push delivery and settlement across
-    armed `dst_units` (`KVCacheManagerWithTransfer::mu_` and
-    `ReshardReceiveSession::mu_` scopes, `Receive.lean`), and the producer
-    worker's `registry_->Complete(...)` vote
-    (`ReshardService::HandleControllerCommand`
-    `COMMAND_COMPLETE_REQUEST_BLOCKS`, 1 `RequestBlockRegistry::mu_` scope) into
-    one step (sound for `CoordInv` because on partial failure `sendFailed = true`,
-    any failed or undispatched `srcUnit` never votes in `Complete`, keeping
-    `allVoted` `false`).
-  * **`finishSendBarrier`:** `for (std::thread& t : senders) t.join();` (or the
-    last `futures[i].Await()`) establishes happens-before over all
-    `sender_status[i]` writes before `for (const absl::Status& status : sender_status)`.
+  threads by the two `std::thread::join` barriers, while shared registry and
+  receiver state are guarded by `RequestBlockRegistry::mu_` (`Registry.lean`) and
+  each destination's `KVCacheManagerWithTransfer::mu_`:
+
+  | Event | Scopes | Between them |
+  |---|---|---|
+  | `registerProducer srcUnit` | 1 `RequestBlockRegistry::mu_` scope (`RequestBlockRegistry::Register`) | — |
+  | `startPlan planOk` | 1 `RequestBlockRegistry::mu_` scope in `BuildPoolReshardPlan` (`LookupAndClaim`), plus a second scope (`AbandonClaim`) if `planOk = false` after claiming | — |
+  | `armDstResult dstUnit ok` | 1 `armers` worker thread calling `PoolReshardRegisterRecv` on `dstUnit` (2 `KVCacheManagerWithTransfer::mu_` scopes, `Pipeline.lean`) and writing its own `arm_replies[i]` / `arm_status[i]` slot | worker threads write disjoint slots of `arm_replies` / `arm_status`, joined at `finishArmBarrier` |
+  | `finishArmBarrier` | `for (std::thread& t : armers) t.join();`, followed on `!status.ok()` by 1 `RequestBlockRegistry::mu_` scope (`registry_->AbandonClaim`) | `join()` orders all `arm_status[i]` writes before the loop that inspects them |
+  | `sendSrcResult srcUnit ok` | 1 `senders` worker thread (or `SubmitTransferProgram` future) calling `PoolReshardPush` on `srcUnit` and writing `sender_status[i]` on failure; on `ok = true`, folds the sender RPC, receiver settlement (`Receive.lean`), and the producer's `registry_->Complete` vote (1 `RequestBlockRegistry::mu_` scope) | folding `Complete` into `ok = true` is sound for `CoordInv` because whenever any `srcUnit` fails (`sendFailed = true`), that unit never calls `Complete`, keeping `allVoted = false` |
+  | `finishSendBarrier` | `for (std::thread& t : senders) t.join();` (or the final `futures[i].Await()`) before `for (const absl::Status& status : sender_status)` | `join()` / `Await()` orders all `sender_status[i]` writes before the status check |
 
 ## Source map
 

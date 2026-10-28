@@ -62,21 +62,10 @@ tpu-inference `7ed46a6`; `tpu_connector.py` =
 
 ## Lock scopes
 
-On the C++ side, `KVCacheManagerWithTransfer::CompleteReadWithDetails` sweeps
-all four session maps (`send_sessions_`, `active_pool_reshard_sends_`,
-`active_recv_sessions_`, `active_pool_reshard_recvs_`) and drains
-`done_sending_`, `done_recving_`, and `failed_recving_` into `completions` inside
-a single `KVCacheManagerWithTransfer::mu_` critical section
-(`absl::MutexLock lock(mu_);`). Above `poll_stats()`, the worker-side
-connector (`get_finished`, `get_block_ids_with_load_errors`),
-`KVOutputAggregator.aggregate`, and vLLM's scheduler
-(`update_from_output`, `schedule`, `finish_requests`) run on the
-single-threaded Python scheduler / model-runner loop, so each `Ev`
-(`pOutcome`, `dOutcome`, `promote`, `finish`) or `MWEv` (`pWorker`,
-`dWorker`, `promote`, `finish`) is one atomic scheduler step (and by
-`applySend_staggered_eq_batch` / `applyRecv_staggered_eq_batch`, two workers
-reporting in the same `KVOutputAggregator.aggregate` pass produce the exact
-same scheduler state as two back-to-back `pWorker` / `dWorker` steps).
+| Event | Scopes | Between them |
+|---|---|---|
+| `pOutcome ok`, `dOutcome ok`, `pWorker w ok`, `dWorker w ok` | 1 `KVCacheManagerWithTransfer::mu_` scope in `CompleteReadWithDetails` (`absl::MutexLock lock(mu_);`), followed on the single-threaded Python scheduler / model-runner loop by `get_finished`, `get_block_ids_with_load_errors`, `KVOutputAggregator.aggregate`, and `update_from_output` | nothing engine-visible happens between `CompleteReadWithDetails` draining `done_sending_`, `done_recving_`, and `failed_recving_` and the scheduler step that consumes them; by `applySend_staggered_eq_batch` / `applyRecv_staggered_eq_batch`, two workers reporting in one `KVOutputAggregator.aggregate` pass produce the same state as two back-to-back `pWorker` / `dWorker` steps |
+| `promote`, `finish` | 0 (single-threaded Python scheduler `schedule()` and `finish_requests()`) | serialized on the Python scheduler loop |
 
 ## What is modelled
 

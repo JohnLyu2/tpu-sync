@@ -117,54 +117,49 @@ Session-level fields:
 
 Every mutable field of `ReshardReceiveSession` is `ABSL_GUARDED_BY(mu_)`;
 `base_`, `staging_allocator_`, `uuid_`, `req_id_`, `deadline_`, and
-`start_time_` are `const`. Each `Ev` stands for the following `mu_` critical
-sections:
+`start_time_` are `const`.
 
-| Event | `mu_` scopes | C++ locks and accesses |
+| Event | `mu_` scopes | Between them |
 |---|---|---|
-| `pushBegin` | 1 | `ReshardReceiveSession::TryBeginRecvOp` (`if (done_ || draining_) return false; ++in_flight_;`), called from `hooks.begin_incoming_push` after looking up `active_pool_reshard_recvs_` under `KVCacheManagerWithTransfer::mu_`. |
-| `pushEnd ok` | 3–6 | `hooks.end_incoming_push`: on `ok = false` under `.finishOnError`, `reshard_session->Finish(status)` (`ReshardReceiveSession::Finish`); then `reshard_session->EndRecvOp()` (`ReshardReceiveSession::EndRecvOp`); then `reshard_session->Done()` and, if settled, `reshard_session->TakePendingUnregister(&generation)` (`2–4` scopes), followed by `1–2` trailing read-only `GetStatus()` scopes for the hook's return value. |
-| `onPoolReceived p` | 2 | `ReshardReceiveSession::OnPoolReceived` checks `if (done_)` and calls `RecordPoolReceivedLocked(pool_idx)` under `mu_`, then `ExecuteEligiblePoolH2ds` locks `mu_` to check `if (done_ || draining_)` and run `to_launch = CollectEligiblePoolH2dsLocked(); in_flight_ += static_cast<int32_t>(to_launch.size());` (folded by **A4**). |
-| `h2dIssue p ok` | 1–7 | In `ExecuteEligiblePoolH2ds`: re-check lock (`if (done_ || draining_) { EndRecvOpLocked(); continue; }`, 1 scope when draining); otherwise `base_->H2dPoolBlocks` runs outside `mu_`. On `ok = true`, a second scope executes `h2d_futures_.push_back(future);` before `future.OnReady` is attached (while pool `p`'s op in `in_flight_` is already counted: 2 scopes). On `ok = false`, `FinishPoolH2d` (1 scope if `reshard_finalizing_` was already set, else 3), `EndRecvOp()` (1 scope), and (unless `manager.IsShuttingDown()`) `MaybeUnregisterSettledReshardRecv` (`Done()`, plus `TakePendingUnregister` once settled: 0–2 scopes) run in sequence (3–7 scopes). |
-| `h2dReady p` | 0 | Async device completion makes pool `p`'s future in `h2d_futures_` report `IsReady() == true`. |
-| `h2dDone p ok` | 2–6 | `ExecuteEligiblePoolH2ds`'s `future.OnReady` callback: `FinishPoolH2d` locks `mu_` once for `if (done_) return;` / `finished = RecordPoolH2dResultLocked(pool_idx, status);`; on `!finished && status.ok()` it calls `ExecuteEligiblePoolH2ds`'s first lock (1 scope, folded by **A4**), on `finished` it locks `mu_` to latch `terminal_status` or `should_record_duration = true; network_completed_ = true;` and calls `Finish(terminal_status)` (2 scopes), and on `!finished && !status.ok()` (when `reshard_finalizing_` was already set) neither branch runs (0 extra scopes); then the callback calls `self->EndRecvOp()` (1 scope) and (unless `manager.IsShuttingDown()`) `MaybeUnregisterSettledReshardRecv` (`Done()`, plus `TakePendingUnregister` once settled: 0–2 scopes). |
-| `pollReady` | 3 | In `CompleteReadWithDetails` (under `KVCacheManagerWithTransfer::mu_`): `session->IsDraining()`, `session->IsReadyToComplete()`, and `session->Finish()`. Disabled on every reachable state (`reachable_pollReady_disabled`) because `FinishPoolH2d` calls `Finish(terminal_status)` right after setting `network_completed_ = true` while the final pool's op still holds `in_flight_ >= 1`. |
-| `cancel` | 1–4 | `ReshardReceiveSession::Finish(error)` (`FinishLocked`), called directly in `~KVCacheManagerWithTransfer` (1 scope), after `!session->IsDraining()`, `!session->IsReadyToComplete()`, and `session->deadline() <= now` in `CompleteReadWithDetails` (3 scopes), or after `!reshard_it->second->Done()` under manager `mu_` in `UnregisterActivePlan` followed by `Done()` and `TakePendingUnregister` if already idle (3–4 scopes). |
-| `publish` | 3–4 | In `CompleteReadWithDetails` (under `KVCacheManagerWithTransfer::mu_`): `session->Done()`, `session->GetStatus()` (twice on failure, the second to fill `transfer_details_`), and `session->TakePendingUnregister(&generation)` before `active_pool_reshard_recvs_.erase(it++)`. |
+| `pushBegin` | 1: `ReshardReceiveSession::TryBeginRecvOp` (`if (done_ || draining_) return false; ++in_flight_;`), called from `hooks.begin_incoming_push` after looking up `active_pool_reshard_recvs_` under manager `mu_` | — |
+| `pushEnd ok` | 3–6 in `hooks.end_incoming_push`: on `ok = false` under `.finishOnError`, `reshard_session->Finish(status)`; then `reshard_session->EndRecvOp()`; then `reshard_session->Done()` and, if settled, `reshard_session->TakePendingUnregister(&generation)` (`2–4` scopes), followed by `1–2` read-only `GetStatus()` scopes for the hook's return value | `EndRecvOp` and `TakePendingUnregister` tail, below |
+| `onPoolReceived p` | 2: `ReshardReceiveSession::OnPoolReceived` checks `if (done_)` and calls `RecordPoolReceivedLocked(pool_idx)`, then `ExecuteEligiblePoolH2ds` checks `if (done_ || draining_)` and runs `to_launch = CollectEligiblePoolH2dsLocked(); in_flight_ += static_cast<int32_t>(to_launch.size());` | folded into one event by A4 |
+| `h2dIssue p ok` | 1–7 in `ExecuteEligiblePoolH2ds`: re-check lock (`if (done_ || draining_) { EndRecvOpLocked(); continue; }`, 1 scope when draining), then unlocked `base_->H2dPoolBlocks`; on `ok = true`, 1 scope (`h2d_futures_.push_back(future);`) before `future.OnReady` is attached; on `ok = false`, `FinishPoolH2d` (1 or 3 scopes), `EndRecvOp()` (1 scope), and `MaybeUnregisterSettledReshardRecv` (0–2 scopes) | pool `p`'s op in `in_flight_` is already counted before `H2dPoolBlocks`; on `ok = false`, the `reshard_finalizing_` latch and `EndRecvOp` tail below apply |
+| `h2dReady p` | 0 (device) | — |
+| `h2dDone p ok` | 2–6 in `ExecuteEligiblePoolH2ds`'s `future.OnReady` callback: `FinishPoolH2d` locks `mu_` once for `if (done_) return;` and `finished = RecordPoolH2dResultLocked(pool_idx, status);`; on `!finished && status.ok()` it runs `ExecuteEligiblePoolH2ds`'s opening lock (1 scope, folded by A4), on `finished` it latches `terminal_status` or `should_record_duration = true; network_completed_ = true;` and calls `Finish(terminal_status)` (2 scopes), and on `!finished && !status.ok()` (when `reshard_finalizing_` was already set) neither branch runs; then `self->EndRecvOp()` (1 scope) and `MaybeUnregisterSettledReshardRecv` (0–2 scopes) | see the `reshard_finalizing_` latch, wave launch, and `EndRecvOp` tail notes below |
+| `pollReady` | 3 in `CompleteReadWithDetails` (under manager `mu_`): `session->IsDraining()`, `session->IsReadyToComplete()`, `session->Finish()` | disabled on every reachable state (`reachable_pollReady_disabled`) because `FinishPoolH2d` calls `Finish(terminal_status)` right after setting `network_completed_ = true` while the final pool's op still holds `in_flight_ >= 1` |
+| `cancel` | 1–4: `ReshardReceiveSession::Finish(error)` (`FinishLocked`), called directly in `~KVCacheManagerWithTransfer` (1 scope), after `!session->IsDraining()`, `!session->IsReadyToComplete()`, and `session->deadline() <= now` in `CompleteReadWithDetails` (3 scopes), or after `!reshard_it->second->Done()` under manager `mu_` in `UnregisterActivePlan` followed by `Done()` and `TakePendingUnregister` if idle (3–4 scopes) | `cancel` has no `!draining` guard, admitting every interleaving; late errors, below |
+| `publish` | 3–4 in `CompleteReadWithDetails` (under manager `mu_`): `session->Done()`, `session->GetStatus()` (twice on failure), and `session->TakePendingUnregister(&generation)` before `active_pool_reshard_recvs_.erase(it++)` | on a settled session only `status_` can still change; late errors, below |
 
-Why the multi-scope callback events (`pushEnd`, `h2dIssue _ false`, `h2dDone`)
-need no intermediate state:
-* **`reshard_finalizing_` latch in `FinishPoolH2d`.** When `RecordPoolH2dResultLocked`
-  returns `finished == true`, it has already set `reshard_finalizing_ = true`
-  under the first `mu_` scope. Any concurrent `FinishPoolH2d` or
-  `CollectEligiblePoolH2dsLocked` in the window before `Finish(terminal_status)`
-  sees `reshard_finalizing_ == true` and is a no-op, while the caller's own pool
-  op keeps `in_flight_ >= 1` until `self->EndRecvOp()`.
-* **Wave launch inside `FinishPoolH2d` before `self->EndRecvOp()`.** On an
-  intermediate OK completion (`!finished && status.ok()`), `FinishPoolH2d`
-  invokes `ExecuteEligiblePoolH2ds(manager)` before returning to the outer
-  callback's `self->EndRecvOp()`. In `h2dDone p true`, `launchEligible` folds
-  the opening lock of `ExecuteEligiblePoolH2ds` (which adds `to_launch.size()`
-  to `in_flight_`) together with pool `p`'s `self->EndRecvOp()`, and models the
-  per-pool `to_launch` loop as subsequent `h2dIssue` steps: when `to_launch` is
-  empty the loop is empty; when `to_launch` is non-empty, pool `p`'s unreleased
-  op during the loop only keeps `in_flight_` higher by 1 until `self->EndRecvOp()`
-  runs after the loop, commuting with the `h2dIssue` steps for the same reason
-  as any `EndRecvOp` tail.
-* **`EndRecvOp` and `TakePendingUnregister` tail.** Before `EndRecvOp()`, the
-  caller's op keeps `in_flight_ >= 1` and `done_ = false`, so `EndRecvOp()`
-  commutes with any interleaved step. Between `EndRecvOp()` setting `done_ = true`
-  (and releasing staging in the same scope) and `MaybeUnregisterSettledReshardRecv`
-  (when `!manager.IsShuttingDown()`) claiming `TakePendingUnregister`
-  (`unregister_on_settle_ = false`, modelled as `planUnregistered = true`), the
-  state `(done = true, planUnregistered = false, published = none)` already
-  satisfies `Inv` (`UnregisterActivePlan` on an idle session likewise claims
-  `TakePendingUnregister` immediately, while `Recv.cancel` defers
-  `planUnregistered = true` to `publish`; both satisfy `planUnregistered → done`).
-* **Late error after settle.** `ReshardReceiveSession::FinishLocked` updates
-  `if (!status.ok() && status_.ok()) status_ = status;` before
-  `if (draining_) return;`, so a late `Finish(error)` after an OK settle still
-  flips `status_` to the error (`cancel` has no `!draining` guard).
+**`reshard_finalizing_` latch in `FinishPoolH2d`.** When `RecordPoolH2dResultLocked`
+returns `finished == true`, it has already set `reshard_finalizing_ = true`
+under the first `mu_` scope. Any concurrent `FinishPoolH2d` or
+`CollectEligiblePoolH2dsLocked` before `Finish(terminal_status)` sees
+`reshard_finalizing_ == true` and is a no-op, while the caller's pool op keeps
+`in_flight_ >= 1` until `self->EndRecvOp()`.
+
+**Wave launch inside `FinishPoolH2d` before `self->EndRecvOp()`.** On an
+intermediate OK completion (`!finished && status.ok()`), `FinishPoolH2d` calls
+`ExecuteEligiblePoolH2ds(manager)` before returning to the outer callback's
+`self->EndRecvOp()`. In `h2dDone p true`, `launchEligible` folds the opening
+lock of `ExecuteEligiblePoolH2ds` (which adds `to_launch.size()` to `in_flight_`)
+with pool `p`'s `self->EndRecvOp()`, leaving the per-pool `to_launch` loop to
+subsequent `h2dIssue` steps: while that loop runs, pool `p`'s unreleased op only
+keeps `in_flight_` higher by 1 until `self->EndRecvOp()`, commuting with
+`h2dIssue` for the same reason as any `EndRecvOp` tail.
+
+**`EndRecvOp` and `TakePendingUnregister` tail.** Before `EndRecvOp()`, the
+caller's op keeps `in_flight_ >= 1` and `done_ = false`, so `EndRecvOp()`
+commutes with any interleaved step. Between `EndRecvOp()` setting `done_ = true`
+(releasing staging in the same scope) and `MaybeUnregisterSettledReshardRecv`
+claiming `TakePendingUnregister` (`unregister_on_settle_ = false`, modelled as
+`planUnregistered = true`), the intermediate state `(done = true,
+planUnregistered = false, published = none)` already satisfies `Inv`.
+
+**Late error after settle.** `ReshardReceiveSession::FinishLocked` updates
+`if (!status.ok() && status_.ok()) status_ = status;` before
+`if (draining_) return;`, so a late `Finish(error)` after an OK settle still
+flips `status_` to the error (`cancel` has no `!draining` guard).
 
 ## Assumptions
 

@@ -3,8 +3,6 @@ import TpuSyncVerify.Transfer.PrefillDecode.Receive.Invariant
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Frame
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Traces
-import TpuSyncVerify.Transfer.PrefillDecode.Receive.Coverage
-import TpuSyncVerify.Transfer.PrefillDecode.Receive.Guards
 
 /-!
 # Receive session
@@ -75,68 +73,58 @@ see `Transport.lean`.)
 
 ## Lock scopes
 
-`step` applies each event atomically. The C++ has no events, only critical
-sections of the session's `mu_`, so the model is faithful only if every
-interleaving the C++ allows between the scopes of one event reaches a state
-some sequence of model steps also reaches. Every mutable field of
-`TransferReceiveSession` is `ABSL_GUARDED_BY(mu_)`; `base_`, `uuid_` and
-`staging_allocator_` are set in the constructor and never written again, and
-they (with `base_` / `manager` configuration getters) are the only state an
-event reads outside `mu_`. Scopes per event:
+Every mutable field of `TransferReceiveSession` is `ABSL_GUARDED_BY(mu_)`;
+`base_`, `uuid_` and `staging_allocator_` are set in the constructor and never
+written again, and they (with `base_` / `manager` configuration getters) are the
+only state an event reads outside `mu_`.
 
 | Event          | `mu_` scopes | Between them |
 |----------------|--------------|--------------|
-| `pushBegin`    | one, `TryBeginRecvOp` | the hook's lookup of the session in `active_recv_sessions_` under the manager's `mu_` precedes it; a session published in between is `done_` and refuses the op, the `none` case |
-| `pushEnd`      | `EndRecvOp` (plus the hook's `MaybeUnregisterSettledRecv` — `Done()`, and `TakePendingUnregister` if settled — and 1–2 read-only `GetStatus()` scopes for the hook's return value) | on a failed push the hook's `DeferUnregisterOnSettle()` and `Finish(status)` are their own scopes, the model's `cancel` before `pushEnd`; `unregister_on_settle_` is not modelled |
-| `pullReply`    | two: `on_response`'s `absl::MutexLock lock(self->mu_)` (`FinishLocked(pull_status)` on failure, `handshake_pending_ = false`), then `EndRecvOp()` from the `absl::Cleanup end_op`, which was declared before the lock and so runs after it is released (`ExecutePullRequest` also takes an initial `mu_` scope before scheduling to read `load_plan_` and set `peer_endpoint_`; the fault-injected `Finish(status); EndRecvOp()` in `StartRead` is the same two scopes without `ExecutePullRequest`, leaving `handshake_pending_ = true` on a settled session) | an `EndRecvOp` tail, below |
-| `h2dBegin`     | one, the first scope of `ExecuteLayerH2d` | — |
-| `h2dIssue`     | 1–2 in `ExecuteLayerH2d`: the `done_ || draining_` re-check (`EndRecvOpLocked()` and return in 1 scope when draining), then `h2d_futures_.push_back(future)` after the unlocked `H2dSyncDispatch` (or, when the dispatch fails, `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`), followed by the hook's `MaybeUnregisterSettledRecv` | the copy is dispatched but not yet in `h2d_futures_`, so `AllH2dDoneLocked` does not see it. Harmless by A4: the stream that completed this layer is on this thread and calls `OnBlockShardsReceived` only after `ExecuteLayerH2d` returns, so `network_completed_` cannot be set in the gap, and `num_completed_layers_ == total_layers` is impossible while a layer is unissued, so `IsReadyToComplete` is false throughout. A `Finish(error)` before the re-check is `cancel` then `h2dIssue` (`trace_finish_between_locks`); one during the dispatch finds the op `h2dBegin` took, cannot settle, and commutes with `push_back` (which does not check `draining_`, while `FinishLocked` does not read `h2d_futures_`), i.e. `h2dIssue true` then `cancel` (`trace_deadline_during_copy`, `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`) |
-| `h2dReady`     | none (device) | — |
-| `h2dDone`      | two: the callback's `absl::MutexLock lock(self->mu_)` (the `done_` check, `num_completed_layers_++`, `FinishLocked`), then `EndRecvOp()` from its `absl::Cleanup end_op` | an `EndRecvOp` tail, below. The unmodelled `UnregisterSettledPlan` also runs in this gap when the callback is the last op of a draining session (`self->in_flight_ == 1 && self->unregister_on_settle_`): the plan is dropped one scope before `done_` is set, with no op left that could use it |
-| `netAccount`   | `OnBlockShardsReceived` (`RecordBlockShardsReceivedLocked`, `RecordNetworkCompleteLocked`, `FinishLocked`), preceded by the manager's `active_recv_sessions_` lookup and followed by `MaybeUnregisterSettledRecv` | — |
-| `pollReady`    | on the poll thread under the manager's `mu_`: `IsDraining()`, `IsReadyToComplete()`, `req_id()` (read-only `mu_` scope for the log), `Finish()` | the poll, below |
-| `cancel`       | `Finish(error)`, after its condition was decided in earlier scopes (`!IsDraining()`, `IsReadyToComplete()`, `deadline() <= now`, and `DeferUnregisterOnSettle()` for the sweep; `!Done()` under the manager's `mu_` and `DeferUnregisterOnSettle()` for `UnregisterActivePlan`, followed by `Done()` and `TakePendingUnregister` if settled) | the model's `cancel` has no guard, so it admits every such interleaving; late errors, below |
-| `publish`      | `Done()`, then `GetStatus()` for the set, `Details()`, `TakePendingUnregister()` | on a settled session only `status_` can still change; late errors, below |
+| `pushBegin`    | 1: `TryBeginRecvOp` | preceded by the hook's `active_recv_sessions_` lookup under manager `mu_`; a session published in between is `done_` and refuses the op (`none`) |
+| `pushEnd`      | `EndRecvOp`, plus `MaybeUnregisterSettledRecv` (`Done()`, and `TakePendingUnregister` if settled) and 1–2 read-only `GetStatus()` scopes for the hook's return value | on a failed push, the hook's `DeferUnregisterOnSettle()` and `Finish(status)` run in earlier scopes (`cancel` before `pushEnd`; `unregister_on_settle_` is not modelled) |
+| `pullReply`    | 2: `on_response`'s `absl::MutexLock lock(self->mu_)` (`FinishLocked(pull_status)` on failure, `handshake_pending_ = false`), then `EndRecvOp()` from `absl::Cleanup end_op` after `lock` is released (`ExecutePullRequest` also takes an initial `mu_` scope before scheduling to read `load_plan_` and set `peer_endpoint_`; the fault-injected `Finish(status); EndRecvOp()` in `StartRead` is the same two scopes without `ExecutePullRequest`, leaving `handshake_pending_ = true` on a settled session) | an `EndRecvOp` tail, below |
+| `h2dBegin`     | 1: first scope of `ExecuteLayerH2d` | — |
+| `h2dIssue`     | 1–2 in `ExecuteLayerH2d`: the `done_ || draining_` re-check (`EndRecvOpLocked()` and return in 1 scope when draining), then `h2d_futures_.push_back(future)` after the unlocked `H2dSyncDispatch` (or, on dispatch failure, `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`), followed by `MaybeUnregisterSettledRecv` | during `H2dSyncDispatch` the copy is not yet in `h2d_futures_`, so `AllH2dDoneLocked` does not see it. Harmless by A4: this thread calls `OnBlockShardsReceived` only after `ExecuteLayerH2d` returns, so `network_completed_` cannot be set in the gap, and `num_completed_layers_ == total_layers` is false while a layer is unissued, keeping `IsReadyToComplete` false. A `Finish(error)` before the re-check is `cancel` then `h2dIssue` (`trace_finish_between_locks`); one during the dispatch finds the op `h2dBegin` took, cannot settle, and commutes with `push_back`, i.e. `h2dIssue true` then `cancel` (`trace_deadline_during_copy`, `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`) |
+| `h2dReady`     | 0 (device) | — |
+| `h2dDone`      | 2: the callback's `absl::MutexLock lock(self->mu_)` (`done_` check, `num_completed_layers_++`, `FinishLocked`), then `EndRecvOp()` from `absl::Cleanup end_op` | an `EndRecvOp` tail, below (when this is the last op of a draining session with `unregister_on_settle_`, the unmodelled `UnregisterSettledPlan` also runs in this gap after `in_flight_ == 1`) |
+| `netAccount`   | 1: `OnBlockShardsReceived` (`RecordBlockShardsReceivedLocked`, `RecordNetworkCompleteLocked`, `FinishLocked`), preceded by the manager's `active_recv_sessions_` lookup and followed by `MaybeUnregisterSettledRecv` | — |
+| `pollReady`    | on the poll thread under manager `mu_`: `IsDraining()`, `IsReadyToComplete()`, `req_id()` (for the log), `Finish()` | the poll, below |
+| `cancel`       | 1: `Finish(error)`, after its condition was checked in earlier scopes (`!IsDraining()`, `IsReadyToComplete()`, `deadline() <= now`, and `DeferUnregisterOnSettle()` for the sweep; `!Done()` under manager `mu_` and `DeferUnregisterOnSettle()` for `UnregisterActivePlan`, followed by `Done()` and `TakePendingUnregister` if settled) | `cancel` has no guard in the model, so it admits every such interleaving; late errors, below |
+| `publish`      | under manager `mu_`: `Done()`, `GetStatus()`, `Details()`, `TakePendingUnregister()` | on a settled session only `status_` can still change; late errors, below |
 
-**`EndRecvOp` tails.** `pullReply` and `h2dDone` are a scope that decides,
-then `EndRecvOp` in a scope of its own. Between the two the C++ state differs
-from the model's post-state in one way: `in_flight_` still counts the op. The
-only decisions that read `in_flight_` are the settle checks in `FinishLocked`
-and `EndRecvOpLocked` (and the callback's own unregister pre-claim, outside the
-model), so any step taken in the gap — a `Finish`, a `TryBeginRecvOp`,
-the poll, an accounting — decides as it would after the whole event, except
-that a `Finish` in the gap leaves the settle to the tail instead of performing
-it, with the same `draining_`, `done_` and `status_` at the end (`FinishLocked`
-records an error before it tests `draining_`). Every such interleaving
-therefore ends in the state the model reaches by taking the event and then the
-other step; this is what makes the ghost `pending` and `retired` counters
-sound.
+**`EndRecvOp` tails.** `pullReply` and `h2dDone` run their decision under `mu_`
+and then call `EndRecvOp` in a second scope. Between the two scopes, `in_flight_`
+still counts the op. Because only the settle checks in `FinishLocked` and
+`EndRecvOpLocked` inspect `in_flight_`, any interleaved step makes the same
+decision as it would after `EndRecvOp`, except that an interleaved `Finish`
+leaves the final settle to `EndRecvOp` with the same resulting `draining_`,
+`done_` and `status_`. Every such interleaving therefore reaches the same state
+as running the whole event first, which is why the ghost `pending` and `retired`
+counters need no intermediate state for the tail.
 
-**The poll.** `pollReady` reads `IsDraining()`, `IsReadyToComplete()`, `req_id()`
-and calls `Finish()`. Readiness is stable once true: when
-`network_completed_ || num_completed_layers_ == total_layers` holds,
-`issued = numLayers` (`CountersOrdered` with A1), so no future can join
-`h2d_futures_`, and each ingredient of `IsReadyToComplete` only grows. A
-`Finish(error)` between the scopes makes the session draining, and the poll's
-`Finish()` with an OK status then changes nothing (`FinishLocked` returns at
-`if (draining_) return;` with `status_` untouched) — the model's `pollReady`
-refused after `cancel`.
+**The poll.** `pollReady` checks `IsDraining()` and `IsReadyToComplete()`, reads
+`req_id()`, and calls `Finish()`. Once `IsReadyToComplete()` is true it stays
+true: when `network_completed_ || num_completed_layers_ == total_layers` holds,
+`issued = numLayers` (`CountersOrdered` with A1), so no new future can join
+`h2d_futures_` and each ingredient of `IsReadyToComplete` is monotone. If
+`Finish(error)` runs between the check and `Finish()`, the session is already
+draining when the poll's OK `Finish()` runs, so `FinishLocked` returns at
+`if (draining_) return;` without touching `status_` — matching `pollReady`
+being disabled after `cancel`.
 
-**Late errors.** `FinishLocked` records a non-OK status before it tests
-`draining_`, so a `Finish(error)` that lands after the session settled with an
-OK status flips `status_`; `Lifecycle.finishLocked` does the same, which is
-why `cancel` is enabled in every state and `publish` then reports `some false`.
-Two in-tree sources: the deadline sweep's `Finish(DeadlineExceeded)` after its
-own `IsReadyToComplete()` returned false, which reports a receive whose last
-H2D callback settled it in that gap in `failed_recving_`; and
-`UnregisterActivePlan`, whose `!Done()` test is under the manager's `mu_` but
-whose `Finish(CancelledError)` is not, so it can run while
-`CompleteReadWithDetails` publishes — between the `GetStatus()` that picks the
-set and the `Details()` stored in `transfer_details_`. That is the only gap
-found here where the C++ can produce an outcome (a `done_recving_`
-entry whose details carry an error) that no interleaving of `cancel` and
-`publish` produces; `transfer_details_` is outside the model's state, and
-within it every such interleaving is a `cancel` before or after `publish`.
+**Late errors.** `FinishLocked` records a non-OK status before testing
+`draining_`, so a `Finish(error)` after an OK settle still flips `status_`;
+`Lifecycle.finishLocked` does the same, which is why `cancel` is unguarded and
+a subsequent `publish` reports `some false`. Two callers can do this: the
+deadline sweep's `Finish(DeadlineExceeded)` if the last H2D callback settled the
+session after `IsReadyToComplete()` returned false; and `UnregisterActivePlan`,
+whose `!Done()` check holds manager `mu_` while its `Finish(CancelledError)`
+runs after releasing manager `mu_`. In the second case, `Finish(CancelledError)`
+can land during `CompleteReadWithDetails` between the `GetStatus()` that selects
+`done_recving_` and the `Details()` stored in `transfer_details_`, producing a
+`done_recving_` entry whose details carry an error (`transfer_details_` is
+outside the model's state; on the modelled fields every interleaving is `cancel`
+before or after `publish`).
 
 ## Assumptions
 
@@ -214,13 +202,6 @@ All proved on every reachable state (`reachable_safe`):
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and
   release its staging in a finite number of steps (`reachable_can_settle`).
-* **Published is quiet (`PublishedQuiet`).** `published ≠ none → pending = 0 ∧ retired = issued`:
-  once `poll_stats()` has reported the receive, as `done_recving` or as
-  `failed_recving`, no H2D copy is dispatching or still writing decode HBM, so
-  the engine may reuse it. The receiver's promise to the engine at the session
-  level (the pipeline restates it as `DecodeHbmSafe`); added when the guard
-  inventory (`Guards.lean`) found that dropping `Done()` before publishing a
-  *failed* receive violated nothing the module stated.
 
 Note on the readiness predicate. One might expect `IsReadyToComplete` to
 coincide with "every layer's callback has run OK"; it does not.
@@ -229,39 +210,6 @@ coincide with "every layer's callback has run OK"; it does not.
 `num_completed_layers_` reaches `numLayers` (`trace_poll_before_callbacks`).
 That is harmless — `done` still waits for every callback through `in_flight_`
 — and the publication property above is the one that matters.
-
-## Coverage and guards
-
-`Coverage.lean` measures how much of `step` the replayed upstream tests
-exercise. A branch is a leaf of an event's decision tree together with its
-effect on the lifecycle (drains / settles / records the first error); the
-reachable set is computed by exhausting the one- and two-layer state spaces
-(37 branches; two further leaves are unreachable — the retired-callback
-`LOG(DFATAL)`, an assertion the invariant discharges, and the `FinishLocked()`
-arm of `RecordNetworkCompleteLocked`, dead because the last H2D callback always
-finishes first). The 20 upstream tests paired with traces (13 named) reach 18
-of the 37; the 19 they miss
-are tabulated there with the shortest schedule reaching each and classified as
-a missing upstream test (10 — 8 drivable by `RecvTestManager` today, among
-them every `H2dSyncDispatch` failure, 2 needing a control-plane producer stub
-that answers), a lock-window or poll-timing interleaving no harness hook
-reaches (5), or a data-before-reply ordering the model leaves open (4). The
-`#guard` at the end of `Coverage.lean`
-fails if a branch, a trace or a classification changes.
-
-`Guards.lean` asks the other question: which of the C++ checks `step`
-transcribes do the properties need? Each is dropped or weakened and searched
-exhaustively against `Safe` without the ghost-counter equations. Five are
-load-bearing (`TryBeginRecvOp`'s refusal, `ExecuteLayerH2d`'s first check,
-`Done()` before publishing — whose failed-receive half survived the `Safe`
-the module had, `PublishedQuiet` being the property that was missing —
-`draining_` in `EndRecvOpLocked`'s settle condition, `in_flight_ == 0` in
-`FinishLocked`); five survive — the
-`draining_` half of the first check and the whole re-check in
-`ExecuteLayerH2d` (wasted DMA, not safety), the `!draining_` on the last
-layer's finish and the `done_ || draining_` in `OnBlockShardsReceived`
-(metrics and accounting), and the poll's `!IsDraining()` (a no-op without
-it).
 
 ## Source map
 
