@@ -68,8 +68,10 @@ The top-level system theorems establish for **every** transfer `idx` (under both
     (`KVCacheManagerBase::ConfigurePoolStaging`), and `ComputePoolBlockCopyExtents`
     places every region of block $b$ of pool $P$ at device offset
     $\text{base\_offset\_bytes} + b \cdot \text{block\_stride\_bytes} + \text{region\_offset} \in [b \cdot S, (b + 1) \cdot S)$
-    when each pool's sub-page offset fits within one storage page $S = \text{block\_stride\_bytes}$
-    (`PoolSpec::Validate`). Two pool blocks $b$ and $b'$ on the same storage
+    when each pool's `base_offset_bytes + region.extent_end_bytes()` fits within
+    one storage page $S = \text{block\_stride\_bytes}$ (`PoolSpec::Validate(storage_bytes)`
+    with `storage_bytes = num_blocks * block_stride_bytes`, and the caller's
+    manifest builder). Two pool blocks $b$ and $b'$ on the same storage
     therefore overlap in device HBM bytes only when $b = b'$.
   - On the host staging side, `KVCacheManagerBase::AcquirePoolStagingLease`
     allocates disjoint host arena slots to distinct concurrent `uuid`s
