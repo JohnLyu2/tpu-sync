@@ -158,10 +158,12 @@ every Monday and on `workflow_dispatch`:
    `TPU_SYNC_TORCH_VERSION_OVERRIDE=<candidate>`: the candidate layered over
    the image built from vllm-torchtpu's current pins, every lane (tests,
    integration, perf and eval, verify). It must pass.
-3. **sglang-torchtpu**: a dispatch of the `Nightly Test (TPU - Remote Wheel)`
-   workflow with `wheel=tpu-sync-torch==<candidate>`: feature validation and
-   perf against the candidate layered over the latest nightly image. It must
-   succeed.
+3. **sglang-torchtpu**: `sglang-torchtpu` runs `Nightly Test (TPU - Remote
+   Wheel)` with `tpu-sync-torch` on a Monday 12:00 UTC schedule; `sglang_canary`
+   finds and waits for that scheduled run read-only when `SGLANG_GITHUB_TOKEN`
+   is unset, or dispatches a run with `wheel=tpu-sync-torch==<candidate>` when
+   `SGLANG_GITHUB_TOKEN` is configured: feature validation and perf against the
+   candidate layered over the latest nightly image. It must succeed.
 4. **Record**: a pull request labeled `pull ready` that updates `lkg.version`
    and appends to `verified_commits.csv`; Copybara imports it into Piper and
    exports it back to `main`. The commit is tagged `golden-YYYYMMDD`.
@@ -218,11 +220,14 @@ example to check a candidate before a release.
   grants it write access to the staging repository and the manifest folder.
 - `PYPI_FILE_LIMIT_MB` repository variable: the per-file limit PyPI has
   granted the project, once it differs from the default 100.
-- The `Golden Commit` workflow needs four secrets: `BUILDKITE_API_TOKEN` (the
-  `vllm` Buildkite organization, `read_builds` and `write_builds`),
-  `SGLANG_GITHUB_TOKEN` (`actions:write` on `sgl-project/sglang-torchtpu`),
-  `GOLDEN_COMMIT_TOKEN` (`contents:write` and `pull_requests:write` on this
-  repository, so the record pull request gets CI and Copybara imports it) and
-  `DOWNSTREAM_PR_TOKEN` (`contents:write` and `pull_requests:write` on the two
-  downstream repositories, or on forks named by the `DOWNSTREAM_FORK_OWNER`
-  repository variable). The header of the workflow file lists them.
+- The `Golden Commit` workflow uses up to four secrets: `BUILDKITE_API_TOKEN`
+  (the `vllm` Buildkite organization, `read_builds` and `write_builds`),
+  `SGLANG_GITHUB_TOKEN` (optional; `actions:write` on
+  `sgl-project/sglang-torchtpu` to dispatch runs — when unset, `sglang_canary`
+  matches and waits for `sglang-torchtpu`'s Monday 12:00 UTC scheduled run
+  read-only), `GOLDEN_COMMIT_TOKEN` (`contents:write` and `pull_requests:write`
+  on this repository, so the record pull request gets CI and Copybara imports
+  it) and `DOWNSTREAM_PR_TOKEN` (`contents:write` and `pull_requests:write` on
+  the two downstream repositories, or on forks named by the
+  `DOWNSTREAM_FORK_OWNER` repository variable). The header of the workflow file
+  lists them.
