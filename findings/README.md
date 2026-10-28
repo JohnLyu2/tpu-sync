@@ -60,7 +60,7 @@ here.
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
-| `coverage_gap_tests.patch` | 18 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, `Controller/ReadRemoteCoverage.lean`): 8 `RecvLifecycleTest`/`RecvDrainTest` cases and 1 `SendDrainTest` case appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 6 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Not yet compiled or run (no Bazel on the authoring machine); each case asserts the expected outcome read off the Lean model, so a failing assertion is either a model error or a finding. Not included: the two `Receive` handshake cases that need a replying control-plane producer stub, the multi-request recycle case, which needs a seam that observes staging contents, and two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see). See "Coverage-gap tests" below |
+| `coverage_gap_tests.patch` | 9 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, `Controller/ReadRemoteCoverage.lean`): 4 `RecvLifecycleTest`/`RecvDrainTest` cases appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 2 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary with `RAIDEN_REMOTE_READ_DEADLINE_S=1` because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Based on `42dda542`; all 9 pass there (2026-10-28). Offered upstream as a test-only PR. Not included: the two `Receive` handshake cases that need a replying control-plane producer stub, the multi-request recycle case, which needs a seam that observes staging contents, two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see), and the receiver's late-`Finish` status flip, kept as a finding instead. See "Coverage-gap tests" below |
 
 To run F1–F4: copy the two `.cc` files next to the code they test
 (`tpu_sync/core/controller/`, `tpu_sync/kv_cache/`), `git apply
@@ -1198,49 +1198,79 @@ already carries the F6 witness for the same slot-aliasing consequence.
   destroyed first among the members that matter, so this is probably safe.
   Not verified.
 
-## Coverage-gap tests (`coverage_gap_tests.patch`, drafted 2026-10-28 at `c9bc124`, not yet run; fork-only for now, not offered upstream)
+## Coverage-gap tests (`coverage_gap_tests.patch`, at `42dda542`, run 2026-10-28: 9/9 pass; offered upstream)
 
 The branch-coverage tables in `tpu_sync/formal_verification/` classify, per
 model, which branches of the Lean `step` the upstream tests reach; the rows
 classed **test** are schedules the existing harnesses can drive today but no
 test does. This patch is those rows as tests, in the style of the files they
-extend, with the outcome each asserts taken from the model's post-state:
+extend, with the outcome each asserts taken from the model's post-state. It
+was first drafted at `c9bc124` (18 cases, all 18 passing there), then re-based
+on `42dda542` and cut to the 9 cases that still add a branch after an
+independent redundancy audit; the cuts are listed below the table.
 
 | Case | Branch (Lean table) | What it pins |
 |---|---|---|
-| `RecvLifecycleTest.FailedH2dDispatchFailsAndSettlesTheReceive` | `Receive` `h2dIssueFail` drains settles errors | `hooks::kTransferRecvSessionH2dDispatch`: the receive fails, settles at once, slot back — no upstream test fails an H2D dispatch |
-| `RecvLifecycleTest.FailedH2dDispatchUnderPushLeaseWaitsForTheLease` | `h2dIssueFail` drains errors | same under an open `BeginIncomingPush` lease: pinned until `EndIncomingPush` |
-| `RecvLifecycleTest.SecondFinishOnAFailedReceiveIsANoOp` | `cancel` (no effect) | one failure reported once |
-| `RecvLifecycleTest.LateErrorAfterSettledOkIsReportedAsFailed` | `cancel` errors | **pins the receiver's first-error-wins rule**: a `Finish(error)` after a settled-OK receive, before the poll, flips it to `failed_recving` (the late-error window of `Receive.lean` §Lock scopes) |
-| `RecvLifecycleTest.PushLeaseClosingBeforeTheCopyEndsDoesNotSettle` | `pushEnd` (no effect) | the lease release neither settles nor frees staging; the callback does |
-| `RecvDrainTest.CancelledReceiveWhoseCopyThenFailsSettlesOnce` | `h2dDoneFail` settles | failure absorbed by a draining session, settles on the callback |
-| `RecvDrainTest.CancelledReceiveWhoseCopyFailsUnderPushLeaseWaitsForTheLease` | `h2dDoneFail` (no effect) | same under a lease |
-| `RecvDrainTest.CancelledReceiveLastCopyOkUnderPushLeaseStaysCancelled` | `h2dDoneLastDraining` (no effect) | the `!draining_` guard: an OK last callback does not finish a cancelled receive |
-| `SendDrainTest.ExpiredSendWhoseCopyThenFailsSettlesOnce` | `Send` `wakeFail` (no effect) | deadline sweep, then the copy fails |
-| `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce` | `d2hIssueFail` drains settles errors | `D2hSyncDispatch` refuses: `FinishLocked; EndSendOpLocked`, settles at once — no upstream test fails a D2H dispatch |
-| `TransferSendSessionTest.FailedD2hDispatchOnSecondLayerWaitsForTheFirstCopy` | `d2hIssueFail` drains errors | second layer refused, first copy in flight holds the send |
-| `TransferSendSessionTest.CopyAlreadyFailedAtDispatchFailsTheSend` | `wakeFail` drains settles errors | a future already failed when `StartPush` registers: `d2hEnd` then `wake false` (the Lean row names the completion fault hook; an already-failed future reaches the same branch without it) |
-| `TransferSendSessionTest.FailedPushFailsTheSend` | `h2hDoneFail` drains settles errors | `CompleteH2h(0, error)` — every existing caller passes success |
-| `TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled` | `h2hDoneFail` settles | **pins the sender's first-`Finish`-wins rule** (the opposite of the receiver's) |
-| `TransferSendSessionTest.DrainWithLastCopyCompletingBeforeTheFirstPush` | `h2hDoneOk` settles | `DoneGuarantees…` with the completions swapped: the push is the last op to end |
+| `RecvLifecycleTest.FailedH2dDispatchFailsAndSettlesTheReceive` | `Receive` `h2dIssueFail` drains settles errors | `hooks::kTransferRecvSessionH2dDispatch`: the receive fails in phase `h2d`, settles at once, slot back — no upstream test fails an H2D dispatch |
+| `RecvLifecycleTest.SecondFinishOnAFailedReceiveIsANoOp` | `cancel` (no effect) | a second `Finish(error)` on a draining receive: the first error's code and reason are what the poll reports, once |
+| `RecvLifecycleTest.PushLeaseClosingBeforeTheCopyEndsDoesNotSettle` | `pushEnd` (no effect) | the lease release neither settles nor frees staging; the callback does (the usual order for an asynchronous H2D) |
+| `RecvDrainTest.CancelledReceiveWhoseCopyThenFailsStaysCancelled` | `h2dDoneFail` settles | the copy's error is absorbed by the draining receive; the reported code stays `CANCELLED` |
+| `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce` | `Send` `d2hIssueFail` drains settles errors | layer 0's `D2hSyncDispatch` refused with nothing issued: `fail_unissued_layers` fails layer 0's promise and the H2H chain's own callback releases the last op, so the send settles inside `StartPush` (upstream's `D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies` covers a later layer with a copy in flight) |
+| `TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled` | `h2hDoneFail` settles | **pins the sender's first-`Finish`-wins rule** through the push callback's error branch (no upstream test completes an H2H with an error) |
 | `ReadRemoteDeadlineTest.UnansweredAcquireSettlesAtTheDeadline` | `ReadRemote` `deadlineSettles` settles | the deadline thread fires (1 s), the late lease is released |
-| `ReadRemoteDeadlineTest.LateAcquireFailureAfterTheDeadlineIsAbsorbed` | `acquireFailed` (no effect) | a `NotFound` landing after the settle changes nothing |
+| `ReadRemoteDeadlineTest.LateAcquireFailureAfterTheDeadlineIsAbsorbed` | `acquireFailed` (no effect) | a `NotFound` landing after the settle changes nothing and starts no read |
 | `ReadRemoteDeadlineTest.PullCompletingAfterTheDeadlineReleasesTheLease` | `pullDone` (no effect) | shape B's shape, asserting only settle + lease release (the DMA-after-settle itself is F2) |
 
 The `ReadRemote` deadline fixture holds the first in-suite tests in which
 `RemoteReadDeadline()` fires at all (default 150 s; every `ReadRemotePullTest`
-ends in seconds). They assert what the shipping code promises and do not
-assert the F2 property; `raiden_controller_bughunt_test.cc` does that and
+ends in seconds). It is its own `cc_test` with
+`env = {"RAIDEN_REMOTE_READ_DEADLINE_S": "1"}` because the deadline is a
+process-wide static. The cases assert what the shipping code promises and do
+not assert the F2 property; `raiden_controller_bughunt_test.cc` does that and
 fails on purpose.
 
-Expected result when run: all 18 pass. A failure is either a transcription
-error in the test (check against the harness first), a model error (the Lean
-post-state disagrees with the C++ — a finding for `tpu_sync/formal_verification/`),
-or a defect. The patch is kept here as a repro set, in the manner of the
-bug-hunt tests above; whether to offer it upstream is a separate decision,
-not yet taken. Three cases pin behaviours worth an owner's eye rather than a
-fix: the receiver's and sender's opposite late-`Finish` rules, and a push
-lease outliving its copy.
+**Cut on the re-base (drafted at `c9bc124`, dropped at `42dda542`).** Upstream
+`1b78685f` (pre-created per-layer promises, H2H chain armed before the copies
+are issued) and the tests landed with it made several cases redundant:
+`FailedD2hDispatchOnSecondLayerWaitsForTheFirstCopy` (same schedule as
+upstream's `D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies`),
+`CopyAlreadyFailedAtDispatchFailsTheSend` (the `d2hEnd`-before-`wake` branch
+no longer exists: the chain is registered on the promise, not on the
+dispatch's future), `FailedPushFailsTheSend` and
+`ExpiredSendWhoseCopyThenFailsSettlesOnce` (already pinned by
+`DetailsSayAFailedPushFailedInPushWhileCopiesRun` /
+`ExpiredSendKeepsItsStagingUntilTheCopyEnds`),
+`DrainWithLastCopyCompletingBeforeTheFirstPush` (the swapped order exercises no
+branch `DoneGuaranteesAllResourcesReleased…` does not), and the three
+receive-under-lease variants (the lease arithmetic is already
+`IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`). `Send.lean`
+itself is structurally stale against `1b78685f` (A6, the chain-arming order):
+an upstream-recheck item, not part of this patch.
+
+**Dropped as a finding, not a test: the receiver's late-`Finish` status flip.**
+`LateErrorAfterSettledOkIsReportedAsFailed` (in the `c9bc124` draft; passed
+there) drove a receive to settle OK (`FinishCopy(0, OkStatus)` → done, staging
+released, data on device) and then called `Finish(CancelledError)`: the poll
+reported the receive in `failed_recving`. `TransferReceiveSession::FinishLocked`
+(`transfer_receive_session.cc:451` at `42dda542`) overwrites `status_` whenever
+the new status is an error and the old one OK, with no `done_` guard; the
+sender's `FinishLocked` (`transfer_send_session.cc:247`) returns early once
+draining or done. In production the writer is the deadline sweep or
+`UnregisterActivePlan`'s check-then-`Finish` racing the last H2D callback; the
+consumer then treats a landed transfer as failed and re-requests it (wasteful,
+not unsafe). An upstream reviewer would rightly ask for the one-line guard
+rather than a test that pins the flip, so the case is not in the PR; it is a
+reproducer for an issue to file (the late-error window of `Receive.lean`
+§Lock scopes), and the Lean model should then gain the guard too.
+
+Runs: 18/18 at `c9bc124` (2026-10-28, OSS Bazel recipe in the fork notes) and
+9/9 at `42dda542` the same day, with the full `transfer_send_session_test`
+(19 cases) and `kv_cache_manager_with_transfer_send_drain_test` (42 cases)
+binaries green around them; `--runs_per_test=10` on the two kv_cache targets
+also green. A failure on a later upstream is either a transcription error
+(check against the harness first), a model error (the Lean post-state
+disagrees with the C++ — a finding for `tpu_sync/formal_verification/`), or a
+defect.
 
 ## Observations on the prefill-to-decode path (non-bugs at `2ed6f8f`)
 
