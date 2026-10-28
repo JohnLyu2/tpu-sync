@@ -73,15 +73,25 @@ Do not re-investigate:
   pool on a storage shares one uniform `block_stride_bytes = raw_nbytes // num_blocks`
   and `num_blocks` (`ConfigurePoolStaging` in `kv_cache_manager_base.cc:1981-2009`),
   with sub-page `base_offset_bytes + region.extent_end_bytes <= block_stride_bytes`
-  (`PoolSpec::Validate`). Thus block $b$ of pool $P_1$ and block $b'$ of pool
-  $P_2$ overlap in device bytes iff $b = b'$. Above `tpu-sync`, vLLM's unified
-  `BlockPool` (`kv_cache_materializer.py:237-306`, `runner/kv_cache_dsv4.py:168-170`,
-  `runner/kv_cache_manager.py:448-450`) allocates from a single `[0, num_blocks)`
-  free list shared across all `kv_cache_groups` (FA and Mamba/GDN/KDA/DSv4 state
-  groups never own the same `block_id` $b$ simultaneously, and shared prefix-cached
-  blocks are stripped from `local_block_ids[prefix_pages:]` at `tpu_connector.py:1930-1951`).
-  Per-transfer `order_rank` (`CollectEligiblePoolH2dsLocked`) is only needed when a
-  single transfer or test aliases `b_fa == b_state` within one `uuid`.
+  enforced by `_bind_pool_manifest` (`pool_manifest.py:1140-1148`) and by
+  `PoolSpec::Validate(storage_bytes)` whenever `storage_bytes == num_blocks * block_stride_bytes`
+  (note: `PoolSpec::Validate` checks `region.Validate(block_stride_bytes)` relative to
+  `base_offset_bytes` plus `storage_extent_end_bytes() <= storage_bytes`, so if a
+  synthetic test passes `storage_bytes > num_blocks * stride` — as in
+  `PoolStagingTest.PoolHostBaseAddrs` at `pool_staging_test.cc:493-497` —
+  `base_offset_bytes + extent_end` can exceed `stride`; production storage tensors
+  always have `storage_bytes == num_blocks * stride`). Thus block $b$ of pool $P_1$
+  and block $b'$ of pool $P_2$ overlap in device bytes iff $b = b'$. Above `tpu-sync`,
+  vLLM's unified `BlockPool` (`kv_cache_materializer.py:237-306`,
+  `runner/kv_cache_dsv4.py:168-170`, `runner/kv_cache_manager.py:448-450`) allocates
+  from a single `[0, num_blocks)` free list shared across all `kv_cache_groups`
+  (in fact, `local_block_ids` for FA and `mamba_state_block_ids` / non-0 `group_blocks`
+  for Mamba/GDN/KDA/DSv4 are disjoint even within the *same* request in `tpu_connector.py:5703-5739`,
+  and shared prefix-cached blocks are stripped from `local_block_ids[prefix_pages:]`
+  at `tpu_connector.py:1930-1951`). `sglang-torchtpu` (`pp_swa.py:113-121`) assigns
+  a distinct `storage_index` per pool and never aliases storages at all. Per-transfer
+  `order_rank` (`CollectEligiblePoolH2dsLocked`) is only exercised when a single
+  transfer or unit test passes `b_fa == b_state` within one `uuid`.
 
 Open (parked, checked through `c9bc124` in `../loose-ends/parked.md`): whether
 the Peregrine `BlockTransport` backend (`5adb0f4`, `b43de27`, `86d4506`;
