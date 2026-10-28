@@ -1,0 +1,700 @@
+diff --git a/tpu_sync/core/controller/BUILD b/tpu_sync/core/controller/BUILD
+index f809093..760966d 100644
+--- a/tpu_sync/core/controller/BUILD
++++ b/tpu_sync/core/controller/BUILD
+@@ -362,3 +362,25 @@ py_library(
+         "//tpu_sync/store_node:kv_cache_host_store_node_main",
+     ],
+ )
++
++cc_test(
++    name = "read_remote_deadline_test",
++    srcs = ["read_remote_deadline_test.cc"],
++    copts = ["-fexceptions"],
++    features = ["-use_header_modules"],
++    deps = [
++        ":controller_client",
++        ":controller_server",
++        ":raiden_controller",
++        ":test_util",
++        "//tpu_sync/core:kv_manager_holder",
++        "//tpu_sync/core:raiden_transfer_endpoint",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/time",
++        "@com_google_absl//absl/types:span",
++        "@com_google_googletest//:gtest",
++        "@com_google_googletest//:gtest_main",
++        "@xla//xla/tsl/platform:statusor",
++    ],
++)
+diff --git a/tpu_sync/core/controller/read_remote_deadline_test.cc b/tpu_sync/core/controller/read_remote_deadline_test.cc
+new file mode 100644
+index 0000000..455b9c5
+--- /dev/null
++++ b/tpu_sync/core/controller/read_remote_deadline_test.cc
+@@ -0,0 +1,219 @@
++// Copyright 2026 Google LLC.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// RaidenController::ReadRemote with a short destination deadline.
++//
++// RemoteReadDeadline() reads RAIDEN_REMOTE_READ_DEADLINE_S once per process
++// (a function-local static) and defaults to the lease TTL plus 30 s, so the
++// deadline thread never fires inside raiden_controller_test. These cases run
++// in their own binary with a 1 s deadline and exercise the three lifecycle
++// branches that depend on it: the deadline settling an unanswered read, a late
++// acquire reply after the deadline, and a pull completing after the deadline.
++// They assert only what the shipping code promises (the read settles with
++// DeadlineExceeded, nothing crashes, the source holds no pins afterwards); they
++// do not assert that no DMA runs after the settle.
++
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <gmock/gmock.h>
++#include <gtest/gtest.h>
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
++#include "absl/time/clock.h"
++#include "absl/time/time.h"
++#include "absl/types/span.h"
++#include "xla/tsl/platform/statusor.h"
++#include "tpu_sync/core/controller/controller_client.h"
++#include "tpu_sync/core/controller/raiden_controller.h"
++#include "tpu_sync/core/controller/test_util.h"
++#include "tpu_sync/core/kv_manager_holder.h"
++#include "tpu_sync/core/raiden_transfer_endpoint.h"
++
++namespace tpu_raiden {
++namespace controller {
++namespace {
++
++// Set before any ReadRemote in this process.
++const bool kDeadlineEnvSet = [] {
++  setenv("RAIDEN_REMOTE_READ_DEADLINE_S", "1", /*overwrite=*/1);
++  return true;
++}();
++
++class ReadRemoteDeadlineTest : public ::testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(kDeadlineEnvSet);
++    worker_ = CreateTestWorkerServer();
++    unit_.set_job_name("test_job");
++    unit_.set_job_replica_id("0");
++    unit_.set_data_name("test_data");
++    src_ = core::controller::CreateTestControllerServer();
++    ASSERT_TRUE(src_->client
++                    ->RegisterWorker("src_worker_0", "src_worker_0_addr",
++                                     {::tpu_raiden::RaidenTransferEndpoint{
++                                         "src_ep:1", {0, 1}}},
++                                     /*node_id=*/0)
++                    .ok());
++  }
++
++  void Register(RaidenController& c) {
++    core::controller::RaidenControllerClient client(c.controller_address());
++    auto st = client.RegisterWorker(
++        "worker_0", worker_->server_address,
++        {::tpu_raiden::RaidenTransferEndpoint{worker_->server_address, {}}},
++        /*node_id=*/0);
++    ASSERT_TRUE(st.ok()) << st.message();
++  }
++
++  // The source validates and pins on the main path; `pins` counts outstanding
++  // pins so the tests can check the lease was released.
++  void SetSourceHooks(absl::Duration validate_delay,
++                      absl::Status validate_status = absl::OkStatus()) {
++    src_->service->SetReadRemoteHooks(
++        [this, validate_delay, validate_status](absl::Span<const std::string> h)
++            -> absl::StatusOr<std::vector<int32_t>> {
++          absl::SleepFor(validate_delay);
++          if (!validate_status.ok()) return validate_status;
++          pins_ += static_cast<int>(h.size());
++          return std::vector<int32_t>(h.size(), 42);
++        },
++        [this](absl::Span<const std::string> h) {
++          pins_ -= static_cast<int>(h.size());
++        });
++  }
++
++  void TearDown() override {
++    if (src_ != nullptr) src_->service->ClearReadRemoteHooks();
++  }
++
++  ::tpu_sync::rpc::RaidenIdProto unit_;
++  std::unique_ptr<TestWorkerServer> worker_;
++  // Declared before src_: the service's teardown may still call the unpin hook.
++  std::atomic<int> pins_{0};
++  std::unique_ptr<core::controller::TestControllerServer> src_;
++};
++
++// The source never answers in time: the deadline thread settles the read with
++// DeadlineExceeded about one second in; the acquire reply (an OK lease) lands
++// later and is released, leaving no pins.
++TEST_F(ReadRemoteDeadlineTest, UnansweredAcquireSettlesAtTheDeadline) {
++  ShardAwareMockTransferManager mock;
++  worker_->service->SetTransferManager(KVManagerHolder(&mock));
++  SetSourceHooks(/*validate_delay=*/absl::Milliseconds(2500));
++
++  TF_ASSERT_OK_AND_ASSIGN(
++      auto dest, RaidenController::Create(unit_, /*num_blocks=*/5,
++                                          /*num_shards=*/2,
++                                          /*shard_size_bytes=*/512, ""));
++  Register(*dest);
++
++  const absl::Time start = absl::Now();
++  absl::Status st =
++      dest->ReadRemote(src_->server_address, {10}, /*dst_host_block_ids=*/{20},
++                       {"h0"})
++          .Await();
++  EXPECT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded) << st;
++  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
++
++  // Let the late acquire land and be released.
++  absl::SleepFor(absl::Seconds(2));  // the grant lands at ~2.5 s
++  for (int i = 0; i < 300 && pins_.load() != 0; ++i) {
++    absl::SleepFor(absl::Milliseconds(10));
++  }
++  EXPECT_EQ(pins_.load(), 0);
++}
++
++// The acquire fails at the source, but only after the deadline has settled
++// the read: the late failure changes nothing the caller sees.
++TEST_F(ReadRemoteDeadlineTest, LateAcquireFailureAfterTheDeadlineIsAbsorbed) {
++  ShardAwareMockTransferManager mock;
++  worker_->service->SetTransferManager(KVManagerHolder(&mock));
++  SetSourceHooks(/*validate_delay=*/absl::Milliseconds(2500),
++                 absl::NotFoundError("gone"));
++
++  TF_ASSERT_OK_AND_ASSIGN(
++      auto dest, RaidenController::Create(unit_, /*num_blocks=*/5,
++                                          /*num_shards=*/2,
++                                          /*shard_size_bytes=*/512, ""));
++  Register(*dest);
++
++  absl::Status st =
++      dest->ReadRemote(src_->server_address, {10}, /*dst_host_block_ids=*/{20},
++                       {"h0"})
++          .Await();
++  EXPECT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded) << st;
++  absl::SleepFor(absl::Seconds(3));  // the NotFound reply lands here
++  EXPECT_EQ(mock.vector_h2h_read_calls + mock.h2h_read_calls, 0);
++  EXPECT_EQ(pins_.load(), 0);
++}
++
++// The worker's read outlasts the deadline: the read settles DeadlineExceeded
++// while the pull runs, and the pull's completion afterwards releases the
++// lease. (That the DMA runs on after the settle is the known behaviour this
++// test observes but does not judge.)
++struct SlowReadMock : ShardAwareMockTransferManager {
++  using ShardAwareMockTransferManager::H2dRead;
++  using ShardAwareMockTransferManager::H2hRead;
++  using ShardAwareMockTransferManager::H2hWrite;
++
++  absl::Duration read_duration = absl::Seconds(3);
++  std::atomic<int64_t> read_finished_ns{0};
++
++  absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
++      const std::vector<::tpu_raiden::RaidenTransferEndpoint>& remote_descriptors,
++      const std::vector<int>& src_block_ids,
++      const std::vector<int>& dst_block_ids) {
++    absl::SleepFor(read_duration);
++    auto result = ShardAwareMockTransferManager::H2hReadExplicit(
++        remote_descriptors, src_block_ids, dst_block_ids);
++    read_finished_ns = absl::ToUnixNanos(absl::Now());
++    return result;
++  }
++};
++
++TEST_F(ReadRemoteDeadlineTest, PullCompletingAfterTheDeadlineReleasesTheLease) {
++  SlowReadMock mock;
++  worker_->service->SetTransferManager(KVManagerHolder(&mock));
++  SetSourceHooks(/*validate_delay=*/absl::ZeroDuration());
++
++  TF_ASSERT_OK_AND_ASSIGN(
++      auto dest, RaidenController::Create(unit_, /*num_blocks=*/5,
++                                          /*num_shards=*/2,
++                                          /*shard_size_bytes=*/512, ""));
++  Register(*dest);
++
++  absl::Status st =
++      dest->ReadRemote(src_->server_address, {10}, /*dst_host_block_ids=*/{20},
++                       {"h0"})
++          .Await();
++  const absl::Time settled_at = absl::Now();
++  EXPECT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded) << st;
++  EXPECT_EQ(mock.read_finished_ns.load(), 0) << "pull already done at settle";
++
++  absl::SleepFor(mock.read_duration + absl::Seconds(1));
++  EXPECT_GT(mock.read_finished_ns.load(), absl::ToUnixNanos(settled_at));
++  for (int i = 0; i < 200 && pins_.load() != 0; ++i) {
++    absl::SleepFor(absl::Milliseconds(10));
++  }
++  EXPECT_EQ(pins_.load(), 0);
++}
++
++}  // namespace
++}  // namespace controller
++}  // namespace tpu_raiden
+diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
+index 9f4ac39..7dd9310 100644
+--- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
++++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
+@@ -1092,5 +1092,209 @@ TEST(RecvLifecycleTest,
+   EXPECT_FALSE(rejected.ok());
+   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
+ }
++
++// ---------------------------------------------------------------------------
++// Receive-side schedules the suite did not drive. Each test is one branch of
++// TransferReceiveSession's lifecycle that no existing test reached: a failed
++// H2D dispatch, a second Finish, a late error on a settled receive, a push
++// lease that closes while the receive continues, and a cancelled receive
++// whose last copy then fails or completes under an open push lease.
++// ---------------------------------------------------------------------------
++
++// ExecuteLayerH2d: H2dSyncDispatch fails. The session finishes with the
++// dispatch error, releases the op it took, and settles at once (no copy was
++// issued, so nothing is left to wait for); the poll reports it failed.
++TEST(RecvLifecycleTest, FailedH2dDispatchFailsAndSettlesTheReceive) {
++  GetFaultInjector().Reset();
++  absl::Cleanup reset_faults = [] { GetFaultInjector().Reset(); };
++  FaultInjectionRule failed_dispatch;
++  failed_dispatch.hook = std::string(hooks::kTransferRecvSessionH2dDispatch);
++  failed_dispatch.probability = 1.0;
++  ABSL_ASSERT_OK(GetFaultInjector().Install({failed_dispatch}));
++
++  RecvTestManager consumer(/*num_layers=*/1);
++  consumer.AddRecv("req", /*uuid=*/201);
++  EXPECT_FALSE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/201).ok());
++  EXPECT_EQ(consumer.copies_issued(), 0);
++
++  Reports reports = consumer.CompleteReadRaw();
++  EXPECT_THAT(DoneReceiving(reports), IsEmpty());
++  EXPECT_THAT(FailedRecving(reports), ElementsAre("req"));
++  EXPECT_FALSE(consumer.has_recv(201));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++}
++
++// The same dispatch failure while an incoming push lease is open: the
++// failure drains the session, but the lease keeps staging pinned until
++// EndIncomingPush, which then settles it.
++TEST(RecvLifecycleTest, FailedH2dDispatchUnderPushLeaseWaitsForTheLease) {
++  GetFaultInjector().Reset();
++  absl::Cleanup reset_faults = [] { GetFaultInjector().Reset(); };
++  FaultInjectionRule failed_dispatch;
++  failed_dispatch.hook = std::string(hooks::kTransferRecvSessionH2dDispatch);
++  failed_dispatch.probability = 1.0;
++  ABSL_ASSERT_OK(GetFaultInjector().Install({failed_dispatch}));
++
++  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
++  consumer.AddRecv("req", /*uuid=*/202);
++  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/202));
++  EXPECT_FALSE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/202).ok());
++
++  // Draining, but the push lease still holds an op: not settled, staging held.
++  Reports during = consumer.CompleteReadRaw();
++  EXPECT_THAT(FailedRecving(during), IsEmpty());
++  EXPECT_TRUE(consumer.has_recv(202));
++  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
++
++  // end_incoming_push reports any failed session as Cancelled (the dispatch
++  // error itself is in the session's status / TransferDetails).
++  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/202),
++              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++  Reports after = consumer.CompleteReadRaw();
++  EXPECT_THAT(FailedRecving(after), ElementsAre("req"));
++  EXPECT_FALSE(consumer.has_recv(202));
++}
++
++// A second Finish(error) on a receive that already failed changes nothing:
++// one failure is reported, once.
++TEST(RecvLifecycleTest, SecondFinishOnAFailedReceiveIsANoOp) {
++  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
++  consumer.AddRecv("req", /*uuid=*/203);
++  consumer.FailRecv(/*uuid=*/203, absl::InternalError("first"));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++  consumer.FailRecv(/*uuid=*/203, absl::UnavailableError("second"));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++
++  Reports reports = consumer.CompleteReadRaw();
++  EXPECT_THAT(FailedRecving(reports), ElementsAre("req"));
++  EXPECT_THAT(FailedRecving(consumer.CompleteReadRaw()), IsEmpty());
++}
++
++// Pins the receiver's first-error-wins rule: a Finish(error) that lands after
++// the receive settled OK but before the poll picked it up flips its status,
++// and the poll reports it as failed. (The sender's FinishLocked has the
++// opposite, first-Finish-wins rule.) In production this is the deadline
++// sweep's or UnregisterActivePlan's check-then-Finish racing the last H2D
++// callback.
++TEST(RecvLifecycleTest, LateErrorAfterSettledOkIsReportedAsFailed) {
++  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
++  consumer.AddRecv("req", /*uuid=*/204);
++  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/204).ok());
++  ASSERT_TRUE(consumer.ReceiveBlocks({0}, /*uuid=*/204).ok());
++  consumer.FinishCopy(0, absl::OkStatus());
++  EXPECT_EQ(consumer.free_slots(), kSlots);  // settled OK
++
++  consumer.FailRecv(/*uuid=*/204, absl::CancelledError("late"));
++
++  Reports reports = consumer.CompleteReadRaw();
++  EXPECT_THAT(DoneReceiving(reports), IsEmpty());
++  EXPECT_THAT(FailedRecving(reports), ElementsAre("req"));
++}
++
++// A push lease that closes while the receive is still running: the lease
++// release neither settles the session nor returns its staging; the copy's
++// callback does.
++TEST(RecvLifecycleTest, PushLeaseClosingBeforeTheCopyEndsDoesNotSettle) {
++  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
++  consumer.AddRecv("req", /*uuid=*/205);
++  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/205));
++  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/205).ok());
++  ASSERT_TRUE(consumer.ReceiveBlocks({0}, /*uuid=*/205).ok());
++  ABSL_ASSERT_OK(consumer.base()->EndIncomingPush(/*uuid=*/205));
++
++  Reports during = consumer.CompleteReadRaw();
++  EXPECT_THAT(DoneReceiving(during), IsEmpty());
++  EXPECT_TRUE(consumer.has_recv(205));
++  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
++
++  consumer.FinishCopy(0, absl::OkStatus());
++  Reports after = consumer.CompleteReadRaw();
++  EXPECT_THAT(DoneReceiving(after), ElementsAre("req"));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++}
++
++// A cancelled receive whose only copy then fails: the failure is absorbed
++// (the session is already draining), the callback ends the last op, the
++// receive settles and is reported failed once.
++TEST(RecvDrainTest, CancelledReceiveWhoseCopyThenFailsSettlesOnce) {
++  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
++  consumer.AddRecv("req", /*uuid=*/206);
++  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/206).ok());
++  consumer.FailRecv(/*uuid=*/206, absl::CancelledError("cancel"));
++  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
++
++  consumer.FinishCopy(0, absl::InternalError("copy failed"));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++  Reports reports = consumer.CompleteReadRaw();
++  EXPECT_THAT(FailedRecving(reports), ElementsAre("req"));
++  EXPECT_THAT(FailedRecving(consumer.CompleteReadRaw()), IsEmpty());
++}
++
++// The same with an incoming push lease open: the failed callback cannot
++// settle the session while the lease holds an op; EndIncomingPush does.
++TEST(RecvDrainTest, CancelledReceiveWhoseCopyFailsUnderPushLeaseWaitsForTheLease) {
++  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
++  consumer.AddRecv("req", /*uuid=*/207);
++  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/207));
++  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/207).ok());
++  consumer.FailRecv(/*uuid=*/207, absl::CancelledError("cancel"));
++  consumer.FinishCopy(0, absl::InternalError("copy failed"));
++  EXPECT_TRUE(consumer.has_recv(207));
++  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
++
++  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/207),
++              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++  EXPECT_THAT(FailedRecving(consumer.CompleteReadRaw()), ElementsAre("req"));
++}
++
++// A cancelled receive whose last copy completes OK under an open push lease:
++// the OK callback does not finish a draining session (the `!draining_`
++// guard), the lease keeps it unsettled, and the outcome is the cancellation.
++TEST(RecvDrainTest, CancelledReceiveLastCopyOkUnderPushLeaseStaysCancelled) {
++  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
++  consumer.AddRecv("req", /*uuid=*/208);
++  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/208));
++  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/208).ok());
++  consumer.FailRecv(/*uuid=*/208, absl::CancelledError("cancel"));
++  consumer.FinishCopy(0, absl::OkStatus());
++  EXPECT_TRUE(consumer.has_recv(208));
++  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
++
++  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/208),
++              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_EQ(consumer.free_slots(), kSlots);
++  Reports reports = consumer.CompleteReadRaw();
++  EXPECT_THAT(DoneReceiving(reports), IsEmpty());
++  EXPECT_THAT(FailedRecving(reports), ElementsAre("req"));
++}
++
++// ---------------------------------------------------------------------------
++// Send-side schedule the suite did not drive: an expired send whose copy
++// then fails. The deadline sweep has already drained it; the failed copy is
++// absorbed and the send settles when the copy's OnReady ends the op.
++// ---------------------------------------------------------------------------
++TEST(SendDrainTest, ExpiredSendWhoseCopyThenFailsSettlesOnce) {
++  TestManager producer(/*num_layers=*/1);
++  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/209, {0},
++                                   std::chrono::steady_clock::now() -
++                                       std::chrono::milliseconds(1)),
++            0);
++  producer.ServePull(209);
++  ASSERT_EQ(producer.copies_issued(), 1);
++  Reports swept = producer.CompleteReadRaw();  // deadline: Finish, draining
++  EXPECT_THAT(FailedRecving(swept), IsEmpty());
++  EXPECT_TRUE(producer.send_draining(209));
++  EXPECT_EQ(producer.free_slots(), kSlots - 1);
++
++  producer.FinishCopy(0, absl::InternalError("copy failed"));
++  Reports after = producer.CompleteReadRaw();
++  EXPECT_THAT(DoneSending(after), IsEmpty());
++  EXPECT_THAT(FailedRecving(after), ElementsAre("req"));
++  EXPECT_EQ(producer.free_slots(), kSlots);
++  EXPECT_THAT(FailedRecving(producer.CompleteReadRaw()), IsEmpty());
++}
++
+ }  // namespace
+ }  // namespace tpu_raiden
+diff --git a/tpu_sync/kv_cache/transfer_send_session_test.cc b/tpu_sync/kv_cache/transfer_send_session_test.cc
+index 296c6ce..7ea9c44 100644
+--- a/tpu_sync/kv_cache/transfer_send_session_test.cc
++++ b/tpu_sync/kv_cache/transfer_send_session_test.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "tpu_sync/kv_cache/transfer_send_session.h"
+ 
++#include <atomic>
+ #include <chrono>  // NOLINT(build/c++11)
+ #include <cstddef>
+ #include <cstdint>
+@@ -647,5 +648,218 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
+       session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// Send-session schedules the suite did not drive: a failed D2H dispatch
++// (first layer, and second layer with the first copy in flight), a copy
++// whose future is already failed when StartPush registers on it, the only
++// push failing, a cancelled send whose push then fails, and the two-layer
++// drain with the completions in the other order.
++// ---------------------------------------------------------------------------
++
++// A FakeSendBase whose `fail_dispatch_index`-th D2H dispatch fails outright,
++// and whose other dispatches can hand back an already-failed future.
++class FailingD2hSendBase : public FakeSendBase {
++ public:
++  using FakeSendBase::FakeSendBase;
++
++  void FailDispatchAt(int index) { fail_dispatch_index_ = index; }
++  void FailAllFuturesAtDispatch() { fail_futures_ = true; }
++
++  absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
++      const std::vector<int64_t>& src_offsets_major_dim,
++      const std::vector<int64_t>& dst_offsets_major_dim,
++      const std::vector<int64_t>& copy_sizes_major_dim,
++      std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
++      std::optional<size_t> shard_idx) override {
++    const int index = dispatches_++;
++    if (index == fail_dispatch_index_) {
++      return absl::InternalError("dispatch refused");
++    }
++    if (fail_futures_) {
++      auto [promise, future] = xla::MakePromise<>();
++      promise.Set(absl::InternalError("copy failed at dispatch"));
++      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
++    }
++    return FakeSendBase::D2hSyncDispatch(src_offsets_major_dim,
++                                         dst_offsets_major_dim,
++                                         copy_sizes_major_dim, slot_idx,
++                                         layer_idx, shard_idx);
++  }
++
++ private:
++  std::atomic<int> dispatches_{0};
++  int fail_dispatch_index_ = -1;
++  bool fail_futures_ = false;
++};
++
++// StartPush: the first layer's D2hSyncDispatch fails. FinishLocked with the
++// dispatch error, EndSendOpLocked for the copy that never started, and the
++// send settles at once with nothing else in flight.
++TEST(TransferSendSessionTest, FailedD2hDispatchOnFirstLayerSettlesAtOnce) {
++  FailingD2hSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
++  base.FailDispatchAt(0);
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
++  const auto now = std::chrono::steady_clock::now();
++  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
++      &base, allocator.get(), "req_dispatch_fail", /*uuid=*/401,
++      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
++      /*register_start=*/now);
++  session->ValidateAndBeginPull({0}, now);
++  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
++                     /*dst_block_ids=*/{0});
++
++  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
++  EXPECT_TRUE(session->Done());
++  EXPECT_FALSE(session->HasStaging());
++  EXPECT_EQ(base.h2h_calls(), 0);
++  EXPECT_EQ(allocator->num_free_slots(), 2);
++}
++
++// The second layer's dispatch fails while the first layer's copy is still
++// running: the send drains on the dispatch error and settles only when the
++// first copy's OnReady ends its op.
++TEST(TransferSendSessionTest, FailedD2hDispatchOnSecondLayerWaitsForTheFirstCopy) {
++  FailingD2hSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
++  base.SetManualD2h(true);
++  base.FailDispatchAt(1);
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
++  const auto now = std::chrono::steady_clock::now();
++  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
++      &base, allocator.get(), "req_dispatch_fail_2", /*uuid=*/402,
++      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
++      /*register_start=*/now);
++  session->ValidateAndBeginPull({0}, now);
++  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
++                     /*dst_block_ids=*/{0});
++
++  // Layer 0 issued and in flight; layer 1 refused; draining, not done.
++  EXPECT_TRUE(session->IsDraining());
++  EXPECT_FALSE(session->Done());
++  EXPECT_TRUE(session->HasStaging());
++  EXPECT_EQ(allocator->num_free_slots(), 0);
++
++  base.CompleteD2h(0, absl::OkStatus());
++  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
++  EXPECT_FALSE(session->HasStaging());
++  EXPECT_EQ(base.h2h_calls(), 0);
++  EXPECT_EQ(allocator->num_free_slots(), 1);
++}
++
++// The copy's future is already failed when StartPush registers on it: the
++// StartPush callback ends its op at registration, then SendNextLayer's
++// callback sees the failure (kD2hPhase) and the send settles failed.
++TEST(TransferSendSessionTest, CopyAlreadyFailedAtDispatchFailsTheSend) {
++  FailingD2hSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
++  base.FailAllFuturesAtDispatch();
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
++  const auto now = std::chrono::steady_clock::now();
++  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
++      &base, allocator.get(), "req_future_failed", /*uuid=*/403,
++      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
++      /*register_start=*/now);
++  session->ValidateAndBeginPull({0}, now);
++  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
++                     /*dst_block_ids=*/{0});
++
++  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
++  EXPECT_FALSE(session->HasStaging());
++  EXPECT_EQ(base.h2h_calls(), 0);
++  EXPECT_EQ(allocator->num_free_slots(), 2);
++}
++
++// The only push fails: FinishLocked(status, kPushPhase) in the push callback,
++// the send settles failed, staging released.
++TEST(TransferSendSessionTest, FailedPushFailsTheSend) {
++  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
++  base.SetManualH2h(true);
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
++  const auto now = std::chrono::steady_clock::now();
++  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
++      &base, allocator.get(), "req_push_fail", /*uuid=*/404, /*block_ids=*/{0},
++      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
++  session->ValidateAndBeginPull({0}, now);
++  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
++                     /*dst_block_ids=*/{0});
++  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
++  EXPECT_FALSE(session->Done());
++
++  base.CompleteH2h(0, absl::UnavailableError("peer went away"));
++  EXPECT_THAT(session->AwaitForDone(),
++              StatusIs(absl::StatusCode::kUnavailable));
++  EXPECT_FALSE(session->HasStaging());
++  EXPECT_EQ(allocator->num_free_slots(), 2);
++}
++
++// A send cancelled mid-push whose push then fails keeps the cancellation:
++// the sender's FinishLocked is first-Finish-wins, so the push's error does
++// not replace the status the caller already decided.
++TEST(TransferSendSessionTest, CancelledSendWhosePushThenFailsKeepsCancelled) {
++  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
++  base.SetManualH2h(true);
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
++  const auto now = std::chrono::steady_clock::now();
++  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
++      &base, allocator.get(), "req_cancel_then_push_fail", /*uuid=*/405,
++      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
++      /*register_start=*/now);
++  session->ValidateAndBeginPull({0}, now);
++  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
++                     /*dst_block_ids=*/{0});
++  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
++
++  session->Finish(absl::CancelledError("consumer cancelled"));
++  EXPECT_FALSE(session->Done());
++  base.CompleteH2h(0, absl::InternalError("push failed"));
++  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_FALSE(session->HasStaging());
++  EXPECT_EQ(allocator->num_free_slots(), 2);
++}
++
++// DoneGuaranteesAllResourcesReleased… with the completions swapped: layer 1's
++// D2H completes before layer 0's push. The draining send drops layer 1's
++// push, is still held by layer 0's push in flight, and settles when that
++// push completes.
++TEST(TransferSendSessionTest, DrainWithLastCopyCompletingBeforeTheFirstPush) {
++  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
++  base.SetManualD2h(true);
++  base.SetManualH2h(true);
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
++  const auto now = std::chrono::steady_clock::now();
++  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
++      &base, allocator.get(), "req_drain_swapped", /*uuid=*/406,
++      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
++      /*register_start=*/now);
++  session->ValidateAndBeginPull({0}, now);
++  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
++                     /*dst_block_ids=*/{0});
++  ASSERT_EQ(base.d2h_calls(), 2);
++  base.CompleteD2h(0, absl::OkStatus());
++  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
++
++  session->Finish(absl::DeadlineExceededError("send deadline exceeded"));
++  EXPECT_TRUE(session->IsDraining());
++
++  // Layer 1's copy completes first: no push for it (draining), and the send
++  // is still held by layer 0's push.
++  base.CompleteD2h(1, absl::OkStatus());
++  EXPECT_FALSE(session->Done());
++  EXPECT_TRUE(session->HasStaging());
++  EXPECT_EQ(base.h2h_calls(), 1);
++
++  base.CompleteH2h(0, std::vector<int>{0});
++  EXPECT_THAT(session->AwaitForDone(),
++              StatusIs(absl::StatusCode::kDeadlineExceeded));
++  EXPECT_FALSE(session->HasStaging());
++  EXPECT_EQ(allocator->num_free_slots(), 1);
++  EXPECT_EQ(base.h2h_calls(), 1);
++}
++
+ }  // namespace
+ }  // namespace tpu_raiden
