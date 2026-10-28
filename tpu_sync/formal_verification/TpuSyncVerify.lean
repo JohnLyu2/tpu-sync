@@ -20,8 +20,8 @@ import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
 import TpuSyncVerify.Transfer.Reshard.Coordinator
--- The remaining Transfer models and the Controller model land in follow-up
--- changes and are imported here as they arrive.
+-- The Controller model lands in a follow-up change and is imported here when
+-- it arrives.
 
 /-!
 # TpuSyncVerify

@@ -8,10 +8,11 @@ machine-checked proofs about them.
 
 ## What is modelled
 
-The shared infrastructure (`Common/`), the transfer-session lifecycle model
-and the prefill-to-decode subsystem (`Transfer/PrefillDecode/`, including the
-transport and engine caller models) are in; the resharding and controller
-models below arrive in follow-up changes.
+The shared infrastructure (`Common/`), the transfer-session lifecycle model,
+the prefill-to-decode subsystem (`Transfer/PrefillDecode/`, including the
+transport and engine caller models) and the pool-resharding subsystem
+(`Transfer/Reshard/`) are in; the controller model below arrives in a
+follow-up change.
 
 **Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
 - C++: `TransferSendSession`, `TransferReceiveSession`,
@@ -28,10 +29,10 @@ models below arrive in follow-up changes.
 - Proved: a connector that forwards every publication leaks no held block and
   never decodes on unwritten KV.
 
-**Pool resharding** — `docs/transfer/reshard.md` *(follow-up)*
+**Pool resharding** — [reshard.md](docs/transfer/reshard.md)
 - C++: `ReshardSendSession`, `ReshardReceiveSession`, `PoolStagingStorage`,
   `RequestBlockRegistry`, `ReshardCoordinator`.
-- Lean: `Transfer/Reshard/`.
+- Lean: [`Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/).
 - Proved: data correctness including sub-block coverage and aliased-page
   ordering, staging slot conservation, registry claim safety,
   arm-before-dispatch, termination.
@@ -51,13 +52,13 @@ TpuSyncVerify/
   Common/                     transition-system core, list lemmas, bounded model checker
   Transfer/Session.lean       settle protocol shared by every transfer session
   Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller
-  Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator (follow-up)
+  Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator
   Controller/ReadRemote.lean  controller remote-read lease (follow-up)
 docs/
   conventions.md              how the models are written (one executable step, ghost
                               fields, replay traces, mutants) and how the C++ is cited
   transfer/, controller/      per-subsystem C++ <-> Lean docs: states, events,
-                              assumptions, proved theorems (reshard, controller follow-up)
+                              assumptions, proved theorems (controller follow-up)
 tools/
   resolve_anchors.py          resolves and checks the source-map tables
 lakefile.toml, lake-manifest.json, lean-toolchain
