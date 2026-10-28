@@ -444,7 +444,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       }
       recv_session = it->second;
     }
-    return recv_session->OnRecvProgress(*this);
+    return recv_session->OnRecvProgress();
   };
   hooks.on_recv_network_complete = [this](uint64_t uuid) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;
@@ -456,7 +456,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       }
       recv_session = it->second;
     }
-    return recv_session->OnRecvNetworkComplete(*this);
+    return recv_session->OnRecvNetworkComplete();
   };
   hooks.acquire_recv_staging =
       [this](uint64_t uuid, size_t layer_idx) -> absl::StatusOr<size_t> {
@@ -749,7 +749,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
         std::shared_ptr<TransferReceiveSession> recv_session,
         TransferReceiveSession::CreateFromActivePlan(
             base_.get(), staging_allocator_.get(), uuid, request, generation,
-            DeadlineFromNow(), &host_block_of));
+            DeadlineFromNow(), &host_block_of, metrics_collector_));
 
     if (recv_session->total_blocks() > 0) {
       absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
@@ -814,9 +814,10 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
   absl::MutexLock lock(mu_);
   ASSIGN_OR_RETURN(
       std::shared_ptr<TransferReceiveSession> recv_session,
-      TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
-                                     uuid, req_id, expected_block_count,
-                                     deadline.value_or(DeadlineFromNow())));
+      TransferReceiveSession::Create(
+          base_.get(), staging_allocator_.get(), uuid, req_id,
+          expected_block_count, deadline.value_or(DeadlineFromNow()),
+          /*acquire_staging=*/false, metrics_collector_));
   // host_to_chip is left empty -> defaults to 1-to-1 mapping in
   // OnBlockShardsReceived
   absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
@@ -1104,7 +1105,7 @@ void KVCacheManagerWithTransfer::StartRead(
         TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
                                        uuid, req_id, remote_block_ids,
                                        local_block_ids, local_host_block_ids,
-                                       effective_deadline);
+                                       effective_deadline, metrics_collector_);
     if (!created.ok()) {
       failed_recving_.insert(req_id);
       transfer_details_[req_id] = DetailsFromStatus(created.status());

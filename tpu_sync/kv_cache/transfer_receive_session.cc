@@ -168,12 +168,14 @@ TransferReceiveSession::Create(
     const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline,
+    std::shared_ptr<MetricsCollector> metrics_collector) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
-  auto session = std::shared_ptr<TransferReceiveSession>(
-      new TransferReceiveSession(base, staging_allocator, uuid));
+  auto session =
+      std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
+          base, staging_allocator, uuid, std::move(metrics_collector)));
   std::vector<int64_t> host_block_ids;
   if (!session->AllocateStagingForLoad(req_id, local_block_ids,
                                        local_host_block_ids, &host_block_ids)) {
@@ -192,13 +194,14 @@ TransferReceiveSession::Create(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
     std::string req_id, int32_t total_blocks,
-    std::chrono::steady_clock::time_point deadline, bool acquire_staging) {
+    std::chrono::steady_clock::time_point deadline, bool acquire_staging,
+    std::shared_ptr<MetricsCollector> metrics_collector) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
   return std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
       base, staging_allocator, uuid, std::move(req_id), total_blocks, deadline,
-      acquire_staging));
+      acquire_staging, std::move(metrics_collector)));
 }
 
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
@@ -208,12 +211,14 @@ TransferReceiveSession::CreateFromActivePlan(
     const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
     std::chrono::steady_clock::time_point deadline,
     absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
-        host_block_of) {
+        host_block_of,
+    std::shared_ptr<MetricsCollector> metrics_collector) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
-  auto session = std::shared_ptr<TransferReceiveSession>(
-      new TransferReceiveSession(base, staging_allocator, uuid));
+  auto session =
+      std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
+          base, staging_allocator, uuid, std::move(metrics_collector)));
   ABSL_RETURN_IF_ERROR(session->InitFromActivePlan(request, generation,
                                                    deadline, host_block_of));
   return session;
@@ -581,20 +586,19 @@ bool TransferReceiveSession::RecordBlockShardsReceivedLocked(
 }
 
 bool TransferReceiveSession::RecordNetworkCompleteLocked(
-    MetricsCollector* absl_nullable metrics, bool all_complete,
-    std::string* session_req_id,
+    bool all_complete, std::string* session_req_id,
     std::chrono::steady_clock::time_point* session_start_time) {
   network_completed_ = true;
   *session_req_id = req_id_;
-  if (metrics != nullptr) {
-    metrics->RecordLastPacket(uuid_);
+  if (metrics_collector_ != nullptr) {
+    metrics_collector_->RecordLastPacket(uuid_);
   }
   if (!all_complete) {
     return false;
   }
   *session_start_time = start_time_;
-  if (metrics != nullptr) {
-    metrics->RecordEnd(uuid_);
+  if (metrics_collector_ != nullptr) {
+    metrics_collector_->RecordEnd(uuid_);
   }
   FinishLocked();
   return true;
@@ -678,32 +682,28 @@ void TransferReceiveSession::ExecutePullRequest(
       });
 }
 
-absl::Status TransferReceiveSession::OnRecvProgress(
-    KVCacheManagerWithTransfer& manager) {
+absl::Status TransferReceiveSession::OnRecvProgress() {
   absl::MutexLock lock(mu_);
   if (done_ || draining_) {
     return absl::OkStatus();
   }
   if (!any_blocks_received_) {
     any_blocks_received_ = true;
-    MetricsCollector* const metrics = manager.metrics_collector_.get();
-    if (metrics != nullptr) {
-      metrics->RecordFirstPacket(uuid_);
+    if (metrics_collector_ != nullptr) {
+      metrics_collector_->RecordFirstPacket(uuid_);
     }
   }
   return absl::OkStatus();
 }
 
-absl::Status TransferReceiveSession::OnRecvNetworkComplete(
-    KVCacheManagerWithTransfer& manager) {
+absl::Status TransferReceiveSession::OnRecvNetworkComplete() {
   absl::MutexLock lock(mu_);
   if (done_ || draining_ || network_completed_) {
     return absl::OkStatus();
   }
   network_completed_ = true;
-  MetricsCollector* const metrics = manager.metrics_collector_.get();
-  if (metrics != nullptr) {
-    metrics->RecordLastPacket(uuid_);
+  if (metrics_collector_ != nullptr) {
+    metrics_collector_->RecordLastPacket(uuid_);
   }
   return absl::OkStatus();
 }
@@ -733,9 +733,8 @@ absl::Status TransferReceiveSession::OnBlockShardsReceived(
     }
     all_complete = RecordBlockShardsReceivedLocked(
         block_ids, shard_ids, &first_packet, &network_just_completed);
-    MetricsCollector* const metrics = manager.metrics_collector_.get();
-    if (first_packet && metrics != nullptr) {
-      metrics->RecordFirstPacket(uuid_);
+    if (first_packet && metrics_collector_ != nullptr) {
+      metrics_collector_->RecordFirstPacket(uuid_);
     }
     if (!network_just_completed) {
       VLOG(1) << "OnBlockShardsReceived: partial for uuid " << uuid_
@@ -746,7 +745,7 @@ absl::Status TransferReceiveSession::OnBlockShardsReceived(
       return absl::OkStatus();
     }
     should_record_duration = RecordNetworkCompleteLocked(
-        metrics, all_complete, &session_req_id, &session_start_time);
+        all_complete, &session_req_id, &session_start_time);
   }
 
   if (should_record_duration) {
@@ -815,8 +814,8 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
       trigger_enqueue = true;
     }
   }
-  if (trigger_enqueue && manager.metrics_collector_) {
-    manager.metrics_collector_->RecordH2dEnqueue(uuid_);
+  if (trigger_enqueue && metrics_collector_ != nullptr) {
+    metrics_collector_->RecordH2dEnqueue(uuid_);
   }
 
   LOG(INFO) << "OnLayerReceived (H2D copy start) layer " << layer_idx
@@ -861,9 +860,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
   const uint64_t uuid = uuid_;
   const int numa_node = base_->assigned_numa_node().value_or(-1);
   future.OnReady([self = shared_from_this(), &manager, uuid, numa_node,
-                  layer_idx, session_req_id,
-                  metrics_collector =
-                      manager.metrics_collector_](auto status_or) {
+                  layer_idx, session_req_id](auto status_or) {
     absl::Status injected =
         FaultInjectStatus(hooks::kTransferRecvSessionH2dComplete);
     if (status_or.ok() && !injected.ok()) {
@@ -911,12 +908,12 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
     if (all_layers_done) {
       RecordTransferDuration(
           DurationMs(session_start_time, std::chrono::steady_clock::now()));
-      if (metrics_collector) {
-        metrics_collector->RecordH2dComplete(uuid);
+      if (self->metrics_collector_ != nullptr) {
+        self->metrics_collector_->RecordH2dComplete(uuid);
       }
       LOG(INFO) << "All layers H2D copy complete: req_id=" << session_req_id;
-      if (metrics_collector) {
-        metrics_collector->RecordEnd(uuid);
+      if (self->metrics_collector_ != nullptr) {
+        self->metrics_collector_->RecordEnd(uuid);
       }
     }
     if (should_unregister && !manager.IsShuttingDown()) {
