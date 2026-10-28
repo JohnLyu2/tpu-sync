@@ -54,6 +54,15 @@ which the next run of the same target overwrites).
 (`transfer_send_session_test.cc`); `FakeSendBase(num_layers, host_blocks)` is
 the ready-made `KVCacheManagerBase` stub for allocator-level tests.
 
+[EMP] 2026-10-28, upstream `42dda542` (fork machine, bazelisk at
+`~/.local/bin`, Bazel 8.6.0 from `.bazelversion`, clang-21): the build now
+pulls in `peregrine` 0.1.14, whose RDMA targets `#include
+<infiniband/verbs.h>` with no opt-out, so `sudo apt install libibverbs-dev`
+is a prerequisite (the `c9bc124` fork build did not need it). Cold build of
+the three transfer/controller test targets ≈ 16 min; `--runs_per_test=10`
+on the two kv_cache targets ≈ 3 min warm. A second checkout (a `git
+worktree`) gets its own output base, so the first build there is cold again.
+
 ## See also
 
 - ../journal/2026-10/2026-10-07-f5-per-peer-staging-admission-fix.md
