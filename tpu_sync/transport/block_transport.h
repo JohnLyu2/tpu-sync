@@ -36,6 +36,7 @@
 #include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/block_transport_session.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/adapter/peregrine_transport_adapter.h"
 #include "tpu_sync/transport/lib/adapter/socket_transport_adapter.h"
@@ -48,47 +49,12 @@
 namespace tpu_raiden {
 namespace transport {
 
-enum class MajorOrder : uint8_t {
-  kLayerMajor = 0,
-  kBlockMajor = 1,
-};
-
 using BlockReceivedCallback = lib::BlockReceivedCallback;
-
-// Maximum shard index addressable by a shard-masked push stream; the
-// per-stream shard subset travels as a 16-bit mask in `ChunkHeader::buffer_id`
-// (0 = every shard, the legacy encoding).
-inline constexpr int kMaxShardMaskBits = 16;
-
-// Data-plane adapter used by a BlockTransport block op.
-enum class TransportBackend : uint8_t {
-  kSocket = 0,     // lib::SocketTransportAdapter.
-  kPeregrine = 1,  // lib::PeregrineTransportAdapter.
-};
 
 // High-speed Key-Value block transport engine.
 class BlockTransport final {
  public:
-  struct Config {
-    int handshake_read_timeout_ms = -1;
-    int payload_read_timeout_ms = -1;
-    int ack_write_timeout_ms = -1;
-    int payload_write_timeout_ms = -1;
-    size_t coalesce_window_bytes = 0;
-
-    absl::flat_hash_map<lib::TransferOp, TransportBackend> op_backends;
-
-    TransportBackend backend_for(lib::TransferOp op) const {
-      auto it = op_backends.find(op);
-      return it == op_backends.end() ? TransportBackend::kSocket : it->second;
-    }
-    bool uses_peregrine() const {
-      for (const auto& [op, backend] : op_backends) {
-        if (backend == TransportBackend::kPeregrine) return true;
-      }
-      return false;
-    }
-  };
+  using Config = BlockTransportConfig;
 
   // Constructor sets up a TCP listening socket on the given `local_port`. It
   // starts #`parallelism` worker threads to handle incoming `WriteTask`s.
@@ -292,11 +258,8 @@ class BlockTransport final {
                                   const lib::ChunkHeader& header);
   absl::Status HandleIncomingPull(int client_fd,
                                   const lib::ChunkHeader& header);
-  absl::Status CompleteIncomingPush(
-      uint64_t uuid, uint32_t local_id, uint32_t remote_id, size_t num_streams,
-      size_t landed_shards,
-      const std::optional<PoolPushProgressSpec>& pool_progress_spec,
-      bool is_peregrine = false);
+  std::shared_ptr<BlockTransportServerPushSession> GetOrCreatePushSession(
+      uint64_t uuid);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
       const std::vector<std::string>& peers,
@@ -306,66 +269,22 @@ class BlockTransport final {
       MajorOrder major_order, BlockReceivedCallback on_block_received,
       uint64_t uuid);
 
-  struct SendStreamState {
-    int client_fd;
-    uint64_t uuid;
-    int remote_id;
-    size_t count_or_size;
-    MajorOrder major_order;
-    size_t current_step = 0;
-    size_t total_steps = 0;
-  };
-
-  struct LayerProgress {
-    size_t completed_chunks = 0;
-    // Streams landed per sender node id, with the stream count that sender
-    // declared for this block array. Used when the receive plan declares how
-    // many senders assemble the array.
-    struct SenderStreams {
-      size_t landed = 0;
-      size_t declared = 0;
-      // Shards landed beyond the last full shard set; a full set (one per
-      // split push) counts as one landed push.
-      size_t landed_shards = 0;
-    };
-    absl::flat_hash_map<uint32_t, SenderStreams> sender_streams;
-    // Senders whose declared streams have all landed.
-    size_t senders_complete = 0;
-    // Sender count the receive plan declares for this block array, resolved
-    // from the delegate on the array's first stream. nullopt once resolved
-    // means the header-declared contract applies.
-    bool expected_senders_resolved = false;
-    std::optional<size_t> expected_senders;
-    bool on_layer_received_called = false;
-  };
-
-  static size_t AccumulateLandedShards(LayerProgress::SenderStreams& streams,
-                                       size_t shards, size_t full_shards);
-
-  void TriggerNextSendStep(std::shared_ptr<SendStreamState> state);
-  void ResolveStepCoordinates(const std::shared_ptr<SendStreamState>& state,
-                              size_t* layer, size_t* shard, size_t* block_idx);
-  uint32_t GetChunksTotalSize(const std::vector<BlockChunk>& chunks);
   absl::Status HandleCustomRequest(int client_fd,
                                    const lib::ChunkHeader& header);
-
-  using SendMap =
-      absl::flat_hash_map<uint64_t, std::shared_ptr<SendStreamState>>;
-  using ProgressMap =
-      absl::flat_hash_map<std::pair<uint64_t, int>, LayerProgress>;
 
  private:
   BlockTransportDelegate* const block_delegate_;
   const int parallelism_;
   const Config config_;
 
-  absl::Mutex active_sends_mu_;
-  SendMap active_sends_ ABSL_GUARDED_BY(active_sends_mu_);
-
-  absl::Mutex progress_mu_;
-  ProgressMap layer_progress_ ABSL_GUARDED_BY(progress_mu_);
-  absl::flat_hash_map<uint64_t, size_t> layers_dispatched_
-      ABSL_GUARDED_BY(progress_mu_);
+  absl::Mutex server_sessions_mu_;
+  absl::flat_hash_map<uint64_t,
+                      std::shared_ptr<BlockTransportServerPushSession>>
+      active_push_sessions_ ABSL_GUARDED_BY(server_sessions_mu_);
+  uint64_t next_pull_session_id_ ABSL_GUARDED_BY(server_sessions_mu_) = 0;
+  absl::flat_hash_map<uint64_t,
+                      std::shared_ptr<BlockTransportServerPullSession>>
+      active_pull_sessions_ ABSL_GUARDED_BY(server_sessions_mu_);
   lib::TransportMetricsExporter metrics_exporter_;
   absl::Notification stop_metrics_thread_;
   std::thread metrics_thread_;
