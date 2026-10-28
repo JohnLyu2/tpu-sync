@@ -850,28 +850,35 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   §Upper boundary; `wroteReleased` in `MultiRequest.lean`) for this caller
   pair, by reading — the leak is the trace where a failure report never maps
   to a free.
-- **Lean** (`tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Caller.lean`, 2026-10-22):
+- **Lean** (`tpu_sync/formal_verification/TpuSyncVerify/Transfer/Caller.lean` and `Caller/MultiWorker.lean`, 2026-10-22 / 2026-10-27):
   the pair is modelled above `Pipeline.lean`'s publication boundary — the
   connector as a function from tpu-sync's per-request report to what it tells
   the scheduler (`Connector`), the scheduler's transfer-held block lifecycle
-  on both nodes under both `kv_load_failure_policy` values. C1 is
+  on both nodes under both `kv_load_failure_policy` values, both for a single
+  worker and across two workers aggregated by `KVOutputAggregator`
+  (`MultiWorker.lean`). C1 is
   `trace_current_connector_p` (P: `pOutcome false` → `leakP`), `trace_current_connector_d_abort_after` and
   `trace_current_connector_d_abort_before` (D: `dOutcome false` and `finish` in either order
-  → `leakD`), all with `connectorCurrent`; `leakP_absorbing` /
-  `leakD_absorbing` prove no later engine event can undo either, which is the
-  formal content of "leak". The fix shape below is `connectorFixed`, and
-  `contract_safe` proves that *any* connector meeting `Contract` (forward
+  → `leakD`), and in the multi-worker model `trace_mw_current_partial_failure_leaks`
+  (one worker succeeds while the other fails, stopping `pSentCount` / `dRecvCount`
+  at `1 < 2`), all with `connectorCurrent`; `leakP_absorbing` /
+  `leakD_absorbing` (`mwLeakP_absorbing` / `mwLeakD_absorbing`) prove no later
+  engine event can undo either, which is the formal content of "leak". The fix
+  shape below is `connectorFixed`, and `contract_safe` / `mw_contract_safe`
+  prove that *any* connector meeting `Contract` (forward
   every outcome; a failed receive also on the load-failure channel — the
-  `base.py:357-393` text) never leaks and never decodes unwritten KV under
+  `base.py:357-393` text) never frees HBM while a worker is still in flight
+  (`mwEarlyFree = false`), never leaks, and never decodes unwritten KV under
   either policy. The two half-fixes each have a trace: `trace_naive_decodes`
   (`done_recving` alone — the EngineCore crash the connector's comment fears
   is real: the request is promoted with its whole prompt counted as computed)
   and `trace_loadErrorOnly_*` (`invalid_block_ids` alone — errored or marked,
   but the free waits for a `finished_recving` that never comes, so still a
   leak). Each of these end states is also asserted against the real
-  scheduler in §4 of the test file. Exhaustive `search` per configuration:
-  `fixed` safe, the other three find the trace. Assumptions B1–B3 in the
-  module header (one worker, whole-transfer failure, no preemption / prefix
+  scheduler in §4 of the test file. Exhaustive `search` / `mwSearch` per
+  configuration: `fixed` safe, the other three find the trace. Assumptions B1–B3
+  in the module header (`expectedP = 2`, `expectedD = 2` matching participating
+  workers in `MultiWorker.lean`, whole-transfer failure, no preemption / prefix
   caching / chunking).
 - **Hardware repro (not yet run):** `examples/single_host_disagg`: start P
   and D, send one request through the proxy, stop D before it pulls (or make
