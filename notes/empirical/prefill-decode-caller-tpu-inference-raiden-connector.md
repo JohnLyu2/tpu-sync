@@ -32,12 +32,15 @@ on both nodes, never implements `get_block_ids_with_load_errors`, and its own
 leak their blocks until restart.
 
 [FACT] Since 2026-10-22 the pair is modelled (moved to shared
-`tpu_sync/formal_verification/TpuSyncVerify/Transfer/Caller.lean` on 2026-10-27
+`tpu_sync/formal_verification/TpuSyncVerify/Transfer/Caller.lean` and split into
+`Caller/{Model,Invariant,Traces,MultiWorker}.lean` on 2026-10-27
 to cover both `PrefillDecode` and `Reshard` above `poll_stats()`; `Contract` is
-the `base.py:357-393` text as a `Prop` on the connector; `contract_safe`; C1 as
-`trace_current_connector_*`; leaks absorbing). The scheduler transcription it
-rests on is asserted against the real scheduler by §4 of the C1 test file (17/17).
-What the model does not cover is its B1–B3.
+the `base.py:357-393` text as a `Prop` on the connector; `contract_safe` and
+multi-worker `mw_contract_safe`; C1 as `trace_current_connector_*` and
+`trace_mw_current_partial_failure_leaks`; leaks absorbing). The scheduler
+transcription it rests on is asserted against the real scheduler by §4 of the
+C1 test file (17/17). Multi-worker `KVOutputAggregator` aggregation (B1) is
+modelled in `Caller/MultiWorker.lean`; what the model does not cover is B2–B3.
 
 Do not re-investigate:
 - "Would reporting a failed receive as `done_recving` alone be a fix?" — no;

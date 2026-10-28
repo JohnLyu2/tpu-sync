@@ -4,9 +4,10 @@ Load this before touching `Caller.lean`, before filing or reviewing a fix
 for C1, or when a question starts "what must a connector do with a
 `poll_stats()` outcome".
 
-Canonical: `verification/TpuSyncVerify/Transfer/Caller.lean` (moved from `Transfer/PrefillDecode/Caller.lean` on 2026-10-27 to cover both transfer paths)
+Canonical: `tpu_sync/formal_verification/TpuSyncVerify/Transfer/Caller.lean` (moved from `Transfer/PrefillDecode/Caller.lean` on 2026-10-27 to cover both transfer paths, and split into `Caller/{Model,Invariant,Traces,MultiWorker}.lean`)
 (module header: scope, event table, B1–B3, properties);
-`verification/docs/transfer/prefill_decode.md` §Modules, §Upper boundary;
+`tpu_sync/formal_verification/docs/transfer/prefill_decode.md` §Modules, §Upper boundary;
+`tpu_sync/formal_verification/docs/transfer/reshard.md` §Modules, §Coordinator and engine boundary;
 `findings/README.md` §C1 (**Lean** bullet, test re-run);
 `findings/tpu_inference_connector_c1_test.py` §4.
 
@@ -80,9 +81,14 @@ crash the real scheduler while the model said safe.
   across workers when one worker fails early and triggers `loadError` while a
   sibling worker's H2D is still live), decodes unwritten KV
   (`mwDecodesUnwritten = false`), or leaks blocks on P or D (`mwLeakP = false`,
-  `mwLeakD = false`).
+  `mwLeakD = false`). `applySend_staggered_eq_batch` and
+  `applyRecv_staggered_eq_batch` (via `applyLoadError_idem`) prove that two
+  workers reporting in the same `KVOutputAggregator.aggregate` pass yield the
+  exact same scheduler state as two back-to-back `pWorker` / `dWorker` steps, and
+  `mw_earlyLoadError_fail_eq_finish` / `mw_earlyLoadError_fail_holds_blocks`
+  extend the uncertain-load proofs to 2 workers.
 - Under `connectorCurrent` (`tpu-inference`), if one worker fails and the other
-  succeeds, theaggregator count sticks at `1 < 2` and leaks
+  succeeds, the aggregator count sticks at `1 < 2` and leaks
   (`trace_mw_current_partial_failure_leaks` — the multi-worker manifestation of C1).
 - Even under `connectorFixed`, if `get_finished_count()` exceeds the number of
   participating workers (`expectedP = 3` or `expectedD = 3` with 2 workers), the

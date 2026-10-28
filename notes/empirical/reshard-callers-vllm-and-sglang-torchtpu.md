@@ -63,6 +63,25 @@ Do not re-investigate:
   terminal?" — no (`:6365-6378, 6462-6463, 6545-6571`: `recv_finished = _done_recving | _failed_recving`,
   `newly_failed` blocks staged into `_failed_block_ids`, and producer
   `done_sending` emitted only from `native_terminal_sends | cancelled_sends`).
+- "Can a single aliased physical page on a shared `storage_index` hold bytes
+  belonging to two different concurrent requests (so Request $A$'s rank-0 FA
+  H2D could clobber Request $B$'s rank-1 state bytes across transfers)?" — no
+  (`MultiRequest` A1 in `Reshard/MultiRequest.lean`): across all three hybrid
+  pool manifests in `vllm-torchtpu` (`raiden/pool_manifest.py` at `9725110`:
+  `build_qwen35_pool_manifest` `:1105-1166`, `build_kimi_k3_pool_manifest`,
+  `build_dsv4_pool_manifest` `:1641-1695`, plus `block_major_pool.py`), every
+  pool on a storage shares one uniform `block_stride_bytes = raw_nbytes // num_blocks`
+  and `num_blocks` (`ConfigurePoolStaging` in `kv_cache_manager_base.cc:1981-2009`),
+  with sub-page `base_offset_bytes + region.extent_end_bytes <= block_stride_bytes`
+  (`PoolSpec::Validate`). Thus block $b$ of pool $P_1$ and block $b'$ of pool
+  $P_2$ overlap in device bytes iff $b = b'$. Above `tpu-sync`, vLLM's unified
+  `BlockPool` (`kv_cache_materializer.py:237-306`, `runner/kv_cache_dsv4.py:168-170`,
+  `runner/kv_cache_manager.py:448-450`) allocates from a single `[0, num_blocks)`
+  free list shared across all `kv_cache_groups` (FA and Mamba/GDN/KDA/DSv4 state
+  groups never own the same `block_id` $b$ simultaneously, and shared prefix-cached
+  blocks are stripped from `local_block_ids[prefix_pages:]` at `tpu_connector.py:1930-1951`).
+  Per-transfer `order_rank` (`CollectEligiblePoolH2dsLocked`) is only needed when a
+  single transfer or test aliases `b_fa == b_state` within one `uuid`.
 
 Open (parked, checked through `c9bc124` in `../loose-ends/parked.md`): whether
 the Peregrine `BlockTransport` backend (`5adb0f4`, `b43de27`, `86d4506`;
