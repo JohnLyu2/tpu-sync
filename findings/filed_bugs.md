@@ -4,7 +4,8 @@ Code references below are against [`google/tpu-sync` @ `50b0774`](https://github
 for bug 1, [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tree/1fa06d1f44345369f4327079828ec6c4989d6694) for bug 2,
 and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1) for bugs 3–6,
 [`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) for bug 7,
-and [`google/tpu-sync` @ `2ed6f8f`](https://github.com/google/tpu-sync/tree/2ed6f8f) for bug 9.
+[`google/tpu-sync` @ `2ed6f8f`](https://github.com/google/tpu-sync/tree/2ed6f8f) for bug 9,
+and [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) (plus [`vllm-project/tpu-inference` @ `f366ef52`](https://github.com/vllm-project/tpu-inference/tree/f366ef52) from [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)) for bug 10.
 Bug 8 is a caller-side defect and cites
 [`vllm-project/tpu-inference` @ `c2b062b`](https://github.com/vllm-project/tpu-inference/tree/c2b062b),
 [`vllm-project/vllm` @ `5ab4e44`](https://github.com/vllm-project/vllm/tree/5ab4e44)
@@ -12,7 +13,7 @@ and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac1
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
 the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2, `0ac16d1` for
-bugs 3–6, `449b591` for bug 7, the three pins above for bug 8, `2ed6f8f` for bug 9) and are not re-pinned on upstream syncs; the only edits are the italic
+bugs 3–6, `449b591` for bug 7, the three pins above for bug 8, `2ed6f8f` for bug 9, `42dda542` / `f366ef52` for bug 10) and are not re-pinned on upstream syncs; the only edits are the italic
 *Update* sentences and one internal tooling word replaced by "with the fix".
 Status updates go in [README.md](README.md) (§Summary, §History).
 
@@ -260,3 +261,26 @@ Confirmed by a unit test. Found during Lean formalization.
 Drop the early `UnregisterActivePlan` in `RecordPushCompletion` (keep `finalizing_` / `status_`); `EndOp` already unregisters at settle.
 
 Reproducer: `ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6` in [`reshard_send_session_bughunt_test.cc`](reshard_send_session_bughunt_test.cc).
+
+
+---
+
+## 10. `NumaAwareKVCacheManager::CompleteReadRaw` emits `failed_recving` while sibling sub-managers still have DMAs in flight, and never erases `failed_recving_set_` on failure (F11)
+
+Filed 2026-10-29. Permalinks: [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) and [`vllm-project/tpu-inference` @ `f366ef52`](https://github.com/vllm-project/tpu-inference/tree/f366ef52) ([PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)).
+
+[`NumaAwareKVCacheManager::CompleteReadRaw`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L638-L676) (the C++ method backing JAX [`KVCacheManager.poll_stats()`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/api/jax/kv_cache_manager.py#L169-L175)) barrier-waits `done_sending` and `done_recving` across NUMA sub-managers, but has two defects on the failure path:
+1. It emits `failed_recving` on the **first** failing sub-manager while sibling sub-managers still have H2D or D2H DMAs in flight.
+2. It **never erases `failed_recving_set_`** (or the barrier count maps) when a transfer fails.
+
+Confirmed by a unit test. Found during Lean formalization.
+
+**Cause**
+- *No barrier on `failed_recving` (`num_subs >= 2`, `ENABLE_MULTI_NUMA=1`).* `done_sending` ([L644-650](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L644-L650)) waits for `num_subs` sub-managers and `done_recving` ([L651-667](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L651-L667)) waits for `expected` sub-managers, whereas the `f` loop ([L668-672](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L668-L672)) emits `failed_recving` as soon as the first sub-manager reports `f` (pinned by [`AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc#L197-L220)).
+- *Cleanup only runs on all-success `done_recving`.* `failed_recving_set_.erase(req)` ([L665](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L665)) is inside the `r` (`done_recving`) loop under `cnt_it->second >= expected` ([L659-666](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L659-L666)), which increments only on `r`—never on `f` or `s`. Any failed receive, failed send, or expired unpulled send leaves `req` in [`failed_recving_set_`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.h#L286-L289) (and any partial counts in `done_sending_counts_`, `done_recving_counts_`, `req_expected_counts_`) permanently.
+
+**Impact**
+- *Mid-DMA HBM reuse (`ENABLE_MULTI_NUMA=1`).* Each sub-manager drains its own DMAs before reporting `failed_recving`, but emitting `failed_recving` on the first sub-manager breaks that guarantee across sub-managers. Because [`tpu_raiden_connector`](https://github.com/vllm-project/tpu-inference/blob/f366ef52/tpu_inference/distributed/tpu_raiden_connector.py#L657-L676) forwards `failed_recving` to vLLM to free transfer-held blocks, vLLM recycles the request's HBM blocks while sibling sub-managers still have H2D or D2H DMAs reading or writing them.
+- *Map leak and `req_id`-reuse poisoning (`ENABLE_MULTI_NUMA=0` included).* `failed_recving_set_` grows on every failed or expired transfer. If a `req_id` is reused, `failed_recving_set_.insert(req).second` ([L669](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L669)) silently drops subsequent failures, [L662-665](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L662-L665) suppresses healthy `done_recving`, and at `num_subs >= 2` stale `done_recving_counts_` entries cause premature `done_recving` before all sub-managers finish.
+
+Reproducer: [`numa_kv_cache_manager_bughunt_test.cc`](numa_kv_cache_manager_bughunt_test.cc) (4 cases).
