@@ -98,21 +98,29 @@ Open items only (5-field `better-than-fish` format, symbol citations instead of 
 **Effort estimate:** `ReadRemote` ~1 day; `Receive` ~3 days; `Send` +1–2 days.
 **References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive.lean §Lock scopes, ../journal/2026-10/2026-10-26-faithfulness-feedback-and-receive-lock-scope-audit.md
 
-## Coverage stopping criterion (W1–W4 remaining): Reshard W1, `Pipeline`/`ReadRemote` W2, `llvm-cov` W3, schedule-runner W4
-**Status:** parked 2026-10-27 (PrefillDecode + `ReadRemote` W1 and `Receive`/`Send` W2 done; `Common/Coverage.lean` in place)
-**Context:** Spec/implementation coverage plan from McMillan & Zuck's QUIC work (`docs/conventions.md` §"Coverage"). Remaining stages: (W1) branch-coverage modules for `Transfer/Reshard/{Receive,Send,Pipeline,Registry,Coordinator}`; (W2) guard × mutant inventories for `Pipeline` and `ReadRemote`; (W3) `llvm-cov export` intersected with `resolve_anchors.py` source-map spans to list unexecuted C++ branches inside modelled code; (W4) `TEST_P` C++ schedule interpreter over `RecvTestManager` running Lean-enumerated schedules and checking post-states (`Done()`, `IsDraining()`, `num_free_slots`, `copies_issued`, published status).
-**Why parked:** Prioritized landing the PrefillDecode/Controller coverage modules and upstream gap-test PR first.
-**To resume:** Pick independently: Reshard W1 (~½ day/model), `Pipeline`/`ReadRemote` W2 (~½ day), W3 `llvm-cov` + `resolve_anchors.py --coverage` (~1 day via OSS Bazel), or W4 `Receive` `TEST_P` runner (~3 days).
+## Coverage stopping criterion (W1–W2–W4 remaining): Reshard W1, `Pipeline`/`ReadRemote` W2, schedule-runner W4
+**Status:** parked 2026-10-29 (PrefillDecode + `ReadRemote` W1, `Receive`/`Send` W2, and `llvm-cov` × `resolve_anchors.py --coverage` W3 done)
+**Context:** Spec/implementation coverage plan from McMillan & Zuck's QUIC work (`docs/conventions.md` §"Coverage"). Remaining stages: (W1) branch-coverage modules for `Transfer/Reshard/{Receive,Send,Pipeline,Registry,Coordinator}`; (W2) guard × mutant inventories for `Pipeline` and `ReadRemote`; (W4) `TEST_P` C++ schedule interpreter over `RecvTestManager` running Lean-enumerated schedules and checking post-states (`Done()`, `IsDraining()`, `num_free_slots`, `copies_issued`, published status).
+**Why parked:** Completed PrefillDecode/Controller W1, session W2, and repo-wide `llvm-cov` W3 first.
+**To resume:** Pick independently: Reshard W1 (~½ day/model), `Pipeline`/`ReadRemote` W2 (~½ day), or W4 `Receive` `TEST_P` runner (~3 days).
 **Effort estimate:** As above per stage.
 **References:** ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md, tpu_sync/formal_verification/docs/conventions.md §"Coverage"
 
-## Upstream coverage-gap test PR + remaining handshake-stub and recycle tests
-**Status:** parked 2026-10-28 (`findings/coverage_gap_tests.patch` green 9/9 at `42dda542`, ready to file)
-**Context:** Nine hardware-free gtest cases closing `Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` test gaps are validated (`--runs_per_test=10`) in `findings/coverage_gap_tests.patch` (`findings/README.md` §Coverage-gap tests). Also surfaced: receiver late-`Finish` flip (`TransferReceiveSession::FinishLocked` lacks a `if (done_) return;` guard, unlike sender) and three unwritten test gaps needing new seams (2 consumer handshake tests needing a replying producer stub; 1 multi-request staging-recycle test needing a staging-observing seam).
-**Why parked:** Waiting on user filing of the 9-test PR and the late-`Finish` GitHub issue.
-**To resume:** (1) Cut a clean branch from `42dda542`, apply `findings/coverage_gap_tests.patch`, and open the test-only PR; (2) file the late-`Finish` flip issue with the `if (done_) return;` fix; (3) once merged, flip those rows to `paired` in `Receive/Coverage.lean`, `Send/Coverage.lean`, and `ReadRemoteCoverage.lean`; (4) optionally build the replying-producer stub (2 cases) and multi-request recycle case (1 case).
+## Upstream coverage-gap test PRs + remaining handshake-stub and recycle tests
+**Status:** parked 2026-10-29 (split into `findings/coverage_gap_{send,recv,read_remote_deadline}.patch` at `61e393bf`, green on `42dda542`)
+**Context:** Hardware-free gtest cases closing `Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` test gaps are split into three independent upstream PR patches (`findings/coverage_gap_send.patch`, `findings/coverage_gap_recv.patch`, `findings/coverage_gap_read_remote_deadline.patch`; `findings/README.md` §Coverage-gap tests). Also surfaced: receiver late-`Finish` flip (`TransferReceiveSession::FinishLocked` overwrites an OK `status_` with a later error after settle, with no `done_` guard, unlike the sender; `findings/README.md` §Coverage-gap tests, "the receiver's late-`Finish` status flip") and three unwritten test gaps needing new seams (2 consumer handshake tests needing a replying producer stub; 1 multi-request staging-recycle test needing a staging-observing seam).
+**Why parked:** Waiting on user filing of the three test PRs and the late-`Finish` GitHub issue.
+**To resume:** (1) Open the three test-only PRs from `42dda542`; (2) file the late-`Finish` flip issue; (3) once merged, flip those rows to `paired` in `Receive/Coverage.lean`, `Send/Coverage.lean`, and `ReadRemoteCoverage.lean`; (4) optionally build the replying-producer stub (2 cases) and multi-request recycle case (1 case).
 **Effort estimate:** Filing ~30 min; stub + recycle tests ~3 h.
 **References:** findings/README.md §Coverage-gap tests, ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md
+
+## Reshard CPU device-copy test hooks and post-`1b78685f` dead `d2h_layer_futures_.size()` guards surfaced by W3
+**Status:** parked 2026-10-29 (`Read at: 42dda542`)
+**Context:** `resolve_anchors.py --coverage` over all CPU unit-test binaries showed: (a) `ReshardSendSession::ExecutePush`, `StartPoolPush`, the `!status.ok()` early-unregister arm of `RecordPushCompletion`, `CompleteReadWithDetails`'s `active_pool_reshard_sends_` sweep, and `ReshardReceiveSession::OnPoolReceived` / `CollectEligiblePoolH2dsLocked` / `ExecuteEligiblePoolH2ds` have zero executions in deviceless tests (unlike `PrefillDecode`, `CopyPoolBlocksToHost` / `CopyPoolBlocks` have no CPU test hooks, and `ReshardSendSessionTestPeer` only passes `OkStatus()` to `RecordPushCompletion`); (b) in `TransferSendSession`, `l >= d2h_layer_futures_.size()` in `SendNextLayer` (after `l >= base_->num_layers()`) and `d2h_layer_futures_.size() < base_->num_layers()` in `CurrentPhaseLocked` are dead since `1b78685f` pre-populates all `d2h_layer_futures_` before `SendNextLayer(0)`.
+**Why parked:** Upstream test/cleanup candidates; Lean models in `Reshard/{Send,Receive,Pipeline}.lean` already verify the unexecuted reshard paths.
+**To resume:** (1) Add a failure-status unit test through `ReshardSendSessionTestPeer::RecordPushCompletion` (exercising F10's early-unregister path on CPU); (2) optionally add virtual/injectable host-only hooks around `CopyPoolBlocksToHost` / `CopyPoolBlocks` so `PoolReshardRecvTest` exercises `CollectEligiblePoolH2dsLocked` and `ExecuteEligiblePoolH2ds` without TPU buffers; (3) fold (b) into any `transfer_send_session.cc` cleanup PR.
+**Effort estimate:** (1) ~20 min; (2) ~2–3 h; (3) ~15 min.
+**References:** tpu_sync/formal_verification/docs/transfer/reshard.md §"C++ branch coverage of the anchored spans", tpu_sync/formal_verification/docs/transfer/prefill_decode.md §"C++ branch coverage of the anchored spans"
 
 ## `RecordNetworkCompleteLocked`'s `FinishLocked()` arm is dead; reply-after-data flips a complete receive to failed
 **Status:** parked 2026-10-27 (`Read at: c9bc124`; two low-severity observations, neither filed)

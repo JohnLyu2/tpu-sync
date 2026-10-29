@@ -49,6 +49,31 @@ logs on stdout (otherwise inspect `bazel-testlogs/<pkg>/<target>/test.log` befor
 re-running). Hardware-free unit tests use `ABSL_ASSERT_OK` / `ABSL_EXPECT_OK`,
 `absl_testing::StatusIs`, and `FakeSendBase(num_layers, host_blocks)`.
 
+[EMP] Source-based branch coverage for `tpu_sync/formal_verification/tools/resolve_anchors.py --coverage`:
+add `--per_file_copt='^tpu_sync/.*@-fprofile-instr-generate,-fcoverage-mapping' --linkopt=-fprofile-instr-generate`
+to the base `--config=oss` + `CC`/`CXX` command above (the anchored `^` keeps
+generated `bazel-out/.../*.pb.cc` and `external/` uninstrumented; the link flag
+pulls in the profile runtime) and build the 19 hardware-free test binaries
+measured on 2026-10-29: `transfer_send_session_test`,
+`kv_cache_manager_with_transfer_{send_drain,control,pool_reshard,ip}_test`,
+`reshard_{send,receive}_session_test`, `pool_staging_test`, `pool_layout_test`,
+`kv_cache_listener_test` (tagged `no_oss` in `tpu_sync/kv_cache/BUILD` but with
+no TPU dependency; build it by explicit label), `staging_arena_test`,
+`pool_reshard_send_slots_test`, `pool_reshard_planner_streams_test`,
+`reshard_control_pipe_test`, `reshard_service_test`, `control_plane_backend_test`,
+`data_connection_policy_test`, `block_transport_test`,
+`block_transport_session_test`.
+Run each binary under `LLVM_PROFILE_FILE=<dir>/<name>-%p-%m.profraw` (pass
+`--gtest_filter=-*InvalidArgumentsRejected` to `block_transport_session_test`,
+whose `BlockTransportServerPullSessionTest.InvalidArgumentsRejected` aborts on
+`peregrine::v1::WriteExact(-1, ...)`'s `IsValidSocket` `CHECK`), merge with
+`llvm-profdata-21 merge -sparse`, and export with
+`llvm-cov-21 export -skip-functions -instr-profile=... <bin1> -object <bin2> ... -object <dso> ...`
+over `realpath`-deduplicated `ldd` `_solib_k8/libtpu_Usync*.so` shared libraries
+(globbing `_solib_k8/*.so` directly can pick up stale DSOs from moved targets;
+`functions have mismatched data` warnings come from third-party inline COMDATs
+and do not affect `tpu_sync/` counts).
+
 ## See also
 
 - ../journal/2026-10/2026-10-07-f5-per-peer-staging-admission-fix.md
