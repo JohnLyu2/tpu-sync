@@ -669,6 +669,44 @@
 ]
 
 // ---------------------------------------------------------------------------
+#slide[Stopping criterion & coverage: Arie's comment & the QUIC paper][
+  Replaying existing unit tests has no stopping criterion — inspired by McMillan & Zuck (_QUIC_, SIGCOMM '19), we measure three kinds of coverage:
+
+  #v(0.4em)
+  #show table: set text(size: 13.8pt)
+  #table(
+    columns: (0.88fr, 1.12fr),
+    inset: (x: 11pt, y: 12pt),
+    align: (left + horizon, left + horizon),
+    table.header[*Coverage criterion*][*What we built & found*],
+    [*1. Model branch coverage (`Coverage.lean`)* — what fraction of reachable `(event, branch)` paths in `step` do the 71 tests hit?],
+    [Exhaustively computed and `#guard`-pinned: e.g. `Receive` hits *18 / 37* branches; `MultiRequest` has *0* unit tests recycling buffers mid-flight; exposed *1 dead C++ branch*.],
+    [*2. Spec-driven gap tests* — generate concrete schedules from the model for uncovered branches and run them on C++.],
+    [Lean emits a shortest witness schedule per gap (*missing test* vs. *lock window*) #sym.arrow.r turned drivable gaps into *9 new C++ unit tests*.],
+    [*3. Guard / mutant coverage (`Guards.lean`)* — mutate _every_ C++ guard in `step` (not just a few examples) against `Safe`.],
+    [Mutating every guard in `Receive` and `Send` caught a missing clause in our own session `Safe` (early _failed_ publication while copies run #sym.arrow.r added `PublishedQuiet`).],
+  )
+]
+
+// ---------------------------------------------------------------------------
+#slide[Closing the C++ #sym.arrow.l.r Lean gap: Aosen's comments][
+  #v(0.4em)
+  #show table: set text(size: 14pt)
+  #table(
+    columns: (0.96fr, 1.04fr),
+    inset: (x: 11pt, y: 15pt),
+    align: (left + horizon, left + horizon),
+    table.header[*Gap pointed out & Aosen's suggestion*][*Our check & response*],
+    [*1. Lean _assumes_ events are atomic (no data races)* — discharge this premise in C++ with `GUARDED_BY(mu)` + TSan (rather than modeling locks in Lean).],
+    [Session headers already carry 80+ `ABSL_GUARDED_BY` annotations. *Extra gap `GUARDED_BY` misses:* holding `mu_` per access doesn't guarantee 1 event = 1 lock scope — so we audited all 12 models, proving multi-lock cleanup tails commute and splitting open windows.],
+    [*2. Lean _assumes_ sequential consistency* — check whether `tpu-sync` uses weak atomic orderings (`memory_order_relaxed`, acquire/release) on modelled paths.],
+    [*Checked — safe.* Shared state on modelled paths uses mutexes and default sequentially consistent atomics (no lock-free weak-memory protocols).],
+    [*3. Lean `step` is hand-transcribed from C++* — connect them mechanically by logging events in C++ tests and replaying logs through executable `step`.],
+    [*Planned next — with one catch:* logs (or a sequence number) must be recorded *inside* `mu_`, otherwise preemption right after `unlock` can invert log order relative to step order.],
+  )
+]
+
+// ---------------------------------------------------------------------------
 #slide[Case study: removing the extra `IsReadyToComplete` check][
   #v(0.3em)
   #set text(size: 14pt)
