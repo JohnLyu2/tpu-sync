@@ -24,19 +24,16 @@ import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
 import TpuSyncVerify.Transfer.Reshard.Coordinator
-import TpuSyncVerify.Controller.ReadRemote
-import TpuSyncVerify.Controller.ReadRemoteCoverage
 
 /-!
 # TpuSyncVerify
 
-Lean 4 models of TPU Sync's KV-cache data paths and machine-checked proofs
-about them. This module imports every model; see `README.md` for what is
+Lean 4 models of TPU Sync's KV-cache transfer data paths and machine-checked
+proofs about them. This module imports every model; see `README.md` for what is
 modelled, the directory layout, and how the C++ is cited.
 
 * `Common` — transition-system core, list lemmas, bounded model checker, branch coverage.
 * `Transfer` — `Session` (settle protocol shared by every transfer session),
   `Caller` (serving engine above `poll_stats()` shared by both transfer paths),
   `PrefillDecode/`, `Reshard/`.
-* `Controller` — `ReadRemote` (and its branch coverage, `ReadRemoteCoverage`).
 -/

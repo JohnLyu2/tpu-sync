@@ -1,10 +1,10 @@
 # Formal Verification of TPU Sync (Lean 4)
 
 TPU Sync is a KV-cache orchestration, host-memory offload and cross-node
-transfer library for TPUs. Its data paths run on asynchronous callbacks and
-lock-scoped state machines across TPU HBM, host DRAM staging pools, and network
-peers. This directory holds Lean 4 models of those data paths and
-machine-checked proofs about them.
+transfer library for TPUs. Its transfer data paths run on asynchronous
+callbacks and lock-scoped state machines across TPU HBM, host DRAM staging
+pools, and network peers. This directory holds Lean 4 models of those transfer
+data paths and machine-checked proofs about them.
 
 ## What is modelled
 
@@ -17,13 +17,6 @@ machine-checked proofs about them.
 - Proved: data correctness on publication, HBM and staging safety,
   drain-to-settle termination, cross-peer isolation.
 
-**Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries, [reshard.md](docs/transfer/reshard.md) §Boundaries
-- Python: vLLM's scheduler through tpu-inference's and vllm-torchtpu's
-  connectors, above `poll_stats()`.
-- Lean: [`Transfer/Caller.lean`](TpuSyncVerify/Transfer/Caller.lean).
-- Proved: a connector that forwards every publication leaks no held block and
-  never decodes on unwritten KV.
-
 **Pool resharding** — [reshard.md](docs/transfer/reshard.md)
 - C++: `ReshardSendSession`, `ReshardReceiveSession`, `PoolStagingStorage`,
   `RequestBlockRegistry`, `ReshardCoordinator`.
@@ -32,12 +25,13 @@ machine-checked proofs about them.
   ordering, staging slot conservation, registry claim safety,
   arm-before-dispatch, termination.
 
-**Controller remote leases** — [read_remote.md](docs/controller/read_remote.md)
-- C++: `RaidenController::ReadRemote`.
-- Lean: [`Controller/ReadRemote.lean`](TpuSyncVerify/Controller/ReadRemote.lean).
-- Checked: `NoWriteAfterRelease` by exhaustive search — violated by the
-  current code (two witness traces), holds if the deadline defers while a pull
-  is in flight.
+**Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries, [reshard.md](docs/transfer/reshard.md) §Boundaries
+- Python: vLLM's scheduler and `KVOutputAggregator` through tpu-inference's and
+  vllm-torchtpu's connectors, above `poll_stats()`.
+- Lean: [`Transfer/Caller.lean`](TpuSyncVerify/Transfer/Caller.lean).
+- Proved: a connector that forwards every publication leaks no held block,
+  never frees HBM while a worker is still in flight, and never decodes on
+  unwritten KV.
 
 ## Layout
 
@@ -49,11 +43,10 @@ TpuSyncVerify/
   Transfer/Caller.lean        engine caller contract above poll_stats() shared by both transfer paths
   Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator
-  Controller/ReadRemote.lean  controller remote-read lease (+ ReadRemoteCoverage.lean)
 docs/
   conventions.md              how the models are written (one executable step, ghost
                               fields, replay traces, mutants) and how the C++ is cited
-  transfer/, controller/      per-subsystem C++ <-> Lean docs: states, events,
+  transfer/                   per-subsystem C++ <-> Lean docs: states, events,
                               assumptions, proved theorems
 tools/
   resolve_anchors.py          resolves and checks the source-map tables

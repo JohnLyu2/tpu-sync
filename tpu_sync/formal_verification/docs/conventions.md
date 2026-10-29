@@ -34,14 +34,15 @@ guards could drift from the function. Three things follow:
 
 Events are named in the voice of the C++ (`h2dBegin`, `pullReply`, `cancel`),
 not of the property, and carry their outcome as an argument (`h2dDone (ok :
-Bool)`, `acquireReply ok`) instead of being split into a success and a
+Bool)`, `pullReply ok`) instead of being split into a success and a
 failure constructor. Event lists stay short, and one C++ callback maps to one
 row of the events table.
 
 ## How a module file is laid out
 
-Modules are grouped by subsystem (`Transfer/…`, `Controller/…`), with shared
-machinery in `Common/`. Each model file has these sections, in this order:
+Modules are grouped by transfer path (`Transfer/PrefillDecode/…`,
+`Transfer/Reshard/…`), with shared machinery in `Common/` and `Transfer/`. Each
+model file has these sections, in this order:
 
 1. **Module docstring** — what is modelled; abbreviations for cited files; the
    **State** table (field → C++ → role); the **Events** table (event → C++
@@ -73,9 +74,8 @@ umbrella file and a directory of parts:
 * `X/Frame.lean` — frame lemmas for other modules.
 * `X/Traces.lean` — traces, searches, mutants.
 * `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
-  below); `Receive`, `Send`, `Pipeline`, `MultiRequestCoverage.lean` (new
-  leaves only: its state space is unbounded) and `Controller/ReadRemoteCoverage.lean`
-  so far (`Pipeline/Coverage.lean`
+  below); `Receive`, `Send`, `Pipeline`, and `MultiRequestCoverage.lean` (new
+  leaves only: its state space is unbounded) so far (`Pipeline/Coverage.lean`
   imports the traces in `PipelineChecks.lean`, so `TpuSyncVerify.lean` imports
   it directly). Not to be confused with `Reshard/Coverage.lean`, which is the
   reshard model's sub-block byte coverage, a model of the C++.
@@ -225,8 +225,8 @@ recycle) measures only the leaves it adds to the model it composes, by trace
 and by theorem.
 
 The search keys states by `Hashable`: every state type a coverage search runs
-on, and its component types (`Lifecycle`, `Cell`, `Send`, `Recv`, `Pipeline`,
-`ReadRemote.S`), derive it.
+on, and its component types (`Lifecycle`, `Cell`, `Send`, `Recv`, `Pipeline`),
+derive it.
 
 ## Citing the C++
 

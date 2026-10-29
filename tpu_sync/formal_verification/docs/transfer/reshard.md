@@ -85,9 +85,8 @@ Out of scope: prefill-to-decode ("symmetric") transfer — see
 lowering (`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` and
 `tpu_sync/core/transfer_program_reshard.cc`, which compile topology geometry
 into `StartTransferRequest` plans validated by `ValidatePlan` /
-`ValidateReceiverCoverage`); `RaidenController` — see
-[../controller/read_remote.md](../controller/read_remote.md); and `weight_sync/`
-model-weight resharding.
+`ValidateReceiverCoverage`); `RaidenController`, `kv_cache_store`, and
+`weight_sync/` model-weight resharding.
 
 ### Coordinator and engine boundary (above the sessions)
 

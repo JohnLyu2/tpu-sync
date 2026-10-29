@@ -77,13 +77,6 @@ ALIASES = {
     "reg.h": "tpu_sync/kv_cache/reshard/request_block_registry.h",
     "planner.cc": "tpu_sync/kv_cache/reshard/pool_reshard_planner.cc",
     "planner.h": "tpu_sync/kv_cache/reshard/pool_reshard_planner.h",
-    "ctrl.cc": "tpu_sync/core/controller/raiden_controller.cc",
-    "ctrl.h": "tpu_sync/core/controller/raiden_controller.h",
-    "ctrl_test.cc": "tpu_sync/core/controller/raiden_controller_test.cc",
-    "store.cc": "tpu_sync/kv_cache/kv_cache_store.cc",
-    "store.h": "tpu_sync/kv_cache/kv_cache_store.h",
-    "offload.cc": "tpu_sync/kv_cache/host_offload_backend.cc",
-    "offload.h": "tpu_sync/kv_cache/host_offload_backend.h",
     "send_drain_test.cc":
         "tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc",
     "control_test.cc":
@@ -119,7 +112,6 @@ RAW_STR_OPEN = re.compile(r'R"([A-Za-z0-9_{}\[\]#<>%:;.?*+\-/^&|~!=,\']*)\(')
 
 NO_MAP_FILES = {
     "TpuSyncVerify/Common/Coverage.lean",
-    "TpuSyncVerify/Controller/ReadRemoteCoverage.lean",
     "TpuSyncVerify/Transfer/PrefillDecode/MultiRequestCoverage.lean",
     "TpuSyncVerify/Common/ListAux.lean",
     "TpuSyncVerify/Common/ModelCheck.lean",
