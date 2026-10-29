@@ -32,7 +32,7 @@ diff --git a/tpu_sync/kv_cache/BUILD b/tpu_sync/kv_cache/BUILD
 index b6fd414..66bb611 100644
 --- a/tpu_sync/kv_cache/BUILD
 +++ b/tpu_sync/kv_cache/BUILD
-@@ -1240,3 +1240,51 @@ cc_library(
+@@ -1242,3 +1242,52 @@ cc_library(
          "@com_google_absl//absl/types:span",
      ],
  )
@@ -88,7 +88,7 @@ index b6fd414..66bb611 100644
 diff --git a/tpu_sync/kv_cache/reshard/BUILD b/tpu_sync/kv_cache/reshard/BUILD
 --- a/tpu_sync/kv_cache/reshard/BUILD
 +++ b/tpu_sync/kv_cache/reshard/BUILD
-@@ -276,3 +276,28 @@ cc_library(
+@@ -276,3 +276,31 @@ cc_library(
          "@com_google_absl//absl/time",
      ],
  )
@@ -120,3 +120,35 @@ diff --git a/tpu_sync/kv_cache/reshard/BUILD b/tpu_sync/kv_cache/reshard/BUILD
 +        "@com_google_googletest//:gtest_main",
 +    ],
 +)
+diff --git a/tpu_sync/frameworks/jax/BUILD b/tpu_sync/frameworks/jax/BUILD
+--- a/tpu_sync/frameworks/jax/BUILD
++++ b/tpu_sync/frameworks/jax/BUILD
+@@ -907,4 +907,27 @@ cc_test(
+         "@xla//xla/tsl/platform:test",
+         "@xla//xla/tsl/platform:test_main",
+     ],
+ )
++
++cc_test(
++    name = "numa_kv_cache_manager_bughunt_test",
++    srcs = ["numa_kv_cache_manager_bughunt_test.cc"],
++    copts = [
++        "-DWITHOUT_PYTHON",
++        "-fexceptions",
++    ],
++    features = ["-use_header_modules"],
++    deps = [
++        ":kv_cache_manager_core_lib",
++        "//tpu_sync/core:raw_transfer_core",
++        "//tpu_sync/kv_cache:kv_cache_manager_base",
++        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
++        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/synchronization",
++        "@xla//xla/tsl/platform:statusor",
++        "@xla//xla/tsl/platform:test",
++        "@xla//xla/tsl/platform:test_main",
++    ],
++)
+

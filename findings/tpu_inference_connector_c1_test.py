@@ -268,7 +268,7 @@ def test_consumer_blocks_after_failed_pull_and_abort(tpu_sync_report, expect_fre
 # Each variant is the Signal the Lean `Connector.onRecv false` produces for a
 # failed pull, rendered as the KVConnectorOutput the worker would hand the
 # scheduler. The assertions are the Lean traces' end states:
-#   fixed          -> trace_fixed_fail / trace_fixed_recompute / trace_fixed_abort_before
+#   fixed          -> trace_twoChannel_fail / trace_twoChannel_recompute / trace_twoChannel_abort_before
 #   naive          -> trace_naive_decodes
 #   loadErrorOnly  -> trace_loadErrorOnly_fail / trace_loadErrorOnly_recompute
 # They check the model's transcription of scheduler.py:1516-1523, 1742-1744,
@@ -316,13 +316,13 @@ def test_fixed_connector_failed_pull_frees_or_recomputes(policy):
     sched, req, total, block_ids = _parked_consumer(policy)
     _step(sched, kv_out=_consumer_signal("fixed", req.request_id, block_ids))
     if policy == "fail":
-        # trace_fixed_fail: FINISHED_ERROR in the same step, blocks released by
+        # trace_twoChannel_fail: FINISHED_ERROR in the same step, blocks released by
         # the finished_recving that arrives with the load error.
         assert req.status == RequestStatus.FINISHED_ERROR
         assert _free_blocks(sched) == total
         assert req.request_id not in sched.requests
     else:
-        # trace_fixed_recompute: marked failed and complete; the next
+        # trace_twoChannel_recompute: marked failed and complete; the next
         # schedule() frees the transfer blocks and prefills locally from 0.
         assert req.request_id in sched.finished_recving_kv_req_ids
         assert req.request_id in sched.failed_recving_kv_req_ids
@@ -336,7 +336,7 @@ def test_fixed_connector_failed_pull_frees_or_recomputes(policy):
 
 @pytest.mark.parametrize("policy", ["fail", "recompute"])
 def test_fixed_connector_abort_before_failed_pull_frees(policy):
-    # trace_fixed_abort_before: the deferred free is released by the
+    # trace_twoChannel_abort_before: the deferred free is released by the
     # completion report; the load error is ignored for a finished request.
     sched, req, total, block_ids = _parked_consumer(policy)
     sched.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)

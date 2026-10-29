@@ -21,7 +21,9 @@ these two provide it. The **prefill-to-decode** path (`register_read` /
 [`vllm-project/tpu-inference`](https://github.com/vllm-project/tpu-inference)
 `tpu_inference/distributed/tpu_raiden_connector.py` @ `7ed46a6` (the commit
 `examples/*_disagg/setup.sh` pin; unchanged on the cited lines at `main`
-`c2b062b`, 2026-10-20) on vLLM @ `6185d73` (same scripts). Caller-side defects
+`c2b062b`, 2026-10-20, and still at `main` `7840339b`, 2026-10-28 — the fix
+is open as [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918),
+see C1) on vLLM @ `6185d73` (same scripts). Caller-side defects
 are numbered C1, C2, … and live in the caller, not in tpu-sync.
 
 ## Evidence levels
@@ -56,7 +58,8 @@ here.
 | `kv_cache_store_pin_race_test.cc` | F1 |
 | `reshard_bughunt_test.cc` | R7a, R7b, R8, R2b of `tpu_sync/formal_verification/docs/transfer/reshard.md` (registry / coordinator claim lifecycle; all four pass, not yet filed) |
 | `reshard_send_session_bughunt_test.cc` | F10 (R6 of `tpu_sync/formal_verification/docs/transfer/reshard.md`): the sender's early plan unregister and the uuid-keyed staging lease it hands to a retry |
-| `build_targets.patch` | `cc_test` targets for the four files above |
+| `numa_kv_cache_manager_bughunt_test.cc` | F11: `NumaAwareKVCacheManager::CompleteReadRaw` eager `failed_recving` while sibling sub-managers still have H2D / D2H DMAs in flight, plus `failed_recving_set_` / barrier-count leak and `req_id`-reuse poisoning |
+| `build_targets.patch` | `cc_test` targets for the five files above |
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
@@ -66,30 +69,38 @@ To run F1–F4: copy the two `.cc` files next to the code they test
 (`tpu_sync/core/controller/`, `tpu_sync/kv_cache/`), `git apply
 findings/build_targets.patch`, then
 `bazel test //tpu_sync/core/controller:raiden_controller_bughunt_test
-//tpu_sync/kv_cache:kv_cache_store_pin_race_test`. F5 needs no repro file:
+//tpu_sync/kv_cache:kv_cache_store_pin_race_test`. To run F11: copy
+`numa_kv_cache_manager_bughunt_test.cc` to `tpu_sync/frameworks/jax/`, apply
+`findings/build_targets.patch`, and run
+`bazel test --config=oss //tpu_sync/frameworks/jax:numa_kv_cache_manager_bughunt_test`.
+F5 needs no repro file:
 its test is already in the tree as `DISABLED_`
 (`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
 --test_arg=--gtest_also_run_disabled_tests`); the fix patch that re-enabled it
-was retired on 2026-10-16 (see F5). Both patches apply cleanly at `2ed6f8f`;
+was retired on 2026-10-16 (see F5). All three patches apply cleanly at
+`42dda542` (`git apply --check`, 2026-10-29; `build_targets.patch` updated
+2026-10-29 for F11; `candidate_fixes.patch` was last re-based at `2ed6f8f`);
 `kv_cache_store_pin_race_test.cc` needs its `WindowBackend::Insert` override
 ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
-(F1 is fixed there, see §F1).
+(F1 is fixed there, see §F1). The F1–F4, R7/R8/R2b and F10 `.cc` reproducers
+have not been rebuilt since the runs their entries record.
 
 ## Summary
 
 | # | Finding | Status | Reachable from production? |
 |---|---|---|---|
 | F1 | `ValidateAndPinHostBlocks` could return a host block id that no longer holds the hash ([filed](filed_bugs.md#4-kvcachestorevalidateandpinhostblocks-check-then-act-window-between-lookup-and-pin-can-return-a-stale-host_block_id-f1) 2026-10-19) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `0ac16d1`; **FIXED upstream** in `b3ea4dc` (2026-10-21) | only via the `ReadRemote` API (no in-tree caller) |
-| F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error ([filed](filed_bugs.md#7-raidencontrollerreadremote-deadline-settles-the-read-while-the-acquire-callback-and-pull-continue-so-the-dma-writes-into-blocks-the-caller-has-already-recycled-f2--f3) 2026-10-20, together with F3) | CONFIRMED (test) for shapes A and B (B added 2026-10-20, on upstream `449b591`); proved in Lean for both; filed upstream, fix pending | same |
-| F3 | Data race on `RemoteReadState::lease_id` (filed as part of the F2 report) | CONFIRMED (read); filed upstream, fix pending | same |
+| F2 | Remote read keeps DMA-ing into destination blocks after it settled with a deadline error ([filed](filed_bugs.md#7-raidencontrollerreadremote-deadline-settles-the-read-while-the-acquire-callback-and-pull-continue-so-the-dma-writes-into-blocks-the-caller-has-already-recycled-f2--f3) 2026-10-20, together with F3) | CONFIRMED (test) for shapes A and B (B added 2026-10-20, on upstream `449b591`); proved in Lean for both; filed upstream, fix pending; **still open at `42dda542`** (`raiden_controller.cc` unchanged since `449b591`) | same |
+| F3 | Data race on `RemoteReadState::lease_id` (filed as part of the F2 report) | CONFIRMED (read); filed upstream, fix pending; **still open at `42dda542`** (same file, unchanged) | same |
 | F4 | `TransferBuffers` leaks auto-allocated staging on every early error, and can return an error after some workers were dispatched ([filed](filed_bugs.md#1-raidencontrollertransferbuffers-error-path-defects-f4), fix: [PR #1105](https://github.com/google/tpu-sync/pull/1105)) | CONFIRMED (test) on `b68161a` / `d16701e`, code unchanged through `50b0774`; **FIXED upstream** by PR #1105 = `72255dd` (2026-10-07) | leak: no in-tree trigger; orphaned copies: yes, via Fetch / WriteRemote on a node_id mismatch |
-| F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix designed and validated on `50b0774`, patch retired 2026-10-16) | CONFIRMED (test), with the owners' own parked test | yes: every consumer `StartRead`, given one producer that accepts and never answers |
+| F5 | One unresponsive producer pins every host staging slot; `StartRead` then rejects reads from every other producer (no per-peer admission; owner-acknowledged, fix designed and validated on `50b0774`, patch retired 2026-10-16) | CONFIRMED (test), with the owners' own parked test; **still open at `42dda542`** (the test is still `DISABLED_`; `StartRead` → `TransferReceiveSession::Create` → `AllocateStagingForLoad` → `StagingBlockAllocator::Acquire` is still first-come-first-served, `0b12f51f` only threads a `MetricsCollector` through `Create`) | yes: every consumer `StartRead`, given one producer that accepts and never answers |
 | F6 | `PoolReshardRegisterRecv`: a rejected duplicate (or racing) registration for an active `uuid` destroys a session object whose destructor releases the **active** session's host-staging lease ([filed](filed_bugs.md#2-poolreshardregisterrecv-duplicate-registration-frees-the-active-sessions-staging-lease-f6)) | CONFIRMED (read) at `1fa06d1`; reproduced by the reporter; **FIXED upstream** in `8653373` (2026-10-13) | yes: any pool-reshard receiver with bounded host staging (`RegisterPools(..., staging_leases > 0)`), on a duplicate or concurrent register for the same `uuid` |
 | F7 | `end_incoming_push` hook: a failed incoming push on a `ReshardReceiveSession` is not turned into `Finish(status)` (the `TransferReceiveSession` branch does), so the session, its staging lease and plan claim stay pinned until the deadline sweep, which reports `DEADLINE_EXCEEDED` instead of the push error ([filed](filed_bugs.md#3-reshardreceivesession-ignores-a-failed-endincomingpush-and-pins-poolstagingstorage-until-timeout-r1); R1 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (read) at `0ac16d1`, witnessed in Lean (`Receive.lean`); **FIXED upstream** in `fdeebcd` (2026-10-16) | yes: any pool-reshard receiver whose sender's push fails mid-transfer (socket timeout / disconnect) |
-| F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
-| F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
-| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape on the sender; early unregister since `FinishPoolReshardSend` before `1673c9b`, lease-aliasing window since `3d1b5d4`) (R6 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `2ed6f8f`); **filed 2026-10-23** (bug 9 in `filed_bugs.md`) | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
-| C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_current_connector_*`, leaks absorbing, `contract_safe` for the fix); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet) | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
+| F8 | `ReshardCoordinator::ExecutePoolReshard`: the sender-dispatch error return omits `registry_->AbandonClaim(...)` (the plan-build, receiver-arm and null-controller returns all call it), so the request stays `STATUS_CLAIMED` until `ttl_s_`, refusing `CancelIfUnclaimed` and re-registration ([filed](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b) 2026-10-19; R2b in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending; **still open at `42dda542`, code moved**: `09a42d4e` (2026-10-25) split `ExecutePoolReshard` and the plan/arm/dispatch sequence now lives in `ReshardCoordinator::RunSubPlan`, whose sender-status loop (`if (!status.ok()) return status;`) still has no `registry_->AbandonClaim(...)`; the three abandoning returns are now guarded by `index == 0` | yes: any pool reshard whose sender `StartTransfer` RPC fails after the receivers were armed |
+| F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending; **still open at `42dda542`** (`request_block_registry.cc` unchanged since `0ac16d1`) | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
+| F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape on the sender; early unregister since `FinishPoolReshardSend` before `1673c9b`, lease-aliasing window since `3d1b5d4`) (R6 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `2ed6f8f`); **filed 2026-10-23** (bug 9 in `filed_bugs.md`); **still open at `42dda542`** (`reshard_send_session.cc` unchanged since `2ed6f8f`; the header only gained `sub_plan_index()` / `sub_plan_count()` accessors in `09a42d4e`) | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
+| F11 | `NumaAwareKVCacheManager::CompleteReadRaw` (the JAX `poll_stats()` wrapper) emits `failed_recving` on the **first** failing sub-manager while sibling sub-managers still have H2D / D2H DMAs in flight (`done_sending` and `done_recving` barrier-wait across sub-managers; pinned by upstream's `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`), and **never erases `failed_recving_set_`** on failure (erased only when `done_recving_counts_[req] >= expected` on pure `done_recving` completions), leaking map entries on every failed/expired transfer and poisoning reused `req_id`s (dropping subsequent `failed_recving` / `done_recving` at `num_subs == 1`, and desynchronizing `done_recving_counts_` into premature `done_recving` after partial failure at `num_subs >= 2`). Present since `00a3f670` (2026-06-23) | CONFIRMED (test) 2026-10-29 (`numa_kv_cache_manager_bughunt_test.cc`, 4/4 cases on unmodified `42dda542`); not yet filed | eager `failed_recving` mid-DMA: yes on a single request when `ENABLE_MULTI_NUMA=1` (`num_subs >= 2`, wired in `tpu_raiden_connector._remote_endpoint`) + a caller forwarding `failed_recving` (masked while C1 dropped `failed_recving`; exposed once [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918) lands); `failed_recving_set_` leak: yes on every failed/expired transfer even at default `ENABLE_MULTI_NUMA=0`; `req_id`-reuse poisoning: immediate for direct `jax::KVCacheManager` callers, gated by `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` (or 8-hex suffix collision) in vLLM V1 |
+| C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_dropFailed_*`, leaks absorbing, `contract_safe` / `mw_contract_safe` for `connectorTwoChannel`); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet); **fix open as [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)** (`f366ef52`, 2026-10-27, "[Disagg] Forward tpu-sync failed transfers in tpu_raiden_connector"; unmerged, not on `main` `7840339b` as of 2026-10-28, where the connector is still unchanged): a new `get_transfer_results()` forwards `failed_recving` as `finished_sending` on P and as `finished_recving` + `failed_recving` on D — an instance of `connectorTwoChannel` over `AggChannel.latchedReq` (`MultiWorker.lean`), with the D-side failure on vLLM's request-level `KVConnectorTransferResults.failed_recving` channel rather than `get_block_ids_with_load_errors` (requiring `ENABLE_MULTI_NUMA=0`, see F11, and a `get_transfer_results()`-capable vLLM ≥ `e7bb7e2f`); tpu-sync at `42dda542` still files failed and expired sends in `failed_recving_` | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
 
@@ -573,7 +584,20 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   witnessed in Lean by `trace_r2b_dispatch_failure_orphans_receivers_and_claim`
   in `Coordinator.lean`). Filed upstream 2026-10-19
   ([write-up](filed_bugs.md#5-reshardcoordinatorexecutepoolreshard-sender-dispatch-failure-returns-without-calling-abandonclaim-leaking-the-registry-claim-r2b));
-  fix pending. Output, verbatim (built against the warm OSS Bazel outputs with
+  fix pending. **Still open at `42dda542` (2026-10-28), code moved:**
+  `09a42d4e` (2026-10-25, bounded-staging sub-transfer chains) left
+  `ExecutePoolReshard` as the per-request shell (metadata, uuid, claim owner,
+  `PlanSubTransfers`) and moved the plan / arm / dispatch sequence into
+  `ReshardCoordinator::RunSubPlan(ctx, index)`, run inline for sub-plan 0 and
+  on a coordinator thread for the rest. There the plan-build, receiver-arm and
+  null-controller returns call `registry_->AbandonClaim(args.req_id, uuid,
+  ctx->claim_owner)` — now only when `index == 0` — and the sender-status
+  loop (`for (const absl::Status& status : sender_status) if (!status.ok())
+  return status;`) still does not. The reproducer drives
+  `ReshardService::HandleControllerCommand` over a fake worker transport and
+  does not name the private method, so the split does not touch it; not
+  rebuilt at `42dda542`.
+  Output, verbatim (built against the warm OSS Bazel outputs with
   the recipe in `notes/empirical/oss-bazel-test-recipe.md`; all four tests in
   the file pass):
   ```
@@ -714,6 +738,187 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
 
 ---
 
+## F11. `NumaAwareKVCacheManager::CompleteReadRaw` emits `failed_recving` while sibling sub-managers still have DMAs in flight, and never erases `failed_recving_set_` on failure
+
+- **Status:** **CONFIRMED (test)** 2026-10-29 on unmodified `42dda542`
+  (`numa_kv_cache_manager_bughunt_test.cc`, 4/4 cases; found while auditing
+  [tpu-inference PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)
+  against `Caller.lean` / `Caller/MultiWorker.lean`'s boundary assumptions).
+  Not yet filed. Output, verbatim (all four tests assert the safety contract
+  and therefore fail on unmodified code):
+  ```
+  [ RUN      ] NumaKVCacheManagerBughuntTest.FailedRecvSubManagerDoesNotSettleWhileSiblingH2dInFlight
+  I0000 00:00:1793242868.767765    1441 transfer_receive_session.cc:821] OnLayerReceived (H2D copy start) layer 0: req_id=req_recv, uuid=101, numa=-1
+  I0000 00:00:1793242868.767855    1441 transfer_receive_session.cc:821] OnLayerReceived (H2D copy start) layer 0: req_id=req_recv, uuid=101, numa=-1
+  E0000 00:00:1793242868.767916    1441 transfer_receive_session.cc:892] OnLayerReceived (H2D copy failed) layer 0 for req_id: req_recv, error: INTERNAL: sub0 h2d failed
+  W0000 00:00:1793242868.768045    1441 kv_cache_manager_with_transfer.cc:1287] Transfer failed: req_id=req_recv code=INTERNAL phase=h2d elapsed_ms=0.333251 reason=sub0 h2d failed
+  I0000 00:00:1793242868.768121    1441 transfer_receive_session.cc:881] OnLayerReceived (H2D copy complete) layer 0: req_id=req_recv, numa=-1
+  I0000 00:00:1793242868.768163    1441 transfer_receive_session.cc:914] All layers H2D copy complete: req_id=req_recv
+  tpu_sync/frameworks/jax/numa_kv_cache_manager_bughunt_test.cc:295: Failure
+  Value of: f1.empty()
+    Actual: false
+  Expected: true
+  CompleteReadRaw emitted failed_recving while sub1 still had an in-flight H2D DMA; recycled HBM byte became 0x55 instead of 0xaa
+
+  [  FAILED  ] NumaKVCacheManagerBughuntTest.FailedRecvSubManagerDoesNotSettleWhileSiblingH2dInFlight (15 ms)
+  [ RUN      ] NumaKVCacheManagerBughuntTest.FailedSendSubManagerDoesNotSettleWhileSiblingD2hInFlight
+  I0000 00:00:1793242868.773835    1441 kv_cache_manager_with_transfer.cc:111] RAIDEN_TIMING event=producer_register req_id=req_send uuid=202 node_id=0 blocks=1 enqueue_ms=0.03596 failed=0
+  I0000 00:00:1793242868.773946    1441 kv_cache_manager_with_transfer.cc:111] RAIDEN_TIMING event=producer_register req_id=req_send uuid=202 node_id=0 blocks=1 enqueue_ms=0.02383 failed=0
+  I0000 00:00:1793242868.774026    1441 transfer_send_session.cc:523] StartPush (D2H start) layer 0: uuid=202, numa=-1
+  W0000 00:00:1793242868.774146    1441 kv_cache_manager_with_transfer.cc:1287] Transfer failed: req_id=req_send code=CANCELLED phase=await_pull elapsed_ms=0.57406 reason=sub0 peer reset
+  tpu_sync/frameworks/jax/numa_kv_cache_manager_bughunt_test.cc:333: Failure
+  Value of: f1.empty()
+    Actual: false
+  Expected: true
+  CompleteReadRaw emitted failed_recving while sub1 still had an in-flight D2H DMA; sub1 D2H read overwritten byte 0xfe instead of 0x11
+
+  I0000 00:00:1793242868.774375    1503 transfer_send_session.cc:622] StartPush (H2H start layer 0): uuid=202, numa=-1
+  I0000 00:00:1793242868.774528    1503 transfer_send_session.cc:644] StartPush (H2H complete layer 0): uuid=202, numa=-1
+  I0000 00:00:1793242868.774569    1503 transfer_send_session.cc:650] StartPush (All H2H complete): uuid=202
+  [  FAILED  ] NumaKVCacheManagerBughuntTest.FailedSendSubManagerDoesNotSettleWhileSiblingD2hInFlight (5 ms)
+  [ RUN      ] NumaKVCacheManagerBughuntTest.SingleSubManagerFailureDoesNotPoisonReusedReqId
+  tpu_sync/frameworks/jax/numa_kv_cache_manager_bughunt_test.cc:357: Failure
+  Expected equality of these values:
+    f2
+      Which is: {}
+    std::vector<std::string>{"req_reuse"}
+      Which is: { "req_reuse" }
+  Second failure for req_reuse was silently dropped!
+
+  tpu_sync/frameworks/jax/numa_kv_cache_manager_bughunt_test.cc:362: Failure
+  Expected equality of these values:
+    r3
+      Which is: {}
+    std::vector<std::string>{"req_reuse"}
+      Which is: { "req_reuse" }
+  Healthy done_recving for req_reuse was silently suppressed!
+
+  [  FAILED  ] NumaKVCacheManagerBughuntTest.SingleSubManagerFailureDoesNotPoisonReusedReqId (2 ms)
+  [ RUN      ] NumaKVCacheManagerBughuntTest.PartialFailureDoesNotDesyncBarrierCountIntoPrematureDoneRecving
+  tpu_sync/frameworks/jax/numa_kv_cache_manager_bughunt_test.cc:393: Failure
+  Expected equality of these values:
+    r2
+      Which is: {}
+    std::vector<std::string>{"req_chain"}
+      Which is: { "req_chain" }
+  Healthy transfer 2 done_recving was dropped due to residual state!
+
+  tpu_sync/frameworks/jax/numa_kv_cache_manager_bughunt_test.cc:400: Failure
+  Value of: r3.empty()
+    Actual: false
+  Expected: true
+  Transfer 3 emitted done_recving after only 1 of 2 sub-managers finished (decoding unwritten KV on sub1's shards)!
+
+  [  FAILED  ] NumaKVCacheManagerBughuntTest.PartialFailureDoesNotDesyncBarrierCountIntoPrematureDoneRecving (4 ms)
+  ```
+  (Transport startup lines `Detected interface: lo` / `InitTransportServer:
+  Local IP: 127.0.0.1` omitted above for brevity; the test passes
+  `bind_ip = "127.0.0.1"`.)
+- **Where (at `42dda542`, unchanged since `00a3f670`):**
+  `NumaAwareKVCacheManager::CompleteReadRaw`
+  (`tpu_sync/frameworks/jax/kv_cache_manager.cc:639-678`), over per-request
+  aggregation maps `done_sending_counts_`, `done_recving_counts_`,
+  `req_expected_counts_`, `failed_recving_set_` (`kv_cache_manager.h:287-290`).
+  Every JAX `KVCacheManager.poll_stats()` call (`api/jax/kv_cache_manager.py:170-177`
+  → `tpu_raiden_jax_module.cc:321-326`) routes through this method, both under
+  default `ENABLE_MULTI_NUMA=0` (`num_subs == 1`) and under `ENABLE_MULTI_NUMA=1`
+  (`num_subs >= 2`). The eager-failure behaviour is explicitly pinned by
+  upstream's own unit test
+  `KVCacheManagerWrapperTest.AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`
+  (`kv_cache_manager_wrapper_test.cc:198-225`).
+- **History and attribution:** introduced with `NumaAwareKVCacheManager` in
+  `00a3f670` (2026-06-23). Until C1's fix
+  ([tpu-inference PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918),
+  `f366ef52`, 2026-10-27), `tpu_raiden_connector` dropped `failed_recving` on
+  both producer and consumer, masking Defect 1's mid-DMA block free. Once a
+  `KVConnectorTransferResults`-compliant caller forwards `failed_recving`
+  (`finished_sending` on P; `finished_recving` + `failed_recving` on D),
+  `NumaAwareKVCacheManager::CompleteReadRaw` becomes the intra-worker twin of
+  the cross-worker race vLLM fixed in `KVOutputAggregator` (`e7bb7e2f`,
+  holding `failed_recving` until every worker reports `finished_recving`).
+- **Two coupled defects and the four test sequences:**
+  1. **Eager `failed_recving` while sibling sub-managers still have DMAs in
+     flight (`num_subs >= 2`, `ENABLE_MULTI_NUMA=1`).** `done_sending`
+     (`:646-652`) and `done_recving` (`:653-669`) barrier-wait until all
+     participating sub-managers report, whereas `failed_recving` (`:670-674`)
+     is emitted on the **first** sub-manager that reports `f`. Each
+     `KVCacheManagerWithTransfer` sub-manager drains its own D2H / H2D copies
+     before publishing `failed_recving` (`RecvDrainTest.*`, `SendDrainTest.*`),
+     but `CompleteReadRaw` breaks that drain invariant across sub-managers:
+     - *Case 1a (`FailedRecvSubManagerDoesNotSettleWhileSiblingH2dInFlight`,
+       real `TransferReceiveSession`s):* `sub0` and `sub1` both have H2D copies
+       in flight into HBM block 0; `sub0`'s H2D fails and drains while `sub1`'s
+       H2D is still running (`!ptr0->HasActiveRecv(101)`,
+       `ptr1->HasActiveRecv(101)`). `CompleteReadRaw` immediately emits
+       `failed_recving = {"req_recv"}`; the caller recycles HBM block 0 to a
+       new request (`0xAA`), and `sub1`'s in-flight H2D DMA overwrites it with
+       `0x55` (`Pipeline` A4 / `Caller` `earlyFree = false` violated).
+     - *Case 1b (`FailedSendSubManagerDoesNotSettleWhileSiblingD2hInFlight`,
+       real `TransferSendSession`s):* `sub1` serves a pull and has a D2H copy
+       reading HBM block 0 (`0x11`), while `sub0` cancels/fails before pull.
+       `CompleteReadRaw` immediately emits `failed_recving = {"req_send"}`; the
+       producer connector forwards it as `finished_sending`, the scheduler
+       recycles HBM block 0 (`0xFE`), and `sub1`'s in-flight D2H reads `0xFE`.
+  2. **Unbounded `failed_recving_set_` / count-map leak and `req_id`-reuse
+     poisoning (including default `ENABLE_MULTI_NUMA=0`, `num_subs == 1`).**
+     `failed_recving_set_.erase(req)` (`:667`) is reachable **only** inside the
+     `done_recving` loop when `done_recving_counts_[req] >= expected`
+     (`:661-668`), which counts `done_recving` (`r`) only — never
+     `failed_recving` (`f`) and never `done_sending` (`s`). Every failed
+     receive or failed/expired send (including every unpulled prefill after
+     `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s under `ENABLE_MULTI_NUMA=0`) leaves
+     `req` in `failed_recving_set_` for the life of the process (and on
+     multi-NUMA partial failures also leaks `done_sending_counts_`,
+     `done_recving_counts_`, and `req_expected_counts_`):
+     - *Case 2a (`SingleSubManagerFailureDoesNotPoisonReusedReqId`,
+       `num_subs == 1`):* after one failure on `"req_reuse"`, a second failure
+       with the same `req_id` hits `failed_recving_set_.insert(req).second ==
+       false` (`:671`) and is silently dropped (re-creating C1's block leak
+       even with PR #3918), and a subsequent healthy receive has `done_recving`
+       silently suppressed (`:664-667`, hanging the request in
+       `WAITING_FOR_REMOTE_KVS`).
+     - *Case 2b
+       (`PartialFailureDoesNotDesyncBarrierCountIntoPrematureDoneRecving`,
+       `num_subs == 2`):* after a partial failure (`sub0` fails, `sub1`
+       finishes `done_recving` — the exact sequence of
+       `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`),
+       `done_recving_counts_["req_chain"]` stays `1` and `failed_recving_set_`
+       retains `"req_chain"`. On a second (healthy) transfer, `sub0`'s
+       `done_recving` bumps the count `1 → 2 == expected`, suppresses
+       `done_recving` via `failed_recving_set_`, and erases both maps; `sub1`'s
+       `done_recving` in the same poll re-inserts `done_recving_counts_ = 1`.
+       On a third transfer, `done_recving` is emitted **prematurely** as soon as
+       `sub0` alone finishes (`1 → 2`), before `sub1` has written its KV shards.
+- **Reachability:**
+  - *Defect 1 (single-request mid-DMA HBM free):* requires `ENABLE_MULTI_NUMA=1`
+    (`num_subs >= 2`), which `tpu-inference` explicitly wires in
+    `TPUConnectorWorker._remote_endpoint` (`tpu_raiden_connector.py:551-583` at
+    `f366ef52`, present since `a342edc3`), plus a caller that frees blocks on
+    `failed_recving` (such as PR #3918), plus any staggered or asymmetric
+    sub-manager failure/timeout on P or D. No `req_id` reuse is needed.
+  - *Defect 2 (`failed_recving_set_` leak + `req_id` reuse):* the map growth
+    fires unconditionally on every failed/expired transfer even at default
+    `ENABLE_MULTI_NUMA=0`. For the `req_id`-collision consequences, vLLM V1's
+    `InputProcessor.assign_request_id` (`vllm/v1/engine/input_processor.py:354-371`
+    at `e7bb7e2f`) appends `-{random_uuid():.8}` by default even when a client
+    supplies `request_id`, so in vLLM it requires either
+    `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` or an 8-hex birthday collision
+    across ~65k failed/expired transfers sharing the same external prefix;
+    direct Python/C++ `jax::KVCacheManager` callers and benchmarks hit it
+    immediately on deterministic IDs.
+- **Fix (proposed):** track per-request *settled* sub-manager counts (`ok +
+  fail`) on both send (`num_subs`) and recv (`expected`) barriers together with
+  a per-request `any_failed` bit; emit nothing until all participating
+  sub-managers have settled, then emit once (`failed_recving` if `any_failed`,
+  otherwise `done_sending` / `done_recving`) and erase all per-request map
+  entries (`done_sending_counts_`, `done_recving_counts_`,
+  `req_expected_counts_`, `failed_recving_set_`). Update
+  `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks` to expect
+  `failed_recving` on the barrier-completing poll rather than the first failing
+  sub-manager's poll.
+
+---
+
 ## C1. tpu-inference `tpu_raiden_connector`: failed and never-pulled transfers leak their KV blocks on both nodes
 
 - **Status:** **CONFIRMED (test)** 2026-10-20, on CPU, no TPU:
@@ -739,10 +944,48 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   tpu-inference's own `examples/disagg` and kube benchmark configure — and
   its D-side remedy is exactly the fix shape below: the failed request stays
   in `done_recving` *and* its local blocks go through a new
-  `get_block_ids_with_load_errors()` in the same step. tpu-sync upstream
+  `get_block_ids_with_load_errors()` in the same step. (That legacy connector
+  has since received its own fixes on tpu-inference `main`:
+  [#3751](https://github.com/vllm-project/tpu-inference/pull/3751),
+  `4325e35a6`, 2026-10-14, "TPUConnector: free prefill KV when decode skips
+  the pull", and [#3839](https://github.com/vllm-project/tpu-inference/pull/3839),
+  `58d3883d4`, 2026-10-19, "Fix decode hang when KV pull fails …", which adds
+  `get_block_ids_with_load_errors` and `_invalid_block_ids` there. Neither
+  touches `tpu_raiden_connector.py`.) tpu-sync upstream
   through `2ed6f8f` (merged 2026-10-22) does not change the
   `failed_recving_` classification of a failed or never-pulled send. The
-  `vllm-jax` successor repository holds only a README (`d086b9c`). This is a defect in the
+  `vllm-jax` successor repository holds only a README (`d086b9c`).
+  **Upstream status 2026-10-28:** the fix is open as
+  [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)
+  (`f366ef523b2d385d6f9df0083f11eafcc5ba9c89`, Shawn Lu, 2026-10-27,
+  "[Disagg] Forward tpu-sync failed transfers in tpu_raiden_connector"; ref
+  `refs/pull/3918/head`, not on `main` `7840339b`, where the connector's
+  history is still the five commits listed under "History and attribution").
+  Its description names both halves as this entry does (prefill: a
+  never-pulled request stays delay-free forever; decode: a failed pull stays
+  `WAITING_FOR_REMOTE_KVS`). The change adds
+  `TPUConnector.get_transfer_results(finished_req_ids)` delegating to a new
+  `TPUConnectorWorker.get_transfer_results() -> KVConnectorTransferResults`;
+  producer: `finished_sending_set.update(failed_recving)` plus
+  `self.transfer_stats.record_failed_transfer()` per entry; consumer:
+  `self._submitted.difference_update(failed_recving)`,
+  `finished_recving_set.update(failed_recving)`,
+  `failed_recving_set.update(failed_recving)`; `get_finished()` becomes
+  `results.finished_sending, results.finished_recving`; the old comment "Do
+  NOT report failed receives as done_recving …" is removed. Tests added in
+  `tests/distributed/test_tpu_connector.py`, class
+  `TestTPURaidenConnectorWorker`:
+  `test_get_transfer_results_when_kv_manager_is_none`,
+  `test_get_transfer_results_producer_forwards_failed_as_finished_sending`,
+  `test_get_transfer_results_consumer_forwards_failed_recving`,
+  `test_connector_delegates_get_transfer_results`. It relies on the vLLM API
+  tpu-inference's LKG moved to in `43768bd50` (2026-10-26, vLLM `e7bb7e2f`)
+  and `7840339bd` (2026-10-28, vLLM `2fb320d8`): see "Fix shape" below for
+  how that API carries the D-side failure. tpu-sync at `42dda542` still files
+  failed and expired sends in `failed_recving_`
+  (`KVCacheManagerWithTransfer::CompleteReadWithDetails`, `(failed ?
+  failed_recving_ : done_sending_)`), with no `failed_sending` list.
+  This is a defect in the
   **caller**, recorded here because it is the production caller of the path
   `tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/` models and because tpu-sync's
   `poll_stats` naming and the `4246613` reclassification (the "tpu-sync side" subsection below) are half of the P-side story.
@@ -858,26 +1101,28 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   on both nodes under both `kv_load_failure_policy` values, both for a single
   worker and across two workers aggregated by `KVOutputAggregator`
   (`MultiWorker.lean`). C1 is
-  `trace_current_connector_p` (P: `pOutcome false` → `leakP`), `trace_current_connector_d_abort_after` and
-  `trace_current_connector_d_abort_before` (D: `dOutcome false` and `finish` in either order
-  → `leakD`), and in the multi-worker model `trace_mw_current_partial_failure_leaks`
+  `trace_dropFailed_p` (P: `pOutcome false` → `leakP`), `trace_dropFailed_d_abort_after` and
+  `trace_dropFailed_d_abort_before` (D: `dOutcome false` and `finish` in either order
+  → `leakD`), and in the multi-worker model `trace_mw_dropFailed_partial_failure_leaks`
   (one worker succeeds while the other fails, stopping `pSentCount` / `dRecvCount`
-  at `1 < 2`), all with `connectorCurrent`; `leakP_absorbing` /
+  at `1 < 2`), all with `connectorDropFailed`; `leakP_absorbing` /
   `leakD_absorbing` (`mwLeakP_absorbing` / `mwLeakD_absorbing`) prove no later
-  engine event can undo either, which is the formal content of "leak". The fix
-  shape below is `connectorFixed`, and `contract_safe` / `mw_contract_safe`
-  prove that *any* connector meeting `Contract` (forward
+  engine event can undo either, which is the formal content of "leak". The
+  two-channel fix shape below is `connectorTwoChannel`, and `contract_safe` /
+  `mw_contract_safe` prove that *any* connector meeting `Contract` (forward
   every outcome; a failed receive also on the load-failure channel — the
   `base.py:357-393` text) never frees HBM while a worker is still in flight
   (`mwEarlyFree = false`), never leaks, and never decodes unwritten KV under
-  either policy. The two half-fixes each have a trace: `trace_naive_decodes`
+  either policy and under both `AggChannel.eagerBlock` and
+  `AggChannel.latchedReq`. The two half-fixes each have a trace: `trace_naive_decodes`
   (`done_recving` alone — the EngineCore crash the connector's comment fears
   is real: the request is promoted with its whole prompt counted as computed)
-  and `trace_loadErrorOnly_*` (`invalid_block_ids` alone — errored or marked,
+  and `trace_loadErrorOnly_*` / `trace_mw_latched_loadErrorOnly_never_emits`
+  (load-failure channel alone — errored or latched,
   but the free waits for a `finished_recving` that never comes, so still a
   leak). Each of these end states is also asserted against the real
   scheduler in §4 of the test file. Exhaustive `search` / `mwSearch` per
-  configuration: `fixed` safe, the other three find the trace. Assumptions B1–B3
+  configuration: `connectorTwoChannel` safe, the other three find the trace. Assumptions B1–B3
   in the module header (`expectedP = 2`, `expectedD = 2` matching participating
   workers in `MultiWorker.lean`, whole-transfer failure, no preemption / prefix
   caching / chunking).
@@ -894,7 +1139,39 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   (`Caller.trace_naive_decodes`, `trace_loadErrorOnly_*`); the pair preserves
   the crash protection the comment is about (`Caller.contract_safe`);
   companion tpu-sync change: a separate `failed_sending` list from
-  `poll_stats()`.
+  `poll_stats()`. *As carried by PR #3918 (2026-10-28):* the same shape, with
+  the D-side failure on vLLM's request-level channel instead of the
+  block-level one. In the vLLM that tpu-inference's LKG now tracks
+  (`e7bb7e2f`, then `2fb320d8`),
+  `KVConnectorBase_V1.get_transfer_results` returns
+  `KVConnectorTransferResults(finished_sending, finished_recving,
+  failed_recving)` (the default implementation wraps `get_finished`);
+  `KVConnectorModelRunnerMixin._get_kv_connector_output` copies the three
+  sets into `KVConnectorOutput` and still sets `invalid_block_ids =
+  get_block_ids_with_load_errors()`; `Scheduler.update_from_output` calls
+  `_handle_failed_recving(kv_connector_output.failed_recving)` before
+  `_handle_invalid_blocks` — for a `WAITING_FOR_REMOTE_KVS` request, under
+  `recompute_kv_load_failures` it sets `num_computed_tokens = 0` and adds the
+  id to `failed_recving_kv_req_ids`, otherwise the request is failed; and
+  `KVOutputAggregator.aggregate` keeps `_failed_recving_pending |=
+  kv_output.failed_recving` and emits `failed_recving =
+  _failed_recving_pending & finished_recving`, so a multi-worker failure is
+  surfaced only once every worker has reported. The PR's mapping (P: failed →
+  `finished_sending`; D: failed → `finished_recving` ∧ `failed_recving`) is
+  therefore an instance of `connectorTwoChannel` / `Contract` in `Caller.lean`
+  over `AggChannel.latchedReq` (`MultiWorker.lean`): the aggregator forwards
+  `invalid_block_ids` eagerly (`AggChannel.eagerBlock`) whereas it latches
+  `failed_recving` in `_failed_recving_pending` (`dFailPending`) until every
+  participating worker has reported (`finished_recving`), delivering failure and
+  completion to the scheduler in the same pass (`applyRecv_eager_eq_latched`,
+  `trace_mw_latched_staggered_fail_then_ok_*`). Note two couplings: PR #3918's
+  `get_finished()` wrapper returns `(results.finished_sending,
+  results.finished_recving)` without overriding `get_block_ids_with_load_errors`,
+  so on a pre-`e7bb7e2f` vLLM that calls `get_finished()` it would behave as
+  `connectorNaive` (`trace_naive_decodes`); and under `TPU_RAIDEN_ENABLE_MULTI_NUMA=1`,
+  `NumaAwareKVCacheManager::CompleteReadRaw` violates the settled-before-report
+  precondition (F11). The companion tpu-sync change is still open (see the next
+  subsection).
 
 ### The tpu-sync side of C1: `4246613` reclassified a never-pulled send from `done_sending` to `failed_recving`, and the list is named for the other side — contributing cause and improvement request, not a defect
 
@@ -954,6 +1231,15 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
   (the consumer does not need it, so the bytes "not being sent" is not an
   error for the producer) or in `failed_sending` is the owners' call; what
   matters is that it is not silently in neither place the producer reads.
+  Still the case at `42dda542` (2026-10-28): `CompleteReadWithDetails` files
+  a failed or expired send with `(failed ? failed_recving_ : done_sending_)`
+  and there is no `failed_sending` list. The nearest upstream activity is the
+  unmerged branch `yinlin/settled-transfer-failure-reason` (`74376a90`,
+  2026-10-13, "Report why a transfer failed in poll_stats_with_details"),
+  which attaches a code / reason / phase to each failed transfer but keeps
+  the list structure. With PR #3918 the tpu-inference connector reads
+  `failed_recving` on both roles, so the request is now about the next
+  caller, not this one.
 
 ---
 
@@ -1004,7 +1290,11 @@ reshard findings depend on. Read 2026-10-20 at `vllm-torchtpu` `9725110`
   (`:437-455`); worker `register_read` (`:587`). Consumer: one `start_read`
   per request (`:600-613`), a no-op "notify" when there is nothing to pull
   (`:614-621`). Outcome: `get_finished` forwards `done_sending`/`done_recving`
-  and drops `failed_recving` (`:632-657`) — see C1. uuid: fresh per send
+  and drops `failed_recving` (`:632-657`) — see C1 (fix open as PR #3918,
+  2026-10-27; note that `_remote_endpoint`, `:519-551` at `7ed46a6`, wires
+  multi-NUMA `len(local_eps) > 1` shard-matched pulls, so forwarding
+  `failed_recving` under `ENABLE_MULTI_NUMA=1` unmasks F11's eager-failure
+  mid-DMA free in `NumaAwareKVCacheManager::CompleteReadRaw`). uuid: fresh per send
   (`get_uuid`, `:659-663`), no same-uuid retry anywhere, which is what R-B
   needs. No Python-side timeout is enforced (`SendMeta.expiration_time` is
   dead); every deadline is tpu-sync's.
@@ -1113,6 +1403,20 @@ chunk-count branch, mirroring the other two, and keep a per-layer once-latch in
 violation, honest traces unchanged). Worth doing if the transport is ever
 exposed to a sender it does not control.
 
+Re-read 2026-10-28 at `42dda542`: `42dda542` itself ("Extract server session
+classes for BlockTransport") moved the server side into
+`tpu_sync/transport/block_transport_session.{h,cc}`. The three completion
+contracts now live in `BlockTransportServerPushSession::CompleteIncomingPush`;
+the sender-declared and plan-declared branches still reject an over-count
+(`AlreadyExistsError`) and the chunk-count branch is still
+`array_complete = progress.completed_chunks == expected_chunks;` with no
+rejection. Retirement is now per session object: once every layer has been
+called the session clears `layer_progress_`, sets `done_` and is erased from
+`BlockTransport::active_push_sessions_`, and
+`BlockTransport::GetOrCreatePushSession` seats a fresh session for the next
+stream of that uuid. Same hazard, same verdict; the line citations above are
+from `0ac16d1` and are not re-pinned.
+
 ### R-C. `RequestBlockRegistry` lifecycle: no defect found (read)
 
 Claims are owner-scoped; a cancel tombstone blocks later registration and
@@ -1215,7 +1519,7 @@ independent redundancy audit; the cuts are listed below the table.
 | `RecvLifecycleTest.SecondFinishOnAFailedReceiveIsANoOp` | `cancel` (no effect) | a second `Finish(error)` on a draining receive: the first error's code and reason are what the poll reports, once |
 | `RecvLifecycleTest.PushLeaseClosingBeforeTheCopyEndsDoesNotSettle` | `pushEnd` (no effect) | the lease release neither settles nor frees staging; the callback does (the usual order for an asynchronous H2D) |
 | `RecvDrainTest.CancelledReceiveWhoseCopyThenFailsStaysCancelled` | `h2dDoneFail` settles | the copy's error is absorbed by the draining receive; the reported code stays `CANCELLED` |
-| `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce` | `Send` `d2hIssueFail` drains settles errors | layer 0's `D2hSyncDispatch` refused with nothing issued: `fail_unissued_layers` fails layer 0's promise and the H2H chain's own callback releases the last op, so the send settles inside `StartPush` (upstream's `D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies` covers a later layer with a copy in flight) |
+| `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce` | `Send` `wakeFail` settles | layer 0's `D2hSyncDispatch` refused with nothing issued: `fail_unissued_layers` fails layer 0's promise and the H2H chain's own callback releases the last op, so the send settles inside `StartPush` (upstream's `D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies` covers a later layer with a copy in flight) |
 | `TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled` | `h2hDoneFail` settles | **pins the sender's first-`Finish`-wins rule** through the push callback's error branch (no upstream test completes an H2H with an error) |
 | `ReadRemoteDeadlineTest.UnansweredAcquireSettlesAtTheDeadline` | `ReadRemote` `deadlineSettles` settles | the deadline thread fires (1 s), the late lease is released |
 | `ReadRemoteDeadlineTest.LateAcquireFailureAfterTheDeadlineIsAbsorbed` | `acquireFailed` (no effect) | a `NotFound` landing after the settle changes nothing and starts no read |
@@ -1243,9 +1547,7 @@ dispatch's future), `FailedPushFailsTheSend` and
 `DrainWithLastCopyCompletingBeforeTheFirstPush` (the swapped order exercises no
 branch `DoneGuaranteesAllResourcesReleased…` does not), and the three
 receive-under-lease variants (the lease arithmetic is already
-`IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`). `Send.lean`
-itself is structurally stale against `1b78685f` (A6, the chain-arming order):
-an upstream-recheck item, not part of this patch.
+`IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`).
 
 **Dropped as a finding, not a test: the receiver's late-`Finish` status flip.**
 `LateErrorAfterSettledOkIsReportedAsFailed` (in the `c9bc124` draft; passed
@@ -1484,3 +1786,73 @@ clone reset. Results, verbatim:
   only; closed as an API hazard with the same precondition as R-B and the F10
   aliasing half (same-uuid re-coordination, which no caller does). Not
   modelled in Lean.
+- 2026-10-28: upstream `42dda542` merged (40 commits past `c9bc124`, which
+  was 21 past `2ed6f8f`). **No finding fixed.** Re-checked every open
+  finding by `git diff c9bc1241 42dda542` on its cited files and by reading
+  the current code:
+  - F2, F3: `raiden_controller.cc` unchanged since `449b591` — still open.
+  - F5: `ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`
+    still `DISABLED_` (`control_test.cc:1103`); `StartRead` →
+    `TransferReceiveSession::Create` → `AllocateStagingForLoad` →
+    `StagingBlockAllocator::Acquire` still first-come-first-served, on
+    `ResourceExhausted` the request still goes to `failed_recving_`;
+    `staging_arena.{h,cc}` unchanged; `0b12f51f` only adds a
+    `MetricsCollector` argument to `Create` — still open.
+  - F8: still open, **code moved** — `09a42d4e` (2026-10-25) split
+    `ExecutePoolReshard` into a per-request shell plus
+    `ReshardCoordinator::RunSubPlan(ctx, index)`; the sender-status return
+    there still omits `AbandonClaim`, and the three abandoning returns are
+    now guarded by `index == 0` (a chained sub-plan after the first leaves
+    the claim to the dispatched senders' terminals by design, per the header
+    comment). Summary row and the F8 status line point at the new symbol.
+  - F9: `request_block_registry.cc` unchanged since `0ac16d1` — still open.
+  - F10: `reshard_send_session.cc` unchanged since `2ed6f8f` (the header
+    gained `sub_plan_index()` / `sub_plan_count()`) — still open.
+  - R-B: `42dda542` moved the server push path into
+    `BlockTransportServerPushSession` (`block_transport_session.{h,cc}`); the
+    chunk-count branch still has no over-count rejection and retirement is
+    now per session object — same verdict, note added under R-B.
+  - R-G: the settle sweep in `CompleteReadWithDetails` still pushes failed
+    sends as `(uuid, 0)` and releases pool staging by uuid — unchanged.
+  - "Open / not yet checked": `kv_cache_store_client.cc` unchanged
+    (`Fetch` still sets no RPC deadline) — unchanged.
+  - **C1: fix open upstream.** tpu-inference
+    [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)
+    (`f366ef52`, 2026-10-27) adds `get_transfer_results()` to
+    `TPUConnector` / `TPUConnectorWorker` and forwards `failed_recving` as
+    `finished_sending` on P and as `finished_recving` + `failed_recving` on
+    D, with four unit tests in `TestTPURaidenConnectorWorker`; unmerged, not
+    on tpu-inference `main` `7840339b` (2026-10-28), where
+    `tpu_raiden_connector.py`'s history is unchanged. It is an instance of
+    `connectorFixed` on vLLM's request-level
+    `KVConnectorTransferResults.failed_recving` channel (the LKG moved to it
+    in `43768bd50` / `7840339bd`). The legacy JAX-P2P `tpu_connector.py` got
+    its own fixes on `main` (#3751 `4325e35a6`, #3839 `58d3883d4`). tpu-sync
+    side at `42dda542`: still `(failed ? failed_recving_ : done_sending_)`,
+    no `failed_sending`; nearest upstream activity is the unmerged branch
+    `yinlin/settled-transfer-failure-reason` (`74376a90`). Summary row, C1
+    status / fix-shape paragraphs, the tpu-sync-side subsection, §Callers
+    and `filed_bugs.md` bug 8 updated; the frozen line citations are not
+    re-pinned.
+  - Patches: `build_targets.patch`, `candidate_fixes.patch` and
+    `coverage_gap_tests.patch` (re-based on `42dda542` in the fork on
+    2026-10-28, 9/9 pass) all pass `git apply --check` at `42dda542`; the
+    first two were not regenerated. The four `.cc` reproducers were not
+    rebuilt. Filed tally unchanged: F1 (fixed), F2+F3, F4 (fixed), F6
+    (fixed), F7 (fixed), F8, F9, F10, C1 (fix open as PR #3918).
+- 2026-10-29: **F11 added** (`NumaAwareKVCacheManager::CompleteReadRaw` in
+  `tpu_sync/frameworks/jax/kv_cache_manager.cc:639-678`: emits `failed_recving`
+  on the first failing sub-manager while sibling sub-managers still have H2D /
+  D2H DMAs in flight, and never erases `failed_recving_set_` on failure,
+  leaking map entries on every failed/expired transfer and poisoning reused
+  `req_id`s). Found while checking `tpu-inference` PR #3918 against
+  `Caller.lean` / `Caller/MultiWorker.lean`, and confirmed by
+  `numa_kv_cache_manager_bughunt_test.cc` (4/4 cases on unmodified `42dda542`,
+  target added to `build_targets.patch` alongside fixing two pre-existing hunk
+  line counts in `tpu_sync/kv_cache/BUILD` and `tpu_sync/kv_cache/reshard/BUILD`).
+  Not yet filed. In `Transfer/Caller`, made the two-channel connector primary
+  (`connectorFixed` → `connectorTwoChannel`, `connectorCurrent` →
+  `connectorDropFailed`, `trace_current_connector_*` → `trace_dropFailed_*`,
+  `trace_fixed_*` → `trace_twoChannel_*`) and modelled `KVOutputAggregator`'s
+  latched `_failed_recving_pending` channel directly (`AggChannel.latchedReq` in
+  `Caller/MultiWorker.lean`).

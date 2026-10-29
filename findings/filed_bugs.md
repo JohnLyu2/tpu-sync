@@ -153,7 +153,7 @@ Confirmed by a unit test. Found during Lean formalization.
 **Proposed fix**
 - At [reshard_coordinator.cc:542-544](https://github.com/google/tpu-sync/blob/0ac16d1/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L542-L544), call `registry_->AbandonClaim(args.req_id, uuid, claim_owner);` before returning `!status.ok()`.
 
-Reproducer: `ReshardBughuntTest.R2b_SenderDispatchFailureOrphansRegistryClaimAndArmedReceiver` in [`reshard_bughunt_test.cc`](reshard_bughunt_test.cc).
+Reproducer: `ReshardBughuntTest.R2b_SenderDispatchFailureOrphansRegistryClaimAndArmedReceiver` in [`reshard_bughunt_test.cc`](reshard_bughunt_test.cc). *Update 2026-10-28: still open at upstream `42dda542`; `09a42d4e` (2026-10-25) moved the plan / arm / dispatch sequence into `ReshardCoordinator::RunSubPlan`, where the sender-status return still omits `registry_->AbandonClaim(...)` (the other three returns now abandon only for sub-plan 0); see README.md §F8.*
 
 
 ---
@@ -234,7 +234,7 @@ Confirmed by a CPU unit test driving the real vLLM `Scheduler` and connector cla
 **Proposed fix**
 Forward `failed_recving` instead of dropping it: failed sends as `finished_sending`, failed receives via [`get_transfer_results`](https://github.com/vllm-project/vllm/blob/5ab4e44/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L401-L409) so vLLM recomputes rather than decodes.
 
-Reproducer: [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py). The tpu-sync side (`4246613`'s reclassification and the `failed_recving` naming) is an improvement request, not filed as a defect; see README §C1 "tpu-sync side".
+Reproducer: [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py). The tpu-sync side (`4246613`'s reclassification and the `failed_recving` naming) is an improvement request, not filed as a defect; see README §C1 "tpu-sync side". *Update 2026-10-28: fix open as [vllm-project/tpu-inference#3918](https://github.com/vllm-project/tpu-inference/pull/3918) (`f366ef523b2d385d6f9df0083f11eafcc5ba9c89`, 2026-10-27, "[Disagg] Forward tpu-sync failed transfers in tpu_raiden_connector"): `TPUConnector.get_transfer_results()` / `TPUConnectorWorker.get_transfer_results()` forward `failed_recving` as `finished_sending` on the producer and as `finished_recving` + `failed_recving` on the consumer, with `get_finished()` as a wrapper and four tests in `TestTPURaidenConnectorWorker` — the proposed fix above, on the request-level `KVConnectorTransferResults.failed_recving` channel. Unmerged; not on tpu-inference `main` `7840339b` as of 2026-10-28. tpu-sync at `42dda542` still reports failed and expired sends in `failed_recving`; see README.md §C1.*
 
 
 ---
