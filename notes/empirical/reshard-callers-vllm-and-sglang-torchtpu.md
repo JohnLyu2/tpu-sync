@@ -48,8 +48,8 @@ Do not re-investigate:
   holds `dHeld = true` until `done_recving`).
 - "Does `vllm-torchtpu` drop `failed_recving` (like C1) or free producer blocks
   early?" — no: `recv_finished = _done_recving | _failed_recving` stages
-  `_failed_block_ids` (`connectorFixed`), and `done_sending` fires only from
-  `native_terminal_sends | cancelled_sends`.
+  `_failed_block_ids` (`connectorTwoChannel` over `AggChannel.eagerBlock`), and
+  `done_sending` fires only from `native_terminal_sends | cancelled_sends`.
 - "Can an aliased physical page on a shared `storage_index` hold bytes from two
   concurrent requests (so one transfer's rank-0 FA H2D clobbers another's rank-1
   state bytes)?" — no (`Reshard/MultiRequest.lean` A1): in `vllm-torchtpu`

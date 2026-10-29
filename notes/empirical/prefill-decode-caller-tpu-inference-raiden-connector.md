@@ -33,8 +33,8 @@ the connector drops `failed_recving` on both P and D, omits
 leaking KV blocks until restart. Upstream fix in flight: `vllm` `e7bb7e2f`
 (`KVConnectorTransferResults`, `Scheduler._handle_failed_recving`,
 `KVOutputAggregator._failed_recving_pending` — matching `Caller/MultiWorker.lean`
-`mwAggRecv`) + `tpu-inference` PR `#3918` (`f366ef523`, matching
-`connectorFixed`).
+`mwAggRecv` with `AggChannel.latchedReq`) + `tpu-inference` PR `#3918`
+(`f366ef523`, matching `connectorTwoChannel`).
 
 Do not re-investigate:
 - "Would reporting a failed receive as `done_recving` alone fix C1?" — no

@@ -121,3 +121,11 @@ Open items only (5-field `better-than-fish` format, symbol citations instead of 
 **To resume:** Mention alongside any `transfer_receive_session.cc` touch: turn (a) into a `DCHECK` or remove it, and have `on_response` ignore non-OK once `done_` / all layers completed.
 **Effort estimate:** ~30 min each.
 **References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive/Coverage.lean, ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md
+
+## File F11 upstream (`NumaAwareKVCacheManager::CompleteReadRaw`) and optionally add a sub-manager aggregation model
+**Status:** parked 2026-10-29 (`Read at: 42dda542`)
+**Context:** F11 (`NumaAwareKVCacheManager::CompleteReadRaw` eager `failed_recving` mid-DMA under `ENABLE_MULTI_NUMA=1` + `failed_recving_set_` / barrier-count leak on every failed/expired transfer) is confirmed by `findings/numa_kv_cache_manager_bughunt_test.cc` and recorded in `findings/README.md` §F11. Defect 1 was masked while C1 dropped `failed_recving` and becomes reachable once `tpu-inference` PR #3918 merges.
+**Why parked:** Recorded and reproduced first per user direction; not yet filed upstream and Lean modelling of `NumaAwareKVCacheManager` deferred.
+**To resume:** (1) Draft an upstream issue in `findings/filed_bugs.md` from `findings/README.md` §F11 and file before or alongside `tpu-inference` PR #3918; (2) optionally add a small sub-manager barrier model under `TpuSyncVerify/Transfer/Caller/` proving `earlyFree = false` and cross-transfer state reset for the settled-count (`ok + fail`) fix.
+**Effort estimate:** Filing ~20 min; optional Lean model ~2 h.
+**References:** findings/README.md §F11, findings/numa_kv_cache_manager_bughunt_test.cc, ../empirical/prefill-decode-caller-tpu-inference-raiden-connector.md
