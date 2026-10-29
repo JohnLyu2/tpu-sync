@@ -62,8 +62,8 @@ GTest names (`Suite.TestName`); exact line spans live in per-file
 last resolved at commit **`42dda54`**;
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py) `--check` re-verifies
 them against the working tree. The external callers that `Caller.lean`
-cites are pinned separately: tpu-inference `7ed46a6` (and pull request #3918
-`f366ef52`), vllm-torchtpu `9725110`, and vLLM `6185d73` (and `e7bb7e2f`).
+cites are pinned separately: tpu-inference `f366ef52`, vllm-torchtpu
+`9725110`, and vLLM `e7bb7e2f`.
 
 ## Building & Verifying
 

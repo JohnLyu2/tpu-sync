@@ -48,20 +48,15 @@ unwritten KV (`trace_naive_decodes`), and why reporting on the load-failure
 channel without `finished_recving` still leaks D's blocks
 (`trace_loadErrorOnly_*`, `trace_mw_latched_loadErrorOnly_never_emits`).
 
-Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py` at
-tpu-inference pull request #3918 (`f366ef52`, 2026-10-27; line citations shared
-with pre-fix `7ed46a6` noted where unchanged); `tpu_connector.py` =
-`src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py` at vllm-torchtpu
-`9725110`; `sched.py` = `vllm/v1/core/sched/scheduler.py`,
+Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py`;
+`tpu_connector.py` = `src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py`;
+`sched.py` = `vllm/v1/core/sched/scheduler.py`,
 `base.py` = `vllm/distributed/kv_transfer/kv_connector/v1/base.py`,
 `utils.py` = `vllm/distributed/kv_transfer/kv_connector/utils.py`,
 `mixin.py` = `vllm/v1/worker/kv_connector_model_runner_mixin.py`,
-`kvcfg.py` = `vllm/config/kv_transfer.py` at vLLM `6185d73` (line numbers for
-the block-level scheduler handlers) and `e7bb7e2f` (for
-`KVConnectorBase_V1.get_transfer_results`, `KVConnectorTransferResults`,
-`Scheduler._handle_failed_recving` and `KVOutputAggregator`'s
-`_failed_recving_pending` latch); `mgr.cc` =
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`.
+`kvcfg.py` = `vllm/config/kv_transfer.py`; `mgr.cc` =
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` (pinned commits in
+`README.md`).
 
 ## Source map
 
@@ -89,10 +84,11 @@ the block-level scheduler handlers) and `e7bb7e2f` (for
 
 One request, both nodes. On the prefill/producer node (P) the request has
 finished its one output token and the connector has asked vLLM to keep its KV
-blocks until the send is reported (`request_finished` returns
-`delay_free_blocks = True`, `conn.py:438`); on the decode/consumer node (D) the
-request has been allocated blocks and parked in `WAITING_FOR_REMOTE_KVS` with
-the transfer issued (`conn.py:322-378`, `conn.py:606`;
+blocks until the send is reported (`TPUConnectorScheduler.request_finished`
+returns `delay_free_blocks = True` in `conn.py`); on the decode/consumer node
+(D) the request has been allocated blocks and parked in `WAITING_FOR_REMOTE_KVS`
+with the transfer issued (`TPUConnectorScheduler.update_state_after_alloc` and
+`TPUConnectorWorker._start_load_kv` in `conn.py`;
 `tpu_connector.py` `_apply_stage3_submit_outcome`). Nothing before that point
 touches a transfer-held block, so the model starts there (`init`, `mwInit`).
 
@@ -119,20 +115,21 @@ set once, by `pOutcome ok` / `dOutcome ok` (or per worker by `pWorker w ok` /
 `dWorker w ok`), with `ok = false` covering a failed push or pull *and* a send
 nobody pulled before `timeout_s` (both `(failed ? failed_recving_ : done_sending_)`
 and timed-out sends go to `failed_recving_`; the connectors pass
-`TPU_P2P_WAIT_PULL_TIMEOUT`, 180 s, as `timeout_s`, `conn.py:529`,
-`tpu_connector.py` `get_p2p_wait_pull_timeout()`). Which value is published is
+`TPU_P2P_WAIT_PULL_TIMEOUT`, 180 s, as `timeout_s` in
+`TPUConnectorWorker.register_kv_caches` and `tpu_connector.py`
+`get_p2p_wait_pull_timeout()`). Which value is published is
 nondeterministic here; the `Pipeline.lean` modules say when each is possible.
 
 Between tpu-sync and the scheduler sits the **connector**. Per request and per
 step it sees at most one of the three `poll_stats()` lists and produces a
 `Signal`: `finishedSending` / `finishedRecving` are membership in
 `KVConnectorTransferResults.finished_sending` / `finished_recving` (or the pair
-`get_finished()` returns, `base.py:357-373`), and `loadError` is vLLM's
-load-failure channel for the request — either "the request is in
+`KVConnectorBase_V1.get_finished` returns in `base.py`), and `loadError` is
+vLLM's load-failure channel for the request — either "the request is in
 `KVConnectorTransferResults.failed_recving`" (`KVConnectorOutput.failed_recving`,
 copied by `KVConnectorModelRunnerMixin._get_kv_connector_output`) or "the
-request's local blocks are in `get_block_ids_with_load_errors()`"
-(`base.py:375-393`, `KVConnectorOutput.invalid_block_ids`). The two channels
+request's local blocks are in `KVConnectorBase_V1.get_block_ids_with_load_errors`"
+(`KVConnectorOutput.invalid_block_ids` in `base.py`). The two channels
 reach the single-worker scheduler with the same effect (step 1 below), and
 differ in multi-worker aggregation (`AggChannel.latchedReq` vs.
 `AggChannel.eagerBlock` in `MultiWorker.lean`). A `Connector` is the pair of
@@ -140,55 +137,56 @@ functions `onSend`, `onRecv : (ok : Bool) → Signal`:
 
 | Connector | `onSend ok` | `onRecv ok` | Role |
 |-----------|-------------|-------------|------|
-| `connectorTwoChannel` | `finishedSending := true` | `finishedRecving := true, loadError := !ok` | **shipping** (`Contract`): `TPUConnectorWorker.get_transfer_results` in `tpu_raiden_connector.py` (`f366ef52`, producer merges `failed_recving` into `finished_sending`; consumer reports failed receives in `finished_recving` and `failed_recving`, over `AggChannel.latchedReq`) and Stage-3 `TPURaidenConnectorWorker` in `tpu_connector.py` (`get_finished` + `_failed_block_ids` → `get_block_ids_with_load_errors`, over `AggChannel.eagerBlock`) |
-| `connectorDropFailed` | `finishedSending := ok` | `finishedRecving := ok` | **mutant**: `failed_recving` dropped on both nodes (`get_finished`-only `conn.py` at `7ed46a6` before `get_transfer_results`) |
-| `connectorNaive` | `finishedSending := true` | `finishedRecving := true` | **mutant**: failed receive reported in `finished_recving` (`done_recving`) without the load-failure channel (also reached if `f366ef52`'s `get_finished()` wrapper, which returns `(results.finished_sending, results.finished_recving)` without overriding `get_block_ids_with_load_errors`, is called by a legacy `get_finished`-only runner) |
+| `connectorTwoChannel` | `finishedSending := true` | `finishedRecving := true, loadError := !ok` | **shipping** (`Contract`): `TPUConnectorWorker.get_transfer_results` in `tpu_raiden_connector.py` (producer merges `failed_recving` into `finished_sending`; consumer reports failed receives in `finished_recving` and `failed_recving`, over `AggChannel.latchedReq`) and Stage-3 `TPURaidenConnectorWorker` in `tpu_connector.py` (`get_finished` + `_failed_block_ids` → `get_block_ids_with_load_errors`, over `AggChannel.eagerBlock`) |
+| `connectorDropFailed` | `finishedSending := ok` | `finishedRecving := ok` | **mutant**: `failed_recving` dropped on both nodes (a `get_finished`-only connector that overrides neither `get_block_ids_with_load_errors` nor `get_transfer_results`) |
+| `connectorNaive` | `finishedSending := true` | `finishedRecving := true` | **mutant**: failed receive reported in `finished_recving` (`done_recving`) without the load-failure channel (also reached if a `get_finished()` wrapper returning `(finished_sending, finished_recving)` without `get_block_ids_with_load_errors` is called by a runner that does not use `get_transfer_results`) |
 | `connectorLoadErrorOnly` | `finishedSending := true` | `finishedRecving := ok, loadError := !ok` | **mutant**: load-failure channel without the `finished_recving` completion |
 
 The **scheduler** is `sched.py` restricted to what touches a transfer-held
-request, in the order `update_from_output` runs it within one step:
+request, in the order `Scheduler.update_from_output` runs it within one step:
 
 1. Load-failure handlers (`Scheduler._handle_failed_recving` on
-   `KVConnectorOutput.failed_recving` at vLLM `e7bb7e2f`, and
-   `sched.py:1516-1523` → `_handle_invalid_blocks`, `sched.py:2579-2648`, on
-   `invalid_block_ids`): only a request still in `WAITING_FOR_REMOTE_KVS` is
-   affected (`sched.py:2591-2594`). Under `kv_load_failure_policy = "recompute"`
-   (`recompute_kv_load_failures`) its `num_computed_tokens` is reset to 0 and it
-   is added to `failed_recving_kv_req_ids` (`sched.py:2646`). Under `"fail"` —
-   the default, `kvcfg.py:69` — it is finished with `FINISHED_ERROR` through
-   `finish_requests` (`sched.py:1742-1744`), which for a
+   `KVConnectorOutput.failed_recving` and `Scheduler._handle_invalid_blocks` on
+   `KVConnectorOutput.invalid_block_ids` in `sched.py`): only a request still in
+   `WAITING_FOR_REMOTE_KVS` is affected. Under
+   `kv_load_failure_policy = "recompute"` (`recompute_kv_load_failures`) its
+   `num_computed_tokens` is reset to 0 and it is added to
+   `failed_recving_kv_req_ids`. Under `"fail"` — the default in
+   `KVTransferConfig.kv_load_failure_policy` (`kvcfg.py`) — it is finished with
+   `FINISHED_ERROR` through `Scheduler.finish_requests`, which for a
    `WAITING_FOR_REMOTE_KVS` request defers the block free until the id is in
-   `finished_recving_kv_req_ids` (`sched.py:2061-2070`). Since a tpu-sync
-   failure invalidates the whole transfer (**B2**), `applyLoadError` is the
-   scheduler effect of either handler.
-2. `finished_recving` (`sched.py:1758` → `sched.py:2462-2470`): a request still
-   waiting is added to `finished_recving_kv_req_ids`; a request already finished
-   (aborted or errored) has its blocks freed on the spot (`_free_blocks`,
-   `sched.py:2094-2097`, which also deletes it from `scheduler.requests`).
-3. `finished_sending` (`sched.py:2471-2474`): blocks freed on the spot.
+   `finished_recving_kv_req_ids`. Since a tpu-sync failure invalidates the whole
+   transfer (**B2**), `applyLoadError` is the scheduler effect of either
+   handler.
+2. `finished_recving` (`Scheduler._update_from_kv_xfer_finished`): a request
+   still waiting is added to `finished_recving_kv_req_ids`; a request already
+   finished (aborted or errored) has its blocks freed on the spot
+   (`Scheduler._free_blocks`, which also deletes it from `scheduler.requests`).
+3. `finished_sending` (`Scheduler._update_from_kv_xfer_finished`): blocks freed
+   on the spot.
 
-Across steps: the next `schedule()` promotes a waiting request whose id is in
-`finished_recving_kv_req_ids` (`sched.py:643-652`, `sched.py:2414-2429` →
-`_update_waiting_for_remote_kv`, `sched.py:2380-2412`): if the id is also in
+Across steps: the next `Scheduler.schedule` promotes a waiting request whose id
+is in `finished_recving_kv_req_ids`
+(`Scheduler._try_promote_blocked_waiting_request` →
+`Scheduler._update_waiting_for_remote_kv`): if the id is also in
 `failed_recving_kv_req_ids` and nothing valid was computed, the blocks are
 freed and the request goes back to `WAITING` to prefill locally
-(`recomputing`, `sched.py:2399`); otherwise the blocks are kept as the
-request's KV and it proceeds to decode (`decoding`, `sched.py:2405`). And at any
-time the API layer may abort the request (`finish_requests`,
-`sched.py:2012-2073`): a waiting request's free is deferred as in 1, a decoding
-one is freed; a P request is already finished and is skipped
-(`sched.py:2041-2043`) — there is no API-layer action that reaches a P-side
-hold.
+(`recomputing`); otherwise the blocks are kept as the request's KV and it
+proceeds to decode (`decoding`). And at any time the API layer may abort the
+request (`Scheduler.finish_requests`): a waiting request's free is deferred as
+in 1, a decoding one is freed; a P request is already finished and is skipped —
+there is no API-layer action that reaches a P-side hold.
 
 The P side keeps only `pHeld`; its connector signal is read for
 `finishedSending` alone (a P scheduler has no request in
-`WAITING_FOR_REMOTE_KVS`, and `request_finished` on D returns
-`delay_free_blocks = False`, `conn.py:404-455`).
+`WAITING_FOR_REMOTE_KVS`, and `TPUConnectorScheduler.request_finished` on D
+returns `delay_free_blocks = False` in `conn.py`).
 
-In a multi-host or multi-rank deployment (`conn.py:398-402`
-`get_finished_count = len(kv_ip)`, `tpu_connector.py:2566-2583`
-`get_finished_count`), `KVOutputAggregator` (`utils.py`) sits between the
-worker-rank connectors and `update_from_output` (`MultiWorker.lean`): it counts
+In a multi-host or multi-rank deployment
+(`TPUConnectorScheduler.get_finished_count` in `conn.py`,
+`TPURaidenConnector.get_finished_count` in `tpu_connector.py`),
+`KVOutputAggregator` (`utils.py`) sits between the worker-rank connectors and
+`update_from_output` (`MultiWorker.lean`): it counts
 `finished_sending` / `finished_recving` reports per request across workers and
 withholds completion until all workers have reported (`pSentCount = expectedP`,
 `dRecvCount = expectedD`), while handling the load-failure channel according to
@@ -222,8 +220,9 @@ withholds completion until all workers have reported (`pSentCount = expectedP`,
 `Contract conn` is the obligation on a connector that the theorems need:
 every P outcome yields `finishedSending`, every D outcome yields
 `finishedRecving`, and a failed D outcome also yields `loadError` — the
-`base.py` contracts on both channels (`get_block_ids_with_load_errors`,
-`base.py:375-393`, and `KVConnectorTransferResults`). `contract_safe` (single
+`base.py` contracts on both channels
+(`KVConnectorBase_V1.get_block_ids_with_load_errors` and
+`KVConnectorTransferResults`). `contract_safe` (single
 worker) and `mw_contract_safe` (2-worker `KVOutputAggregator` with
 `expectedP = 2`, `expectedD = 2`, on both `AggChannel.eagerBlock` and
 `AggChannel.latchedReq`) prove that any connector satisfying `Contract`, under
@@ -262,8 +261,10 @@ subsequent terminal `dOutcome false` / `dWorker` publications on
   terminal publication (`some true` or `some false`) after its local DMAs have
   drained, and `get_finished_count()` equals the number of participating workers
   (`expectedP = 2`, `expectedD = 2`). On both paths this is enforced for
-  single-sub-manager workers (`ENABLE_MULTI_NUMA=0`) by the 180 s native session
-  deadline (`TPU_P2P_WAIT_PULL_TIMEOUT`, `conn.py:529`, `tpu_connector.py`
+  single-plan transfers (`sub_plan_count <= 1`) on single-sub-manager workers
+  (`ENABLE_MULTI_NUMA=0`) by the 180 s native session
+  deadline (`TPU_P2P_WAIT_PULL_TIMEOUT` in
+  `TPUConnectorWorker.register_kv_caches` and `tpu_connector.py`
   `get_p2p_wait_pull_timeout()`) together with `_sync_stage3_tp_submit_states`
   in `tpu_connector.py` (which broadcasts `"failed"`, `"uncertain"`, or
   `"accepted"` across TP ranks so no rank is left unarmed while another waits).
@@ -271,8 +272,8 @@ subsequent terminal `dOutcome false` / `dWorker` publications on
   directly on both `AggChannel.eagerBlock` and `AggChannel.latchedReq`.
 * **B2 (whole-transfer failure).** A failed pull invalidates every local
   block of the request, so recomputation starts from token 0 and the
-  `num_computed_tokens ≠ 0` branch of `_update_waiting_for_remote_kv`
-  (`sched.py:2393-2395`, cache the valid prefix) is not reached. tpu-sync
+  `num_computed_tokens ≠ 0` branch of `Scheduler._update_waiting_for_remote_kv`
+  (cache the valid prefix) is not reached. tpu-sync
   reports a receive as one outcome (`(!session->GetStatus().ok() ? failed_recving_ : done_recving_)`
   in `KVCacheManagerWithTransfer::CompleteReadWithDetails`), so a connector has
   no finer information to report.

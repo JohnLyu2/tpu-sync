@@ -99,13 +99,16 @@ theorem trace_twoChannel_early_uncertain_load_error :
 
 Each mutant omits one part of `Contract`:
 
-1. `connectorDropFailed` drops `failed_recving` on both P and D (the pre-PR-#3918
-   `get_finished`-only `tpu_raiden_connector.py` at `7ed46a6`). When every
+1. `connectorDropFailed` drops `failed_recving` on both P and D (a
+   `get_finished`-only connector that overrides neither
+   `get_block_ids_with_load_errors` nor `get_transfer_results`). When every
    transfer succeeds (`okEvents`), it is fine; on any failure or unpulled send,
    blocks leak permanently (`leakP_absorbing`, `leakD_absorbing`).
 2. `connectorNaive` reports failed receives in `finished_recving` without the
-   load-failure channel (also reached if PR #3918's `get_finished()` wrapper is
-   called by a legacy `get_finished`-only runner). D decodes unwritten KV.
+   load-failure channel (also reached if a `get_finished()` wrapper returning
+   `(finished_sending, finished_recving)` without
+   `get_block_ids_with_load_errors` is called by a runner that does not use
+   `get_transfer_results`). D decodes unwritten KV.
 3. `connectorLoadErrorOnly` reports on the load-failure channel without
    `finished_recving`. D leaks its blocks under either policy. -/
 
@@ -122,8 +125,8 @@ theorem trace_dropFailed_p :
 
 /-- **Mutant `connectorDropFailed`, D side, abort after.** The pull fails, the
 report is dropped, the request stays parked; when the API layer later aborts it,
-`finish_requests` defers the block free to a `finished_recving` that will never
-come (`sched.py:2064-2066`). -/
+`Scheduler.finish_requests` defers the block free to a `finished_recving` that
+will never come. -/
 theorem trace_dropFailed_d_abort_after :
     ((sys (dropFailed .fail)).run [.dOutcome false, .finish]).map (fun s => (view s, leakD s)) =
     some (⟨true, .finished, true, false, false⟩, true) := by

@@ -32,9 +32,8 @@ structure Connector where
 /-- Shipping two-channel connector meeting `Contract`: every outcome is
 forwarded on `finished_sending` / `finished_recving` and a failed receive also
 goes on vLLM's load-failure channel. Instantiated by both production connectors:
-* `tpu-inference` `TPUConnectorWorker.get_transfer_results` (`conn.py` at pull
-  request #3918 `f366ef52`, paired with vLLM `e7bb7e2f`'s
-  `KVConnectorModelRunnerMixin._get_kv_connector_output` and
+* `tpu-inference` `TPUConnectorWorker.get_transfer_results` (`conn.py`, paired
+  with vLLM's `KVConnectorModelRunnerMixin._get_kv_connector_output` and
   `Scheduler._handle_failed_recving`: producer merges `failed_recving` into
   `finished_sending`; consumer drops the id from `_submitted` and reports it in
   both `finished_recving` and `failed_recving`, the request-level channel), and
@@ -47,21 +46,18 @@ def connectorTwoChannel : Connector where
   onRecv ok := { finishedRecving := true, loadError := !ok }
 
 /-- Mutant: `failed_recving` is logged and dropped on both nodes
-(`finishedSending := ok`, `finishedRecving := ok`, `loadError := false` — the
-pre-PR-#3918 `get_finished`-only `tpu_raiden_connector.py` at `7ed46a6`, where
-neither `get_block_ids_with_load_errors` nor `get_transfer_results` was
-overridden). -/
+(`finishedSending := ok`, `finishedRecving := ok`, `loadError := false` — a
+`get_finished`-only connector where neither `get_block_ids_with_load_errors` nor
+`get_transfer_results` is overridden). -/
 def connectorDropFailed : Connector where
   onSend ok := { finishedSending := ok }
   onRecv ok := { finishedRecving := ok }
 
 /-- Mutant: a failed receive is reported in `finished_recving` (`done_recving`)
-with no signal on the load-failure channel — both the one-channel shortcut the
-original `conn.py` comment (`conn.py:641-644` at `7ed46a6`) warned against and
-what happens if PR #3918's `get_finished()` wrapper (`return
-results.finished_sending, results.finished_recving`, without
-`get_block_ids_with_load_errors`) is invoked by a legacy `get_finished`-only
-runner that ignores `get_transfer_results()`. -/
+with no signal on the load-failure channel — a one-channel shortcut, and also
+what happens if a `get_finished()` wrapper (`return results.finished_sending,
+results.finished_recving`, without `get_block_ids_with_load_errors`) is invoked
+by a runner that does not call `get_transfer_results()`. -/
 def connectorNaive : Connector where
   onSend _ := { finishedSending := true }
   onRecv _ := { finishedRecving := true }
@@ -72,7 +68,8 @@ def connectorLoadErrorOnly : Connector where
   onSend _ := { finishedSending := true }
   onRecv ok := { finishedRecving := ok, loadError := !ok }
 
-/-- vLLM's `kv_load_failure_policy` (`kvcfg.py:69`; `"fail"` is the default). -/
+/-- vLLM's `KVTransferConfig.kv_load_failure_policy` (`kvcfg.py`; `"fail"` is
+the default). -/
 inductive Policy where
   | recompute
   | fail
@@ -86,9 +83,9 @@ structure Cfg where
 inductive DStatus where
   /-- `WAITING_FOR_REMOTE_KVS`, blocks allocated, pull issued. -/
   | waitingRemoteKv
-  /-- promoted with its blocks as its KV cache (`sched.py:2405`). -/
+  /-- promoted with its blocks as its KV cache (`Scheduler._update_waiting_for_remote_kv`). -/
   | decoding
-  /-- promoted after a load failure: blocks freed, back to `WAITING` to prefill locally (`sched.py:2399`). -/
+  /-- promoted after a load failure: blocks freed, back to `WAITING` to prefill locally (`Scheduler._update_waiting_for_remote_kv`). -/
   | recomputing
   /-- finished (aborted by the API layer, or `FINISHED_ERROR`); blocks freed unless deferred. -/
   | finished
@@ -104,21 +101,22 @@ structure S where
   dStatus : DStatus := .waitingRemoteKv
   /-- D still holds the blocks allocated for the remote KV. -/
   dHeld : Bool := true
-  /-- `request_id ∈ finished_recving_kv_req_ids` (`sched.py:197`). -/
+  /-- `request_id ∈ finished_recving_kv_req_ids` (`Scheduler`). -/
   dFinRecv : Bool := false
-  /-- `request_id ∈ failed_recving_kv_req_ids` (`sched.py:198`). -/
+  /-- `request_id ∈ failed_recving_kv_req_ids` (`Scheduler`). -/
   dFailRecv : Bool := false
   deriving Repr, DecidableEq
 
-/-- P finished and holding (`conn.py:438`), D allocated and waiting
-(`conn.py:322-378`), pull issued, nothing published. -/
+/-- P finished and holding (`TPUConnectorScheduler.request_finished`), D
+allocated and waiting (`TPUConnectorScheduler.update_state_after_alloc`), pull
+issued, nothing published. -/
 def init : S := {}
 
 inductive Ev where
   /-- tpu-sync publishes the send (`done_sending` if `ok`, else `failed_recving`,
   `(failed ? failed_recving_ : done_sending_).insert(session->req_id())` in
   `KVCacheManagerWithTransfer::CompleteReadWithDetails`) and P's next
-  `get_finished()` forwards it. -/
+  `get_finished()` / `get_transfer_results()` forwards it. -/
   | pOutcome (ok : Bool)
   /-- tpu-sync publishes the receive (`done_recving` if `ok`, else
   `failed_recving`, `(!session->GetStatus().ok() ? failed_recving_ : done_recving_).insert(session->req_id())`
@@ -126,33 +124,31 @@ inductive Ev where
   `get_finished()` / `get_block_ids_with_load_errors()` (or
   `get_transfer_results()`) forward it. -/
   | dOutcome (ok : Bool)
-  /-- D's next `schedule()` promotes the waiting request (`sched.py:2414-2429`). -/
+  /-- D's next `Scheduler.schedule` promotes the waiting request. -/
   | promote
-  /-- D's request leaves the engine: an API-layer abort (`finish_requests`,
-  `sched.py:2012-2073`) at any time, or normal completion once decoding. -/
+  /-- D's request leaves the engine: an API-layer abort
+  (`Scheduler.finish_requests`) at any time, or normal completion once decoding. -/
   | finish
   deriving Repr, DecidableEq
 
-/-- `sched.py:2471-2474`: `finished_sending` frees the blocks. -/
+/-- `Scheduler._update_from_kv_xfer_finished`: `finished_sending` frees the blocks. -/
 def applySend (sig : Signal) (s : S) : S :=
   if sig.finishedSending then { s with pHeld := false } else s
 
-/-- `sched.py:1516-1523`, `sched.py:2579-2648`: `invalid_block_ids` for a
-request still in `WAITING_FOR_REMOTE_KVS` (`_handle_invalid_blocks`); the
-request-level `failed_recving` handler `Scheduler._handle_failed_recving`
-has the same effect under both policies (`Caller.lean` step 1). -/
+/-- `Scheduler._handle_invalid_blocks` and `Scheduler._handle_failed_recving`
+for a request still in `WAITING_FOR_REMOTE_KVS` (`Caller.lean` step 1). -/
 def applyLoadError (policy : Policy) (s : S) : S :=
   if s.dStatus = .waitingRemoteKv then
     match policy with
     | .recompute => { s with dFailRecv := true }
     | .fail =>
-      -- `finish_requests(FINISHED_ERROR)`, `sched.py:1742-1744` → `sched.py:2061-2070`
+      -- `Scheduler.finish_requests(FINISHED_ERROR)`
       { s with dStatus := .finished, dHeld := s.dHeld && !s.dFinRecv,
                dFinRecv := false, dFailRecv := false }
   else s
 
-/-- `sched.py:2462-2470`: `finished_recving` for a waiting request records it;
-for a finished request frees its blocks. -/
+/-- `Scheduler._update_from_kv_xfer_finished`: `finished_recving` for a waiting
+request records it; for a finished request frees its blocks. -/
 def applyFinishedRecving (s : S) : S :=
   match s.dStatus with
   | .waitingRemoteKv => { s with dFinRecv := true }
@@ -161,8 +157,8 @@ def applyFinishedRecving (s : S) : S :=
   -- report, which happens once: unreachable (the real code would assert).
   | _ => s
 
-/-- One `update_from_output` on D, in its order: load errors (`sched.py:1516`),
-then transfer completions (`sched.py:1758`). -/
+/-- One `Scheduler.update_from_output` on D, in its order: load errors first,
+then transfer completions. -/
 def applyRecv (policy : Policy) (sig : Signal) (s : S) : S :=
   let s := if sig.loadError then applyLoadError policy s else s
   if sig.finishedRecving then applyFinishedRecving s else s
@@ -177,8 +173,8 @@ def dOutcome (c : Cfg) (ok : Bool) (s : S) : Option S :=
     some (applyRecv c.policy (c.conn.onRecv ok) { s with recvPub := some ok })
   else none
 
-/-- `_try_promote_blocked_waiting_request` → `_update_waiting_for_remote_kv`
-(`sched.py:2414-2429`, `sched.py:2380-2412`). -/
+/-- `Scheduler._try_promote_blocked_waiting_request` →
+`Scheduler._update_waiting_for_remote_kv`. -/
 def promote (s : S) : Option S :=
   if s.dStatus = .waitingRemoteKv ∧ s.dFinRecv = true then
     if s.dFailRecv then
@@ -187,7 +183,7 @@ def promote (s : S) : Option S :=
       some { s with dStatus := .decoding, dFinRecv := false }
   else none
 
-/-- `finish_requests` (`sched.py:2012-2073`) on D. -/
+/-- `Scheduler.finish_requests` on D. -/
 def finish (s : S) : Option S :=
   match s.dStatus with
   | .waitingRemoteKv =>
@@ -225,7 +221,8 @@ def violates (s : S) : Bool := leakP s || leakD s || decodesUnwritten s
 
 def Safe (s : S) : Prop := violates s = false
 
-/-- What a connector owes the scheduler (`base.py:357-393`, and the
+/-- What a connector owes the scheduler (`KVConnectorBase_V1.get_finished`,
+`KVConnectorBase_V1.get_block_ids_with_load_errors`, and the
 `KVConnectorTransferResults` contract that a failed receive also appears in
 `finished_recving`). -/
 structure Contract (conn : Connector) : Prop where
@@ -240,8 +237,8 @@ structure Contract (conn : Connector) : Prop where
   /-- No cross-talk: a producer-side report never names the request in
   `finished_recving` or the load-failure set, and a consumer-side report never
   names it in `finished_sending`. The model does not read these fields; the
-  real scheduler would assert on them (`sched.py:2469`, `sched.py:2473` →
-  `_free_blocks`, `sched.py:2095`), so the contract forbids them. -/
+  real scheduler would assert on them (`Scheduler._update_from_kv_xfer_finished` →
+  `Scheduler._free_blocks`), so the contract forbids them. -/
   send_no_recv : ∀ ok, (conn.onSend ok).finishedRecving = false ∧ (conn.onSend ok).loadError = false
   recv_no_send : ∀ ok, (conn.onRecv ok).finishedSending = false
 

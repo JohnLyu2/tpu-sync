@@ -6,8 +6,8 @@ import TpuSyncVerify.Transfer.Caller.Traces
 
 Discharges assumption **B1** of the single-worker caller model by placing vLLM's
 `KVOutputAggregator` (`vllm/distributed/kv_transfer/kv_connector/utils.py`,
-configured by `get_finished_count()` in `conn.py:398-402` and
-`tpu_connector.py:2566-2583`) between two producer workers (`w ∈ {false, true}`)
+configured by `get_finished_count()` in `conn.py` and `tpu_connector.py`)
+between two producer workers (`w ∈ {false, true}`)
 and two consumer workers (`w ∈ {false, true}`) and the scheduler, across **both**
 load-failure channels of `KVOutputAggregator.aggregate`:
 
@@ -24,8 +24,7 @@ load-failure channels of `KVOutputAggregator.aggregate`:
      `applyLoadError policy` immediately on whichever step any worker reports
      `loadError = true`, without waiting for `dRecvCount = expectedD`.
   2. `AggChannel.latchedReq` (`KVConnectorOutput.failed_recving`, driven by
-     `tpu-inference` `TPUConnectorWorker.get_transfer_results` at pull request
-     #3918 `f366ef52` over vLLM `e7bb7e2f`): latched in
+     `tpu-inference` `TPUConnectorWorker.get_transfer_results`): latched in
      `_failed_recving_pending |= kv_output.failed_recving` (`dFailPending`) and
      emitted as `failed_recving = _failed_recving_pending & finished_recving`
      (clearing `_failed_recving_pending -= failed_recving`) only on the step
@@ -82,8 +81,8 @@ inductive AggChannel where
 
 /-- Multi-worker configuration: connector, scheduler failure policy, aggregator
 load-failure channel, and the `get_finished_count()` thresholds (`expectedP`,
-`expectedD`) used by `KVOutputAggregator` (`conn.py:398-402`,
-`tpu_connector.py:2566-2583`). -/
+`expectedD`) used by `KVOutputAggregator` (`TPUConnectorScheduler.get_finished_count`
+in `conn.py`, `TPURaidenConnector.get_finished_count` in `tpu_connector.py`). -/
 structure MWCfg where
   conn : Connector
   policy : Policy
@@ -114,9 +113,9 @@ structure MWS where
   dStatus : DStatus := .waitingRemoteKv
   /-- D still holds the blocks allocated for the remote KV. -/
   dHeld : Bool := true
-  /-- `request_id ∈ finished_recving_kv_req_ids` (`sched.py:197`). -/
+  /-- `request_id ∈ finished_recving_kv_req_ids` (`Scheduler`). -/
   dFinRecv : Bool := false
-  /-- `request_id ∈ failed_recving_kv_req_ids` (`sched.py:198`). -/
+  /-- `request_id ∈ failed_recving_kv_req_ids` (`Scheduler`). -/
   dFailRecv : Bool := false
   deriving Repr, DecidableEq
 
@@ -131,9 +130,9 @@ inductive MWEv where
   receive outcome `ok`, which passes through `conn.onRecv ok` and
   `KVOutputAggregator` before reaching D's scheduler. -/
   | dWorker (w : Bool) (ok : Bool)
-  /-- D's next `schedule()` promotes the waiting request (`sched.py:2414-2429`). -/
+  /-- D's next `Scheduler.schedule` promotes the waiting request. -/
   | promote
-  /-- D's request leaves the engine (`finish_requests`, `sched.py:2012-2073`). -/
+  /-- D's request leaves the engine (`Scheduler.finish_requests`). -/
   | finish
   deriving Repr, DecidableEq
 

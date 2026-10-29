@@ -64,7 +64,7 @@ over the four shared buffers.
 | `PrefillDecode/BlockOrdering.lean` | within-layer blocks: `PopulateRegisteredBlocks`, `ValidateRequestedBlocksLocked`, `BuildCoalescedCopySpec`, `BuildLoadCopyPlan` (`remote_order` / `local_order`), custom host staging, `BlockPipeline` | `execCoalesced_buildCoalescedSpec`, `landStage_get_requested`, `h2dStage_get_requested`, `BlockPipeline.step_pipe`, `BlockPipeline.reachable_safe` |
 | `PrefillDecode/PipelineChecks.lean` | `Pipeline` / `multiSys` traces, `#guard` searches, mutants | `Pipeline.trace_normal`, `trace_layers_out_of_order`, `trace_pull_ahead_of_registration`, `trace_multi_request`, `trace_overlapped_requests` |
 | `PrefillDecode/Transport.lean` | `BlockTransport` receiver-side stream accounting (the per-uuid `BlockTransportServerPushSession`: `layer_progress_`, chunk-count and sender-declared contracts, once-latch, retirement) feeding the receiver's block and layer counters; discharges `Receive` A1 and the A4 coarsening under one explicit assumption (honest senders) and shows what one extra stream does without it | `Transport.reachable_safe`, `trace_dup_chunk_publishes_missing_layer`, `trace_dup_after_retirement`, `trace_dup_declared_rejected`, bounded `searchHardened` |
-| `Transfer/Caller.lean` | the engine above `poll_stats()` shared by both transfer paths (tpu-inference `tpu_raiden_connector.py` @ `f366ef52` / `7ed46a6` on vLLM `e7bb7e2f` / `6185d73` and vllm-torchtpu `tpu_connector.py` @ `9725110`): the worker-side connector as a `Connector` (`connectorTwoChannel` and three counterfactual mutants `connectorDropFailed`, `connectorNaive`, `connectorLoadErrorOnly`), `KVOutputAggregator` multi-worker counting over both `AggChannel.latchedReq` (`_failed_recving_pending`) and `AggChannel.eagerBlock` (`invalid_block_ids`) (`MultiWorker.lean`), and the scheduler's block lifecycle under both `kv_load_failure_policy` values; the other direction of `Pipeline` A4 (`Contract`, `mwEarlyFree = false`) | `Caller.contract_safe`, `Caller.mw_contract_safe`, `twoChannel_contract`, `applyRecv_eager_eq_latched`, `earlyLoadError_fail_eq_finish`, `earlyLoadError_fail_holds_blocks`, `leakP_absorbing`, `leakD_absorbing`, `mwLeakP_absorbing`, `mwLeakD_absorbing`, `trace_twoChannel_*`, `trace_mw_latched_*`, `trace_dropFailed_*`, `trace_mw_dropFailed_partial_failure_leaks`, `trace_naive_decodes`, `trace_loadErrorOnly_*`, exhaustive `search` and `mwSearch` per configuration |
+| `Transfer/Caller.lean` | the engine above `poll_stats()` shared by both transfer paths (tpu-inference `tpu_raiden_connector.py` and vllm-torchtpu `tpu_connector.py` on vLLM): the worker-side connector as a `Connector` (`connectorTwoChannel` and three counterfactual mutants `connectorDropFailed`, `connectorNaive`, `connectorLoadErrorOnly`), `KVOutputAggregator` multi-worker counting over both `AggChannel.latchedReq` (`_failed_recving_pending`) and `AggChannel.eagerBlock` (`invalid_block_ids`) (`MultiWorker.lean`), and the scheduler's block lifecycle under both `kv_load_failure_policy` values; the other direction of `Pipeline` A4 (`Contract`, `mwEarlyFree = false`) | `Caller.contract_safe`, `Caller.mw_contract_safe`, `twoChannel_contract`, `applyRecv_eager_eq_latched`, `earlyLoadError_fail_eq_finish`, `earlyLoadError_fail_holds_blocks`, `leakP_absorbing`, `leakD_absorbing`, `mwLeakP_absorbing`, `mwLeakD_absorbing`, `trace_twoChannel_*`, `trace_mw_latched_*`, `trace_dropFailed_*`, `trace_mw_dropFailed_partial_failure_leaks`, `trace_naive_decodes`, `trace_loadErrorOnly_*`, exhaustive `search` and `mwSearch` per configuration |
 
 ## Boundaries
 
@@ -93,8 +93,7 @@ is proved as HBM and staging safety (§What is proved); when the engine may
 recycle is `MultiRequest.lean` (`.recyclePrefill` only after the send is
 published, `.nextRequest` only after the receive is; `wroteReleased` catches a
 premature recycle). What the engine owes a publication is `Caller.lean`, for
-the production caller pair tpu-inference `tpu_raiden_connector.py` (`f366ef52`
-for `get_transfer_results`, `7ed46a6` before it) on vLLM `e7bb7e2f` / `6185d73`
+the production caller pair tpu-inference `tpu_raiden_connector.py` on vLLM
 (both for a single worker and across workers aggregated by `KVOutputAggregator`
 over `AggChannel.latchedReq` and `AggChannel.eagerBlock` in
 `Caller/MultiWorker.lean`): a two-channel connector (`connectorTwoChannel`) that
@@ -199,7 +198,7 @@ Each mutant removes a specific C++ guard or ordering constraint and yields a
 | `BlockOrdering.trace_mutant_mismatched_transport_order` (`buildBuggyCopyPlan`) | `BuildLoadCopyPlan` applies `remote_order` to `producer_remote_block_ids` **and** to `transport_host_block_ids`; the mutant keeps `h2hPairs` in the unsorted request order | Within-layer block publication correctness: on `test_host_reordering` (`remote = [1, 0]`, `local = [0, 1]`) `h2dStage` yields `[.kv 0 0, .kv 0 1]` instead of the correct `[.kv 0 1, .kv 0 0]` |
 | `Transport` with `Cfg.honest = false` (`trace_dup_chunk_publishes_missing_layer`, `trace_dup_after_retirement`) | `Transport` A4, honest senders: the chunk-count contract has no over-count rejection, every accepted stream is counted, and `layer_progress_` is erased on `all_layers_called` while the receive is live | `NetworkSound` / `CompleteOnSuccess`: success published with a layer never copied (chunk-count, before retirement); `OnceDispatched`: a layer copied twice after retirement on either contract (`trace_dup_copy_fails_late`: a failing duplicate fails the receive) |
 | `Transport.stepHardened` (candidate fix, not a mutant) | adds the missing over-count rejection to the chunk-count contract and a per-layer once-latch in `ExecuteLayerH2d` | none within the search depth on the dishonest instances (`searchHardened … = .outOfFuel`); honest traces unchanged (`trace_hardened_honest`) |
-| `Caller.connectorDropFailed`, `Caller.connectorNaive`, `Caller.connectorLoadErrorOnly` | `connectorTwoChannel` (`TPUConnectorWorker.get_transfer_results` / `TPURaidenConnectorWorker.get_finished`) forwards `failed_recving` on both P (`finished_sending`) and D (`finished_recving` + load-failure channel) | `connectorDropFailed` leaks held blocks on both nodes (`trace_dropFailed_*`, `trace_mw_dropFailed_partial_failure_leaks`); `connectorNaive` (including legacy `get_finished()` without `get_block_ids_with_load_errors`) decodes on unwritten KV (`trace_naive_decodes`); `connectorLoadErrorOnly` leaks D blocks (`trace_loadErrorOnly_*`, `trace_mw_latched_loadErrorOnly_never_emits`) |
+| `Caller.connectorDropFailed`, `Caller.connectorNaive`, `Caller.connectorLoadErrorOnly` | `connectorTwoChannel` (`TPUConnectorWorker.get_transfer_results` / `TPURaidenConnectorWorker.get_finished`) forwards `failed_recving` on both P (`finished_sending`) and D (`finished_recving` + load-failure channel) | `connectorDropFailed` leaks held blocks on both nodes (`trace_dropFailed_*`, `trace_mw_dropFailed_partial_failure_leaks`); `connectorNaive` (including `get_finished()` without `get_block_ids_with_load_errors`) decodes on unwritten KV (`trace_naive_decodes`); `connectorLoadErrorOnly` leaks D blocks (`trace_loadErrorOnly_*`, `trace_mw_latched_loadErrorOnly_never_emits`) |
 
 ## Branch coverage by the replayed tests
 
@@ -379,13 +378,10 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 <!-- source-map:end -->
 
 *External, the production caller pair (`Transfer/Caller.lean`):*
-tpu-inference `tpu_inference/distributed/tpu_raiden_connector.py` @ `7ed46a6`
-(and pull request #3918 `f366ef52` for `get_transfer_results`),
+tpu-inference `tpu_inference/distributed/tpu_raiden_connector.py`,
 vLLM `vllm/distributed/kv_transfer/kv_connector/utils.py`, and
-vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73` (`e7bb7e2f` for
-`KVConnectorTransferResults`, `_handle_failed_recving` and
-`_failed_recving_pending`; `TPUConnectorWorker.get_finished`,
-`get_block_ids_with_load_errors`, `get_transfer_results`, `request_finished`,
+vLLM `vllm/v1/core/sched/scheduler.py` (`TPUConnectorWorker.get_transfer_results`,
+`get_finished`, `TPUConnectorScheduler.request_finished`,
 `update_state_after_alloc`, `get_finished_count`; `KVOutputAggregator.aggregate`;
 scheduler `_handle_invalid_blocks`, `_handle_failed_recving`,
 `_update_from_kv_xfer_finished`, `finish_requests`,
