@@ -4,7 +4,7 @@
 > **About this fork:** This repository adds [`tpu_sync/formal_verification/`](tpu_sync/formal_verification/README.md) — Lean 4 formal verification of TPU Sync's distributed KV-cache transfer protocols and memory management, paired with a formal-backed code-reasoning agent.
 >
 > - **Overview & proof status:** [`tpu_sync/formal_verification/README.md`](tpu_sync/formal_verification/README.md)
-> - **C++ ↔ Lean design & proof docs:** [`prefill_decode.md`](tpu_sync/formal_verification/docs/transfer/prefill_decode.md), [`reshard.md`](tpu_sync/formal_verification/docs/transfer/reshard.md), [`read_remote.md`](tpu_sync/formal_verification/docs/controller/read_remote.md)
+> - **C++ ↔ Lean design & proof docs:** [`prefill_decode.md`](tpu_sync/formal_verification/docs/transfer/prefill_decode.md), [`reshard.md`](tpu_sync/formal_verification/docs/transfer/reshard.md)
 > - **Findings, reproducers & patches:** [`findings/README.md`](findings/README.md)
 > - **Formal-backed code-reasoning agent (`tpu-sync-lean-helper`):** [`agents/tpu-sync-lean-helper/`](agents/tpu-sync-lean-helper/agent.json) — reasons about C++ concurrency/lifecycle behavior and proposed diffs against machine-checked theorems, invariants, and executable counterexample searches via [`run_lean.sh`](tpu_sync/formal_verification/tools/run_lean.sh)
 > - **Check all proofs & bounded searches:** `cd tpu_sync/formal_verification && lake build`

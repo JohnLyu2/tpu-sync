@@ -43,7 +43,7 @@ here.
 1. **Extract.** Read the C++ and write down the state and transitions, each
    with a `file:line` citation.
 2. **Hypothesise.** Use a Lean model or a bounded search to find a property
-   violation (`tpu_sync/formal_verification/TpuSyncVerify/Controller/ReadRemote.lean` for F2).
+   violation (`TpuSyncVerify/Controller/ReadRemote.lean` on branch `controller-verification` for F2).
 3. **Reachability.** Check the violating order against the real threading and
    lock structure and against real callers.
 4. **Confirm.** Write a deterministic gtest that drives the real code into
@@ -63,7 +63,7 @@ here.
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
-| `coverage_gap_tests.patch` | 9 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, `Controller/ReadRemoteCoverage.lean`): 4 `RecvLifecycleTest`/`RecvDrainTest` cases appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 2 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary with `RAIDEN_REMOTE_READ_DEADLINE_S=1` because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Based on `42dda542`; all 9 pass there (2026-10-28). Offered upstream as a test-only PR. Not included: the two `Receive` handshake cases that need a replying control-plane producer stub, the multi-request recycle case, which needs a seam that observes staging contents, two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see), and the receiver's late-`Finish` status flip, kept as a finding instead. See "Coverage-gap tests" below |
+| `coverage_gap_tests.patch` | 9 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` on branch `controller-verification`): 4 `RecvLifecycleTest`/`RecvDrainTest` cases appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 2 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary with `RAIDEN_REMOTE_READ_DEADLINE_S=1` because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Based on `42dda542`; all 9 pass there (2026-10-28). Offered upstream as a test-only PR. Not included: the two `Receive` handshake cases that need a replying control-plane producer stub, the multi-request recycle case, which needs a seam that observes staging contents, two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see), and the receiver's late-`Finish` status flip, kept as a finding instead. See "Coverage-gap tests" below |
 
 To run F1–F4: copy the two `.cc` files next to the code they test
 (`tpu_sync/core/controller/`, `tpu_sync/kv_cache/`), `git apply
@@ -189,7 +189,7 @@ have not been rebuilt since the runs their entries record.
   `449b591` (controller sources rebuilt from `449b591`, leaf libraries from
   the `0ac16d1` OSS build; `raiden_controller.cc`'s `ReadRemote` region is
   unchanged between the two). **Proved in Lean** for shapes A and B
-  (`tpu_sync/formal_verification/TpuSyncVerify/Controller/ReadRemote.lean`, exhaustive over the reachable
+  (`TpuSyncVerify/Controller/ReadRemote.lean` on branch `controller-verification`, exhaustive over the reachable
   state space).
 - **C++ test output** (unmodified code, verbatim, 2026-10-20 run; the tests
   are written so that a failure shows the defect):
