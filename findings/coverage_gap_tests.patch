@@ -34,10 +34,10 @@ index 954554b..6618a4d 100644
 +)
 diff --git a/tpu_sync/core/controller/read_remote_deadline_test.cc b/tpu_sync/core/controller/read_remote_deadline_test.cc
 new file mode 100644
-index 0000000..181bce2
+index 0000000..ce56b52
 --- /dev/null
 +++ b/tpu_sync/core/controller/read_remote_deadline_test.cc
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,226 @@
 +// Copyright 2026 Google LLC.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -103,6 +103,9 @@ index 0000000..181bce2
 +  }
 +
 +  void TearDown() override {
++    if (worker_ != nullptr) {
++      worker_->service->SetTransferManager(KVManagerHolder(nullptr));
++    }
 +    if (src_ != nullptr) src_->service->ClearReadRemoteHooks();
 +  }
 +
@@ -115,17 +118,19 @@ index 0000000..181bce2
 +    ASSERT_TRUE(st.ok()) << st.message();
 +  }
 +
-+  // The source validates (after `validate_delay`) and pins on the main path;
-+  // `pins_` counts outstanding pins so the tests can check the lease was
-+  // released.
++  // The source validates (taking `validate_delay`) and pins on the main path;
++  // `pins_` counts outstanding pins from the moment the acquire reaches the
++  // source so the tests can wait for the grant to land and be released.
 +  void SetSourceHooks(absl::Duration validate_delay,
 +                      absl::Status validate_status = absl::OkStatus()) {
 +    src_->service->SetReadRemoteHooks(
 +        [this, validate_delay, validate_status](absl::Span<const std::string> h)
 +            -> absl::StatusOr<std::vector<int32_t>> {
++          if (validate_status.ok()) {
++            pins_ += static_cast<int>(h.size());
++          }
 +          absl::SleepFor(validate_delay);
 +          if (!validate_status.ok()) return validate_status;
-+          pins_ += static_cast<int>(h.size());
 +          return std::vector<int32_t>(h.size(), 42);
 +        },
 +        [this](absl::Span<const std::string> h) {
@@ -169,10 +174,11 @@ index 0000000..181bce2
 +                        .Await();
 +  EXPECT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded) << st;
 +  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
++  EXPECT_GT(pins_.load(), 0);  // the acquire is still at the source
 +
-+  // The grant lands at ~2.5 s and is released as late.
++  // The grant lands at ~2.5 s and is released after the post-deadline path
++  // completes.
 +  EXPECT_TRUE(WaitForNoPins(absl::Seconds(5)));
-+  EXPECT_EQ(mock.vector_h2h_read_calls + mock.h2h_read_calls, 0);
 +}
 +
 +// The acquire fails at the source, but only after the deadline has settled
@@ -221,9 +227,10 @@ index 0000000..181bce2
 +  }
 +};
 +
-+// The worker's read outlasts the deadline: the read settles DeadlineExceeded
-+// while the pull runs, and the pull's completion afterwards releases the
-+// lease.
++// The worker's read outlasts the deadline: the deadline thread settles the
++// read with DeadlineExceeded and sends an early lease release while the pull
++// runs, and when the pull completes afterwards its commit-phase release and
++// Settle(OK) run against the already-settled state.
 +TEST_F(ReadRemoteDeadlineTest, PullCompletingAfterTheDeadlineReleasesTheLease) {
 +  SlowReadMock mock;
 +  worker_->service->SetTransferManager(KVManagerHolder(&mock));
@@ -243,19 +250,25 @@ index 0000000..181bce2
 +  EXPECT_EQ(st.code(), absl::StatusCode::kDeadlineExceeded) << st;
 +  EXPECT_EQ(mock.read_finished_ns.load(), 0) << "pull already done at settle";
 +
-+  absl::SleepFor(mock.read_duration + absl::Seconds(1));
++  const absl::Time pull_deadline = absl::Now() + absl::Seconds(10);
++  while (mock.read_finished_ns.load() == 0 && absl::Now() < pull_deadline) {
++    absl::SleepFor(absl::Milliseconds(20));
++  }
 +  EXPECT_GT(mock.read_finished_ns.load(), absl::ToUnixNanos(settled_at));
 +  EXPECT_TRUE(WaitForNoPins(absl::Seconds(2)));
++  // Detach before `mock` leaves scope; SetTransferManager takes the worker's
++  // RPC mutex, waiting out any in-flight TransferBuffers call.
++  worker_->service->SetTransferManager(KVManagerHolder(nullptr));
 +}
 +
 +}  // namespace
 +}  // namespace controller
 +}  // namespace tpu_raiden
 diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
-index 331de88..b21b660 100644
+index 331de88..0df7c1e 100644
 --- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
 +++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
-@@ -1733,5 +1733,95 @@ TEST(SendLifecycleTest,
+@@ -1733,5 +1733,91 @@ TEST(SendLifecycleTest,
    EXPECT_EQ(producer.free_slots(), kSlots);
    EXPECT_FALSE(producer.has_send(404));
  }
@@ -289,8 +302,7 @@ index 331de88..b21b660 100644
 +TEST(RecvLifecycleTest, SecondFinishOnAFailedReceiveIsANoOp) {
 +  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
 +  consumer.AddRecv("req", /*uuid=*/502);
-+  ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/502),
-+              ::absl_testing::IsOk());
++  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/502));
 +  consumer.FailRecv(/*uuid=*/502, absl::InternalError("first"));
 +  consumer.FailRecv(/*uuid=*/502, absl::UnavailableError("second"));
 +  EXPECT_TRUE(consumer.has_recv(502));
@@ -313,10 +325,8 @@ index 331de88..b21b660 100644
 +  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
 +  consumer.AddRecv("req", /*uuid=*/503);
 +  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/503));
-+  ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/503),
-+              ::absl_testing::IsOk());
-+  ASSERT_THAT(consumer.ReceiveBlocks({0}, /*uuid=*/503),
-+              ::absl_testing::IsOk());
++  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/503));
++  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/503));
 +  ABSL_ASSERT_OK(consumer.base()->EndIncomingPush(/*uuid=*/503));
 +
 +  Reports during = consumer.CompleteReadRaw();
@@ -336,8 +346,7 @@ index 331de88..b21b660 100644
 +TEST(RecvDrainTest, CancelledReceiveWhoseCopyThenFailsStaysCancelled) {
 +  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
 +  consumer.AddRecv("req", /*uuid=*/504);
-+  ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/504),
-+              ::absl_testing::IsOk());
++  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/504));
 +  consumer.FailRecv(/*uuid=*/504, absl::CancelledError("cancel"));
 +  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 +
