@@ -21,7 +21,7 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 - TCP block transport: `tpu_sync/transport/block_transport.{h,cc}`, `tpu_sync/transport/block_transport_session.{h,cc}`
 - KV-cache store, host offload, store RPC service/client: `tpu_sync/kv_cache/{kv_cache_store,host_offload_backend,kv_cache_store_service,kv_cache_store_client}.{h,cc}`
 - Raiden controller and remote leases: `tpu_sync/core/controller/raiden_controller.{h,cc}`
-- Lean models `tpu_sync/formal_verification/TpuSyncVerify/` (`Common/`, `Transfer/`, `Controller/`; modules over ~1000 lines are an umbrella `X.lean` holding the docstring and source map over `X/{Model,Lemmas,Invariant,Progress,Frame,Traces}.lean`); docs `tpu_sync/formal_verification/docs/`; tools `tpu_sync/formal_verification/tools/{resolve_anchors.py,run_lean.sh}`. `tpu_sync/formal_verification/` is self-contained and mirrors what lands upstream. Fork-only, at the repo root: bug-hunt reports, reproducers and patches `findings/`; Lean-backed Q&A and code-reasoning subagent `agents/tpu-sync-lean-helper/`; slides `slides/`
+- Lean models `tpu_sync/formal_verification/TpuSyncVerify/` (`Common/`, `Transfer/`; `Controller/` is parked on branch `controller-verification`; modules over ~1000 lines are an umbrella `X.lean` holding the docstring and source map over `X/{Model,Lemmas,Invariant,Progress,Frame,Traces}.lean`); docs `tpu_sync/formal_verification/docs/`; tools `tpu_sync/formal_verification/tools/{resolve_anchors.py,run_lean.sh}`. `tpu_sync/formal_verification/` is self-contained and mirrors what lands upstream. Fork-only, at the repo root: bug-hunt reports, reproducers and patches `findings/`; Lean-backed Q&A and code-reasoning subagent `agents/tpu-sync-lean-helper/`; slides `slides/`
 
 ## Conventions
 
