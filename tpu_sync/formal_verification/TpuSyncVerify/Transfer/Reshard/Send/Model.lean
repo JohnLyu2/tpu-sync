@@ -25,7 +25,7 @@ inductive SendStage where
   | d2h
   | pushing (active : Nat)
   | aborted
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace SendStage
 
@@ -44,7 +44,7 @@ end SendStage
 structure SendPool where
   peers : Nat
   stage : SendStage := .pending
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace SendPool
 
@@ -65,7 +65,7 @@ structure Send where
   remainingPushes : Nat
   planUnregistered : Bool := false
   published : Option Bool := none
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Send
 

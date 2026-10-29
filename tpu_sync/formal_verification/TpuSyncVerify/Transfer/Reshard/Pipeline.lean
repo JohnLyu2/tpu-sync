@@ -4,6 +4,7 @@ import TpuSyncVerify.Transfer.Reshard.Pipeline.Invariant
 import TpuSyncVerify.Transfer.Reshard.Pipeline.Preservation
 import TpuSyncVerify.Transfer.Reshard.Pipeline.Progress
 import TpuSyncVerify.Transfer.Reshard.Pipeline.Traces
+import TpuSyncVerify.Transfer.Reshard.Pipeline.Coverage
 
 /-!
 # Pool-reshard transfer pipeline

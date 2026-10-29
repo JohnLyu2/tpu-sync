@@ -74,10 +74,11 @@ umbrella file and a directory of parts:
 * `X/Frame.lean` — frame lemmas for other modules.
 * `X/Traces.lean` — traces, searches, mutants.
 * `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
-  below); `Receive`, `Send`, `Pipeline`, and `MultiRequestCoverage.lean` (new
-  leaves only: its state space is unbounded) so far (`Pipeline/Coverage.lean`
-  imports the traces in `PipelineChecks.lean`, so `TpuSyncVerify.lean` imports
-  it directly). Not to be confused with `Reshard/Coverage.lean`, which is the
+  below); `Receive`, `Send`, `Pipeline` on both transfer paths, and
+  `PrefillDecode/MultiRequestCoverage.lean` (new leaves only: its state space
+  is unbounded) so far (`PrefillDecode/Pipeline/Coverage.lean` imports the
+  traces in `PipelineChecks.lean`, so `TpuSyncVerify.lean` imports it
+  directly). Not to be confused with `Reshard/Coverage.lean`, which is the
   reshard model's sub-block byte coverage, a model of the C++.
 
 Modules with their own internal numbering (`BlockOrdering`, `PoolStaging`)
@@ -185,7 +186,7 @@ they all run on every `lake build`.
 **Coverage: which branches of `step` the replayed tests reach.** Replaying
 every upstream test says the model is not vacuous; it does not say how much of
 the model the tests exercise. `Common/Coverage.lean` holds the machinery and
-`Receive/Coverage.lean` is the template for measuring that:
+`PrefillDecode/Receive/Coverage.lean` is the template for measuring that:
 
 * a `Leaf` per leaf of each event's decision tree, named for the C++ path it
   stands for, and an `Effect` read off the before/after lifecycle (drains,

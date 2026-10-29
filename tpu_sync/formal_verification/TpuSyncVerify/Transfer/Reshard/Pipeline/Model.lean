@@ -16,7 +16,7 @@ inductive Cell where
   | blank
   | kv (pool : Nat)
   | junk
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Pipeline
 
@@ -62,7 +62,7 @@ structure Pipeline where
   reclaimed : Bool := false
   /-- Whether `PoolReshardRegisterRecv` has armed the receiver (`ReshardCoordinator::RunSubPlan`). -/
   armed : Bool := true
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Pipeline
 

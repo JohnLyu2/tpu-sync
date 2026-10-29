@@ -17,7 +17,7 @@ inductive PoolStage where
   | ready
   | completed
   | aborted
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace PoolStage
 
@@ -49,7 +49,7 @@ end PoolStage
 structure Pool where
   rank : Nat
   stage : PoolStage := .waiting
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 /-- Policy for `hooks.end_incoming_push` on `ReshardReceiveSession`
 (`KVCacheManagerWithTransfer::InitializeBaseHooks`): `finishOnError`, the
@@ -71,7 +71,7 @@ structure Recv where
   durationRecorded : Bool := false
   published : Option Bool := none
   pushes : Nat := 0
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Recv
 

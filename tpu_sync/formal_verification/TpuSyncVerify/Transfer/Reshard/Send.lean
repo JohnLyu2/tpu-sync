@@ -3,6 +3,7 @@ import TpuSyncVerify.Transfer.Reshard.Send.Lemmas
 import TpuSyncVerify.Transfer.Reshard.Send.Invariant
 import TpuSyncVerify.Transfer.Reshard.Send.Progress
 import TpuSyncVerify.Transfer.Reshard.Send.Traces
+import TpuSyncVerify.Transfer.Reshard.Send.Coverage
 
 /-!
 # Reshard send session
@@ -17,8 +18,10 @@ In the source-map table below, `reshard_send.h` and `reshard_send.cc` are
 `tpu_sync/kv_cache/reshard_send_session.{h,cc}`; `reshard_recv.cc` is
 `tpu_sync/kv_cache/reshard_receive_session.cc`; `slots.cc` is
 `tpu_sync/core/pool_reshard_send_slots.cc`; `mgr.cc` is
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.cc` is
-`tpu_sync/kv_cache/kv_cache_manager_base.cc`; `utils.h` is
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.h` and `base.cc`
+are `tpu_sync/kv_cache/kv_cache_manager_base.{h,cc}`; `raw_core.h` is
+`tpu_sync/core/raw_transfer_core.h`; `bt.cc` is
+`tpu_sync/transport/block_transport.cc`; `utils.h` is
 `tpu_sync/core/utils.h`; `pool_layout.cc` is `tpu_sync/kv_cache/pool_layout.cc`;
 `reshard_send_test.cc` is `tpu_sync/kv_cache/reshard_send_session_test.cc`; and
 `pool_reshard_test.cc` is
@@ -249,12 +252,20 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:833-871` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:912-949` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1182-1202` |
+| `base.h` | `KVCacheManagerBase::AttachPlaceholderDeviceHoldForTest` | `:853` |
+| `base.cc` | `KVCacheManagerBase::CopyPoolBlocks` | `:2517-2653` |
+| `base.cc` | `KVCacheManagerBase::D2hPoolBlocks` | `:2655-2660` |
 | `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3271-3582` |
 | `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`) | `:3477-3509` |
+| `raw_core.h` | `PjRtCopyFuture::OnReady` | `:483-537` |
+| `raw_core.h` | `IssueD2hShard` | `:626-654` |
+| `bt.cc` | `BlockTransport::AsyncPush` | `:499-548` |
 | `utils.h` | `StridedSpanFitsBlock` | `:322-333` |
 | `utils.h` | `StridedSpanFitsRegions` | `:335-349` |
 | `pool_layout.cc` | `RegionCoversOffset` | `:66-87` |
 | `pool_layout.cc` | `RegionsCoverRange` | `:257-274` |
+| `reshard_send_test.cc` | `ReshardSendSessionTestPeer` | `:45-70` |
+| `reshard_send_test.cc` | `MakeTestBase` | `:80-86` |
 | `reshard_send_test.cc` | `ReshardSendSessionTest.AcceptsCanonicalPlanOnExplicitPools` | `:151-159` |
 | `reshard_send_test.cc` | `ReshardSendSessionTest.AcceptsImplicitPools` | `:161-168` |
 | `reshard_send_test.cc` | `ReshardSendSessionTest.RejectsMissingIdentityAndPoolFields` | `:170-202` |
@@ -265,6 +276,8 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `reshard_send_test.cc` | `ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush` | `:364-404` |
 | `reshard_send_test.cc` | `ReshardSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:406-435` |
 | `reshard_send_test.cc` | `ReshardSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:437-453` |
+| `pool_reshard_test.cc` | `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints` | `:271-287` |
 | `pool_reshard_test.cc` | `PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront` | `:302-325` |
+| `pool_reshard_test.cc` | `DeviceBackedTestBase` | `:596-609` |
 <!-- source-map:end -->
 -/

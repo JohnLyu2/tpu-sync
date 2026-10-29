@@ -69,6 +69,7 @@ ALIASES = {
     "coord.h": "tpu_sync/kv_cache/reshard/reshard_coordinator.h",
     "base.cc": "tpu_sync/kv_cache/kv_cache_manager_base.cc",
     "base.h": "tpu_sync/kv_cache/kv_cache_manager_base.h",
+    "raw_core.h": "tpu_sync/core/raw_transfer_core.h",
     "slots.cc": "tpu_sync/core/pool_reshard_send_slots.cc",
     "slots.h": "tpu_sync/core/pool_reshard_send_slots.h",
     "reshard_recv.cc": "tpu_sync/kv_cache/reshard_receive_session.cc",
