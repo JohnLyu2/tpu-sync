@@ -59,7 +59,8 @@ here.
 | `reshard_bughunt_test.cc` | R7a, R7b, R8, R2b of `tpu_sync/formal_verification/docs/transfer/reshard.md` (registry / coordinator claim lifecycle; all four pass, not yet filed) |
 | `reshard_send_session_bughunt_test.cc` | F10 (R6 of `tpu_sync/formal_verification/docs/transfer/reshard.md`): the sender's early plan unregister and the uuid-keyed staging lease it hands to a retry |
 | `numa_kv_cache_manager_bughunt_test.cc` | F11: `NumaAwareKVCacheManager::CompleteReadRaw` eager `failed_recving` while sibling sub-managers still have H2D / D2H DMAs in flight, plus `failed_recving_set_` / barrier-count leak and `req_id`-reuse poisoning |
-| `build_targets.patch` | `cc_test` targets for the five files above |
+| `pool_reshard_chain_bughunt_test.cc` | F12 (`PoolReshardChainBughunt`, `ChainClaimTest`) and F13 (`PoolReshardChainBughunt1B`): windowed pool-reshard sub-plan chains (`09a42d4e`) — a sender absent from some windows never reports `done_sending`; a chain failing after window 0 holds the registry claim until TTL; the first failing sub-plan is reported while sibling / later windows still run and can be reported twice |
+| `build_targets.patch` | `cc_test` targets for the six files above |
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
@@ -73,13 +74,16 @@ findings/build_targets.patch`, then
 `numa_kv_cache_manager_bughunt_test.cc` to `tpu_sync/frameworks/jax/`, apply
 `findings/build_targets.patch`, and run
 `bazel test --config=oss //tpu_sync/frameworks/jax:numa_kv_cache_manager_bughunt_test`.
+To run F12 / F13: copy `pool_reshard_chain_bughunt_test.cc` to `tpu_sync/kv_cache/`,
+apply the patch, and run
+`bazel test --config=oss //tpu_sync/kv_cache:pool_reshard_chain_bughunt_test`.
 F5 needs no repro file:
 its test is already in the tree as `DISABLED_`
 (`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
 --test_arg=--gtest_also_run_disabled_tests`); the fix patch that re-enabled it
 was retired on 2026-10-16 (see F5). All three patches apply cleanly at
 `42dda542` (`git apply --check`, 2026-10-29; `build_targets.patch` updated
-2026-10-29 for F11; `candidate_fixes.patch` was last re-based at `2ed6f8f`);
+2026-10-29 for F11 and F12/F13; `candidate_fixes.patch` was last re-based at `2ed6f8f`);
 `kv_cache_store_pin_race_test.cc` needs its `WindowBackend::Insert` override
 ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
 (F1 is fixed there, see §F1). The F1–F4, R7/R8/R2b and F10 `.cc` reproducers
@@ -100,6 +104,8 @@ have not been rebuilt since the runs their entries record.
 | F9 | `RequestBlockRegistry::LookupAndClaim` refreshes the `claimed_` TTL but not `expires_at` on the claimed `request_blocks_` rows, so in `[t_reg + ttl, t_claim + ttl)` the producer registrations are purged while the claim is live: `Status` says `STATUS_CLAIMED`, `CancelIfUnclaimed` refuses, and a sibling stage or retry fails with `"Missing producer block registration"` ([filed](filed_bugs.md#6-requestblockregistrylookupandclaim-claiming-a-request-does-not-refresh-request_blocks_-ttl-evicting-producer-registrations-while-the-claim-is-active-r8) 2026-10-19; R8 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) at `0ac16d1` (`reshard_bughunt_test.cc`); filed upstream, fix pending; **still open at `42dda542`** (`request_block_registry.cc` unchanged since `0ac16d1`) | yes: any multi-stage pool reshard (or a retry) whose later claim lands more than `ttl_s_` after registration but before the first claim expires |
 | F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape on the sender; early unregister since `FinishPoolReshardSend` before `1673c9b`, lease-aliasing window since `3d1b5d4`) (R6 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `2ed6f8f`); **filed 2026-10-23** (bug 9 in `filed_bugs.md`); **still open at `42dda542`** (`reshard_send_session.cc` unchanged since `2ed6f8f`; the header only gained `sub_plan_index()` / `sub_plan_count()` accessors in `09a42d4e`) | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
 | F11 | `NumaAwareKVCacheManager::CompleteReadRaw` (the JAX `poll_stats()` wrapper) emits `failed_recving` on the **first** failing sub-manager while sibling sub-managers still have H2D / D2H DMAs in flight (`done_sending` and `done_recving` barrier-wait across sub-managers; pinned by upstream's `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`), and **never erases `failed_recving_set_`** on failure (erased only when `done_recving_counts_[req] >= expected` on pure `done_recving` completions), leaking map entries on every failed/expired transfer and poisoning reused `req_id`s (dropping subsequent `failed_recving` / `done_recving` at `num_subs == 1`, and desynchronizing `done_recving_counts_` into premature `done_recving` after partial failure at `num_subs >= 2`). Present since `00a3f670` (2026-06-23) | CONFIRMED (test) 2026-10-29 (`numa_kv_cache_manager_bughunt_test.cc`, 4/4 cases on unmodified `42dda542`); **filed 2026-10-29** (bug 10 in `filed_bugs.md`) | eager `failed_recving` mid-DMA: yes on a single request when `ENABLE_MULTI_NUMA=1` (`num_subs >= 2`, wired in `tpu_raiden_connector._remote_endpoint`) + a caller forwarding `failed_recving` (masked while C1 dropped `failed_recving`; exposed once [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918) lands); `failed_recving_set_` leak: yes on every failed/expired transfer even at default `ENABLE_MULTI_NUMA=0`; `req_id`-reuse poisoning: immediate for direct `jax::KVCacheManager` callers, gated by `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` (or 8-hex suffix collision) in vLLM V1 |
+| F12 | Windowed pool reshard (`dst_window_blocks` sub-plan chains, `09a42d4e`): `BuildPoolReshardPlan` dispatches only the source units with spans in the current window, while every sub-plan is stamped with the request-wide `sub_plan_count = K`, so a sender in `1 <= m < K` windows never reaches `K` settled sub-plans, reports nothing until `SweepSubPlanChainsLocked` fails it (`DEADLINE_EXCEEDED … m of K sub-plans settled`) after `timeout_s_`; and `RunSubPlan` abandons the registry claim only `if (index == 0)`, so a chain failing at window ≥ 1 leaves every rank not dispatched in `0 .. index-1` — which has no session and never votes `Complete` — in the claim until `ttl_s_` (the F8 gap, now by design for later windows) | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt` 2 failing + 1 control, `ChainClaimTest` 1 failing + 2 controls, on unmodified `42dda542`); **filed 2026-10-29** (bug 11 in `filed_bugs.md`) | yes for any multi-window request whose span ownership varies by window (upstream's own `WindowedRequestChainsOneSubTransferPerWindow` / `WindowClipsStraddlingSpansAtWindowBoundaries` shapes), once a caller passes `dst_window_blocks` (`SUPPORTS_DST_WINDOW_BLOCKS` is wired in `api/torch/reshard_client.py`; `vllm-torchtpu` `9725110` and `sglang-torchtpu` `9a6eef1` do not pass it yet) |
+| F13 | Windowed pool reshard: `RecordPoolReshardTerminalLocked` emits `failed_recving` on the **first** failing sub-plan with no check for sibling sub-plans of the `req_id` still active (the check `SweepSubPlanChainsLocked` does make), `StartChain` sees only control-plane errors so it keeps arming and dispatching windows `1 .. K-1`, and `PoolReshardPush` / `PoolReshardRegisterRecv` seat them regardless of `chains[req_id].failed` (pinned by upstream's `FirstSubPlanFailureFailsTheRequestOnce`); the failed entry is swept after one `timeout_s_` of inactivity, so a later sub-plan starts a fresh unanchored chain that is failed again | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt1B` 4/4 failing on unmodified `42dda542`); **filed 2026-10-29** (bug 12 in `filed_bugs.md`) | mid-DMA free: yes for any multi-window request whose first failure has another window active (the F11 shape on pool reshard, with the engine recomputing into / freeing the destination blocks on `failed_recving`); double report: a worker whose next sub-plan arrives > `timeout_s_` after the failure (a sender skipped in the intervening windows, cf. F12); same caller gate as F12 |
 | C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_dropFailed_*`, leaks absorbing, `contract_safe` / `mw_contract_safe` for `connectorTwoChannel`); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet); **fix open as [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)** (`f366ef52`, 2026-10-27, "[Disagg] Forward tpu-sync failed transfers in tpu_raiden_connector"; unmerged, not on `main` `7840339b` as of 2026-10-28, where the connector is still unchanged): a new `get_transfer_results()` forwards `failed_recving` as `finished_sending` on P and as `finished_recving` + `failed_recving` on D — an instance of `connectorTwoChannel` over `AggChannel.latchedReq` (`MultiWorker.lean`), with the D-side failure on vLLM's request-level `KVConnectorTransferResults.failed_recving` channel rather than `get_block_ids_with_load_errors` (requiring `ENABLE_MULTI_NUMA=0`, see F11, and a `get_transfer_results()`-capable vLLM ≥ `e7bb7e2f`); tpu-sync at `42dda542` still files failed and expired sends in `failed_recving_` | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
@@ -916,6 +922,246 @@ have not been rebuilt since the runs their entries record.
   `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks` to expect
   `failed_recving` on the barrier-completing poll rather than the first failing
   sub-manager's poll.
+
+---
+
+## F12. Windowed pool reshard: a sender absent from some windows never reports `done_sending`, and a chain failing after window 0 holds the registry claim until TTL
+
+- **Status:** **CONFIRMED (test)** 2026-10-29 on unmodified `42dda542`
+  (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt` — 1 passing
+  control, 2 failing; `ChainClaimTest` — 1 failing, 2 passing controls).
+  **Filed upstream 2026-10-29** (bug 11 in [`filed_bugs.md`](filed_bugs.md),
+  which holds the write-up). Output, verbatim (transport start-up lines
+  `Detected interface: lo` / `InitTransportServer` / `bound_ip_` /
+  `pool host staging configured` omitted; `timeout_s_ = 0.05` in the sender
+  half, an injected clock with `ttl_s_ = 600` in the claim half):
+  ```
+  [ RUN      ] PoolReshardChainBughunt.ControlSenderInEverySubPlanReportsDone
+  [1A] poll at +0ms after settling (timeout_s=0.05): sent={windowed_req,} failed={}
+  [1A] poll at +60ms after settling (timeout_s=0.05): sent={} failed={}
+  [1A] poll at +120ms after settling (timeout_s=0.05): sent={} failed={}
+  [1A] poll at +180ms after settling (timeout_s=0.05): sent={} failed={}
+  [       OK ] PoolReshardChainBughunt.ControlSenderInEverySubPlanReportsDone (195 ms)
+  [ RUN      ] PoolReshardChainBughunt.SenderInOnlySomeSubPlansFirstWindowOnlyNeverReportsDone
+  [1A] poll at +0ms after settling (timeout_s=0.05): sent={} failed={}
+  W0000 00:00:1793298019.244212     125 kv_cache_manager_with_transfer.cc:279] Pool reshard send req_id=windowed_req: pool reshard sub-plan chain stalled: 1 of 2 sub-plans settled, none active for 0.05s
+  W0000 00:00:1793298019.244352     125 kv_cache_manager_with_transfer.cc:1287] Transfer failed: req_id=windowed_req code=DEADLINE_EXCEEDED reason=pool reshard sub-plan chain stalled: 1 of 2 sub-plans settled, none active for 0.05s
+  [1A] poll at +60ms after settling (timeout_s=0.05): sent={} failed={windowed_req,} details[windowed_req].reason=pool reshard sub-plan chain stalled: 1 of 2 sub-plans settled, none active for 0.05s
+  [1A] poll at +120ms after settling (timeout_s=0.05): sent={} failed={}
+  [1A] poll at +180ms after settling (timeout_s=0.05): sent={} failed={}
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:277: Failure
+  Value of: reported_sent
+    Actual: false
+  Expected: true
+  sender settled every sub-plan it was dispatched (1 of sub_plan_count=2) successfully, but req_id never appeared in done_sending
+
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:281: Failure
+  Value of: reported_failed
+    Actual: true
+  Expected: false
+  sender whose every dispatched sub-plan succeeded was reported failed: pool reshard sub-plan chain stalled: 1 of 2 sub-plans settled, none active for 0.05s
+
+  [  FAILED  ] PoolReshardChainBughunt.SenderInOnlySomeSubPlansFirstWindowOnlyNeverReportsDone (185 ms)
+  [ RUN      ] PoolReshardChainBughunt.SenderInOnlySomeSubPlansLastWindowOnlyNeverReportsDone
+  (same two failures, `1 of sub_plan_count=2`)
+  [  FAILED  ] PoolReshardChainBughunt.SenderInOnlySomeSubPlansLastWindowOnlyNeverReportsDone (184 ms)
+  [ RUN      ] ChainClaimTest.ArmFailureAtSubPlan1LeavesClaimUntilTtl
+  E0000 00:00:1793298019.829035     226 reshard_coordinator.cc:631] Pool reshard sub-transfer 1 of 2 failed for req_id=req-1c uuid=81: INTERNAL: Raiden remote native execution failed: injected arm refusal
+   (the request's receivers and senders settle through their sub-plan chain deadline)
+  [1C] worker calls: 10.0.0.2:9600(arm sub_plan 0/2), 10.0.0.1:9100(send sub_plan 0/2), 10.0.0.2:9600(arm sub_plan 1/2)
+  [1C] transfer status: 4 (4 = kFailed)
+  [1C] rank 0 votes Complete -> success=1 rows_retired=0
+  [1C] after every dispatched sender voted: status=STATUS_CLAIMED CancelIfUnclaimed=false
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:842: Failure
+  Expected: (after_vote) != (ProtoStatus::STATUS_CLAIMED), actual: 3 vs 3
+  the failed chain's claim outlives every dispatched sender's vote
+
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:844: Failure
+  Expected equality of these values:
+    cancel
+      Which is: "false"
+    "true"
+  CancelIfUnclaimed still refuses after the chain failed and every dispatched sender voted
+
+  [1C] at claim+599s: status=STATUS_CLAIMED CancelIfUnclaimed=false
+  [1C] at claim+601s: status=STATUS_UNKNOWN
+  [  FAILED  ] ChainClaimTest.ArmFailureAtSubPlan1LeavesClaimUntilTtl (24 ms)
+  [ RUN      ] ChainClaimTest.ControlUndispatchedRankVoteWouldRetireTheClaim
+  [1C-ctl] rank 1 votes too -> rows_retired=2 status=STATUS_UNKNOWN
+  [       OK ] ChainClaimTest.ControlUndispatchedRankVoteWouldRetireTheClaim (3 ms)
+  [ RUN      ] ChainClaimTest.ControlArmFailureAtSubPlan0AbandonsTheClaim
+  [1C-0] coordinate success=0 (Raiden remote native execution failed: injected arm refusal); worker calls: 10.0.0.2:9600(arm sub_plan 0/2); status=STATUS_REGISTERED CancelIfUnclaimed=true
+  [       OK ] ChainClaimTest.ControlArmFailureAtSubPlan0AbandonsTheClaim (1 ms)
+  ```
+- **Where (at `42dda542`, introduced by `09a42d4e`, 2026-10-25):**
+  `BuildPoolReshardPlan` keeps only the units with schedule entries in the
+  window (`pool_reshard_planner.cc:1290-1294`) while
+  `ReshardCoordinator::RunSubPlan` stamps `sub_plan_count = ctx->chain.count`
+  on every sub-plan (`reshard_coordinator.cc:730-733`) and dispatches only
+  `plan.src_units` (`:812-878`); on the sender,
+  `KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked`
+  (`kv_cache_manager_with_transfer.cc:151-175`),
+  `RecordPoolReshardTerminalLocked` (`:218-226`) and
+  `SweepSubPlanChainsLocked` (`:273-283`). The claim half: `RunSubPlan`'s three
+  `if (index == 0)` abandons (`reshard_coordinator.cc:725`, `:785-787`,
+  `:816-818`), the header's "later ones leave the claim to the dispatched
+  senders' terminals" (`reshard_coordinator.h:173-175`), `LookupAndClaim` over
+  all of `request.src_units` (`pool_reshard_planner.cc:1119-1120`) and
+  `RequestBlockRegistry::Complete`'s all-voted retirement
+  (`request_block_registry.cc:317-371`).
+- **How the tests drive it:** the sender half uses a real
+  `KVCacheManagerWithTransfer` and registers each sender sub-plan exactly as
+  `PoolReshardPush` does (`ReshardSendSession::Create`, insert into
+  `active_pool_reshard_sends_`, `NoteSubPlanRegisteredLocked`), replacing only
+  the device push by settling the session with `Finish(OkStatus())`; reporting
+  then runs through the production `CompleteReadWithDetails`. A sender
+  dispatched in `{0, 1}` of `K = 2` reports `done_sending` (control); one
+  dispatched in `{0}` or `{1}` never does and is failed by the sweep. The claim
+  half runs a real `ReshardService` over a payload-capturing transport with an
+  injected clock: two ranks, window = 2 of 4 pages (`K = 2`, rank 0 in window 0
+  only), sub-plan 1's arm hard-refused; after the only dispatched rank votes
+  `Complete` the request is still `STATUS_CLAIMED` and `CancelIfUnclaimed`
+  returns `false` until `ttl_s_`; controls show rank 1's vote would retire it
+  at once and that the same refusal at sub-plan 0 abandons immediately.
+- **Relation to F8:** F8 is the sender-dispatch return in the same function
+  that never abandons at any index; F12's claim half is the `index >= 1`
+  design (abandon left to the senders' terminals) meeting partial dispatch.
+  Fixing F8 alone does not close it.
+- **Reachability:** every multi-window request whose span ownership varies by
+  window — upstream's own `WindowedRequestChainsOneSubTransferPerWindow` (2 of
+  4 windows per rank) and `WindowClipsStraddlingSpansAtWindowBoundaries` (rank 0
+  in window 0 of 2) have this shape. Gated on a caller passing
+  `dst_window_blocks`: the binding is wired
+  (`api/torch/reshard_client.py:55-56`, `SUPPORTS_DST_WINDOW_BLOCKS`), but
+  `vllm-torchtpu` `9725110` and `sglang-torchtpu` `9a6eef1` do not pass it.
+- **Fix:** not proposed in the report (design choice for the owners: per-sender
+  `sub_plan_count`, or an explicit no-op terminal for the windows a unit is not
+  in; and for the claim, votes recorded for never-dispatched units when the
+  chain aborts).
+
+## F13. Windowed pool reshard: the first failing sub-plan is reported while sibling or later windows still run DMAs, and can be reported twice
+
+- **Status:** **CONFIRMED (test)** 2026-10-29 on unmodified `42dda542`
+  (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt1B`, 4/4
+  failing). **Filed upstream 2026-10-29** (bug 12 in
+  [`filed_bugs.md`](filed_bugs.md), which holds the write-up). Output, verbatim
+  (start-up lines omitted as for F12; the `[1A]` prefix on the poll lines is
+  the shared print helper's):
+  ```
+  [ RUN      ] PoolReshardChainBughunt1B.RecvFailureNotReportedWhileSiblingSubPlanActive
+  [1B-a] EndIncomingPush(sub-plan 0, error) -> CANCELLED: ReshardReceiveSession for uuid=7100 failed: peer reset mid-push
+  W0000 00:00:1793298019.554387     125 kv_cache_manager_with_transfer.cc:212] Pool reshard receive req_id=windowed_req failed at sub-plan 0 of 2: UNAVAILABLE: peer reset mid-push
+  W0000 00:00:1793298019.554455     125 kv_cache_manager_with_transfer.cc:1287] Transfer failed: req_id=windowed_req code=UNAVAILABLE reason=sub-plan 0 of 2: peer reset mid-push
+  [1A] 1B-a poll after sub-plan 0 failed: sent={} failed={windowed_req,} details[windowed_req].reason=sub-plan 0 of 2: peer reset mid-push
+  [1B-a] at that poll: sub-plan 0{Done=1 IsDraining=1 HasPendingWork=0 status=UNAVAILABLE: peer reset mid-push} sub-plan 1{Done=0 IsDraining=0 HasPendingWork=1 status=OK}
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:423: Failure
+  Value of: Reports(r.failed) && !sub1->Done()
+    Actual: true
+  Expected: false
+  failed_recving published for windowed_req while sibling sub-plan 1 is still live: sub-plan 1{Done=0 IsDraining=0 HasPendingWork=1 status=OK}
+
+  [1B-a] EndIncomingPush(sub-plan 1, ok) -> OK
+  [1A] 1B-a poll after sub-plan 1 settled OK: sent={} failed={}
+  [1B-a] final sub-plan 1{Done=1 IsDraining=1 HasPendingWork=0 status=OK}
+  [  FAILED  ] PoolReshardChainBughunt1B.RecvFailureNotReportedWhileSiblingSubPlanActive (4 ms)
+  [ RUN      ] PoolReshardChainBughunt1B.RecvLaterSubPlanAcceptedAfterChainFailureReported
+  [1A] 1B-b poll after sub-plan 0 failed: sent={} failed={windowed_req,} details[windowed_req].reason=sub-plan 0 of 2: peer reset mid-push
+  [1B-b] PoolReshardRegisterRecv(sub-plan 1 of failed chain) -> OK; plan claimed=1 session=sub-plan 1{Done=0 IsDraining=0 HasPendingWork=1 status=OK}
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:462: Failure
+  Value of: late.ok()
+    Actual: true
+  Expected: false
+  sub-plan 1 of a chain already reported failed was accepted
+
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:464: Failure
+  Value of: claimed
+    Actual: true
+  Expected: false
+  the late sub-plan claimed its plan uuid
+
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:465: Failure
+  Expected equality of these values:
+    sub1
+      Which is: (ptr = 0x55edc892e190, value = 328-byte object <...>)
+    nullptr
+      Which is: (nullptr)
+  the late sub-plan has a live receive session
+
+  [1A] 1B-b poll after the late sub-plan settled OK: sent={} failed={}
+  [1B-b] late sub-plan terminal swallowed: received=0 failed=0
+  [  FAILED  ] PoolReshardChainBughunt1B.RecvLaterSubPlanAcceptedAfterChainFailureReported (4 ms)
+  [ RUN      ] PoolReshardChainBughunt1B.RecvLateSubPlanAfterSweepReportsTheFailureAgain
+  [1A] 1B-b' poll after sub-plan 0 failed: sent={} failed={windowed_req,} details[windowed_req].reason=sub-plan 0 of 2: peer reset mid-push
+  [1A] 1B-b' poll +120ms (failed chain erased): sent={} failed={}
+  [1A] 1B-b' poll +0ms after late sub-plan 1 settled OK: sent={} failed={}
+  W0000 00:00:1793298019.743117     125 kv_cache_manager_with_transfer.cc:279] Pool reshard receive req_id=windowed_req: pool reshard sub-plan chain stalled: 1 of 2 sub-plans settled, none active for 0.05s
+  [1A] 1B-b' poll +60ms after late sub-plan 1 settled OK: sent={} failed={windowed_req,} details[windowed_req].reason=pool reshard sub-plan chain stalled: 1 of 2 sub-plans settled, none active for 0.05s
+  [1A] 1B-b' poll +120ms after late sub-plan 1 settled OK: sent={} failed={}
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:511: Failure
+  Expected equality of these values:
+    failed_reports
+      Which is: 2
+    1
+  windowed_req was reported in failed_recving 2 times
+
+  [  FAILED  ] PoolReshardChainBughunt1B.RecvLateSubPlanAfterSweepReportsTheFailureAgain (245 ms)
+  [ RUN      ] PoolReshardChainBughunt1B.SenderFailureNotReportedWhileSiblingSubPlanActive
+  E0000 00:00:1793298019.807564     125 reshard_send_session.cc:361] Pool reshard send failed uuid=7400 req_id=windowed_req: UNAVAILABLE: peer reset mid-push
+  W0000 00:00:1793298019.807699     125 kv_cache_manager_with_transfer.cc:212] Pool reshard send req_id=windowed_req failed at sub-plan 0 of 2: UNAVAILABLE: peer reset mid-push
+  [1A] 1B-c poll after sender sub-plan 0 failed: sent={} failed={windowed_req,} details[windowed_req].reason=sub-plan 0 of 2: peer reset mid-push
+  [1B-c] at that poll: sub-plan 0{Done=1 IsDraining=1 status=UNAVAILABLE: peer reset mid-push} sub-plan 1{Done=0 IsDraining=0 status=OK}
+  tpu_sync/kv_cache/pool_reshard_chain_bughunt_test.cc:539: Failure
+  Value of: Reports(r.failed) && !(*sub1)->Done()
+    Actual: true
+  Expected: false
+  failed_recving published for sender windowed_req while sibling sub-plan 1 still has a push in flight: sub-plan 1{Done=0 IsDraining=0 status=OK}
+
+  [1A] 1B-c poll after sender sub-plan 1 settled OK: sent={} failed={}
+  [1B-c] final sub-plan 1{Done=1 IsDraining=1 status=OK}
+  [  FAILED  ] PoolReshardChainBughunt1B.SenderFailureNotReportedWhileSiblingSubPlanActive (3 ms)
+  ```
+  Whole binary: `10 tests from 3 test suites ran. (852 ms total)`, 3 passed
+  (the controls), 7 failed.
+- **Where (at `42dda542`):** `RecordPoolReshardTerminalLocked`'s failure
+  branch (`kv_cache_manager_with_transfer.cc:205-217`) against the
+  active-session check `SweepSubPlanChainsLocked` does make (`:252-267`);
+  `PoolReshardPush` (`:833-871`) and `PoolReshardRegisterRecv` (`:873-910`)
+  never consult `chains[req_id].failed`; the swallowed-terminal early-out
+  (`:203`); the tombstone erase one `timeout_s_` after the last registration
+  or terminal (`:242-248`) and the stall report (`:273-283`);
+  `ReshardCoordinator::StartChain` (`reshard_coordinator.cc:614-649`) and the
+  arm-retry loop (`:749-795`). Upstream's
+  `SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce`
+  (`kv_cache_manager_with_transfer_pool_reshard_test.cc:861-884`) pins the
+  "later sub-plan still armed, terminal swallowed" behaviour.
+- **The four cases:** (a) receiver: sub-plans 0 and 1 of `K = 2` armed, both
+  with an admitted push (`BeginIncomingPush`); sub-plan 0's push ends with an
+  error → `failed_recving` is published while sub-plan 1 is live. (b) receiver:
+  after the failure is reported, `PoolReshardRegisterRecv` for sub-plan 1 is
+  accepted (plan claimed, session live) and its clean terminal dropped. (b′)
+  receiver, `timeout_s_ = 50 ms`: the failed entry is swept, a late sub-plan 1
+  settles OK, and the request is failed a second time with `chain stalled`.
+  (c) sender: the same as (a) with `ReshardSendSession`s and one push in flight
+  each. Each test asserts the per-session contract (no `failed_recving` while a
+  sibling is live; a sub-plan of a failed chain refused; at most one failure
+  report) and fails on the unmodified code.
+- **Relation to F11:** the same defect class — an aggregate terminal emitted
+  on the first failure without a barrier on the aggregate's other members —
+  one level up (sub-plans of a request instead of NUMA sub-managers of a
+  worker). The per-session drain (`Recv.SettleSafe` / `Send.SettleSafe` in
+  `Transfer/Reshard/`) is intact; the chain aggregation above it is not
+  modelled (`reshard.md` §Boundaries), which is where it was found.
+- **Reachability:** mid-DMA free — any multi-window request whose first
+  failure has another window active, with the engine recomputing into (or on
+  abort freeing) the destination blocks on `failed_recving` (§Callers); double
+  report — a worker whose next sub-plan arrives more than `timeout_s_` after
+  the failure, typically a sender skipped in the intervening windows (F12's
+  shape). Same `dst_window_blocks` caller gate as F12.
+- **Fix:** not proposed in the report (fail the chain once all of the request's
+  sessions on this worker have settled, mirroring the sweep's active check;
+  refuse new sub-plans of a failed `req_id` or stop the chain on a data-plane
+  failure; and keep the tombstone until the chain's last window can no longer
+  arrive).
 
 ---
 
@@ -1858,3 +2104,30 @@ clone reset. Results, verbatim:
   `trace_fixed_*` → `trace_twoChannel_*`) and modelled `KVOutputAggregator`'s
   latched `_failed_recving_pending` channel directly (`AggChannel.latchedReq` in
   `Caller/MultiWorker.lean`).
+- 2026-10-29 (later): **F12 and F13 added and filed** (bugs 11 and 12 in
+  `filed_bugs.md`, both pinned to `42dda542`). Both are in the windowed
+  pool-reshard sub-plan chains `09a42d4e` (2026-10-25) introduced, which no
+  Lean model covers (`reshard.md` §Boundaries names `StartChain` /
+  `RecordPoolReshardTerminalLocked` / `SweepSubPlanChainsLocked` as out of
+  scope) — found by a read of that boundary after F11, confirmed by
+  `pool_reshard_chain_bughunt_test.cc` (10 cases: F12 sender half 2 failing +
+  1 control, F12 claim half 1 failing + 2 controls, F13 4 failing; target
+  added to `build_targets.patch`). F12: a sender dispatched in only some
+  windows never reports `done_sending` and is failed by the sweep after
+  `timeout_s_`; a chain failing at window ≥ 1 keeps never-dispatched units in
+  the claim until `ttl_s_` (the `index == 0` guard F8's 2026-10-28 note
+  describes, meeting `BuildPoolReshardPlan`'s per-window `src_units`). F13: the
+  first failing sub-plan is reported while siblings still run and the chain
+  keeps arming later windows (pinned by upstream's
+  `FirstSubPlanFailureFailsTheRequestOnce`); the swept tombstone lets a late
+  sub-plan fail the request a second time. Both gated on a caller passing
+  `dst_window_blocks`, which neither `vllm-torchtpu` `9725110` nor
+  `sglang-torchtpu` `9a6eef1` does. Filed tally: F1 (fixed), F2+F3, F4
+  (fixed), F6 (fixed), F7 (fixed), F8, F9, F10, F11, F12, F13, C1 (fix open as
+  PR #3918). Also run but not filed in this pass: reproducers for
+  `KVCacheStore` remote-write settlement (`kv_cache_store_remote_write_bughunt_test.cc`),
+  `KVCacheStoreClient::Fetch` / `LoadRemoteBlocks` (`kv_cache_store_fetch_bughunt_test.cc`),
+  the unsynchronized host `LogicalBlockManager` (`host_block_manager_race_bughunt_test.cc`),
+  and a refutation of a `WriteRemoteServerReactor` `StartAck` / `OnCancel`
+  contract hazard (`kv_cache_store_service_reactor_bughunt_test.cc`, passes);
+  recorded as untriaged files only, write-ups to follow.

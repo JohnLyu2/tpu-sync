@@ -5,7 +5,8 @@ for bug 1, [`google/tpu-sync` @ `1fa06d1`](https://github.com/google/tpu-sync/tr
 and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac16d1) for bugs 3–6,
 [`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) for bug 7,
 [`google/tpu-sync` @ `2ed6f8f`](https://github.com/google/tpu-sync/tree/2ed6f8f) for bug 9,
-and [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) (plus [`vllm-project/tpu-inference` @ `f366ef52`](https://github.com/vllm-project/tpu-inference/tree/f366ef52) from [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)) for bug 10.
+and [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) (plus [`vllm-project/tpu-inference` @ `f366ef52`](https://github.com/vllm-project/tpu-inference/tree/f366ef52) from [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)) for bug 10,
+and [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) for bugs 11–12.
 Bug 8 is a caller-side defect and cites
 [`vllm-project/tpu-inference` @ `c2b062b`](https://github.com/vllm-project/tpu-inference/tree/c2b062b),
 [`vllm-project/vllm` @ `5ab4e44`](https://github.com/vllm-project/vllm/tree/5ab4e44)
@@ -13,7 +14,7 @@ and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac1
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
 the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2, `0ac16d1` for
-bugs 3–6, `449b591` for bug 7, the three pins above for bug 8, `2ed6f8f` for bug 9, `42dda542` / `f366ef52` for bug 10) and are not re-pinned on upstream syncs; the only edits are the italic
+bugs 3–6, `449b591` for bug 7, the three pins above for bug 8, `2ed6f8f` for bug 9, `42dda542` / `f366ef52` for bug 10, `42dda542` for bugs 11–12) and are not re-pinned on upstream syncs; the only edits are the italic
 *Update* sentences and one internal tooling word replaced by "with the fix".
 Status updates go in [README.md](README.md) (§Summary, §History).
 
@@ -284,3 +285,51 @@ Confirmed by a unit test. Found during Lean formalization.
 - *Map leak and `req_id`-reuse poisoning (`ENABLE_MULTI_NUMA=0` included).* `failed_recving_set_` grows on every failed or expired transfer. If a `req_id` is reused, `failed_recving_set_.insert(req).second` ([L669](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L669)) silently drops subsequent failures, [L662-665](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L662-L665) suppresses healthy `done_recving`, and at `num_subs >= 2` stale `done_recving_counts_` entries cause premature `done_recving` before all sub-managers finish.
 
 Reproducer: [`numa_kv_cache_manager_bughunt_test.cc`](numa_kv_cache_manager_bughunt_test.cc) (4 cases).
+
+
+
+---
+
+## 11. Windowed pool reshard: senders not in every window never report `done_sending`, and a chain failing after window 0 holds the registry claim until TTL (F12)
+
+Filed 2026-10-29. Permalinks: [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542).
+
+Windowed pool reshard (sub-plan chains, `dst_window_blocks`) assumes every source unit takes part in every window, while [`BuildPoolReshardPlan`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/pool_reshard_planner.cc#L1290-L1294) dispatches only the units with spans in the current window. This breaks two things:
+1. A sender dispatched in some—but not all—windows never reports `done_sending`, and is reported failed one `timeout_s_` later even when all its transfers succeed.
+2. A chain that fails after window 0 leaves undispatched source units in the registry claim, keeping the request `STATUS_CLAIMED` until `ttl_s_`.
+
+**Cause**
+- *Global count, partial dispatch.* [`ReshardCoordinator::RunSubPlan`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L730-L733) stamps every sub-plan with `sub_plan_count = K` and dispatches only `plan.src_units` ([L812-878](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L812-L878)). On the sender, [`NoteSubPlanRegisteredLocked`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L151-L175) sets `count = K`, and [`RecordPoolReshardTerminalLocked`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L218-L226) emits `done_sending` only once `K` sub-plans settle. A unit dispatched in `1 <= m < K` windows stops at `m`, so [`SweepSubPlanChainsLocked`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L273-L283) reports it in `failed_recving` after `timeout_s_` (`pool reshard sub-plan chain stalled: m of K sub-plans settled`), as in [`WindowedRequestChainsOneSubTransferPerWindow`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_service_test.cc#L1057-L1071) (2 of 4 windows per rank).
+- *Undispatched units never clear the claim after window 0.* `RunSubPlan` abandons the claim only `if (index == 0)` ([L725](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L725), [L785-787](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L785-L787), [L816-818](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L816-L818)), and [`StartChain`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L614-L649) leaves the claim "to the dispatched senders' terminals" ([header](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.h#L173-L175)). Yet [`LookupAndClaim`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/pool_reshard_planner.cc#L1119-L1120) claims every `request.src_units` rank, and [`Complete`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/request_block_registry.cc#L317-L371) retires the claim only after all of them vote. Any rank with no spans in `0 .. index - 1` was never dispatched, gets no native terminal, and never votes ([`ChainedArmFailureMarksTheTransferFailed`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_service_test.cc#L1296-L1318) checks `STATUS_CLAIMED` before rank 0 votes, not after).
+
+**Impact**
+- *Producer blocks held for `timeout_s_` and reported failed on error-free transfers.* Until `SweepSubPlanChainsLocked` fires at `timeout_s_` (default 120 s) with a spurious `DEADLINE_EXCEEDED`, a sender in `1 <= m < K` windows emits no terminal at all, holding producer KV blocks and delaying `Complete` by 120 s. This occurs whenever span ownership varies across windows (e.g., PCP, round-robin TP tail windows, or head-replicated TP with state tags on the last window); external callers have not enabled `dst_window_blocks` yet ([`reshard_client.py`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/api/torch/reshard_client.py#L55-L56)).
+- *Claim held until `ttl_s_` after a mid-chain failure.* When a chain fails at window ≥ 1 and some rank was not dispatched in earlier windows, `(req_id, uuid)` stays `STATUS_CLAIMED` even after every dispatched sender votes `Complete`. `CancelIfUnclaimed` keeps returning `false` until `ttl_s_` (default 600 s), keeping that rank's producer blocks pinned until TTL.
+
+Confirmed by a unit test. Found during Lean formalization.
+
+Reproducer: `PoolReshardChainBughunt.SenderInOnlySomeSubPlans*` and `ChainClaimTest.ArmFailureAtSubPlan1LeavesClaimUntilTtl` in [`pool_reshard_chain_bughunt_test.cc`](pool_reshard_chain_bughunt_test.cc).
+
+
+---
+
+## 12. Windowed pool reshard: first sub-plan failure emits `failed_recving` while sibling or later windows still run DMAs, and can report failure twice (F13)
+
+Filed 2026-10-29. Permalinks: [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542).
+
+A pool-reshard session reports `failed_recving` only once `Done()`, i.e. after its last DMA has returned. A windowed request (`dst_window_blocks`, `sub_plan_count > 1`) is instead reported through [`SubPlanChainProgress`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.h#L338-L343), which fails the whole request at its first failing sub-plan. That loses the per-session guarantee in two ways:
+1. `failed_recving` is emitted while sibling sub-plans still have DMAs in flight, and the chain keeps arming and running the remaining windows afterwards.
+2. A sub-plan arriving after the failed chain entry has been swept makes the request report `failed_recving` a second time.
+
+**Cause**
+- *No sibling barrier on failure.* [`RecordPoolReshardTerminalLocked`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L205-L217) sets `progress.failed` and inserts `req_id` into `failed_recving_` on the first `!status.ok()` sub-plan without checking `active_pool_reshard_recvs_` / `active_pool_reshard_sends_` for other live sub-plans of the request (the check [`SweepSubPlanChainsLocked`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L252-L267) does make before failing a stalled chain).
+- *The chain runs on after the failure.* [`StartChain`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L614-L649) stops only when `RunSubPlan` itself fails (planning or a control RPC); a data-plane failure in an earlier window is invisible to it, so it arms and dispatches windows `1 .. K-1` regardless (a failed window even frees the staging its successors wait for in the arm-retry loop, [L749-795](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/reshard/reshard_coordinator.cc#L749-L795)). On the workers, neither [`PoolReshardPush`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L833-L871) nor [`PoolReshardRegisterRecv`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L873-L910) consults `chains[req_id].failed`, so the late sub-plans are seated and executed and only their terminals are dropped ([L203](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L203)). [`FirstSubPlanFailureFailsTheRequestOnce`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc#L861-L884) pins exactly this: after the failure is reported it registers sub-plan 1 on another device block and expects its terminal to be swallowed ([L876-880](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc#L876-L880), "the connector already recomputed the request").
+- *The tombstone expires before the chain can.* `SweepSubPlanChainsLocked` erases a failed entry once no sub-plan of the request has registered or settled for `timeout_s_` ([L242-248](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L242-L248)), assuming one timeout "is as long as any of them can live". But a worker's next sub-plan can arrive later than that—a sender not dispatched in the intervening windows (each window runs under its own `DeadlineFromNow()`), or a receiver whose arm waited through `kChainArmAttempts = 12` lease timeouts. It then starts a fresh, unanchored entry that the stall sweep fails again ([L273-283](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc#L273-L283)).
+
+**Impact**
+- *DMAs into HBM the engine has already reclaimed.* On `failed_recving` the consumer recomputes into (or, on abort, frees) the request's destination blocks and the producer releases its source blocks once every rank has a terminal, while sibling windows are still copying and windows `1 .. K-1` are still being dispatched into those same blocks. Reached by any multi-window request whose first failure has another window active; external callers have not enabled `dst_window_blocks` yet ([`reshard_client.py`](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/api/torch/reshard_client.py#L55-L56)).
+- *Duplicate `failed_recving`.* The same `req_id` is reported failed twice, at least one `timeout_s_` apart, the second time with a misleading `pool reshard sub-plan chain stalled` reason.
+
+Confirmed by a unit test. Found during Lean formalization.
+
+Reproducer: `PoolReshardChainBughunt1B.*` (4 cases) in [`pool_reshard_chain_bughunt_test.cc`](pool_reshard_chain_bughunt_test.cc).
