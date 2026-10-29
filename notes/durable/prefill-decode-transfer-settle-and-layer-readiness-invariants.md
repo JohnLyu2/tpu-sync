@@ -5,7 +5,7 @@ theorems, correspondence, observations, upstream re-checks) and the module
 docstrings under `tpu_sync/formal_verification/TpuSyncVerify/Transfer/`. The facts and their
 citations live there; this note is what to keep in mind when touching the code.
 
-**Verified against:** tpu-sync `c9bc124` (the canonical doc's baseline).
+**Read at:** tpu-sync `42dda54` (frozen stamp; live baseline and anchors live in the canonical doc).
 
 ## What to keep in mind
 

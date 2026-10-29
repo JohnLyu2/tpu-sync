@@ -6,7 +6,7 @@ assumptions, properties and proofs, replay/search/mutants, naming) and
 `tpu_sync/formal_verification/TpuSyncVerify/Common/{System,ModelCheck}.lean`. This note is the
 working method distilled from using them.
 
-**Verified against:** `tpu_sync/formal_verification/` at `c9bc124` (23 top-level modules across 74 `.lean` files, `leanprover/lean4:v4.33.0`).
+**Read at:** tpu-sync `42dda54` (frozen stamp; live module inventory and toolchain pin live in `tpu_sync/formal_verification/README.md` and `lean-toolchain`).
 
 ## Working method
 
@@ -25,7 +25,7 @@ running when the caller got its blocks back") into state predicates
 an `Impl`/`Config` toggle for shipping vs. fixed behaviour, a latch for the
 hazard, then `ModelCheck.check` yields the counterexample for the report and
 `.safe` for the fix in one file (`ReadRemote.shipping_counterexample`,
-`ReadRemote.deferred_settle_is_safe` — 263 lines for F2, both shapes and the fix).
+`ReadRemote.deferred_settle_is_safe`).
 
 [FACT] Validation runs in both directions at `lake build`: the transfer path's
 C++ unit tests and E2E tests are replayed as `decide` traces (positive — the

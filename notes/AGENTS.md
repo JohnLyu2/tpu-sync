@@ -1,47 +1,52 @@
 # TPU Sync research notes
 
-Kept with the `better-than-fish` skill; its `SKILL.md` and `references/format.md`
-define the markers, tiers and triggers. Repo entry point, code map and commit
+Kept with the `better-than-fish` skill (`SKILL.md` and `references/format.md`
+define markers, tiers and triggers). Repo entry point, code map and commit
 conventions: `../AGENTS.md`.
 
-## Project conventions
+## Maintenance rules (keep cost O(1))
 
-- Facts live in `tpu_sync/formal_verification/` (docs, Lean docstrings) and `findings/`. A `durable/`
-  or `empirical/` note is a thin pointer: a `Canonical:` line naming the
-  `tpu_sync/formal_verification/` or `findings/` document that owns the facts, then only what that document
-  does not say — interpretation, "do not re-investigate" guidance, the
-  correction trail. Never copy a fact table or a citation list into a note;
-  every copy made so far went stale within a week.
-- Upstream-sync facts (what changed in cited code, what was re-pinned) go in
-  `notes/upstream-rechecks.md` and
-  `findings/README.md` §"History"; the journal records the delta
-  of understanding, corrections and tooling lessons, with a link.
-- `loose-ends/parked.md` is the only backlog.
-- Version stamps: every note names the tpu-sync commit its claims were read at.
-  Notes dated before 2026-10-06 are at `01ffa3d`; the line-shift table to
-  `50b0774` is in `journal/2026-10/2026-10-06-upstream-50b0774-merge-and-citation-repin.md`;
-  notes dated 2026-10-06..09 are at `50b0774`, 2026-10-10..15 at `1fa06d1`
-  (session/manager sources under `tpu_sync/kv_cache/`,
-  `journal/2026-10/2026-10-10-upstream-1fa06d1-sync.md`); 2026-10-16..21 at `0ac16d1`
-  (`StagingBlockAllocator` in `tpu_sync/core/staging_arena.*`,
-  `journal/2026-10/2026-10-16-upstream-0ac16d1-sync.md`); since 2026-10-22 the
-  pin is `2ed6f8f` (`journal/2026-10/2026-10-22-upstream-2ed6f8f-sync-and-repin-tool-defect.md`);
-  2026-10-23 (afternoon) is at `c15ead5` (`notes/upstream-rechecks.md`
-  row 2026-10-23); from 2026-10-24 it is `c9bc124` (`notes/upstream-rechecks.md`
-  rows 2026-10-24: `86d4506` adds the Peregrine receive path `OnRecvComplete` / `is_peregrine` in `block_transport.cc`, socket path unchanged).
-- Markers as in the skill: `[FACT]` source-grounded or Lean-proved (`durable/`);
-  `[EMP]` reproducible result with a "Verified against" stamp (`empirical/`);
+- **One home per fact.** Facts, symbol spans and module/test inventories live in
+  `tpu_sync/formal_verification/` and `findings/`. A `durable/` or `empirical/`
+  note starts with `Canonical:` naming the deliverable that owns the facts, then
+  keeps only what that document does not say: workstation/build recipes,
+  interpretation, "do not re-investigate" traps, and correction trails. Cite
+  symbols (`Class::Method`), never raw `file:line` spans or file/module counts.
+- **Frozen `Read at:` stamps (no sync re-stamping).** Every note states the
+  commit(s) its claims were actually read or run against, and keeps that stamp
+  frozen until an upstream change invalidates a claim in the note. Routine
+  upstream syncs touch **only** `notes/upstream-rechecks.md` (one row per sync;
+  add a `journal/YYYY-MM/` entry only when a model or assumption changed).
+  Unstamped journal notes before 2026-10-06 are at `01ffa3d`; full pin history
+  is `notes/upstream-rechecks.md`.
+- **Evict closed items from `loose-ends/parked.md`.** `parked.md` holds *open*
+  work only. When an item is `done`, `closed`, or `retired`, delete it from
+  `parked.md` (any lasting takeaway belongs in `journal/`, `upstream-rechecks.md`,
+  or the deliverable).
+- **Keep `sessions.md` a short rolling index.** Each entry in `sessions.md` is
+  ≤ 2–3 lines (date, theme, commit/journal/finding pointers, plus one-line user
+  correction if any — never duplicate journal narratives). Roll completed months
+  to `sessions/YYYY-MM.md` so `sessions.md` stays under ~50 lines.
+- **Markers:** `[FACT]` source-grounded or Lean-proved (`durable/`); `[EMP]`
+  reproducible observation with a frozen `Read at:` stamp (`empirical/`);
   `[OBS YYYY-MM-DD]` and `[HYP]` (`journal/YYYY-MM/`); `[OPEN]` with a parked
-  entry; `[SUPERSEDED → file]` marks a wrong claim in place, never deleted.
+  entry; `[SUPERSEDED → path]` marks a wrong or graduated note in place, never
+  silently deleted.
 
-## Durable notes index
+## Live notes index
 
-- `prefill-decode-transfer-settle-and-layer-readiness-invariants.md` — why the
-  settle protocol and the `ExecuteLayerH2d` lock window matter; what to check
-  before touching them. Canonical: `tpu_sync/formal_verification/docs/transfer/prefill_decode.md`.
-- `lean-step-models-and-ghost-state-in-tpu-sync-verify.md` — how the models are
-  built (one executable `step`, ghost latches, replay + mutants) and how to
-  start a new one. Canonical: `tpu_sync/formal_verification/docs/conventions.md`.
-- `controller-read-remote-and-kv-store-pinning-concurrency-traps.md` — the four
-  confirmed defects and the look-alikes already refuted. Canonical:
-  `findings/README.md`.
+- `durable/prefill-decode-transfer-settle-and-layer-readiness-invariants.md` —
+  why the settle protocol and `ExecuteLayerH2d` lock window matter; shortcuts
+  already ruled out. Canonical: `tpu_sync/formal_verification/docs/transfer/prefill_decode.md`.
+- `durable/lean-step-models-and-ghost-state-in-tpu-sync-verify.md` — working
+  method for executable `step` models, ghost latches, replay + mutants.
+  Canonical: `tpu_sync/formal_verification/docs/conventions.md`.
+- `durable/controller-read-remote-and-kv-store-pinning-concurrency-traps.md` —
+  shared shape of controller/store hand-off races and refuted look-alikes.
+  Canonical: `findings/README.md`.
+- `empirical/oss-bazel-test-recipe.md` — building and running hardware-free C++
+  tests from the fork (OSS Bazel, `clang`, `libibverbs-dev`).
+- `empirical/prefill-decode-caller-tpu-inference-raiden-connector.md` —
+  `tpu-inference` + `vllm` caller boundary and settled C1 non-fixes.
+- `empirical/reshard-callers-vllm-and-sglang-torchtpu.md` — `vllm-torchtpu` +
+  `sglang-torchtpu` retry/topology/block-pool invariants and local clone paths.

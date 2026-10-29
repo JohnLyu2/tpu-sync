@@ -7,13 +7,8 @@ and `tpu_sync/formal_verification/TpuSyncVerify/Controller/ReadRemote.lean`. Thi
 to carry into the next audit of `RaidenController`, `KVCacheStore`,
 `HostOffloadBackend` or `KVCacheStoreService`.
 
-**Verified against:** tpu-sync `c9bc124` (2026-10-24). Fixed upstream since
-this note was written: F4 (`72255dd`, 2026-10-07) and **F1 (`b3ea4dc`,
-2026-10-21: one `Lookup(..., pin_found = true)` under one backend lock,
-partial pins released on refusal — the fix `candidate_fixes.patch` proposed;
-the hunk is dropped and the patch now carries F2 shape A only)**. F2/F3
-remain open (filed as bug 7). The `ReadRemote` region of
-`raiden_controller.cc` is unchanged since `1fa06d1`, shifted +6 by `9ac3d3e`.
+**Read at:** tpu-sync `42dda54` (2026-10-28, frozen stamp; live finding status lives in `findings/README.md`). Fixed upstream since
+this note was written: F4 (`72255dd`) and F1 (`b3ea4dc`: one `Lookup(..., pin_found = true)` under one backend lock, partial pins released on refusal). F2/F3 remain open (`findings/filed_bugs.md` §7).
 
 ## What to carry forward
 
@@ -69,4 +64,3 @@ were right in `findings/README.md` throughout. Old text:
 
 - prefill-decode-transfer-settle-and-layer-readiness-invariants.md
 - lean-step-models-and-ghost-state-in-tpu-sync-verify.md
-- ../empirical/bughunt-repro-status-at-01ffa3d.md

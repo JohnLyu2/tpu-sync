@@ -1,24 +1,11 @@
-# Bug-hunt reproduction status
+# Bug-hunt reproduction status (graduated)
 
-Canonical: `findings/README.md` §Summary (evidence level per
-finding), §"Fix validation" (what the candidate patch changes), §History
-(which commit each test run was on). This note holds the stamp and the
-correction trail only.
-
-**Verified against:** tpu-sync `b68161a`, re-run on `d16701e`
-(reproducers `findings/kv_cache_store_pin_race_test.cc`,
-`raiden_controller_bughunt_test.cc`, wired in by `build_targets.patch`); the
-cited code is unchanged at `01ffa3d` and `50b0774`; tests not re-run since
-`d16701e`.
-**Last verified:** 2026-09-24 (test runs), 2026-10-06 (code diff)
-
-[EMP] F1, F2 (shape A) and F4 fail deterministically on the unmodified tree;
-F3 is a reading-level finding (data race, no test); F2 shape B is Lean-only
-(`ReadRemote.shipping_inFlight`). With `candidate_fixes.patch` applied the same
-tests pass, except that the F2 fix is the naive one and closes shape A only.
-
-[EMP] `lake build` of `tpu_sync/formal_verification/` is clean: 23 top-level modules (74 `.lean` files), no `sorry`, no
-extra axioms, `leanprover/lean4:v4.33.0` (`tpu_sync/formal_verification/README.md` §"Building & Verifying").
+[SUPERSEDED → ../../findings/README.md] (2026-10-29) All reproduction evidence
+levels, patch validation results, and test-run commit history live canonically
+in `findings/README.md` (§Summary, §"Fix validation", §History), while Lean
+module inventories and build instructions live in
+`tpu_sync/formal_verification/README.md`. Kept as a frozen stub to preserve the
+2026-10-06 correction trail linked from `../journal/2026-10/`.
 
 ## Correction trail
 
@@ -26,11 +13,7 @@ extra axioms, `leanprover/lean4:v4.33.0` (`tpu_sync/formal_verification/README.m
 (2026-10-06) The 2026-10-05 table named bazel targets `bughunt_f1_test` /
 `bughunt_f2_test` and a test `ShapeB_DeadlineFreesStagingWhilePullInFlight` —
 none exist (shape B has no C++ test); put `raiden_controller.cc` at
-`tpu_sync/`; said "12 modules under Lean v4.29.0"; and cited
+`tpu_sync/`; misstated the module count and Lean version; and cited
 `ReadRemote.bug_trace_B_violates`, whose real name is
 `ReadRemote.shipping_inFlight`. Old text:
 `git show aaa9be1:notes/empirical/bughunt-repro-status-at-01ffa3d.md`.
-
-## See also
-
-- ../durable/controller-read-remote-and-kv-store-pinning-concurrency-traps.md
