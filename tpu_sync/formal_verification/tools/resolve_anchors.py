@@ -18,6 +18,7 @@
 Usage (run from `tpu_sync/formal_verification/` or repo root):
     python3 tpu_sync/formal_verification/tools/resolve_anchors.py [--ref REF] [--check | --apply] [SOURCE ...]
     python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff OLD_REF NEW_REF [--apply] [SOURCE ...]
+    python3 tpu_sync/formal_verification/tools/resolve_anchors.py --coverage COV_JSON [--coverage COV_JSON ...] [-v] [SOURCE ...]
 
 Each `<!-- source-map:begin --> ... <!-- source-map:end -->` block is a Markdown
 table with `File`, `Symbol / anchor` (or `Symbol`), and `Lines` columns:
@@ -44,6 +45,7 @@ Supported anchor forms in the Symbol column:
 
 import argparse
 import difflib
+import json
 import os
 import re
 import subprocess
@@ -750,18 +752,235 @@ def check_stray_citations(src_path, rel_path):
     return stray
 
 
+LOG_LINE_RE = re.compile(
+    r"^\s*(?:ABSL_)?(?:V?LOG|DLOG|PLOG|Q?CHECK|DCHECK)(?:_[A-Z0-9_]+)?\b"
+)
+
+
+def _norm_cov_repo_path(filename):
+    idx = filename.find("tpu_sync/")
+    return filename[idx:] if idx != -1 else filename
+
+
+def _log_statement_lines(sf):
+    skip = set()
+    n = len(sf.lines)
+    for ln, line in enumerate(sf.clean_lines, 1):
+        if LOG_LINE_RE.search(line):
+            end_ln = scan_statement_or_block_end(sf, ln, n)
+            for k in range(ln, end_ln + 1):
+                skip.add(k)
+    return skip
+
+
+def load_llvm_cov_branches(cov_paths, loader):
+    """Load and merge `llvm-cov export` JSON files into repo_path -> branch list."""
+    raw_by_file = {}
+    log_lines_by_file = {}
+    for cov_path in cov_paths:
+        with open(cov_path, "r", encoding="utf-8") as fh:
+            cov = json.load(fh)
+        for datum in cov.get("data", []):
+            for fobj in datum.get("files", []):
+                rp = _norm_cov_repo_path(fobj.get("filename", ""))
+                if not rp.startswith("tpu_sync/") or "_test." in rp or rp.endswith(".proto"):
+                    continue
+                sf = loader.load(rp)
+                if sf is None:
+                    continue
+                log_skip = log_lines_by_file.get(rp)
+                if log_skip is None:
+                    log_skip = _log_statement_lines(sf)
+                    log_lines_by_file[rp] = log_skip
+                raw = raw_by_file.setdefault(rp, {})
+                for b in fobj.get("branches", []):
+                    l1, c1, l2, c2, tcnt, fcnt, fid, efid = b[:8]
+                    # Top-level source branches have fid == 0 (macro
+                    # expansions live under fobj["expansions"]).
+                    if fid != 0 or efid != 0 or l1 in log_skip:
+                        continue
+                    if l1 > len(sf.lines):
+                        print(f"warning: {rp}:{l1} beyond end of file at {loader.ref}; "
+                              "coverage JSON and source tree differ", file=sys.stderr)
+                        continue
+                    key = (l1, c1, l2, c2)
+                    prev = raw.get(key)
+                    if prev is None:
+                        raw[key] = [tcnt, fcnt]
+                    else:
+                        prev[0] += tcnt
+                        prev[1] += fcnt
+
+    file_branches = {}
+    for rp, raw in raw_by_file.items():
+        by_start = {}
+        for k in sorted(raw.keys()):
+            by_start.setdefault((k[0], k[1]), []).append(k)
+        kept = []
+        for (_l1, _c1), group in sorted(by_start.items()):
+            # Keep the shortest operand region starting at (l1, c1), dropping
+            # Clang's outer compound-condition cleanup wrapper when present.
+            group.sort(key=lambda x: (x[2], x[3]))
+            k0 = group[0]
+            kept.append((k0[0], k0[1], k0[2], k0[3], raw[k0][0], raw[k0][1]))
+        file_branches[rp] = kept
+    return file_branches
+
+
+def collect_source_spans(src_path, rel_path, loader):
+    """Resolve non-test C++ source-map spans in `src_path`."""
+    spans = []
+    fails = 0
+    in_map = False
+    fc, sc = 0, 1
+    with open(src_path, "r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            s = line.strip()
+            if "<!-- source-map:begin -->" in s:
+                in_map = True
+                continue
+            if "<!-- source-map:end -->" in s:
+                in_map = False
+                continue
+            if not in_map or not s.startswith("|") or s.startswith("|---") or s.startswith("| ---"):
+                continue
+            cells, _ = split_md_row(line)
+            cells = [c.strip() for c in cells]
+            if len(cells) < 3:
+                continue
+            if any(c.lower() in ("file", "symbol", "symbol / anchor", "lines") for c in cells):
+                for idx, c in enumerate(cells):
+                    cl = c.lower()
+                    if cl == "file":
+                        fc = idx
+                    elif cl in ("symbol", "symbol / anchor"):
+                        sc = idx
+                continue
+            raw_tok = cells[fc].strip("`").strip()
+            if raw_tok in EXTERNAL or os.path.basename(raw_tok) in EXTERNAL:
+                continue
+            rp = loader.resolve_path(cells[fc])
+            if not rp:
+                print(f"{rel_path}:{lineno}  FAIL  unknown file {cells[fc]}")
+                fails += 1
+                continue
+            if "_test." in rp or rp.endswith(".proto") or rp.endswith(".py"):
+                continue
+            sf = loader.load(rp)
+            if sf is None:
+                print(f"{rel_path}:{lineno}  FAIL  cannot load {rp} at {loader.ref}")
+                fails += 1
+                continue
+            lo, hi, err = resolve_spec(sf, cells[sc])
+            if err:
+                print(f"{rel_path}:{lineno}  FAIL  {cells[fc]} {cells[sc]}: {err}")
+                fails += 1
+                continue
+            spans.append((rp, cells[sc], lo, hi))
+    return spans, fails
+
+
+def run_coverage_report(cov_paths, sources, ver_root, loader, show_details=False):
+    file_branches = load_llvm_cov_branches(cov_paths, loader)
+    union_seen = {}
+    total_fails = 0
+    reported = 0
+
+    for src in sources:
+        rel = os.path.relpath(src, ver_root)
+        spans, fails = collect_source_spans(src, rel, loader)
+        total_fails += fails
+        if not spans:
+            continue
+        reported += 1
+        mod_branches = {}
+        missing_cpp = set()
+        for rp, spec, lo, hi in spans:
+            if rp not in file_branches:
+                if rp.endswith(".cc"):
+                    missing_cpp.add(rp)
+                continue
+            span_len = hi - lo
+            for l1, c1, _l2, _c2, tcnt, fcnt in file_branches[rp]:
+                if lo <= l1 <= hi:
+                    prev = mod_branches.get((rp, l1, c1))
+                    if prev is None or span_len < prev[3]:
+                        mod_branches[(rp, l1, c1)] = (tcnt, fcnt, spec, span_len)
+                    union_seen[(rp, l1, c1)] = (tcnt, fcnt)
+
+        tot = len(mod_branches)
+        both = sum(1 for (t, f, _, _) in mod_branches.values() if t > 0 and f > 0)
+        one = sum(1 for (t, f, _, _) in mod_branches.values() if (t > 0) ^ (f > 0))
+        zero = sum(1 for (t, f, _, _) in mod_branches.values() if t == 0 and f == 0)
+        miss_note = f"  [missing: {', '.join(sorted(missing_cpp))}]" if missing_cpp else ""
+        print(
+            f"  {rel:52s}  total={tot:3d}  both={both:3d}  "
+            f"one-side={one:3d}  unreached={zero:3d}{miss_note}"
+        )
+
+        if show_details:
+            for (rp, l1, c1), (tcnt, fcnt, spec, _) in sorted(mod_branches.items()):
+                if tcnt == 0 or fcnt == 0:
+                    sf = loader.load(rp)
+                    snippet = sf.lines[l1 - 1].strip() if sf and 1 <= l1 <= len(sf.lines) else ""
+                    tag = "BOTH=0" if (tcnt == 0 and fcnt == 0) else f"T={tcnt} F={fcnt}"
+                    print(f"    {rp}:{l1}:{c1} [{tag}]  ({spec})")
+                    print(f"      {snippet}")
+
+    if reported > 1:
+        utot = len(union_seen)
+        uboth = sum(1 for (t, f) in union_seen.values() if t > 0 and f > 0)
+        uone = sum(1 for (t, f) in union_seen.values() if (t > 0) ^ (f > 0))
+        uzero = sum(1 for (t, f) in union_seen.values() if t == 0 and f == 0)
+        print(
+            f"\nUnion ({reported} file(s)): total={utot}  both={uboth}  "
+            f"one-side={uone}  unreached={uzero}"
+        )
+    return 1 if total_fails > 0 else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", default="WORKTREE", help="Git ref to resolve against (default: WORKTREE)")
     ap.add_argument("--diff", nargs=2, metavar=("OLD_REF", "NEW_REF"),
                     help="Compare resolved spans between OLD_REF and NEW_REF")
+    ap.add_argument("--coverage", action="append", metavar="COV_JSON",
+                    help="Intersect `llvm-cov export` JSON branch records with source-map spans (repeatable)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="With --coverage, list every one-sided or unreached C++ branch "
+                         "(implied when SOURCE files are given)")
     ap.add_argument("--apply", action="store_true", help="Write resolved line numbers into source-map tables")
     ap.add_argument("--check", action="store_true", help="Exit non-zero on any drift, failure, or stray raw citation")
     ap.add_argument("sources", nargs="*", help="Source files to process")
     args = ap.parse_args()
 
+    if args.coverage and (args.diff or args.apply or args.check):
+        ap.error("--coverage cannot be combined with --diff, --apply, or --check")
+    if args.verbose and not args.coverage:
+        ap.error("-v/--verbose requires --coverage")
+
     repo = find_repo(os.getcwd())
     ver_root = os.path.join(repo, "tpu_sync", "formal_verification")
+
+    if args.coverage:
+        if args.sources:
+            cov_sources = [os.path.abspath(s) for s in args.sources]
+        else:
+            cov_sources = []
+            for root, _, files in sorted(os.walk(os.path.join(ver_root, "TpuSyncVerify"))):
+                for fn in sorted(files):
+                    if fn.endswith(".lean"):
+                        cov_sources.append(os.path.join(root, fn))
+        loader = FileLoader(repo, args.ref)
+        sys.exit(
+            run_coverage_report(
+                args.coverage,
+                cov_sources,
+                ver_root,
+                loader,
+                show_details=args.verbose or bool(args.sources),
+            )
+        )
 
     if args.sources:
         sources = [os.path.abspath(s) for s in args.sources]

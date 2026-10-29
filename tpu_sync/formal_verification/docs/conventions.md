@@ -228,6 +228,24 @@ The search keys states by `Hashable`: every state type a coverage search runs
 on, and its component types (`Lifecycle`, `Cell`, `Send`, `Recv`, `Pipeline`),
 derive it.
 
+**Coverage: which C++ branches in the anchored spans the tests reach.** Model
+coverage asks whether the tests exercise `step`; the converse asks whether the
+C++ spans cited in each module's source map hold control flow the tests never
+run, or that the model leaves out. Build the CPU unit-test binaries with Clang
+source-based coverage (`-fprofile-instr-generate -fcoverage-mapping`), export
+branch counts with `llvm-cov export`, and pass the JSON to
+`tools/resolve_anchors.py --coverage <cov.json>`, which intersects the C++
+branch regions with each Lean module's `<!-- source-map:begin -->` spans. It
+counts top-level source branches only (so branches expanded from `LOG` /
+`CHECK` and `RETURN_IF_ERROR` / `ASSIGN_OR_RETURN` are excluded) and skips
+inline branches inside logging and check statements. The JSON must come from
+the same tree the spans resolve against. Each one-sided or unreached branch in
+a modelled method is classified as a `Coverage.lean` gap (missing test or
+lock-window re-check), an invariant proved (or assumed) to make the arm dead,
+fault-injection or metrics plumbing, or a boundary documented in the module
+(such as device-copy paths that CPU-only tests bypass); the subsystem docs
+record the result.
+
 ## Citing the C++
 
 **Symbols in prose, line numbers in tables.** Prose, state/event tables, and
@@ -249,7 +267,10 @@ whose `Lines` column is resolved from the C++ tree by `tools/resolve_anchors.py`
 * `--apply` rewrites the `Lines` cells from the current tree;
 * `--diff <old> <new>` classifies each anchor between two commits as `same`,
   `shift` (moved, body identical), `modified` (body changed — reread the
-  model) or `FAIL` (renamed or removed).
+  model) or `FAIL` (renamed or removed);
+* `--coverage <cov.json> [SOURCE ...]` intersects `llvm-cov export` branch
+  records with the resolved non-test C++ spans of `TpuSyncVerify/` (and prints
+  each one-sided or unreached branch when `SOURCE` or `-v` is given).
 
 **One last-resolved commit.** The commit at which the spans were last resolved
 is stated once, in `README.md`; modules and docs do not repeat it.

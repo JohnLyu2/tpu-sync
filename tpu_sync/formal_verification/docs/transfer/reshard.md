@@ -201,6 +201,46 @@ by an executable counterexample trace or `#guard` check in
 | `Registry.trace_split_ttl_purges_request_blocks_while_claim_active` | `RequestBlockRegistry::LookupAndClaim` sets `claimed_[(req_id, uuid)] = t_1 + ttl_s_` without refreshing `registration.expires_at` on the claimed `request_blocks_` rows | Claimed registration liveness (`PurgeExpiredRequestBlocksLocked` erases `request_blocks_` in `[t_0 + ttl_s_, t_1 + ttl_s_)` while `claimed_` is still active) |
 | `Coordinator.mutant_dispatch_without_arm_barrier_drops_push` | `ReshardCoordinator::RunSubPlan` joins all Stage 1 receiver-arming threads and verifies every `armed[i]` before launching Stage 2 senders | Two-phase Arm-then-Dispatch (`NoPushBeforeAllArmed`: premature sender push arrives at unarmed `dst_unit 11` and is dropped) |
 
+## C++ branch coverage of the anchored spans
+
+`tools/resolve_anchors.py --coverage` intersects `llvm-cov` branch counts from
+every OSS-buildable CPU unit-test binary, measured at the commit in
+`README.md`, with the `Reshard/` source-map spans
+([conventions.md](../conventions.md) §Coverage). The control and staging layers
+are exercised; the device-copy session bodies are not:
+
+* **Exercised on CPU:** static plan and sub-block coverage validation
+  (`ReshardReceiveSession::ValidatePlan`, `ValidateReceiverCoverage`,
+  `CountPoolReshardSendSlots`), `PoolStagingStorage` leases
+  (`AcquirePoolStagingLease`, `ReleasePoolStagingLeases`), receiver arming
+  (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`),
+  `RequestBlockRegistry`, and `ReshardCoordinator::RunSubPlan` over
+  `WorkerDelivery::Mode::kRpc`.
+* **Never executed on CPU:** unlike `TransferSendSession` /
+  `TransferReceiveSession`, whose D2H and H2D dispatches go through
+  CPU-testable hooks, `PoolReshardPush` rejects deviceless managers at
+  `ReshardSendSession::Create`'s `base->has_device_buffers()` check, and
+  `ReshardSendSession::ExecutePush`'s `CopyPoolBlocksToHost` has no CPU hook
+  even when unit tests satisfy `Create` via `AttachPlaceholderDeviceHoldForTest`.
+  So `ReshardSendSession::ExecutePush`, `ReshardSendSession::StartPoolPush`,
+  and the `active_pool_reshard_sends_` sweep in
+  `KVCacheManagerWithTransfer::CompleteReadWithDetails` never run in deviceless
+  unit tests (`ReshardSendSessionTestPeer` drives `in_flight_` and
+  `RecordPushCompletion` directly). On the receiver, deviceless tests attach no
+  device buffers for `CopyPoolBlocks`, so `ReshardReceiveSession::OnPoolReceived`,
+  `RecordPoolReceivedLocked`, `CollectEligiblePoolH2dsLocked` (the rank-wave
+  gate), `ExecuteEligiblePoolH2ds` and `AllH2dDoneLocked` never run (tests
+  drive `RecordPoolH2dResultLocked` / `FinishPoolH2d` or the incoming-push
+  failure hook directly); neither does the `WorkerDelivery::Mode::kController`
+  arm of `ReshardCoordinator::RunSubPlan`.
+* **Executed one way only:** `ReshardSendSessionTestPeer` passes only
+  `OkStatus()` to `RecordPushCompletion`, so its `!status.ok()` early-unregister
+  arm (`UnregisterPolicy.shipping`) is never taken on CPU.
+
+Without TPU hardware, the Lean models in
+`Reshard/{Send,Receive,Pipeline,Coordinator}.lean` are the only check on those
+paths.
+
 ## C++ → Lean routing index
 
 Per C++ symbol: the Lean module that owns it, the model events or definitions

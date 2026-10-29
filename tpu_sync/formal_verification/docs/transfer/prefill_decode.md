@@ -227,6 +227,56 @@ exercise exactly the happy paths and the handshake rejections, every failure or
 window branch being accounted for at the session level; no test in the suite
 recycles a released buffer under an earlier request.
 
+## C++ branch coverage of the anchored spans
+
+The converse check ([conventions.md](../conventions.md) §Coverage):
+`tools/resolve_anchors.py --coverage` intersects `llvm-cov` branch counts from
+every OSS-buildable CPU unit-test binary, measured at the commit in
+`README.md`, with the C++ spans in each module's source map. At that commit
+`Receive.lean` spans 234 branches, `Send.lean` 109 and `Pipeline.lean` 112
+(the spans overlap: `ExecuteLayerH2d`, `StartStream` and `CompleteIncomingPush`
+are cited by both `Receive.lean` and `Pipeline.lean`), and every branch in
+`Pipeline.lean`'s spans is reached on at least one side. Branches expanded
+from `RETURN_IF_ERROR` / `ASSIGN_OR_RETURN` are not counted, so error returns
+written that way are outside this check. `--coverage -v` lists every one-sided
+or unreached branch; they fall into these groups:
+
+* **Model gaps confirmed in C++:** in `TransferReceiveSession`, `!future_or.ok()`
+  in `ExecuteLayerH2d` and `pull_status.ok()` in `ExecutePullRequest` are never
+  true, `!f.IsReady()` in `AllH2dDoneLocked` is never false (in the tests,
+  `AllH2dDoneLocked` returns `true` only with an empty `h2d_futures_`, never
+  after an H2D future has become ready), and the second-lock
+  `if (done_ || draining_)` re-check in `ExecuteLayerH2d` is never taken; in
+  `TransferSendSession`, the pool-task `if (self->draining_)` re-check in
+  `SendNextLayer` and the per-layer `if (draining_)` exit in `StartPush` are
+  never taken (and `fail_unissued_layers` only runs after an error finish where
+  `!status_.ok()`), while `CompleteReadWithDetails` only visits non-draining
+  sends whose `session->deadline() <= now` already holds.
+* **Proved invariants and dead C++ arms (the dead side is never taken):** in
+  `TransferSendSession`, `done_` is never true when `draining_` is false in
+  `if (draining_ || done_)` (`FinishLocked`, `AcquireStagingWithRetry`,
+  `StartPush`); `!done_` is never false in
+  `if (draining_ && in_flight_ == 0 && !done_)` (`EndSendOpLocked`,
+  `EndRecvOpLocked`) nor in `TransferReceiveSession::FinishLocked`'s
+  `if (in_flight_ == 0 && !done_)`; all three match `Lifecycle.Consistent`.
+  `if (self->done_)` in `ExecuteLayerH2d`'s callback (`NoRetiredCallback`) and
+  the `FinishLocked()` arm of `RecordNetworkCompleteLocked` (`!all_complete` is
+  always true) are never entered. In `TransferSendSession`,
+  `l >= d2h_layer_futures_.size()` in `SendNextLayer` (after
+  `l >= base_->num_layers()`) and `d2h_layer_futures_.size() < base_->num_layers()`
+  in `CurrentPhaseLocked` are never true because `StartPush` pre-populates every
+  layer's future before `SendNextLayer(0)`.
+* **Assumed, not proved:** `if (in_flight_ <= 0)` in `EndRecvOpLocked` is never
+  entered, consistent with Receive A3 (no double end).
+* **The rest:** documented boundaries (`AcquireStagingSlot` /
+  `LookupStagingSlot` early-drain paths under bounded layer staging,
+  `AcquireStagingWithRetry`'s non-`ResourceExhausted` and deadline loop exits,
+  unused `AckSend`, Peregrine's `OnRecvProgress` / `OnRecvNetworkComplete`),
+  input-validation and setup guards (`InitFromActivePlan`, `NotifyForRead`,
+  `HandlePullStream`), unused fault-injection and metrics hooks, and
+  bookkeeping arms the tests drive one way only (`TakePendingUnregister`'s
+  `generation != nullptr`, `DeferUnregisterOnSettle`'s `if (done_)`).
+
 ## C++ → Lean routing index
 
 Per C++ symbol: the Lean module that owns it, the model events or definitions

@@ -49,7 +49,7 @@ docs/
   transfer/                   per-subsystem C++ <-> Lean docs: states, events,
                               assumptions, proved theorems
 tools/
-  resolve_anchors.py          resolves and checks the source-map tables
+  resolve_anchors.py          resolves/checks source-map tables and intersects llvm-cov JSON
   run_lean.sh                 evaluates ad hoc Lean snippets against the built models
 lakefile.toml, lake-manifest.json, lean-toolchain
 ```
