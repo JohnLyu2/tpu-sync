@@ -9,8 +9,12 @@ live in `Caller.lean`. -/
 namespace TpuSyncVerify.Transfer.Caller
 
 /-- What the worker-side connector tells the scheduler about one request in
-one step: membership in the two sets `get_finished()` returns and whether the
-request's local blocks are in `get_block_ids_with_load_errors()`. -/
+one step: membership in the two sets `get_finished()` returns
+(`KVConnectorTransferResults.finished_sending` / `finished_recving` with
+`get_transfer_results`) and whether the request is on vLLM's load-failure
+channel — its local blocks in `get_block_ids_with_load_errors()`
+(`invalid_block_ids`) or its id in `KVConnectorTransferResults.failed_recving`
+(`Caller.lean` §"What is modelled", step 1). -/
 structure Signal where
   finishedSending : Bool := false
   finishedRecving : Bool := false
@@ -25,26 +29,45 @@ structure Connector where
   onSend : Bool → Signal
   onRecv : Bool → Signal
 
-/-- `conn.py:632-656`: `failed_recving` is logged and dropped on both nodes;
-`get_block_ids_with_load_errors` is the base-class default. -/
-def connectorCurrent : Connector where
-  onSend ok := { finishedSending := ok }
-  onRecv ok := { finishedRecving := ok }
-
-/-- The proposed fix for `conn.py` and the shipping Stage-3 Reshard connector in
-`tpu_connector.py` (`get_finished` / `_poll_finished`): every outcome is
-forwarded; a failed receive goes through both of vLLM's channels. -/
-def connectorFixed : Connector where
+/-- Shipping two-channel connector meeting `Contract`: every outcome is
+forwarded on `finished_sending` / `finished_recving` and a failed receive also
+goes on vLLM's load-failure channel. Instantiated by both production connectors:
+* `tpu-inference` `TPUConnectorWorker.get_transfer_results` (`conn.py` at pull
+  request #3918 `f366ef52`, paired with vLLM `e7bb7e2f`'s
+  `KVConnectorModelRunnerMixin._get_kv_connector_output` and
+  `Scheduler._handle_failed_recving`: producer merges `failed_recving` into
+  `finished_sending`; consumer drops the id from `_submitted` and reports it in
+  both `finished_recving` and `failed_recving`, the request-level channel), and
+* `vllm-torchtpu` Stage-3 `TPURaidenConnectorWorker` (`tpu_connector.py`:
+  `get_finished` / `_poll_finished`, staging failed receive blocks into
+  `_failed_block_ids` for `get_block_ids_with_load_errors`, the block-level
+  channel). -/
+def connectorTwoChannel : Connector where
   onSend _ := { finishedSending := true }
   onRecv ok := { finishedRecving := true, loadError := !ok }
 
-/-- The fix the connector's comment (`conn.py:641-644`) warns against: a failed
-receive reported as `done_recving` and nothing else. -/
+/-- Mutant: `failed_recving` is logged and dropped on both nodes
+(`finishedSending := ok`, `finishedRecving := ok`, `loadError := false` — the
+pre-PR-#3918 `get_finished`-only `tpu_raiden_connector.py` at `7ed46a6`, where
+neither `get_block_ids_with_load_errors` nor `get_transfer_results` was
+overridden). -/
+def connectorDropFailed : Connector where
+  onSend ok := { finishedSending := ok }
+  onRecv ok := { finishedRecving := ok }
+
+/-- Mutant: a failed receive is reported in `finished_recving` (`done_recving`)
+with no signal on the load-failure channel — both the one-channel shortcut the
+original `conn.py` comment (`conn.py:641-644` at `7ed46a6`) warned against and
+what happens if PR #3918's `get_finished()` wrapper (`return
+results.finished_sending, results.finished_recving`, without
+`get_block_ids_with_load_errors`) is invoked by a legacy `get_finished`-only
+runner that ignores `get_transfer_results()`. -/
 def connectorNaive : Connector where
   onSend _ := { finishedSending := true }
   onRecv _ := { finishedRecving := true }
 
-/-- The other half-fix: the failure channel without the completion report. -/
+/-- Mutant: failed receives reported on the load-failure channel without the
+`finished_recving` completion report. -/
 def connectorLoadErrorOnly : Connector where
   onSend _ := { finishedSending := true }
   onRecv ok := { finishedRecving := ok, loadError := !ok }
@@ -100,7 +123,8 @@ inductive Ev where
   /-- tpu-sync publishes the receive (`done_recving` if `ok`, else
   `failed_recving`, `(!session->GetStatus().ok() ? failed_recving_ : done_recving_).insert(session->req_id())`
   in `KVCacheManagerWithTransfer::CompleteReadWithDetails`) and D's next
-  `get_finished()` / `get_block_ids_with_load_errors()` forward it. -/
+  `get_finished()` / `get_block_ids_with_load_errors()` (or
+  `get_transfer_results()`) forward it. -/
   | dOutcome (ok : Bool)
   /-- D's next `schedule()` promotes the waiting request (`sched.py:2414-2429`). -/
   | promote
@@ -114,7 +138,9 @@ def applySend (sig : Signal) (s : S) : S :=
   if sig.finishedSending then { s with pHeld := false } else s
 
 /-- `sched.py:1516-1523`, `sched.py:2579-2648`: `invalid_block_ids` for a
-request still in `WAITING_FOR_REMOTE_KVS`. -/
+request still in `WAITING_FOR_REMOTE_KVS` (`_handle_invalid_blocks`); the
+request-level `failed_recving` handler `Scheduler._handle_failed_recving`
+has the same effect under both policies (`Caller.lean` step 1). -/
 def applyLoadError (policy : Policy) (s : S) : S :=
   if s.dStatus = .waitingRemoteKv then
     match policy with
@@ -199,7 +225,9 @@ def violates (s : S) : Bool := leakP s || leakD s || decodesUnwritten s
 
 def Safe (s : S) : Prop := violates s = false
 
-/-- What a connector owes the scheduler (`base.py:357-393`). -/
+/-- What a connector owes the scheduler (`base.py:357-393`, and the
+`KVConnectorTransferResults` contract that a failed receive also appears in
+`finished_recving`). -/
 structure Contract (conn : Connector) : Prop where
   /-- Every send outcome is reported as finished sending. -/
   send_total : ∀ ok, (conn.onSend ok).finishedSending = true
@@ -217,7 +245,7 @@ structure Contract (conn : Connector) : Prop where
   send_no_recv : ∀ ok, (conn.onSend ok).finishedRecving = false ∧ (conn.onSend ok).loadError = false
   recv_no_send : ∀ ok, (conn.onRecv ok).finishedSending = false
 
-theorem fixed_contract : Contract connectorFixed where
+theorem twoChannel_contract : Contract connectorTwoChannel where
   send_total := by intro ok; rfl
   recv_total := by intro ok; rfl
   recv_failure_reported := rfl

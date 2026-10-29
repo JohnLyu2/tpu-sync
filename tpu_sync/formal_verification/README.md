@@ -10,7 +10,8 @@ machine-checked proofs about them.
 
 **Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
 - C++: `TransferSendSession`, `TransferReceiveSession`,
-  `KVCacheManagerWithTransfer`, the receiver side of `BlockTransport`.
+  `KVCacheManagerWithTransfer`, the receiver side of `BlockTransport`
+  (`BlockTransportServerPushSession`).
 - Lean: [`Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean),
   [`Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/).
 - Proved: data correctness on publication, HBM and staging safety,
@@ -65,11 +66,11 @@ lakefile.toml, lake-manifest.json, lean-toolchain
 Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest names (`Suite.TestName`); exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables. Those spans were
-last resolved at commit **`c9bc124`**;
+last resolved at commit **`42dda54`**;
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py) `--check` re-verifies
 them against the working tree. The external callers that `Caller.lean`
-cites are pinned separately: tpu-inference `7ed46a6`, vllm-torchtpu `9725110`,
-and vLLM `6185d73`.
+cites are pinned separately: tpu-inference `7ed46a6` (and pull request #3918
+`f366ef52`), vllm-torchtpu `9725110`, and vLLM `6185d73` (and `e7bb7e2f`).
 
 ## Building & Verifying
 

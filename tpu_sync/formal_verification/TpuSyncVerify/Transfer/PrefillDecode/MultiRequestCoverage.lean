@@ -100,7 +100,7 @@ the `Pipeline` numbers. -/
 
 def tr_multi_request : List MultiEv :=
   ([.send .beginPull, .send .start, .send .d2hBegin, .send .cancel, .recv .cancel,
-    .send (.d2hIssue true), .d2hReady 0, .send .d2hEnd,
+    .send (.d2hIssue true), .d2hReady 0, .send (.wake true), .send .d2hEnd,
     .recv (.pullReply true), .send .publish, .recv .publish].map (MultiEv.reqStep 0)) ++
   [.nextRequest 0] ++ ((producer ++ consumer).map (MultiEv.reqStep 1))
 

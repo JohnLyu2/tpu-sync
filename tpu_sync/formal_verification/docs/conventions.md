@@ -202,9 +202,9 @@ the model the tests exercise. `Common/Coverage.lean` holds the machinery and
   **test** (a harness can drive it — a missing upstream test), **window** (an
   interleaving no harness hook reaches), or an ordering the model leaves open
   (data arriving before a pull reply). Check first whether an "open" order is
-  in fact fixed by code outside the model: the two callbacks on one D2H
-  future run in reverse registration order, which the send pairing had to
-  establish;
+  in fact fixed by code outside the model: the sender's D2H callback resolves
+  the per-layer promise (running `SendNextLayer`'s waiter inline) before its
+  own `EndSendOp`, which the send pairing had to establish;
 * tests whose stimulus is not an event of the model (a synthetic call with no
   production source) listed as `notReplayable` with the reason, not paired
   with the nearest trace;

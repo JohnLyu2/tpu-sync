@@ -212,8 +212,9 @@ def tr_push_lease_outlives_h2d : List Ev :=
   [.pushBegin, .h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true, .pushEnd, .publish]
 
 /-- `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`:
-even if the H2D copy and its callback finish inside `HandleIncomingPush` before
-`EndIncomingPush` runs, the open push lease (`pushes = 1`) keeps `done = false`
+even if the H2D copy and its callback finish inside the push stream
+(`BlockTransportServerPushSession::StartStream`) before `EndIncomingPush`
+runs, the open push lease (`pushes = 1`) keeps `done = false`
 and `hasStaging = true` until `pushEnd`. -/
 theorem trace_push_lease_outlives_h2d :
     let pre := tr_push_lease_outlives_h2d.take 5
