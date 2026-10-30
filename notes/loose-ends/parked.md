@@ -130,15 +130,6 @@ Open items only (5-field `better-than-fish` format, symbol citations instead of 
 **Effort estimate:** ~30 min each.
 **References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive/Coverage.lean, ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md
 
-## Optionally add a `NumaAwareKVCacheManager` sub-manager barrier model under `Transfer/Caller/`
-**Status:** parked 2026-10-29 (`Read at: 42dda542`)
-**Context:** F11 (`NumaAwareKVCacheManager::CompleteReadRaw` eager `failed_recving` mid-DMA under `ENABLE_MULTI_NUMA=1` + `failed_recving_set_` / barrier-count leak on every failed/expired transfer) is confirmed by `findings/numa_kv_cache_manager_bughunt_test.cc`, recorded in `findings/README.md` §F11, and filed as bug 10 in `findings/filed_bugs.md`.
-**Why parked:** Lean modelling of `NumaAwareKVCacheManager` deferred after confirming and filing F11.
-**To resume:** Optionally add a small sub-manager barrier model under `TpuSyncVerify/Transfer/Caller/` proving `earlyFree = false` and cross-transfer state reset for the settled-count (`ok + fail`) fix.
-**Effort estimate:** ~2 h.
-**References:** findings/README.md §F11, findings/filed_bugs.md, ../empirical/prefill-decode-caller-tpu-inference-raiden-connector.md
-
-
 ## Triage and write up the four unfiled bug-hunt reproducers from the 2026-10-29 post-F11 audit
 **Status:** parked 2026-10-29 (`Read at: 42dda542`; all four built and run on unmodified `42dda542`, files committed under `findings/` without `README.md` entries or `build_targets.patch` targets)
 **Context:** After F11, four parked/unmodelled areas were audited by reading and the candidates confirmed or refuted by test: (1) `KVCacheStore::active_remote_writes_` is never erased on async `HostOffloadBackend::BeginWriteRemote` settlement (`~KVCacheStore` then double-`Release`s live pins) and a remote `CANCELLED` after the ack drops the pin release and the save verdict — `findings/kv_cache_store_remote_write_bughunt_test.cc` (3 failing + 1 control); (2) `KVCacheStoreClient::Fetch` sets no RPC deadline and `HostOffloadBackend::LoadRemoteBlocks` frees `dst_host_block_ids` on a transport error while the receiver still accepts planless op-6 / uuid-0 pushes into them — `findings/kv_cache_store_fetch_bughunt_test.cc` (4 failing; closes the older "`Fetch` missing RPC deadline" parked item above); (3) `KVCacheManagerBase::host_block_manager_` (`LogicalBlockManager`, documented as externally synchronized) is mutated without a lock by concurrent auto-allocating inbound pushes, `H2hRead` and `AllocateBlocks` — `findings/host_block_manager_race_bughunt_test.cc` (duplicate block ids; 1 failing + 1 control; no in-tree production caller of the auto-allocating `H2hWrite` / `H2hRead` found); (4) `WriteRemoteServerReactor::StartAck` vs `OnCancel` is **refuted** (gRPC 1.81.0 defers `OnCancel` until after `SetupReactor`; `Finish` during a pending `StartWrite` is legal) — `findings/kv_cache_store_service_reactor_bughunt_test.cc` (2 passing). User decision 2026-10-29: filing is scoped to the transfer path first; (1)–(3) are store-path and deferred.
