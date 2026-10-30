@@ -60,7 +60,7 @@ here.
 | `reshard_send_session_bughunt_test.cc` | F10 (R6 of `tpu_sync/formal_verification/docs/transfer/reshard.md`): the sender's early plan unregister and the uuid-keyed staging lease it hands to a retry |
 | `numa_kv_cache_manager_bughunt_test.cc` | F11: `NumaAwareKVCacheManager::CompleteReadRaw` eager `failed_recving` while sibling sub-managers still have H2D / D2H DMAs in flight, plus `failed_recving_set_` / barrier-count leak and `req_id`-reuse poisoning |
 | `pool_reshard_chain_bughunt_test.cc` | F12 (`PoolReshardChainBughunt`, `ChainClaimTest`) and F13 (`PoolReshardChainBughunt1B`): windowed pool-reshard sub-plan chains (`09a42d4e`) — a sender absent from some windows never reports `done_sending`; a chain failing after window 0 holds the registry claim until TTL; the first failing sub-plan is reported while sibling / later windows still run and can be reported twice |
-| `transfer_receive_late_finish_bughunt_test.cc` | F14 (`RecvLateFinishBughunt`): 1 control (`TransferSendSession`) + 4 failing cases (`end_incoming_push`, `UnregisterActivePlan`, `ExecutePullRequest` `on_response`, and `ReshardReceiveSession`) where a late `Finish(error)` after 100% of H2Ds completed OK overwrites `status_` and flips `completions.received` to `completions.failed` |
+| `transfer_receive_late_finish_bughunt_test.cc` | F14 (`RecvLateFinishBughunt`): 1 control (`TransferSendSession`) + 4 failing cases driving `end_incoming_push`, `UnregisterActivePlan`, `ExecutePullRequest` `on_response`, and `ReshardReceiveSession` directly, where a late `Finish(error)` after every H2D completed OK flips `completions.received` to `completions.failed` (in production only the `on_response` path and a photo-finish deadline-sweep race reach it; see §F14) |
 | `build_targets.patch` | `cc_test` targets for the seven files above (plus the four untriaged store/host reproducers recorded in `## History`) |
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
@@ -111,7 +111,7 @@ have not been rebuilt since the runs their entries record.
 | F11 | `NumaAwareKVCacheManager::CompleteReadRaw` (the JAX `poll_stats()` wrapper) emits `failed_recving` on the **first** failing sub-manager while sibling sub-managers still have H2D / D2H DMAs in flight (`done_sending` and `done_recving` barrier-wait across sub-managers; pinned by upstream's `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`), and **never erases `failed_recving_set_`** on failure (erased only when `done_recving_counts_[req] >= expected` on pure `done_recving` completions), leaking map entries on every failed/expired transfer and poisoning reused `req_id`s (dropping subsequent `failed_recving` / `done_recving` at `num_subs == 1`, and desynchronizing `done_recving_counts_` into premature `done_recving` after partial failure at `num_subs >= 2`). Present since `00a3f670` (2026-06-23) | CONFIRMED (test) 2026-10-29 (`numa_kv_cache_manager_bughunt_test.cc`, 4/4 cases on unmodified `42dda542`); **filed 2026-10-29** (bug 10 in `filed_bugs.md`) | eager `failed_recving` mid-DMA: yes on a single request when `ENABLE_MULTI_NUMA=1` (`num_subs >= 2`, wired in `tpu_raiden_connector._remote_endpoint`) + a caller forwarding `failed_recving` (masked while C1 dropped `failed_recving`; exposed once [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918) lands); `failed_recving_set_` leak: yes on every failed/expired transfer even at default `ENABLE_MULTI_NUMA=0`; `req_id`-reuse poisoning: immediate for direct `jax::KVCacheManager` callers, gated by `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` (or 8-hex suffix collision) in vLLM V1 |
 | F12 | Windowed pool reshard (`dst_window_blocks` sub-plan chains, `09a42d4e`): `BuildPoolReshardPlan` dispatches only the source units with spans in the current window, while every sub-plan is stamped with the request-wide `sub_plan_count = K`, so a sender in `1 <= m < K` windows never reaches `K` settled sub-plans, reports nothing until `SweepSubPlanChainsLocked` fails it (`DEADLINE_EXCEEDED … m of K sub-plans settled`) after `timeout_s_`; and `RunSubPlan` abandons the registry claim only `if (index == 0)`, so a chain failing at window ≥ 1 leaves every rank not dispatched in `0 .. index-1` — which has no session and never votes `Complete` — in the claim until `ttl_s_` (the F8 gap, now by design for later windows) | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt` 2 failing + 1 control, `ChainClaimTest` 1 failing + 2 controls, on unmodified `42dda542`); **filed 2026-10-29** (bug 11 in `filed_bugs.md`) | yes for any multi-window request whose span ownership varies by window (upstream's own `WindowedRequestChainsOneSubTransferPerWindow` / `WindowClipsStraddlingSpansAtWindowBoundaries` shapes), once a caller passes `dst_window_blocks` (`SUPPORTS_DST_WINDOW_BLOCKS` is wired in `api/torch/reshard_client.py`; `vllm-torchtpu` `9725110` and `sglang-torchtpu` `9a6eef1` do not pass it yet) |
 | F13 | Windowed pool reshard: `RecordPoolReshardTerminalLocked` emits `failed_recving` on the **first** failing sub-plan with no check for sibling sub-plans of the `req_id` still active (the check `SweepSubPlanChainsLocked` does make), `StartChain` sees only control-plane errors so it keeps arming and dispatching windows `1 .. K-1`, and `PoolReshardPush` / `PoolReshardRegisterRecv` seat them regardless of `chains[req_id].failed` (pinned by upstream's `FirstSubPlanFailureFailsTheRequestOnce`); the failed entry is swept after one `timeout_s_` of inactivity, so a later sub-plan starts a fresh unanchored chain that is failed again | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt1B` 4/4 failing on unmodified `42dda542`); **filed 2026-10-29** (bug 12 in `filed_bugs.md`) | mid-DMA free: yes for any multi-window request whose first failure has another window active (the F11 shape on pool reshard, with the engine recomputing into / freeing the destination blocks on `failed_recving`); double report: a worker whose next sub-plan arrives > `timeout_s_` after the failure (a sender skipped in the intervening windows, cf. F12); same caller gate as F12 |
-| F14 | `TransferReceiveSession::FinishLocked` and `ReshardReceiveSession::FinishLocked` (plus `ReshardSendSession::Finish`) mutate `status_ = status` **before** checking `draining_` (`finalizing_`) and without checking `done_` (`TransferSendSession::FinishLocked` returns early on `if (draining_ \|\| done_)`), so a late `Finish(error)` after 100% of H2D copies into destination HBM have completed OK overwrites `status_` and causes `CompleteReadWithDetails` (and `EndIncomingPush(OkStatus())` on `TransferReceiveSession`) to report the completed receive as `failed` instead of `received` | CONFIRMED (test) 2026-10-30 (`transfer_receive_late_finish_bughunt_test.cc`: 1 control passing + 4/4 production paths failing on unmodified `42dda542`); not yet filed | yes across four paths: (1) trailing stream error / rejected extra push via `hooks.end_incoming_push` after H2D completed OK; (2) `UnregisterActivePlan` while `EndIncomingPush` still holds the push lease or in the unlocked check-then-`Finish` window; (3) `ExecutePullRequest` control reply arriving with an error after the detached producer push + H2Ds already completed OK; (4) `~KVCacheManagerWithTransfer` on `done_ == true` sessions |
+| F14 | `TransferReceiveSession::FinishLocked` records any first error even while draining (needed: the poll can `Finish()` OK before a failed H2D's callback, whose error must win), so it also admits an *external* `Finish(error)` after every H2D completed OK and the completed receive is reported `failed` instead of `received`. `ReshardReceiveSession::FinishLocked` (and `ReshardSendSession::Finish`) have the same shape | CONFIRMED (test) 2026-10-30 (`transfer_receive_late_finish_bughunt_test.cc`: 1 control passing + 4 cases failing on unmodified `42dda542`); audited 2026-10-30: low severity; not yet filed | in production only (3) an `ExecutePullRequest` control reply failing on the return leg after the detached push and every H2D completed (narrow; `control_timeout_s_` is sized to avoid it) and the deadline sweep's multi-lock-scope check-then-`Finish` window in `CompleteReadWithDetails` when the last H2D/push finishes right at `deadline()`. (1) `end_incoming_push` needs a duplicate stream (no in-tree sender); (2) receive-side `UnregisterActivePlan` has no caller in tpu-sync or the three connector repos; (4) `~KVCacheManagerWithTransfer` is never published |
 | C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_dropFailed_*`, leaks absorbing, `contract_safe` / `mw_contract_safe` for `connectorTwoChannel`); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet); **fix open as [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)** (`f366ef52`, 2026-10-27, "[Disagg] Forward tpu-sync failed transfers in tpu_raiden_connector"; unmerged, not on `main` `7840339b` as of 2026-10-28, where the connector is still unchanged): a new `get_transfer_results()` forwards `failed_recving` as `finished_sending` on P and as `finished_recving` + `failed_recving` on D — an instance of `connectorTwoChannel` over `AggChannel.latchedReq` (`MultiWorker.lean`), with the D-side failure on vLLM's request-level `KVConnectorTransferResults.failed_recving` channel rather than `get_block_ids_with_load_errors` (requiring `ENABLE_MULTI_NUMA=0`, see F11, and a `get_transfer_results()`-capable vLLM ≥ `e7bb7e2f`); tpu-sync at `42dda542` still files failed and expired sends in `failed_recving_` | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
@@ -1171,87 +1171,90 @@ have not been rebuilt since the runs their entries record.
 
 ---
 
-## F14. `TransferReceiveSession::FinishLocked` and `ReshardReceiveSession::FinishLocked` overwrite `OkStatus()` after all H2D copies have completed, flipping `received` to `failed`
+## F14. `TransferReceiveSession::FinishLocked` lets a late external error overwrite a receive whose every H2D already completed OK, flipping `received` to `failed`
 
 - **Status:** **CONFIRMED (test)** 2026-10-30, on unmodified `42dda542`:
   `transfer_receive_late_finish_bughunt_test.cc` (1 positive control + 4
-  production-path cases; `RecvLateFinishBughunt`). Not yet filed. Surfaced
-  while auditing the late-error window of `Transfer/PrefillDecode/Receive.lean`
-  (§Lock scopes) and `findings/coverage_gap_tests.patch` (see "Coverage-gap
-  tests" below).
-- **Root cause (`42dda542`):** across the session hierarchy,
-  `TransferSendSession::FinishLocked`
-  (`tpu_sync/kv_cache/transfer_send_session.cc:247`) guards entry with
-  `if (draining_ || done_) return;`, making terminal status immutable once
-  `FinishLocked` has entered drain (`OkStatus()` or error). Three sibling
-  methods instead mutate `status_` **before** checking `draining_`
-  (`finalizing_`) and omit `!done_`:
-  - `TransferReceiveSession::FinishLocked`
-    (`tpu_sync/kv_cache/transfer_receive_session.cc:449-455`):
-    `if (!status.ok() && status_.ok()) { status_ = status; ... } if (draining_) return;`
-  - `ReshardReceiveSession::FinishLocked`
-    (`tpu_sync/kv_cache/reshard_receive_session.cc:474-478`):
-    `if (!status.ok() && status_.ok()) { status_ = status; } if (draining_) return;`
-  - `ReshardSendSession::Finish`
-    (`tpu_sync/kv_cache/reshard_send_session.cc:394-400`):
-    `if (!status.ok() && status_.ok()) { status_ = status; } if (done_ || finalizing_) return;`
-
-  On both receive sessions, `FinishLocked(absl::OkStatus())` is called **only**
-  after 100% of destination uploads have already completed OK (the last H2D
-  callback in `TransferReceiveSession::ExecuteLayerH2d` `:915` / host-only
-  `RecordNetworkCompleteLocked` `:773`, or the last pool H2D in
-  `ReshardReceiveSession::FinishPoolH2d` `:701` / zero-H2D `:600`). There is no
-  early-OK-drain state where destination HBM is incomplete; once `draining_` is
-  set with `status_.ok()`, the transfer's data has already landed.
-- **Four production paths that flip a completed receive from `received` to `failed`:**
+  cases; `RecvLateFinishBughunt`). **Audited 2026-10-30 (later): the code defect
+  is real, but of the four tested paths only (3, the pull reply) is reachable in
+  production (alongside a photo-finish deadline-sweep check-then-`Finish` window
+  in `CompleteReadWithDetails`), both through narrow windows; severity low.**
+  The four cases drive `EndIncomingPush`, `UnregisterActivePlan`, the pull reply
+  and the pool H2D directly; they show the flip, not production reachability.
+  Not yet filed. Surfaced while auditing the late-error window of
+  `Transfer/PrefillDecode/Receive.lean` (§Lock scopes) and
+  `findings/coverage_gap_tests.patch` (see "Coverage-gap tests" below).
+- **Root cause (`42dda542`):** `TransferReceiveSession::FinishLocked`
+  (`tpu_sync/kv_cache/transfer_receive_session.cc:449-464`) records the first
+  error even while draining (`if (!status.ok() && status_.ok()) status_ = status;`
+  before `if (draining_) return;`, no `done_` check), whereas
+  `TransferSendSession::FinishLocked` (`transfer_send_session.cc:247`) returns
+  on `if (draining_ || done_)`. The receive rule is **needed**: `IsReadyToComplete`
+  / `AllH2dDoneLocked` (`transfer_receive_session.cc:537-550`) test that every
+  H2D future is *ready*, not that it succeeded, so the poll in
+  `CompleteReadWithDetails` (`kv_cache_manager_with_transfer.cc:1212-1215`) can
+  `Finish()` OK before a failed H2D's callback runs
+  `FinishLocked(status_or.status(), kH2dPhase)` (`:895`), and that late error
+  must win (`ReceivePoll.pollReady_window`; replayed in the Lean receive model:
+  after `.pollReady` the session is draining, OK, one op in flight, and
+  `.h2dDone false` publishes `some false`). The defect is narrower: the rule
+  also admits *external* errors after the last successful H2D callback has
+  called `FinishLocked()` (`:889`), i.e. once every layer is on device.
+  `ReshardReceiveSession::FinishLocked` (`reshard_receive_session.cc:474-484`)
+  has the same shape; there `IsReadyToComplete` requires `network_completed_`,
+  which `FinishPoolH2d` sets only when every pool completed OK (`:699`), so the
+  poll-side dependency does not exist. `ReshardSendSession::Finish`
+  (`reshard_send_session.cc:394-410`) has the same shape and no poll-side
+  `IsReadyToComplete` caller either; its only external caller is the deadline
+  sweep (`:1185-1188` of the manager), where `!session->IsDraining()` and
+  `session->Finish(DeadlineExceededError)` run in separate `session->mu_` lock
+  scopes (the same near-deadline check-then-`Finish` window the two receive
+  sweeps have at `:1211-1222` and `:1243-1250`).
+- **The four paths the test drives, and what reaches them:**
   1. **Trailing stream cleanup (`hooks.end_incoming_push`,
-     `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc:406-425` +
+     `kv_cache_manager_with_transfer.cc:390-425`;
      `BlockTransportServerPushSession::StartStream`,
-     `tpu_sync/transport/block_transport_session.cc:334-454`).** `StartStream`
-     holds `incoming_push_lease_held = true` (`in_flight_ > 0`) across
-     `CompleteIncomingPush` (`:439`, which dispatches H2D) and
-     `OnBlockShardsReceived` (`:446`), clearing it only at `:448` before the
-     trailing ACK `WriteExact` (`:453`); a second stream concurrently admitted
-     before `draining_` and rejected by `CompleteIncomingPush` (`AlreadyExists`)
-     likewise exits via `absl::Cleanup end_incoming_push`, calling
-     `EndIncomingPush(uuid, InternalError("Incoming push failed"))`. If H2D has
-     already completed OK (`draining_ = true, status_ = OK`),
-     `end_incoming_push` calls `Finish(status)` and overwrites `status_` with
-     `INTERNAL` before `EndRecvOp` settles `done_ = true`.
+     `block_transport_session.cc:334-448`) — not reachable from in-tree
+     senders.** `StartStream` passes `InternalError` only if it fails before
+     `incoming_push_lease_held = false`; after its data landed only
+     `CompleteIncomingPush` / `OnBlockShardsReceived` can fail, which needs a
+     duplicate or extra stream (excluded by honest senders, `Transport.lean`
+     A4). A stream failing earlier means data never arrived, so the failure is
+     genuine.
   2. **`KVCacheManagerWithTransfer::UnregisterActivePlan`
-     (`kv_cache_manager_with_transfer.cc:917-946`).** Checks
-     `!it->second->Done()` under `mu_` (`:927`, `:932`), unlocks `mu_` (`:936`),
-     and calls `Finish(CancelledError("receive plan unregistered"))` (`:938`,
-     `:943`). Either while `in_flight_ > 0` after all H2Ds completed OK (before
-     `EndIncomingPush` releases the push lease — in which case
-     `EndIncomingPush(uuid, OkStatus())` at `:413-417` also spuriously returns
-     `CancelledError` to `StartStream`, failing the sender's push ACK) **or** in
-     the race window after `Done()` becomes `true` between `:927` and `:938`,
-     `status_` flips from `OK` to `CANCELLED` (and on `ReshardReceiveSession`,
-     if `in_flight_ > 0`, `EndRecvOp` fires `on_settled_` with `CANCELLED` into
-     `RecordPoolReshardTerminalLocked`).
-  3. **Delayed control-channel reply on `StartRead`
+     (`kv_cache_manager_with_transfer.cc:912-946`) — race real, no production
+     caller.** The `!Done()` check under `mu_` then `Finish(Cancelled)` outside
+     it can land after the data completed (and makes `EndIncomingPush(OK)`
+     return `CancelledError`, failing the sender's ACK). Receive-side
+     `UnregisterActivePlan` is reached only through the Python
+     `unregister_active_plan` API, which nothing calls in tpu-sync,
+     tpu-inference, vllm-torchtpu or sglang-torchtpu; cancel-wins on a race is
+     also a defensible meaning.
+  3. **Late control reply on `StartRead`
      (`TransferReceiveSession::ExecutePullRequest`,
-     `transfer_receive_session.cc:629-665` +
+     `transfer_receive_session.cc:629-664`;
      `KVCacheManagerWithTransfer::HandlePullStream`,
-     `kv_cache_manager_with_transfer.cc:1525-1547`).** `HandlePullStream`
-     detaches the producer's `StartPush` worker (`:1533`) *before* returning
-     `PullStreamResponseSpec` on the control channel (`:1546`). If the TCP data
-     push and every layer's H2D complete OK before a delayed or timed-out
-     control reply invokes `on_response`, `self->FinishLocked(pull_status)`
-     (`:658`) overwrites `status_ = OK` with the control error even when `done_`
-     is already `true` (`CompleteReadWithDetails` reads `session->GetStatus()`
-     at poll time, `:1222`).
-  4. **Manager shutdown (`~KVCacheManagerWithTransfer`,
-     `kv_cache_manager_with_transfer.cc:568-587`).** Calls
-     `session->Finish(CancelledError("... shutting down"))` on every entry in
-     `active_recv_sessions_` and `active_pool_reshard_recvs_`, including
-     already-settled `done_ == true && status_.ok()` entries, corrupting
-     `GetStatus()` / `AwaitForDone()` for any holder.
-- **Consequence:** not memory corruption — destination HBM already holds the
-  complete KV blocks and `in_flight_` still drains before `Done()` — so the
-  caller discards a completed transfer and recomputes or fails the request
-  unnecessarily (and in Path 2 also fails the sender's trailing push ACK).
+     `kv_cache_manager_with_transfer.cc:1525-1547`) — reachable in production
+     (alongside the deadline sweep's check-then-`Finish` window).**
+     `HandlePullStream` detaches `StartPush` before returning the response. If
+     the reply fails on the return leg after the push and every H2D completed,
+     `on_response` runs `self->FinishLocked(pull_status)` (`:662`) and the
+     session settles failed. This happens **before** `done_`, not after: the
+     handshake op (`InitFromLoadPlan`, `in_flight_ = 1`) is released only by
+     `on_response`'s `end_op` (`:631`). Narrow: `control_timeout_s_` =
+     `kPullRegistrationGrace` + slack (`:91-95`) is sized so the reply
+     normally arrives first. (Separately, in `CompleteReadWithDetails`,
+     `!IsDraining()` / `IsReadyToComplete()` and `Finish(DeadlineExceededError)`
+     take separate `session->mu_` locks at `:1185-1188`, `:1211-1222`, and
+     `:1243-1250`, so an H2D or push callback completing OK in between right at
+     `deadline()` is likewise overwritten.)
+  4. **`~KVCacheManagerWithTransfer` (`:555-587`) — no observable effect.** No
+     `CompleteReadWithDetails` poll can follow teardown, so the flipped status
+     is never published.
+- **Consequence:** no data corruption (HBM holds every block). A completed P/D
+  receive is reported in `failed_recving`; under vLLM's default
+  `kv_load_failure_policy = "fail"` the request ends `FINISHED_ERROR`, under
+  `"recompute"` the prefill is redone.
 - **Test output** (unedited; OSS Bazel on unmodified `42dda542`):
 
   ```
@@ -1381,7 +1384,23 @@ have not been rebuilt since the runs their entries record.
   [  FAILED  ] RecvLateFinishBughunt.LateControlPullReplyErrorAfterCompletedH2dMustNotFlipReceivedToFailed
   [  FAILED  ] RecvLateFinishBughunt.PoolReshardUnregisterAfterCompletedPoolH2dMustNotFlipReceivedToFailed
   ```
-- **Fix:** move the `if (draining_ || done_) return;` (`if (done_ || finalizing_) return;`) early return **above** `if (!status.ok() && status_.ok()) { status_ = status; ... }` in `TransferReceiveSession::FinishLocked`, `ReshardReceiveSession::FinishLocked`, and `ReshardSendSession::Finish`, matching `TransferSendSession::FinishLocked` ("first `Finish` wins").
+- **Fix:** gate **recording the error** (not `draining_ = true` itself, which
+  the final `Finish(OkStatus())` call still needs to set!) once every upload
+  has completed OK: in `TransferReceiveSession::FinishLocked`, set
+  `all_layers_ok_ = true` at `ExecuteLayerH2d` (`:889`) and host-only
+  `RecordNetworkCompleteLocked` (`:603`) and guard the assignment with
+  `if (!status.ok() && status_.ok() && !done_ && !all_layers_ok_)`; in
+  `ReshardReceiveSession::FinishLocked`, guard the assignment with
+  `if (!status.ok() && status_.ok() && !done_ && !network_completed_)` (since
+  `FinishPoolH2d` sets `network_completed_ = true` at `:699` *before* calling
+  `Finish(terminal_status)` at `:702`, returning early on `network_completed_`
+  before `draining_ = true` would prevent `done_` from ever becoming `true`);
+  and in `ReshardSendSession::Finish`, move `if (done_ || finalizing_) return;`
+  to the top (safe there because `ReshardSendSession` has no `IsReadyToComplete`
+  poll). **Do not** copy `TransferSendSession`'s `if (draining_ || done_) return;`
+  onto `TransferReceiveSession::FinishLocked` (the fix originally proposed here):
+  it would drop an H2D failure that lands after the poll-side `Finish()` and
+  publish `done_recving` over a failed copy.
 
 ---
 
@@ -2039,8 +2058,9 @@ there) drove a receive to settle OK (`FinishCopy(0, OkStatus)` → done, staging
 released, data on device) and then called `Finish(CancelledError)`: the poll
 reported the receive in `failed_recving`. Rather than pinning the flip in a
 coverage test, **F14** (`transfer_receive_late_finish_bughunt_test.cc`, above)
-confirms all four production reachability paths across `TransferReceiveSession`
-and `ReshardReceiveSession` on unmodified `42dda542`.
+drives four candidate paths across `TransferReceiveSession`
+and `ReshardReceiveSession` on unmodified `42dda542` (one of them, the late pull
+reply, is reachable in production; §F14).
 
 Runs: 18/18 at `c9bc124` (2026-10-28, OSS Bazel recipe in the fork notes) and
 9/9 at `42dda542` the same day, with the full `transfer_send_session_test`
@@ -2399,3 +2419,18 @@ clone reset. Results, verbatim:
   `Reshard/Coordinator/Coverage.lean`, 7/7 pass `--runs_per_test=5` on
   `42dda542`), and checked `Transport` A2 & A3 against the in-repo controllers
   (`R-B` above and `Transport.lean` §Assumptions).
+- 2026-10-30 (later): **F14 audited and corrected.** Of the four tested paths,
+  only the late `ExecutePullRequest` reply is reachable in production (alongside
+  a near-deadline check-then-`Finish` window across separate `session->mu_`
+  lock scopes in `CompleteReadWithDetails` on `TransferReceiveSession`,
+  `ReshardReceiveSession`, and `ReshardSendSession`), and the pull reply lands
+  before `done_` (the handshake op), not after; `end_incoming_push` needs a
+  duplicate stream, receive-side `UnregisterActivePlan` has no caller in
+  tpu-sync or the connector repos, and the destructor's flip is never
+  published. Replaced the proposed fix on `TransferReceiveSession` (copy the
+  sender's `if (draining_ || done_) return;`), which would publish
+  `done_recving` over an H2D that fails after the poll-side `Finish()`, with
+  gating `status_ = status` on `!done_ && !all_layers_ok_` (and `!done_ &&
+  !network_completed_` on `ReshardReceiveSession`, without skipping
+  `draining_ = true`). Also corrected the claim that no OK-draining state has
+  incomplete HBM: the poll-side `Finish()` creates one.
