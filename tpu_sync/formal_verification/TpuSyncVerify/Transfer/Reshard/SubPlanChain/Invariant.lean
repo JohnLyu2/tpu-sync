@@ -54,33 +54,23 @@ theorem planSubTransfers_no_aliased_window_split {args : PlanArgs} {chain : SubT
         windowsForTag (counts.getD i 0) (windows.getD i 0)
       hasWindowedTagSharingIds (idsByTag args.dstDeviceBlockIds counts) winPerTag = false := by
   unfold planSubTransfers at hplan
-  split at hplan
-  · cases hplan
-  split at hplan
-  · injection hplan with h; subst h; simp at hgt
-  split at hplan
-  · cases hplan
+  split at hplan; · cases hplan
+  split at hplan; · injection hplan with h; subst h; simp at hgt
+  split at hplan; · cases hplan
   cases hcnt :
       (if args.dstBlockCounts.isEmpty then
         if args.numTags != 1 then none else some [args.dstDeviceBlockIds.length]
       else if args.dstBlockCounts.length != args.numTags then none
       else some args.dstBlockCounts) with
-  | none =>
-    simp only [hcnt] at hplan
-    injection hplan with h; subst h; simp at hgt
+  | none => simp only [hcnt] at hplan; injection hplan with h; subst h; simp at hgt
   | some counts =>
     simp only [hcnt] at hplan
-    split at hplan
-    · injection hplan with h; subst h; simp at hgt
-    split at hplan
-    · injection hplan with h; subst h; simp at hgt
+    split at hplan; · injection hplan with h; subst h; simp at hgt
+    split at hplan; · injection hplan with h; subst h; simp at hgt
     rename_i hno_share
-    split at hplan
-    · injection hplan with h; subst h; simp at hgt
-    injection hplan with h
-    subst h
-    refine ⟨by simp, counts, ?_⟩
-    simpa using hno_share
+    split at hplan; · injection hplan with h; subst h; simp at hgt
+    injection hplan with h; subst h
+    exact ⟨by simp, counts, by simpa using hno_share⟩
 
 /-! ## Part II — Worker chain folding -/
 
@@ -101,14 +91,9 @@ private theorem nodup_append_single {l : List Nat} {x : Nat} (h : l.Nodup) (hx :
   | nil => simp
   | cons a t ih =>
     rw [List.nodup_cons] at h
-    simp only [List.cons_append, List.nodup_cons]
-    refine ⟨?_, ih h.2 (fun hm => hx (List.mem_cons_of_mem _ hm))⟩
-    intro hm
-    rcases List.mem_append.mp hm with hm | hm
-    · exact h.1 hm
-    · simp only [List.mem_singleton] at hm
-      subst hm
-      exact hx (List.mem_cons_self ..)
+    simp only [List.cons_append, List.nodup_cons, List.mem_append, List.mem_singleton]
+    exact ⟨fun hm => hm.elim h.1 fun e => hx (e ▸ List.mem_cons_self ..),
+      ih h.2 fun hm => hx (List.mem_cons_of_mem _ hm)⟩
 
 theorem insertNodup_nodup {x : Nat} {xs : List Nat} (h : xs.Nodup) : (insertNodup x xs).Nodup := by
   unfold insertNodup
@@ -246,19 +231,13 @@ private theorem foldRecord_shape (settled : List SubSession) :
       rcases hrt : recordTerminal acc.chain s with ⟨c', t⟩
       rw [hrt] at h hn' hb' hgood
       cases t with
-      | supersededIgnored => subst h; exact ⟨hn', hb', hlog⟩
-      | failedIgnored => subst h; exact ⟨hn', hb', hlog⟩
-      | settledPartial => subst h; exact ⟨hn', hb', hlog⟩
       | done k idx =>
         subst h
-        refine ⟨hn', hb', ?_⟩
-        intro e he
+        refine ⟨hn', hb', fun e he => ?_⟩
         rcases List.mem_append.mp he with he | he
         · exact hlog e he
-        · simp only [List.mem_singleton] at he
-          subst he
-          exact hgood k idx rfl
-      | failed => subst h; exact ⟨hn', hb', hlog⟩
+        · simp only [List.mem_singleton] at he; subst he; exact hgood k idx rfl
+      | _ => subst h; exact ⟨hn', hb', hlog⟩
     obtain ⟨hn1, hb1, hlog1⟩ := hstep _ rfl
     exact ih _ hn1 hb1 hrest hlog1
 
@@ -278,29 +257,21 @@ theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
   cases e with
   | registerSubPlan uuid index count =>
     simp only [WorkerState.step] at hstep
-    split at hstep
-    · cases hstep
-    split at hstep
-    · cases hstep
+    split at hstep; · cases hstep
+    split at hstep; · cases hstep
     rename_i hidx
     injection hstep with h; subst h
     obtain ⟨hn, hb⟩ := noteSubPlanRegistered_shape w.chain uuid index count
       hinv.settledNodup hinv.settledBound
-    refine ⟨⟨hinv.safe.doneAfterAll⟩, hn, hb, ?_⟩
-    intro s hs
+    refine ⟨⟨hinv.safe.doneAfterAll⟩, hn, hb, fun s hs => ?_⟩
     rcases List.mem_append.mp hs with hs | hs
     · exact hinv.activeIndex s hs
-    · simp only [List.mem_singleton] at hs
-      subst hs
-      simp only [Nat.not_le] at hidx
-      exact hidx
+    · simp only [List.mem_singleton] at hs; subst hs; exact Nat.lt_of_not_ge hidx
   | settleSession uuid ok =>
     simp only [WorkerState.step] at hstep
-    split at hstep
-    · cases hstep
+    split at hstep; · cases hstep
     injection hstep with h; subst h
-    refine ⟨⟨hinv.safe.doneAfterAll⟩, hinv.settledNodup, hinv.settledBound, ?_⟩
-    intro s' hs'
+    refine ⟨⟨hinv.safe.doneAfterAll⟩, hinv.settledNodup, hinv.settledBound, fun s' hs' => ?_⟩
     obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
     have := hinv.activeIndex s hs
     split <;> simpa using this
@@ -312,7 +283,6 @@ theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
       hinv.settledNodup hinv.settledBound hsettled
     generalize WorkerState.recordAll w.chain (w.active.filter (·.done)) = r at hstep hr
     obtain ⟨hn1, hb1, hlog⟩ := hr
-    -- The sweep keeps `settled` or erases the entry.
     have hsweep : ∀ (c2 : ChainProgress) (b : SweepOutcome),
         (if stalled && !r.touched then sweepStalledChain r.chain (w.active.filter (!·.done))
          else (r.chain, .notSwept)) = (c2, b) →
@@ -320,26 +290,17 @@ theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
       intro c2 b h
       split at h
       · unfold sweepStalledChain at h
-        split at h
-        · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
-        split at h
-        · injection h with h1 _; subst h1; exact ⟨List.nodup_nil, fun _ h => by cases h⟩
-        split at h
-        · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
-        · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
+        split at h; · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
+        split at h; · injection h with h1 _; subst h1; exact ⟨List.nodup_nil, fun _ h => by cases h⟩
+        split at h <;> (injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩)
       · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
     generalize hr2 : (if stalled && !r.touched then sweepStalledChain r.chain (w.active.filter (!·.done))
         else (r.chain, .notSwept)) = r2 at hstep
     rcases r2 with ⟨c2, sweep⟩
     obtain ⟨hn2, hb2⟩ := hsweep c2 sweep hr2
     injection hstep with h; subst h
-    refine ⟨⟨?_⟩, hn2, hb2, ?_⟩
-    · intro e he
-      rcases List.mem_append.mp he with he | he
-      · exact hinv.safe.doneAfterAll e he
-      · exact hlog e he
-    · intro s hs
-      exact hinv.activeIndex s (List.mem_filter.mp hs).1
+    refine ⟨⟨fun e he => (List.mem_append.mp he).elim (hinv.safe.doneAfterAll e) (hlog e)⟩,
+      hn2, hb2, fun s hs => hinv.activeIndex s (List.mem_filter.mp hs).1⟩
 
 /-- **Main worker theorem (`reachable_worker_safe`)**: in every reachable state of
 `WorkerState.step`, `DoneAfterAllSubPlans` holds. -/
@@ -415,20 +376,29 @@ def ClaimReleased (s : CoordChainState) : Prop :=
 def RemainingUnvoted (s : CoordChainState) : Prop :=
   ∀ j, s.winIdx ≤ j → ∀ w ∈ s.winSrcUnits.getD j [], w ∉ s.reg.completedUnits
 
-def Running (s : CoordChainState) : Prop :=
-  s.winPhase = .idle ∨ s.winPhase = .arming ∨ s.winPhase = .dispatching
+/-- Per-`winPhase` shape of destination arming and Stage 2 sender results. -/
+def WinPhaseInv (s : CoordChainState) : Prop :=
+  match s.winPhase with
+  | .idle | .succeeded => ∀ d ∈ s.dstStates, d.curWinArmed = false
+  | .arming => s.sendResults = [] ∧ ∀ d ∈ s.dstStates, d.curWinArmed = armOk s.armResults d.unit
+  | .dispatching => ∀ d ∈ s.dstStates, d.curWinArmed = true
+  | .aborted => True
 
+/-- Per-`transferStatus` shape of window progress and the registry claim. -/
 def PhaseShape (s : CoordChainState) : Prop :=
-  (s.transferStatus = .notStarted ∧ s.winIdx = 0 ∧ s.winPhase = .idle ∧
-    s.activeSenders = [] ∧ RegIdle s) ∨
-  (s.transferStatus = .inProgress ∧ s.winIdx = 0 ∧ s.winPhase = .idle ∧
-    s.activeSenders = [] ∧ RegIdle s) ∨
-  (s.transferStatus = .inProgress ∧ s.winIdx < s.winSrcUnits.length ∧ Running s ∧
-    (s.winIdx = 0 → s.winPhase ≠ .idle ∧ (s.winPhase = .arming → s.activeSenders = [])) ∧
-    ClaimedBy s ∧ RemainingUnvoted s) ∨
-  (((s.transferStatus = .completed ∧ s.winIdx + 1 = s.winSrcUnits.length ∧
-      s.winPhase = .succeeded) ∨ s.transferStatus = .failed) ∧
-    (ClaimedBy s ∨ ClaimReleased s))
+  match s.transferStatus with
+  | .notStarted =>
+    s.winIdx = 0 ∧ s.winPhase = .idle ∧ s.activeSenders = [] ∧ RegIdle s
+  | .inProgress =>
+    (s.winIdx = 0 ∧ s.winPhase = .idle ∧ s.activeSenders = [] ∧ RegIdle s) ∨
+    (s.winIdx < s.winSrcUnits.length ∧
+      (s.winIdx = 0 → s.winPhase ≠ .idle ∧ (s.winPhase = .arming → s.activeSenders = [])) ∧
+      ClaimedBy s ∧ RemainingUnvoted s)
+  | .completed =>
+    s.winIdx + 1 = s.winSrcUnits.length ∧ s.winPhase = .succeeded ∧
+    (ClaimedBy s ∨ ClaimReleased s)
+  | .failed =>
+    ClaimedBy s ∨ ClaimReleased s
 
 /-- Inductive invariant of `CoordChainState.step`. -/
 structure CoordChainInv (s : CoordChainState) : Prop where
@@ -439,39 +409,29 @@ structure CoordChainInv (s : CoordChainState) : Prop where
   activeSrc : ∀ u ∈ s.activeSenders, u ∈ s.allSrcUnits ∧ u ∉ s.reg.completedUnits
   activeClaimed : s.activeSenders ≠ [] → ClaimedBy s
   oneLease : ∀ d ∈ s.dstStates, d.prevSessionActive = true → d.curWinArmed = false
-  armShape : s.winPhase = .arming → ∀ d ∈ s.dstStates, d.curWinArmed = armOk s.armResults d.unit
-  dispShape : s.winPhase = .dispatching → ∀ d ∈ s.dstStates, d.curWinArmed = true
-  restShape : (s.winPhase = .idle ∨ s.winPhase = .succeeded) →
-    ∀ d ∈ s.dstStates, d.curWinArmed = false
-  noPushArming : s.winPhase = .arming → s.sendResults = []
+  winShape : WinPhaseInv s
   phase : PhaseShape s
 
 theorem CoordChainInv.toSafe {s : CoordChainState} (h : CoordChainInv s) : CoordChainSafe s where
   regInv := h.regInv
   noSenderExposed := h.noExposed
-  noPushBeforeAllArmed := h.noPushArming
-  allArmedWhileDispatching := h.dispShape
+  noPushBeforeAllArmed := fun hp => by
+    have hw := h.winShape; simp only [WinPhaseInv, hp] at hw; exact hw.1
+  allArmedWhileDispatching := fun hp => by
+    have hw := h.winShape; simp only [WinPhaseInv, hp] at hw; exact hw
   oneWindowStaged := h.oneLease
-  completedOnlyAtChainEnd := by
-    intro hc
-    rcases h.phase with ⟨ht, _⟩ | ⟨ht, _⟩ | ⟨ht, _⟩ | ⟨⟨_, hl, hp⟩ | ht, _⟩
-    · rw [hc] at ht; cases ht
-    · rw [hc] at ht; cases ht
-    · rw [hc] at ht; cases ht
-    · exact ⟨hl, hp⟩
-    · rw [hc] at ht; cases ht
+  completedOnlyAtChainEnd := fun hc => by
+    have hp := h.phase; simp only [PhaseShape, hc] at hp; exact ⟨hp.1, hp.2.1⟩
   claimHeldAcrossWindows := by
     intro hst hrun
-    rcases h.phase with ⟨ht, _⟩ | ⟨_, hi, hp, _⟩ | ⟨_, _, _, _, hcl, _⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-    · rw [hst] at ht; cases ht
+    have hp := h.phase; simp only [PhaseShape, hst] at hp
+    rcases hp with ⟨hi, hidle, _⟩ | ⟨_, _, hcl, _⟩
     · rcases hrun with hne | hpos
-      · exact absurd hp hne
+      · exact absurd hidle hne
       · omega
     · exact hcl
-    · rw [hst] at ht; cases ht
-    · rw [hst] at ht; cases ht
 
-/-! ### Registry and list helpers -/
+/-! ### Registry, list, and abort helpers -/
 
 private theorem lookupAndClaim_when_claimed {reg reg' : RegGen} {owner : Nat} {units : List Nat}
     (hinv : Registry.Inv reg) (hc : reg.claimedUnits = some units) (ho : reg.claimOwners = [owner])
@@ -479,12 +439,9 @@ private theorem lookupAndClaim_when_claimed {reg reg' : RegGen} {owner : Nat} {u
     reg'.claimedUnits = some units ∧ reg'.claimOwners = [owner] ∧
     reg'.completedUnits = reg.completedUnits := by
   dsimp only [RegGen.step] at hstep
-  split at hstep
-  · cases hstep
-  split at hstep
-  · cases hstep
-  split at hstep
-  · cases hstep
+  split at hstep; · cases hstep
+  split at hstep; · cases hstep
+  split at hstep; · cases hstep
   have hall : allVoted units reg.completedUnits = false := hinv.partialVotes units hc
   simp only [hall, Bool.false_eq_true, ↓reduceIte, Option.some.injEq] at hstep
   subst hstep
@@ -505,19 +462,17 @@ private theorem complete_claimed {reg : RegGen} {units : List Nat} {owner u : Na
 private theorem cancelIfUnclaimed_shape {reg reg' : RegGen}
     (hstep : RegGen.step reg .cancelIfUnclaimed = some reg') :
     reg' = reg ∨
-    (reg.claimedUnits = none ∧ reg'.claimedUnits = none ∧ reg'.claimOwners = [] ∧
-      reg'.completedUnits = []) := by
+      (reg.claimedUnits = none ∧
+       reg'.claimedUnits = none ∧ reg'.claimOwners = [] ∧ reg'.completedUnits = []) := by
   dsimp only [RegGen.step] at hstep
-  split at hstep
-  · injection hstep with h; exact Or.inl h.symm
-  split at hstep
-  · injection hstep with h; exact Or.inl h.symm
-  · rename_i hns
-    injection hstep with h; subst h
-    refine Or.inr ⟨?_, rfl, rfl, rfl⟩
-    cases hcl : reg.claimedUnits with
-    | none => rfl
-    | some _ => rw [hcl] at hns; simp at hns
+  split at hstep; · injection hstep with h; exact Or.inl h.symm
+  split at hstep; · injection hstep with h; exact Or.inl h.symm
+  rename_i hns
+  injection hstep with h; subst h
+  refine Or.inr ⟨?_, rfl, rfl, rfl⟩
+  cases hcl : reg.claimedUnits with
+  | none => rfl
+  | some _ => rw [hcl] at hns; simp at hns
 
 private theorem armOk_append (rs : List (Nat × ArmOutcome)) (u : Nat) (o : ArmOutcome) (v : Nat) :
     armOk (rs ++ [(u, o)]) v = (armOk rs v || (u == v && o == .ok)) := by
@@ -532,14 +487,6 @@ private theorem armOk_filter_ok (rs : List (Nat × ArmOutcome)) (v : Nat) :
     simp only [armOk, List.filter_cons] at ih ⊢
     split <;> simp_all [List.any_cons]
 
-private theorem armOk_false_of_not_reported {rs : List (Nat × ArmOutcome)} {v : Nat}
-    (h : armReported rs v = false) : armOk rs v = false := by
-  simp only [armReported, List.any_eq_false] at h
-  simp only [armOk, List.any_eq_false]
-  intro r hr
-  have := h r hr
-  simp_all
-
 private theorem armOk_of_reported_no_fail {rs : List (Nat × ArmOutcome)} {v : Nat}
     (hrep : armReported rs v = true) (hok : anyArmFailed rs = false) : armOk rs v = true := by
   simp only [armReported, List.any_eq_true] at hrep
@@ -547,8 +494,7 @@ private theorem armOk_of_reported_no_fail {rs : List (Nat × ArmOutcome)} {v : N
   obtain ⟨r, hr, hrv⟩ := hrep
   have := hok r hr
   simp only [armOk, List.any_eq_true]
-  refine ⟨r, hr, ?_⟩
-  simp_all
+  exact ⟨r, hr, by simp_all⟩
 
 private theorem getD_mem_of_lt {l : List (List Nat)} {j : Nat} (h : j < l.length) :
     l.getD j [] ∈ l := by
@@ -577,35 +523,12 @@ private theorem not_in_remaining {s : CoordChainState} {u : Nat}
 private theorem map_unit_preserved (ds : List ChainDstState) (f : ChainDstState → ChainDstState)
     (hf : ∀ d, (f d).unit = d.unit) : (ds.map f).map (·.unit) = ds.map (·.unit) := by
   rw [List.map_map]
-  apply List.map_congr_left
-  intro d _
-  exact hf d
+  exact List.map_congr_left fun d _ => hf d
 
-/-! ### Initial state and step preservation -/
-
-theorem init_coordChainInv {allSrcs : List Nat} {winSrcs : List (List Nat)} {dsts : List Nat}
-    {owner maxAtt : Nat} (hcfg : ValidChainCfg allSrcs winSrcs) :
-    CoordChainInv (CoordChainState.init allSrcs winSrcs dsts owner maxAtt) where
-  cfg := hcfg
-  dstShape := by simp [CoordChainState.init, List.map_map, Function.comp_def]
-  regInv := Registry.init_inv
-  noExposed := rfl
-  activeSrc := fun _ h => by cases h
-  activeClaimed := fun h => absurd rfl h
-  oneLease := by
-    intro d hd
-    simp only [CoordChainState.init, List.mem_map] at hd
-    obtain ⟨_, _, rfl⟩ := hd
-    intro h; cases h
-  armShape := fun h => by cases h
-  dispShape := fun h => by cases h
-  restShape := by
-    intro _ d hd
-    simp only [CoordChainState.init, List.mem_map] at hd
-    obtain ⟨_, _, rfl⟩ := hd
-    rfl
-  noPushArming := fun h => by cases h
-  phase := Or.inl ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+private theorem length_pos_of_ne_nil {l : List (List Nat)} (h : l ≠ []) : 0 < l.length := by
+  cases l with
+  | nil => exact absurd rfl h
+  | cons _ _ => simp
 
 /-- `syncSenderExposure` is the identity when no sender is active or the
 generation is claimed. -/
@@ -620,596 +543,462 @@ private theorem inv_syncSenderExposure {s : CoordChainState}
     CoordChainInv s.syncSenderExposure := by
   rw [syncSenderExposure_id h]; exact hinv
 
-private theorem length_pos_of_ne_nil {l : List (List Nat)} (h : l ≠ []) : 0 < l.length := by
-  cases l with
-  | nil => exact absurd rfl h
-  | cons _ _ => simp
+private theorem CoordChainInv.inProgress_active {s : CoordChainState} (h : CoordChainInv s)
+    (hst : s.transferStatus = .inProgress) (hne : s.winPhase ≠ .idle) :
+    s.winIdx < s.winSrcUnits.length ∧
+    (s.winIdx = 0 → s.winPhase = .arming → s.activeSenders = []) ∧
+    ClaimedBy s ∧ RemainingUnvoted s := by
+  have hp := h.phase; simp only [PhaseShape, hst] at hp
+  rcases hp with ⟨_, hidle, _⟩ | ⟨hl, hz, hc, hrem⟩
+  · exact absurd hidle hne
+  · exact ⟨hl, fun hw0 => (hz hw0).2, hc, hrem⟩
 
-set_option maxHeartbeats 800000 in
+/-- Shared preservation for `abortWindow` across Stage 0, Stage 1, and Stage 2. -/
+private theorem inv_abortWindow {stage : Nat} {s : CoordChainState}
+    (hcfg : ValidChainCfg s.allSrcUnits s.winSrcUnits)
+    (hdst : s.dstStates.map (·.unit) = s.dstUnits)
+    (hreg : Registry.Inv s.reg)
+    (hexp : s.activeSenderExposed = false)
+    (hasrc : ∀ u ∈ s.activeSenders, u ∈ s.allSrcUnits ∧ u ∉ s.reg.completedUnits)
+    (hacl : s.activeSenders ≠ [] → ClaimedBy s)
+    (hlease : ∀ d ∈ s.dstStates, d.prevSessionActive = true → d.curWinArmed = false)
+    (hab0 : stage ≤ 1 → s.winIdx = 0 → s.activeSenders = [] ∧ (ClaimedBy s ∨ ClaimReleased s))
+    (hab1 : ¬(stage ≤ 1 ∧ s.winIdx = 0) → ClaimedBy s) :
+    CoordChainInv (s.abortWindow stage) := by
+  unfold CoordChainState.abortWindow
+  by_cases hcond : stage ≤ 1 ∧ s.winIdx = 0
+  · obtain ⟨hact, hsh⟩ := hab0 hcond.1 hcond.2
+    have hcl := abandonIfClaimed_clears_single_owner s.reg s.allSrcUnits s.claimOwner hsh
+    have hif : (decide (stage ≤ 1) && (s.winIdx == 0)) = true := by simp [hcond.1, hcond.2]
+    simp only [hif, ↓reduceIte]
+    exact inv_syncSenderExposure (Or.inl hact)
+      ⟨hcfg, hdst, abandonIfClaimed_inv _ _ hreg, hexp,
+       (fun _ hv => by simp [hact] at hv), (fun h => absurd hact h),
+       hlease, trivial, Or.inr hcl⟩
+  · have hcl : ClaimedBy s := hab1 hcond
+    have hif : (decide (stage ≤ 1) && (s.winIdx == 0)) = false := by
+      simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not, beq_eq_false_iff_ne]
+      omega
+    simp only [hif, Bool.false_eq_true, ↓reduceIte]
+    exact inv_syncSenderExposure (Or.inr (by simp [hcl.1]))
+      ⟨hcfg, hdst, hreg, hexp, hasrc, hacl, hlease, trivial, Or.inl hcl⟩
+
+private theorem CoordChainInv.abort {stage : Nat} {s : CoordChainState} (h : CoordChainInv s)
+    (hab0 : stage ≤ 1 → s.winIdx = 0 → s.activeSenders = [] ∧ (ClaimedBy s ∨ ClaimReleased s))
+    (hab1 : ¬(stage ≤ 1 ∧ s.winIdx = 0) → ClaimedBy s) :
+    CoordChainInv (s.abortWindow stage) :=
+  inv_abortWindow h.cfg h.dstShape h.regInv h.noExposed h.activeSrc h.activeClaimed h.oneLease
+    hab0 hab1
+
+/-! ### Initial state and per-event preservation -/
+
+theorem init_coordChainInv {allSrcs : List Nat} {winSrcs : List (List Nat)} {dsts : List Nat}
+    {owner maxAtt : Nat} (hcfg : ValidChainCfg allSrcs winSrcs) :
+    CoordChainInv (CoordChainState.init allSrcs winSrcs dsts owner maxAtt) where
+  cfg := hcfg
+  dstShape := by simp [CoordChainState.init, List.map_map, Function.comp_def]
+  regInv := Registry.init_inv
+  noExposed := rfl
+  activeSrc := fun _ h => by cases h
+  activeClaimed := fun h => absurd rfl h
+  oneLease := by
+    intro d hd
+    obtain ⟨_, _, rfl⟩ := List.mem_map.mp hd
+    intro h; cases h
+  winShape := by
+    simp only [WinPhaseInv, CoordChainState.init]
+    intro d hd
+    obtain ⟨_, _, rfl⟩ := List.mem_map.mp hd
+    rfl
+  phase := ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+private theorem step_registerProducer {s s' : CoordChainState} {u : Nat}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s (.registerProducer u) = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, Bool.not_eq_true', not_or,
+    Decidable.not_not] at hg
+  cases hr : RegGen.step s.reg (.register u true) with
+  | none => rw [hr] at hstep; cases hstep
+  | some reg' =>
+    rw [hr] at hstep
+    simp only [Option.map_some, Option.some.injEq] at hstep
+    subst hstep
+    have hp := h.phase; simp only [PhaseShape, hg.1] at hp
+    obtain ⟨hi, hidle, hact, hc, ho, hcomp⟩ := hp
+    obtain ⟨hc', ho', hcomp'⟩ := register_preserves_idle_reg s.reg reg' u hc ho hcomp hr
+    refine ⟨h.cfg, h.dstShape, Registry.step_preserves_inv h.regInv hr, h.noExposed,
+      (fun _ hv => by simp [hact] at hv), (fun hne => absurd hact hne),
+      h.oneLease, h.winShape, ?_⟩
+    simp only [PhaseShape, hg.1]
+    exact ⟨hi, hidle, hact, hc', ho', hcomp'⟩
+
+private theorem step_startChainCoordination {s s' : CoordChainState}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s .startChainCoordination = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [bne_iff_ne, ne_eq, Decidable.not_not] at hg
+  injection hstep with hs; subst hs
+  have hp := h.phase; simp only [PhaseShape, hg] at hp
+  exact ⟨h.cfg, h.dstShape, h.regInv, h.noExposed, h.activeSrc, h.activeClaimed,
+    h.oneLease, h.winShape, Or.inl hp⟩
+
+private theorem step_startWindowPlan {s s' : CoordChainState} {planOk : Bool}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s (.startWindowPlan planOk) = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
+  obtain ⟨hst, hidle⟩ := hg
+  have hp := h.phase; simp only [PhaseShape, hst] at hp
+  have hw := h.winShape; simp only [WinPhaseInv, hidle] at hw
+  cases hr : RegGen.step s.reg (.lookupAndClaim s.claimOwner s.allSrcUnits) with
+  | none =>
+    simp only [hr, Option.some.injEq] at hstep; subst hstep
+    refine h.abort (fun _ hw0 => ?_) (fun hnot => ?_)
+    · rcases hp with ⟨_, _, hact, hc, ho, _⟩ | ⟨_, hz, _⟩
+      · exact ⟨hact, Or.inr ⟨hc, ho⟩⟩
+      · exact absurd hidle (hz hw0).1
+    · rcases hp with ⟨hi, _⟩ | ⟨_, _, hc, _⟩
+      · exact absurd ⟨Nat.zero_le 1, hi⟩ hnot
+      · exact hc
+  | some regClaimed =>
+    simp only [hr] at hstep
+    have hreg' : Registry.Inv regClaimed := Registry.step_preserves_inv h.regInv hr
+    have hclaimed : regClaimed.claimedUnits = some s.allSrcUnits ∧
+        regClaimed.claimOwners = [s.claimOwner] ∧
+        s.winIdx < s.winSrcUnits.length ∧
+        (∀ j, s.winIdx ≤ j → ∀ w ∈ s.winSrcUnits.getD j [], w ∉ regClaimed.completedUnits) ∧
+        (∀ u ∈ s.activeSenders, u ∈ s.allSrcUnits ∧ u ∉ regClaimed.completedUnits) ∧
+        (s.winIdx = 0 → s.activeSenders = []) := by
+      rcases hp with ⟨hi, _, hact, _, ho, hcomp⟩ | ⟨hl, hz, hc, hrem⟩
+      · obtain ⟨hc', ho', hcomp'⟩ := lookupAndClaim_from_idle_shape s.reg regClaimed
+          s.claimOwner s.allSrcUnits ho hcomp hr
+        refine ⟨hc', ho', hi ▸ length_pos_of_ne_nil h.cfg.winNonEmpty, ?_, ?_, fun _ => hact⟩
+        · intro _ _ _ _; rw [hcomp']; intro hm; cases hm
+        · intro u hu; rw [hact] at hu; cases hu
+      · obtain ⟨hc', ho', hcomp'⟩ := lookupAndClaim_when_claimed h.regInv hc.1 hc.2 hr
+        refine ⟨hc', ho', hl, ?_, ?_, fun hw0 => absurd hidle (hz hw0).1⟩
+        · intro j hj w hw; rw [hcomp']; exact hrem j hj w hw
+        · intro u hu; rw [hcomp']; exact h.activeSrc u hu
+    obtain ⟨hc', ho', hl, hrem', hasrc', hact0⟩ := hclaimed
+    split at hstep
+    · injection hstep with hs; subst hs
+      refine inv_syncSenderExposure (Or.inr (by simp [hc'])) ?_
+      refine ⟨h.cfg, h.dstShape, hreg', h.noExposed, hasrc', fun _ => ⟨hc', ho'⟩, h.oneLease,
+        ⟨rfl, fun d hd => by rw [hw d hd]; rfl⟩, ?_⟩
+      simp only [PhaseShape, hst]
+      exact Or.inr ⟨hl, fun hw0 => ⟨by decide, fun _ => hact0 hw0⟩, ⟨hc', ho'⟩, hrem'⟩
+    · injection hstep with hs; subst hs
+      exact inv_abortWindow h.cfg h.dstShape hreg' h.noExposed hasrc' (fun _ => ⟨hc', ho'⟩)
+        h.oneLease (fun _ hw0 => ⟨hact0 hw0, Or.inl ⟨hc', ho'⟩⟩) (fun _ => ⟨hc', ho'⟩)
+
+private theorem step_armDstResult {s s' : CoordChainState} {dstUnit : Nat} {outcome : ArmOutcome}
+    (h : CoordChainInv s)
+    (hstep : CoordChainState.step s (.armDstResult dstUnit outcome) = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
+  split at hstep; · cases hstep
+  split at hstep; · cases hstep
+  rename_i hadmit
+  injection hstep with hs; subst hs
+  have hw := h.winShape; simp only [WinPhaseInv, hg.2] at hw
+  have hbusy_false : outcome = .ok →
+      ∀ d ∈ s.dstStates, d.unit = dstUnit → d.prevSessionActive = false := by
+    intro hok d hd hu
+    simp only [Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true', not_or,
+      not_and] at hadmit
+    have := hadmit.1 hok
+    simp only [Bool.not_eq_true, List.any_eq_false, Bool.and_eq_true, beq_iff_eq, not_and] at this
+    exact this d hd hu
+  refine ⟨h.cfg, ?_, h.regInv, h.noExposed, h.activeSrc, h.activeClaimed, ?_, ?_, h.phase⟩
+  · rw [map_unit_preserved _ _ (fun _ => by split <;> rfl)]; exact h.dstShape
+  · intro d' hd'
+    obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
+    split
+    · rename_i hcond
+      simp only [Bool.and_eq_true, beq_iff_eq] at hcond
+      intro hprev
+      exact absurd hprev (by rw [hbusy_false hcond.2 d hd hcond.1]; decide)
+    · exact h.oneLease d hd
+  · simp only [WinPhaseInv, hg.2]
+    refine ⟨hw.1, fun d' hd' => ?_⟩
+    obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
+    have hd_arm := hw.2 d hd
+    split
+    · rename_i hcond
+      simp only [Bool.and_eq_true, beq_iff_eq] at hcond
+      simp [armOk_append, hcond.1, hcond.2]
+    · rename_i hcond
+      simp only [Bool.and_eq_true, beq_iff_eq, not_and] at hcond
+      simp only [armOk_append, hd_arm]
+      by_cases hu : dstUnit = d.unit
+      · simp [hu, beq_false_of_ne (fun hok => hcond hu.symm hok)]
+      · simp [beq_false_of_ne hu]
+
+private theorem step_retryBusyArm {s s' : CoordChainState}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s .retryBusyArm = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
+  split at hstep; · cases hstep
+  injection hstep with hs; subst hs
+  have hw := h.winShape; simp only [WinPhaseInv, hg.2] at hw
+  refine ⟨h.cfg, h.dstShape, h.regInv, h.noExposed, h.activeSrc, h.activeClaimed, h.oneLease,
+    ?_, h.phase⟩
+  simp only [WinPhaseInv, hg.2]
+  exact ⟨hw.1, fun d hd => by rw [armOk_filter_ok]; exact hw.2 d hd⟩
+
+private theorem step_finishWindowArm {s s' : CoordChainState}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s .finishWindowArm = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
+  obtain ⟨hst, harming⟩ := hg
+  split at hstep; · cases hstep
+  rename_i hg2
+  simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at hg2
+  obtain ⟨hallrep, _⟩ := hg2
+  simp only [Bool.not_eq_false] at hallrep
+  obtain ⟨hl, hz, hc, hrem⟩ := h.inProgress_active hst (by simp [harming])
+  have hw := h.winShape; simp only [WinPhaseInv, harming] at hw
+  split at hstep
+  · rename_i hnofail
+    simp only [Bool.not_eq_true'] at hnofail
+    injection hstep with hs; subst hs
+    refine ⟨h.cfg, h.dstShape, h.regInv, h.noExposed, h.activeSrc, h.activeClaimed, h.oneLease,
+      ?_, ?_⟩
+    · show ∀ d ∈ s.dstStates, d.curWinArmed = true
+      intro d hd
+      rw [hw.2 d hd]
+      simp only [allArmReported, List.all_eq_true] at hallrep
+      exact armOk_of_reported_no_fail
+        (hallrep d.unit (h.dstShape ▸ List.mem_map.mpr ⟨d, hd, rfl⟩)) hnofail
+    · simp only [PhaseShape, hst]
+      exact Or.inr ⟨hl, fun _ => ⟨by decide, fun hp => by cases hp⟩, hc, hrem⟩
+  · injection hstep with hs; subst hs
+    exact h.abort (fun _ hw0 => ⟨hz hw0 harming, Or.inl hc⟩) (fun _ => hc)
+
+private theorem step_sendSrcResult {s s' : CoordChainState} {srcUnit : Nat} {ok : Bool}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s (.sendSrcResult srcUnit ok) = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
+  obtain ⟨hst, hdisp⟩ := hg
+  split at hstep; · cases hstep
+  rename_i hg2
+  simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at hg2
+  have hmem : srcUnit ∈ s.winSrcUnits.getD s.winIdx [] := by
+    simpa [CoordChainState.curWindowSrcs] using hg2.1
+  injection hstep with hs; subst hs
+  obtain ⟨hl, _, hc, hrem⟩ := h.inProgress_active hst (by simp [hdisp])
+  have hw := h.winShape; simp only [WinPhaseInv, hdisp] at hw
+  have hsrc : srcUnit ∈ s.allSrcUnits ∧ srcUnit ∉ s.reg.completedUnits :=
+    ⟨(h.cfg.winSub _ (getD_mem_of_lt hl)).2 srcUnit hmem, hrem s.winIdx (Nat.le_refl _) srcUnit hmem⟩
+  refine inv_syncSenderExposure (Or.inr (by simp [hc.1])) ?_
+  refine ⟨h.cfg, h.dstShape, h.regInv, h.noExposed, ?_, fun _ => hc, h.oneLease, ?_, ?_⟩
+  · intro u hu
+    split at hu
+    · rcases mem_insertNodup.mp hu with rfl | hu
+      · exact hsrc
+      · exact h.activeSrc u hu
+    · exact h.activeSrc u hu
+  · simp only [WinPhaseInv, hdisp]; exact hw
+  · simp only [PhaseShape, hst]
+    exact Or.inr ⟨hl, fun _ => ⟨by simp [hdisp], fun hp => by rw [hdisp] at hp; cases hp⟩, hc, hrem⟩
+
+private theorem step_finishWindowSend {s s' : CoordChainState}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s .finishWindowSend = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
+  obtain ⟨hst, hdisp⟩ := hg
+  split at hstep; · cases hstep
+  obtain ⟨hl, _, hc, hrem⟩ := h.inProgress_active hst (by simp [hdisp])
+  split at hstep
+  · injection hstep with hs; subst hs
+    exact h.abort (fun hs _ => by omega) (fun _ => hc)
+  · let advanceDst : ChainDstState → ChainDstState := fun d =>
+      { d with prevSessionActive := d.prevSessionActive || d.curWinArmed, curWinArmed := false }
+    have hdst' : (s.dstStates.map advanceDst).map (·.unit) = s.dstUnits := by
+      rw [map_unit_preserved s.dstStates advanceDst (fun _ => rfl)]; exact h.dstShape
+    have hlease' : ∀ d ∈ s.dstStates.map advanceDst,
+        d.prevSessionActive = true → d.curWinArmed = false := by
+      intro d' hd'; obtain ⟨_, _, rfl⟩ := List.mem_map.mp hd'; exact fun _ => rfl
+    have hcur' : ∀ d ∈ s.dstStates.map advanceDst, d.curWinArmed = false := by
+      intro d' hd'; obtain ⟨_, _, rfl⟩ := List.mem_map.mp hd'; rfl
+    split at hstep
+    · rename_i hmore
+      injection hstep with hs; subst hs
+      refine ⟨h.cfg, hdst', h.regInv, h.noExposed, h.activeSrc, h.activeClaimed, hlease', hcur', ?_⟩
+      simp only [PhaseShape, hst]
+      exact Or.inr ⟨hmore, fun hw => by omega, hc, fun j hj => hrem j (Nat.le_of_succ_le hj)⟩
+    · rename_i hlast
+      injection hstep with hs; subst hs
+      refine ⟨h.cfg, hdst', h.regInv, h.noExposed, h.activeSrc, h.activeClaimed, hlease', hcur', ?_⟩
+      show s.winIdx + 1 = s.winSrcUnits.length ∧ _ ∧ _
+      exact ⟨by omega, rfl, Or.inl hc⟩
+
+private theorem step_settleDispatchedRecv {s s' : CoordChainState} {dstUnit : Nat}
+    (h : CoordChainInv s)
+    (hstep : CoordChainState.step s (.settleDispatchedRecv dstUnit) = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  injection hstep with hs; subst hs
+  have hunit : ∀ d : ChainDstState,
+      (if d.unit == dstUnit then { d with prevSessionActive := false } else d).unit = d.unit :=
+    fun _ => by split <;> rfl
+  have hcur : ∀ d : ChainDstState,
+      (if d.unit == dstUnit then { d with prevSessionActive := false } else d).curWinArmed =
+        d.curWinArmed :=
+    fun _ => by split <;> rfl
+  refine ⟨h.cfg, map_unit_preserved s.dstStates _ hunit ▸ h.dstShape, h.regInv,
+    h.noExposed, h.activeSrc, h.activeClaimed, ?_, ?_, h.phase⟩
+  · intro d' hd'
+    obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
+    split
+    · intro hp; cases hp
+    · exact h.oneLease d hd
+  · have hw := h.winShape
+    cases hp : s.winPhase <;> simp only [WinPhaseInv, hp] at hw ⊢
+    · intro d' hd'; obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'; rw [hcur]; exact hw d hd
+    · refine ⟨hw.1, fun d' hd' => ?_⟩
+      obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'; rw [hcur, hunit]; exact hw.2 d hd
+    · intro d' hd'; obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'; rw [hcur]; exact hw d hd
+    · intro d' hd'; obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'; rw [hcur]; exact hw d hd
+
+private theorem step_senderVoteComplete {s s' : CoordChainState} {srcUnit : Nat}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s (.senderVoteComplete srcUnit) = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  split at hstep; · cases hstep
+  rename_i hg
+  simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at hg
+  obtain ⟨hactive, hnorem⟩ := hg
+  have hactive' : srcUnit ∈ s.activeSenders := List.contains_iff_mem.mp (by simpa using hactive)
+  have hne : s.activeSenders ≠ [] := fun hn => by rw [hn] at hactive'; cases hactive'
+  have hc := h.activeClaimed hne
+  obtain ⟨hsrc_in, _⟩ := h.activeSrc srcUnit hactive'
+  rw [complete_claimed hc.1 hc.2 hsrc_in] at hstep
+  simp only [Option.map_some, Option.some.injEq] at hstep; subst hstep
+  split
+  · rename_i hall
+    have hempty : s.activeSenders.filter (· != srcUnit) = [] := by
+      refine List.eq_nil_iff_forall_not_mem.mpr fun v hv => ?_
+      obtain ⟨hv_act, hv_ne⟩ := List.mem_filter.mp hv
+      simp only [bne_iff_ne, ne_eq] at hv_ne
+      obtain ⟨hv_in, hv_unvoted⟩ := h.activeSrc v hv_act
+      simp only [allVoted, List.all_eq_true] at hall
+      rcases mem_insertNodup.mp (List.contains_iff_mem.mp (hall v hv_in)) with rfl | hm
+      · exact hv_ne rfl
+      · exact hv_unvoted hm
+    rw [hempty]
+    refine inv_syncSenderExposure (Or.inl rfl)
+      ⟨h.cfg, h.dstShape, Registry.retireLocked_inv s.reg, h.noExposed,
+       (fun _ hm => by cases hm), (fun hn => absurd rfl hn), h.oneLease, h.winShape, ?_⟩
+    have hp := h.phase
+    cases hst : s.transferStatus <;> simp only [PhaseShape, hst] at hp ⊢
+    · exact absurd hp.2.2.1 hne
+    · rcases hp with ⟨_, _, hact, _⟩ | ⟨hl, _, _, hrem⟩
+      · exact absurd hact hne
+      · exfalso
+        obtain ⟨hwne, hwsub⟩ := h.cfg.winSub _ (getD_mem_of_lt hl)
+        obtain ⟨w, hw⟩ := List.exists_mem_of_ne_nil _ hwne
+        simp only [allVoted, List.all_eq_true] at hall
+        rcases mem_insertNodup.mp (List.contains_iff_mem.mp (hall w (hwsub w hw))) with rfl | hm
+        · exact not_in_remaining hst (Bool.eq_false_iff.mpr hnorem) s.winIdx (Nat.le_refl _) hw
+        · exact hrem s.winIdx (Nat.le_refl _) w hw hm
+    · exact ⟨hp.1, hp.2.1, Or.inr ⟨rfl, rfl⟩⟩
+    · exact Or.inr ⟨rfl, rfl⟩
+  · rename_i hnall
+    refine inv_syncSenderExposure (Or.inr (by simp [hc.1])) ?_
+    have hreg' : Registry.Inv { s.reg with completedUnits := insertNodup srcUnit s.reg.completedUnits } := by
+      simpa [hnall] using Registry.step_preserves_inv h.regInv (complete_claimed hc.1 hc.2 hsrc_in)
+    have hasrc' : ∀ v ∈ s.activeSenders.filter (· != srcUnit),
+        v ∈ s.allSrcUnits ∧ v ∉ insertNodup srcUnit s.reg.completedUnits := by
+      intro v hv
+      obtain ⟨hv_act, hv_ne⟩ := List.mem_filter.mp hv
+      simp only [bne_iff_ne, ne_eq] at hv_ne
+      obtain ⟨hv_in, hv_unvoted⟩ := h.activeSrc v hv_act
+      exact ⟨hv_in, fun hm => (mem_insertNodup.mp hm).elim (fun e => hv_ne e) hv_unvoted⟩
+    refine ⟨h.cfg, h.dstShape, hreg', h.noExposed, hasrc', fun _ => hc, h.oneLease, h.winShape, ?_⟩
+    have hp := h.phase
+    cases hst : s.transferStatus <;> simp only [PhaseShape, hst] at hp ⊢
+    · exact absurd hp.2.2.1 hne
+    · rcases hp with ⟨_, _, hact, _⟩ | ⟨hl, hz, _, hrem⟩
+      · exact absurd hact hne
+      · refine Or.inr ⟨hl, fun hw0 => ⟨(hz hw0).1, fun ha => absurd ((hz hw0).2 ha) hne⟩, hc, ?_⟩
+        intro j hj w hw hm
+        rcases mem_insertNodup.mp hm with rfl | hm
+        · exact not_in_remaining hst (Bool.eq_false_iff.mpr hnorem) j hj hw
+        · exact hrem j hj w hw hm
+    · exact ⟨hp.1, hp.2.1, Or.inl hc⟩
+    · exact Or.inl hc
+
+private theorem step_cancelIfUnclaimed {s s' : CoordChainState}
+    (h : CoordChainInv s) (hstep : CoordChainState.step s .cancelIfUnclaimed = some s') :
+    CoordChainInv s' := by
+  simp only [CoordChainState.step] at hstep
+  cases hr : RegGen.step s.reg .cancelIfUnclaimed with
+  | none => rw [hr] at hstep; cases hstep
+  | some reg' =>
+    rw [hr] at hstep
+    simp only [Option.map_some, Option.some.injEq] at hstep; subst hstep
+    have hreg' := Registry.step_preserves_inv h.regInv hr
+    rcases cancelIfUnclaimed_shape hr with rfl | ⟨hnone, hc', ho', hcomp'⟩
+    · refine inv_syncSenderExposure ?_
+        ⟨h.cfg, h.dstShape, hreg', h.noExposed, h.activeSrc, h.activeClaimed,
+         h.oneLease, h.winShape, h.phase⟩
+      by_cases hact : s.activeSenders = []
+      · exact Or.inl hact
+      · exact Or.inr (by simp [(h.activeClaimed hact).1])
+    · have hact : s.activeSenders = [] :=
+        Classical.byContradiction fun hne => by
+          have := (h.activeClaimed hne).1; rw [hnone] at this; cases this
+      refine inv_syncSenderExposure (Or.inl hact)
+        ⟨h.cfg, h.dstShape, hreg', h.noExposed, (fun _ hm => by simp [hact] at hm),
+         (fun hne => absurd hact hne), h.oneLease, h.winShape, ?_⟩
+      have hp := h.phase
+      cases hst : s.transferStatus <;> simp only [PhaseShape, hst] at hp ⊢
+      · exact ⟨hp.1, hp.2.1, hp.2.2.1, hc', ho', hcomp'⟩
+      · rcases hp with ⟨hi, hidle, ha, _⟩ | ⟨_, _, hc, _⟩
+        · exact Or.inl ⟨hi, hidle, ha, hc', ho', hcomp'⟩
+        · exfalso; have := hc.1; rw [hnone] at this; cases this
+      · exact ⟨hp.1, hp.2.1, Or.inr ⟨hc', ho'⟩⟩
+      · exact Or.inr ⟨hc', ho'⟩
+
 theorem step_preserves_coordChainInv {s s' : CoordChainState} {e : ChainEv}
     (hinv : CoordChainInv s) (hstep : CoordChainState.step s e = some s') :
     CoordChainInv s' := by
-  obtain ⟨hcfg, hdst, hreg, hexp, hasrc, hacl, hlease, harm, hdisp, hrest, hnp, hph⟩ := hinv
   cases e with
-  | registerProducer u =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, Bool.not_eq_true', not_or,
-      Decidable.not_not] at hg
-    obtain ⟨hst, _⟩ := hg
-    cases hr : RegGen.step s.reg (.register u true) with
-    | none => rw [hr] at hstep; cases hstep
-    | some reg' =>
-      rw [hr] at hstep
-      simp only [Option.map_some, Option.some.injEq] at hstep
-      subst hstep
-      rcases hph with ⟨_, hi, hp, hact, hc, ho, hcomp⟩ | ⟨ht, _⟩ | ⟨ht, _⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-      · obtain ⟨hc', ho', hcomp'⟩ := register_preserves_idle_reg s.reg reg' u hc ho hcomp hr
-        refine ⟨hcfg, hdst, Registry.step_preserves_inv hreg hr, hexp, ?_, ?_, hlease, harm, hdisp,
-          hrest, hnp, Or.inl ⟨hst, hi, hp, hact, hc', ho', hcomp'⟩⟩
-        · intro v hv; rw [hact] at hv; cases hv
-        · intro h; exact absurd hact h
-      · rw [hst] at ht; cases ht
-      · rw [hst] at ht; cases ht
-      · rw [hst] at ht; cases ht
-      · rw [hst] at ht; cases ht
-
-  | startChainCoordination =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [bne_iff_ne, ne_eq, Decidable.not_not] at hg
-    injection hstep with h; subst h
-    rcases hph with ⟨_, hi, hp, hact, hidle⟩ | ⟨ht, _⟩ | ⟨ht, _⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-    · exact ⟨hcfg, hdst, hreg, hexp, hasrc, hacl, hlease, harm, hdisp, hrest, hnp,
-        Or.inr (Or.inl ⟨rfl, hi, hp, hact, hidle⟩)⟩
-    · rw [hg] at ht; cases ht
-    · rw [hg] at ht; cases ht
-    · rw [hg] at ht; cases ht
-    · rw [hg] at ht; cases ht
-
-  | startWindowPlan planOk =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
-    obtain ⟨hst, hidle⟩ := hg
-    have hpos : 0 < s.winSrcUnits.length := length_pos_of_ne_nil hcfg.winNonEmpty
-    have hrest_idle := hrest (Or.inl hidle)
-    -- Abort at Stage 0 from a state whose claim shape we know.
-    have habort : ∀ (s0 : CoordChainState), s0.allSrcUnits = s.allSrcUnits →
-        s0.winSrcUnits = s.winSrcUnits → s0.dstUnits = s.dstUnits → s0.claimOwner = s.claimOwner →
-        s0.winIdx = s.winIdx → s0.dstStates = s.dstStates → s0.activeSenders = s.activeSenders →
-        s0.activeSenderExposed = false → s0.sendResults = s.sendResults → s0.winPhase = .idle →
-        Registry.Inv s0.reg →
-        (s.winIdx ≠ 0 → ClaimedBy s0) →
-        (s.winIdx = 0 → s0.activeSenders = [] ∧
-          ((s0.reg.claimedUnits = none ∧ s0.reg.claimOwners = []) ∨ ClaimedBy s0)) →
-        (∀ u ∈ s0.activeSenders, u ∈ s0.allSrcUnits ∧ u ∉ s0.reg.completedUnits) →
-        (s0.activeSenders ≠ [] → ClaimedBy s0) →
-        CoordChainInv (CoordChainState.abortWindow 0 s0) := by
-      intro s0 h1 h2 h3 h4 h5 h6 h7 h8 h9 h10 hinv0 hcl0 hsh0 hasrc0 hacl0
-      unfold CoordChainState.abortWindow
-      simp only [Nat.zero_le, decide_true, Bool.true_and, beq_iff_eq]
-      split
-      · rename_i hw0
-        obtain ⟨hact, hshape⟩ := hsh0 (by rw [← h5]; exact hw0)
-        have hcl : (abandonIfClaimed s0.reg s0.claimOwner).claimedUnits = none ∧
-            (abandonIfClaimed s0.reg s0.claimOwner).claimOwners = [] := by
-          rcases hshape with ⟨hcn, ho⟩ | ⟨hc, ho⟩
-          · exact abandonIfClaimed_clears_single_owner s0.reg s0.allSrcUnits s0.claimOwner
-              (Or.inr ⟨hcn, ho⟩)
-          · exact abandonIfClaimed_clears_single_owner s0.reg s0.allSrcUnits s0.claimOwner
-              (Or.inl ⟨hc, ho⟩)
-        refine inv_syncSenderExposure (Or.inl hact) ?_
-        refine ⟨by rw [h1, h2]; exact hcfg, by rw [h6, h3]; exact hdst,
-          abandonIfClaimed_inv _ _ hinv0, h8, ?_, ?_, by rw [h6]; exact hlease,
-          (fun h => by cases h), (fun h => by cases h), (fun h => by rcases h with h | h <;> cases h),
-          (fun h => by cases h), ?_⟩
-        · intro v hv; rw [hact] at hv; cases hv
-        · intro h; exact absurd hact h
-        · exact Or.inr (Or.inr (Or.inr ⟨Or.inr rfl, Or.inr hcl⟩))
-      · rename_i hw0
-        have hcl : ClaimedBy s0 := hcl0 (by rw [← h5]; exact hw0)
-        have hsome : s0.reg.claimedUnits.isSome = true := by rw [hcl.1]; rfl
-        refine inv_syncSenderExposure (Or.inr hsome) ?_
-        refine ⟨by rw [h1, h2]; exact hcfg, by rw [h6, h3]; exact hdst, hinv0, h8, hasrc0, hacl0,
-          by rw [h6]; exact hlease,
-          (fun h => by cases h), (fun h => by cases h), (fun h => by rcases h with h | h <;> cases h),
-          (fun h => by cases h), ?_⟩
-        exact Or.inr (Or.inr (Or.inr ⟨Or.inr rfl, Or.inl hcl⟩))
-    cases hr : RegGen.step s.reg (.lookupAndClaim s.claimOwner s.allSrcUnits) with
-    | none =>
-      simp only [hr, Option.some.injEq] at hstep
-      subst hstep
-      -- `LookupAndClaim` refused: the registry is unchanged.
-      refine habort s rfl rfl rfl rfl rfl rfl rfl hexp rfl hidle hreg ?_ ?_ hasrc hacl
-      · intro hw0
-        rcases hph with ⟨_, hi, _⟩ | ⟨_, hi, _⟩ | ⟨_, _, _, _, hc, _⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-        · exact absurd hi hw0
-        · exact absurd hi hw0
-        · exact hc
-        · rw [hst] at ht; cases ht
-        · rw [hst] at ht; cases ht
-      · intro hw0
-        rcases hph with ⟨_, _, _, hact, hc, ho, _⟩ | ⟨_, _, _, hact, hc, ho, _⟩ |
-            ⟨_, _, _, hz, _⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-        · exact ⟨hact, Or.inl ⟨hc, ho⟩⟩
-        · exact ⟨hact, Or.inl ⟨hc, ho⟩⟩
-        · exact absurd hidle (hz hw0).1
-        · rw [hst] at ht; cases ht
-        · rw [hst] at ht; cases ht
-    | some regClaimed =>
-      simp only [hr] at hstep
-      have hreg' : Registry.Inv regClaimed := Registry.step_preserves_inv hreg hr
-      -- The claim shape after `LookupAndClaim`.
-      have hclaimed : regClaimed.claimedUnits = some s.allSrcUnits ∧
-          regClaimed.claimOwners = [s.claimOwner] ∧
-          (regClaimed.completedUnits = s.reg.completedUnits ∨ regClaimed.completedUnits = []) ∧
-          (s.winIdx = 0 → s.activeSenders = []) := by
-        rcases hph with ⟨ht, _⟩ | ⟨_, _, _, hact, _, ho, hcomp⟩ |
-            ⟨_, _, _, hz, hc, _⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-        · rw [hst] at ht; cases ht
-        · obtain ⟨hc', ho', hcomp'⟩ := lookupAndClaim_from_idle_shape s.reg regClaimed
-            s.claimOwner s.allSrcUnits ho hcomp hr
-          exact ⟨hc', ho', Or.inr hcomp', fun _ => hact⟩
-        · obtain ⟨hc', ho', hcomp'⟩ := lookupAndClaim_when_claimed hreg hc.1 hc.2 hr
-          exact ⟨hc', ho', Or.inl hcomp', fun hw0 => absurd hidle (hz hw0).1⟩
-        · rw [hst] at ht; cases ht
-        · rw [hst] at ht; cases ht
-      obtain ⟨hc', ho', hcomp', hact0⟩ := hclaimed
-      have hasrc' : ∀ u ∈ s.activeSenders, u ∈ s.allSrcUnits ∧ u ∉ regClaimed.completedUnits := by
-        intro u hu
-        obtain ⟨h1, h2⟩ := hasrc u hu
-        refine ⟨h1, ?_⟩
-        rcases hcomp' with h | h <;> rw [h]
-        · exact h2
-        · intro h; cases h
-      split at hstep
-      · -- `BuildPoolReshardPlan` succeeded: Stage 1 begins.
-        injection hstep with h; subst h
-        refine inv_syncSenderExposure (Or.inr (by simp [hc'])) ?_
-        refine ⟨hcfg, hdst, hreg', hexp, hasrc', fun _ => ⟨hc', ho'⟩, hlease, ?_,
-          (fun h => by cases h), (fun h => by rcases h with h | h <;> cases h), fun _ => rfl, ?_⟩
-        · intro _ d hd
-          rw [hrest_idle d hd]
-          rfl
-        · refine Or.inr (Or.inr (Or.inl ⟨hst, ?_, Or.inr (Or.inl rfl), ?_, ⟨hc', ho'⟩, ?_⟩))
-          · rcases hph with ⟨ht, _⟩ | ⟨_, hi, _⟩ | ⟨_, hl, _⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-            · rw [hst] at ht; cases ht
-            · rw [hi]; exact hpos
-            · exact hl
-            · rw [hst] at ht; cases ht
-            · rw [hst] at ht; cases ht
-          · intro hw0
-            exact ⟨(fun h => by cases h), fun _ => hact0 hw0⟩
-          · intro j hj w hw
-            rcases hph with ⟨ht, _⟩ | ⟨_, _, _, _, _, _, hcomp⟩ | ⟨_, _, _, _, _, hrem⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-            · rw [hst] at ht; cases ht
-            · rcases hcomp' with h | h <;> rw [h]
-              · rw [hcomp]; intro h; cases h
-              · intro h; cases h
-            · rcases hcomp' with h | h <;> rw [h]
-              · exact hrem j hj w hw
-              · intro h; cases h
-            · rw [hst] at ht; cases ht
-            · rw [hst] at ht; cases ht
-      · -- `BuildPoolReshardPlan` refused: abort with the claim taken.
-        injection hstep with h; subst h
-        exact habort { s with reg := regClaimed } rfl rfl rfl rfl rfl rfl rfl hexp rfl hidle hreg'
-          (fun _ => ⟨hc', ho'⟩) (fun hw0 => ⟨hact0 hw0, Or.inr ⟨hc', ho'⟩⟩) hasrc' (fun _ => ⟨hc', ho'⟩)
-
-  | armDstResult dstUnit outcome =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
-    obtain ⟨hst, harming⟩ := hg
-    split at hstep
-    · cases hstep
-    rename_i hg2
-    simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at hg2
-    obtain ⟨_, hnrep⟩ := hg2
-    split at hstep
-    · cases hstep
-    rename_i hadmit
-    injection hstep with h; subst h
-    have harm' := harm harming
-    have hbusy_false : outcome = .ok →
-        ∀ d ∈ s.dstStates, d.unit = dstUnit → d.prevSessionActive = false := by
-      intro hok d hd hu
-      simp only [Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true', not_or,
-        not_and] at hadmit
-      have := hadmit.1 hok
-      simp only [Bool.not_eq_true, List.any_eq_false, Bool.and_eq_true, beq_iff_eq,
-        not_and] at this
-      exact this d hd hu
-    refine ⟨hcfg, ?_, hreg, hexp, hasrc, hacl, ?_, ?_,
-      (fun h => by rw [harming] at h; cases h),
-      (fun h => by rcases h with h | h <;> rw [harming] at h <;> cases h), hnp, ?_⟩
-    · rw [map_unit_preserved _ _ (fun d => by split <;> rfl)]
-      exact hdst
-    · intro d' hd'
-      obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
-      split
-      · rename_i hcond
-        simp only [Bool.and_eq_true, beq_iff_eq] at hcond
-        intro hprev
-        exact absurd hprev (by rw [hbusy_false hcond.2 d hd hcond.1]; decide)
-      · exact hlease d hd
-    · intro _ d' hd'
-      obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
-      have hd_arm := harm' d hd
-      have hnotok := armOk_false_of_not_reported (Bool.eq_false_iff.mpr hnrep)
-      split
-      · rename_i hcond
-        simp only [Bool.and_eq_true, beq_iff_eq] at hcond
-        simp only [armOk_append, hcond.1, hcond.2, beq_self_eq_true, Bool.and_self, Bool.or_true]
-      · rename_i hcond
-        simp only [Bool.and_eq_true, beq_iff_eq, not_and] at hcond
-        simp only [armOk_append, hd_arm]
-        by_cases hu : dstUnit = d.unit
-        · have hno : outcome ≠ .ok := fun h => hcond hu.symm h
-          have : (outcome == .ok) = false := beq_false_of_ne hno
-          simp [hu, this]
-        · have : (dstUnit == d.unit) = false := beq_false_of_ne hu
-          simp [this]
-    · rcases hph with ⟨ht, _⟩ | ⟨_, _, hp, _⟩ | ⟨_, hl, _, hz, hc, hrem⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-      · rw [hst] at ht; cases ht
-      · rw [harming] at hp; cases hp
-      · refine Or.inr (Or.inr (Or.inl ⟨hst, hl, Or.inr (Or.inl harming), ?_, hc, hrem⟩))
-        intro hw0
-        exact ⟨(fun h => by rw [harming] at h; cases h), fun _ => (hz hw0).2 harming⟩
-      · rw [hst] at ht; cases ht
-      · rw [hst] at ht; cases ht
-
-  | retryBusyArm =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
-    obtain ⟨hst, harming⟩ := hg
-    split at hstep
-    · cases hstep
-    injection hstep with h; subst h
-    refine ⟨hcfg, hdst, hreg, hexp, hasrc, hacl, hlease, ?_,
-      (fun h => by rw [harming] at h; cases h),
-      (fun h => by rcases h with h | h <;> rw [harming] at h <;> cases h), hnp, ?_⟩
-    · intro _ d hd
-      rw [armOk_filter_ok]
-      exact harm harming d hd
-    · rcases hph with ⟨ht, _⟩ | ⟨_, _, hp, _⟩ | ⟨_, hl, _, hz, hc, hrem⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-      · rw [hst] at ht; cases ht
-      · rw [harming] at hp; cases hp
-      · exact Or.inr (Or.inr (Or.inl ⟨hst, hl, Or.inr (Or.inl harming), hz, hc, hrem⟩))
-      · rw [hst] at ht; cases ht
-      · rw [hst] at ht; cases ht
-
-  | finishWindowArm =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
-    obtain ⟨hst, harming⟩ := hg
-    split at hstep
-    · cases hstep
-    rename_i hg2
-    simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at hg2
-    obtain ⟨hallrep, _⟩ := hg2
-    simp only [Bool.not_eq_false] at hallrep
-    rcases hph with ⟨ht, _⟩ | ⟨_, _, hp, _⟩ | ⟨_, hl, _, hz, hc, hrem⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-    · rw [hst] at ht; cases ht
-    · rw [harming] at hp; cases hp
-    · split at hstep
-      · -- Every destination armed: Stage 2.
-        rename_i hnofail
-        simp only [Bool.not_eq_true'] at hnofail
-        injection hstep with h; subst h
-        refine ⟨hcfg, hdst, hreg, hexp, hasrc, hacl, hlease, (fun h => by cases h), ?_,
-          (fun h => by rcases h with h | h <;> cases h), (fun h => by cases h), ?_⟩
-        · intro _ d hd
-          rw [harm harming d hd]
-          have hmem : d.unit ∈ s.dstUnits := by
-            rw [← hdst]; exact List.mem_map.mpr ⟨d, hd, rfl⟩
-          have hrep : armReported s.armResults d.unit = true := by
-            simp only [allArmReported, List.all_eq_true] at hallrep
-            exact hallrep d.unit hmem
-          exact armOk_of_reported_no_fail hrep hnofail
-        · refine Or.inr (Or.inr (Or.inl ⟨hst, hl, Or.inr (Or.inr rfl), ?_, hc, hrem⟩))
-          intro _
-          exact ⟨(fun h => by cases h), (fun h => by cases h)⟩
-      · -- A destination refused: `return arm_status[i]`.
-        injection hstep with h; subst h
-        unfold CoordChainState.abortWindow
-        simp only [Nat.le_refl, decide_true, Bool.true_and, beq_iff_eq]
-        split
-        · rename_i hw0
-          have hact : s.activeSenders = [] := (hz hw0).2 harming
-          have hcl := abandonIfClaimed_clears_single_owner s.reg s.allSrcUnits s.claimOwner
-            (Or.inl hc)
-          refine inv_syncSenderExposure (Or.inl hact) ?_
-          refine ⟨hcfg, hdst, abandonIfClaimed_inv _ _ hreg, hexp, ?_, ?_, hlease,
-            (fun h => by cases h), (fun h => by cases h), (fun h => by rcases h with h | h <;> cases h),
-            (fun h => by cases h), ?_⟩
-          · intro v hv; rw [hact] at hv; cases hv
-          · intro h; exact absurd hact h
-          · exact Or.inr (Or.inr (Or.inr ⟨Or.inr rfl, Or.inr hcl⟩))
-        · refine inv_syncSenderExposure (Or.inr (by simp [hc.1])) ?_
-          refine ⟨hcfg, hdst, hreg, hexp, hasrc, hacl, hlease,
-            (fun h => by cases h), (fun h => by cases h), (fun h => by rcases h with h | h <;> cases h),
-            (fun h => by cases h), ?_⟩
-          exact Or.inr (Or.inr (Or.inr ⟨Or.inr rfl, Or.inl hc⟩))
-    · rw [hst] at ht; cases ht
-    · rw [hst] at ht; cases ht
-
-  | sendSrcResult srcUnit ok =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
-    obtain ⟨hst, hdispatching⟩ := hg
-    split at hstep
-    · cases hstep
-    rename_i hg2
-    simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at hg2
-    obtain ⟨hmem, _⟩ := hg2
-    simp only [Bool.not_eq_false] at hmem
-    injection hstep with h; subst h
-    rcases hph with ⟨ht, _⟩ | ⟨_, _, hp, _⟩ | ⟨_, hl, _, hz, hc, hrem⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-    · rw [hst] at ht; cases ht
-    · rw [hdispatching] at hp; cases hp
-    · have hsrc_mem : srcUnit ∈ s.allSrcUnits ∧ srcUnit ∉ s.reg.completedUnits := by
-        have hwin : s.winSrcUnits.getD s.winIdx [] ∈ s.winSrcUnits := getD_mem_of_lt hl
-        have hin : srcUnit ∈ s.winSrcUnits.getD s.winIdx [] := by
-          unfold CoordChainState.curWindowSrcs at hmem
-          exact List.contains_iff_mem.mp hmem
-        exact ⟨(hcfg.winSub _ hwin).2 srcUnit hin, hrem s.winIdx (Nat.le_refl _) srcUnit hin⟩
-      refine inv_syncSenderExposure (Or.inr (by simp [hc.1])) ?_
-      refine ⟨hcfg, hdst, hreg, hexp, ?_, fun _ => hc, hlease,
-        (fun h => by rw [hdispatching] at h; cases h), fun _ => hdisp hdispatching,
-        (fun h => by rcases h with h | h <;> rw [hdispatching] at h <;> cases h),
-        (fun h => by rw [hdispatching] at h; cases h), ?_⟩
-      · intro u hu
-        split at hu
-        · rcases mem_insertNodup.mp hu with rfl | hu
-          · exact hsrc_mem
-          · exact hasrc u hu
-        · exact hasrc u hu
-      · refine Or.inr (Or.inr (Or.inl ⟨hst, hl, Or.inr (Or.inr hdispatching), ?_, hc, hrem⟩))
-        intro _
-        exact ⟨(fun h => by rw [hdispatching] at h; cases h),
-          (fun h => by rw [hdispatching] at h; cases h)⟩
-    · rw [hst] at ht; cases ht
-    · rw [hst] at ht; cases ht
-
-  | finishWindowSend =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, bne_iff_ne, ne_eq, not_or, Decidable.not_not] at hg
-    obtain ⟨hst, hdispatching⟩ := hg
-    split at hstep
-    · cases hstep
-    rcases hph with ⟨ht, _⟩ | ⟨_, _, hp, _⟩ | ⟨_, hl, _, hz, hc, hrem⟩ | ⟨⟨ht, _⟩ | ht, _⟩
-    · rw [hst] at ht; cases ht
-    · rw [hdispatching] at hp; cases hp
-    · have hsome : s.reg.claimedUnits.isSome = true := by rw [hc.1]; rfl
-      split at hstep
-      · -- A sender RPC failed: `return status;` with the claim in place.
-        injection hstep with h; subst h
-        unfold CoordChainState.abortWindow
-        have h21 : ((2 : Nat) <= 1) = false := by decide
-        simp only [h21, Bool.false_eq_true]
-        refine inv_syncSenderExposure (Or.inr hsome) ?_
-        refine ⟨hcfg, hdst, hreg, hexp, hasrc, hacl, hlease,
-          (fun h => by cases h), (fun h => by cases h), (fun h => by rcases h with h | h <;> cases h),
-          (fun h => by cases h), ?_⟩
-        exact Or.inr (Or.inr (Or.inr ⟨Or.inr rfl, Or.inl hc⟩))
-      · have hdst' : (s.dstStates.map fun d =>
-            { d with prevSessionActive := d.prevSessionActive || d.curWinArmed,
-                     curWinArmed := false }).map (·.unit) = s.dstUnits := by
-          have hmap := map_unit_preserved s.dstStates
-            (fun d => { d with prevSessionActive := d.prevSessionActive || d.curWinArmed, curWinArmed := false })
-            (fun _ => rfl)
-          rw [hmap]
-          exact hdst
-        have hlease' : ∀ d ∈ (s.dstStates.map fun d =>
-            { d with prevSessionActive := d.prevSessionActive || d.curWinArmed,
-                     curWinArmed := false }), d.prevSessionActive = true → d.curWinArmed = false := by
-          intro d' hd'
-          obtain ⟨d, _, rfl⟩ := List.mem_map.mp hd'
-          intro _; rfl
-        have hrest' : ∀ d ∈ (s.dstStates.map fun d =>
-            { d with prevSessionActive := d.prevSessionActive || d.curWinArmed,
-                     curWinArmed := false }), d.curWinArmed = false := by
-          intro d' hd'
-          obtain ⟨d, _, rfl⟩ := List.mem_map.mp hd'
-          rfl
-        split at hstep
-        · -- Another window follows on `StartChain`.
-          rename_i hmore
-          injection hstep with h; subst h
-          refine ⟨hcfg, hdst', hreg, hexp, hasrc, fun h => hacl h, hlease',
-            (fun h => by cases h), (fun h => by cases h), fun _ => hrest', (fun h => by cases h), ?_⟩
-          refine Or.inr (Or.inr (Or.inl ⟨hst, hmore, Or.inl rfl, (fun h => by cases h), hc, ?_⟩))
-          intro j hj
-          exact hrem j (Nat.le_of_succ_le hj)
-        · -- Last window: `transfer_status_ = kCompleted`.
-          rename_i hlast
-          injection hstep with h; subst h
-          refine ⟨hcfg, hdst', hreg, hexp, hasrc, fun h => hacl h, hlease',
-            (fun h => by cases h), (fun h => by cases h), fun _ => hrest', (fun h => by cases h), ?_⟩
-          refine Or.inr (Or.inr (Or.inr ⟨Or.inl ⟨rfl, ?_, rfl⟩, Or.inl hc⟩))
-          show s.winIdx + 1 = s.winSrcUnits.length
-          omega
-    · rw [hst] at ht; cases ht
-    · rw [hst] at ht; cases ht
-
-  | settleDispatchedRecv dstUnit =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    injection hstep with h; subst h
-    have hunit : ∀ d : ChainDstState,
-        (if d.unit == dstUnit then { d with prevSessionActive := false } else d).unit = d.unit := by
-      intro d; split <;> rfl
-    have hcur : ∀ d : ChainDstState,
-        (if d.unit == dstUnit then { d with prevSessionActive := false } else d).curWinArmed =
-          d.curWinArmed := by
-      intro d; split <;> rfl
-    refine ⟨hcfg, by rw [map_unit_preserved _ _ hunit]; exact hdst, hreg, hexp, hasrc, hacl, ?_,
-      ?_, ?_, ?_, hnp, ?_⟩
-    · intro d' hd'
-      obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
-      split
-      · intro h; cases h
-      · exact hlease d hd
-    · intro hp d' hd'
-      obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
-      rw [hcur, hunit]
-      exact harm hp d hd
-    · intro hp d' hd'
-      obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
-      rw [hcur]
-      exact hdisp hp d hd
-    · intro hp d' hd'
-      obtain ⟨d, hd, rfl⟩ := List.mem_map.mp hd'
-      rw [hcur]
-      exact hrest hp d hd
-    · rcases hph with ⟨h1, h2, h3, h4, h5⟩ | ⟨h1, h2, h3, h4, h5⟩ | ⟨h1, h2, h3, h4, h5, h6⟩ | ⟨h1, h2⟩
-      · exact Or.inl ⟨h1, h2, h3, h4, h5⟩
-      · exact Or.inr (Or.inl ⟨h1, h2, h3, h4, h5⟩)
-      · exact Or.inr (Or.inr (Or.inl ⟨h1, h2, h3, h4, h5, h6⟩))
-      · exact Or.inr (Or.inr (Or.inr ⟨h1, h2⟩))
-
-  | senderVoteComplete srcUnit =>
-    simp only [CoordChainState.step] at hstep
-    split at hstep
-    · cases hstep
-    rename_i hg
-    simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at hg
-    obtain ⟨hactive, hnorem⟩ := hg
-    simp only [Bool.not_eq_false] at hactive
-    have hactive' : srcUnit ∈ s.activeSenders := List.contains_iff_mem.mp hactive
-    have hne : s.activeSenders ≠ [] := by
-      intro h; rw [h] at hactive'; cases hactive'
-    have hc := hacl hne
-    obtain ⟨hsrc_in, hsrc_unvoted⟩ := hasrc srcUnit hactive'
-    rw [complete_claimed hc.1 hc.2 hsrc_in] at hstep
-    simp only [Option.map_some, Option.some.injEq] at hstep
-    subst hstep
-    -- The remaining active senders after this vote.
-    have hfilter_mem : ∀ v, v ∈ s.activeSenders.filter (· != srcUnit) ↔
-        v ∈ s.activeSenders ∧ v ≠ srcUnit := by
-      intro v
-      simp [List.mem_filter]
-    split
-    · -- Every claimed rank has voted: `RetireLocked`.
-      rename_i hall
-      have hempty : s.activeSenders.filter (· != srcUnit) = [] := by
-        apply List.eq_nil_iff_forall_not_mem.mpr
-        intro v hv
-        obtain ⟨hv_act, hv_ne⟩ := (hfilter_mem v).mp hv
-        obtain ⟨hv_in, hv_unvoted⟩ := hasrc v hv_act
-        simp only [allVoted, List.all_eq_true] at hall
-        have := hall v hv_in
-        rcases mem_insertNodup.mp (List.contains_iff_mem.mp this) with h | h
-        · exact hv_ne h
-        · exact hv_unvoted h
-      rw [hempty]
-      refine inv_syncSenderExposure (Or.inl rfl) ?_
-      refine ⟨hcfg, hdst, Registry.retireLocked_inv s.reg, hexp, (fun _ h => by cases h),
-        fun h => absurd rfl h, hlease, harm, hdisp, hrest, hnp, ?_⟩
-      rcases hph with ⟨_, _, _, hact, _⟩ | ⟨_, _, _, hact, _⟩ | ⟨hst, hl, hrun, _, _, hrem⟩ |
-          ⟨hterm, _⟩
-      · exact absurd hact hne
-      · exact absurd hact hne
-      · -- In progress, the running window still has an unvoted rank.
-        exfalso
-        have hwin : s.winSrcUnits.getD s.winIdx [] ∈ s.winSrcUnits := getD_mem_of_lt hl
-        obtain ⟨hwne, hwsub⟩ := hcfg.winSub _ hwin
-        obtain ⟨w, hw⟩ := List.exists_mem_of_ne_nil _ hwne
-        have hw_unvoted := hrem s.winIdx (Nat.le_refl _) w hw
-        have hw_ne : w ≠ srcUnit := by
-          intro h; subst h
-          exact not_in_remaining hst (Bool.eq_false_iff.mpr hnorem) s.winIdx (Nat.le_refl _) hw
-        simp only [allVoted, List.all_eq_true] at hall
-        have := hall w (hwsub w hw)
-        rcases mem_insertNodup.mp (List.contains_iff_mem.mp this) with h | h
-        · exact hw_ne h
-        · exact hw_unvoted h
-      · exact Or.inr (Or.inr (Or.inr ⟨hterm, Or.inr ⟨rfl, rfl⟩⟩))
-    · -- The claim stays; `srcUnit` is recorded.
-      rename_i hnall
-      refine inv_syncSenderExposure (Or.inr (by simp [hc.1])) ?_
-      have hasrc' : ∀ v ∈ s.activeSenders.filter (· != srcUnit),
-          v ∈ s.allSrcUnits ∧ v ∉ insertNodup srcUnit s.reg.completedUnits := by
-        intro v hv
-        obtain ⟨hv_act, hv_ne⟩ := (hfilter_mem v).mp hv
-        obtain ⟨hv_in, hv_unvoted⟩ := hasrc v hv_act
-        refine ⟨hv_in, ?_⟩
-        intro h
-        rcases mem_insertNodup.mp h with h | h
-        · exact hv_ne h
-        · exact hv_unvoted h
-      refine ⟨hcfg, hdst, ?_, hexp, hasrc', fun _ => ⟨hc.1, hc.2⟩, hlease, harm, hdisp, hrest, hnp, ?_⟩
-      · have := Registry.step_preserves_inv hreg (complete_claimed hc.1 hc.2 hsrc_in)
-        simpa [hnall] using this
-      · rcases hph with ⟨_, _, _, hact, _⟩ | ⟨_, _, _, hact, _⟩ | ⟨hst, hl, hrun, hz, _, hrem⟩ |
-            ⟨hterm, _⟩
-        · exact absurd hact hne
-        · exact absurd hact hne
-        · refine Or.inr (Or.inr (Or.inl ⟨hst, hl, hrun, ?_, ⟨hc.1, hc.2⟩, ?_⟩))
-          · intro hw0
-            obtain ⟨h1, h2⟩ := hz hw0
-            refine ⟨h1, fun hp => ?_⟩
-            exact absurd hne (by rw [h2 hp]; exact fun h => h rfl)
-          · intro j hj w hw hmem
-            have hnot := not_in_remaining hst (Bool.eq_false_iff.mpr hnorem) j hj
-            rcases mem_insertNodup.mp hmem with h | h
-            · subst h; exact hnot hw
-            · exact hrem j hj w hw h
-        · exact Or.inr (Or.inr (Or.inr ⟨hterm, Or.inl ⟨hc.1, hc.2⟩⟩))
-
-  | cancelIfUnclaimed =>
-    simp only [CoordChainState.step] at hstep
-    cases hr : RegGen.step s.reg .cancelIfUnclaimed with
-    | none => rw [hr] at hstep; cases hstep
-    | some reg' =>
-      rw [hr] at hstep
-      simp only [Option.map_some, Option.some.injEq] at hstep
-      subst hstep
-      have hreg' := Registry.step_preserves_inv hreg hr
-      rcases cancelIfUnclaimed_shape hr with rfl | ⟨hnone, hc', ho', hcomp'⟩
-      · refine inv_syncSenderExposure ?_ ?_
-        · by_cases h : s.activeSenders = []
-          · exact Or.inl h
-          · exact Or.inr (by simp [(hacl h).1])
-        · exact ⟨hcfg, hdst, hreg', hexp, hasrc, hacl, hlease, harm, hdisp, hrest, hnp, hph⟩
-      · -- Unclaimed: no sender can be active.
-        have hact : s.activeSenders = [] := by
-          by_cases h : s.activeSenders = []
-          · exact h
-          · exfalso
-            have := (hacl h).1
-            rw [hnone] at this; cases this
-        refine inv_syncSenderExposure (Or.inl hact) ?_
-        refine ⟨hcfg, hdst, hreg', hexp, (fun _ h => by rw [hact] at h; cases h),
-          fun h => absurd hact h, hlease, harm, hdisp, hrest, hnp, ?_⟩
-        rcases hph with ⟨h1, h2, h3, h4, _⟩ | ⟨h1, h2, h3, h4, _⟩ | ⟨_, _, _, _, hc, _⟩ | ⟨hterm, _⟩
-        · exact Or.inl ⟨h1, h2, h3, h4, hc', ho', hcomp'⟩
-        · exact Or.inr (Or.inl ⟨h1, h2, h3, h4, hc', ho', hcomp'⟩)
-        · exfalso; have := hc.1; rw [hnone] at this; cases this
-        · exact Or.inr (Or.inr (Or.inr ⟨hterm, Or.inr ⟨hc', ho'⟩⟩))
+  | registerProducer _ => exact step_registerProducer hinv hstep
+  | startChainCoordination => exact step_startChainCoordination hinv hstep
+  | startWindowPlan _ => exact step_startWindowPlan hinv hstep
+  | armDstResult _ _ => exact step_armDstResult hinv hstep
+  | retryBusyArm => exact step_retryBusyArm hinv hstep
+  | finishWindowArm => exact step_finishWindowArm hinv hstep
+  | sendSrcResult _ _ => exact step_sendSrcResult hinv hstep
+  | finishWindowSend => exact step_finishWindowSend hinv hstep
+  | settleDispatchedRecv _ => exact step_settleDispatchedRecv hinv hstep
+  | senderVoteComplete _ => exact step_senderVoteComplete hinv hstep
+  | cancelIfUnclaimed => exact step_cancelIfUnclaimed hinv hstep
 
 /-- **Main coordinator theorem (`reachable_coordChain_safe`)**: for every
 well-formed chain topology, every reachable state of `CoordChainState.step`
