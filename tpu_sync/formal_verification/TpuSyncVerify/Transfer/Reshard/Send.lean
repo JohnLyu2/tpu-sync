@@ -37,7 +37,8 @@ into `active_pool_reshard_sends_` (recording it in the request's `send_chains_`
 entry, `NoteSubPlanRegisteredLocked`, when the plan is a sub-plan of a chain).
 It then calls `ExecutePush(*this, src_block_ids)`. The model is one such
 session — one plan `uuid`, which for a windowed request is one sub-plan of
-its chain (`Pipeline.lean` §"Scope: one plan").
+its chain (`Pipeline.lean` §"Scope: one plan"; multi-window chaining and worker
+terminal folding are modelled in `Reshard/SubPlanChain.lean`).
 
 `ReshardSendSession::ExecutePush` takes its own caller op
 (`++in_flight_; manager_ = &manager;`) and iterates over

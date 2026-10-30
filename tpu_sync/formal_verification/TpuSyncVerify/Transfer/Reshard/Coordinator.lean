@@ -58,18 +58,15 @@ ranges for every symbol, sub-block, and test are in the generated
   one schedule entry (`plan.src_units = request.src_units`; when prefix clipping
   or pipelined stage filtering leaves a claimed rank with no surviving entries,
   `if (schedules.find(unit) != schedules.end())` omits it from `plan.src_units`).
-  Later sub-plans of a chain differ in two places the model does not cover: a
-  planning or arm failure leaves the registry claim to the dispatched senders'
-  terminals (`if (index == 0) registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner);`),
-  and an arm refused because the destination's staging arena is still held by
-  earlier sub-plans (`ArmRefusedForBusyStaging`) is re-tried up to
-  `kChainArmAttempts` times while `!stopping_.load()`. The sender-dispatch
-  failure path is the same for every index: `for (const absl::Status& status : sender_status)`
-  returns the first error without disarming receivers and without
-  `AbandonClaim`. The per-request terminal bookkeeping a chained request gets
-  on each worker (`KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked`,
-  `RecordPoolReshardTerminalLocked`, `SweepSubPlanChainsLocked`) is outside this
-  model.
+  Later sub-plans of a chain (`index >= 1`, `StartChain`, sparse
+  `plan.src_units`, `ArmRefusedForBusyStaging` re-arming up to
+  `kChainArmAttempts` times while `!stopping_.load()`, and `if (index == 0)`
+  registry-claim ownership across sub-plans) together with worker-side
+  per-request chain folding (`KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked`,
+  `RecordPoolReshardTerminalLocked`, `SweepSubPlanChainsLocked`) are modelled
+  in `Reshard/SubPlanChain.lean`. The sender-dispatch failure path is the same
+  for every index: `for (const absl::Status& status : sender_status)` returns
+  the first error without disarming receivers and without `AbandonClaim`.
 
   What this file proves:
   1. **Universal Protocol Guarantees (`CoordInv`, `reachable_coord_inv`)**:
