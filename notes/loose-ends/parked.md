@@ -98,13 +98,13 @@ Open items only (5-field `better-than-fish` format, symbol citations instead of 
 **Effort estimate:** `ReadRemote` ~1 day; `Receive` ~3 days; `Send` +1–2 days.
 **References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive.lean §Lock scopes, ../journal/2026-10/2026-10-26-faithfulness-feedback-and-receive-lock-scope-audit.md
 
-## Coverage stopping criterion (W1–W2–W4 remaining): Reshard `Registry`/`Coordinator` W1, `Pipeline`/`ReadRemote` W2, schedule-runner W4
-**Status:** parked 2026-10-29 (PrefillDecode + `ReadRemote` W1, Reshard `Receive`/`Send`/`Pipeline` W1, `Receive`/`Send` W2, and `llvm-cov` × `resolve_anchors.py --coverage` W3 done)
-**Context:** Spec/implementation coverage plan from McMillan & Zuck's QUIC work (`docs/conventions.md` §"Coverage"). Remaining stages: (W1) branch-coverage modules for `Transfer/Reshard/{Registry,Coordinator}` (their CPU tests are `reshard_service_test` and `reshard_control_pipe_test`; no dedicated registry test target exists); (W2) guard × mutant inventories for `Pipeline` and `ReadRemote`; (W4) `TEST_P` C++ schedule interpreter over `RecvTestManager` running Lean-enumerated schedules and checking post-states (`Done()`, `IsDraining()`, `num_free_slots`, `copies_issued`, published status).
-**Why parked:** Completed PrefillDecode/Controller W1, session W2, and repo-wide `llvm-cov` W3 first.
-**To resume:** Pick independently: Reshard `Registry`/`Coordinator` W1 (~½ day/model), `Pipeline`/`ReadRemote` W2 (~½ day), or W4 `Receive` `TEST_P` runner (~3 days).
+## Coverage stopping criterion (W2–W4 remaining): `Pipeline`/`ReadRemote` W2, schedule-runner W4
+**Status:** parked 2026-10-29; updated 2026-10-30 (W1 now complete on every model: PrefillDecode + `ReadRemote`, Reshard `Receive`/`Send`/`Pipeline`, and Reshard `Registry` (25 branches, 11 reached) / `Coordinator` (14 branches, 10 reached); `Receive`/`Send` W2 and `llvm-cov` × `resolve_anchors.py --coverage` W3 done)
+**Context:** Spec/implementation coverage plan from McMillan & Zuck's QUIC work (`docs/conventions.md` §"Coverage"). Remaining stages: (W2) guard × mutant inventories for `Pipeline` and `ReadRemote`; (W4) `TEST_P` C++ schedule interpreter over `RecvTestManager` running Lean-enumerated schedules and checking post-states (`Done()`, `IsDraining()`, `num_free_slots`, `copies_issued`, published status). The `Registry`/`Coordinator` W1 gaps are all controller-command schedules (`reshard_service_test` with `transport_.FailFor` on a source rank or a second destination; re-registration, `Complete` no-ops, double cancel, `COMMAND_RELEASE_REQUEST_BLOCKS`) — candidates for a fourth upstream test patch.
+**Why parked:** Completed W1 everywhere, session W2, and repo-wide `llvm-cov` W3 first.
+**To resume:** Pick independently: `Pipeline`/`ReadRemote` W2 (~½ day), the `Registry`/`Coordinator` test patch (~2 h), or W4 `Receive` `TEST_P` runner (~3 days).
 **Effort estimate:** As above per stage.
-**References:** ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md, tpu_sync/formal_verification/docs/conventions.md §"Coverage"
+**References:** ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md, tpu_sync/formal_verification/docs/conventions.md §"Coverage", tpu_sync/formal_verification/docs/transfer/reshard.md §"Branch coverage by the replayed tests"
 
 ## Upstream coverage-gap test PRs + remaining handshake-stub and recycle tests
 **Status:** parked 2026-10-29; updated 2026-10-30 (the three patches were handed to the maintainers for landing through their own review flow, re-verified to apply on upstream `337540eb`; `send` and `read_remote_deadline` at 0 offset, `recv` at `-9` lines after `9f5270bc` removed `ScopedEnv`)
