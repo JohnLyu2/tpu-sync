@@ -167,9 +167,13 @@ buffer for a waiting layer), and wholesale at settle (`ReleaseAll()` in
 loop, pushes of earlier layers still complete and release buffers while the D2H
 loop is blocked in `AcquireStagingSlot` (`SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers`,
 `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes`).
-What this module does not model is the host-buffer reuse across layers itself
-and the bounded wait in `Acquire`; `Pipeline.lean` keeps one `prefillStaging`
-cell per layer.
+`PrefillDecode/LayerStaging.lean` (with `Transfer/LayerStaging.lean`) models
+`StagingLayerManager`, `TransferSendSession::AcquireStagingSlot`,
+`LookupStagingSlot`, `prefillSlots` reuse across layers, and the unlocked gaps
+around `Acquire`, proving publication correctness, slot conservation/exclusivity,
+drain-to-settle termination, and the `1`-slot sufficiency witness
+(`LayerStaging.reachable_safe`, `LayerStaging.reachable_can_settle`,
+`LayerStaging.exists_complete_trace`).
 
 ## Assumptions
 

@@ -179,12 +179,13 @@ interleaving the test harness has no hook for. **test** branches (10) are
 schedules `RecvTestManager` can drive today (8), or could with a control-plane
 producer stub that answers on command (2).
 
-Two receive-lifecycle tests are not replayable because their stimulus is not
-an event of this model: `RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers`
-and `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes`
+Two receive-lifecycle tests are not replayable in this full-mirror session
+model because their stimulus is bounded host-layer slot cycling:
+`RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` and
+`RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes`
 run under `TPU_RAIDEN_NUM_STAGING_LAYERS` and exercise the host layer buffer
-leases of `TransferReceiveSession::AcquireStagingSlot`, which the full-mirror
-model does not carry (`Receive.lean` §"Bounded host layer staging"). -/
+leases of `TransferReceiveSession::AcquireStagingSlot`; both are modelled and
+replayed in `PrefillDecode/LayerStaging.lean` (`LayerStaging/Traces.lean`). -/
 
 /-- `(leaf, drains, settles, errors)`. -/
 def br (l : Leaf) (drains settles errors : Bool) : Branch := (l, ⟨drains, settles, errors⟩)

@@ -665,8 +665,9 @@ consumer-Ack path `AckSend` that A5 excludes as dead; pulls rejected by
 `ValidateRequestedBlocksLocked` before `pull_started_` is claimed — refusals,
 not lifecycle steps (the idle send is then settled by the manager's
 destructor); and bounded host-layer staging (`TPU_RAIDEN_NUM_STAGING_LAYERS`,
-exercising `TransferSendSession::AcquireStagingSlot`, which the full-mirror
-model leaves out of scope; see `Send.lean` §"Bounded host layer staging"). -/
+exercising `TransferSendSession::AcquireStagingSlot`, which this full-mirror
+session model delegates to `PrefillDecode/LayerStaging.lean` — both tests are
+replayed there in `LayerStaging/Traces.lean`). -/
 def notReplayable : List (String × String) :=
   [("SendLifecycleTest.SuccessfulSendWithoutWorkSettlesImmediately", "external Finish(OkStatus())"),
    ("SendLifecycleTest.SuccessfulSendWaitsForEveryOperation", "external Finish(OkStatus())"),

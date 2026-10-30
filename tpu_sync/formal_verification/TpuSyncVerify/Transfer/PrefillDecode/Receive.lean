@@ -159,11 +159,14 @@ lease on the push thread (taken after `pushBegin`, ended before the stream's
 makes; a timeout, a cancelled wait or a failed `Lookup` fails the stream, which
 is `cancel` before `pushEnd` (the unguarded `cancel` admits it), and a
 `Lookup` can only fail on a draining session (its lease was released by an
-early return or `ReleaseAll`). What the mode adds and this module does not
-model is the buffer recycle itself — a later layer's payload lands in a buffer
-whose earlier layer's copy the device has finished (the lease is released only
-by that copy's callback) — and the liveness of the wait, which is bounded by
-`deadline_`; `Pipeline.lean` keeps one `decodeStaging` cell per layer.
+early return or `ReleaseAll`). `PrefillDecode/LayerStaging.lean` (with
+`Transfer/LayerStaging.lean`) models `StagingLayerManager`,
+`TransferReceiveSession::AcquireStagingSlot`, `decodeSlots` reuse across layers,
+and the unlocked gaps around `Acquire`, proving publication correctness, slot
+conservation/exclusivity, drain-to-settle termination, and the necessary and
+sufficient `1`-slot bound (`LayerStaging.reachable_safe`,
+`LayerStaging.reachable_can_settle`, `LayerStaging.no_slots_cannot_publish_ok`,
+`LayerStaging.exists_complete_trace`).
 
 ## Assumptions
 
