@@ -608,7 +608,7 @@ theorem mutant_gap_in_coverage_leaves_unwritten_byte :
 /-- Mutant 2: overlapping sub-block intervals (`[0, 20)` and `[16, 32)`) are
 rejected by `validBlockCoverage`
 (`ReshardReceiveSession::ValidateReceiverCoverage`
-`if (interval.start_bytes < covered_until)` in `reshard_receive_session.cc`). -/
+`if (start_bytes != covered_until)` in `reshard_receive_session.cc`). -/
 theorem mutant_overlap_in_coverage_rejected :
     validBlockCoverage 32 [⟨0, 20⟩, ⟨16, 32⟩] = false := by
   decide

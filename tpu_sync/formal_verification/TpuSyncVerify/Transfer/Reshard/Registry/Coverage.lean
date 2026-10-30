@@ -113,10 +113,13 @@ theorem stepT_step (s : RegGen) (e : Ev) : (stepT s e).map (·.1) = RegGen.step 
 
 /-! ## Refusals
 
-The arms of `RegGen.step` that return `none`: the C++ error returns
-(`InvalidArgument` / `FailedPrecondition` / `NotFound` statuses that
-`ReshardService` turns into `success = false` responses). `refusal` names the
-arm; `refusal_step` checks it against `step` on the states the tests reach. -/
+The arms of `RegGen.step` that return `none`: `RequestBlockRegistry::Register`,
+`LookupAndClaim`, and `Complete` `InvalidArgumentError` returns (turned into
+`success = false` responses by `ReshardService`), `AbandonClaim`'s `false`
+return when called by a non-owner (invoked internally by
+`ReshardCoordinator::RunSubPlan`, which discards the `bool`), and the
+single-generation model guards (`s.retired`, `units.isEmpty`). `refusal` names
+the arm; `refusal_step` checks it against `step` on the states the tests reach. -/
 
 inductive Refusal
   /-- `Register` on a cancelled, claimed, or retired generation
@@ -263,7 +266,7 @@ def notReplayable : List (String × String) :=
    ("ReshardStackTest.NegativeOrdinalRejectedAtRegistration",
       "RequestBlockRegistry::Register rejects dst_unit_ordinal < -1 before acquiring the lifecycle mu_ scope"),
    ("ReshardStackTest.LegacyCommandsFailClosed",
-      "worker-side COMMAND_REGISTER_TRANSFER_SCHEDULE rejection; never touches RequestBlockRegistry"),
+      "controller-side retired inter-controller COMMAND_REGISTER_TRANSFER_SCHEDULE rejection; never touches RequestBlockRegistry"),
    ("ReshardControlPipeTest.* (3 tests)", "control-pipe transport round-trip only"),
    ("PlanSubTransfersTest.* (5 tests)", "pure PlanSubTransfers window-splitting unit tests"),
    ("SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct", "pure SubPlanUuid helper unit test")]
@@ -297,10 +300,14 @@ or a stub:
 
 Unasserted `Refusal` constructors: `registerConflict` (a different payload for a
 registered unit), `claimIncompatible` (a second claim for a different unit
-set), `abandonNotOwner`, and `completeBeforeClaim` (a non-empty registration
-completing before planning); within the asserted constructors, no test exercises
-`registerLifecycle` on a claimed or retired generation or `claimCancelledOrEmpty`
-with `units = []`. -/
+set), `abandonNotOwner` (`AbandonClaim` returns `false` on pre-claim planner
+failures in `RunSubPlan`, which discards the `bool`), and `completeBeforeClaim`
+(a non-empty registration completing before planning); within the asserted
+constructors, no C++ test exercises `registerLifecycle` on a `claimed`
+generation (`retired` in `registerLifecycle` is a single-generation model latch
+because `RetireLocked` clears all six maps, and `units = []` in
+`claimCancelledOrEmpty` is rejected upstream in `StartPoolReshard` and
+`BuildPoolReshardPlan` before `LookupAndClaim`). -/
 
 def coveredByPaired : List Branch := Coverage.coveredBy instr (paired.map fun (_, tr) => (RegGen.init, tr))
 

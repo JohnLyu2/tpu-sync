@@ -183,10 +183,6 @@ def paired : List (String × CoordState × List Ev) :=
      CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
    ("ReshardStackTest.SubsetSourceManifestsPairPoolsByTag", CoordState.init [0, 1] [10] 101,
      tr_full_flow_2x1),
-   -- stage 0 (and stage 1) of `req-pp4`: its single receiver refuses the arm,
-   -- abandoning the claim before Stage 2 is reached.
-   ("ReshardStackTest.AbandoningTheLastStageFreesTheClaim", CoordState.init [0, 1] [10] 101,
-     tr_arm_failure_2x1),
    ("ReshardStackTest.SourceTagsAbsentOnTheDestinationAreIgnored", CoordState.init [0] [10] 101,
      tr_full_flow_1x1),
    -- 3rd call (`unique_peers` duplicate endpoint check after `LookupAndClaim`)
@@ -242,6 +238,8 @@ def notReplayable : List (String × String) :=
       "pipelined stage filters plan.src_units to 1 of 2 claimed request.src_units; shared claim replayed in Registry/Coverage.lean"),
    ("ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace",
       "same pipelined plan.src_units ⊊ request.src_units filter on stage 0 and stage 1's retry; multi-owner claim rollback replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.AbandoningTheLastStageFreesTheClaim",
+      "same pipelined plan.src_units ⊊ request.src_units filter on both refused stages; last-owner claim release replayed in Registry/Coverage.lean"),
    ("ReshardStackTest.StridedGlobalSpansClipByWholePages",
       "prefix clip drops rank 0's page whole so plan.src_units ⊊ request.src_units; registry claim replayed in Registry/Coverage.lean"),
    ("ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv",
@@ -257,7 +255,7 @@ def notReplayable : List (String × String) :=
    ("ReshardStackTest.NegativeOrdinalRejectedAtRegistration",
       "registration-time input validation only; no Coordinate call"),
    ("ReshardStackTest.LegacyCommandsFailClosed",
-      "worker-side COMMAND_REGISTER_TRANSFER_SCHEDULE rejection; no Coordinate call"),
+      "controller-side retired inter-controller COMMAND_REGISTER_TRANSFER_SCHEDULE rejection; no Coordinate call"),
    ("ReshardControlPipeTest.* (3 tests)", "control-pipe transport round-trip only"),
    ("PlanSubTransfersTest.* (5 tests)", "pure PlanSubTransfers window-splitting unit tests"),
    ("SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct", "pure SubPlanUuid helper unit test")]
@@ -277,10 +275,11 @@ def modelOnly : List (String × CoordState × List Ev) :=
 /-! ## Result
 
 The four searches exhaust their state spaces: **14 branches**, every leaf of
-`Leaf` reachable. The 22 tests in `paired` (25 traces) reach **10 of 14**; the
+`Leaf` reachable. The 21 tests in `paired` (24 traces) reach **10 of 14**; the
 two `modelOnly` counterexample traces reach the other four. The four the tests
 miss, all schedules `ReshardStackTest`'s fake transport can drive with
-`transport_.FailFor` on the right endpoint:
+`transport_.FailFor` (plus `HoldAfterCalls` so the first destination arms before
+the second fails):
 
 | Branch | Schedule | What it would take |
 |---|---|---|

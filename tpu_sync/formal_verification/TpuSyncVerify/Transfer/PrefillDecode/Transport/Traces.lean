@@ -240,12 +240,14 @@ The transport unit tests drive `CompleteIncomingPush` through mock delegates
 `MultiSenderReceiverDelegate` in `block_transport_test.cc`) with no
 `TransferReceiveSession`, so what they observe is the table: `OnLayerReceived`
 calls (`dispatched`), retirement (`entry = none`), and rejected push streams
-(returned as `InvalidArgumentError` to the sender, recorded on `step` as
-`life.statusOk = false`). The traces below replay them on `step` with those
-projections; `paired` lists them with the configuration each runs on, and
-`notReplayable` lists the sibling push-progress tests whose stimulus is outside
-A3, calls `Cancel` or `ForgetPushProgress`, or exercises the plan-declared pool
-or Peregrine bitmask paths of `CompleteIncomingPush`. -/
+(where `CompleteIncomingPush` returns `AlreadyExistsError` or
+`FailedPreconditionError` and `StartStream` drops the stream before the 1-byte
+ack, recorded on `step` as `life.statusOk = false`). The traces below replay
+them on `step` with those projections; `paired` lists them with the
+configuration each runs on, and `notReplayable` lists the sibling push-progress
+tests whose stimulus is outside A3, calls `Cancel` or `ForgetPushProgress`, or
+exercises the plan-declared pool or Peregrine bitmask paths of
+`CompleteIncomingPush`. -/
 
 /-- `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion`: one
 layer, one sender declaring two streams (`num_streams = 2`), chunk-count
@@ -351,8 +353,8 @@ contract (`BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
 `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
 `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration`) is
 `Reshard/Pipeline.lean`'s `landStream`, and `PeregrineRecvCompleteTest` exercises
-the `is_peregrine = true` shard-bitmask branch of `CompleteIncomingPush`, neither
-a contract of this model. -/
+`OnPeregrinePostComplete` and the `is_peregrine = true` shard-bitmask branch of
+`CompleteIncomingPush`, neither a contract of this model. -/
 def notReplayable : List (String × String) :=
   [("BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism", "per-sender declarations (A3)"),
    ("BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected", "per-sender declarations (A3)"),
@@ -365,7 +367,7 @@ def notReplayable : List (String × String) :=
    ("BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration",
      "plan-declared pool contract (Reshard/Pipeline.lean)"),
    ("PeregrineRecvCompleteTest.* (9 tests)",
-     "Peregrine shard-bitmask branch (is_peregrine = true) of CompleteIncomingPush")]
+     "OnPeregrinePostComplete and is_peregrine = true shard-bitmask branch")]
 
 -- Every paired trace runs to its end.
 #guard paired.all fun (_, c, tr) => ((sys c).run tr).isSome

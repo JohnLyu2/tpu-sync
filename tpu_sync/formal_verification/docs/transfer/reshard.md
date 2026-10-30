@@ -226,7 +226,7 @@ reaches on the 1–2 pool instances).
 | `Send` | 1 pool with 1 or 2 peers; 2 pools | 25 (every leaf live) | 3 (3 tests, starting after `ReshardSendSessionTestPeer::BeginPush`) | 22 | 16 test, 6 future (stub) |
 | `Pipeline` | 1 pool, armed and unarmed | 59; every memory move writes the right pool's KV and no H2D clobbers KV in a higher-rank slot | 0 | 59 | 3 environment, 1 coordinator, 1 transport, 8 covered by session tests, 46 in the session gap tables, none unaccounted |
 | `Registry` | one `(req_id, uuid)` generation over two units and two owners | 25 (every leaf live); effect is the `Status` before and after and whether `RetireLocked` fired | 11 (35 tests, 36 traces; 3 of 7 `Refusal` constructors asserted) | 14 | 14 test (controller commands no test sends: an identical re-registration, `Complete` no-ops, an empty-blocks registration voting before its claim, a repeated cancel, `Release`) |
-| `Coordinator` | 1×1, 1×2, 2×1 and 2×2 sub-plans under `CleanupPolicy.shipping` | 14 (every leaf live); effect is the phase before and after and what an abort leaves armed or claimed | 10 (22 tests, 25 traces) | 4 | 4 test (a failed sender dispatch and a refused arm beside an armed destination; `transport_.FailFor` on a source rank or a second destination) — the two `Traces.lean` counterexamples |
+| `Coordinator` | 1×1, 1×2, 2×1 and 2×2 sub-plans under `CleanupPolicy.shipping` | 14 (every leaf live); effect is the phase before and after and what an abort leaves armed or claimed | 10 (21 tests, 24 traces) | 4 | 4 test (a failed sender dispatch and a refused arm beside an armed destination; `transport_.FailFor` on a source rank or a second destination) — the two `Traces.lean` counterexamples |
 
 What the tests miss: on the receiver, every test that "completes a pool" calls
 `FinishPoolH2d` through `PoolReshardRecvTestPeer` on a pool that was never
@@ -261,7 +261,7 @@ are exercised; the device-copy session bodies are not:
   (`AcquirePoolStagingLease`, `ReleasePoolStagingLeases`), receiver arming
   (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`),
   `RequestBlockRegistry`, and `ReshardCoordinator::RunSubPlan` over
-  `WorkerDelivery::Mode::kRpc`.
+  `WorkerDelivery::Mode::kFramed`.
 * **Never executed in the current CPU suite:** `PoolReshardPush` and
   `ReshardReceiveSession::Create` reject deviceless managers at
   `base->has_device_buffers()`. `AttachPlaceholderDeviceHoldForTest` satisfies
