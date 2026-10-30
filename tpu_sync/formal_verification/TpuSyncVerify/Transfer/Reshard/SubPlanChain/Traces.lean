@@ -258,17 +258,19 @@ def stepCountStale (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
     let stillActive := w.active.filter (!·.done)
     let r := settledNow.foldl
       (fun (acc : WorkerState.SweepAcc) s =>
-        match recordTerminalCountingStale acc.1 s with
-        | (c', .done k idx) => (c', acc.2.1 + 1, acc.2.2.1, acc.2.2.2 ++ [(k, idx)])
-        | (c', .failed) => (c', acc.2.1, acc.2.2.1 + 1, acc.2.2.2)
-        | (c', _) => (c', acc.2.1, acc.2.2.1, acc.2.2.2))
-      (w.chain, 0, 0, [])
-    let (c2, sweep) := if stalled then sweepStalledChain r.1 stillActive else (r.1, .notSwept)
+        let touched := acc.touched || s.count > 1
+        match recordTerminalCountingStale acc.chain s with
+        | (c', .done k idx) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(k, idx)], touched }
+        | (c', .failed) => { acc with chain := c', fail := acc.fail + 1, touched }
+        | (c', _) => { acc with chain := c', touched })
+      { chain := w.chain }
+    let (c2, sweep) :=
+      if stalled && !r.touched then sweepStalledChain r.chain stillActive else (r.chain, .notSwept)
     some
       { w with
-        doneReports := w.doneReports + r.2.1
-        failReports := w.failReports + r.2.2.1 + (if sweep == .stalled then 1 else 0)
-        doneLog := w.doneLog ++ r.2.2.2
+        doneReports := w.doneReports + r.done
+        failReports := w.failReports + r.fail + (if sweep == .stalled then 1 else 0)
+        doneLog := w.doneLog ++ r.log
         active := stillActive
         chain := c2 }
   | e => WorkerState.step w e

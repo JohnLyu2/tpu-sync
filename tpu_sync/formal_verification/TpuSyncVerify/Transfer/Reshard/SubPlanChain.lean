@@ -125,6 +125,11 @@ window's arming, which is what `prevSessionActive` and `retryBusyArm` model.
   `senderVoteComplete` refuses a rank still in `plan.src_units` of the running
   or a later window. Without it a rank's vote could retire the claim while
   another window is being armed.
+* **Not modelled:** `!stopping_.load()` in the re-arm condition (a coordinator
+  shutting down aborts instead of re-arming; `retryBusyArm` assumes it is not
+  stopping), the `kController` delivery mode's null-controller error path, and
+  `transfer_details_`. A worker holds one `recv_chains_` and one `send_chains_`
+  entry per `req_id`; `WorkerState` is one of them.
 * **A4 — producers register before `Coordinate`.** `registerProducer` is
   enabled only before `startChainCoordination`. The registry refuses `Register`
   once the claim is taken (`Reshard/Registry.lean`); a registration landing

@@ -288,20 +288,31 @@ namespace WorkerState
 
 def init : WorkerState := {}
 
-/-- Accumulator of one `CompleteReadWithDetails` sweep: the chain entry, the
-`done` and `failed_recving_` insertions so far, and the ghost `doneLog` entries. -/
-abbrev SweepAcc := ChainProgress × Nat × Nat × List (Nat × List Nat)
+/-- Accumulator of one `CompleteReadWithDetails` sweep. -/
+structure SweepAcc where
+  chain : ChainProgress
+  /-- `done.insert(req_id)` calls so far. -/
+  done : Nat := 0
+  /-- `failed_recving_.insert(req_id)` calls so far. -/
+  fail : Nat := 0
+  /-- Ghost `doneLog` entries. -/
+  log : List (Nat × List Nat) := []
+  /-- A chained sub-plan reached `progress.last_activity = now` in this call
+  (not a single-plan or superseded one), so the entry is not quiet. -/
+  touched : Bool := false
+  deriving DecidableEq, Repr
 
 def recordStep (acc : SweepAcc) (s : SubSession) : SweepAcc :=
-  match recordTerminal acc.1 s with
-  | (c', .done k idx) => (c', acc.2.1 + 1, acc.2.2.1, acc.2.2.2 ++ [(k, idx)])
-  | (c', .failed) => (c', acc.2.1, acc.2.2.1 + 1, acc.2.2.2)
-  | (c', _) => (c', acc.2.1, acc.2.2.1, acc.2.2.2)
+  let touched := acc.touched || (s.count > 1 && (recordTerminal acc.chain s).2 != .supersededIgnored)
+  match recordTerminal acc.chain s with
+  | (c', .done k idx) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(k, idx)], touched }
+  | (c', .failed) => { acc with chain := c', fail := acc.fail + 1, touched }
+  | (c', _) => { acc with chain := c', touched }
 
 /-- Fold `recordTerminal` over the settled sessions of one
 `CompleteReadWithDetails` call. -/
 def recordAll (c : ChainProgress) (settled : List SubSession) : SweepAcc :=
-  settled.foldl recordStep (c, 0, 0, [])
+  settled.foldl recordStep { chain := c }
 
 /-- Transition function of the worker chain folding. -/
 def step (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
@@ -328,13 +339,16 @@ def step (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
   | .poll stalled =>
     let settledNow := w.active.filter (·.done)
     let stillActive := w.active.filter (!·.done)
-    let (c1, dInc, fInc, log) := recordAll w.chain settledNow
-    let (c2, sweep) := if stalled then sweepStalledChain c1 stillActive else (c1, .notSwept)
+    let r := recordAll w.chain settledNow
+    -- `SweepSubPlanChainsLocked(now)` runs after the records of this call, which
+    -- set `last_activity = now`: an entry touched here is not quiet.
+    let (c2, sweep) :=
+      if stalled && !r.touched then sweepStalledChain r.chain stillActive else (r.chain, .notSwept)
     some
       { w with
-        doneReports := w.doneReports + dInc
-        failReports := w.failReports + fInc + (if sweep == .stalled then 1 else 0)
-        doneLog := w.doneLog ++ log
+        doneReports := w.doneReports + r.done
+        failReports := w.failReports + r.fail + (if sweep == .stalled then 1 else 0)
+        doneLog := w.doneLog ++ r.log
         active := stillActive
         chain := c2 }
 

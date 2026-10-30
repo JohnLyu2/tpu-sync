@@ -128,8 +128,9 @@ def stepT (w : WorkerState) : WorkerEv → Option (WorkerState × Leaf)
     (WorkerState.step w (.poll stalled)).map fun w' =>
       let settledNow := w.active.filter (·.done)
       let stillActive := w.active.filter (!·.done)
-      let c1 := (WorkerState.recordAll w.chain settledNow).1
-      let sweep := if stalled then (sweepStalledChain c1 stillActive).2 else .notSwept
+      let r := WorkerState.recordAll w.chain settledNow
+      let sweep :=
+        if stalled && !r.touched then (sweepStalledChain r.chain stillActive).2 else .notSwept
       (w', .poll (pollArms w.chain settledNow) sweep)
 
 theorem stepT_step (w : WorkerState) (e : WorkerEv) :

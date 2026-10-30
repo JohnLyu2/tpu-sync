@@ -222,11 +222,11 @@ private theorem recordTerminal_shape (c : ChainProgress) (s : SubSession)
 
 private theorem foldRecord_shape (settled : List SubSession) :
     ∀ (acc : WorkerState.SweepAcc),
-      acc.1.settled.Nodup → (∀ i ∈ acc.1.settled, i < acc.1.count) →
+      acc.chain.settled.Nodup → (∀ i ∈ acc.chain.settled, i < acc.chain.count) →
       (∀ s ∈ settled, s.index < max 1 s.count) →
-      (∀ e ∈ acc.2.2.2, GoodEntry e) →
+      (∀ e ∈ acc.log, GoodEntry e) →
       let r := settled.foldl WorkerState.recordStep acc
-      r.1.settled.Nodup ∧ (∀ i ∈ r.1.settled, i < r.1.count) ∧ ∀ e ∈ r.2.2.2, GoodEntry e := by
+      r.chain.settled.Nodup ∧ (∀ i ∈ r.chain.settled, i < r.chain.count) ∧ ∀ e ∈ r.log, GoodEntry e := by
   induction settled with
   | nil =>
     intro acc hn hb _ hlog
@@ -236,14 +236,14 @@ private theorem foldRecord_shape (settled : List SubSession) :
     have hs0 := hs s (List.mem_cons_self ..)
     have hrest : ∀ s' ∈ rest, s'.index < max 1 s'.count :=
       fun s' h => hs s' (List.mem_cons_of_mem _ h)
-    obtain ⟨hn', hb', hgood⟩ := recordTerminal_shape acc.1 s hn hb hs0
+    obtain ⟨hn', hb', hgood⟩ := recordTerminal_shape acc.chain s hn hb hs0
     simp only [List.foldl_cons]
     have hstep : ∀ acc' : WorkerState.SweepAcc, WorkerState.recordStep acc s = acc' →
-        acc'.1.settled.Nodup ∧ (∀ i ∈ acc'.1.settled, i < acc'.1.count) ∧
-        ∀ e ∈ acc'.2.2.2, GoodEntry e := by
+        acc'.chain.settled.Nodup ∧ (∀ i ∈ acc'.chain.settled, i < acc'.chain.count) ∧
+        ∀ e ∈ acc'.log, GoodEntry e := by
       intro acc' h
       unfold WorkerState.recordStep at h
-      rcases hrt : recordTerminal acc.1 s with ⟨c', t⟩
+      rcases hrt : recordTerminal acc.chain s with ⟨c', t⟩
       rw [hrt] at h hn' hb' hgood
       cases t with
       | supersededIgnored => subst h; exact ⟨hn', hb', hlog⟩
@@ -265,10 +265,11 @@ private theorem foldRecord_shape (settled : List SubSession) :
 private theorem recordAll_shape (c : ChainProgress) (settled : List SubSession)
     (hn : c.settled.Nodup) (hb : ∀ i ∈ c.settled, i < c.count)
     (hs : ∀ s ∈ settled, s.index < max 1 s.count) :
-    (WorkerState.recordAll c settled).1.settled.Nodup ∧
-    (∀ i ∈ (WorkerState.recordAll c settled).1.settled, i < (WorkerState.recordAll c settled).1.count) ∧
-    ∀ e ∈ (WorkerState.recordAll c settled).2.2.2, GoodEntry e :=
-  foldRecord_shape settled (c, 0, 0, []) hn hb hs (fun _ h => by cases h)
+    (WorkerState.recordAll c settled).chain.settled.Nodup ∧
+    (∀ i ∈ (WorkerState.recordAll c settled).chain.settled,
+      i < (WorkerState.recordAll c settled).chain.count) ∧
+    ∀ e ∈ (WorkerState.recordAll c settled).log, GoodEntry e :=
+  foldRecord_shape settled { chain := c } hn hb hs (fun _ h => by cases h)
 
 theorem WorkerInv.toSafe {w : WorkerState} (h : WorkerInv w) : WorkerSafe w := h.safe
 
@@ -310,11 +311,11 @@ theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
     have hr := recordAll_shape w.chain (w.active.filter (·.done))
       hinv.settledNodup hinv.settledBound hsettled
     generalize WorkerState.recordAll w.chain (w.active.filter (·.done)) = r at hstep hr
-    rcases r with ⟨c1, dInc, fInc, log⟩
     obtain ⟨hn1, hb1, hlog⟩ := hr
     -- The sweep keeps `settled` or erases the entry.
     have hsweep : ∀ (c2 : ChainProgress) (b : SweepOutcome),
-        (if stalled then sweepStalledChain c1 (w.active.filter (!·.done)) else (c1, .notSwept)) = (c2, b) →
+        (if stalled && !r.touched then sweepStalledChain r.chain (w.active.filter (!·.done))
+         else (r.chain, .notSwept)) = (c2, b) →
         c2.settled.Nodup ∧ ∀ i ∈ c2.settled, i < c2.count := by
       intro c2 b h
       split at h
@@ -327,9 +328,10 @@ theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
         · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
         · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
       · injection h with h1 _; subst h1; exact ⟨hn1, hb1⟩
-    generalize hr2 : (if stalled then sweepStalledChain c1 (w.active.filter (!·.done)) else (c1, .notSwept)) = r2 at hstep
-    rcases r2 with ⟨c2, sweepFail⟩
-    obtain ⟨hn2, hb2⟩ := hsweep c2 sweepFail hr2
+    generalize hr2 : (if stalled && !r.touched then sweepStalledChain r.chain (w.active.filter (!·.done))
+        else (r.chain, .notSwept)) = r2 at hstep
+    rcases r2 with ⟨c2, sweep⟩
+    obtain ⟨hn2, hb2⟩ := hsweep c2 sweep hr2
     injection hstep with h; subst h
     refine ⟨⟨?_⟩, hn2, hb2, ?_⟩
     · intro e he
