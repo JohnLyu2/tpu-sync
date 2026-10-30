@@ -1,0 +1,148 @@
+diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc
+index 1f9db6fc..b31a710b 100644
+--- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc
++++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc
+@@ -54,6 +54,7 @@
+ #include "absl/time/time.h"
+ #include "tpu_sync/core/control_plane_backend.h"
+ #include "tpu_sync/core/grpc_control_plane_backend.h"
++#include "tpu_sync/core/numa_thread_pool.h"
+ #include "tpu_sync/core/tcp_control_plane_backend.h"
+ #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+ #include "tpu_sync/kv_cache/transfer_receive_session.h"
+@@ -152,6 +153,17 @@ class TestManager : private ScopedControlPlaneBackend,
+     return it != active_recv_sessions_.end() && !it->second->Done();
+   }
+ 
++  void FailRecv(uint64_t uuid, const absl::Status& status) {
++    std::shared_ptr<TransferReceiveSession> session;
++    {
++      absl::MutexLock lock(mu_);
++      auto it = active_recv_sessions_.find(uuid);
++      if (it == active_recv_sessions_.end()) return;
++      session = it->second;
++    }
++    session->Finish(status);
++  }
++
+   void MarkPullStarted(uint64_t uuid) {
+     absl::MutexLock lock(mu_);
+     send_sessions_.at(uuid)->ValidateAndBeginPull(
+@@ -659,6 +671,15 @@ class SilentProducer {
+     }) && request_received_;
+   }
+ 
++  void AcceptClient() {
++    std::lock_guard<std::mutex> lock(mu_);
++    ASSERT_FALSE(clients_.empty());
++    TestManager::ControlResponseHeader resp{
++        .magic = TestManager::kResponseMagic, .status = 0, .message_len = 0};
++    WriteAll(clients_.front(), &resp, sizeof(resp));
++    shutdown(clients_.front(), SHUT_WR);
++  }
++
+   void DropClient() {
+     std::lock_guard<std::mutex> lock(mu_);
+     if (!clients_.empty()) shutdown(clients_.front(), SHUT_RDWR);
+@@ -834,6 +855,101 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
+   EXPECT_THAT(failed_again, ::testing::IsEmpty());
+ }
+ 
++// Rendezvous across every worker in `manager`'s handshake pool so any
++// previously running handshake callback has finished before the caller returns.
++void DrainPushPool(TestManager& manager) {
++  NumaThreadPool* pool = manager.base()->push_pool().get();
++  ASSERT_NE(pool, nullptr);
++  const size_t n = pool->num_threads();
++  std::mutex mu;
++  std::condition_variable cv;
++  size_t arrived = 0;
++  std::vector<std::future<void>> barrier;
++  barrier.reserve(n);
++  for (size_t i = 0; i < n; ++i) {
++    barrier.push_back(pool->Schedule([&] {
++      std::unique_lock<std::mutex> lock(mu);
++      if (++arrived == n) {
++        cv.notify_all();
++      } else {
++        cv.wait(lock, [&] { return arrived == n; });
++      }
++    }));
++  }
++  for (std::future<void>& f : barrier) {
++    f.get();
++  }
++}
++
++TEST(ControlHandshakeTest,
++     AcceptedPullAdvancesReceivePhaseAndReleasesHandshakeOp) {
++  SilentProducer producer(/*read_request=*/true);
++  TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
++  const size_t free_before = consumer.free_slots();
++
++  consumer.StartRead("req", /*uuid=*/202, producer.endpoint(),
++                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
++  ASSERT_TRUE(producer.WaitUntilRequestReceived(std::chrono::seconds(5)));
++  producer.AcceptClient();
++  DrainPushPool(consumer);
++
++  CompleteReadResult during = consumer.CompleteReadWithDetails();
++  EXPECT_THAT(during.sent, ::testing::IsEmpty());
++  EXPECT_THAT(during.received, ::testing::IsEmpty());
++  EXPECT_THAT(during.failed, ::testing::IsEmpty());
++  EXPECT_TRUE(consumer.has_recv(202));
++  EXPECT_EQ(consumer.free_slots(), free_before - 1);
++
++  // With the handshake op released and `handshake_pending_` cleared, a
++  // subsequent failure settles at once in the `receive` phase rather than
++  // staying draining in `connect`.
++  consumer.FailRecv(/*uuid=*/202, absl::InternalError("data stream lost"));
++  EXPECT_FALSE(consumer.has_recv(202));
++  EXPECT_EQ(consumer.free_slots(), free_before);
++
++  CompleteReadResult after = consumer.CompleteReadWithDetails();
++  EXPECT_THAT(after.received, ::testing::IsEmpty());
++  EXPECT_THAT(after.failed, ElementsAre("req"));
++  EXPECT_EQ(after.details["req"].code, "INTERNAL");
++  EXPECT_EQ(after.details["req"].phase, "receive");
++}
++
++TEST(ControlHandshakeTest, AcceptedPullAfterDeadlineSweepSettlesExpiredReceive) {
++  SilentProducer producer(/*read_request=*/true);
++  TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
++  const size_t free_before = consumer.free_slots();
++  consumer.StartRead(
++      "req", /*uuid=*/203, producer.endpoint(),
++      /*remote_block_ids=*/{0}, /*local_block_ids=*/{0},
++      /*parallelism=*/1, /*local_host_block_ids=*/std::nullopt,
++      std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
++  ASSERT_TRUE(producer.WaitUntilRequestReceived(std::chrono::seconds(5)));
++  ASSERT_TRUE(consumer.has_recv(203));
++  ASSERT_EQ(consumer.free_slots(), free_before - 1);
++
++  absl::SleepFor(absl::Milliseconds(25));
++  CompleteReadResult during = consumer.CompleteReadWithDetails();
++  EXPECT_THAT(during.received, ::testing::IsEmpty());
++  EXPECT_THAT(during.failed, ::testing::IsEmpty());
++  EXPECT_TRUE(consumer.has_recv(203));
++  EXPECT_EQ(consumer.free_slots(), free_before - 1);
++
++  // The producer replies OK after the deadline sweep marked the receive
++  // draining: `on_response` records no second error, releases the handshake
++  // op, and settles the expired receive with its original `connect` timeout.
++  producer.AcceptClient();
++  DrainPushPool(consumer);
++  EXPECT_FALSE(consumer.has_recv(203));
++  EXPECT_EQ(consumer.free_slots(), free_before);
++
++  CompleteReadResult after = consumer.CompleteReadWithDetails();
++  EXPECT_THAT(after.received, ::testing::IsEmpty());
++  EXPECT_THAT(after.failed, ElementsAre("req"));
++  EXPECT_EQ(after.details["req"].code, "DEADLINE_EXCEEDED");
++  EXPECT_EQ(after.details["req"].phase, "connect");
++  EXPECT_THAT(consumer.CompleteReadWithDetails().failed, ::testing::IsEmpty());
++}
++
+ // Polls `consumer` until a read fails, or gives up after `timeout`.
+ CompleteReadResult AwaitFailedRead(TestManager& consumer,
+                                    absl::Duration timeout) {

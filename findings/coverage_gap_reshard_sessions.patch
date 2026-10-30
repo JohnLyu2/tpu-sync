@@ -1,0 +1,975 @@
+diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc
+index f8b74874..6f1d3303 100644
+--- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc
++++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc
+@@ -19,9 +19,18 @@
+ // byte path and the pool receive lifecycle are device-only by design and are
+ // exercised on real chips by the D-series harness.
+ 
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <chrono>
++#include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <string>
+ #include <thread>
+@@ -591,32 +600,56 @@ TEST(DemandStagingTest, DemandStagedReceiverPlanUnregistersWhenItSettles) {
+   EXPECT_EQ(pool->num_locked_blocks(), 0);
+ }
+ 
+-// Declares storage 0 device-backed so RegisterPools configures bounded staging
+-// without TPU hardware.
++// Declares storages device-backed so RegisterPools configures bounded staging
++// and CopyPoolBlocks exercises D2H/H2D without TPU hardware.
+ class DeviceBackedTestBase : public kv_cache::KVCacheManagerBase {
+  public:
+   DeviceBackedTestBase(size_t slice_byte_size, int host_blocks,
+-                       size_t physical_size)
+-      : KVCacheManagerBase(/*num_layers=*/1, /*num_shards=*/1, slice_byte_size,
++                       size_t physical_size, size_t num_storages = 1)
++      : KVCacheManagerBase(num_storages, /*num_shards=*/1, slice_byte_size,
+                            /*local_port=*/std::nullopt,
+                            std::make_optional(host_blocks)) {
+-    buffer_holds_.resize(1);
+-    buffer_holds_[0].holds.resize(1);
+-    buffer_holds_[0].physical_size = physical_size;
+-    major_dim_size_ = 1;
+-    layers_[0].shards[0].device_size = physical_size;
++    buffer_holds_.resize(num_storages);
++    major_dim_size_ = num_storages;
++    for (size_t i = 0; i < num_storages; ++i) {
++      buffer_holds_[i].holds.resize(1);
++      buffer_holds_[i].physical_size = physical_size;
++      layers_[i].shards[0].device_size = physical_size;
++    }
++  }
++
++  void SetStorageDeviceSize(size_t storage_idx, size_t bytes) {
++    layers_[storage_idx].shards[0].device_size = bytes;
+   }
+ };
+ 
+ class BoundedPoolTestManager : public KVCacheManagerWithTransfer {
+  public:
+   BoundedPoolTestManager(size_t slice_byte_size, int host_blocks,
+-                         size_t physical_size)
++                         size_t physical_size, size_t num_storages = 1,
++                         double timeout_s = 30.0)
+       : KVCacheManagerWithTransfer(
+-            std::make_unique<DeviceBackedTestBase>(slice_byte_size, host_blocks,
+-                                                   physical_size),
++            std::make_unique<DeviceBackedTestBase>(
++                slice_byte_size, host_blocks, physical_size, num_storages),
+             /*node_id=*/0, /*local_control_port=*/-1, /*max_blocks=*/0,
+-            /*num_slots=*/0, /*timeout_s=*/30.0) {}
++            /*num_slots=*/0, timeout_s) {}
++
++  void SetStorageDeviceSize(size_t storage_idx, size_t bytes) {
++    static_cast<DeviceBackedTestBase*>(base())->SetStorageDeviceSize(
++        storage_idx, bytes);
++  }
++
++  bool has_pool_send(uint64_t uuid) {
++    absl::MutexLock lock(mu_);
++    auto it = active_pool_reshard_sends_.find(uuid);
++    return it != active_pool_reshard_sends_.end() && !it->second->Done();
++  }
++
++  bool has_pool_recv(uint64_t uuid) {
++    absl::MutexLock lock(mu_);
++    auto it = active_pool_reshard_recvs_.find(uuid);
++    return it != active_pool_reshard_recvs_.end() && !it->second->Done();
++  }
+ 
+   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
+ };
+@@ -801,6 +834,677 @@ TEST(PoolReshardRecvTest,
+   EXPECT_THAT(failed_recving, Contains("pool_reshard_req_3003"));
+ }
+ 
++// Loopback TCP listener that accepts incoming push connections and holds them
++// open without replying until CloseAll(), keeping SocketTransportAdapter pushes
++// deterministically in flight.
++class HeldTcpPeer {
++ public:
++  HeldTcpPeer() {
++    fd_ = socket(AF_INET, SOCK_STREAM, 0);
++    sockaddr_in addr{};
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    addr.sin_port = 0;
++    EXPECT_EQ(bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
++    socklen_t len = sizeof(addr);
++    EXPECT_EQ(getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len), 0);
++    port_ = ntohs(addr.sin_port);
++    EXPECT_EQ(listen(fd_, 16), 0);
++    accept_thread_ = std::thread([this]() {
++      while (true) {
++        int client = accept(fd_, nullptr, nullptr);
++        if (client < 0) return;
++        {
++          std::lock_guard<std::mutex> lock(mu_);
++          if (closed_) {
++            shutdown(client, SHUT_RDWR);
++            close(client);
++            return;
++          }
++          clients_.push_back(client);
++        }
++        cv_.notify_all();
++      }
++    });
++  }
++
++  ~HeldTcpPeer() { CloseAll(); }
++
++  std::string endpoint() const {
++    return "127.0.0.1:" + std::to_string(port_);
++  }
++
++  bool WaitUntilAccepted(size_t count) {
++    std::unique_lock<std::mutex> lock(mu_);
++    return cv_.wait_for(lock, std::chrono::seconds(5), [this, count]() {
++             return clients_.size() >= count || closed_;
++           }) &&
++           clients_.size() >= count;
++  }
++
++  void CloseAll() {
++    std::vector<int> to_close;
++    int listen_fd = -1;
++    {
++      std::lock_guard<std::mutex> lock(mu_);
++      if (closed_) return;
++      closed_ = true;
++      to_close.swap(clients_);
++      listen_fd = fd_;
++      fd_ = -1;
++    }
++    for (int client : to_close) {
++      shutdown(client, SHUT_RDWR);
++      close(client);
++    }
++    if (listen_fd >= 0) {
++      shutdown(listen_fd, SHUT_RDWR);
++      close(listen_fd);
++    }
++    cv_.notify_all();
++    if (accept_thread_.joinable()) {
++      accept_thread_.join();
++    }
++  }
++
++ private:
++  int fd_ = -1;
++  int port_ = 0;
++  std::mutex mu_;
++  std::condition_variable cv_;
++  std::vector<int> clients_;
++  bool closed_ = false;
++  std::thread accept_thread_;
++};
++
++StartTransferRequest TwoPoolPlan(int64_t uuid, int32_t rank_0, int32_t rank_1,
++                                 const std::string& peer_0 = "127.0.0.1:1",
++                                 const std::string& peer_1 = "127.0.0.1:1") {
++  StartTransferRequest plan;
++  plan.set_uuid(uuid);
++  plan.set_req_id("pool_reshard_req_" + std::to_string(uuid));
++  plan.set_dst_mem_type(MEMORY_TYPE_HBM);
++  plan.set_use_block_chunks(true);
++  plan.set_parallelism(1);
++  plan.add_transfer_pool_indices(0);
++  plan.add_transfer_pool_indices(1);
++  plan.add_pool_dtype_tags("bf16");
++  plan.add_pool_dtype_tags("bf16");
++
++  for (int group_idx = 0; group_idx < 2; ++group_idx) {
++    auto* group = plan.add_pool_groups();
++    group->add_pool_indices(group_idx);
++    group->set_order_rank(group_idx == 0 ? rank_0 : rank_1);
++    group->add_dst_device_block_ids(0);
++    group->set_expected_pushes(1);
++    group->add_dst_expected_extent_bytes(16);
++
++    auto* entry = (*plan.mutable_shard_push_schedules())[0].add_entries();
++    entry->set_pool_group(group_idx);
++    entry->set_dst_peer(group_idx == 0 ? peer_0 : peer_1);
++    entry->set_dst_shard_idx(0);
++    entry->set_src_block_id(0);
++    entry->set_dst_block_id(0);
++    entry->set_src_offset_bytes(0);
++    entry->set_dst_offset_bytes(0);
++    entry->set_size_bytes(16);
++    entry->set_src_stride_bytes(0);
++    entry->set_dst_stride_bytes(0);
++    entry->set_count(1);
++  }
++  return plan;
++}
++
++TEST(PoolReshardRecvTest,
++     OnPoolReceivedUploadsSinglePoolAndWaitsForOpenPushLease) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 16;
++  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
++                                 /*physical_size=*/kStride * kNumBlocks);
++
++  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
++  pool.num_blocks = kNumBlocks;
++  pool.staging_blocks_per_request = 1;
++  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
++
++  // 1. Open incoming push lease spans OnPoolReceived and synchronous H2D:
++  //    a prior empty push stream ends without settling, then the payload
++  //    stream's OnPoolReceived finishes H2D and marks the session draining
++  //    while keeping staging pinned until EndIncomingPush closes the lease.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/4101),
++                                                 std::vector<int64_t>{0}));
++  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/4101));
++  ABSL_EXPECT_OK(
++      manager.base()->EndIncomingPush(/*uuid=*/4101, absl::OkStatus()));
++  EXPECT_TRUE(manager.has_pool_recv(4101));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/4101));
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/4101));
++  EXPECT_TRUE(manager.has_pool_recv(4101));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++  EXPECT_TRUE(manager.base()->HasActivePlan(4101));
++
++  ABSL_EXPECT_OK(
++      manager.base()->EndIncomingPush(/*uuid=*/4101, absl::OkStatus()));
++  EXPECT_FALSE(manager.has_pool_recv(4101));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  EXPECT_FALSE(manager.base()->HasActivePlan(4101));
++  {
++    const auto [sent, received, failed] = manager.CompleteReadRaw();
++    EXPECT_THAT(received, Contains("pool_reshard_req_4101"));
++    EXPECT_THAT(failed, IsEmpty());
++  }
++
++  // 2. With no incoming push lease open, OnPoolReceived uploads and settles
++  //    immediately when the synchronous H2D callback finishes.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/4102),
++                                                 std::vector<int64_t>{0}));
++  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/4102));
++  EXPECT_FALSE(manager.has_pool_recv(4102));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  {
++    const auto [sent, received, failed] = manager.CompleteReadRaw();
++    EXPECT_THAT(received, Contains("pool_reshard_req_4102"));
++    EXPECT_THAT(failed, IsEmpty());
++  }
++}
++
++TEST(PoolReshardRecvTest,
++     RankWaveGatesHigherRankPoolAndChainsWhileBatchWaitsForPeers) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 16;
++  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
++                                 /*physical_size=*/kStride * kNumBlocks,
++                                 /*num_storages=*/2);
++
++  kv_cache::PoolSpec pool0 = DensePool("fa0", kStride, "bf16");
++  pool0.storage_index = 0;
++  pool0.num_blocks = kNumBlocks;
++  pool0.staging_blocks_per_request = 1;
++  kv_cache::PoolSpec pool1 = DensePool("fa1", kStride, "bf16");
++  pool1.storage_index = 1;
++  pool1.num_blocks = kNumBlocks;
++  pool1.staging_blocks_per_request = 1;
++  ABSL_ASSERT_OK(
++      manager.base()->RegisterPools({pool0, pool1}, /*staging_leases=*/2));
++
++  // 1. Ranks [0, 1]: pool 1 arriving before pool 0 is held back by the rank
++  //    gate; pool 0's upload then chains pool 1's upload to completion.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
++      TwoPoolPlan(/*uuid=*/4111, /*rank_0=*/0, /*rank_1=*/1),
++      std::vector<int64_t>{0, 0}));
++  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/1, /*uuid=*/4111));
++  EXPECT_TRUE(manager.has_pool_recv(4111));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++  {
++    const auto [sent, received, failed] = manager.CompleteReadRaw();
++    EXPECT_THAT(received, IsEmpty());
++    EXPECT_THAT(failed, IsEmpty());
++  }
++
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/4111));
++  EXPECT_FALSE(manager.has_pool_recv(4111));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  {
++    const auto [sent, received, failed] = manager.CompleteReadRaw();
++    EXPECT_THAT(received, Contains("pool_reshard_req_4111"));
++    EXPECT_THAT(failed, IsEmpty());
++  }
++
++  // 2. Ranks [0, 0]: pool 0 uploads immediately without settling while pool 1
++  //    has not yet arrived; pool 1 arriving finishes the receive.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
++      TwoPoolPlan(/*uuid=*/4112, /*rank_0=*/0, /*rank_1=*/0),
++      std::vector<int64_t>{0, 0}));
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/4112));
++  EXPECT_TRUE(manager.has_pool_recv(4112));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/1, /*uuid=*/4112));
++  EXPECT_FALSE(manager.has_pool_recv(4112));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  {
++    const auto [sent, received, failed] = manager.CompleteReadRaw();
++    EXPECT_THAT(received, Contains("pool_reshard_req_4112"));
++    EXPECT_THAT(failed, IsEmpty());
++  }
++}
++
++TEST(PoolReshardRecvTest,
++     ConcurrentPushesAndUnregisterDrainBeforeSettling) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 16;
++  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
++                                 /*physical_size=*/kStride * kNumBlocks);
++
++  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
++  pool.num_blocks = kNumBlocks;
++  pool.staging_blocks_per_request = 1;
++  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
++
++  // 1. Two open push streams across UnregisterActivePlan: the first unregister
++  //    starts draining, a duplicate unregister is a no-op, OnPoolReceived on
++  //    the draining session launches no upload, the first failed push end
++  //    keeps staging pinned, and the second settles the receive.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/4121),
++                                                 std::vector<int64_t>{0}));
++  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/4121));
++  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/4121));
++
++  ABSL_ASSERT_OK(manager.UnregisterActivePlan(/*uuid=*/4121));
++  EXPECT_TRUE(manager.has_pool_recv(4121));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  ABSL_ASSERT_OK(manager.UnregisterActivePlan(/*uuid=*/4121));
++  EXPECT_TRUE(manager.has_pool_recv(4121));
++
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/4121));
++  EXPECT_TRUE(manager.has_pool_recv(4121));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  EXPECT_THAT(
++      manager.base()->EndIncomingPush(
++          /*uuid=*/4121, absl::DeadlineExceededError("stream 1 timeout")),
++      StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_TRUE(manager.has_pool_recv(4121));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  EXPECT_THAT(
++      manager.base()->EndIncomingPush(
++          /*uuid=*/4121, absl::DeadlineExceededError("stream 2 timeout")),
++      StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_FALSE(manager.has_pool_recv(4121));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  EXPECT_FALSE(manager.base()->HasActivePlan(4121));
++  {
++    CompleteReadResult res = manager.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, Contains("pool_reshard_req_4121"));
++    EXPECT_EQ(res.details["pool_reshard_req_4121"].code, "CANCELLED");
++  }
++
++  // 2. First of two concurrent push streams fails directly in EndIncomingPush:
++  //    the session starts draining with the push error while waiting for the
++  //    sibling stream to close.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/4122),
++                                                 std::vector<int64_t>{0}));
++  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/4122));
++  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/4122));
++
++  EXPECT_THAT(
++      manager.base()->EndIncomingPush(
++          /*uuid=*/4122, absl::DeadlineExceededError("stream 1 timeout")),
++      StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_TRUE(manager.has_pool_recv(4122));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  EXPECT_THAT(manager.base()->EndIncomingPush(/*uuid=*/4122, absl::OkStatus()),
++              StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_FALSE(manager.has_pool_recv(4122));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  {
++    CompleteReadResult res = manager.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, Contains("pool_reshard_req_4122"));
++    EXPECT_EQ(res.details["pool_reshard_req_4122"].code, "DEADLINE_EXCEEDED");
++  }
++}
++
++TEST(PoolReshardRecvTest,
++     FailedH2dPoolBlocksFailsReceiveAndWaitsForOpenPushLease) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 16;
++  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
++                                 /*physical_size=*/kStride * kNumBlocks);
++
++  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
++  pool.num_blocks = kNumBlocks;
++  pool.staging_blocks_per_request = 1;
++  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
++  manager.SetStorageDeviceSize(/*storage_idx=*/0, /*bytes=*/0);
++
++  // 1. No open push lease: synchronous H2dPoolBlocks failure settles at once.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/4131),
++                                                 std::vector<int64_t>{0}));
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/4131));
++  EXPECT_FALSE(manager.has_pool_recv(4131));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  EXPECT_FALSE(manager.base()->HasActivePlan(4131));
++  {
++    CompleteReadResult res = manager.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, Contains("pool_reshard_req_4131"));
++    EXPECT_EQ(res.details["pool_reshard_req_4131"].code, "OUT_OF_RANGE");
++  }
++
++  // 2. Open push lease: synchronous H2dPoolBlocks failure latches the error
++  //    and drains while keeping staging pinned until EndIncomingPush runs.
++  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/4132),
++                                                 std::vector<int64_t>{0}));
++  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/4132));
++  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/4132));
++  EXPECT_TRUE(manager.has_pool_recv(4132));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
++  EXPECT_TRUE(manager.base()->HasActivePlan(4132));
++
++  EXPECT_THAT(manager.base()->EndIncomingPush(/*uuid=*/4132, absl::OkStatus()),
++              StatusIs(absl::StatusCode::kCancelled));
++  EXPECT_FALSE(manager.has_pool_recv(4132));
++  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
++  EXPECT_FALSE(manager.base()->HasActivePlan(4132));
++  {
++    CompleteReadResult res = manager.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, Contains("pool_reshard_req_4132"));
++    EXPECT_EQ(res.details["pool_reshard_req_4132"].code, "OUT_OF_RANGE");
++  }
++}
++
++TEST(PoolReshardSendTest,
++     LoopbackPushUploadsReceiverPoolAndPublishesBothSides) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 4;
++  BoundedPoolTestManager sender(/*slice_byte_size=*/kStride, /*host_blocks=*/4,
++                                /*physical_size=*/kStride * kNumBlocks);
++  BoundedPoolTestManager receiver(/*slice_byte_size=*/kStride,
++                                  /*host_blocks=*/1,
++                                  /*physical_size=*/kStride * kNumBlocks);
++
++  ABSL_ASSERT_OK(sender.base()->RegisterPools({DensePool("fa", kStride)}));
++  kv_cache::PoolSpec recv_pool = DensePool("fa", kStride);
++  recv_pool.staging_blocks_per_request = 1;
++  ABSL_ASSERT_OK(
++      receiver.base()->RegisterPools({recv_pool}, /*staging_leases=*/2));
++
++  const std::string peer = "127.0.0.1:" + std::to_string(
++      receiver.base()->InitTransportServer()->local_port());
++  StartTransferRequest plan = ValidPlan(/*uuid=*/4201);
++  plan.mutable_pool_groups(0)->set_dst_device_block_ids(0, 2);
++  auto* entry = (*plan.mutable_shard_push_schedules())[0].mutable_entries(0);
++  entry->set_dst_peer(peer);
++  entry->set_dst_block_id(2);
++
++  std::memset(sender.base()->GetHostPointer(0, 0), 0xA5, 16);
++  std::memset(receiver.base()->GetHostPointer(0, 0), 0x00, kStride * 2);
++
++  ABSL_ASSERT_OK(
++      receiver.PoolReshardRegisterRecv(plan, std::vector<int64_t>{2}));
++  ASSERT_EQ(receiver.base()->PoolStagingSummary()[0].free_slots, 1);
++
++  ABSL_ASSERT_OK(
++      sender.PoolReshardPush(plan, std::vector<int64_t>{0}, /*parallelism=*/1));
++
++  const absl::Time deadline = absl::Now() + absl::Seconds(5);
++  bool sender_done = false;
++  bool receiver_done = false;
++  while ((!sender_done || !receiver_done) && absl::Now() < deadline) {
++    if (!sender_done) {
++      const auto [sent, received, failed] = sender.CompleteReadRaw();
++      EXPECT_THAT(failed, IsEmpty());
++      if (!sent.empty()) {
++        EXPECT_THAT(sent, Contains("pool_reshard_req_4201"));
++        sender_done = true;
++      }
++    }
++    if (!receiver_done) {
++      const auto [sent, received, failed] = receiver.CompleteReadRaw();
++      EXPECT_THAT(failed, IsEmpty());
++      if (!received.empty()) {
++        EXPECT_THAT(received, Contains("pool_reshard_req_4201"));
++        receiver_done = true;
++      }
++    }
++    if (!sender_done || !receiver_done) {
++      absl::SleepFor(absl::Milliseconds(5));
++    }
++  }
++  ASSERT_TRUE(sender_done);
++  ASSERT_TRUE(receiver_done);
++  EXPECT_FALSE(sender.base()->HasActivePlan(4201));
++  EXPECT_FALSE(receiver.base()->HasActivePlan(4201));
++  EXPECT_EQ(receiver.base()->PoolStagingSummary()[0].free_slots, 2);
++  // Bounded staging leased one of the two arena slots on storage 0; the 16-byte
++  // 0xA5 payload landed in that slot before H2D completed.
++  const uint8_t* recv_base = receiver.base()->GetHostPointer(0, 0);
++  EXPECT_TRUE(recv_base[0] == 0xA5 || recv_base[kStride] == 0xA5);
++}
++
++TEST(PoolReshardSendTest, ExecutePushReturnsWhilePeerPushRemainsInFlight) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 4;
++  HeldTcpPeer held_peer;
++  BoundedPoolTestManager sender(/*slice_byte_size=*/kStride, /*host_blocks=*/4,
++                                /*physical_size=*/kStride * kNumBlocks);
++  ABSL_ASSERT_OK(sender.base()->RegisterPools({DensePool("fa", kStride)}));
++
++  StartTransferRequest plan = ValidPlan(/*uuid=*/4211);
++  (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
++      held_peer.endpoint());
++
++  ABSL_ASSERT_OK(
++      sender.PoolReshardPush(plan, std::vector<int64_t>{0}, /*parallelism=*/1));
++  ASSERT_TRUE(held_peer.WaitUntilAccepted(1));
++  EXPECT_TRUE(sender.has_pool_send(4211));
++  {
++    const auto [sent, received, failed] = sender.CompleteReadRaw();
++    EXPECT_THAT(sent, IsEmpty());
++    EXPECT_THAT(failed, IsEmpty());
++  }
++
++  held_peer.CloseAll();
++  const absl::Time deadline = absl::Now() + absl::Seconds(5);
++  bool settled = false;
++  while (!settled && absl::Now() < deadline) {
++    const auto [sent, received, failed] = sender.CompleteReadRaw();
++    if (!failed.empty()) {
++      EXPECT_THAT(failed, Contains("pool_reshard_req_4211"));
++      settled = true;
++    } else {
++      absl::SleepFor(absl::Milliseconds(5));
++    }
++  }
++  EXPECT_TRUE(settled);
++  EXPECT_FALSE(sender.has_pool_send(4211));
++  EXPECT_FALSE(sender.base()->HasActivePlan(4211));
++}
++
++TEST(PoolReshardSendTest,
++     SynchronousD2hFailureSettlesOrDrainsInFlightPoolPush) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 4;
++
++  // 1. Single pool on device_size = 0: D2hPoolBlocks fails synchronously,
++  //    settling the send immediately before PoolReshardPush returns.
++  {
++    BoundedPoolTestManager sender(/*slice_byte_size=*/kStride,
++                                  /*host_blocks=*/4,
++                                  /*physical_size=*/kStride * kNumBlocks);
++    ABSL_ASSERT_OK(sender.base()->RegisterPools({DensePool("fa", kStride)}));
++    sender.SetStorageDeviceSize(/*storage_idx=*/0, /*bytes=*/0);
++
++    EXPECT_THAT(sender.PoolReshardPush(ValidPlan(/*uuid=*/4221),
++                                       std::vector<int64_t>{0},
++                                       /*parallelism=*/1),
++                StatusIs(absl::StatusCode::kOutOfRange));
++    EXPECT_FALSE(sender.has_pool_send(4221));
++    EXPECT_FALSE(sender.base()->HasActivePlan(4221));
++    CompleteReadResult res = sender.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, Contains("pool_reshard_req_4221"));
++    EXPECT_EQ(res.details["pool_reshard_req_4221"].code, "OUT_OF_RANGE");
++  }
++
++  // 2. Two pools where pool 0 starts an in-flight push to HeldTcpPeer and
++  //    pool 1 fails D2hPoolBlocks synchronously: the send latches pool 1's
++  //    error and stays active until pool 0's push finishes.
++  {
++    HeldTcpPeer held_peer;
++    BoundedPoolTestManager sender(/*slice_byte_size=*/kStride,
++                                  /*host_blocks=*/8,
++                                  /*physical_size=*/2 * kStride * kNumBlocks);
++    kv_cache::PoolSpec pool0 = DensePool("fa0", kStride);
++    kv_cache::PoolSpec pool1 = DensePool("fa1", kStride);
++    pool1.base_offset_bytes = kStride * kNumBlocks;
++    ABSL_ASSERT_OK(sender.base()->RegisterPools({pool0, pool1}));
++    sender.SetStorageDeviceSize(/*storage_idx=*/0,
++                                /*bytes=*/kStride * kNumBlocks);
++
++    StartTransferRequest plan = TwoPoolPlan(
++        /*uuid=*/4222, /*rank_0=*/0, /*rank_1=*/0, held_peer.endpoint(),
++        "127.0.0.1:1");
++    EXPECT_THAT(sender.PoolReshardPush(plan, std::vector<int64_t>{0},
++                                       /*parallelism=*/1),
++                StatusIs(absl::StatusCode::kOutOfRange));
++    ASSERT_TRUE(held_peer.WaitUntilAccepted(1));
++    EXPECT_TRUE(sender.has_pool_send(4222));
++
++    held_peer.CloseAll();
++    const absl::Time deadline = absl::Now() + absl::Seconds(5);
++    bool settled = false;
++    while (!settled && absl::Now() < deadline) {
++      CompleteReadResult res = sender.CompleteReadWithDetails();
++      if (!res.failed.empty()) {
++        EXPECT_THAT(res.failed, Contains("pool_reshard_req_4222"));
++        EXPECT_EQ(res.details["pool_reshard_req_4222"].code, "OUT_OF_RANGE");
++        settled = true;
++      } else {
++        absl::SleepFor(absl::Milliseconds(5));
++      }
++    }
++    EXPECT_TRUE(settled);
++    EXPECT_FALSE(sender.has_pool_send(4222));
++  }
++}
++
++TEST(PoolReshardSendTest,
++     FinalizingSessionDuringExecutePushSettlesOrDrainsRemainingOps) {
++  constexpr int64_t kStride = 128;
++  constexpr int64_t kNumBlocks = 4;
++
++  // Keying the sender's sole schedule under shard index 1 passes Create's
++  // single-schedule fallback while failing BuildBlockRequests synchronously
++  // on shard 0 inside StartPoolPush, latching finalizing_ while ExecutePush
++  // still holds its caller op.
++  auto make_sync_push_fail_plan = [](StartTransferRequest plan) {
++    auto schedule = (*plan.mutable_shard_push_schedules())[0];
++    plan.mutable_shard_push_schedules()->erase(0);
++    (*plan.mutable_shard_push_schedules())[1] = std::move(schedule);
++    return plan;
++  };
++
++  // 1. Single pool: StartPoolPush latches finalizing_ synchronously and
++  //    ExecutePush's closing EndOp() settles the session.
++  {
++    BoundedPoolTestManager sender(/*slice_byte_size=*/kStride,
++                                  /*host_blocks=*/4,
++                                  /*physical_size=*/kStride * kNumBlocks);
++    ABSL_ASSERT_OK(sender.base()->RegisterPools({DensePool("fa", kStride)}));
++
++    StartTransferRequest plan =
++        make_sync_push_fail_plan(ValidPlan(/*uuid=*/4231));
++    ABSL_ASSERT_OK(sender.PoolReshardPush(plan, std::vector<int64_t>{0},
++                                          /*parallelism=*/1));
++    EXPECT_FALSE(sender.has_pool_send(4231));
++    EXPECT_FALSE(sender.base()->HasActivePlan(4231));
++    CompleteReadResult res = sender.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, Contains("pool_reshard_req_4231"));
++    EXPECT_EQ(res.details["pool_reshard_req_4231"].code, "NOT_FOUND");
++  }
++
++  // 2. Two pools: pool 0's StartPoolPush latches finalizing_ synchronously,
++  //    then pool 1's D2hPoolBlocks fails on the already-finalizing session;
++  //    RecordPushCompletion ignores pool 1's error and EndOp() settles with
++  //    pool 0's NOT_FOUND status.
++  {
++    BoundedPoolTestManager sender(/*slice_byte_size=*/kStride,
++                                  /*host_blocks=*/8,
++                                  /*physical_size=*/2 * kStride * kNumBlocks);
++    kv_cache::PoolSpec pool0 = DensePool("fa0", kStride);
++    kv_cache::PoolSpec pool1 = DensePool("fa1", kStride);
++    pool1.base_offset_bytes = kStride * kNumBlocks;
++    ABSL_ASSERT_OK(sender.base()->RegisterPools({pool0, pool1}));
++    sender.SetStorageDeviceSize(/*storage_idx=*/0,
++                                /*bytes=*/kStride * kNumBlocks);
++
++    StartTransferRequest plan = make_sync_push_fail_plan(
++        TwoPoolPlan(/*uuid=*/4232, /*rank_0=*/0, /*rank_1=*/0));
++    EXPECT_THAT(sender.PoolReshardPush(plan, std::vector<int64_t>{0},
++                                       /*parallelism=*/1),
++                StatusIs(absl::StatusCode::kOutOfRange));
++    EXPECT_FALSE(sender.has_pool_send(4232));
++    CompleteReadResult res = sender.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, Contains("pool_reshard_req_4232"));
++    EXPECT_EQ(res.details["pool_reshard_req_4232"].code, "NOT_FOUND");
++  }
++
++  // 3. Two storages: pool 0 pushes to HeldTcpPeer while pool 1 waits on
++  //    storage 1's bounded staging lease across a deadline sweep; waking
++  //    pool 1 fails D2hPoolBlocks on the finalizing session without settling
++  //    until pool 0's push ends.
++  {
++    HeldTcpPeer held_peer;
++    BoundedPoolTestManager sender(/*slice_byte_size=*/kStride,
++                                  /*host_blocks=*/4,
++                                  /*physical_size=*/kStride * kNumBlocks,
++                                  /*num_storages=*/2, /*timeout_s=*/0.03);
++    kv_cache::PoolSpec pool0 = DensePool("fa0", kStride);
++    pool0.storage_index = 0;
++    kv_cache::PoolSpec pool1 = DensePool("fa1", kStride);
++    pool1.storage_index = 1;
++    pool1.staging_blocks_per_request = 1;
++    ABSL_ASSERT_OK(
++        sender.base()->RegisterPools({pool0, pool1}, /*staging_leases=*/1));
++    sender.SetStorageDeviceSize(/*storage_idx=*/1, /*bytes=*/0);
++
++    ABSL_ASSERT_OK(sender.base()->AcquirePoolStagingLease(
++        /*uuid=*/9999, /*storage_idx=*/1, std::vector<int64_t>{0},
++        absl::Seconds(5)));
++    ASSERT_EQ(sender.base()->PoolStagingSummary()[1].free_slots, 0);
++
++    StartTransferRequest plan = TwoPoolPlan(
++        /*uuid=*/4233, /*rank_0=*/0, /*rank_1=*/0, held_peer.endpoint(),
++        "127.0.0.1:1");
++    absl::Status push_status;
++    std::thread push_worker([&]() {
++      push_status = sender.PoolReshardPush(plan, std::vector<int64_t>{0},
++                                           /*parallelism=*/1);
++    });
++    ASSERT_TRUE(held_peer.WaitUntilAccepted(1));
++
++    absl::SleepFor(absl::Milliseconds(45));
++    CompleteReadResult swept = sender.CompleteReadWithDetails();
++    EXPECT_THAT(swept.failed, IsEmpty());
++    EXPECT_TRUE(sender.has_pool_send(4233));
++
++    sender.base()->ReleasePoolStagingLeases(/*uuid=*/9999);
++    push_worker.join();
++    EXPECT_THAT(push_status, StatusIs(absl::StatusCode::kOutOfRange));
++    // Pool 0's push is still open, so neither the session nor storage 1's
++    // newly acquired lease settles yet.
++    EXPECT_TRUE(sender.has_pool_send(4233));
++    EXPECT_EQ(sender.base()->PoolStagingSummary()[1].free_slots, 0);
++
++    held_peer.CloseAll();
++    const absl::Time deadline = absl::Now() + absl::Seconds(5);
++    bool settled = false;
++    while (!settled && absl::Now() < deadline) {
++      CompleteReadResult res = sender.CompleteReadWithDetails();
++      if (!res.failed.empty()) {
++        EXPECT_THAT(res.failed, Contains("pool_reshard_req_4233"));
++        EXPECT_EQ(res.details["pool_reshard_req_4233"].code,
++                  "DEADLINE_EXCEEDED");
++        settled = true;
++      } else {
++        absl::SleepFor(absl::Milliseconds(5));
++      }
++    }
++    EXPECT_TRUE(settled);
++    EXPECT_FALSE(sender.has_pool_send(4233));
++    EXPECT_EQ(sender.base()->PoolStagingSummary()[1].free_slots, 1);
++  }
++}
++
+ 
+ // ---------------------------------------------------------------------------
+ // Sub-plan chains: a request coordinated as several pool-reshard plans
+diff --git a/tpu_sync/kv_cache/reshard_send_session_test.cc b/tpu_sync/kv_cache/reshard_send_session_test.cc
+index 1e7310a3..f1bd7c28 100644
+--- a/tpu_sync/kv_cache/reshard_send_session_test.cc
++++ b/tpu_sync/kv_cache/reshard_send_session_test.cc
+@@ -67,6 +67,9 @@ struct ReshardSendSessionTestPeer {
+     session.RecordPushCompletion(manager, status);
+     session.EndOp();
+   }
++
++  // Ends ExecutePush's caller-held operation without recording a push result.
++  static void EndOp(ReshardSendSession& session) { session.EndOp(); }
+ };
+ 
+ namespace {
+@@ -452,5 +455,189 @@ TEST(ReshardSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
+   EXPECT_FALSE(base.HasActivePlan(plan.uuid()));
+ }
+ 
++StartTransferRequest TwoPeerPlan(int64_t uuid, const std::string& peer_a,
++                                 const std::string& peer_b) {
++  StartTransferRequest plan = ValidPlan(uuid, /*dtype_tags=*/{""});
++  plan.mutable_pool_groups(0)->set_expected_pushes(2);
++  plan.mutable_pool_groups(0)->set_dst_expected_extent_bytes(0, 32);
++  auto* schedule = &(*plan.mutable_shard_push_schedules())[0];
++  schedule->mutable_entries(0)->set_dst_peer(peer_a);
++  auto* second = schedule->add_entries();
++  *second = schedule->entries(0);
++  second->set_dst_peer(peer_b);
++  second->set_dst_offset_bytes(16);
++  return plan;
++}
++
++TEST(ReshardSendSessionTest,
++     SingleFailedPushSettlesUnregistersPlanAndPropagatesError) {
++  ScopedDataConnReuseEnv env(/*value=*/nullptr);
++  KVCacheManagerWithTransfer manager = MakeTestManager();
++  manager.base()->AttachPlaceholderDeviceHoldForTest();
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
++                                  /*max_blocks=*/0);
++  StartTransferRequest plan = ValidPlan(/*uuid=*/1210, /*dtype_tags=*/{""});
++  absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
++      ReshardSendSession::Create(
++          manager.base(), allocator.get(), std::vector<int64_t>{0},
++          /*parallelism=*/1,
++          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
++  ABSL_ASSERT_OK(session);
++  ASSERT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
++
++  ReshardSendSessionTestPeer::BeginPush(**session, manager);
++  ReshardSendSessionTestPeer::CompletePush(
++      **session, manager, absl::UnavailableError("peer reset connection"));
++
++  EXPECT_TRUE((*session)->Done());
++  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
++  EXPECT_THAT((*session)->AwaitForDone(),
++              StatusIs(absl::StatusCode::kUnavailable,
++                       HasSubstr("peer reset connection")));
++}
++
++TEST(ReshardSendSessionTest,
++     FirstFailedPushWaitsForInFlightSiblingBeforeSettling) {
++  ScopedDataConnReuseEnv env(/*value=*/nullptr);
++  KVCacheManagerWithTransfer manager = MakeTestManager();
++  manager.base()->AttachPlaceholderDeviceHoldForTest();
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
++                                  /*max_blocks=*/0);
++  StartTransferRequest plan =
++      TwoPeerPlan(/*uuid=*/1211, "127.0.0.1:1", "127.0.0.1:2");
++  absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
++      ReshardSendSession::Create(
++          manager.base(), allocator.get(), std::vector<int64_t>{0},
++          /*parallelism=*/1,
++          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
++  ABSL_ASSERT_OK(session);
++
++  ReshardSendSessionTestPeer::BeginPush(**session, manager);
++  ReshardSendSessionTestPeer::BeginPush(**session, manager);
++
++  // First peer push fails while the second peer push is still in flight: the
++  // session records the failure and starts finalizing, but must not settle
++  // until the sibling push completes.
++  ReshardSendSessionTestPeer::CompletePush(
++      **session, manager, absl::UnavailableError("peer 1 disconnected"));
++  EXPECT_FALSE((*session)->Done());
++
++  ReshardSendSessionTestPeer::CompletePush(**session, manager,
++                                           absl::OkStatus());
++  EXPECT_TRUE((*session)->Done());
++  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
++  EXPECT_THAT((*session)->AwaitForDone(),
++              StatusIs(absl::StatusCode::kUnavailable,
++                       HasSubstr("peer 1 disconnected")));
++}
++
++TEST(ReshardSendSessionTest,
++     MultiPeerPushAndCallerHeldOpKeepSessionLiveUntilFinalOp) {
++  ScopedDataConnReuseEnv env(/*value=*/nullptr);
++  KVCacheManagerWithTransfer manager = MakeTestManager();
++  manager.base()->AttachPlaceholderDeviceHoldForTest();
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
++                                  /*max_blocks=*/0);
++
++  // 1. Two-peer plan: the first peer push completing OK decrements
++  //    remaining_pool_peer_pushes_ without finalizing or unregistering.
++  {
++    StartTransferRequest two_peer =
++        TwoPeerPlan(/*uuid=*/1212, "127.0.0.1:1", "127.0.0.1:2");
++    absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
++        ReshardSendSession::Create(
++            manager.base(), allocator.get(), std::vector<int64_t>{0},
++            /*parallelism=*/1,
++            std::chrono::steady_clock::now() + std::chrono::seconds(10),
++            two_peer);
++    ABSL_ASSERT_OK(session);
++    ReshardSendSessionTestPeer::BeginPush(**session, manager);
++    ReshardSendSessionTestPeer::BeginPush(**session, manager);
++
++    ReshardSendSessionTestPeer::CompletePush(**session, manager,
++                                             absl::OkStatus());
++    EXPECT_FALSE((*session)->Done());
++    EXPECT_TRUE(manager.base()->HasActivePlan(two_peer.uuid()));
++
++    ReshardSendSessionTestPeer::CompletePush(**session, manager,
++                                             absl::OkStatus());
++    EXPECT_TRUE((*session)->Done());
++    EXPECT_FALSE(manager.base()->HasActivePlan(two_peer.uuid()));
++    ABSL_EXPECT_OK((*session)->AwaitForDone());
++  }
++
++  // 2. Single-peer plan where the push completes on a worker before
++  //    ExecutePush drops its caller-held op: the last scheduled push starts
++  //    finalizing without settling until the caller op ends.
++  {
++    StartTransferRequest single_peer =
++        ValidPlan(/*uuid=*/1213, /*dtype_tags=*/{""});
++    absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
++        ReshardSendSession::Create(
++            manager.base(), allocator.get(), std::vector<int64_t>{0},
++            /*parallelism=*/1,
++            std::chrono::steady_clock::now() + std::chrono::seconds(10),
++            single_peer);
++    ABSL_ASSERT_OK(session);
++    ReshardSendSessionTestPeer::BeginPush(**session, manager);  // caller op
++    ReshardSendSessionTestPeer::BeginPush(**session, manager);  // peer push
++
++    ReshardSendSessionTestPeer::CompletePush(**session, manager,
++                                             absl::OkStatus());
++    EXPECT_FALSE((*session)->Done());
++    EXPECT_FALSE(manager.base()->HasActivePlan(single_peer.uuid()));
++
++    ReshardSendSessionTestPeer::EndOp(**session);
++    EXPECT_TRUE((*session)->Done());
++    ABSL_EXPECT_OK((*session)->AwaitForDone());
++  }
++}
++
++TEST(ReshardSendSessionTest,
++     DuplicateCancelAndNonFinalPushCompletionKeepSessionDraining) {
++  ScopedDataConnReuseEnv env(/*value=*/nullptr);
++  KVCacheManagerWithTransfer manager = MakeTestManager();
++  manager.base()->AttachPlaceholderDeviceHoldForTest();
++  std::unique_ptr<StagingBlockAllocator> allocator =
++      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
++                                  /*max_blocks=*/0);
++  StartTransferRequest plan =
++      TwoPeerPlan(/*uuid=*/1214, "127.0.0.1:1", "127.0.0.1:2");
++  absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
++      ReshardSendSession::Create(
++          manager.base(), allocator.get(), std::vector<int64_t>{0},
++          /*parallelism=*/1,
++          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
++  ABSL_ASSERT_OK(session);
++
++  ReshardSendSessionTestPeer::BeginPush(**session, manager);
++  ReshardSendSessionTestPeer::BeginPush(**session, manager);
++
++  (*session)->Finish(absl::CancelledError("first cancel"));
++  // A second Finish while finalizing neither overwrites the first error nor
++  // settles the session while pushes remain in flight.
++  (*session)->Finish(absl::DeadlineExceededError("later sweep"));
++  EXPECT_FALSE((*session)->Done());
++  EXPECT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
++
++  // The first push completion on a finalizing session drops one op without
++  // settling or unregistering; the final push completion unregisters and
++  // settles with the original cancellation status.
++  ReshardSendSessionTestPeer::CompletePush(**session, manager,
++                                           absl::OkStatus());
++  EXPECT_FALSE((*session)->Done());
++  EXPECT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
++
++  ReshardSendSessionTestPeer::CompletePush(**session, manager,
++                                           absl::OkStatus());
++  EXPECT_TRUE((*session)->Done());
++  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
++  EXPECT_THAT((*session)->AwaitForDone(),
++              StatusIs(absl::StatusCode::kCancelled, HasSubstr("first cancel")));
++}
++
+ }  // namespace
+ }  // namespace tpu_raiden

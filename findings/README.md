@@ -65,8 +65,11 @@ here.
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
-| `coverage_gap_tests.patch` (`coverage_gap_{send,recv,read_remote_deadline}.patch`) | 9 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` on branch `controller-verification`): 4 `RecvLifecycleTest`/`RecvDrainTest` cases appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 2 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary with `RAIDEN_REMOTE_READ_DEADLINE_S=1` because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Based on `42dda542`; all 9 pass there (2026-10-28). Offered upstream as three small per-target test-only PRs (`coverage_gap_{send,recv,read_remote_deadline}.patch`). Not included: the two `Receive` handshake cases that need a replying control-plane producer stub, the multi-request recycle case, which needs a seam that observes staging contents, two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see), and the receiver's late-`Finish` status flip, confirmed separately as **F14**. See "Coverage-gap tests" below |
+| `coverage_gap_tests.patch` (`coverage_gap_{send,recv,read_remote_deadline}.patch`) | 9 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` on branch `controller-verification`): 4 `RecvLifecycleTest`/`RecvDrainTest` cases appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 2 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary with `RAIDEN_REMOTE_READ_DEADLINE_S=1` because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Based on `42dda542`; all 9 pass there (2026-10-28). Offered upstream as three small per-target test-only PRs (`coverage_gap_{send,recv,read_remote_deadline}.patch`). Packaged separately below: the two `Receive` handshake cases (`coverage_gap_control_handshake.patch`) and the two `MultiRequest` staging-recycle cases (`coverage_gap_multi_request_recycle.patch`). Not included: two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see), and the receiver's late-`Finish` status flip, confirmed separately as **F14**. See "Coverage-gap tests" below |
 | `coverage_gap_reshard_control.patch` | 7 upstream-shaped `ReshardStackTest` cases extending `tpu_sync/kv_cache/reshard/reshard_service_test.cc` to close every `Gap.test` branch (all 14) and all 4 unasserted `Refusal` constructors of `Reshard/Registry/Coverage.lean` plus all 4 gap branches of `Reshard/Coordinator/Coverage.lean`, without pinning F8. Based on `42dda542` (applies identically to `337540eb`); 7/7 pass (`--runs_per_test=5`, 2026-10-30). See "Coverage-gap tests" below |
+| `coverage_gap_reshard_sessions.patch` | 12 upstream-shaped test cases (4 `ReshardSendSessionTest` cases in `tpu_sync/kv_cache/reshard_send_session_test.cc` plus 4 `PoolReshardRecvTest` and 4 `PoolReshardSendTest` cases in `tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`) closing every non-F14 `Gap.test` branch of `Reshard/Receive/Coverage.lean` (18 of 21; the other 3 are F14's late-`Finish` status flips) and `Reshard/Send/Coverage.lean` (15 of 16; the other 1 is F14), plus the first CPU end-to-end loopback `Reshard/Pipeline` trace (`trace_arm_before_dispatch`), without pinning F10 or F14. Based on `42dda542`; 12/12 pass (`--runs_per_test=6`, 2026-10-30). See "Coverage-gap tests" below |
+| `coverage_gap_control_handshake.patch` | 2 upstream-shaped `ControlHandshakeTest` cases extending `tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc` (adding `SilentProducer::AcceptClient` and a `NumaThreadPool` worker barrier) to close both `Gap.test (stub)` branches of `PrefillDecode/Receive/Coverage.lean` (`pullReplyOk` with no lifecycle effect and `pullReplyOk` settling an expired receive). Based on `42dda542`; 2/2 pass (`--runs_per_test=6`, 2026-10-30). See "Coverage-gap tests" below |
+| `coverage_gap_multi_request_recycle.patch` | 2 upstream-shaped `MultiRequestTest` cases in `tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc` closing both live multi-request branches of `PrefillDecode/MultiRequestCoverage.lean` (`nextRequest` / `tr_multi_request` and `recyclePrefill` / `tr_overlapped_requests`) and all 3 `Pipeline/Coverage.lean` environment branches (`reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging`) over loopback control + `BlockTransport` with simulated HBM and staging-pointer reuse assertions; applies cleanly both standalone and stacked with `coverage_gap_recv.patch`. Based on `42dda542`; 2/2 pass (`--runs_per_test=6`, 2026-10-30). See "Coverage-gap tests" below |
 
 To run F1–F4: copy the two `.cc` files next to the code they test
 (`tpu_sync/core/controller/`, `tpu_sync/kv_cache/`), `git apply
@@ -86,7 +89,7 @@ F5 needs no repro file:
 its test is already in the tree as `DISABLED_`
 (`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
 --test_arg=--gtest_also_run_disabled_tests`); the fix patch that re-enabled it
-was retired on 2026-10-16 (see F5). All four patches apply cleanly at
+was retired on 2026-10-16 (see F5). All patches apply cleanly at
 `42dda542` (`git apply --check`, 2026-10-30; `build_targets.patch` updated
 2026-10-30 for F14; `candidate_fixes.patch` was last re-based at `2ed6f8f`);
 `kv_cache_store_pin_race_test.cc` needs its `WindowBackend::Insert` override
@@ -2116,6 +2119,76 @@ Runs: full `//tpu_sync/kv_cache/reshard:reshard_service_test` target green at
 `42dda542` with `--runs_per_test=5` (2026-10-30); `git apply --check` also clean
 against `337540eb`.
 
+### Reshard session and loopback-pipeline coverage-gap tests (`coverage_gap_reshard_sessions.patch`, at `42dda542`, run 2026-10-30: 12/12 pass)
+
+Extends `tpu_sync/kv_cache/reshard_send_session_test.cc` (4 `ReshardSendSessionTest`
+cases) and `tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`
+(4 `PoolReshardRecvTest` + 4 `PoolReshardSendTest` cases) to close every
+non-**F14** `Gap.test` branch of `Reshard/Receive/Coverage.lean` (18 of 21) and
+`Reshard/Send/Coverage.lean` (15 of 16) plus the end-to-end CPU loopback
+`Reshard/Pipeline` trace (`trace_arm_before_dispatch`), using
+`DeviceBackedTestBase`'s null `RaidenBufferHandle` (on which `raiden::IssueD2hShard`
+and `IssueH2dShard` run a synchronous no-op `PjRtCopyFuture` on CPU) without
+production code changes. Excluded intentionally: the 3 `Reshard/Receive`
+(`cancel` errors, `pushEndFail` settles+errors, `pushEndFail` errors) and 1
+`Reshard/Send` (`cancel` errors) **F14** late-`Finish` status flips (covered as
+failing bug-hunt tests in `transfer_receive_late_finish_bughunt_test.cc`), and
+mid-flight `HasActivePlan` on a first failed push (**F10**):
+
+| Case | Branch (`Reshard/Receive`, `Reshard/Send`, `Reshard/Pipeline` Lean table) | What it pins |
+|---|---|---|
+| `ReshardSendSessionTest.SingleFailedPushSettlesUnregistersPlanAndPropagatesError` | `Send` `pushDoneFail` drains settles errors | a single failed push settles the send at once, unregisters the active plan, and propagates the error status |
+| `ReshardSendSessionTest.FirstFailedPushWaitsForInFlightSiblingBeforeSettling` | `Send` `pushDoneFail` drains errors, `pushDoneFinalizing` settles | the first failed push enters draining/finalizing while a sibling push remains in flight (asserts drain + error preservation without pinning F10's early plan unregister) |
+| `ReshardSendSessionTest.MultiPeerPushAndCallerHeldOpKeepSessionLiveUntilFinalOp` | `Send` `pushDoneMore` (no effect), `pushDoneLast` drains (caller op held) | on a 2-peer plan, peer 0's completion keeps the pool live until peer 1's completion settles it; on a single-peer plan with `ExecutePush`'s caller op still held, the peer's completion marks the session draining without settling until `EndOp` settles it OK |
+| `ReshardSendSessionTest.DuplicateCancelAndNonFinalPushCompletionKeepSessionDraining` | `Send` `cancel` (no effect), `pushDoneFinalizing` (no effect) | a second `Finish(error)` on a draining send preserves the first error, and the first of two in-flight push completions on a finalizing send keeps it draining until the second ends |
+| `PoolReshardRecvTest.OnPoolReceivedUploadsSinglePoolAndWaitsForOpenPushLease` | `Receive` `pushEndOk` (no effect; settles), `poolReceivedLaunches`, `h2dIssueOk`, `h2dReady`, `h2dDoneLast` (drains; drains settles) | an empty push stream closes without settling; `OnPoolReceived` under an open push lease runs synchronous H2D and marks the receive draining while keeping staging pinned until `EndIncomingPush(OK)`; with no open lease, `OnPoolReceived` uploads and settles immediately |
+| `PoolReshardRecvTest.RankWaveGatesHigherRankPoolAndChainsWhileBatchWaitsForPeers` | `Receive` `poolReceivedGated`, `h2dDoneChains`, `h2dDoneMore` (no effect) | on ranks `[0, 1]`, pool 1 arriving first is held back until pool 0's upload chains pool 1; on ranks `[0, 0]`, pool 0 uploads without settling until pool 1 arrives |
+| `PoolReshardRecvTest.ConcurrentPushesAndUnregisterDrainBeforeSettling` | `Receive` `cancel` (drains errors; no effect), `poolReceivedQuiesced`, `pushEndFail` (no effect; settles; drains errors) | two open push streams across `UnregisterActivePlan` (plus duplicate unregister and `OnPoolReceived` while draining) keep staging pinned until the second stream ends; a failed first stream with a second open drains without settling until `EndIncomingPush(OK)` |
+| `PoolReshardRecvTest.FailedH2dPoolBlocksFailsReceiveAndWaitsForOpenPushLease` | `Receive` `h2dIssueFail` (drains settles errors; drains errors) | `device_size = 0` fails `H2dPoolBlocks` (`OUT_OF_RANGE`), settling immediately with no open push lease and waiting for `EndIncomingPush` when a push lease is open |
+| `PoolReshardSendTest.LoopbackPushUploadsReceiverPoolAndPublishesBothSides` | `Send` `d2hIssueOk`, `d2hDoneStartsPushes`, `publish`; `Receive` `publish`; `Pipeline` `trace_arm_before_dispatch` | full loopback `PoolReshardRegisterRecv` + `PoolReshardPush` copies bytes from sender host mirror into receiver bounded staging, uploads, settles, releases staging, and publishes `sent` and `received` |
+| `PoolReshardSendTest.ExecutePushReturnsWhilePeerPushRemainsInFlight` | `Send` `execFinish` (no effect) | `PoolReshardPush` returns while a TCP push to a held peer socket is still in flight (`has_pool_send == true`), then settles and reports failure once the peer closes |
+| `PoolReshardSendTest.SynchronousD2hFailureSettlesOrDrainsInFlightPoolPush` | `Send` `d2hIssueFail` (drains settles errors; drains errors) | `device_size = 0` fails `PoolReshardPush` synchronously (`OUT_OF_RANGE`), settling at once on 1 pool and draining until pool 0's in-flight TCP push ends on a 2-pool plan |
+| `PoolReshardSendTest.FinalizingSessionDuringExecutePushSettlesOrDrainsRemainingOps` | `Send` `execFinish` settles, `d2hIssueFailFinalizing` (settles; no effect) | a synchronous `BuildBlockRequests` failure inside `StartPoolPush` marks the session finalizing while `ExecutePush` still holds its caller op, settling at `ExecutePush`'s `EndOp` on 1 pool, absorbing pool 1's synchronous `D2hPoolBlocks` failure on 2 pools (preserving pool 0's `NOT_FOUND`), and keeping staging pinned when a sibling TCP push is still open |
+
+Runs: full `//tpu_sync/kv_cache:reshard_send_session_test` (13 cases) and
+`//tpu_sync/kv_cache:kv_cache_manager_with_transfer_pool_reshard_test` (32 cases)
+green at `42dda542` with `--runs_per_test=6` (2026-10-30).
+
+### Consumer control-handshake coverage-gap tests (`coverage_gap_control_handshake.patch`, at `42dda542`, run 2026-10-30: 2/2 pass)
+
+Extends `tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc`
+(`SilentProducer::AcceptClient` + a `NumaThreadPool` barrier) with 2
+`ControlHandshakeTest` cases closing both `Gap.test (stub)` branches of
+`PrefillDecode/Receive/Coverage.lean`:
+
+| Case | Branch (`PrefillDecode/Receive` Lean table) | What it pins |
+|---|---|---|
+| `ControlHandshakeTest.AcceptedPullAdvancesReceivePhaseAndReleasesHandshakeOp` | `Receive` `pullReplyOk` (no effect) | an `OK` pull reply clears `handshake_pending_` and releases the handshake's `in_flight_` op while keeping staging pinned; a subsequent `FailRecv` settles immediately in phase `receive` rather than staying draining in `connect` |
+| `ControlHandshakeTest.AcceptedPullAfterDeadlineSweepSettlesExpiredReceive` | `Receive` `pullReplyOk` settles | when the deadline sweep marks a connecting receive draining in phase `connect` and the producer subsequently answers `OK`, `on_response` releases the last op and settles the receive with its original `DEADLINE_EXCEEDED` / `connect` details |
+
+Runs: full `//tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test`
+green at `42dda542` with `--runs_per_test=6` (2026-10-30); `git apply --check`
+also clean against `337540eb`.
+
+### Multi-request buffer-recycling coverage-gap tests (`coverage_gap_multi_request_recycle.patch`, at `42dda542`, run 2026-10-30: 2/2 pass)
+
+Adds 2 `MultiRequestTest` cases to
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc` closing
+both live multi-request branches of `PrefillDecode/MultiRequestCoverage.lean`
+(`nextRequest` and `recyclePrefill`) and all 3 `Pipeline/Coverage.lean`
+environment branches (`reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging`)
+over real loopback control + `BlockTransport` with simulated HBM and
+promise-controlled D2H / H2D copies:
+
+| Case | Branch (`MultiRequest` / `Pipeline` Lean table) | What it pins |
+|---|---|---|
+| `MultiRequestTest.HandedOffCancelledTransferRecyclesBothStagingSlotsForNextRequest` | `Multi.Leaf.nextRequest` (`tr_multi_request`) + `Pipeline.Leaf.{reclaim, reseatPrefillStaging, reseatDecodeStaging}` | cancelling request 0 during D2H keeps the producer's single staging slot pinned until D2H finishes; after both sides publish failure (`HandedOff`), request 1 reclaims prefill HBM (`0xAA` → `0xBB`), reuses and overwrites the single staging slot on both sides, and delivers `0xBB` to decode HBM without touching request 0's decode block |
+| `MultiRequestTest.PrefillRecyclesAndOverwritesStagingWhileEarlierConsumerH2dStillRuns` | `Multi.Leaf.recyclePrefill` (`tr_overlapped_requests`) + post-handoff consumer staging recycle | once request 0 publishes `sent` on the producer (`PrefillReleased`) while request 0's consumer H2D is still paused, request 1 recycles and overwrites prefill HBM and the producer's single staging slot with `0xBB` without corrupting request 0's pending consumer H2D (`0xAA`); after request 0 finishes and publishes `received`, request 2 reuses and overwrites request 0's released consumer staging slot (`0xCC`) while request 0's decode HBM retains `0xAA` |
+
+Runs: full `//tpu_sync/kv_cache:kv_cache_manager_with_transfer_send_drain_test`
+green at `42dda542` with `--runs_per_test=6` both standalone and stacked with
+`coverage_gap_recv.patch` (2026-10-30).
+
 ## Observations on the prefill-to-decode path (non-bugs at `2ed6f8f`)
 
 Behaviours that looked like defects during the prefill-to-decode model work and
@@ -2456,3 +2529,18 @@ clone reset. Results, verbatim:
   !network_completed_` on `ReshardReceiveSession`, without skipping
   `draining_ = true`). Also corrected the claim that no OK-draining state has
   incomplete HBM: the poll-side `Finish()` creates one.
+- 2026-10-30 (later): **Added remaining coverage-gap test patches**
+  (`coverage_gap_reshard_sessions.patch`, `coverage_gap_control_handshake.patch`,
+  `coverage_gap_multi_request_recycle.patch`; 16 new test cases total across
+  `reshard_send_session_test.cc`,
+  `kv_cache_manager_with_transfer_pool_reshard_test.cc`,
+  `kv_cache_manager_with_transfer_control_test.cc`, and
+  `kv_cache_manager_with_transfer_send_drain_test.cc`, all green 6/6 with
+  `--runs_per_test=6` at `42dda542`): closes all 18 non-F14 `Gap.test` branches
+  of `Reshard/Receive/Coverage.lean`, all 15 non-F14 `Gap.test` branches of
+  `Reshard/Send/Coverage.lean`, the CPU loopback `Reshard/Pipeline` trace
+  (`trace_arm_before_dispatch`), both `Gap.test (stub)` branches of
+  `PrefillDecode/Receive/Coverage.lean`, both live multi-request branches of
+  `PrefillDecode/MultiRequestCoverage.lean`, and all 3 `Pipeline/Coverage.lean`
+  environment branches (`reclaim`, `reseatPrefillStaging`,
+  `reseatDecodeStaging`).

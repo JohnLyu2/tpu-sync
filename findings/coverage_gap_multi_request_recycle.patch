@@ -1,0 +1,415 @@
+diff --git a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
+index 331de88b..b0271b93 100644
+--- a/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
++++ b/tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc
+@@ -1278,6 +1278,410 @@ TEST(RecvLifecycleTest,
+   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
+ }
+ 
++constexpr size_t kMultiReqSliceBytes = 128;
++constexpr size_t kMultiReqHbmBlocks = 4;
++
++// End-to-end producer and consumer pair with simulated device HBM blocks and
++// promise-controlled D2H / H2D copies over loopback control + BlockTransport,
++// exposing the host staging pointers leased to each request.
++class MultiRequestProducer : public KVCacheManagerWithTransfer {
++ public:
++  explicit MultiRequestProducer(int64_t num_slots = 1)
++      : KVCacheManagerWithTransfer(
++            std::make_unique<Base>(num_slots, this), /*node_id=*/0,
++            /*local_control_port=*/0, /*max_blocks=*/1, num_slots,
++            /*timeout_s=*/10.0),
++        hbm_(kMultiReqHbmBlocks,
++             std::vector<uint8_t>(kMultiReqSliceBytes, 0)) {}
++
++  std::string control_endpoint() const {
++    return absl::StrCat("127.0.0.1:", local_control_port());
++  }
++
++  void SetHbmBlock(size_t block_id, uint8_t fill) {
++    absl::MutexLock lock(copies_mu_);
++    std::memset(hbm_.at(block_id).data(), fill, kMultiReqSliceBytes);
++  }
++
++  bool WaitForCopiesIssued(size_t expected, absl::Duration timeout) {
++    absl::MutexLock lock(copies_mu_);
++    auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(copies_mu_) {
++      return copies_.size() >= expected;
++    };
++    return copies_mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
++  }
++
++  uint8_t* copy_staging_ptr(size_t index) {
++    absl::MutexLock lock(copies_mu_);
++    return copies_.at(index).staging_ptr;
++  }
++
++  void FinishCopy(size_t index, absl::Status status) {
++    xla::Promise<> promise;
++    {
++      absl::MutexLock lock(copies_mu_);
++      CopyRecord& rec = copies_.at(index);
++      if (status.ok()) {
++        std::memcpy(rec.staging_ptr, hbm_.at(rec.src_block).data(),
++                    kMultiReqSliceBytes);
++      }
++      promise = std::move(rec.promise);
++    }
++    promise.Set(std::move(status));
++  }
++
++  void CancelSend(uint64_t uuid) {
++    std::shared_ptr<TransferSendSession> session;
++    {
++      absl::MutexLock lock(mu_);
++      session = send_sessions_.at(uuid);
++    }
++    session->Finish(absl::CancelledError("send cancelled"));
++  }
++
++  size_t free_slots() { return staging_allocator_->num_free_slots(); }
++
++  bool has_send(uint64_t uuid) {
++    absl::MutexLock lock(mu_);
++    auto it = send_sessions_.find(uuid);
++    return it != send_sessions_.end() && !it->second->Done();
++  }
++
++ private:
++  struct CopyRecord {
++    xla::Promise<> promise;
++    size_t src_block = 0;
++    uint8_t* staging_ptr = nullptr;
++  };
++
++  class Base : public kv_cache::KVCacheManagerBase {
++   public:
++    Base(int64_t num_slots, MultiRequestProducer* owner)
++        : kv_cache::KVCacheManagerBase(
++              /*num_layers=*/1, /*num_shards=*/1,
++              std::vector<size_t>(1, kMultiReqSliceBytes), /*local_port=*/0,
++              /*host_blocks_to_allocate=*/static_cast<int>(num_slots),
++              /*parallelism=*/1, nullptr),
++          owner_(owner) {}
++
++    absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
++        const std::vector<int64_t>& src_offsets_major_dim,
++        const std::vector<int64_t>& dst_offsets_major_dim,
++        const std::vector<int64_t>& copy_sizes_major_dim,
++        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
++        std::optional<size_t> host_layer_idx,
++        std::optional<size_t> shard_idx) override {
++      auto [promise, future] = xla::MakePromise<>();
++      uint8_t* ptr = GetBlockHostPointer(
++          /*layer_idx=*/0, /*shard_idx=*/0, dst_offsets_major_dim.at(0));
++      absl::MutexLock lock(owner_->copies_mu_);
++      owner_->copies_.push_back(CopyRecord{
++          .promise = std::move(promise),
++          .src_block = static_cast<size_t>(src_offsets_major_dim.at(0)),
++          .staging_ptr = ptr,
++      });
++      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
++    }
++
++   private:
++    MultiRequestProducer* owner_;
++  };
++
++  absl::Mutex copies_mu_;
++  std::vector<CopyRecord> copies_ ABSL_GUARDED_BY(copies_mu_);
++  std::vector<std::vector<uint8_t>> hbm_ ABSL_GUARDED_BY(copies_mu_);
++};
++
++class MultiRequestConsumer : public KVCacheManagerWithTransfer {
++ public:
++  explicit MultiRequestConsumer(int64_t num_slots = 1)
++      : KVCacheManagerWithTransfer(
++            std::make_unique<Base>(num_slots, this), /*node_id=*/1,
++            /*local_control_port=*/0, /*max_blocks=*/1, num_slots,
++            /*timeout_s=*/10.0),
++        hbm_(kMultiReqHbmBlocks,
++             std::vector<uint8_t>(kMultiReqSliceBytes, 0)) {}
++
++  void SetHbmBlock(size_t block_id, uint8_t fill) {
++    absl::MutexLock lock(copies_mu_);
++    std::memset(hbm_.at(block_id).data(), fill, kMultiReqSliceBytes);
++  }
++
++  uint8_t hbm_byte(size_t block_id) {
++    absl::MutexLock lock(copies_mu_);
++    return hbm_.at(block_id)[0];
++  }
++
++  bool WaitForCopiesIssued(size_t expected, absl::Duration timeout) {
++    absl::MutexLock lock(copies_mu_);
++    auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(copies_mu_) {
++      return copies_.size() >= expected;
++    };
++    return copies_mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
++  }
++
++  uint8_t* copy_staging_ptr(size_t index) {
++    absl::MutexLock lock(copies_mu_);
++    return copies_.at(index).staging_ptr;
++  }
++
++  void FinishCopy(size_t index, absl::Status status) {
++    xla::Promise<> promise;
++    {
++      absl::MutexLock lock(copies_mu_);
++      CopyRecord& rec = copies_.at(index);
++      if (status.ok()) {
++        std::memcpy(hbm_.at(rec.dst_block).data(), rec.staging_ptr,
++                    kMultiReqSliceBytes);
++      }
++      promise = std::move(rec.promise);
++    }
++    promise.Set(std::move(status));
++  }
++
++  void FailRecv(uint64_t uuid, absl::Status status) {
++    std::shared_ptr<TransferReceiveSession> session;
++    {
++      absl::MutexLock lock(mu_);
++      auto it = active_recv_sessions_.find(uuid);
++      if (it == active_recv_sessions_.end()) return;
++      session = it->second;
++    }
++    session->Finish(status);
++  }
++
++  size_t free_slots() { return staging_allocator_->num_free_slots(); }
++
++  bool has_recv(uint64_t uuid) {
++    absl::MutexLock lock(mu_);
++    auto it = active_recv_sessions_.find(uuid);
++    return it != active_recv_sessions_.end() && !it->second->Done();
++  }
++
++ private:
++  struct CopyRecord {
++    xla::Promise<> promise;
++    size_t dst_block = 0;
++    uint8_t* staging_ptr = nullptr;
++  };
++
++  class Base : public kv_cache::KVCacheManagerBase {
++   public:
++    Base(int64_t num_slots, MultiRequestConsumer* owner)
++        : kv_cache::KVCacheManagerBase(
++              /*num_layers=*/1, /*num_shards=*/1,
++              std::vector<size_t>(1, kMultiReqSliceBytes), /*local_port=*/0,
++              /*host_blocks_to_allocate=*/static_cast<int>(num_slots),
++              /*parallelism=*/1, nullptr),
++          owner_(owner) {}
++
++    absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
++        const std::vector<int64_t>& src_offsets_major_dim,
++        const std::vector<int64_t>& dst_offsets_major_dim,
++        const std::vector<int64_t>& copy_sizes_major_dim,
++        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
++        std::optional<size_t> host_layer_idx,
++        std::optional<size_t> shard_idx) override {
++      auto [promise, future] = xla::MakePromise<>();
++      uint8_t* ptr = GetBlockHostPointer(
++          /*layer_idx=*/0, /*shard_idx=*/0, src_offsets_major_dim.at(0));
++      absl::MutexLock lock(owner_->copies_mu_);
++      owner_->copies_.push_back(CopyRecord{
++          .promise = std::move(promise),
++          .dst_block = static_cast<size_t>(dst_offsets_major_dim.at(0)),
++          .staging_ptr = ptr,
++      });
++      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
++    }
++
++   private:
++    MultiRequestConsumer* owner_;
++  };
++
++  absl::Mutex copies_mu_;
++  std::vector<CopyRecord> copies_ ABSL_GUARDED_BY(copies_mu_);
++  std::vector<std::vector<uint8_t>> hbm_ ABSL_GUARDED_BY(copies_mu_);
++};
++
++bool AwaitSent(KVCacheManagerWithTransfer& manager, const std::string& req_id,
++               absl::Duration timeout) {
++  const absl::Time deadline = absl::Now() + timeout;
++  while (absl::Now() < deadline) {
++    CompleteReadResult res = manager.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, IsEmpty());
++    for (const std::string& s : res.sent) {
++      if (s == req_id) return true;
++    }
++    absl::SleepFor(absl::Milliseconds(1));
++  }
++  return false;
++}
++
++bool AwaitReceived(KVCacheManagerWithTransfer& manager,
++                   const std::string& req_id, absl::Duration timeout) {
++  const absl::Time deadline = absl::Now() + timeout;
++  while (absl::Now() < deadline) {
++    CompleteReadResult res = manager.CompleteReadWithDetails();
++    EXPECT_THAT(res.failed, IsEmpty());
++    for (const std::string& r : res.received) {
++      if (r == req_id) return true;
++    }
++    absl::SleepFor(absl::Milliseconds(1));
++  }
++  return false;
++}
++
++bool AwaitFailed(KVCacheManagerWithTransfer& manager, const std::string& req_id,
++                 absl::Duration timeout) {
++  const absl::Time deadline = absl::Now() + timeout;
++  while (absl::Now() < deadline) {
++    CompleteReadResult res = manager.CompleteReadWithDetails();
++    EXPECT_THAT(res.sent, IsEmpty());
++    EXPECT_THAT(res.received, IsEmpty());
++    for (const std::string& f : res.failed) {
++      if (f == req_id) return true;
++    }
++    absl::SleepFor(absl::Milliseconds(1));
++  }
++  return false;
++}
++
++TEST(MultiRequestTest,
++     HandedOffCancelledTransferRecyclesBothStagingSlotsForNextRequest) {
++  MultiRequestProducer producer(/*num_slots=*/1);
++  MultiRequestConsumer consumer(/*num_slots=*/1);
++  producer.SetHbmBlock(/*block_id=*/0, 0xAA);
++  consumer.SetHbmBlock(/*block_id=*/0, 0x11);
++  consumer.SetHbmBlock(/*block_id=*/1, 0x00);
++
++  ASSERT_EQ(producer.NotifyForRead("req_0", /*uuid=*/701, /*block_ids=*/{0}),
++            701);
++  consumer.StartRead("req_0", /*uuid=*/701, producer.control_endpoint(),
++                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
++  ASSERT_TRUE(producer.WaitForCopiesIssued(1, absl::Seconds(5)));
++  uint8_t* prod_slot_0 = producer.copy_staging_ptr(0);
++  uint8_t* cons_slot_0 = consumer.base()->GetBlockHostPointer(0, 0, 0);
++
++  // Cancel both sessions while request 0's D2H copy is still running: the
++  // producer keeps its single staging slot pinned until the D2H finishes, and
++  // neither session pushes into the consumer.
++  producer.CancelSend(/*uuid=*/701);
++  consumer.FailRecv(/*uuid=*/701, absl::CancelledError("recv cancelled"));
++  EXPECT_TRUE(producer.has_send(701));
++  EXPECT_EQ(producer.free_slots(), 0);
++
++  producer.FinishCopy(0, absl::OkStatus());
++  EXPECT_EQ(prod_slot_0[0], 0xAA);
++  ASSERT_TRUE(AwaitFailed(producer, "req_0", absl::Seconds(5)));
++  ASSERT_TRUE(AwaitFailed(consumer, "req_0", absl::Seconds(5)));
++  EXPECT_EQ(producer.free_slots(), 1);
++  EXPECT_EQ(consumer.free_slots(), 1);
++  EXPECT_EQ(consumer.hbm_byte(0), 0x11);
++
++  // Hand-off complete: reclaim prefill HBM block 0 with 0xBB and run request 1
++  // over the single recycled staging slot on both sides.
++  producer.SetHbmBlock(/*block_id=*/0, 0xBB);
++  ASSERT_EQ(producer.NotifyForRead("req_1", /*uuid=*/702, /*block_ids=*/{0}),
++            702);
++  consumer.StartRead("req_1", /*uuid=*/702, producer.control_endpoint(),
++                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{1});
++  ASSERT_TRUE(producer.WaitForCopiesIssued(2, absl::Seconds(5)));
++  EXPECT_EQ(producer.copy_staging_ptr(1), prod_slot_0);
++
++  producer.FinishCopy(1, absl::OkStatus());
++  EXPECT_EQ(prod_slot_0[0], 0xBB);
++  ASSERT_TRUE(consumer.WaitForCopiesIssued(1, absl::Seconds(5)));
++  EXPECT_EQ(consumer.copy_staging_ptr(0), cons_slot_0);
++  EXPECT_EQ(cons_slot_0[0], 0xBB);
++
++  consumer.FinishCopy(0, absl::OkStatus());
++  ASSERT_TRUE(AwaitSent(producer, "req_1", absl::Seconds(5)));
++  ASSERT_TRUE(AwaitReceived(consumer, "req_1", absl::Seconds(5)));
++  EXPECT_EQ(producer.free_slots(), 1);
++  EXPECT_EQ(consumer.free_slots(), 1);
++  EXPECT_EQ(consumer.hbm_byte(1), 0xBB);
++  EXPECT_EQ(consumer.hbm_byte(0), 0x11);
++}
++
++TEST(MultiRequestTest,
++     PrefillRecyclesAndOverwritesStagingWhileEarlierConsumerH2dStillRuns) {
++  MultiRequestProducer producer(/*num_slots=*/1);
++  MultiRequestConsumer consumer(/*num_slots=*/2);
++  producer.SetHbmBlock(/*block_id=*/0, 0xAA);
++  consumer.SetHbmBlock(/*block_id=*/0, 0x00);
++  consumer.SetHbmBlock(/*block_id=*/1, 0x00);
++  consumer.SetHbmBlock(/*block_id=*/2, 0x00);
++
++  ASSERT_EQ(producer.NotifyForRead("req_0", /*uuid=*/703, /*block_ids=*/{0}),
++            703);
++  consumer.StartRead("req_0", /*uuid=*/703, producer.control_endpoint(),
++                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
++  ASSERT_TRUE(producer.WaitForCopiesIssued(1, absl::Seconds(5)));
++  uint8_t* prod_slot_0 = producer.copy_staging_ptr(0);
++
++  // Request 0 finishes D2H and H2H, publishing `sent` on the producer and
++  // releasing the producer's only staging slot while request 0's H2D copy on
++  // the consumer is still pending.
++  producer.FinishCopy(0, absl::OkStatus());
++  ASSERT_TRUE(consumer.WaitForCopiesIssued(1, absl::Seconds(5)));
++  ASSERT_TRUE(AwaitSent(producer, "req_0", absl::Seconds(5)));
++  EXPECT_EQ(producer.free_slots(), 1);
++  EXPECT_TRUE(consumer.has_recv(703));
++  EXPECT_EQ(consumer.free_slots(), 1);
++  uint8_t* cons_slot_0 = consumer.copy_staging_ptr(0);
++  EXPECT_EQ(cons_slot_0[0], 0xAA);
++  EXPECT_EQ(consumer.hbm_byte(0), 0x00);
++
++  // Recycle prefill HBM block 0 and prefill staging for request 1 (0xBB) while
++  // request 0's consumer H2D is still paused.
++  producer.SetHbmBlock(/*block_id=*/0, 0xBB);
++  ASSERT_EQ(producer.NotifyForRead("req_1", /*uuid=*/704, /*block_ids=*/{0}),
++            704);
++  consumer.StartRead("req_1", /*uuid=*/704, producer.control_endpoint(),
++                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{1});
++  ASSERT_TRUE(producer.WaitForCopiesIssued(2, absl::Seconds(5)));
++  EXPECT_EQ(producer.copy_staging_ptr(1), prod_slot_0);
++
++  producer.FinishCopy(1, absl::OkStatus());
++  EXPECT_EQ(prod_slot_0[0], 0xBB);
++  ASSERT_TRUE(consumer.WaitForCopiesIssued(2, absl::Seconds(5)));
++  ASSERT_TRUE(AwaitSent(producer, "req_1", absl::Seconds(5)));
++  uint8_t* cons_slot_1 = consumer.copy_staging_ptr(1);
++  EXPECT_NE(cons_slot_1, cons_slot_0);
++  EXPECT_EQ(cons_slot_0[0], 0xAA);
++  EXPECT_EQ(cons_slot_1[0], 0xBB);
++
++  // Finish request 0's H2D and publish it on the consumer; its released
++  // consumer staging slot is then reused and overwritten by request 2 (0xCC)
++  // while request 0's published decode HBM keeps 0xAA.
++  consumer.FinishCopy(0, absl::OkStatus());
++  ASSERT_TRUE(AwaitReceived(consumer, "req_0", absl::Seconds(5)));
++  EXPECT_EQ(consumer.hbm_byte(0), 0xAA);
++  EXPECT_EQ(consumer.free_slots(), 1);
++
++  producer.SetHbmBlock(/*block_id=*/0, 0xCC);
++  ASSERT_EQ(producer.NotifyForRead("req_2", /*uuid=*/705, /*block_ids=*/{0}),
++            705);
++  consumer.StartRead("req_2", /*uuid=*/705, producer.control_endpoint(),
++                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{2});
++  ASSERT_TRUE(producer.WaitForCopiesIssued(3, absl::Seconds(5)));
++  producer.FinishCopy(2, absl::OkStatus());
++  ASSERT_TRUE(consumer.WaitForCopiesIssued(3, absl::Seconds(5)));
++  ASSERT_TRUE(AwaitSent(producer, "req_2", absl::Seconds(5)));
++  EXPECT_EQ(consumer.copy_staging_ptr(2), cons_slot_0);
++  EXPECT_EQ(cons_slot_0[0], 0xCC);
++  EXPECT_EQ(consumer.hbm_byte(0), 0xAA);
++
++  consumer.FinishCopy(1, absl::OkStatus());
++  ASSERT_TRUE(AwaitReceived(consumer, "req_1", absl::Seconds(5)));
++  consumer.FinishCopy(2, absl::OkStatus());
++  ASSERT_TRUE(AwaitReceived(consumer, "req_2", absl::Seconds(5)));
++  EXPECT_EQ(consumer.free_slots(), 2);
++  EXPECT_EQ(consumer.hbm_byte(0), 0xAA);
++  EXPECT_EQ(consumer.hbm_byte(1), 0xBB);
++  EXPECT_EQ(consumer.hbm_byte(2), 0xCC);
++}
++
+ // StagingLayerManager: TPU_RAIDEN_NUM_STAGING_LAYERS=4 leaves four host layer
+ // buffers for a 64-layer cache. Layers lease them in arrival order, a fifth
+ // layer waits for a release, and a released buffer goes to the waiting layer
