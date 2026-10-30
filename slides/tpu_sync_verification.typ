@@ -505,13 +505,155 @@
 ]
 
 // ---------------------------------------------------------------------------
+#slide[Verification architecture: Lean modules & model boundaries][
+  #set block(spacing: 0.36em)
+  #let tag(label, fg: muted) = text(size: 9.5pt, weight: "bold", tracking: 0.4pt, fill: fg, upper(label))
+  #let lean-mod(body) = text(size: 11.2pt, fill: accent.lighten(10%), body)
+  #let out-box(body) = block(
+    width: 100%, fill: luma(247),
+    stroke: (paint: luma(165), thickness: 0.9pt, dash: "dashed"),
+    inset: (x: 12pt, y: 6pt), radius: 4pt,
+    text(size: 12.2pt, body),
+  )
+  #let in-box(body) = block(
+    width: 100%, fill: white,
+    stroke: 0.8pt + accent.lighten(25%),
+    inset: (x: 11pt, y: 5.5pt), radius: 4pt,
+    text(size: 12pt, body),
+  )
+  #let v-conn(label) = block(width: 100%, inset: (y: 0.5pt), align(center)[
+    #text(size: 12.5pt, fill: accent)[#sym.arrow.b] #h(0.3em) #text(size: 10.8pt, fill: muted, label)
+  ])
+
+  #out-box[
+    #grid(
+      columns: (auto, 1fr), column-gutter: 1em, align: horizon,
+      tag[Outside (above)],
+      [*Serving engine & planner* #h(0.4em) #text(fill: muted)[·] #h(0.4em) vLLM request scheduling & local KV cache #h(0.4em) #text(fill: muted)[·] #h(0.4em) `PoolReshardPlanner`],
+    )
+  ]
+
+  #v-conn[Engine & plan-validation boundary]
+
+  #block(
+    width: 100%, fill: accent.lighten(93%),
+    stroke: 1.3pt + accent, radius: 5pt,
+    inset: (x: 11pt, top: 6pt, bottom: 8pt),
+  )[
+    #block(spacing: 0.35em)[#tag(fg: accent)[Modeled in Lean] #h(0.35em) #text(size: 10.5pt, fill: accent)[· `TpuSyncVerify`]]
+
+    #in-box[
+      #grid(
+        columns: (1fr, auto), align: horizon,
+        [*Engine model above `poll_stats()`* — vLLM transfer-block ownership + TPU connectors],
+        lean-mod[`Transfer/Caller/`],
+      )
+    ]
+
+    #block(width: 100%, inset: (y: 1pt), align(center)[
+      #text(size: 13pt, fill: accent)[#sym.arrow.t.b] #h(0.3em)
+      #text(size: 11pt, fill: accent)[*`poll_stats()` contract*]
+      #h(0.3em) #text(size: 10.8pt, fill: muted)[— pipelines prove what holds once an outcome is published; the engine model assumes it and proves the caller's side]
+    ])
+
+    #let chain-box(label, mod, cpp: none) = block(
+      width: 100%, fill: white,
+      stroke: 0.8pt + accent.lighten(25%),
+      inset: (x: 8pt, y: 5pt), radius: 4pt,
+    )[
+      #set text(size: 11.5pt)
+      #set par(leading: 0.4em)
+      *#label* \
+      #lean-mod[#mod]
+      #if cpp != none { text(size: 10.3pt, fill: muted, cpp) }
+    ]
+    #let side-box(label, mod) = block(
+      width: 100%, fill: luma(252),
+      stroke: (paint: accent.lighten(45%), thickness: 0.7pt, dash: "dotted"),
+      inset: (x: 7pt, y: 5pt), radius: 4pt,
+    )[
+      #set text(size: 11pt)
+      #set par(leading: 0.4em)
+      *#label* \
+      #lean-mod[#mod]
+    ]
+    #let compose = block(width: 100%, inset: (y: 0pt), align(center)[
+      #text(size: 11pt, fill: accent)[#sym.arrow.b] #h(0.2em) #text(size: 9.8pt, fill: muted)[composes]
+    ])
+    #let pipe-col(title, dir, chain, sides) = block(
+      width: 100%, fill: accent.lighten(97%),
+      stroke: 0.8pt + accent.lighten(40%),
+      inset: (x: 7pt, y: 5pt), radius: 4pt,
+    )[
+      #grid(columns: (1fr, auto), text(size: 12.5pt)[*#title*], lean-mod[#dir])
+      #grid(
+        columns: (1fr, 1fr), column-gutter: 0.6em,
+        chain,
+        [#tag[Side models] #sides],
+      )
+    ]
+
+    #grid(
+      columns: (1fr, 1fr), column-gutter: 0.9em,
+      pipe-col[Prefill #sym.arrow.r Decode][`PrefillDecode/`][
+        #chain-box[Concurrent transfers][`MultiRequest`]
+        #compose
+        #chain-box[Single transfer][`Pipeline`]
+        #compose
+        #chain-box(cpp: [`TransferSendSession`, `TransferReceiveSession`])[Sessions][`Send`, `Receive`]
+      ][
+        #side-box[Transport][`Transport`, `BlockOrdering`]
+        #side-box[Layer staging][`LayerStaging`]
+        #side-box[Manager tables][`UuidTable`, `PeerIsolation`]
+      ],
+      pipe-col[Pool Reshard][`Reshard/`][
+        #chain-box[Concurrent transfers][`MultiRequest`]
+        #compose
+        #chain-box[Single transfer][`Pipeline`]
+        #compose
+        #chain-box(cpp: [`ReshardSendSession`, `ReshardReceiveSession`])[Sessions][`Send`, `Receive`]
+      ][
+        #side-box[Coordination][`Coordinator`, `Registry`]
+        #side-box[Sub-plan chains][`SubPlanChain`]
+        #side-box[Staging][`PoolStaging`]
+        #side-box[Streams & byte coverage][`Coverage`]
+      ],
+    )
+
+    #grid(
+      columns: (1fr, 1fr), column-gutter: 0.9em,
+      v-conn[built on],
+      v-conn[built on],
+    )
+
+    #in-box[
+      #grid(
+        columns: (1fr, auto), align: horizon,
+        [*Shared session settle protocol* — `in_flight_`, `draining_`, `done_` across all 4 session classes],
+        lean-mod[`Transfer/Session`],
+      )
+    ]
+  ]
+
+  #v-conn[Wire & DMA boundary (declared stream counts, atomic stream landing, PJRT copies)]
+
+  #out-box[
+    #grid(
+      columns: (auto, 1fr), column-gutter: 1em, align: horizon,
+      tag[Outside (below)],
+      [*Wire & DMA runtime* #h(0.4em) #text(fill: muted)[·] #h(0.4em) `RawBufferTransport` (sockets, framing, timeouts) #h(0.4em) #text(fill: muted)[·] #h(0.4em) PJRT HBM/DRAM copies],
+    )
+  ]
+]
+
+// ---------------------------------------------------------------------------
 #slide[Model boundary: the serving engine above `poll_stats()`][
   #v(0.6em)
   #set text(size: 17pt)
   #set par(leading: 0.65em)
   #set list(spacing: 0.9em)
 
-  #text(fill: muted)[vLLM scheduler + tpu-inference connector]
+  #text(fill: muted)[vLLM scheduler + TPU connectors]
 
   #v(0.9em)
   The proofs initially assumed:
@@ -520,10 +662,10 @@
   - Every reported outcome, success or failure, leads the engine to free that request's blocks.
 
   #v(0.9em)
-  We then modeled the engine to check these assumptions, and found that the shipping connector drops failed outcomes, so KV blocks leak on both nodes; we reproduced it and reported it.
+  We modeled how `poll_stats()` outcomes drive transfer-block ownership across the connector and scheduler — and found that the shipping connector dropped failed outcomes, leaking KV blocks on both nodes; we reproduced and reported it, the bug has been fixed upstream, and we proved the fix safe.
 
   #v(0.9em)
-  The engine model still assumes one connector worker per node; multi-host decode, where several workers' reports are combined, isn't modeled yet.
+  General request scheduling and local KV management stay outside the model.
 ]
 
 // ---------------------------------------------------------------------------
@@ -676,16 +818,41 @@
   #show table: set text(size: 13.8pt)
   #table(
     columns: (0.88fr, 1.12fr),
-    inset: (x: 11pt, y: 12pt),
+    inset: (x: 11pt, y: 8pt),
     align: (left + horizon, left + horizon),
     table.header[*Coverage criterion*][*What we built & found*],
-    [*1. Model branch coverage (`Coverage.lean`)* — what fraction of reachable `(event, branch)` paths in `step` do the 71 tests hit?],
-    [Exhaustively computed and `#guard`-pinned: e.g. `Receive` hits *18 / 37* branches; `MultiRequest` has *0* unit tests recycling buffers mid-flight; exposed *1 dead C++ branch*.],
+    [*1. Model branch coverage (`Coverage.lean`)* — what fraction of reachable `(event, branch)` paths in `step` do the upstream tests hit?],
+    [Now on *every model*, cross-checked against C++ line coverage; exposed *1 dead C++ branch*.
+      #set text(size: 12.5pt)
+      - *Prefill #sym.arrow.r Decode:* Receive 18/37 · Send 27/40 · Layer staging 39/95 · Multi-request 0/2
+      - *Reshard:* Receive 4/36 · Send 3/25 · Registry 11/25 · Coordinator 10/14 · Sub-plan chains 28/39
+      - *End to end:* Prefill #sym.arrow.r Decode pipeline 25/74 reached; no upstream test runs a full reshard transfer on CPU.],
     [*2. Spec-driven gap tests* — generate concrete schedules from the model for uncovered branches and run them on C++.],
-    [Lean emits a shortest witness schedule per gap (*missing test* vs. *lock window*) #sym.arrow.r turned drivable gaps into *9 new C++ unit tests*.],
+    [*29 new C++ tests*, closing every gap a CPU test can drive in the session, registry and coordinator models; the rest need controllable futures or TPU. One gap was a real bug (*F14*). _Status: 6 merged upstream · 23 prepared._],
     [*3. Guard / mutant coverage (`Guards.lean`)* — mutate _every_ C++ guard in `step` (not just a few examples) against `Safe`.],
-    [Mutating every guard in `Receive` and `Send` caught a missing clause in our own session `Safe` (early _failed_ publication while copies run #sym.arrow.r added `PublishedQuiet`).],
+    [Mutating every guard in `Receive` and `Send` caught a missing clause in our own session `Safe` (early _failed_ publication while copies run #sym.arrow.r added `PublishedQuiet`). Done for Prefill #sym.arrow.r Decode; not yet for Reshard.],
   )
+]
+
+// ---------------------------------------------------------------------------
+#slide[Bugs found: status][
+  #v(0.3em)
+  #text(size: 16pt)[*15 bugs*: 14 in TPU Sync C++, 1 in a Python caller. *12* confirmed by a test on unmodified code, *3* by reading the code.]
+  #v(0.6em)
+  #show table: set text(size: 14pt)
+  #table(
+    columns: (1.25fr, 1.15fr, 0.8fr, 1.15fr, 0.8fr),
+    inset: (x: 9pt, y: 10pt),
+    align: (left + horizon,) * 5,
+    table.header[*Area*][*Bugs*][*Fixed upstream*][*Filed, open*][*Not filed*],
+    [Prefill #sym.arrow.r Decode receive], [F5, F14], [—], [F5 (owner-acknowledged)], [F14 (low severity)],
+    [Pool reshard], [F6–F10, F12, F13], [F6, F7], [F8, F9, F10, F12, F13], [—],
+    [Engine side of `poll_stats()`], [F11 (C++ NUMA wrapper), C1 (Python connector)], [F11, C1], [—], [—],
+    [Controller & KV store], [F1–F4], [F1, F4], [F2, F3], [—],
+    [*Total*], [*15*], [*6*], [*8*], [*1*],
+  )
+  #v(1fr)
+  #note[Most are reachable in production; F1–F3 only through an API with no in-tree caller.]
 ]
 
 // ---------------------------------------------------------------------------
@@ -749,27 +916,94 @@
 ]
 
 // ---------------------------------------------------------------------------
-#slide[Plan & discussion][
-  #v(1.4em)
-  #let item(num, title) = block(
-    stroke: (left: 3pt + accent),
-    inset: (left: 14pt, y: 6pt),
-  )[
-    #text(fill: accent, weight: "medium", size: 19pt)[#num · ]
-    #text(weight: "medium", size: 19pt)[#title]
-  ]
+// CAV 2027 industry case study: paper outline
+#title-slide(
+  [CAV 2027 industry case study: paper outline],
+  subtitle: [Trustworthy AI-assisted verification of TPU Sync in Lean],
+)
 
-  #stack(
-    spacing: 1.8em,
-    item[1][Extend the formalization: reshard, KV cache storage & lower-level transport],
-    item[2][Everyday agent use],
-    item[3][Lean model maintenance],
-  )
+// ---------------------------------------------------------------------------
+#slide[Background \& motivation][
+  #v(0.5em)
+  #set text(size: 19pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 1.4em)
+
+  - AI writes code fast. Bugs come with it; review cannot keep up, and tests are not enough.
+  - Formal verification can catch what tests miss; AI can write the models and proofs fast as well.
+  - But an AI-written model may not match the code, and an AI-written spec may not say what matters.
+  - This paper: towards a more trustworthy AI formal-verification workflow, and a case study on TPU Sync.
+
+  #v(1fr)
+  #text(size: 12pt, fill: muted)[CAV 2027 · Application / case study track · 10 pages + appendix · due Jan 20, 2027 · not anonymized]
+]
+
+// ---------------------------------------------------------------------------
+#slide[The system: TPU Sync][
+  #v(0.5em)
+  #set text(size: 19pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 1.4em)
+
+  - What it does: a C++ library that moves a request's KV cache between TPU workers for LLM serving. Two cases: same chip layout on both sides (prefill #sym.arrow.r decode), or different layouts (reshard).
+  - Why it is hard: each transfer is a chain of asynchronous copies, HBM #sym.arrow.r host #sym.arrow.r TCP #sym.arrow.r host #sym.arrow.r HBM, with many in flight at once, driven by a Python serving engine (vLLM).
+  - What goes wrong: corrupted KV, freed memory still written, leaked blocks. Hard to test, often hard to notice.
+  - Why speed matters: developed with heavy AI assistance and changing quickly, for real customers and large-scale workloads — verification has to keep pace.
 ]
 
 
+// ---------------------------------------------------------------------------
+#slide[How we modeled and proved it (what the paper will cover)][
+  #v(0.5em)
+  #set text(size: 18pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 1.3em)
 
+  - Abstraction level: which C++ state the model keeps (control flags, counters, leases; buffers as good/junk) and what constitutes one step (one method or callback under one lock).
+  - Boundaries: where the model ends above (the serving engine) and below (sockets, DMA), and the assumptions stated at each boundary.
+  - Structure: a stack of composed models — sessions #sym.arrow.r single transfer #sym.arrow.r concurrent transfers — with side models for transport, staging and coordination, and a separate engine model connected through the `poll_stats()` contract.
+  - Specification: two system-level goals — KV integrity (the decoder reads exactly the KV the prefill produced) and liveness (serving never stalls).
+  - Proof strategy: the general proof flow.
+]
 
+// ---------------------------------------------------------------------------
+#slide[What we do to keep the verification faithful][
+  #v(0.4em)
+  #set text(size: 17pt)
+  #set par(leading: 0.6em)
+  #set list(spacing: 1.0em)
 
+  - AI moves faster than humans can review, so we keep the human part small but decisive: specs, abstraction level, boundaries, assumptions, and bug review.
+  - Audit lock scopes in the C++: each model step must match one lock scope, or the extra scopes must be shown not to matter.
+  - Replay the C++ tests (and, next, logged runtime traces) through the model.
+  - Measure which model branches the tests reach, following the QUIC verification work, and turn each gap into a new C++ test.
+  - Break each guard in the model and confirm the spec fails.
+  - State each boundary assumption explicitly; where the neighbor is risky, model the part of it the assumption relies on.
+]
 
+// ---------------------------------------------------------------------------
+#slide[Rest of the paper and appendix][
+  #v(0.5em)
+  #set text(size: 19pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 1.4em)
 
+  - More detailed theorems, lemmas, and proof descriptions.
+  - Bugs found.
+  - Coverage and the new tests it led to.
+  - A formal-model-based agent (briefly).
+  - Human effort and token usage.
+  - ...
+]
+
+// ---------------------------------------------------------------------------
+#slide[What we need from the TPU Sync team][
+  #v(0.5em)
+  #set text(size: 19pt)
+  #set par(leading: 0.65em)
+  #set list(spacing: 1.4em)
+
+  - Context for the paper: how TPU Sync is used in production.
+  - Fix the bugs we reported, and give us their view of severity and real-world impact.
+  - The development story: how KV transfer was built and how bugs were found before formal methods.
+]
