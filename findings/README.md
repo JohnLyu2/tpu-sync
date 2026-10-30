@@ -1904,21 +1904,37 @@ from `0ac16d1` and are not re-pinned.
 
 Checked 2026-10-30 at `42dda542` against the in-repo controllers and
 `ExpectedPushSenders`: `KVCacheManagerBase::ExpectedPushSenders(uuid)`
-(`kv_cache_manager_base.cc:2745-2762`) returns `std::nullopt` whenever
-`request.pool_groups_size() > 0` as well as when no receiver plan is registered,
-so neither prefill-decode (`StartRead`) nor pool reshard (`ReshardCoordinator`)
-nor weight sync (`WeightSynchronizerBase`) enters the `sender_streams` gate —
-only non-pool `RegisterActivePlan` plans (`pool_groups_size() == 0` with
-`shard_push_schedules_size() > 0`) do. Every controller path in-repo
-(`ReshardCoordinator::RunSubPlan`, `BroadcastEngine._run_single_transfer`,
-`RaidenController.register_transfer_schedule`) awaits destination receiver
-preparation before dispatching senders (discharging `Transport` A2 for
-controller-driven transfers), and `BuildPoolReshardPlan` checks unique
-contiguous `transfer_rank`s while store workers check dense `node_id`s
-(`Transport` A3 remains unchecked only on legacy non-pool `RegisterActivePlan`
-plans, where `KVCacheManager` defaults `node_id` to `0` and
-`JobEntity.encode_start_transfer` emits `num_src_shards` schedule keys per
-source unit). `Transport.lean` §Assumptions updated accordingly.
+(`kv_cache_manager_base.cc:2745-2762`) returns `std::nullopt` when no receiver
+plan is registered (`StartRead`, `KVCacheStore` /
+`WorkerServiceImpl::TransferBuffers`, `WeightSynchronizerBase`), when
+`request.pool_groups_size() > 0` (`ReshardCoordinator::RunSubPlan`), and when
+`request.shard_push_schedules_size() == 0` (including primary
+`StageBroadcastGroup` hops in `BroadcastEngine._dispatch_hop`), so only
+non-pool receiver `RegisterActivePlan` plans (`pool_groups_size() == 0` with
+`shard_push_schedules_size() > 0`) enter the `sender_streams` gate. Inside
+`KVCacheManagerWithTransfer::RegisterActivePlan`, `EmplaceRecvSessionLocked`
+runs synchronously before `base_->RegisterActivePlan`, and in-repo controller
+hops that populate non-pool receiver `shard_push_schedules`
+(`BroadcastEngine._run_single_transfer` via `RaidenController.start_transfer`,
+and remote destination preparation via
+`RaidenControllerClientFacade.register_transfer_schedule`) await receiver
+`COMMAND_START_TRANSFER` completion before dispatching senders (leaving
+`Transport` A2 an external ordering assumption only against pushes dispatched
+before `RegisterActivePlan` returns). For `Transport` A3,
+`BuildPoolReshardPlan` checks unique contiguous `transfer_rank`s and
+`HostOffloadBackend::ComposeKVTransferSpec` checks dense `[0, N)` `node_id`s
+when `KVCacheStore` starts with `expected_worker_count > 0` and a global
+registry (`WorkerRegistry::RegisterWorker` exempts `node_id == 0`, and both
+paths bypass `ExpectedPushSenders`), whereas legacy non-pool
+`RegisterActivePlan` plans leave `A3` unchecked (`KVCacheManagerWithTransfer`
+and its `KVCacheManager` bindings default `node_id` to `0`,
+`KVCacheManagerBase::node_id()` defaults to `-1`, and
+`JobEntity.encode_start_transfer` keys receiver `shard_push_schedules` per
+source shard when `num_src_shards > 1` while `header.remote_id` is per-worker
+`node_id()`, so `num_src_shards > 1` or multi-worker default `node_id = 0`
+mis-indexes `GetBlockChunks`, fails with `AlreadyExistsError`, or hangs with
+`senders_complete < expected_senders`). `Transport.lean` §Assumptions updated
+accordingly.
 
 ### R-C. `RequestBlockRegistry` lifecycle: no defect found (read)
 
@@ -2082,12 +2098,12 @@ failure:
 
 | Case | Branch / refusal (`Registry` / `Coordinator` Lean table) | What it pins |
 |---|---|---|
-| `ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail` | `Registry` `registerRefresh`, `Refusal.registerConflict`, `Refusal.registerLifecycle` (claimed) | idempotent re-registration refreshes `expires_at` (`fake_clock_` advance past initial TTL); mismatched block payload and post-claim writes fail closed without clobbering the live entry |
+| `ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail` | `Registry` `registerRefresh`, `Refusal.registerConflict`, `Refusal.registerLifecycle` (claimed) | idempotent re-registration refreshes `expires_at` (`now_` advance past initial TTL); mismatched block payload and post-claim writes fail closed without clobbering the live entry |
 | `ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim` | `Registry` `Refusal.claimIncompatible`, `Refusal.abandonNotOwner` | a claim for a mismatched source unit set fails while leaving `STATUS_CLAIMED`; `AbandonClaim` by a non-owner is ignored |
-| `ReshardStackTest.CompletionNoOpsAndPreClaimGuard` | `Registry` `Refusal.completeBeforeClaim`, `completeNoOp` (`unknown`, `registered`, `claimed`, `cancelled`, post-retire), `cancelAlready` | non-empty pre-claim `Complete` fails; duplicate / cancelled / unknown / post-retire `Complete` calls and duplicate `CancelIfUnclaimed` are safe no-ops |
+| `ReshardStackTest.CompletionNoOpsAndPreClaimGuard` | `Registry` `Refusal.completeBeforeClaim`, `completeNoOp` (`unknown` incl. post-retire, `registered`, `claimed`, `cancelled`), `cancelAlready` | non-empty pre-claim `Complete` fails; unregistered / unclaimed sibling-unit, unknown, post-retire, and cancelled `Complete` calls and duplicate `CancelIfUnclaimed` are safe no-ops |
 | `ReshardStackTest.EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim` | `Registry` `completeVoteUnclaimed`, `claimRetiresVoted` | a rank with zero `block_ids` may vote `Complete` before `LookupAndClaim`, and claiming when every unit has already voted retires `request_blocks_` immediately |
-| `ReshardStackTest.ForcedReleaseClearsEveryLifecycleState` | `Registry` `release` (all 6 `status` × `retired` combinations) + `force=false` rejection | `COMMAND_RELEASE_REQUEST_BLOCKS` rejects `force=false` and clears `unknown`, `registered`, `claimed` (unretired and retired), and `cancelled` (with and without tombstone) back to `STATUS_UNKNOWN` |
-| `ReshardStackTest.TwoDestinationsSecondArmFailureAbandonsClaimAndSkipsSenders` | `Coordinator` `armOk`, `armFail`, `armBarrierAbort` | with two destinations, dst 0 arming OK and dst 1 failing `COMMAND_START_TRANSFER` aborts at the arm barrier, abandons the registry claim, and dispatches zero senders |
+| `ReshardStackTest.ForcedReleaseClearsEveryLifecycleState` | `Registry` `release` (all 6 reachable `status` × `retired` combinations) + `force=false` rejection | `COMMAND_RELEASE_REQUEST_BLOCKS` rejects `force=false` and clears `unknown` (unretired and post-retire), `registered`, `claimed`, and `cancelled` (unretired and post-retire) back to `STATUS_UNKNOWN` |
+| `ReshardStackTest.TwoDestinationsSecondArmFailureAbandonsClaimAndSkipsSenders` | `Coordinator` `armFail`, `armBarrierAbort` (with `armedLeft = true`) | holding dst 1 until dst 0 has armed and then failing dst 1's `COMMAND_START_TRANSFER` aborts at the arm barrier with dst 0 armed, abandons the registry claim, and dispatches zero senders |
 | `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm` | `Coordinator` `sendFail`, `sendBarrierAbort` | with two source ranks, rank 0 failing sender `COMMAND_START_TRANSFER` and rank 1 succeeding propagates failure from `COMMAND_COORDINATE_TRANSFER` after arming the receiver (asserts error propagation without pinning F8's missing `AbandonClaim`) |
 
 Runs: full `//tpu_sync/kv_cache/reshard:reshard_service_test` target green at

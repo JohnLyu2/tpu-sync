@@ -1,8 +1,40 @@
 diff --git a/tpu_sync/kv_cache/reshard/reshard_service_test.cc b/tpu_sync/kv_cache/reshard/reshard_service_test.cc
-index e410a142..453fdd61 100644
+index e410a142..6a5118d7 100644
 --- a/tpu_sync/kv_cache/reshard/reshard_service_test.cc
 +++ b/tpu_sync/kv_cache/reshard/reshard_service_test.cc
-@@ -2361,6 +2361,312 @@ TEST_F(ReshardStackTest, InvalidTransferStreamsEnvFailsThePlan) {
+@@ -106,6 +106,10 @@ class FakeTransport final : public ControlPipeClient {
+       absl::string_view endpoint,
+       const control_pipe::proto::ControlEnvelope& envelope,
+       absl::Duration /*timeout*/) override {
++    absl::Cleanup mark_completed = [this, ep = std::string(endpoint)] {
++      absl::MutexLock lock(mu_);
++      ++completed_calls_[ep];
++    };
+     absl::Notification* hold = nullptr;
+     {
+       absl::MutexLock lock(mu_);
+@@ -194,9 +198,20 @@ class FakeTransport final : public ControlPipeClient {
+     hold_after_ = after_calls;
+     hold_release_ = release;
+   }
++  void WaitForCompletedCalls(const std::string& addr, size_t min_completed) {
++    auto done = [this, &addr, min_completed]()
++                    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
++                      auto it = completed_calls_.find(addr);
++                      return it != completed_calls_.end() &&
++                             it->second >= min_completed;
++                    };
++    mu_.LockWhen(absl::Condition(&done));
++    mu_.Unlock();
++  }
+ 
+   absl::Mutex mu_;
+   std::vector<std::pair<std::string, std::string>> calls_;
++  std::map<std::string, size_t> completed_calls_;
+   std::string fail_addr_;
+   std::string fail_after_addr_;
+   size_t fail_after_ = 0;
+@@ -2361,6 +2376,340 @@ TEST_F(ReshardStackTest, InvalidTransferStreamsEnvFailsThePlan) {
            AllOf(HasSubstr("TPU_RAIDEN_TRANSFER_STREAMS"), HasSubstr("many"))));
  }
  
@@ -51,6 +83,8 @@ index e410a142..453fdd61 100644
 +      HandleController(claimed_req.SerializeAsString());
 +  EXPECT_FALSE(claimed_resp.success());
 +  EXPECT_THAT(claimed_resp.message(), HasSubstr("already claimed"));
++  EXPECT_EQ(RequestBlockStatuses("req-reg-refresh", 80),
++            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
 +}
 +
 +TEST_F(ReshardStackTest,
@@ -136,10 +170,14 @@ index e410a142..453fdd61 100644
 +      complete("req-comp-guard", 83, 0);
 +  ASSERT_TRUE(retired.success()) << retired.message();
 +  EXPECT_EQ(retired.response_data(), "1");
++  EXPECT_EQ(RequestBlockStatuses("req-comp-guard", 83),
++            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
 +  tpu_sync::rpc::ControllerResponse after_retire =
 +      complete("req-comp-guard", 83, 0);
 +  ASSERT_TRUE(after_retire.success()) << after_retire.message();
 +  EXPECT_EQ(after_retire.response_data(), "0");
++  EXPECT_EQ(RequestBlockStatuses("req-comp-guard", 83),
++            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
 +
 +  // Cancelled generation: repeated CancelIfUnclaimed stays true, and Complete
 +  // is a no-op leaving the tombstone in place.
@@ -217,9 +255,13 @@ index e410a142..453fdd61 100644
 +  tpu_sync::rpc::ControllerResponse rel_u1 = release("req-rel-u", 86, true);
 +  ASSERT_TRUE(rel_u1.success()) << rel_u1.message();
 +  EXPECT_EQ(rel_u1.response_data(), "0");
++  EXPECT_EQ(RequestBlockStatuses("req-rel-u", 86),
++            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
 +  tpu_sync::rpc::ControllerResponse rel_u2 = release("req-rel-u", 86, true);
 +  ASSERT_TRUE(rel_u2.success()) << rel_u2.message();
 +  EXPECT_EQ(rel_u2.response_data(), "0");
++  EXPECT_EQ(RequestBlockStatuses("req-rel-u", 86),
++            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
 +
 +  // Registered.
 +  RegisterSpans(0, "req-rel-r", 87, 1024, 3, 0, 0, 1024);
@@ -239,6 +281,8 @@ index e410a142..453fdd61 100644
 +  EXPECT_EQ(RequestBlockStatuses("req-rel-c", 88),
 +            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
 +  EXPECT_EQ(CancelIfUnclaimed("req-rel-c", 88).response_data(), "true");
++  EXPECT_EQ(RequestBlockStatuses("req-rel-c", 88),
++            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
 +  tpu_sync::rpc::ControllerResponse rel_after_retire_cancel =
 +      release("req-rel-c", 88, true);
 +  ASSERT_TRUE(rel_after_retire_cancel.success())
@@ -264,24 +308,36 @@ index e410a142..453fdd61 100644
 +  RegisterSpans(0, "req-arm2-fail", 90, 1024, 3, 0, 0, 1024);
 +  RegisterSpans(1, "req-arm2-fail", 90, 1024, 5, 1, 0, 512);
 +
-+  // Destination 0 (10.0.0.2:9600) arms; destination 1 (10.0.0.2:9601) refuses.
++  // Hold destination 1 (10.0.0.2:9601) until destination 0 (10.0.0.2:9600) has
++  // armed, then fail destination 1 so armFail fires with an armed peer live.
++  absl::Notification release_dst1;
++  absl::Cleanup notify_on_exit = [&release_dst1] {
++    if (!release_dst1.HasBeenNotified()) release_dst1.Notify();
++  };
 +  transport_.FailFor("10.0.0.2:9601");
-+  tpu_sync::rpc::ControllerResponse resp =
-+      Coordinate("req-arm2-fail", 90, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
++  transport_.HoldAfterCalls("10.0.0.2:9601", /*after_calls=*/0, &release_dst1);
++  tpu_sync::rpc::ControllerResponse resp;
++  std::thread coord([&] {
++    resp = Coordinate("req-arm2-fail", 90, 2, {7, 9}, /*dst_skip=*/{},
++                      /*num_dst=*/2);
++  });
++  transport_.WaitForCompletedCalls("10.0.0.2:9600", 1);
++  release_dst1.Notify();
++  coord.join();
 +  ASSERT_FALSE(resp.success());
 +  EXPECT_THAT(resp.message(), HasSubstr("injected arm refusal"));
 +
-+  for (size_t i = 0; i < transport_.calls_.size(); ++i) {
-+    tpu_sync::rpc::ControlRequest worker_req;
-+    ASSERT_TRUE(worker_req.ParseFromString(transport_.calls_[i].second));
-+    if (worker_req.command() ==
-+        tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER) {
-+      EXPECT_FALSE(worker_req.start_transfer_request().is_sender());
-+    }
-+  }
++  ASSERT_EQ(transport_.calls_.size(), 2u);
++  std::multiset<std::string> arm_endpoints = {transport_.calls_[0].first,
++                                              transport_.calls_[1].first};
++  EXPECT_EQ(arm_endpoints,
++            (std::multiset<std::string>{"10.0.0.2:9600", "10.0.0.2:9601"}));
++  EXPECT_FALSE(WorkerStartTransfer(0).is_sender());
++  EXPECT_FALSE(WorkerStartTransfer(1).is_sender());
 +  EXPECT_EQ(RequestBlockStatuses("req-arm2-fail", 90),
 +            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
 +
++  transport_.HoldAfterCalls("", 0, nullptr);
 +  transport_.FailFor("");
 +  transport_.calls_.clear();
 +  tpu_sync::rpc::ControllerResponse retry =
@@ -308,6 +364,10 @@ index e410a142..453fdd61 100644
 +  ASSERT_EQ(transport_.calls_.size(), 3u);
 +  EXPECT_EQ(transport_.calls_[0].first, "10.0.0.2:9600");
 +  EXPECT_FALSE(WorkerStartTransfer(0).is_sender());
++  std::multiset<std::string> sender_endpoints = {transport_.calls_[1].first,
++                                                 transport_.calls_[2].first};
++  EXPECT_EQ(sender_endpoints,
++            (std::multiset<std::string>{"10.0.0.1:9100", "10.0.0.1:9102"}));
 +  EXPECT_TRUE(WorkerStartTransfer(1).is_sender());
 +  EXPECT_TRUE(WorkerStartTransfer(2).is_sender());
 +}
