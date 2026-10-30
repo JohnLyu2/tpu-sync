@@ -23,6 +23,7 @@ import TpuSyncVerify.Transfer.Reshard.MultiRequest
 import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
+import TpuSyncVerify.Transfer.Reshard.Registry.Coverage
 import TpuSyncVerify.Transfer.Reshard.Coordinator
 
 /-!

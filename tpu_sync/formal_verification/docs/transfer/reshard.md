@@ -225,6 +225,8 @@ reaches on the 1–2 pool instances).
 | `Receive` | 1 pool; 2 pools of one rank; ranks `[0, 1]` | 36 (+3 unreachable leaves: `FinishPoolH2d`'s `if (done_) return;`, a failed issue on a finalizing session, the poll's `IsReadyToComplete` finish) | 4 (2 tests) | 32 | 21 test, 9 future (stub), 2 window |
 | `Send` | 1 pool with 1 or 2 peers; 2 pools | 25 (every leaf live) | 3 (3 tests, starting after `ReshardSendSessionTestPeer::BeginPush`) | 22 | 16 test, 6 future (stub) |
 | `Pipeline` | 1 pool, armed and unarmed | 59; every memory move writes the right pool's KV and no H2D clobbers KV in a higher-rank slot | 0 | 59 | 3 environment, 1 coordinator, 1 transport, 8 covered by session tests, 46 in the session gap tables, none unaccounted |
+| `Registry` | one `(req_id, uuid)` generation over two units and two owners | 25 (every leaf live); effect is the `Status` before and after and whether `RetireLocked` fired | 11 (10 tests, 11 traces; 3 of 7 refusal arms asserted) | 14 | 14 test (controller commands no test sends: an identical re-registration, `Complete` no-ops, an empty-blocks registration voting before its claim, a repeated cancel, `Release`) |
+| `Coordinator` | 1×1, 2×1 and 2×2 sub-plans under `CleanupPolicy.shipping` | 14 (every leaf live); effect is the phase before and after and what an abort leaves armed or claimed | 10 (9 tests) | 4 | 4 test (a failed sender dispatch and a refused arm beside an armed destination; `transport_.FailFor` on a source rank or a second destination) — the two `Traces.lean` counterexamples |
 
 What the tests miss: on the receiver, every test that "completes a pool" calls
 `FinishPoolH2d` through `PoolReshardRecvTestPeer` on a pool that was never
@@ -239,7 +241,11 @@ synchronously on CPU. On the sender, `ReshardSendSessionTest` uses
 completes one push OK via `ReshardSendSessionTestPeer::CompletePush`, so no test
 runs `ExecutePush` / `StartPoolPush` or fails a push (the early unregister of
 `UnregisterPolicy.shipping`). No test runs a reshard transfer end to end. The
-`test` rows need no production seam.
+`test` rows need no production seam. On the control plane, every
+`ReshardStackTest` failure injection is a refused arm or a planner rejection:
+no test fails a sender dispatch (the `Coordinator` gaps), re-sends a
+registration, completes an unknown or retired unit, cancels twice, or sends
+`COMMAND_RELEASE_REQUEST_BLOCKS` (the `Registry` gaps).
 
 ## C++ branch coverage of the anchored spans
 

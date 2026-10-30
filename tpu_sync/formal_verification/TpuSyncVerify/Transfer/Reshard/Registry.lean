@@ -114,6 +114,16 @@ and `reshard_service_test.cc`
   - `purgeExpiredAll_inv`, `trace_single_stage_votes_retire_multi_owner_claim`,
     and `trace_split_ttl_purges_request_blocks_while_claim_active`.
 
+  ## Branch coverage
+
+  `Registry/Coverage.lean`: 25 branches of `RegGen.step` over `checkEvents`
+  (every leaf live); the ten `ReshardStackTest` cases that drive the registry
+  through `ReshardService`'s controller commands or `RunSubPlan`'s claim and
+  abandon reach 11, and assert three of the seven refusal arms. The 14 gaps
+  (idempotent re-registration, `Complete` no-ops, an empty-blocks registration
+  voting before its claim, a repeated cancel, every `Release`) need only
+  controller commands no test sends.
+
   ## Source map
 
   <!-- source-map:begin -->
@@ -156,6 +166,10 @@ and `reshard_service_test.cc`
   | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1744-1769` |
   | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1771-1798` |
   | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1800-1827` |
+  | `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1369-1379` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1381-1397` |
+  | `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:760-834` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1531-1601` |
   <!-- source-map:end -->
 -/
 
@@ -203,7 +217,7 @@ structure RegGen where
   /-- Monotonic flag recording whether `RequestBlockRegistry::RetireLocked`
   has fired to retire the generation. -/
   retired : Bool
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 /-- Initial empty state for a `(req_id, uuid)` generation. -/
 def RegGen.init : RegGen :=

@@ -74,10 +74,13 @@ umbrella file and a directory of parts:
 * `X/Frame.lean` — frame lemmas for other modules.
 * `X/Traces.lean` — traces, searches, mutants.
 * `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
-  below); `Receive`, `Send`, `Pipeline` on both transfer paths, and
+  below); `Receive`, `Send`, `Pipeline` on both transfer paths,
+  `Reshard/{Registry,Coordinator}` (no session lifecycle: their effect is the
+  registry `Status` / coordinator phase before and after), and
   `PrefillDecode/MultiRequestCoverage.lean` (new leaves only: its state space
   is unbounded) so far (`PrefillDecode/Pipeline/Coverage.lean` imports the
-  traces in `PipelineChecks.lean`, so `TpuSyncVerify.lean` imports it
+  traces in `PipelineChecks.lean`, and `Reshard/Registry/Coverage.lean` sits
+  beside a single-file module, so `TpuSyncVerify.lean` imports both
   directly). Not to be confused with `Reshard/Coverage.lean`, which is the
   reshard model's sub-block byte coverage, a model of the C++.
 
