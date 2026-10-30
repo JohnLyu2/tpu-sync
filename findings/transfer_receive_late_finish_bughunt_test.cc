@@ -24,18 +24,18 @@
 //   }
 //   if (draining_) return;
 //
-// Compare TransferSendSession::FinishLocked (tpu_sync/kv_cache/
-// transfer_send_session.cc:247), which begins with:
-//
-//   if (draining_ || done_) return;
-//
-// On both receive session classes, FinishLocked(OkStatus()) is invoked only
-// after 100% of destination HBM uploads (every layer or every pool) have
-// completed with OkStatus(). Yet if a non-OK Finish(...) arrives while an
-// already-OK session is draining its last transport/control reference (or in
-// the window before CompleteReadWithDetails reaps a settled session), status_
-// is overwritten with the late error, flipping a completed HBM receive from
-// `completions.received` into `completions.failed`.
+// Unlike TransferSendSession::FinishLocked (tpu_sync/kv_cache/
+// transfer_send_session.cc:247, `if (draining_ || done_) return;`), a receive
+// session cannot simply early-return on `draining_`, because the poll-side
+// Finish() in CompleteReadWithDetails can set `draining_ = true` before H2D
+// copies finish. However, once 100% of destination HBM uploads (every layer or
+// every pool) have completed OK (or `done_` is already true), a late non-OK
+// Finish(...) arriving while the session drains its last transport/control
+// reference (or before CompleteReadWithDetails reaps it) still overwrites
+// `status_`, flipping a completed HBM receive from `completions.received` into
+// `completions.failed`.
+// (Gate `status_ = status` on `!done_ && !all_uploaded_ok` /
+// `!done_ && !network_completed_` rather than skipping `draining_ = true`.)
 
 #include <chrono>
 #include <cstddef>
@@ -299,14 +299,14 @@ TEST(RecvLateFinishBughunt,
   EXPECT_THAT(completions.failed, IsEmpty());
 }
 
-// Path 1 (hooks.end_incoming_push): BlockTransportServerPushSession::StartStream
-// fires CompleteIncomingPush -> OnLayerReceived (lines 438-441) before clearing
-// `incoming_push_lease_held` (line 448) and writing the final 1-byte ACK (line
-// 453), and a second concurrently-admitted duplicate stream can also hit
-// absl::Cleanup end_incoming_push(InternalError("Incoming push failed")) after
-// all layers' H2D copies have already completed OK. Once every H2D copy into
-// destination HBM has succeeded (FinishLocked(OkStatus()) ran), a trailing
-// stream teardown error must not flip the completed receive to failed.
+// Path 1 (hooks.end_incoming_push — direct API / non-honest duplicate stream;
+// StartStream clears `incoming_push_lease_held` at line 448 before the 1-byte
+// ACK at line 453, so in-tree honest senders do not hit this after landing all
+// data, though a duplicate/extra stream failing CompleteIncomingPush or a
+// direct EndIncomingPush call can). Once every layer's H2D copy into
+// destination HBM has completed with OkStatus(), a subsequent non-OK
+// EndIncomingPush teardown on an open push lease overwrites `status_` and flips
+// the completed receive from `completions.received` to `completions.failed`.
 TEST(RecvLateFinishBughunt,
      TrailingPushStreamErrorAfterCompletedH2dMustNotFlipReceivedToFailed) {
   LateFinishTestManager consumer(/*num_layers=*/1);
@@ -331,13 +331,13 @@ TEST(RecvLateFinishBughunt,
   EXPECT_THAT(completions.failed, IsEmpty());
 }
 
-// Path 2 (KVCacheManagerWithTransfer::UnregisterActivePlan): UnregisterActivePlan
-// captures `recv` while `!recv->Done()` (e.g. while EndIncomingPush has not yet
-// released the push lease even though every H2D copy already completed OK, or
-// in the window between the unlocked `mu_` check at line 927 and `recv->Finish`
+// Path 2 (KVCacheManagerWithTransfer::UnregisterActivePlan — direct API hazard,
+// not called on receivers in production): captures `recv` while `!recv->Done()`
+// (while the push lease is still open after every H2D copy completed OK, or in
+// the unlocked gap between the `!Done()` check at lines 920-927 and `Finish`
 // at line 938) and calls `recv->Finish(CancelledError("receive plan
-// unregistered"))`. A receive whose H2D copies into HBM have all completed OK
-// and whose push stream closes cleanly must report `received`, not `failed`.
+// unregistered"))`, flipping the completed receive to `failed` and failing
+// `EndIncomingPush(OkStatus())` with `CancelledError`.
 TEST(RecvLateFinishBughunt,
      UnregisterActivePlanAfterCompletedH2dMustNotFlipReceivedToFailed) {
   LateFinishTestManager consumer(/*num_layers=*/1);
@@ -359,11 +359,11 @@ TEST(RecvLateFinishBughunt,
   EXPECT_THAT(completions.failed, IsEmpty());
 }
 
-// Path 3 (ExecutePullRequest::on_response): HandlePullStream detaches the
-// producer's StartPush worker before returning PullStreamResponseSpec on the
-// control channel. If all pushed layers arrive and complete H2D into HBM before
-// a delayed/failing control reply resolves on_response, `self->FinishLocked`
-// overwrites the settled OK status with the control-channel error.
+// Path 3 (ExecutePullRequest::on_response — production-reachable StartRead
+// race): HandlePullStream detaches StartPush before returning the control
+// reply. If all pushed layers complete H2D into HBM before a failing control
+// reply runs on_response (whose end_op releases the initial handshake op),
+// `self->FinishLocked(pull_status)` overwrites `status_` with the reply error.
 TEST(RecvLateFinishBughunt,
      LateControlPullReplyErrorAfterCompletedH2dMustNotFlipReceivedToFailed) {
   LateFinishTestManager consumer(/*num_layers=*/1);
@@ -398,11 +398,11 @@ TEST(RecvLateFinishBughunt,
   EXPECT_THAT(completions.failed, IsEmpty());
 }
 
-// Path 4 (ReshardReceiveSession::FinishLocked): pool-reshard receive has the
-// exact same unguarded `if (!status.ok() && status_.ok()) status_ = status;`
-// before `if (draining_) return;`. Once every declared pool's H2D has completed
-// OK, a late UnregisterActivePlan (or trailing EndIncomingPush error) flips
-// `done_recving` into `failed_recving`.
+// Path 4 (ReshardReceiveSession::FinishLocked — direct API harness): pool
+// reshard has the same unguarded `if (!status.ok() && status_.ok()) status_ =
+// status;` before `if (draining_) return;`. Once FinishPoolH2d has completed
+// every declared pool OK (`network_completed_ = true`), a direct
+// UnregisterActivePlan or non-OK EndIncomingPush flips `received` to `failed`.
 TEST(RecvLateFinishBughunt,
      PoolReshardUnregisterAfterCompletedPoolH2dMustNotFlipReceivedToFailed) {
   LateFinishTestManager consumer(/*num_layers=*/1);

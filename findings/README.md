@@ -61,7 +61,7 @@ here.
 | `numa_kv_cache_manager_bughunt_test.cc` | F11: `NumaAwareKVCacheManager::CompleteReadRaw` eager `failed_recving` while sibling sub-managers still have H2D / D2H DMAs in flight, plus `failed_recving_set_` / barrier-count leak and `req_id`-reuse poisoning |
 | `pool_reshard_chain_bughunt_test.cc` | F12 (`PoolReshardChainBughunt`, `ChainClaimTest`) and F13 (`PoolReshardChainBughunt1B`): windowed pool-reshard sub-plan chains (`09a42d4e`) — a sender absent from some windows never reports `done_sending`; a chain failing after window 0 holds the registry claim until TTL; the first failing sub-plan is reported while sibling / later windows still run and can be reported twice |
 | `transfer_receive_late_finish_bughunt_test.cc` | F14 (`RecvLateFinishBughunt`): 1 control (`TransferSendSession`) + 4 failing cases driving `end_incoming_push`, `UnregisterActivePlan`, `ExecutePullRequest` `on_response`, and `ReshardReceiveSession` directly, where a late `Finish(error)` after every H2D completed OK flips `completions.received` to `completions.failed` (in production only the `on_response` path and a photo-finish deadline-sweep race reach it; see §F14) |
-| `build_targets.patch` | `cc_test` targets for the seven files above (plus the four untriaged store/host reproducers recorded in `## History`) |
+| `build_targets.patch` | `cc_test` targets for the seven files above |
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
@@ -1212,7 +1212,7 @@ have not been rebuilt since the runs their entries record.
   sweeps have at `:1211-1222` and `:1243-1250`).
 - **The four paths the test drives, and what reaches them:**
   1. **Trailing stream cleanup (`hooks.end_incoming_push`,
-     `kv_cache_manager_with_transfer.cc:390-425`;
+     `kv_cache_manager_with_transfer.cc:390-436`;
      `BlockTransportServerPushSession::StartStream`,
      `block_transport_session.cc:334-448`) — not reachable from in-tree
      senders.** `StartStream` passes `InternalError` only if it fails before
@@ -1222,7 +1222,7 @@ have not been rebuilt since the runs their entries record.
      A4). A stream failing earlier means data never arrived, so the failure is
      genuine.
   2. **`KVCacheManagerWithTransfer::UnregisterActivePlan`
-     (`kv_cache_manager_with_transfer.cc:912-946`) — race real, no production
+     (`kv_cache_manager_with_transfer.cc:912-949`) — race real, no production
      caller.** The `!Done()` check under `mu_` then `Finish(Cancelled)` outside
      it can land after the data completed (and makes `EndIncomingPush(OK)`
      return `CancelledError`, failing the sender's ACK). Receive-side
@@ -1386,11 +1386,15 @@ have not been rebuilt since the runs their entries record.
   ```
 - **Fix:** gate **recording the error** (not `draining_ = true` itself, which
   the final `Finish(OkStatus())` call still needs to set!) once every upload
-  has completed OK: in `TransferReceiveSession::FinishLocked`, set
-  `all_layers_ok_ = true` at `ExecuteLayerH2d` (`:889`) and host-only
-  `RecordNetworkCompleteLocked` (`:603`) and guard the assignment with
-  `if (!status.ok() && status_.ok() && !done_ && !all_layers_ok_)`; in
-  `ReshardReceiveSession::FinishLocked`, guard the assignment with
+  has completed OK: in `TransferReceiveSession::FinishLocked`, compute
+  `all_uploaded_ok = (total_layers > 0 ? num_completed_layers_ >= static_cast<int32_t>(total_layers) : network_completed_)`
+  (where `total_layers = base_ != nullptr ? base_->num_layers() : 0`) and guard
+  the assignment with `if (!status.ok() && status_.ok() && !done_ && !all_uploaded_ok)`
+  (checking `num_completed_layers_` directly rather than setting a latch inside
+  `ExecuteLayerH2d`'s `&& !self->draining_` block at `:886-890`, which is
+  skipped when the poll-side `Finish()` set `draining_ = true` before the last
+  H2D `OnReady` callback ran); in `ReshardReceiveSession::FinishLocked`, guard
+  the assignment with
   `if (!status.ok() && status_.ok() && !done_ && !network_completed_)` (since
   `FinishPoolH2d` sets `network_completed_ = true` at `:699` *before* calling
   `Finish(terminal_status)` at `:702`, returning early on `network_completed_`
@@ -1909,13 +1913,15 @@ plan is registered (`StartRead`, `KVCacheStore` /
 `WorkerServiceImpl::TransferBuffers`, `WeightSynchronizerBase`), when
 `request.pool_groups_size() > 0` (`ReshardCoordinator::RunSubPlan`), and when
 `request.shard_push_schedules_size() == 0` (including primary
-`StageBroadcastGroup` hops in `BroadcastEngine._dispatch_hop`), so only
+`StageBroadcastGroup` hops in `BroadcastEngine.execute_slice_broadcast_pipeline`'s
+`_dispatch_hop`), so only
 non-pool receiver `RegisterActivePlan` plans (`pool_groups_size() == 0` with
 `shard_push_schedules_size() > 0`) enter the `sender_streams` gate. Inside
 `KVCacheManagerWithTransfer::RegisterActivePlan`, `EmplaceRecvSessionLocked`
 runs synchronously before `base_->RegisterActivePlan`, and in-repo controller
 hops that populate non-pool receiver `shard_push_schedules`
-(`BroadcastEngine._run_single_transfer` via `RaidenController.start_transfer`,
+(`BroadcastEngine.execute_slice_broadcast_pipeline`'s `_run_single_transfer`
+via `RaidenController.start_transfer`,
 and remote destination preparation via
 `RaidenControllerClientFacade.register_transfer_schedule`) await receiver
 `COMMAND_START_TRANSFER` completion before dispatching senders (leaving
