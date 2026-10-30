@@ -456,35 +456,6 @@ theorem trace_chained_arm_failure_keeps_claim_past_last_vote :
 
 /-! ### Search -/
 
-private theorem forall_some_iff_all {α : Type} (o : Option α) (P : α → Prop) [DecidablePred P] :
-    (∀ x, o = some x → P x) ↔ o.all (fun x => decide (P x)) = true := by
-  cases o <;> simp
-
-instance (reg : RegGen) : Decidable (ClaimOwnersConsistent reg) :=
-  decidable_of_iff
-    ((reg.claimedUnits.isSome = !reg.claimOwners.isEmpty) ∧
-      reg.claimedUnits.all (fun units =>
-        decide (units ≠ [] ∧ ∀ u ∈ units, (reg.lookupUnit u).isSome = true)) = true)
-    (by unfold ClaimOwnersConsistent; rw [forall_some_iff_all])
-
-instance (reg : RegGen) : Decidable (TombstoneClean reg) := by
-  unfold TombstoneClean; infer_instance
-
-instance (reg : RegGen) : Decidable (RetiredClean reg) := by
-  unfold RetiredClean; infer_instance
-
-instance (reg : RegGen) : Decidable (PartialVotesNotAllVoted reg) :=
-  decidable_of_iff
-    (reg.claimedUnits.all (fun expected =>
-      decide (allVoted expected reg.completedUnits = false)) = true)
-    (by unfold PartialVotesNotAllVoted; rw [forall_some_iff_all])
-
-instance (reg : RegGen) : Decidable (Registry.Inv reg) :=
-  decidable_of_iff
-    (ClaimOwnersConsistent reg ∧ TombstoneClean reg ∧ RetiredClean reg ∧
-      PartialVotesNotAllVoted reg)
-    ⟨fun ⟨a, b, c, d⟩ => ⟨a, b, c, d⟩, fun h => ⟨h.1, h.2, h.3, h.4⟩⟩
-
 instance (s : CoordChainState) : Decidable (NoSenderExposed s) := by
   unfold NoSenderExposed; infer_instance
 instance (s : CoordChainState) : Decidable (NoPushBeforeAllArmed s) := by

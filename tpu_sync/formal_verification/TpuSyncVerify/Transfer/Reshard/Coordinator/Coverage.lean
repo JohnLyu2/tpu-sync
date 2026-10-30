@@ -1,12 +1,11 @@
 import TpuSyncVerify.Common.Coverage
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Traces
 
-/-! # `Coordinator`: branch coverage of `CoordState.step .shipping` by the replayed tests
+/-! # `Coordinator`: branch coverage of `CoordState.step` by the replayed tests
 
 Part of `TpuSyncVerify.Transfer.Reshard.Coordinator`. Built like
 `Reshard/Registry/Coverage.lean`: `Leaf` names one leaf of an event's decision
-tree under the shipping cleanup policy, `stepT` is `step .shipping` with the
-leaf attached, `stepT_step` proves it is the same function, and the effect read
+tree, `stepT` is `step` with the leaf attached, `stepT_step` proves it is the same function, and the effect read
 off a step is the coordinator phase before and after plus what an abort leaves
 behind (`CoordEffect`). -/
 
@@ -15,7 +14,7 @@ namespace TpuSyncVerify.Transfer.Reshard.Coordinator
 open TpuSyncVerify.Coverage (Instr insertNew sameSet)
 open TpuSyncVerify.Transfer.Reshard.Registry
 
-/-- One leaf of `step .shipping`'s decision tree per event. -/
+/-- One leaf of `step`'s decision tree per event. -/
 inductive Leaf
   /-- `RequestBlockRegistry::Register` for a producer, before planning. -/
   | registerProducer
@@ -67,28 +66,28 @@ abbrev Branch := Leaf × CoordEffect
 
 def completedCount (s : CoordState) : Nat := (s.dstStates.filter (·.completed)).length
 
-/-- `step .shipping` with the leaf it took. -/
+/-- `step` with the leaf it took. -/
 def stepT (s : CoordState) : Ev → Option (CoordState × Leaf)
-  | .registerProducer u => (CoordState.step .shipping s (.registerProducer u)).map (·, .registerProducer)
+  | .registerProducer u => (CoordState.step s (.registerProducer u)).map (·, .registerProducer)
   | .startPlan ok =>
-    (CoordState.step .shipping s (.startPlan ok)).map (·, if ok then .startPlanOk else .startPlanFailed)
+    (CoordState.step s (.startPlan ok)).map (·, if ok then .startPlanOk else .startPlanFailed)
   | .armDstResult d ok =>
-    (CoordState.step .shipping s (.armDstResult d ok)).map (·, if ok then .armOk else .armFail)
+    (CoordState.step s (.armDstResult d ok)).map (·, if ok then .armOk else .armFail)
   | .finishArmBarrier =>
-    (CoordState.step .shipping s .finishArmBarrier).map
+    (CoordState.step s .finishArmBarrier).map
       (·, if s.armFailed then .armBarrierAbort else .armBarrierDispatch)
   | .sendSrcResult u ok =>
-    (CoordState.step .shipping s (.sendSrcResult u ok)).map fun s' =>
+    (CoordState.step s (.sendSrcResult u ok)).map fun s' =>
       (s', if !ok then .sendFail
            else if completedCount s' > completedCount s then .sendOkCompletes
            else .sendOk)
   | .finishSendBarrier =>
-    (CoordState.step .shipping s .finishSendBarrier).map
+    (CoordState.step s .finishSendBarrier).map
       (·, if s.sendFailed then .sendBarrierAbort else .sendBarrierSucceeds)
 
-/-- `stepT` is `step .shipping` with a tag. -/
+/-- `stepT` is `step` with a tag. -/
 theorem stepT_step (s : CoordState) (e : Ev) :
-    (stepT s e).map (·.1) = CoordState.step .shipping s e := by
+    (stepT s e).map (·.1) = CoordState.step s e := by
   cases e <;> simp [stepT, Option.map_map, Function.comp_def]
 
 def instr : Instr CoordState Ev Leaf CoordEffect := { stepT, effect }
@@ -267,10 +266,10 @@ def modelOnly : List (String × CoordState × List Ev) :=
    ("dispatchFailureTrace", CoordState.init [0, 1] [10, 11] 101, dispatchFailureTrace)]
 
 -- Every paired trace runs to its end; the refusal is refused.
-#guard paired.all fun (_, s, tr) => ((CoordState.sys .shipping s.srcUnits s.dstUnits s.claimOwner).run tr).isSome
+#guard paired.all fun (_, s, tr) => ((CoordState.sys s.srcUnits s.dstUnits s.claimOwner).run tr).isSome
 #guard refused.all fun (_, s, tr, e) =>
-  ((CoordState.sys .shipping s.srcUnits s.dstUnits s.claimOwner).run tr).bind
-    (fun s' => CoordState.step .shipping s' e) == none
+  ((CoordState.sys s.srcUnits s.dstUnits s.claimOwner).run tr).bind
+    (fun s' => CoordState.step s' e) == none
 
 /-! ## Result
 
@@ -322,7 +321,7 @@ def coverageChecks : Bool :=
     sameSet uncovered gaps ∧
     allLeaves.all (fun l => univ.any (·.1 = l)) ∧
     gaps.all (fun b => inits.any fun (i, evs) => (Coverage.witness instr i evs b).isSome) ∧
-    modelOnly.all (fun (_, s, tr) => ((CoordState.sys .shipping s.srcUnits s.dstUnits s.claimOwner).run tr).isSome)
+    modelOnly.all (fun (_, s, tr) => ((CoordState.sys s.srcUnits s.dstUnits s.claimOwner).run tr).isSome)
 
 #guard coverageChecks
 

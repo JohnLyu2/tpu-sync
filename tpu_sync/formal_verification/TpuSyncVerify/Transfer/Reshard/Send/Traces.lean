@@ -16,9 +16,9 @@ namespace Send
 Concrete traces, checked by `decide`, covering multi-pool multi-peer slot
 counting (`CountPoolReshardSendSlots`), `ReshardSendSessionTest` and
 `PoolReshardSendTest` parity, external deadline or cancellation unregistration
-in `ReshardSendSession::EndOp`, and the contrast between
-`UnregisterPolicy.shipping` and `UnregisterPolicy.onSettle` when one pool fails
-while a sibling pool is still in flight. Each trace is a named `def` so that
+in `ReshardSendSession::EndOp`, and the early plan unregistration of
+`ReshardSendSession::RecordPushCompletion` when one pool fails while a sibling
+pool is still in flight (contrasted below with an `EndOp`-only alternative). Each trace is a named `def` so that
 `Coverage.lean` measures the exact event lists proved here. -/
 
 /-- Sender source-span validation (`ReshardSendSession::ValidatePlan`, invoked
@@ -157,25 +157,16 @@ def tr_early_unregister_on_error : List Ev :=
   [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish,
    .d2hDone 0 true, .d2hDone 1 true, .pushDone 0 false]
 
-/-- Early plan unregistration on partial failure (`ReshardSendSession::RecordPushCompletion`
-vs. `ReshardSendSession::EndOp`): when pool 0's push fails (`pushDone 0 false`)
-while pool 1's push is still in flight, `UnregisterPolicy.shipping` unregisters
-the active plan immediately (`planUnregistered = true` while `done = false` and
-`inFlight = 1`). Under `UnregisterPolicy.onSettle`, the plan remains registered
-until pool 1's op also finishes (`planUnregistered = false` until
-`done = true`). -/
-theorem trace_early_unregister_on_error_vs_onSettle :
-    -- Shipping: planUnregistered is already true while pool 1 still has 1 push in flight (`done = false`).
-    ((sys [1, 1] .shipping).run tr_early_unregister_on_error).map
+/-- Early plan unregistration on partial failure
+(`ReshardSendSession::RecordPushCompletion` vs. `ReshardSendSession::EndOp`):
+when pool 0's push fails (`pushDone 0 false`) while pool 1's push is still in
+flight, `RecordPushCompletion` unregisters the active plan at once
+(`planUnregistered = true` while `done = false` and `inFlight = 1`), so pool 1's
+`StartPoolPush` resolves its chunks against an unregistered plan. -/
+theorem trace_early_unregister_on_error :
+    ((sys [1, 1]).run tr_early_unregister_on_error).map
       (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
-      some (false, 1, true) ∧
-    -- onSettle: plan stays registered while pool 1 is in flight, and unregisters when pool 1 finishes.
-    ((sys [1, 1] .onSettle).run tr_early_unregister_on_error).map
-      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
-      some (false, 1, false) ∧
-    ((sys [1, 1] .onSettle).run (tr_early_unregister_on_error ++ [.pushDone 1 true])).map
-      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
-      some (true, 0, true) := by
+      some (false, 1, true) := by
   decide
 
 def events (numPools : Nat) : List Ev :=
@@ -185,15 +176,15 @@ def events (numPools : Nat) : List Ev :=
      .d2hDone p true, .d2hDone p false,
      .pushDone p true, .pushDone p false]
 
-instance (pol : UnregisterPolicy) (s : Send) : Decidable (Safe pol s) := by
+instance (s : Send) : Decidable (Safe s) := by
   unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ActiveOrDraining PlanIntegrity Publication NoOpLeak
   infer_instance
 
 /-- Executable negation of `Safe`, by construction: the bounded searches and the
 `reachable_safe` theorem check the same predicate. -/
-def violates (pol : UnregisterPolicy) (s : Send) : Bool := !decide (Safe pol s)
+def violates (s : Send) : Bool := !decide (Safe s)
 
-theorem violates_iff (pol : UnregisterPolicy) (s : Send) : violates pol s = false ↔ Safe pol s := by
+theorem violates_iff (s : Send) : violates s = false ↔ Safe s := by
   simp [violates]
 
 
@@ -205,8 +196,8 @@ instead of `2 + 1 = 3`) leaves the session open with `in_flight_ == 0` and
 def initOvercountedSlots : Send :=
   { (init [2, 1]) with remainingPushes := 4 }
 
-#guard (match ModelCheck.check ⟨initOvercountedSlots, step .shipping⟩
-          (events 2) (violates .shipping) 9 with
+#guard (match ModelCheck.check ⟨initOvercountedSlots, step⟩
+          (events 2) violates 9 with
         | .counterexample _ => true
         | _ => false)
 
@@ -222,10 +213,10 @@ def stepWithoutEndOpUnregister (s : Send) : Ev → Option Send
     if s.execActive = true ∧ allIssued s.pools = true then
       some (endOpWithoutUnregister { s with execActive := false })
     else none
-  | e => step .shipping s e
+  | e => step s e
 
 #guard (match ModelCheck.check ⟨init [1], stepWithoutEndOpUnregister⟩
-          (events 1) (violates .shipping) 4 with
+          (events 1) violates 4 with
         | .counterexample _ => true
         | _ => false)
 
@@ -239,14 +230,79 @@ def d2hDoneLeakOnDraining (p : Nat) (ok : Bool) (s : Send) : Option Send :=
     if pool.stage != .d2h then none
     else if ok && (s.life.done || s.life.draining) then
       some { s with pools := s.pools.set p { pool with stage := .aborted } }
-    else s.d2hDone .shipping p ok
+    else s.d2hDone p ok
   | none => none
 
 #guard (match ModelCheck.check ⟨init [1], fun s e => match e with
           | .d2hDone p ok => d2hDoneLeakOnDraining p ok s
-          | e => step .shipping s e⟩ (events 1) (violates .shipping) 5 with
+          | e => step s e⟩ (events 1) violates 5 with
         | .counterexample _ => true
         | _ => false)
+
+/-! ### The `EndOp`-only unregistration alternative
+
+`ReshardReceiveSession` unregisters its plan only when its last op ends
+(`FinishPoolH2d` / `EndRecvOpLocked`); `ReshardSendSession::RecordPushCompletion`
+unregisters as soon as `finalizing_` is latched. `stepUnregisterOnSettle` is
+`step` with the send session doing what the receive session does — the plan
+stays registered until `EndOp` settles the session. It is not the shipping
+code. -/
+
+/-- `RecordPushCompletion` without `UnregisterActivePlan`. -/
+def recordPushCompletionOnSettle (ok : Bool) (s : Send) : Send :=
+  { recordPushCompletion ok s with planUnregistered := s.planUnregistered }
+
+def stepUnregisterOnSettle (s : Send) : Ev → Option Send
+  | .d2hIssue p ok =>
+    if !s.execActive then none
+    else match s.pools[p]? with
+    | some pool =>
+      if pool.stage != .pending then none
+      else if ok then step s (.d2hIssue p ok)
+      else some (endOp (recordPushCompletionOnSettle false
+        { s with pools := s.pools.set p { pool with stage := .aborted }, execActive := false }))
+    | none => none
+  | .d2hDone p ok =>
+    match s.pools[p]? with
+    | some pool =>
+      if pool.stage != .d2h then none
+      else if !ok then
+        some (endOp (recordPushCompletionOnSettle false
+          { s with pools := s.pools.set p { pool with stage := .aborted } }))
+      else step s (.d2hDone p ok)
+    | none => none
+  | .pushDone p ok =>
+    match s.pools[p]? with
+    | some pool =>
+      match pool.stage with
+      | .pushing (k + 1) =>
+        some (endOp (recordPushCompletionOnSettle ok
+          { s with pools := s.pools.set p { pool with stage := .pushing k } }))
+      | _ => none
+    | none => none
+  | e => step s e
+
+/-- Under the alternative the plan stays registered while pool 1 is in flight
+and is unregistered when pool 1's op ends the session. -/
+theorem trace_unregister_on_settle_alternative :
+    ((⟨init [1, 1], stepUnregisterOnSettle⟩ : System Send Ev).run tr_early_unregister_on_error).map
+      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
+      some (false, 1, false) ∧
+    ((⟨init [1, 1], stepUnregisterOnSettle⟩ : System Send Ev).run
+        (tr_early_unregister_on_error ++ [.pushDone 1 true])).map
+      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
+      some (true, 0, true) := by
+  decide
+
+/-- `planUnregistered = done` in every state the alternative reaches on the
+1- and 2-pool instances (exhaustive). -/
+def violatesPlanIffDone (s : Send) : Bool := !decide (s.planUnregistered = s.life.done)
+
+#guard ModelCheck.check (⟨init [1, 1], stepUnregisterOnSettle⟩ : System Send Ev) (events 2)
+  violatesPlanIffDone 12 = .safe
+#guard ModelCheck.check (⟨init [2], stepUnregisterOnSettle⟩ : System Send Ev) (events 1)
+  violatesPlanIffDone 12 = .safe
+#guard (ModelCheck.check (sys [1, 1]) (events 2) violatesPlanIffDone 12 matches .counterexample _)
 
 end Send
 

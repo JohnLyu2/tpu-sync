@@ -5,9 +5,8 @@ import TpuSyncVerify.Transfer.Reshard.Send.Traces
 
 Part of `TpuSyncVerify.Transfer.Reshard.Send`. Built like
 `PrefillDecode/Receive/Coverage.lean` (machinery in `Common/Coverage.lean`):
-`Leaf` names one leaf of an event's decision tree, `stepT` is `step` under the
-shipping `UnregisterPolicy.shipping` with the leaf attached, and `stepT_step`
-proves it is the same function. `life.draining` is the C++ `finalizing_`. -/
+`Leaf` names one leaf of an event's decision tree, `stepT` is `step` with the
+leaf attached, and `stepT_step` proves it is the same function. `life.draining` is the C++ `finalizing_`. -/
 
 namespace TpuSyncVerify.Transfer.Reshard
 
@@ -65,27 +64,27 @@ def pushLeaf (ok : Bool) (s : Send) : Leaf :=
   else if s.remainingPushes ≤ 1 then .pushDoneLast
   else .pushDoneMore
 
-/-- `step .shipping` with the leaf it took. -/
+/-- `step` with the leaf it took. -/
 def stepT (s : Send) : Ev → Option (Send × Leaf)
   | .d2hIssue p ok =>
-    (s.d2hIssue .shipping p ok).map (·,
+    (s.d2hIssue p ok).map (·,
       if ok then .d2hIssueOk
       else if s.life.done = true ∨ s.life.draining = true then .d2hIssueFailFinalizing
       else .d2hIssueFail)
   | .execFinish => (s.execFinish).map (·, .execFinish)
   | .d2hDone p ok =>
-    (s.d2hDone .shipping p ok).map (·,
+    (s.d2hDone p ok).map (·,
       if !ok then
         if s.life.done = true ∨ s.life.draining = true then .d2hDoneFailFinalizing
         else .d2hDoneFail
       else if s.life.done = true ∨ s.life.draining = true then .d2hDoneQuiesced
       else .d2hDoneStartsPushes)
-  | .pushDone p ok => (s.pushDone .shipping p ok).map (·, pushLeaf ok s)
+  | .pushDone p ok => (s.pushDone p ok).map (·, pushLeaf ok s)
   | .cancel => (s.cancel).map (·, .cancel)
   | .publish => (s.publish).map (·, .publish)
 
-/-- `stepT` is `step .shipping` with a tag. -/
-theorem stepT_step (s : Send) (e : Ev) : (stepT s e).map (·.1) = step .shipping s e := by
+/-- `stepT` is `step` with a tag. -/
+theorem stepT_step (s : Send) (e : Ev) : (stepT s e).map (·.1) = step s e := by
   cases e <;> simp [stepT, step, Option.map_map, Function.comp_def]
 
 def instr : Instr Send Ev Leaf Effect := { stepT, effect }
@@ -130,7 +129,7 @@ def modelOnly : List (String × Send × List Ev) :=
   [("trace_reshard_send_session_test_parity", init [1], tr_parity_send),
    ("trace_multi_pool_multi_peer_send", init [2, 1], tr_multi_pool_multi_peer_send),
    ("trace_cancel_unregisters_on_last_endOp", init [2], tr_cancel_unregisters_on_last_endOp),
-   ("trace_early_unregister_on_error_vs_onSettle", init [1, 1], tr_early_unregister_on_error)]
+   ("trace_early_unregister_on_error", init [1, 1], tr_early_unregister_on_error)]
 
 /-- Upstream tests on this C++ whose stimulus is not an event of the model. -/
 def notReplayable : List (String × String) :=
@@ -156,7 +155,7 @@ The three upstream tests in `paired` reach **3 of 25**: `pushDoneLast`
 
 | Class | Count | Branches | What it would take |
 |---|---|---|---|
-| **test** | 16 | `pushDoneFail` (drains+settles+errors; drains+errors), `pushDoneLast` (drains, another op held), `pushDoneMore`, `pushDoneFinalizing` (no effect), `cancel` (no effect; errors after an OK settle), `d2hIssueOk`, `d2hIssueFail` (drains+settles+errors; drains+errors), `d2hIssueFailFinalizing` (settles; no effect), `d2hDoneStartsPushes`, `execFinish` (no effect; settles), `publish` | 7 via `ReshardSendSessionTestPeer` alone (`CompletePush` with an error status for `pushDoneFail` — `UnregisterPolicy.shipping`'s early unregister — `BeginPush` twice, a two-peer plan, a second `Finish`); 9 via `PoolReshardPush` (`ExecutePush`) on `DeviceBackedTestBase`, whose default-constructed `RaidenBufferHandle` makes `raiden::IssueD2hShard` return an empty `PjRtCopyFuture` whose `OnReady` runs `StartPoolPush` synchronously after `ExecutePush` drops `mu_` (`device_size = 0` or `host_blocks = 0` fails `D2hPoolBlocks` synchronously; when pool 0's `AsyncPush` fails synchronously — e.g. `AdapterForOp` under `TPU_RAIDEN_TRANSPORT_BACKEND=peregrine` — `RecordPushCompletion` latches `finalizing_` inline inside `ExecutePush`, reaching `execFinish` settling on 1 pool and `d2hIssueFailFinalizing` on a second `device_size = 0` pool because `ExecutePush`'s loop does not re-check `finalizing_`) |
+| **test** | 16 | `pushDoneFail` (drains+settles+errors; drains+errors), `pushDoneLast` (drains, another op held), `pushDoneMore`, `pushDoneFinalizing` (no effect), `cancel` (no effect; errors after an OK settle), `d2hIssueOk`, `d2hIssueFail` (drains+settles+errors; drains+errors), `d2hIssueFailFinalizing` (settles; no effect), `d2hDoneStartsPushes`, `execFinish` (no effect; settles), `publish` | 7 via `ReshardSendSessionTestPeer` alone (`CompletePush` with an error status for `pushDoneFail` — `RecordPushCompletion`'s early unregister — `BeginPush` twice, a two-peer plan, a second `Finish`); 9 via `PoolReshardPush` (`ExecutePush`) on `DeviceBackedTestBase`, whose default-constructed `RaidenBufferHandle` makes `raiden::IssueD2hShard` return an empty `PjRtCopyFuture` whose `OnReady` runs `StartPoolPush` synchronously after `ExecutePush` drops `mu_` (`device_size = 0` or `host_blocks = 0` fails `D2hPoolBlocks` synchronously; when pool 0's `AsyncPush` fails synchronously — e.g. `AdapterForOp` under `TPU_RAIDEN_TRANSPORT_BACKEND=peregrine` — `RecordPushCompletion` latches `finalizing_` inline inside `ExecutePush`, reaching `execFinish` settling on 1 pool and `d2hIssueFailFinalizing` on a second `device_size = 0` pool because `ExecutePush`'s loop does not re-check `finalizing_`) |
 | **future (stub)** | 6 | `d2hDoneFail` (drains+settles+errors; drains+errors), `d2hDoneFailFinalizing` (no effect; settles), `d2hDoneQuiesced` (no effect; settles) | a controllable `PjRtCopyFuture` fake (a `RawBuffer` / `PJRT_RawBuffer_Extension` test stub backed by `xla::Promise<>`) so an issued D2H copy can stay pending across `Finish` or resolve `OnReady` with an error on CPU |
 
 So no upstream test exercises `ExecutePush`, `StartPoolPush`, a D2H callback,
@@ -220,7 +219,7 @@ def coverageChecks : Bool :=
     countGap .test = 16 ∧ countGap .futureStub = 6 ∧
     allLeaves.all (fun l => univ.any (·.1 = l)) ∧
     (paired ++ modelOnly).all (fun (_, s, tr) =>
-      ((⟨s, step .shipping⟩ : System Send Ev).run tr).isSome) ∧
+      ((⟨s, step⟩ : System Send Ev).run tr).isSome) ∧
     gaps.all (fun (b, _) => inits.any fun (i, evs) => (Coverage.witness instr i evs b).isSome)
 
 #guard coverageChecks

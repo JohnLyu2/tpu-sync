@@ -98,7 +98,7 @@ def stepT (s : Pipeline) : Ev → Option (Pipeline × Leaf)
   | .reseatSrcStaging => (s.reseatSrcStaging).map (·, .reseatSrcStaging)
   | .reseatDstStaging => (s.reseatDstStaging).map (·, .reseatDstStaging)
 
-theorem sendStep_none (s : Pipeline) (e : Send.Ev) (h : Send.step .shipping s.send e = none) :
+theorem sendStep_none (s : Pipeline) (e : Send.Ev) (h : Send.step s.send e = none) :
     s.sendStep e = none := by
   cases e <;> simp [sendStep, h]
 
