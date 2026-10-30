@@ -190,7 +190,8 @@ finds the receive session draining. It is not an event.
   `pool_groups_size() > 0` (pool reshard via `ReshardCoordinator::RunSubPlan`,
   which takes the `GetPoolPushProgressSpec` branch in `CompleteIncomingPush`),
   and when `shard_push_schedules_size() == 0` (including primary
-  `StageBroadcastGroup` hops in `BroadcastEngine._dispatch_hop` in
+  `StageBroadcastGroup` hops in `BroadcastEngine.execute_slice_broadcast_pipeline`
+  (`_dispatch_hop`) in
   `tpu_sync/weight_sync/manager/broadcast_engine.py`), so the sender-declared
   contract (`sender_streams`) is entered only on non-pool receiver
   `RegisterActivePlan` plans (`pool_groups_size() == 0` with
@@ -202,7 +203,8 @@ finds the receive session draining. It is not an event.
   push arriving before or concurrently with `RegisterActivePlan` could latch
   chunk-count on a sender-declared plan, `trace_chunk_two_senders`). Every
   in-repo controller hop that populates receiver `shard_push_schedules` on a
-  non-pool plan (`BroadcastEngine._run_single_transfer` in
+  non-pool plan (`BroadcastEngine.execute_slice_broadcast_pipeline`
+  (`_run_single_transfer`) in
   `tpu_sync/weight_sync/manager/broadcast_engine.py`, invoked from
   `RaidenController.start_transfer` in `tpu_sync/rpc/raiden_controller.py`, and
   remote destination preparation via
