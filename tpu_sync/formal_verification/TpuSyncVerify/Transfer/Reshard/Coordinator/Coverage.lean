@@ -99,6 +99,13 @@ def checkEvents1 : List Ev :=
    .armDstResult 10 true, .armDstResult 10 false, .finishArmBarrier,
    .sendSrcResult 0 true, .sendSrcResult 0 false, .finishSendBarrier]
 
+/-- Events for one source and two destinations. -/
+def checkEvents12 : List Ev :=
+  [.registerProducer 0, .startPlan true, .startPlan false,
+   .armDstResult 10 true, .armDstResult 10 false,
+   .armDstResult 11 true, .armDstResult 11 false, .finishArmBarrier,
+   .sendSrcResult 0 true, .sendSrcResult 0 false, .finishSendBarrier]
+
 /-- Events for two sources and one destination (the `FullPoolReshardFlow` shape). -/
 def checkEvents21 : List Ev :=
   [.registerProducer 0, .registerProducer 1, .startPlan true, .startPlan false,
@@ -106,9 +113,10 @@ def checkEvents21 : List Ev :=
    .sendSrcResult 0 true, .sendSrcResult 0 false, .sendSrcResult 1 true, .sendSrcResult 1 false,
    .finishSendBarrier]
 
-/-- The 1×1, 2×1 and 2×2 sub-plans, each searched over its own events. -/
+/-- The 1×1, 1×2, 2×1 and 2×2 sub-plans, each searched over its own events. -/
 def inits : List (CoordState × List Ev) :=
   [(CoordState.init [0] [10] 101, checkEvents1),
+   (CoordState.init [0] [10, 11] 101, checkEvents12),
    (CoordState.init [0, 1] [10] 101, checkEvents21),
    (CoordState.init [0, 1] [10, 11] 101, checkEvents)]
 
@@ -118,14 +126,23 @@ def allBranches : Option (List Branch) :=
 
 /-! ## Traces
 
-`paired` lists the `ReshardStackTest` cases that drive one `RunSubPlan` through
-events of this model, with the sub-plan shape and the trace each replays. The
+`paired` lists every `ReshardStackTest` case in `reshard_service_test.cc` that
+drives a single `RunSubPlan` within scope (`index == 0`, `plan.src_units =
+request.src_units`), with the sub-plan shape and the trace each replays. The
 tests run `ReshardService` over a fake control transport: an arm or dispatch
 RPC succeeds or is refused by `transport_.FailFor`, and no worker ever votes
-`Complete`, whereas `sendSrcResult _ true` folds the worker's vote in (the
-coordinator model's abstraction of the data plane); the pairing is at the
-coordinator's own transitions. `refused` lists the one refusal asserted. -/
+`Complete` during `Coordinate`, whereas `sendSrcResult _ true` folds the
+worker's vote in (the coordinator model's abstraction of the data plane); the
+pairing is at the coordinator's own transitions. `refused` lists the pre-claim
+refusal asserted, and `notReplayable` accounts for the remaining tests in
+`reshard_service_test.cc`. -/
 
+def tr_full_flow_1x1 : List Ev :=
+  [.registerProducer 0, .startPlan true, .armDstResult 10 true, .finishArmBarrier,
+   .sendSrcResult 0 true, .finishSendBarrier]
+def tr_full_flow_1x2 : List Ev :=
+  [.registerProducer 0, .startPlan true, .armDstResult 10 true, .armDstResult 11 true,
+   .finishArmBarrier, .sendSrcResult 0 true, .finishSendBarrier]
 def tr_full_flow_2x1 : List Ev :=
   [.registerProducer 0, .registerProducer 1, .startPlan true, .armDstResult 10 true,
    .finishArmBarrier, .sendSrcResult 0 true, .sendSrcResult 1 true, .finishSendBarrier]
@@ -134,24 +151,56 @@ def tr_arm_failure_1x1 : List Ev :=
 def tr_arm_failure_2x1 : List Ev :=
   [.registerProducer 0, .registerProducer 1, .startPlan true, .armDstResult 10 false,
    .finishArmBarrier]
+def tr_plan_refused_1x1 : List Ev := [.registerProducer 0, .startPlan false]
+def tr_plan_refused_1x2 : List Ev := [.registerProducer 0, .startPlan false]
 def tr_plan_refused_2x2 : List Ev := [.registerProducer 0, .registerProducer 1, .startPlan false]
 
 /-- `(upstream test, initial state, trace)`. -/
 def paired : List (String × CoordState × List Ev) :=
   [("ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch", CoordState.init [0, 1] [10] 101,
      tr_full_flow_2x1),
-   ("ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce",
-     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
-   ("ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver",
-     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
-   ("ReshardStackTest.ReplicatedAndRoutedSpansCombine",
-     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
+   ("ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries", CoordState.init [0, 1] [10] 101,
+     tr_full_flow_2x1),
+   ("ReshardStackTest.ClipDropsTrimsAndRebasesGlobalSpans", CoordState.init [0, 1] [10] 101,
+     tr_full_flow_2x1),
+   -- 3rd call (`SplitGlobalSpaceSpans` removing the entire tag after `LookupAndClaim`)
+   -- abandons the claim; 4th call (`dst_skip = {0}`) coordinates 1×1 end-to-end.
+   ("ReshardStackTest.ClipValidationFailsClosed", CoordState.init [0] [10] 101,
+     tr_plan_refused_1x1),
+   ("ReshardStackTest.ClipValidationFailsClosed", CoordState.init [0] [10] 101,
+     tr_full_flow_1x1),
+   ("ReshardStackTest.ClipRejectsPageIndexedDeclarations", CoordState.init [0] [10] 101,
+     tr_plan_refused_1x1),
    ("ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders", CoordState.init [0] [10] 101,
      tr_arm_failure_1x1),
-   -- stage 0 of `req-pp4`: its single receiver refuses the arm, the claim is
-   -- abandoned, and the request reads as registered.
+   ("ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders", CoordState.init [0] [10] 101,
+     tr_full_flow_1x1),
+   ("ReshardStackTest.RequestBlockStatusProbeTracksLifecycle", CoordState.init [0, 1] [10] 101,
+     tr_full_flow_2x1),
+   ("ReshardStackTest.CompletionVotesRetireAfterClaim", CoordState.init [0, 1] [10] 101,
+     tr_full_flow_2x1),
+   ("ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce",
+     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
+   ("ReshardStackTest.SubsetSourceManifestsPairPoolsByTag", CoordState.init [0, 1] [10] 101,
+     tr_full_flow_2x1),
+   -- stage 0 (and stage 1) of `req-pp4`: its single receiver refuses the arm,
+   -- abandoning the claim before Stage 2 is reached.
    ("ReshardStackTest.AbandoningTheLastStageFreesTheClaim", CoordState.init [0, 1] [10] 101,
      tr_arm_failure_2x1),
+   ("ReshardStackTest.SourceTagsAbsentOnTheDestinationAreIgnored", CoordState.init [0] [10] 101,
+     tr_full_flow_1x1),
+   -- 3rd call (`unique_peers` duplicate endpoint check after `LookupAndClaim`)
+   -- abandons the claim; 4th call coordinates 1×2 end-to-end.
+   ("ReshardStackTest.MismatchedDestinationsFailClosed", CoordState.init [0] [10, 11] 101,
+     tr_plan_refused_1x2),
+   ("ReshardStackTest.MismatchedDestinationsFailClosed", CoordState.init [0] [10, 11] 101,
+     tr_full_flow_1x2),
+   ("ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver",
+     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
+   ("ReshardStackTest.StridedGlobalSpansStayOneEntryPerDestination",
+     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
+   ("ReshardStackTest.StridedGlobalSpansMustStayInsideOnePage",
+     CoordState.init [0] [10, 11] 101, tr_plan_refused_1x2),
    -- `ValidateSpanCoverage` refuses the plan after `LookupAndClaim`; no arm is
    -- sent (`transport_.calls_.empty()`).
    ("ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed",
@@ -159,7 +208,13 @@ def paired : List (String × CoordState × List Ev) :=
    ("ReshardStackTest.ShardedSpanOrdinalOutOfRangeFailsClosed",
      CoordState.init [0, 1] [10, 11] 101, tr_plan_refused_2x2),
    ("ReshardStackTest.ShardedNonUniformExtentsFailClosed",
-     CoordState.init [0, 1] [10, 11] 101, tr_plan_refused_2x2)]
+     CoordState.init [0, 1] [10, 11] 101, tr_plan_refused_2x2),
+   ("ReshardStackTest.ReplicatedAndRoutedSpansCombine",
+     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
+   ("ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank",
+     CoordState.init [0, 1] [10] 101, tr_full_flow_2x1),
+   ("ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes",
+     CoordState.init [0, 1] [10] 101, tr_full_flow_2x1)]
 
 /-- `(upstream test, initial state, trace, refused event)`:
 `ReshardStackTest.MissingRegistrationKeepsContractString` plans with no producer
@@ -167,6 +222,45 @@ registered, and `LookupAndClaim` refuses the claim before anything else happens.
 def refused : List (String × CoordState × List Ev × Ev) :=
   [("ReshardStackTest.MissingRegistrationKeepsContractString", CoordState.init [0] [10] 101, [],
      .startPlan true)]
+
+/-- Remaining tests in `reshard_service_test.cc` outside the single-`RunSubPlan`
+(`index == 0`, `plan.src_units = request.src_units`) coordinator scope. -/
+def notReplayable : List (String × String) :=
+  [("ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow",
+      "multi-window chain (chain.count = 4, StartChain); registry claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries",
+      "multi-window chain (chain.count = 2, StartChain); registry claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.WindowComposesWithPrefixClip",
+      "multi-window chain (chain.count = 2, StartChain); registry claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.ChainedArmRetriesWhileReceiverStagingIsBusy",
+      "multi-window chain (index > 0 arm-busy retry loop); registry claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.ChainedRequestStaysInProgressUntilTheChainEnds",
+      "multi-window chain (StartChain transfer_status_ lifecycle); registry claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.ChainedArmFailureMarksTheTransferFailed",
+      "multi-window chain (index > 0 arm failure without AbandonClaim); registry claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim",
+      "pipelined stage filters plan.src_units to 1 of 2 claimed request.src_units; shared claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace",
+      "same pipelined plan.src_units ⊊ request.src_units filter on stage 0 and stage 1's retry; multi-owner claim rollback replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.StridedGlobalSpansClipByWholePages",
+      "prefix clip drops rank 0's page whole so plan.src_units ⊊ request.src_units; registry claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv",
+      "calls BuildPoolReshardPlan directly without ReshardCoordinator (Reshard/Coverage.lean, Registry/Coverage.lean)"),
+   ("ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan",
+      "calls BuildPoolReshardPlan directly and fails in DefaultTransferStreams before LookupAndClaim (Reshard/Coverage.lean)"),
+   ("ReshardStackTest.CancelTombstoneBlocksLateRegistration",
+      "registry controller commands only; no Coordinate call (Registry/Coverage.lean)"),
+   ("ReshardStackTest.TtlPurgesExpiredRegistrations",
+      "advances clock past TTL before Coordinate (purgeExpiredAll in Registry/Coverage.lean)"),
+   ("ReshardStackTest.SpansForAnUnregisteredTagAreRefusedAtRegistration",
+      "registration-time input validation only; no Coordinate call"),
+   ("ReshardStackTest.NegativeOrdinalRejectedAtRegistration",
+      "registration-time input validation only; no Coordinate call"),
+   ("ReshardStackTest.LegacyCommandsFailClosed",
+      "worker-side COMMAND_REGISTER_TRANSFER_SCHEDULE rejection; no Coordinate call"),
+   ("ReshardControlPipeTest.* (3 tests)", "control-pipe transport round-trip only"),
+   ("PlanSubTransfersTest.* (5 tests)", "pure PlanSubTransfers window-splitting unit tests"),
+   ("SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct", "pure SubPlanUuid helper unit test")]
 
 /-- The traces no upstream test drives: the two failure-cleanup counterexamples
 of `Traces.lean`. -/
@@ -182,10 +276,10 @@ def modelOnly : List (String × CoordState × List Ev) :=
 
 /-! ## Result
 
-The three searches exhaust their state spaces: **14 branches**, every leaf of
-`Leaf` reachable. The nine tests in `paired` reach **10 of 14**; the two
-`modelOnly` counterexample traces reach the other four. The four the tests miss,
-all schedules `ReshardStackTest`'s fake transport can drive with
+The four searches exhaust their state spaces: **14 branches**, every leaf of
+`Leaf` reachable. The 22 tests in `paired` (25 traces) reach **10 of 14**; the
+two `modelOnly` counterexample traces reach the other four. The four the tests
+miss, all schedules `ReshardStackTest`'s fake transport can drive with
 `transport_.FailFor` on the right endpoint:
 
 | Branch | Schedule | What it would take |
@@ -228,7 +322,8 @@ def coverageChecks : Bool :=
     coveredByPaired.all univ.contains ∧
     sameSet uncovered gaps ∧
     allLeaves.all (fun l => univ.any (·.1 = l)) ∧
-    gaps.all (fun b => inits.any fun (i, evs) => (Coverage.witness instr i evs b).isSome)
+    gaps.all (fun b => inits.any fun (i, evs) => (Coverage.witness instr i evs b).isSome) ∧
+    modelOnly.all (fun (_, s, tr) => ((CoordState.sys .shipping s.srcUnits s.dstUnits s.claimOwner).run tr).isSome)
 
 #guard coverageChecks
 

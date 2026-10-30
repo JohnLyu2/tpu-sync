@@ -235,12 +235,17 @@ theorem trace_hardened_dups :
 
 /-! ## Which traces stand for an upstream test
 
-The transport unit tests drive `CompleteIncomingPush` through a `MockDelegate`
-with no receive session, so what they observe is the table: `OnLayerReceived`
-calls (`dispatched`), retirement (`entry = none`), and rejected pushes. The
-traces below replay them on `step` with those projections; `paired` lists them
-with the configuration each runs on, `notReplayable` the two whose stimulus A3
-excludes. -/
+The transport unit tests drive `CompleteIncomingPush` through mock delegates
+(`MockSessionDelegate` in `block_transport_session_test.cc`, `MockDelegate` and
+`MultiSenderReceiverDelegate` in `block_transport_test.cc`) with no
+`TransferReceiveSession`, so what they observe is the table: `OnLayerReceived`
+calls (`dispatched`), retirement (`entry = none`), and rejected push streams
+(returned as `InvalidArgumentError` to the sender, recorded on `step` as
+`life.statusOk = false`). The traces below replay them on `step` with those
+projections; `paired` lists them with the configuration each runs on, and
+`notReplayable` lists the sibling push-progress tests whose stimulus is outside
+A3, calls `Cancel` or `ForgetPushProgress`, or exercises the plan-declared pool
+or Peregrine bitmask paths of `CompleteIncomingPush`. -/
 
 /-- `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion`: one
 layer, one sender declaring two streams (`num_streams = 2`), chunk-count
@@ -288,9 +293,9 @@ theorem trace_declared_senders_then_reuse :
 /-- `BlockTransportTest.SenderOverDeliveryIsRejected`: two layers, two declared
 senders, one stream each. Both senders complete layer 0; layer 1 is still open,
 so the uuid's progress is live, and a second stream from sender 0 for layer 0
-exceeds the one stream it declared: the push is rejected
-(`else if (streams.landed > streams.declared)`), the layer is not dispatched
-again, and the rejection fails the receive. -/
+exceeds the one stream it declared: `CompleteIncomingPush` rejects the push
+stream (`else if (streams.landed > streams.declared)`, recorded on `step` as
+`life.statusOk = false`) and does not dispatch the layer again. -/
 def tr_sender_over_delivery_rejected : List Ev := [.stream 0 0, .stream 0 1, .stream 0 0]
 
 theorem trace_sender_over_delivery_rejected :
@@ -337,20 +342,30 @@ declare one stream and then two (`else if (streams.declared != num_streams)`):
 both need per-sender declarations, which A3 fixes to one `numStreams`.
 `BlockTransportServerPushSessionTest.Cancel` calls
 `BlockTransportServerPushSession::Cancel` on a push session with no receive
-session behind it; `cancel` here is the receive session's `Finish(error)`, and
-the push session's own cancellation is `ForgetPushProgress`'s doing, which is
-not an event (`Transport.lean` §"State"). The plan-declared pool
-contract (`BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
+session behind it, and `BlockTransportTest.ForgetPushProgressAllowsUuidReuse`
+clears a partial generation with `BlockTransport::ForgetPushProgress` before
+checking auto-retirement across a full generation; `cancel` here is the receive
+session's `Finish(error)`, while push-session cancellation / `ForgetPushProgress`
+is not an event (`Transport.lean` §"Lock scopes"). The plan-declared pool
+contract (`BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
+`BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
 `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration`) is
-`Reshard/Pipeline.lean`'s `landStream`, not a contract of this model. -/
+`Reshard/Pipeline.lean`'s `landStream`, and `PeregrineRecvCompleteTest` exercises
+the `is_peregrine = true` shard-bitmask branch of `CompleteIncomingPush`, neither
+a contract of this model. -/
 def notReplayable : List (String × String) :=
   [("BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism", "per-sender declarations (A3)"),
    ("BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected", "per-sender declarations (A3)"),
    ("BlockTransportServerPushSessionTest.Cancel", "push-session Cancel is not an event"),
+   ("BlockTransportTest.ForgetPushProgressAllowsUuidReuse", "ForgetPushProgress is not an event"),
+   ("BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool",
+     "plan-declared pool contract (Reshard/Pipeline.lean)"),
    ("BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires",
      "plan-declared pool contract (Reshard/Pipeline.lean)"),
    ("BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration",
-     "plan-declared pool contract (Reshard/Pipeline.lean)")]
+     "plan-declared pool contract (Reshard/Pipeline.lean)"),
+   ("PeregrineRecvCompleteTest.* (9 tests)",
+     "Peregrine shard-bitmask branch (is_peregrine = true) of CompleteIncomingPush")]
 
 -- Every paired trace runs to its end.
 #guard paired.all fun (_, c, tr) => ((sys c).run tr).isSome

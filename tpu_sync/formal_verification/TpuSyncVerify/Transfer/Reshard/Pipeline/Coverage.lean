@@ -205,7 +205,8 @@ along the traces, three outside the one-pool universe). They partition as:
   engine freeing producer HBM and the arena handing a released lease to the
   next transfer (`MultiRequest.lean`).
 * **coordinator** (1): `armRecv`, Phase 1 of `ReshardCoordinator::RunSubPlan`
-  (`Coordinator.lean`).
+  (`Coordinator.lean`; paired at the coordinator level in
+  `Coordinator/Coverage.lean`).
 * **transport** (1): `landStream` — `CompleteIncomingPush` counting a stream
   against `expected_pushes`; the block-transport unit tests drive that
   accounting without a reshard session.

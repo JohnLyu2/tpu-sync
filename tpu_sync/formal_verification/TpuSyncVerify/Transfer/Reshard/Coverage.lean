@@ -36,7 +36,10 @@ File aliases used in the source map below:
 `bts.cc` (`tpu_sync/transport/block_transport_session.cc`),
 `base.cc` (`tpu_sync/kv_cache/kv_cache_manager_base.cc`),
 `reshard_recv_test.cc` (`tpu_sync/kv_cache/reshard_receive_session_test.cc`),
-`pool_reshard_test.cc` (`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`).
+`pool_reshard_test.cc` (`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`),
+`pool_reshard_send_slots_test.cc` (`tpu_sync/core/pool_reshard_send_slots_test.cc`),
+`reshard_service_test.cc` (`tpu_sync/kv_cache/reshard/reshard_service_test.cc`),
+`pool_reshard_planner_streams_test.cc` (`tpu_sync/kv_cache/reshard/pool_reshard_planner_streams_test.cc`).
 
 What this module proves:
 1. **Multi-sender stream count conservation (`stream_count_matches`,
@@ -743,11 +746,11 @@ inductive TransferStreamsEnv where
 /-- `DefaultTransferStreams(topology_parallelism)`
 (`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`):
 - Unset, empty, or `0` returns `some topologyParallelism`
-  (`if (raw == nullptr || raw[0] == '\0')` / `if (parsed == 0)`).
+  (`if (raw == nullptr || raw[0] == '\0')` / `if (streams == 0)`).
 - A positive integer `n` returns `some (min n topologyParallelism)`
-  (`if (parsed > topology_parallelism)`).
+  (`if (streams > topology_parallelism)`).
 - Unparsable or negative values return `none` (`InvalidArgumentError`,
-  `if (!absl::SimpleAtoi(raw, &parsed) || parsed < 0)`). -/
+  `if (!absl::SimpleAtoi(raw, &streams) || streams < 0)`). -/
 def defaultTransferStreams (topologyParallelism : Nat) : TransferStreamsEnv → Option Nat
   | .unsetOrEmpty => some topologyParallelism
   | .intVal n =>

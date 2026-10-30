@@ -12,9 +12,11 @@ registration, multi-owner planning claims, claim abandonment, per-unit
 completion voting, and unclaimed cancellation tombstones.
 
 File aliases used in the source map below:
-`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`)
-and `reshard_service_test.cc`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`).
+`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`),
+`coord.cc` (`tpu_sync/kv_cache/reshard/reshard_coordinator.cc`),
+`reshard_service.cc` (`tpu_sync/kv_cache/reshard/reshard_service.cc`),
+`reshard_client.cc` (`tpu_sync/kv_cache/reshard/reshard_client.cc`), and
+`reshard_service_test.cc` (`tpu_sync/kv_cache/reshard/reshard_service_test.cc`).
 
   ## C++ anchorage
 
@@ -28,7 +30,8 @@ and `reshard_service_test.cc`
        (`if (claimed_.find(lifecycle_key) != claimed_.end())`), or
      - `request_blocks_[(req_id, unit)]` already exists with a different payload
        (`auto existing = request_blocks_.find(key);`; identical re-registration
-       is an idempotent TTL refresh, `existing->second.expires_at = now + ttl_s_;`).
+       overwrites the row with `registration.expires_at = now + ttl_s_;`,
+       `request_blocks_[key] = std::move(registration);`).
 
   2. **Claim linearization (`RequestBlockRegistry::LookupAndClaim` in
      `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
@@ -117,12 +120,14 @@ and `reshard_service_test.cc`
   ## Branch coverage
 
   `Registry/Coverage.lean`: 25 branches of `RegGen.step` over `checkEvents`
-  (every leaf live); the ten `ReshardStackTest` cases that drive the registry
-  through `ReshardService`'s controller commands or `RunSubPlan`'s claim and
-  abandon reach 11, and assert three of the seven refusal arms. The 14 gaps
-  (idempotent re-registration, `Complete` no-ops, an empty-blocks registration
-  voting before its claim, a repeated cancel, every `Release`) need only
-  controller commands no test sends.
+  (every leaf live); the 35 `ReshardStackTest` cases (36 traces) that drive the
+  registry through `ReshardService`'s controller commands or
+  `BuildPoolReshardPlan` / `RunSubPlan`'s claim and abandon reach 11, and assert
+  three of the seven `Refusal` constructors (remaining suites and pre-lock
+  input-validation rejections in `reshard_service_test.cc` are listed in
+  `notReplayable`). The 14 gaps (idempotent re-registration, `Complete` no-ops,
+  an empty-blocks registration voting before its claim, a repeated cancel, every
+  `Release`) need only controller commands no test sends.
 
   ## Source map
 
@@ -159,17 +164,48 @@ and `reshard_service_test.cc`
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (completion_it != completed_units_.end())`) | `:477-489` |
   | `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:493-509` |
   | `reg.cc` | `RequestBlockRegistry::AbandonClaim` (`if (owner_it->second.empty())`) | `:503-507` |
+  | `coord.cc` | `ReshardCoordinator::RunSubPlan` | `:678-932` |
+  | `reshard_service.cc` | `ReshardService::HandleControllerCommand` | `:167-353` |
+  | `reshard_client.cc` | `ReshardClient::BuildReleaseRequestBlocks` | `:179-189` |
+  | `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:760-834` |
+  | `reshard_service_test.cc` | `ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries` | `:836-877` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipDropsTrimsAndRebasesGlobalSpans` | `:879-935` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow` | `:1057-1117` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries` | `:1119-1204` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowComposesWithPrefixClip` | `:1206-1243` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmRetriesWhileReceiverStagingIsBusy` | `:1245-1270` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedRequestStaysInProgressUntilTheChainEnds` | `:1272-1294` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmFailureMarksTheTransferFailed` | `:1296-1318` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipValidationFailsClosed` | `:1320-1353` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipRejectsPageIndexedDeclarations` | `:1355-1367` |
+  | `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1369-1379` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1381-1397` |
   | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:1399-1427` |
   | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:1429-1493` |
   | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1495-1518` |
   | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1520-1528` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1531-1601` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SubsetSourceManifestsPairPoolsByTag` | `:1603-1742` |
   | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1744-1769` |
   | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1771-1798` |
   | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1800-1827` |
-  | `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1369-1379` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1381-1397` |
-  | `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:760-834` |
-  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1531-1601` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SpansForAnUnregisteredTagAreRefusedAtRegistration` | `:1829-1854` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SourceTagsAbsentOnTheDestinationAreIgnored` | `:1856-1937` |
+  | `reshard_service_test.cc` | `ReshardStackTest.MismatchedDestinationsFailClosed` | `:1939-1977` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:1982-2047` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansStayOneEntryPerDestination` | `:2049-2104` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansClipByWholePages` | `:2106-2137` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansMustStayInsideOnePage` | `:2139-2149` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedSpanOrdinalOutOfRangeFailsClosed` | `:2151-2166` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2168-2181` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedNonUniformExtentsFailClosed` | `:2183-2197` |
+  | `reshard_service_test.cc` | `ReshardStackTest.NegativeOrdinalRejectedAtRegistration` | `:2199-2205` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2210-2242` |
+  | `reshard_service_test.cc` | `ReshardStackTest.LegacyCommandsFailClosed` | `:2244-2255` |
+  | `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2284-2304` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2306-2326` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2328-2345` |
+  | `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2347-2362` |
   <!-- source-map:end -->
 -/
 
