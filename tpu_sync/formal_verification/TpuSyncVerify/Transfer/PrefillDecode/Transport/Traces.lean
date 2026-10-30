@@ -233,5 +233,127 @@ theorem trace_hardened_dups :
     some ⟨false, false, true, [1, 1], [0, 1]⟩ := by
   decide
 
+/-! ## Which traces stand for an upstream test
+
+The transport unit tests drive `CompleteIncomingPush` through a `MockDelegate`
+with no receive session, so what they observe is the table: `OnLayerReceived`
+calls (`dispatched`), retirement (`entry = none`), and rejected pushes. The
+traces below replay them on `step` with those projections; `paired` lists them
+with the configuration each runs on, `notReplayable` the two whose stimulus A3
+excludes. -/
+
+/-- `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion`: one
+layer, one sender declaring two streams (`num_streams = 2`), chunk-count
+contract. The first stream completes nothing; the second fires
+`OnLayerReceived` once (`layers_received() == 1`) and, every layer now called,
+retires the table (`IsDone()`, `on_completed_`). -/
+def tr_session_two_streams_complete : List Ev := [.stream 0 0, .stream 0 0]
+
+theorem trace_session_two_streams_complete :
+    ((sys (cfgChunk 1 1 2 true)).run (tr_session_two_streams_complete.take 1)).map
+      (fun s => (s.layers.map (·.dispatched), s.layers.map (·.entry.isSome))) =
+      some ([0], [true]) ∧
+    ((sys (cfgChunk 1 1 2 true)).run tr_session_two_streams_complete).map
+      (fun s => (s.layers.map (·.dispatched), s.layers.map (·.entry.isSome))) =
+      some ([1], [false]) := by
+  decide
+
+/-- `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender`: two
+layers, two declared senders (`ExpectSenders(kUuid, 2)`), one stream each. A
+layer completes only when both senders' streams have landed, in either order
+(`layer_completion_count()` 0, 1, 1, 2); once both layers are called the uuid's
+progress is retired, and the same two senders complete layer 0 again on a fresh
+entry (count 3). The reuse after retirement is a stream beyond each sender's
+per-layer declaration, so the run is on `honest = false`. -/
+def tr_declared_senders_then_reuse : List Ev :=
+  [.stream 0 0, .stream 0 1, .stream 1 1, .stream 1 0, .stream 0 0, .stream 0 1]
+
+theorem trace_declared_senders_then_reuse :
+    let c := cfgDeclared 2 2 1 false
+    ((sys c).run (tr_declared_senders_then_reuse.take 1)).map
+      (fun s => s.layers.map (·.dispatched)) = some [0, 0] ∧
+    ((sys c).run (tr_declared_senders_then_reuse.take 2)).map
+      (fun s => s.layers.map (·.dispatched)) = some [1, 0] ∧
+    ((sys c).run (tr_declared_senders_then_reuse.take 3)).map
+      (fun s => s.layers.map (·.dispatched)) = some [1, 0] ∧
+    ((sys c).run (tr_declared_senders_then_reuse.take 4)).map
+      (fun s => (s.layers.map (·.dispatched), s.layers.map (·.entry.isSome))) =
+      some ([1, 1], [false, false]) ∧
+    ((sys c).run (tr_declared_senders_then_reuse.take 5)).map
+      (fun s => s.layers.map (·.dispatched)) = some [1, 1] ∧
+    ((sys c).run tr_declared_senders_then_reuse).map
+      (fun s => s.layers.map (·.dispatched)) = some [2, 1] := by
+  decide
+
+/-- `BlockTransportTest.SenderOverDeliveryIsRejected`: two layers, two declared
+senders, one stream each. Both senders complete layer 0; layer 1 is still open,
+so the uuid's progress is live, and a second stream from sender 0 for layer 0
+exceeds the one stream it declared: the push is rejected
+(`else if (streams.landed > streams.declared)`), the layer is not dispatched
+again, and the rejection fails the receive. -/
+def tr_sender_over_delivery_rejected : List Ev := [.stream 0 0, .stream 0 1, .stream 0 0]
+
+theorem trace_sender_over_delivery_rejected :
+    let c := cfgDeclared 2 2 1 false
+    ((sys c).run (tr_sender_over_delivery_rejected.take 2)).map
+      (fun s => (s.layers.map (·.dispatched), s.life.statusOk)) = some ([1, 0], true) ∧
+    ((sys c).run tr_sender_over_delivery_rejected).map
+      (fun s => (s.layers.map (·.dispatched), s.life.statusOk)) = some ([1, 0], false) := by
+  decide
+
+/-- `BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion`: one
+layer, two senders, but `ExpectSenders` was called for another uuid, so
+`ExpectedPushSenders` is `nullopt` and the layer runs the chunk-count contract
+with `expected_chunks = 1`: each sender's single stream completes the layer by
+itself (`layer_completion_count()` 1 then 2), the first retiring the entry the
+second recreates. This is `trace_chunk_two_senders`'s out-of-contract instance
+(`Cfg.WF.chunkSingle`), produced here by a test that deliberately leaves the
+uuid undeclared. -/
+def tr_undeclared_uuid_chunk_count : List Ev := [.stream 0 0, .stream 0 1]
+
+theorem trace_undeclared_uuid_chunk_count :
+    ((sys (cfgChunk 1 2 1 true)).run (tr_undeclared_uuid_chunk_count.take 1)).map
+      (fun s => s.layers.map (·.dispatched)) = some [1] ∧
+    ((sys (cfgChunk 1 2 1 true)).run tr_undeclared_uuid_chunk_count).map
+      (fun s => s.layers.map (·.dispatched)) = some [2] := by
+  decide
+
+/-- (upstream test, configuration, trace). -/
+def paired : List (String × Cfg × List Ev) :=
+  [("BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion", cfgChunk 1 1 2 true,
+     tr_session_two_streams_complete),
+   ("BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender", cfgDeclared 2 2 1 false,
+     tr_declared_senders_then_reuse),
+   ("BlockTransportTest.SenderOverDeliveryIsRejected", cfgDeclared 2 2 1 false,
+     tr_sender_over_delivery_rejected),
+   ("BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion", cfgChunk 1 2 1 true,
+     tr_undeclared_uuid_chunk_count)]
+
+/-- Transport tests of the same table whose stimulus is not an event of this
+model. `BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism` has
+sender 0 declare two streams and sender 1 one for the same layer, and
+`BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected` has one sender
+declare one stream and then two (`else if (streams.declared != num_streams)`):
+both need per-sender declarations, which A3 fixes to one `numStreams`.
+`BlockTransportServerPushSessionTest.Cancel` calls
+`BlockTransportServerPushSession::Cancel` on a push session with no receive
+session behind it; `cancel` here is the receive session's `Finish(error)`, and
+the push session's own cancellation is `ForgetPushProgress`'s doing, which is
+not an event (`Transport.lean` §"State"). The plan-declared pool
+contract (`BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
+`BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration`) is
+`Reshard/Pipeline.lean`'s `landStream`, not a contract of this model. -/
+def notReplayable : List (String × String) :=
+  [("BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism", "per-sender declarations (A3)"),
+   ("BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected", "per-sender declarations (A3)"),
+   ("BlockTransportServerPushSessionTest.Cancel", "push-session Cancel is not an event"),
+   ("BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires",
+     "plan-declared pool contract (Reshard/Pipeline.lean)"),
+   ("BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration",
+     "plan-declared pool contract (Reshard/Pipeline.lean)")]
+
+-- Every paired trace runs to its end.
+#guard paired.all fun (_, c, tr) => ((sys c).run tr).isSome
+
 
 end TpuSyncVerify.Transfer.PrefillDecode.Transport

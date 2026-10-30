@@ -142,7 +142,7 @@ Two leaves of `Leaf` are in no reachable branch:
   so with `num_shards() ≥ 1` no shard ever newly completes — a base with zero
   shards and zero layers would reach it, and nothing constructs one).
 
-The 20 upstream tests in `paired` (13 named traces) reach **18 of 37**; the
+The 21 upstream tests in `paired` (13 named traces) reach **18 of 37**; the
 four `modelOnly` traces add 4 more. The 19 the tests miss, each with the
 shortest schedule that reaches it (`Coverage.witness`) and what it would take:
 

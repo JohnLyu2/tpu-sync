@@ -152,8 +152,17 @@ callback finishes and retires the session before `OnBlockShardsReceived` runs; t
 late `netAccount` is ignored (`KVCacheManagerWithTransfer::OnBlockShardsReceived`
 returns `OkStatus()` on `it == active_recv_sessions_.end()` once the poll has
 dropped the session, and `TransferReceiveSession::OnBlockShardsReceived` returns
-`OkStatus()` on `done_ || draining_` while it is still seated). -/
+`OkStatus()` on `done_ || draining_` while it is still seated). The same copy
+without the poll is
+`RecvLifecycleTest.SessionRemainsValidAcrossAsyncH2dCallbacksAfterCallerDropsPtr`:
+the caller drops its `shared_ptr` after `ExecuteLayerH2d`, the pending callback
+keeps the session and its staging slot alive (`hasStaging` until `h2dDone`), and
+the callback's `FinishLocked()` settles it and returns the slot. -/
 theorem trace_late_net_account_after_retire :
+    ((sysPush 1).run (tr_late_net_account_after_retire.take 3)).map
+      (fun s => (s.life.done, s.life.hasStaging)) = some (false, true) ∧
+    ((sysPush 1).run (tr_late_net_account_after_retire.take 4)).map
+      (fun s => (s.life.done, s.life.hasStaging)) = some (true, false) ∧
     ((sysPush 1).run tr_late_net_account_after_retire).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) ∧
     (sysPush 1).run (tr_late_net_account_after_retire ++ [.netAccount]) = none := by
@@ -404,6 +413,8 @@ def paired : List (String × Recv × List Ev) :=
    ("RecvLifecycleTest.NetworkCompletionWaitsForH2d", initPush 1, tr_net_completion_waits_for_h2d),
    ("RecvLifecycleTest.LateBlockAccountingAfterRetirementIsANoOp", initPush 1,
      tr_late_net_account_after_retire),
+   ("RecvLifecycleTest.SessionRemainsValidAcrossAsyncH2dCallbacksAfterCallerDropsPtr", initPush 1,
+     tr_late_net_account_after_retire.take 4),
    ("RecvDrainTest.FailedLayerWaitsForOtherH2dCopies", initPush 2,
      tr_failed_h2d_waits_for_other_layer),
    ("RecvLifecycleTest.SingleFailedH2dReportsFailureAndReturnsStaging", initPush 1,
