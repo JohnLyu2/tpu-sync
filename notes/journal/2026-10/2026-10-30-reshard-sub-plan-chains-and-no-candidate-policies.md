@@ -1,6 +1,6 @@
 # 2026-10-30 — Reshard sub-plan chains modelled; candidate-policy proofs rejected in favour of "describe the code as it is"
 
-Version stamp: fork `bf34af03`..`03b7dcf8`; corpus baseline `42dda542`. Canonical:
+Version stamp: fork `bf34af03`..`362adb32`; corpus baseline `42dda542`. Canonical:
 `tpu_sync/formal_verification/TpuSyncVerify/Transfer/Reshard/SubPlanChain.lean`
 (docstring, assumptions A1–A4, source map), its `Model` / `Invariant` /
 `Traces` / `Coverage` parts, and `docs/transfer/reshard.md` §"What is proved",
@@ -90,7 +90,10 @@ the rest; not re-reading `conventions.md` before starting.
   (shipping vs. shipping-minus-guard), which `conventions.md` allows; they are
   not candidate fixes.
 
-## Open
+## Proof compression (`362adb32`)
 
-- The `SubPlanChain` coordinator invariant proof is ~850 lines of mechanical
-  case splits; per-event helper lemmas would cut ~300.
+- [FACT] Replaced the nested `Or` `PhaseShape` and four implication fields on
+  `CoordChainInv` in `SubPlanChain/Invariant.lean` with `match`-indexed
+  `WinPhaseInv` and `PhaseShape`, shared `inv_abortWindow` / `inProgress_active`
+  helpers, and 11 per-event lemmas; builds under default heartbeats (`maxHeartbeats
+  800000` dropped).
