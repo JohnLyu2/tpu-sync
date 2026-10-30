@@ -1,6 +1,6 @@
 # 2026-10-30 — Reshard sub-plan chains modelled; candidate-policy proofs rejected in favour of "describe the code as it is"
 
-Version stamp: fork `bf34af03`..`d78fe3f6`; corpus baseline `42dda542`. Canonical:
+Version stamp: fork `bf34af03`..`03b7dcf8`; corpus baseline `42dda542`. Canonical:
 `tpu_sync/formal_verification/TpuSyncVerify/Transfer/Reshard/SubPlanChain.lean`
 (docstring, assumptions A1–A4, source map), its `Model` / `Invariant` /
 `Traces` / `Coverage` parts, and `docs/transfer/reshard.md` §"What is proved",
@@ -69,11 +69,28 @@ the rest; not re-reading `conventions.md` before starting.
 - `reshard_service_test.cc` is modified in the working tree by the coverage-gap
   patch work; anchors still resolve because the added tests are appended.
 
+## Commit 2 (`03b7dcf8`): no step parameter selects a candidate fix anywhere in `Reshard/`
+
+- [FACT] `Send.UnregisterPolicy` and `Coordinator.CleanupPolicy` removed;
+  `Coordinator/Hardened.lean` deleted. The alternatives survive as plain
+  alternative steps at the bottom of `Send/Traces.lean`
+  (`stepUnregisterOnSettle`, exhaustive `planUnregistered = done` on the 1- and
+  2-pool instances) and `Coordinator/Traces.lean` (`stepDisarmAndAbandon`,
+  exhaustive `NoOrphansWhenAborted` on 2×2) — the `PrefillDecode/Transport`
+  `stepHardened` pattern. `Registry.violates` and
+  `Coordinator.violatesCoordInv` are now `!decide (Inv s)`; the
+  `Decidable (Registry.Inv)` instances live in `Registry.lean`.
+- [FACT] Renamed: `trace_early_unregister_on_error_vs_onSettle` →
+  `Send.trace_early_unregister_on_error` (the alternative half is
+  `trace_unregister_on_settle_alternative`). `findings/README.md` §F10 still
+  cites the old name — findings are frozen at their confirmation commit; do
+  not re-stamp.
+- [INTERPRETATION] The remaining `PushEndPolicy` (`Receive`) and
+  `RegistrationPolicy` (`PoolStaging`) parameters are guard *mutants*
+  (shipping vs. shipping-minus-guard), which `conventions.md` allows; they are
+  not candidate fixes.
+
 ## Open
 
-- Commit 2 of the "Option B, staged" plan: demote `UnregisterPolicy.onSettle`
-  (`Reshard/Send`) and `CleanupPolicy.disarmAndAbandonOnFailure`
-  (`Reshard/Coordinator/Hardened.lean`) to `Traces.lean` alternative steps
-  (→ `loose-ends/parked.md`).
-- The coordinator invariant proof is ~850 lines of mechanical case splits;
-  per-event helper lemmas would cut ~300.
+- The `SubPlanChain` coordinator invariant proof is ~850 lines of mechanical
+  case splits; per-event helper lemmas would cut ~300.
