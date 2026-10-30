@@ -18,12 +18,12 @@ Open items only (5-field `better-than-fish` format, symbol citations instead of 
 **Effort estimate:** ~2 h.
 **References:** ../durable/prefill-decode-transfer-settle-and-layer-readiness-invariants.md, tpu_sync/formal_verification/docs/transfer/prefill_decode.md
 
-## Transport model follow-ups: plan-declared contract, `expected_senders` resolution race, in-tree hardening
-**Status:** parked 2026-10-20 (`Read at: 0ac16d1`)
-**Context:** `Transfer/PrefillDecode/Transport.lean` covers the chunk-count and sender-declared contracts of `CompleteIncomingPush` (`tpu_sync/transport/block_transport_session.cc`, formerly `block_transport.cc`). Not covered: (a) the plan-declared reshard contract (`AccumulateLandedShards`, `expected_pushes`, retirement by `expected_pools`); (b) the plan-publication window where `KVCacheManagerWithTransfer::RegisterActivePlan` seats the receive session under `mu_` before publishing the plan while `CompleteIncomingPush` latches `ExpectedPushSenders` on a layer's first stream (`Transport` A2); (c) whether the sender-declared contract comparing distinct `header.remote_id = node_id()` against `shard_push_schedules_size()` (`KVCacheManagerBase`, `rpc/raiden_service.proto`) can stall if one node owns two source shard partitions (`Transport` A3; decided by schedule construction in `rpc/raiden_controller.py`); (d) the two hardening edits in `Transport.stepHardened` (chunk-count over-count rejection; per-layer once-latch in `ExecuteLayerH2d`), which exist only in Lean.
-**Why parked:** `findings/README.md` §R-B is an API hazard unreachable from in-repo callers; (b) and (c) depend on Python controller sequencing outside the Lean corpus.
-**To resume:** (1) Read `raiden_controller.py` schedule construction + `node_id()` assignment to settle (c); (2) check controller ordering between receiver `RegisterActivePlan` reply and sender start for (b); (3) add a `planDeclared` arm to `completePush` if modelling reshard transport; (4) offer `stepHardened` as a C++ patch + `block_transport_test.cc` case if owners want API hardening.
-**Effort estimate:** (1) ~1 h; (2) ~1 h; (3) ~half-day; (4) ~1 h + OSS Bazel run.
+## Transport model follow-ups: plan-declared reshard contract and in-tree `stepHardened` hardening
+**Status:** parked 2026-10-20 (`Read at: 42dda542`; `Transport` A2 & A3 controller/caller boundary checks closed 2026-10-30 in `Transport.lean` §Assumptions and `findings/README.md` §R-B)
+**Context:** `Transfer/PrefillDecode/Transport.lean` covers the chunk-count and sender-declared contracts of `CompleteIncomingPush` (`tpu_sync/transport/block_transport_session.cc`). Still open: (a) modelling the plan-declared reshard contract (`AccumulateLandedShards`, `expected_pushes`, retirement by `expected_pools`); (b) offering the two Lean-only hardening edits in `Transport.stepHardened` (chunk-count over-count rejection; per-layer once-latch in `ExecuteLayerH2d`) as C++ hardening.
+**Why parked:** `findings/README.md` §R-B is unreachable from in-repo controller paths (every controller awaits receiver `RegisterActivePlan` before dispatching senders, and pool reshard bypasses `ExpectedPushSenders`).
+**To resume:** (1) Add a `planDeclared` arm to `completePush` if modelling reshard transport; (2) offer `stepHardened` as a C++ patch + `block_transport_test.cc` case if owners want API hardening for direct `RegisterActivePlan` callers.
+**Effort estimate:** (1) ~half-day; (2) ~1 h + OSS Bazel run.
 **References:** ../journal/2026-10/2026-10-20-transport-stream-accounting-model.md, tpu_sync/formal_verification/docs/transfer/prefill_decode.md §Boundary assumptions, findings/README.md §R-B
 
 ## Propagate the real push-failure status through `EndIncomingPush`
@@ -99,20 +99,20 @@ Open items only (5-field `better-than-fish` format, symbol citations instead of 
 **References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive.lean §Lock scopes, ../journal/2026-10/2026-10-26-faithfulness-feedback-and-receive-lock-scope-audit.md
 
 ## Coverage stopping criterion (W2–W4 remaining): `Pipeline`/`ReadRemote` W2, schedule-runner W4
-**Status:** parked 2026-10-29; updated 2026-10-30 (W1 now complete on every model: PrefillDecode + `ReadRemote`, Reshard `Receive`/`Send`/`Pipeline`, and Reshard `Registry` (25 branches, 11 reached) / `Coordinator` (14 branches, 10 reached); `Receive`/`Send` W2 and `llvm-cov` × `resolve_anchors.py --coverage` W3 done)
-**Context:** Spec/implementation coverage plan from McMillan & Zuck's QUIC work (`docs/conventions.md` §"Coverage"). Remaining stages: (W2) guard × mutant inventories for `Pipeline` and `ReadRemote`; (W4) `TEST_P` C++ schedule interpreter over `RecvTestManager` running Lean-enumerated schedules and checking post-states (`Done()`, `IsDraining()`, `num_free_slots`, `copies_issued`, published status). The `Registry`/`Coordinator` W1 gaps are all controller-command schedules (`reshard_service_test` with `transport_.FailFor` on a source rank or a second destination; re-registration, `Complete` no-ops, double cancel, `COMMAND_RELEASE_REQUEST_BLOCKS`) — candidates for a fourth upstream test patch.
-**Why parked:** Completed W1 everywhere, session W2, and repo-wide `llvm-cov` W3 first.
-**To resume:** Pick independently: `Pipeline`/`ReadRemote` W2 (~½ day), the `Registry`/`Coordinator` test patch (~2 h), or W4 `Receive` `TEST_P` runner (~3 days).
+**Status:** parked 2026-10-29; updated 2026-10-30 (W1 complete on every model, `Registry`/`Coordinator` gap tests packaged in `findings/coverage_gap_reshard_control.patch`, `Receive`/`Send` W2 and `llvm-cov` × `resolve_anchors.py --coverage` W3 done; remaining W2 deprioritized per user direction)
+**Context:** Spec/implementation coverage plan from McMillan & Zuck's QUIC work (`docs/conventions.md` §"Coverage"). Remaining stages: (W4) `TEST_P` C++ schedule interpreter over `RecvTestManager` running Lean-enumerated schedules and checking post-states (`Done()`, `IsDraining()`, `num_free_slots`, `copies_issued`, published status); optional (W2) guard × mutant inventories for `Pipeline` and `ReadRemote`.
+**Why parked:** Completed W1 everywhere, test patches across `Receive`/`Send`/`ReadRemote`/`Registry`/`Coordinator`, session W2, and repo-wide `llvm-cov` W3; user deprioritized further guard × mutant inventories as lower value.
+**To resume:** Build the W4 `Receive` `TEST_P` runner (~3 days), or revisit `Pipeline`/`ReadRemote` W2 (~½ day) if a wrapper-level spec question motivates it.
 **Effort estimate:** As above per stage.
 **References:** ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md, tpu_sync/formal_verification/docs/conventions.md §"Coverage", tpu_sync/formal_verification/docs/transfer/reshard.md §"Branch coverage by the replayed tests"
 
-## Upstream coverage-gap test PRs + remaining handshake-stub and recycle tests
-**Status:** parked 2026-10-29; updated 2026-10-30 (the three patches were handed to the maintainers for landing through their own review flow, re-verified to apply on upstream `337540eb`; `send` and `read_remote_deadline` at 0 offset, `recv` at `-9` lines after `9f5270bc` removed `ScopedEnv`)
-**Context:** Hardware-free gtest cases closing `Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` test gaps are split into three independent upstream PR patches (`findings/coverage_gap_send.patch`, `findings/coverage_gap_recv.patch`, `findings/coverage_gap_read_remote_deadline.patch`; `findings/README.md` §Coverage-gap tests). Also surfaced: receiver late-`Finish` flip (`TransferReceiveSession::FinishLocked` overwrites an OK `status_` with a later error after settle, with no `done_` guard, unlike the sender; `findings/README.md` §Coverage-gap tests, "the receiver's late-`Finish` status flip") and three unwritten test gaps needing new seams (2 consumer handshake tests needing a replying producer stub; 1 multi-request staging-recycle test needing a staging-observing seam).
-**Why parked:** Waiting for the three test changes to land upstream and for the late-`Finish` issue to be filed.
-**To resume:** (1) once the three land, flip those rows to `paired` in `Receive/Coverage.lean`, `Send/Coverage.lean`, and `ReadRemoteCoverage.lean` at the next sync; (2) file the late-`Finish` flip issue; (3) optionally build the replying-producer stub (2 cases) and multi-request recycle case (1 case).
-**Effort estimate:** Filing ~30 min; stub + recycle tests ~3 h.
-**References:** findings/README.md §Coverage-gap tests, ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md
+## Upstream coverage-gap test PRs, F14 filing, and remaining handshake-stub / recycle tests
+**Status:** parked 2026-10-29; updated 2026-10-30 (first three patches handed to maintainers; fourth patch `findings/coverage_gap_reshard_control.patch` and **F14** reproducer `findings/transfer_receive_late_finish_bughunt_test.cc` verified on `42dda542`)
+**Context:** Hardware-free gtest cases closing model-level `Gap.test` branches are packaged into four upstream PR patches (`findings/coverage_gap_send.patch`, `findings/coverage_gap_recv.patch`, `findings/coverage_gap_read_remote_deadline.patch`, and `findings/coverage_gap_reshard_control.patch` with 7 `ReshardStackTest` cases closing all 14 `Registry` `Gap.test` branches, 4 unasserted `Refusal` constructors, and all 4 `Coordinator` gap branches; `findings/README.md` §Coverage-gap tests). Receiver late-`Finish` status flip is confirmed and documented as **F14** (`findings/transfer_receive_late_finish_bughunt_test.cc`, 1 control + 4 failing production paths; `findings/README.md` §F14). Three unwritten `PrefillDecode` test gaps still need new seams (2 consumer handshake tests needing a replying producer stub; 1 multi-request staging-recycle test needing a staging-observing seam).
+**Why parked:** Waiting for the test patches to land upstream and for **F14** to be filed.
+**To resume:** (1) hand `findings/coverage_gap_reshard_control.patch` to maintainers and, once the patches land, flip those rows to `paired` in `Receive/Coverage.lean`, `Send/Coverage.lean`, `ReadRemoteCoverage.lean`, `Reshard/Registry/Coverage.lean`, and `Reshard/Coordinator/Coverage.lean` at the next sync; (2) file **F14** and add a `findings/filed_bugs.md` entry; (3) optionally build the replying-producer stub (2 cases) and multi-request recycle case (1 case).
+**Effort estimate:** Filing F14 ~15 min; stub + recycle tests ~3 h.
+**References:** findings/README.md §F14 and §Coverage-gap tests, ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md
 
 ## Sync upstream `42dda542` → `337540eb`: bounded host layer staging reached the reshard sessions
 **Status:** parked 2026-10-30 (`resolve_anchors.py --diff 42dda542 337540eb`: `456 same, 274 shift, 77 modified, 0 drift, 9 fail`; every `modified`/`fail` is in `Reshard/*`)
@@ -130,13 +130,13 @@ Open items only (5-field `better-than-fish` format, symbol citations instead of 
 **Effort estimate:** (1) ~1.5 h; (2) ~2 h; (3) ~15 min.
 **References:** tpu_sync/formal_verification/docs/transfer/reshard.md §"Branch coverage by the replayed tests" and §"C++ branch coverage of the anchored spans", tpu_sync/formal_verification/docs/transfer/prefill_decode.md §"C++ branch coverage of the anchored spans"
 
-## `RecordNetworkCompleteLocked`'s `FinishLocked()` arm is dead; reply-after-data flips a complete receive to failed
-**Status:** parked 2026-10-27 (`Read at: c9bc124`; two low-severity observations, neither filed)
-**Context:** (a) `TransferReceiveSession::RecordNetworkCompleteLocked`'s `all_complete` → `FinishLocked()` arm cannot execute for `num_shards() ≥ 1` because `num_completed_layers_` only increments in the H2D callback (which calls `FinishLocked()` on the last layer unless `draining_`, after which `OnBlockShardsReceived` returns early). (b) `HandlePullStream` spawns `StartPush` before returning the pull response, so all layers can land before `on_response` runs; a transport error on that reply then flips `status_` on a completed receive (`Receive/Coverage.lean` `pullReplyFail`).
-**Why parked:** (a) is dead-code cleanup; (b) is a narrow design wart (only promote to a finding if `"control pull request: ..."` is ever observed on a receive whose layers all landed).
-**To resume:** Mention alongside any `transfer_receive_session.cc` touch: turn (a) into a `DCHECK` or remove it, and have `on_response` ignore non-OK once `done_` / all layers completed.
-**Effort estimate:** ~30 min each.
-**References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive/Coverage.lean, ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md
+## `TransferReceiveSession::RecordNetworkCompleteLocked`'s `FinishLocked()` arm is dead
+**Status:** parked 2026-10-27 (`Read at: c9bc124`; reply-after-data late-`Finish` flip graduated to **F14** on 2026-10-30)
+**Context:** `TransferReceiveSession::RecordNetworkCompleteLocked`'s `all_complete` → `FinishLocked()` arm cannot execute for `num_shards() ≥ 1` because `num_completed_layers_` only increments in the H2D callback (which calls `FinishLocked()` on the last layer unless `draining_`, after which `OnBlockShardsReceived` returns early).
+**Why parked:** Dead-code cleanup only.
+**To resume:** Mention alongside any `transfer_receive_session.cc` touch (e.g. when fixing **F14**): turn the `all_complete` arm in `RecordNetworkCompleteLocked` into a `DCHECK` or remove it.
+**Effort estimate:** ~15 min.
+**References:** tpu_sync/formal_verification/TpuSyncVerify/Transfer/PrefillDecode/Receive/Coverage.lean, findings/README.md §F14, ../journal/2026-10/2026-10-27-coverage-stopping-criterion-receive-pilot.md
 
 ## Triage and write up the four unfiled bug-hunt reproducers from the 2026-10-29 post-F11 audit
 **Status:** parked 2026-10-29 (`Read at: 42dda542`; all four built and run on unmodified `42dda542`, files committed under `findings/` without `README.md` entries or `build_targets.patch` targets)
