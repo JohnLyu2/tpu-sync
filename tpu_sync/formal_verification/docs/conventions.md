@@ -75,14 +75,17 @@ umbrella file and a directory of parts:
 * `X/Traces.lean` — traces, searches, mutants.
 * `X/Coverage.lean` — branch coverage of `step` by the replayed tests (see
   below); `Receive`, `Send`, `Pipeline` on both transfer paths,
-  `Reshard/{Registry,Coordinator}` (no session lifecycle: their effect is the
-  registry `Status` / coordinator phase before and after), and
-  `PrefillDecode/MultiRequestCoverage.lean` (new leaves only: its state space
-  is unbounded) so far (`PrefillDecode/Pipeline/Coverage.lean` imports the
-  traces in `PipelineChecks.lean`, and `Reshard/Registry/Coverage.lean` sits
-  beside a single-file module, so `TpuSyncVerify.lean` imports both
-  directly). Not to be confused with `Reshard/Coverage.lean`, which is the
-  reshard model's sub-block byte coverage, a model of the C++.
+  `PrefillDecode/LayerStaging`, `Reshard/{Registry,Coordinator,SubPlanChain}`
+  (no session lifecycle: their effect is the registry `Status` / coordinator
+  phase or worker arm), and `PrefillDecode/MultiRequestCoverage.lean` (new
+  leaves only: its state space is unbounded) (`PrefillDecode/Pipeline/Coverage.lean`
+  imports the traces in `PipelineChecks.lean`, and
+  `Reshard/Registry/Coverage.lean` sits beside a single-file module, so
+  `TpuSyncVerify.lean` imports both directly). Not to be confused with
+  `Reshard/Coverage.lean`, which is the reshard model's sub-block byte coverage,
+  a model of the C++.
+* `X/Guards.lean` — guard inventory mutating every C++ check in `step` against
+  the observable safety properties (see below; `PrefillDecode/{Receive,Send}`).
 
 Modules with their own internal numbering (`BlockOrdering`, `PoolStaging`)
 name their parts after their sections instead.

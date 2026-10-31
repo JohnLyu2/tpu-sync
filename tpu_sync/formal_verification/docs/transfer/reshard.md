@@ -151,8 +151,9 @@ atomic state-machine transitions (`d2hDone`, `landStream`, `h2dIssue`,
 
 ## Assumptions and how each is discharged
 
-Every session module numbers its assumptions (`Receive` A1–A4, `Send` A1–A4);
-the full statements and arguments are in the module docstrings.
+The session and sub-plan chain modules number their assumptions (`Receive` A1–A4,
+`Send` A1–A4, `SubPlanChain` A1–A4); the full statements and arguments are in the
+module docstrings.
 
 | Assumption | One-line statement | Status |
 |---|---|---|
@@ -165,6 +166,8 @@ the full statements and arguments are in the module docstrings.
 | Send A1 — non-empty schedule with positive peer counts per active pool | `ReshardSendSession::Create` rejects `remaining_pool_peer_pushes <= 0`, and `ExecutePush` skips pools with zero scheduled entries on this sender, matching `CountPoolReshardSendSlots`. | Discharged: `Coverage.senderStreams_pos_iff`, `Send.validPools`. |
 | Send A2 — `ExecutePush` starts before external `Finish` | `PoolReshardPush` inserts the session into `active_pool_reshard_sends_` and immediately invokes `ExecutePush`, which takes its caller op (`++in_flight_`). | C++ init discipline (`KVCacheManagerWithTransfer::PoolReshardPush`). |
 | Send A4 — per-transfer connection-release window in `EndOp` | Under `DataConnectionReuse::kPerTransfer`, the last op (`in_flight_ == 1 && finalizing_`) drops `mu_` in `EndOp` to call `ReleaseDataConnectionsAfterSend` before `--in_flight_` and `SettleLocked()`; nothing modelled changes in the window. | Soundness argument in `Send.lean`. |
+| SubPlanChain A1–A2 — valid `sub_plan_index` and fresh per-sub-plan UUIDs | `RunSubPlan` stamps `0 <= sub_plan_index < max(1, sub_plan_count)` (`BuildStartTransferForTarget`), `SubPlanUuid` derives distinct positive UUIDs per index, and retries use a fresh request UUID. | Discharged for `SubPlanUuid` (`subPlanUuid_zero`, `subPlanUuid_pos_of_pos`, `trace_sub_plan_uuid_positive_and_distinct`); duplicate-UUID admission is `Reshard/PoolStaging.lean`. |
+| SubPlanChain A3–A4 — sender `Complete` after last window and producer `Register` before `Coordinate` | A producer calls `RequestBlockRegistry::Complete` for a rank only after its worker emits `done_sending` (once all `count` sub-plans settle), and registers blocks before `StartPoolReshard`. | Discharged for `done_sending` (`SubPlanChain.reachable_worker_safe` / `DoneAfterAllSubPlans`) and post-claim `Register` refusal (`Reshard/Registry.lean`); single-window pre-claim arrival is `Reshard/Coordinator.lean`. |
 | Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`) with one settled outcome per worker (`TPU_RAIDEN_ENABLE_MULTI_NUMA=0`), whole-transfer failure, no preemption/prefix caching | `Transfer/Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_eager_eq_latched`, `applyRecv_staggered_eq_batch`, `mw_earlyLoadError_fail_holds_blocks`; enforced across TP ranks by `_sync_stage3_tp_submit_states`), while per-worker folding of `sub_plan_count > 1` chains into a single worker outcome is modelled in `Reshard/SubPlanChain.lean` (`WorkerState`); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
 
 ## Shipping C++ vs. modelled alternatives
@@ -215,6 +218,9 @@ by an executable counterexample trace or `#guard` check in
 | `Registry.trace_single_stage_votes_retire_multi_owner_claim` | `RequestBlockRegistry::Complete` tracks `completed_units_` per `(req_id, uuid)` rather than per `(req_id, uuid, claim_owner)` | Multi-owner claim isolation (stage 1's senders voting `Complete` retire the generation while stage 2's claim is still active) |
 | `Registry.trace_split_ttl_purges_request_blocks_while_claim_active` | `RequestBlockRegistry::LookupAndClaim` sets `claimed_[(req_id, uuid)] = t_1 + ttl_s_` without refreshing `registration.expires_at` on the claimed `request_blocks_` rows | Claimed registration liveness (`PurgeExpiredRequestBlocksLocked` erases `request_blocks_` in `[t_0 + ttl_s_, t_1 + ttl_s_)` while `claimed_` is still active) |
 | `Coordinator.mutant_dispatch_without_arm_barrier_drops_push` | `ReshardCoordinator::RunSubPlan` joins all Stage 1 receiver-arming threads and verifies every `armed[i]` before launching Stage 2 senders | Two-phase Arm-then-Dispatch (`NoPushBeforeAllArmed`: premature sender push arrives at unarmed `dst_unit 11` and is dropped) |
+| `SubPlanChain.stepCountStale` (`mutant_counting_stale_sub_plan_reports_done_early`) | `KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked` skips settled sessions whose `uuid` is absent from `plan_uuids` | `DoneAfterAllSubPlans` (a stale sub-plan from a superseded chain counts toward a retry's `settled` set and emits `done_recving` / `done_sending` while the retry's own sub-plan is still active) |
+| `SubPlanChain.stepNoReanchor` (`mutant_no_reanchor_never_reports_retry_done`) | `KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked` replaces the chain entry on `sub_plan_index == 0` | Retry liveness under same `req_id` (a retry's sub-plans land in the earlier failed entry and never emit `done`) |
+| `SubPlanChain.stepAbandonAtEveryIndex` (`mutant_abandon_at_every_index_exposes_active_sender`) | `ReshardCoordinator::RunSubPlan` guards `registry_->AbandonClaim(...)` with `if (index == 0)` on arm / plan aborts | `NoSenderExposed` (`AbandonClaim` on a window `>= 1` failure drops the registry claim while window `0`'s dispatched sender is still reading source HBM, letting `CancelIfUnclaimed` tombstone the generation mid-transfer) |
 
 ## Branch coverage by the replayed tests
 
@@ -304,8 +310,8 @@ are exercised; the device-copy session bodies are not:
 Until CPU tests drive `BoundedPoolTestManager` through `OnPoolReceived` and
 `PoolReshardPush` (plus a promise-backed `PjRtCopyFuture` stub for pending and
 failing copies), the Lean models in
-`Reshard/{Send,Receive,Pipeline,Coordinator}.lean` are the only check on those
-paths without TPU hardware.
+`Reshard/{Send,Receive,Pipeline,Coordinator,SubPlanChain}.lean` are the only
+check on those paths without TPU hardware.
 
 ## C++ → Lean routing index
 

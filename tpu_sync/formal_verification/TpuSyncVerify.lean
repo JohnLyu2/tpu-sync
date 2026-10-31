@@ -38,6 +38,7 @@ modelled, the directory layout, and how the C++ is cited.
 
 * `Common` — transition-system core, list lemmas, bounded model checker, branch coverage.
 * `Transfer` — `Session` (settle protocol shared by every transfer session),
+  `LayerStaging` (`StagingLayerManager` bounded host-layer buffer pool),
   `Caller` (serving engine above `poll_stats()` shared by both transfer paths),
   `PrefillDecode/`, `Reshard/`.
 -/

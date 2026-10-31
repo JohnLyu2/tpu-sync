@@ -3,6 +3,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.Send.Invariant
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Frame
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Traces
+import TpuSyncVerify.Transfer.PrefillDecode.Send.Coverage
+import TpuSyncVerify.Transfer.PrefillDecode.Send.Guards
 
 /-!
 # Send session
@@ -258,6 +260,13 @@ All proved on every reachable state (`reachable_safe`):
 * **Pull claim (`PullClaimed`).** `(started → pullStarted) ∧ ((d2hPending ∨ 0 < d2hIssued) → started)`:
   `StartPush` never runs unless `ValidateAndBeginPull` claimed `pull_started_`,
   and no D2H copy is pending or issued unless `StartPush` started.
+* **Published is quiet (`PublishedQuiet`).** `published ≠ none → d2hPending = false ∧ d2hRetired = d2hIssued`:
+  once `poll_stats()` has reported the send, as `done_sending` or as failed,
+  no D2H copy is dispatching or still reading prefill HBM, so the engine may
+  reclaim it. The sender's promise to the engine at the session level (the
+  pipeline restates it as `PrefillHbmSafe`); added when the guard inventory
+  (`Send/Guards.lean`) found that dropping `Done()` before publishing
+  violated nothing the module stated.
 * **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and
@@ -274,6 +283,31 @@ there is no `failed_sending_`. (3) When the D2H loop exits early (`!host_layer_i
 `d2h_promises[next_layer..total_layers-1]` with the session's error status so an
 already-armed `SendNextLayer` callback wakes via `wake false` and retires its op
 (`trace_d2h_dispatch_fail_drains_issued`, `trace_without_fail_unissued_leaks`).
+
+## Coverage and guards
+
+`Coverage.lean` measures how much of `step` the replayed upstream tests
+exercise, as `Receive/Coverage.lean` does (branch = leaf of an event's
+decision tree with its lifecycle effect; `stepT_step` proves agreement with
+`step`). On 0–2 layers, `step` has 40 reachable branches (every leaf live); the
+31 paired upstream tests reach 27, and the remaining 13 are classified into
+missing upstream tests (5), lock-gap windows no harness hook reaches (6), or
+callback orderings where the model admits both orders (2). The `#guard` at the
+end of `Coverage.lean` fails if a branch, a trace or a classification changes.
+
+`Guards.lean` asks the other question: which of the C++ checks `step`
+transcribes do the properties need? Each is dropped or weakened and searched
+exhaustively against `Safe` without the ghost-counter equations. Five are
+load-bearing (the loop's `if (draining_) return`, the last-push `Finish()`,
+`Done()` before publishing, `in_flight_ == 0` in `FinishLocked`, and
+`fail_unissued_layers` resolving unissued promises, alongside `SendNextLayer`'s
+bounds check `sendNextUnbounded`); eight survive — the first lines of a two- or
+three-line defence against working for a dead send, `draining_ &&` in
+`EndSendOpLocked` (redundant because arming `SendNextLayer(0)` before the D2H
+loop keeps `in_flight_ > 0` continuously across active non-zero-layer sends),
+and the first-`Finish`-wins rule, which no safety property can see. The
+`Done()`-before-publishing check survived the `Safe` the module had;
+`PublishedQuiet` is the property that was missing.
 
 ## Source map
 
