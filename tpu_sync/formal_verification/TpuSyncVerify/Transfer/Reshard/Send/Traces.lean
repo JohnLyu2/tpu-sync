@@ -187,6 +187,10 @@ def violates (s : Send) : Bool := !decide (Safe s)
 theorem violates_iff (s : Send) : violates s = false ↔ Safe s := by
   simp [violates]
 
+#guard ModelCheck.check (sys [2]) (events 1) violates 12 = .safe
+#guard ModelCheck.check (sys [1, 1]) (events 2) violates 12 = .safe
+#guard ModelCheck.check (sys [2, 1]) (events 2) violates 12 = .safe
+
 
 /-- Mutant 1 (`initOvercountedSlots`, cf. `ReshardSendSession::Create`):
 initializing `remaining_pool_peer_pushes_` to `pools.size() * total_peers` (4
@@ -294,13 +298,18 @@ theorem trace_unregister_on_settle_alternative :
       some (true, 0, true) := by
   decide
 
-/-- `planUnregistered = done` in every state the alternative reaches on the
-1- and 2-pool instances (exhaustive). -/
-def violatesPlanIffDone (s : Send) : Bool := !decide (s.planUnregistered = s.life.done)
+/-- `Safe` and `planUnregistered = done` in every state the alternative reaches
+on the 1- and 2-pool instances (exhaustive); shipping `sys` violates the
+biconditional on a multi-pool failure (`planUnregistered = true` while sibling
+ops drain). -/
+def violatesPlanIffDone (s : Send) : Bool :=
+  !decide (Safe s ∧ s.planUnregistered = s.life.done)
 
+#guard ModelCheck.check (⟨init [2], stepUnregisterOnSettle⟩ : System Send Ev) (events 1)
+  violatesPlanIffDone 12 = .safe
 #guard ModelCheck.check (⟨init [1, 1], stepUnregisterOnSettle⟩ : System Send Ev) (events 2)
   violatesPlanIffDone 12 = .safe
-#guard ModelCheck.check (⟨init [2], stepUnregisterOnSettle⟩ : System Send Ev) (events 1)
+#guard ModelCheck.check (⟨init [2, 1], stepUnregisterOnSettle⟩ : System Send Ev) (events 2)
   violatesPlanIffDone 12 = .safe
 #guard (ModelCheck.check (sys [1, 1]) (events 2) violatesPlanIffDone 12 matches .counterexample _)
 

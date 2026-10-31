@@ -135,7 +135,7 @@ ranges for every symbol, sub-block, and test are in the generated
 
   ## Branch coverage
 
-  `Coordinator/Coverage.lean`: 14 branches of `step .shipping` over the 1×1,
+  `Coordinator/Coverage.lean`: 14 branches of `CoordState.step` over the 1×1,
   1×2, 2×1 and 2×2 sub-plans; the 21 single-sub-plan `ReshardStackTest` cases
   (24 traces) that drive `RunSubPlan` within scope reach 10, and the two
   failure-cleanup counterexamples of `Traces.lean` the other four — a failed
