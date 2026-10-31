@@ -45,13 +45,14 @@ pool and every other producer's reads are *rejected* (`failed_recving_`), not
 delayed. Owner-acknowledged (their test is parked as `DISABLED_`); confirmed
 as F5, canonical `findings/README.md` §F5 (the `per_peer_staging_admission.patch`
 was validated on `50b0774` and retired on 2026-10-16 when `StagingBlockAllocator`
-moved to `tpu_sync/core/staging_arena.{h,cc}` in `fc8cff9`), guarantee
-`PeerIsolation.reachable_quota_admits_healthy` (cap `c` reserves
-`numSlots − c` slots for other peers; nothing more). Two shortcuts are
+moved to `tpu_sync/core/staging_arena.{h,cc}` in `fc8cff9`), with the
+per-peer cap kept as the non-shipping alternative `PeerIsolation.stepPerPeerQuota`
+(`trace_per_peer_quota_admits_healthy`: cap `c` reserves `numSlots − c` slots
+for other peers; nothing more). Two shortcuts are
 already ruled out, do not re-derive them: allocating staging lazily after the
 peer answers (the pull request carries the host block ids), and reclaiming the
-slot on cancel (release before `inFlight = 0` lets the producer write into
-reused host blocks).
+slot on cancel (`PeerIsolation.stepReleaseOnCancel`: release before `inFlight = 0`
+violates slot conservation and lets the producer write into reused host blocks).
 
 ## Why this matters
 

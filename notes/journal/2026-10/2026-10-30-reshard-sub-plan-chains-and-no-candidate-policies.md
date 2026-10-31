@@ -97,3 +97,14 @@ the rest; not re-reading `conventions.md` before starting.
   `WinPhaseInv` and `PhaseShape`, shared `inv_abortWindow` / `inProgress_active`
   helpers, and 11 per-event lemmas; builds under default heartbeats (`maxHeartbeats
   800000` dropped).
+
+## `PrefillDecode/PeerIsolation` `SlotPolicy` demotion (2026-10-31)
+
+- [FACT] Removed `SlotPolicy` (`unboundedPerPeer` / `perPeerQuota`), `Inv.quota_sick`,
+  `reachable_sick_staging_le_quota`, and `reachable_quota_admits_healthy` from
+  `PrefillDecode/PeerIsolation.lean` (`findings/README.md` §F5 stays frozen at
+  its confirmation commit). Added `PeerIsolation.Safe` / `reachable_safe` plus
+  guard mutant `stepReleaseOnCancel`, and moved the per-peer cap to bottom-of-file
+  `stepPerPeerQuota` (`trace_per_peer_quota_admits_healthy` + bounded `#guard`
+  check). (`NumaBarrier`'s `NumaPolicy.settledCounts` stays until the upstream
+  sync brings `c0e8e686` in as shipping code.)

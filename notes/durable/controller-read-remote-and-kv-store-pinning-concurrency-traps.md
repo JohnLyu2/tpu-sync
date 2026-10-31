@@ -25,8 +25,11 @@ missing?".
 `settled` before issuing the pull stops shape A (`ReadRemote.lateIssue`) and
 leaves shape B (`ReadRemote.inFlight`: the deadline fires during the pull);
 deferring the deadline's settle while a pull is in flight closes both
-(`ReadRemote.deferred_settle_is_safe`, exhaustive search). Shape B has no C++
-reproducer; it is a Lean result (`ReadRemote.shipping_inFlight`).
+(`ReadRemote.deferred_settle_is_safe`, exhaustive search). Both shapes are
+proved in Lean (`ReadRemote.shipping_counterexample`, `ReadRemote.shipping_inFlight`)
+and confirmed by C++ reproducers in `findings/raiden_controller_bughunt_test.cc`
+(`ReadRemoteDoesNotStartPullAfterDeadlineSettled`,
+`ReadRemoteSettlesDeadlineWhilePullStillInFlight`).
 
 [FACT] Reachability bounds the urgency. `RaidenController::ReadRemote` is
 reachable only through the public API (`KVCacheStore::ReadRemote`, bound as
