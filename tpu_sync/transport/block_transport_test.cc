@@ -47,6 +47,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
 #include "grpcpp/create_channel.h"
@@ -56,7 +57,7 @@
 #include "grpcpp/support/channel_arguments.h"
 #include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/prometheus_exporter.h"
@@ -67,6 +68,7 @@
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -119,6 +121,76 @@ struct ScopedPrometheusBackend {
   ~ScopedPrometheusBackend() {
     telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
   }
+};
+
+class StubReceiveSession : public TransferSession {
+ public:
+  absl::Status Start() override { return absl::OkStatus(); }
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    return std::nullopt;
+  }
+  bool Done() const override {
+    absl::MutexLock lock(mu_);
+    return done_;
+  }
+  void Finish(const absl::Status& status) override {
+    absl::MutexLock lock(mu_);
+    if (!status.ok() && status_.ok()) {
+      status_ = status;
+    }
+    draining_ = true;
+    if (in_flight_ == 0) {
+      done_ = true;
+    }
+  }
+  bool TryBeginOp() override {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) return false;
+    ++in_flight_;
+    return true;
+  }
+  void EndOp() override {
+    absl::MutexLock lock(mu_);
+    --in_flight_;
+    if (draining_ && in_flight_ == 0) {
+      done_ = true;
+    }
+  }
+  absl::Status GetStatus() const override {
+    absl::MutexLock lock(mu_);
+    return status_;
+  }
+  absl::Status AwaitForDone() override {
+    absl::MutexLock lock(mu_);
+    mu_.Await(absl::Condition(&done_));
+    return status_;
+  }
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return draining_;
+  }
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+    return size_t{0};
+  }
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override {
+    return absl::OkStatus();
+  }
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
+  bool WaitForDone(absl::Duration timeout) const {
+    absl::MutexLock lock(mu_);
+    return mu_.AwaitWithTimeout(absl::Condition(&done_), timeout);
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  bool draining_ ABSL_GUARDED_BY(mu_) = false;
+  bool done_ ABSL_GUARDED_BY(mu_) = false;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
 };
 
 class MockDelegate : public BlockTransportDelegate {
@@ -248,6 +320,22 @@ class MockDelegate : public BlockTransportDelegate {
     return base_remote_id + chunk_k;
   }
 
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    absl::MutexLock lock(sessions_mu_);
+    auto it = sessions_.find(uuid);
+    if (it != sessions_.end()) {
+      return it->second;
+    }
+    return default_session_;
+  }
+
+  void RegisterSession(uint64_t uuid,
+                       std::shared_ptr<TransferSession> session) {
+    absl::MutexLock lock(sessions_mu_);
+    sessions_[uuid] = std::move(session);
+  }
+
   size_t num_layers() const override { return num_layers_; }
   size_t num_shards() const override { return num_shards_; }
   size_t slice_byte_size() const override { return slice_size_; }
@@ -263,26 +351,6 @@ class MockDelegate : public BlockTransportDelegate {
   std::vector<std::tuple<size_t, size_t, int>> wait_events() {
     absl::MutexLock lock(wait_events_mu_);
     return wait_events_;
-  }
-
-  absl::Status EndIncomingPush(
-      uint64_t uuid, const absl::Status& status = absl::OkStatus()) override {
-    (void)uuid;
-    absl::MutexLock lock(end_status_mu_);
-    end_incoming_push_called_ = true;
-    last_end_incoming_push_status_ = status;
-    return absl::OkStatus();
-  }
-
-  bool WaitForEndIncomingPush(absl::Duration timeout) const {
-    absl::MutexLock lock(end_status_mu_);
-    return end_status_mu_.AwaitWithTimeout(
-        absl::Condition(&end_incoming_push_called_), timeout);
-  }
-
-  absl::Status last_end_incoming_push_status() const {
-    absl::MutexLock lock(end_status_mu_);
-    return last_end_incoming_push_status_;
   }
 
  private:
@@ -306,9 +374,11 @@ class MockDelegate : public BlockTransportDelegate {
   std::atomic<int> pool_completion_count_{0};
   absl::Mutex wait_events_mu_;
   std::vector<std::tuple<size_t, size_t, int>> wait_events_;
-  mutable absl::Mutex end_status_mu_;
-  bool end_incoming_push_called_ ABSL_GUARDED_BY(end_status_mu_) = false;
-  absl::Status last_end_incoming_push_status_ ABSL_GUARDED_BY(end_status_mu_);
+  mutable absl::Mutex sessions_mu_;
+  std::shared_ptr<TransferSession> default_session_ =
+      std::make_shared<StubReceiveSession>();
+  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
+      ABSL_GUARDED_BY(sessions_mu_);
   mutable absl::Mutex peer_channels_mu_;
   std::shared_ptr<grpc::Channel> default_channel_
       ABSL_GUARDED_BY(peer_channels_mu_);
@@ -2098,6 +2168,8 @@ TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
   setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "0.1", 1);
 
   MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/2);
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(77, session);
   BlockTransport receiver(&delegate, /*local_port=*/0);
 
   TF_ASSERT_OK_AND_ASSIGN(
@@ -2120,7 +2192,8 @@ TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
   uint8_t ack = 0;
   EXPECT_THAT(ReadExact(fd, &ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
-  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->GetStatus().ok());
 }
 
 TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
@@ -2132,6 +2205,8 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
   setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "0.1", 1);
 
   MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/2);
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(88, session);
   BlockTransport receiver(&delegate, /*local_port=*/0);
 
   TF_ASSERT_OK_AND_ASSIGN(
@@ -2176,7 +2251,8 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
   EXPECT_THAT(ReadExact(fd, &final_ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
-  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->GetStatus().ok());
 }
 
 TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
@@ -2190,8 +2266,12 @@ TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
   TF_ASSERT_OK_AND_ASSIGN(
       int fd, ConnectToPeer(absl::StrCat("127.0.0.1:", receiver.local_port())));
   auto close_fd = absl::MakeCleanup([fd] { close(fd); });
+
   int rcvbuf = 4096;
   ASSERT_EQ(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(99, session);
 
   // Send an Op 1 header requesting 8M block IDs (32 MiB serialized response)
   // and do not drain `fd`, forcing the receiver's block-ID write to stall and
@@ -2208,8 +2288,9 @@ TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
   ASSERT_EQ(::send(fd, s_header.data(), s_header.size(), MSG_NOSIGNAL),
             static_cast<ssize_t>(s_header.size()));
 
-  EXPECT_TRUE(delegate.WaitForEndIncomingPush(absl::Seconds(2)));
-  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
+  EXPECT_TRUE(session->WaitForDone(absl::Seconds(2)));
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->GetStatus().ok());
 }
 
 TEST(TransportBackendTest, ConfigFromEnv) {
@@ -2294,19 +2375,6 @@ TEST(TransportBackendTest, PeregrineReceiverAllocatedPushIsUnimplemented) {
                              /*dst_block_ids=*/{})
                   .Await(),
               StatusIs(absl::StatusCode::kUnimplemented));
-}
-
-TEST(TransportBackendTest, PeregrinePullWithoutRemoteAddressFails) {
-  // Only op 2 (pull) is on Peregrine. Pull requests carry no remote address,
-  // which Peregrine rejects before contacting the peer.
-  auto cleanup =
-      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
-  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "2", 1);
-  MockDelegate delegate(/*slice_size=*/64);
-  BlockTransport puller(&delegate, 0);
-
-  EXPECT_THAT(puller.SyncPull({"127.0.0.1:1"}, /*src_block_ids=*/{0}),
-              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_P(BlockTransportTest, MixedBackendsRouteIndependently) {
@@ -2503,6 +2571,53 @@ TEST(PeregrineRecvCompleteTest, PerRequestMetadataIsNotInterpretedYet) {
                   lib::PostMetadata{.uuid = 0, .remote_id = 1, .local_id = 0},
                   requests),
               StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+}
+
+// A send session admits no incoming push: TryBeginOp() refuses it, so the
+// push is rejected before any byte is written or any layer completes.
+TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
+  class StubSendSession : public TransferSession {
+   public:
+    absl::Status Start() override { return absl::OkStatus(); }
+    absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+      return std::nullopt;
+    }
+    bool Done() const override { return false; }
+    void Finish(const absl::Status& status) override {}
+    absl::Status GetStatus() const override { return absl::OkStatus(); }
+    absl::Status AwaitForDone() override { return absl::OkStatus(); }
+    bool IsDraining() const override { return false; }
+    bool TryBeginOp() override { return false; }
+    void EndOp() override {
+      ADD_FAILURE() << "EndOp should not be called on sender session";
+    }
+    absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+      ADD_FAILURE() << "ResolveStagingSlot should not be called";
+      return absl::UnimplementedError("unused");
+    }
+    absl::Status OnDataReceived(size_t major_dimension_idx,
+                                absl::Span<const int> minor_dimension_indices,
+                                absl::Span<const int> shard_ids) override {
+      ADD_FAILURE() << "OnDataReceived should not be called on sender session";
+      return absl::FailedPreconditionError(
+          "send session does not receive data");
+    }
+    tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+      return tsl::Future<>(absl::OkStatus());
+    }
+  };
+
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1, /*num_layers=*/1,
+                        /*num_shards=*/2);
+  auto send_session = std::make_shared<StubSendSession>();
+  delegate.RegisterSession(77, send_session);
+  BlockTransport transport(&delegate, 0);
+
+  EXPECT_THAT(transport.OnRecvComplete(
+                  lib::PostMetadata{.uuid = 77, .remote_id = 1, .local_id = 0},
+                  /*requests=*/{}),
+              StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
 }
 

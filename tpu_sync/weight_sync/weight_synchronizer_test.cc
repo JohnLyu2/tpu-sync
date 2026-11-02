@@ -193,6 +193,18 @@ TEST_F(WeightSynchronizerTest, PushWeightsHeterogeneousCorrectness) {
   }
 }
 
+// A layer with no shards has no device buffer to size the host staging buffers
+// from, so Create() must fail instead of indexing shard 0. The Torch facade
+// passes `[[]]` through to this overload unchanged.
+TEST_F(WeightSynchronizerTest, CreateRejectsLayerWithNoShards) {
+  const std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers(1);
+
+  absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> ws =
+      WeightSynchronizerBase::Create(layer_buffers);
+
+  EXPECT_EQ(ws.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
 TEST_F(WeightSynchronizerTest, CustomLayerNamesInitialization) {
   size_t num_layers = 2;
   size_t num_shards = 1;
@@ -3171,9 +3183,11 @@ TEST_F(WeightSynchronizerTest,
                           WeightSynchronizerBase::Create(
                               num_layers, num_shards, slice_byte_size,
                               /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  // One destination shard per push, so the concurrent pushes overlap in time
+  // but never write the same destination bytes.
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_dest,
                           WeightSynchronizerBase::Create(
-                              num_layers, num_shards, slice_byte_size,
+                              num_layers, /*num_shards=*/2, slice_byte_size,
                               /*local_port=*/0, /*host_blocks_to_allocate=*/1));
 
   ASSERT_TRUE(ws_dest->local_port().has_value());
@@ -3185,14 +3199,14 @@ TEST_F(WeightSynchronizerTest,
       std::make_shared<peregrine::v1::TestOnlyRateLimiter>(10'000'000);
   ws_source->SetTestOnlyRateLimiters(egress_limiter, /*ingress=*/nullptr);
 
-  auto make_request = [&](uint64_t uuid) {
+  auto make_request = [&](uint64_t uuid, int dst_shard_idx) {
     tpu_sync::rpc::StartTransferRequest req;
     req.set_skip_d2h(true);
     req.set_uuid(uuid);
     auto* schedules = req.mutable_shard_push_schedules();
     auto* entry = (*schedules)[0].add_entries();
     entry->set_dst_peer(dest_peer);
-    entry->set_dst_shard_idx(0);
+    entry->set_dst_shard_idx(dst_shard_idx);
     entry->set_src_offset_bytes(0);
     entry->set_dst_offset_bytes(0);
     entry->set_size_bytes(slice_byte_size);
@@ -3213,7 +3227,8 @@ TEST_F(WeightSynchronizerTest,
   auto fut1 = std::async(std::launch::async, [&]() -> absl::Status {
     start_notification.WaitForNotification();
     auto t0 = absl::Now();
-    auto s = ws_source->PushWeightsResharded(make_request(uuid1));
+    auto s = ws_source->PushWeightsResharded(
+        make_request(uuid1, /*dst_shard_idx=*/0));
     elapsed1_ms = absl::ToDoubleMilliseconds(absl::Now() - t0);
     return s;
   });
@@ -3221,7 +3236,8 @@ TEST_F(WeightSynchronizerTest,
   auto fut2 = std::async(std::launch::async, [&]() -> absl::Status {
     start_notification.WaitForNotification();
     auto t0 = absl::Now();
-    auto s = ws_source->PushWeightsResharded(make_request(uuid2));
+    auto s = ws_source->PushWeightsResharded(
+        make_request(uuid2, /*dst_shard_idx=*/1));
     elapsed2_ms = absl::ToDoubleMilliseconds(absl::Now() - t0);
     return s;
   });

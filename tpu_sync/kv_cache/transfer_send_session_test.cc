@@ -356,7 +356,7 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   session->ValidateAndBeginPull({0, 1}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0, 1},
                      /*dst_block_ids=*/{0, 1});
-  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 1);
   EXPECT_FALSE(base_session->Done());
   EXPECT_FALSE(base_session->IsDraining());
   ABSL_EXPECT_OK(base_session->GetStatus());
@@ -369,7 +369,7 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
 
   base.CompleteD2h(0, absl::OkStatus());
   EXPECT_TRUE(base_session->Done());
-  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
   EXPECT_THAT(base_session->AwaitForDone(),
               StatusIs(absl::StatusCode::kUnavailable));
 }
@@ -390,7 +390,6 @@ TEST(TransferSendSessionTest,
                       /*dst_block_ids=*/{0});
   ABSL_EXPECT_OK(session1->AwaitForDone());
   EXPECT_TRUE(session1->Done());
-  EXPECT_FALSE(session1->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 
   // Session 2 shares the same StagingBlockAllocator and must still be able to
@@ -403,7 +402,6 @@ TEST(TransferSendSessionTest,
                       /*dst_block_ids=*/{0});
   ABSL_EXPECT_OK(session2->AwaitForDone());
   EXPECT_TRUE(session2->Done());
-  EXPECT_FALSE(session2->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
@@ -442,7 +440,7 @@ TEST(TransferSendSessionTest,
   EXPECT_LT(absl::Now() - cancel_start, absl::Seconds(1));
 
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // Returning the held slot leaves the shared allocator healthy.
   held_slot->Reset();
@@ -475,7 +473,6 @@ TEST(TransferSendSessionTest,
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
                      /*dst_block_ids=*/{0});
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(base.d2h_calls(), 0);
   EXPECT_EQ(base.h2h_calls(), 0);
   EXPECT_EQ(allocator->num_free_slots(), 2);
@@ -499,7 +496,6 @@ TEST(TransferSendSessionTest,
 
   // Both D2H copies (layers 0 and 1) have been issued; slot is held.
   ASSERT_EQ(base.d2h_calls(), 2);
-  EXPECT_TRUE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 0);
   EXPECT_FALSE(session->Done());
 
@@ -512,14 +508,12 @@ TEST(TransferSendSessionTest,
   session->Finish(absl::DeadlineExceededError("send deadline exceeded"));
   EXPECT_TRUE(session->IsDraining());
   EXPECT_FALSE(session->Done());
-  EXPECT_TRUE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // Layer 0 H2H finishes first: Done() MUST remain false and staging MUST
   // remain pinned because Layer 1 D2H is still accessing HBM & host staging.
   base.CompleteH2h(0, std::vector<int>{0});
   EXPECT_FALSE(session->Done());
-  EXPECT_TRUE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // Layer 1 D2H finishes: because the session is draining, Layer 1 H2H is NOT
@@ -528,7 +522,6 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 1);
   EXPECT_EQ(base.h2h_calls(), 1);
 
@@ -594,7 +587,6 @@ TEST(TransferSendSessionTest,
 
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
@@ -615,7 +607,6 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kInvalidArgument));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
@@ -665,16 +656,20 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
                      /*dst_block_ids=*/{0});
 
-  EXPECT_TRUE(
-      session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
-  EXPECT_TRUE(session->HasStaging());
+  // The layer's D2H future exists and is pending until the copy completes.
+  EXPECT_FALSE(
+      session->GetDataReadyFuture(/*major_dimension_idx=*/0).IsReady());
+  EXPECT_EQ(allocator->num_free_slots(), 1);
 
   base.CompleteD2h(0, absl::OkStatus());
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
-  EXPECT_FALSE(
-      session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+  // Releasing the staging drops the future, so readers are not gated.
+  tsl::Future<> released =
+      session->GetDataReadyFuture(/*major_dimension_idx=*/0);
+  EXPECT_TRUE(released.IsReady());
+  ABSL_EXPECT_OK(released.Await());
 }
 
 // A D2H dispatch failure fails the send, and the layers whose copy was never
@@ -704,25 +699,11 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->GetStatus(),
               StatusIs(absl::StatusCode::kResourceExhausted));
   EXPECT_FALSE(session->Done());
-  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // A reader gating on the never-issued layer 2 is told about the failure.
-  absl::Mutex cb_mu;
-  std::optional<absl::Status> layer2_status;
-  session->RegisterLayerReadinessCallback(
-      /*layer_idx=*/2, [&](absl::Status status) {
-        absl::MutexLock lock(cb_mu);
-        layer2_status = std::move(status);
-      });
-  {
-    absl::MutexLock lock(cb_mu);
-    auto called = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(cb_mu) {
-      return layer2_status.has_value();
-    };
-    ASSERT_TRUE(
-        cb_mu.AwaitWithTimeout(absl::Condition(&called), absl::Seconds(2)));
-    EXPECT_THAT(*layer2_status, StatusIs(absl::StatusCode::kResourceExhausted));
-  }
+  EXPECT_THAT(session->GetDataReadyFuture(/*major_dimension_idx=*/2).Await(),
+              StatusIs(absl::StatusCode::kResourceExhausted));
 
   // The issued copy of layer 0 still pins the staging; its completion settles
   // the send without starting any push.
@@ -730,7 +711,6 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kResourceExhausted));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 1);
   EXPECT_EQ(base.h2h_calls(), 0);
 }
@@ -792,7 +772,60 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 0u);
   EXPECT_EQ(base.h2h_calls(), 1);
-  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
+// The first layer's D2H dispatch fails, so no copy is ever issued: the
+// dispatch error fails the send, `fail_unissued_layers` resolves layer 0's
+// promise with it, and the H2H chain's own callback on that promise releases
+// the last op. The send settles inside StartPush with nothing in flight.
+TEST(TransferSendSessionTest, FailedD2hDispatchOnFirstLayerSettlesAtOnce) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.FailD2hDispatchAtLayer(/*layer_idx=*/0,
+                              absl::InternalError("dispatch refused"));
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_first_dispatch_fail", /*uuid=*/309,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  EXPECT_EQ(base.d2h_calls(), 1);
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(base.h2h_calls(), 0);
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
+// A send cancelled while its push is in flight keeps the cancellation when
+// the push then fails: FinishLocked is first-Finish-wins, so the push
+// callback's error does not replace the status already decided, and the
+// failed push's op is what settles the send.
+TEST(TransferSendSessionTest, CancelledSendWhosePushThenFailsKeepsCancelled) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_cancel_then_push_fail", /*uuid=*/310,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+
+  session->Finish(absl::CancelledError("consumer cancelled"));
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+
+  base.CompleteH2h(0, absl::InternalError("push failed"));
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 

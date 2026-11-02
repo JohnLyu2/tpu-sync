@@ -19,10 +19,24 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "transfer_session",
+    hdrs = ["transfer_session.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:optional",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla/tsl/concurrency:future",
+    ],
+)
+
+cc_library(
     name = "block_transport_delegate",
     hdrs = ["block_transport_delegate.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":transfer_session",
         "//tpu_sync/transport/lib:raw_buffer_transport_delegate",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -49,6 +63,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":block_transport_delegate",
+        ":transfer_session",
         "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/telemetry:label_util",
         "//tpu_sync/telemetry:metrics_api",
@@ -129,6 +144,7 @@ cc_test(
         ":block_transport",
         ":block_transport_delegate",
         ":buffer_push_task",
+        ":transfer_session",
         "//tpu_sync/telemetry:metrics_3p_prometheus_exporter",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
@@ -149,12 +165,13 @@ cc_test(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api/v1:conn_util",
         "@peregrine//peregrine/src/api/v1:socket_util",
-        "@xla//xla/tsl/platform:statusor",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -169,7 +186,9 @@ cc_test(
     deps = [
         ":block_transport_delegate",
         ":block_transport_session",
+        ":transfer_session",
         "//tpu_sync/transport/lib:chunk",
+        "//tpu_sync/transport/lib:transport_adapter",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",

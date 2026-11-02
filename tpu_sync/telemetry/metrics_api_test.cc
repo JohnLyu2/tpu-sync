@@ -263,6 +263,69 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kBufferAllocatedBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names, IsEmpty());
 
+  // StorageBytesTotal
+  EXPECT_EQ(metric_names::kStorageBytesTotal, "storage_bytes_total");
+  EXPECT_EQ(metric_descriptions::kStorageBytesTotal,
+            "Total bytes read from or written to secondary storage");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.name, "storage_bytes_total");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.description,
+            "Total bytes read from or written to secondary storage");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(
+      metric_metadata::kStorageBytesTotal.label_names,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+
+  // HostMemoryBreakdownBytes
+  EXPECT_EQ(metric_names::kHostMemoryBreakdownBytes,
+            "host_memory_breakdown_bytes");
+  EXPECT_EQ(metric_descriptions::kHostMemoryBreakdownBytes,
+            "Host DRAM memory breakdown in bytes by component (kv_pool, "
+            "process_heap, page_cache, free)");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.name,
+            "host_memory_breakdown_bytes");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.description,
+            "Host DRAM memory breakdown in bytes by component (kv_pool, "
+            "process_heap, page_cache, free)");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.type,
+            MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostMemoryBreakdownBytes.label_names,
+              ElementsAre(metric_labels::kComponent));
+
+  // HostNumaMemoryBytes
+  EXPECT_EQ(metric_labels::kNumaNode, "numa_node");
+  EXPECT_EQ(metric_labels::kState, "state");
+  EXPECT_EQ(metric_labels::kStateUsed, "used");
+  EXPECT_EQ(metric_labels::kStateFree, "free");
+  EXPECT_EQ(metric_labels::kStateTotal, "total");
+  EXPECT_THAT(metric_labels::kHostNumaMemoryLabels,
+              ElementsAre(metric_labels::kNumaNode, metric_labels::kState));
+  EXPECT_EQ(metric_names::kHostNumaMemoryBytes, "host_numa_memory_bytes");
+  EXPECT_EQ(metric_descriptions::kHostNumaMemoryBytes,
+            "Per-NUMA-node host DRAM memory in bytes by state (used, free, "
+            "total)");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.name,
+            "host_numa_memory_bytes");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.description,
+            "Per-NUMA-node host DRAM memory in bytes by state (used, free, "
+            "total)");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostNumaMemoryBytes.label_names,
+              ElementsAre(metric_labels::kNumaNode, metric_labels::kState));
+
+  // StorageFilesystemBytes
+  EXPECT_EQ(metric_labels::kMount, "mount");
+  EXPECT_EQ(metric_names::kStorageFilesystemBytes, "storage_filesystem_bytes");
+  EXPECT_EQ(metric_descriptions::kStorageFilesystemBytes,
+            "Secondary storage filesystem capacity in bytes by mount and state "
+            "(total, used, free)");
+  EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.name,
+            "storage_filesystem_bytes");
+  EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.description,
+            "Secondary storage filesystem capacity in bytes by mount and state "
+            "(total, used, free)");
+  EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kStorageFilesystemBytes.label_names,
+              ElementsAre(metric_labels::kMount, metric_labels::kState));
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -397,6 +460,52 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_labels::kPcieTransferLabels,
               ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
+  // KV Cache Labels & Metrics
+  EXPECT_EQ(metric_labels::kDpRank, "dp_rank");
+  EXPECT_EQ(metric_labels::kTier, "tier");
+  EXPECT_EQ(metric_labels::kTierLocalDram, "local_dram");
+  EXPECT_EQ(metric_labels::kTierRemoteDram, "remote_dram");
+  EXPECT_EQ(metric_labels::kTierSharedStorage, "shared_storage");
+  EXPECT_EQ(metric_labels::kOutcome, "outcome");
+  EXPECT_EQ(metric_labels::kOutcomeOk, "ok");
+  EXPECT_EQ(metric_labels::kOutcomeNotFound, "not_found");
+  EXPECT_EQ(metric_labels::kOutcomeStagingExhausted, "staging_exhausted");
+  EXPECT_EQ(metric_labels::kOutcomeTransferFailed, "transfer_failed");
+  EXPECT_THAT(metric_labels::kKvRecallBlocksLabels,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+
+  EXPECT_EQ(metric_names::kKvRecallBlocksTotal, "kv_recall_blocks_total");
+  EXPECT_EQ(metric_descriptions::kKvRecallBlocksTotal,
+            "Cumulative count of KV cache block recall attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.name,
+            "kv_recall_blocks_total");
+  EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.description,
+            "Cumulative count of KV cache block recall attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kKvRecallBlocksTotal.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+
+  // Storage Bytes Labels
+  EXPECT_THAT(
+      metric_labels::kStorageBytesLabels,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+  // Host Memory Breakdown Labels
+  EXPECT_EQ(metric_labels::kComponent, "component");
+  EXPECT_EQ(metric_labels::kComponentKvPool, "kv_pool");
+  EXPECT_EQ(metric_labels::kComponentProcessHeap, "process_heap");
+  EXPECT_EQ(metric_labels::kComponentPageCache, "page_cache");
+  EXPECT_EQ(metric_labels::kComponentFree, "free");
+  EXPECT_THAT(metric_labels::kHostMemoryBreakdownLabels,
+              ElementsAre(metric_labels::kComponent));
+
+  // Storage Filesystem Labels
+  EXPECT_THAT(metric_labels::kStorageFilesystemBytesLabels,
+              ElementsAre(metric_labels::kMount, metric_labels::kState));
+
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -414,6 +523,11 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kD2hTransferTimeMs,
           metric_metadata::kD2hDmaTimeMs,
           metric_metadata::kBufferAllocatedBytes,
+          metric_metadata::kKvRecallBlocksTotal,
+          metric_metadata::kStorageBytesTotal,
+          metric_metadata::kHostMemoryBreakdownBytes,
+          metric_metadata::kHostNumaMemoryBytes,
+          metric_metadata::kStorageFilesystemBytes,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

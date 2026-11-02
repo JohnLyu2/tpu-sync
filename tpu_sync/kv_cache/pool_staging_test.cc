@@ -19,20 +19,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/time/time.h"
+#include "absl/types/optional.h"
+#include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -43,15 +52,20 @@ using ::absl_testing::StatusIs;
 class StagingTestManager : public KVCacheManagerBase {
  public:
   StagingTestManager(size_t num_layers, size_t num_shards,
-                     size_t slice_byte_size, int host_blocks)
+                     size_t slice_byte_size, int host_blocks,
+                     std::optional<int> num_staging_layers = std::nullopt)
       : KVCacheManagerBase(num_layers, num_shards, slice_byte_size,
                            /*local_port=*/std::nullopt,
-                           std::make_optional(host_blocks)) {
+                           std::make_optional(host_blocks), /*parallelism=*/1,
+                           /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
+                           num_staging_layers) {
     buffer_holds_.resize(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       buffer_holds_[l].holds.resize(num_shards);
-      for (size_t sh = 0; sh < num_shards; ++sh) {
-        layers_[l].shards[sh].device_size = host_blocks * slice_byte_size;
+      if (l < layers_.size()) {
+        for (size_t sh = 0; sh < num_shards; ++sh) {
+          layers_[l].shards[sh].device_size = host_blocks * slice_byte_size;
+        }
       }
     }
   }
@@ -60,9 +74,33 @@ class StagingTestManager : public KVCacheManagerBase {
   void SetDeviceBacked(size_t layer_idx, size_t physical_size) {
     buffer_holds_[layer_idx].physical_size = physical_size;
     major_dim_size_ = 1;
-    for (auto& shard : layers_[layer_idx].shards) {
-      shard.device_size = physical_size;
+    if (layer_idx < layers_.size()) {
+      for (auto& shard : layers_[layer_idx].shards) {
+        shard.device_size = physical_size;
+      }
     }
+  }
+};
+
+// Hosts a |Base| test manager behind KVCacheManagerWithTransfer so that
+// registered plans live in transfer sessions, the only place plans are
+// stored. Base-level plan calls on manager() route through its hooks.
+template <typename Base>
+class WithPlanSessions : public KVCacheManagerWithTransfer {
+ public:
+  template <typename... Args>
+  explicit WithPlanSessions(Args&&... args)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<Base>(std::forward<Args>(args)...)) {}
+
+  Base& manager() { return static_cast<Base&>(*base_); }
+
+  // Stages plans in per-transfer host blocks, as
+  // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does.
+  void EnableDemandStaging() {
+    staging_allocator_ = CreateStagingBlockAllocator(
+        base_.get(), staging_allocator_->num_slots(),
+        staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
   }
 };
 
@@ -115,8 +153,10 @@ PoolSpec StridedPool(const std::string& tag, size_t storage_index,
 TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   constexpr int64_t kStride = 64;
   constexpr int64_t kNumBlocks = 16;
-  StagingTestManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> manager_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& manager = manager_host.manager();
   manager.SetDeviceBacked(0, kStride * kNumBlocks);
   // 2 leases x 2 blocks per lease = 4 slots, well under the 16-block pool.
   absl::Status status =
@@ -168,7 +208,7 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   entry->set_dst_offset_bytes(8);
   entry->set_src_offset_bytes(0);
   entry->set_size_bytes(16);
-  status = manager.RegisterActivePlan(7, request, /*is_sender=*/false);
+  status = manager_host.RegisterActivePlan(7, request, /*is_sender=*/false);
   ABSL_ASSERT_OK(status);
   uint8_t* host_base = manager.GetHostPointer(/*layer_idx=*/0, 0);
   std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
@@ -194,7 +234,7 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   EXPECT_THAT(status, StatusIs(absl::StatusCode::kResourceExhausted));
 
   // Releasing uuid 7 returns its three slots; uuid 8 now fits.
-  ABSL_ASSERT_OK(manager.UnregisterActivePlan(7));
+  ABSL_ASSERT_OK(manager_host.UnregisterActivePlan(7));
   manager.ReleasePoolStagingLeases(7);
   EXPECT_EQ(manager.PoolStagingSummary()[0].free_slots, 4);
   status = manager.AcquirePoolStagingLease(8, 0, std::vector<int64_t>{1, 2},
@@ -249,8 +289,10 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
   ABSL_ASSERT_OK(status);
   EXPECT_FALSE(small.PoolStorageStagingBounded(0));
 
-  StagingTestManager shared(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> shared_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& shared = shared_host.manager();
   shared.SetDeviceBacked(0, kStride * 32);
   status = shared.RegisterPools(
       {StridedPool("gdn.conv", 0, /*base_offset=*/0, kStride, 32, 1),
@@ -277,7 +319,8 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
     entry->set_size_bytes(16);
     entry->set_layer_idx(pool_idx);
   }
-  ABSL_ASSERT_OK(shared.RegisterActivePlan(5, request, /*is_sender=*/false));
+  ABSL_ASSERT_OK(
+      shared_host.RegisterActivePlan(5, request, /*is_sender=*/false));
   uint8_t* base = shared.GetHostPointer(0, 0);
   auto conv_chunks =
       shared.GetBlockChunks(/*layer_idx=*/0, 0, std::vector<int64_t>{20}, 16, 5,
@@ -307,9 +350,11 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
   constexpr int64_t kDstBase = 128;
   constexpr int64_t kDstStride = 64;
   constexpr int64_t kDstBlocks = 8;
-  StagingTestManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/kDstStride,
-                              /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kDstStride,
+      /*host_blocks=*/1);
+  StagingTestManager& receiver = receiver_host.manager();
   receiver.SetDeviceBacked(0, kDstBase + kDstStride * kDstBlocks);
   ABSL_ASSERT_OK(receiver.RegisterPools(
       {DensePool("fa", 0, kDstBase, kDstStride, kDstBlocks, 0)},
@@ -318,8 +363,10 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
 
   constexpr int64_t kSrcStride = 32;
   constexpr int64_t kSrcBlocks = 16;
-  StagingTestManager sender(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/kSrcStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> sender_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kSrcStride, /*host_blocks=*/1);
+  StagingTestManager& sender = sender_host.manager();
   sender.SetDeviceBacked(0, kSrcStride * kSrcBlocks);
   ABSL_ASSERT_OK(
       sender.RegisterPools({DensePool("fa", 0, 0, kSrcStride, kSrcBlocks, 0)},
@@ -347,8 +394,8 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
 
   tpu_sync::rpc::StartTransferRequest recv_request = request;
   recv_request.set_is_sender(false);
-  ABSL_ASSERT_OK(receiver.RegisterActivePlan(11, recv_request,
-                                             /*is_sender=*/false));
+  ABSL_ASSERT_OK(receiver_host.RegisterActivePlan(11, recv_request,
+                                                  /*is_sender=*/false));
   std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{5},
       /*total_bytes=*/32, /*uuid=*/11, /*sender_node_id=*/0, /*peer=*/"",
@@ -366,8 +413,8 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
   for (uint64_t addr : dst_bases.host_base_addrs()) {
     dst_pool.add_host_base_addrs(addr);
   }
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(11, send_request,
-                                           /*is_sender=*/true));
+  ABSL_ASSERT_OK(sender_host.RegisterActivePlan(11, send_request,
+                                                /*is_sender=*/true));
   std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{3},
       /*total_bytes=*/32, /*uuid=*/11, /*sender_node_id=*/-1, kPeer,
@@ -392,8 +439,8 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
   other_request.mutable_receiver_addrs()->clear();
   (*other_request.mutable_receiver_addrs())["127.0.0.1:2"] =
       send_request.receiver_addrs().at(kPeer);
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(12, other_request,
-                                           /*is_sender=*/true));
+  ABSL_ASSERT_OK(sender_host.RegisterActivePlan(12, other_request,
+                                                /*is_sender=*/true));
   send_chunks = sender.GetBlockChunks(0, 0, std::vector<int64_t>{3}, 32,
                                       /*uuid=*/12, -1, kPeer, -1, 5);
   ASSERT_EQ(send_chunks.size(), 2u);
@@ -405,8 +452,8 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
   send_request.set_uuid(13);
   (*(*send_request.mutable_receiver_addrs())[kPeer].mutable_pools())[0]
       .clear_host_base_addrs();
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(13, send_request,
-                                           /*is_sender=*/true));
+  ABSL_ASSERT_OK(sender_host.RegisterActivePlan(13, send_request,
+                                                /*is_sender=*/true));
   send_chunks = sender.GetBlockChunks(0, 0, std::vector<int64_t>{3}, 32,
                                       /*uuid=*/13, -1, kPeer, -1, 5);
   ASSERT_EQ(send_chunks.size(), 2u);
@@ -419,8 +466,10 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
 TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot) {
   constexpr int64_t kStride = 64;
   constexpr int64_t kBlocks = 16;
-  StagingTestManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& receiver = receiver_host.manager();
   receiver.SetDeviceBacked(0, kStride * kBlocks);
   ABSL_ASSERT_OK(
       receiver.RegisterPools({DensePool("fa", 0, 0, kStride, kBlocks,
@@ -431,8 +480,10 @@ TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot) {
       /*uuid=*/11, /*storage_idx=*/0, std::vector<int64_t>{5, 9},
       absl::Milliseconds(50)));
 
-  StagingTestManager sender(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> sender_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& sender = sender_host.manager();
   sender.SetDeviceBacked(0, kStride * kBlocks);
   ABSL_ASSERT_OK(sender.RegisterPools(
       {DensePool("fa", 0, 0, kStride, kBlocks, 0)}, /*staging_leases=*/0));
@@ -455,8 +506,8 @@ TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot) {
 
   tpu_sync::rpc::StartTransferRequest recv_request = request;
   recv_request.set_is_sender(false);
-  ABSL_ASSERT_OK(receiver.RegisterActivePlan(11, recv_request,
-                                             /*is_sender=*/false));
+  ABSL_ASSERT_OK(receiver_host.RegisterActivePlan(11, recv_request,
+                                                  /*is_sender=*/false));
   std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{9},
       /*total_bytes=*/16, /*uuid=*/11, /*sender_node_id=*/0, /*peer=*/"",
@@ -468,8 +519,8 @@ TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot) {
   TF_ASSERT_OK_AND_ASSIGN(
       (*(*send_request.mutable_receiver_addrs())[kPeer].mutable_pools())[0],
       receiver.PoolHostBaseAddrs(/*uuid=*/11, /*pool_idx=*/0));
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(11, send_request,
-                                           /*is_sender=*/true));
+  ABSL_ASSERT_OK(sender_host.RegisterActivePlan(11, send_request,
+                                                /*is_sender=*/true));
   std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{3},
       /*total_bytes=*/16, /*uuid=*/11, /*sender_node_id=*/-1, kPeer,
@@ -518,6 +569,200 @@ TEST(PoolStagingTest, PoolHostBaseAddrs) {
   TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto addrs,
                           bounded.PoolHostBaseAddrs(/*uuid=*/1, 0));
   EXPECT_TRUE(addrs.host_base_addrs().empty());
+}
+
+TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 16;
+  constexpr size_t kNumLayers = 4;
+  StagingTestManager manager(/*num_layers=*/kNumLayers, /*num_shards=*/1,
+                             /*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                             /*num_staging_layers=*/2);
+
+  EXPECT_EQ(manager.num_layers(), kNumLayers);
+  EXPECT_EQ(manager.num_host_layers(), 2u);
+
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    manager.SetDeviceBacked(i, kStride * kNumBlocks);
+  }
+
+  // Register 4 pools, one per storage, with bounded staging (2 leases x 2
+  // blocks = 4 slots).
+  std::vector<PoolSpec> pools;
+  pools.reserve(kNumLayers);
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    pools.push_back(DensePool("pool_" + std::to_string(i), /*storage_index=*/i,
+                              /*base_offset=*/0, kStride, kNumBlocks,
+                              /*staging_blocks_per_request=*/2));
+  }
+  ABSL_ASSERT_OK(manager.RegisterPools(pools, /*staging_leases=*/2));
+
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    EXPECT_EQ(manager.GetBlockArrayHostSize(i, 0),
+              static_cast<size_t>(4 * kStride));
+  }
+
+  // Receiver plan for uuid 42.
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(42);
+  request.set_is_sender(false);
+  auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer("127.0.0.1:1");
+  entry->set_dst_shard_idx(0);
+  entry->set_dst_block_id(4);
+  entry->set_src_block_id(1);
+  entry->set_dst_offset_bytes(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_size_bytes(16);
+  absl::StatusOr<TransferPlan> plan =
+      TransferPlan::Create(request, /*is_sender=*/false, manager.num_pools(),
+                           manager.has_explicit_pools(), manager.pools());
+  ABSL_ASSERT_OK(plan);
+
+  // A session that carries the plan and leases host layer 1 for pool 3.
+  class StubPoolTransferSession : public TransferSession {
+   public:
+    absl::Status Start() override { return absl::OkStatus(); }
+    explicit StubPoolTransferSession(std::shared_ptr<const TransferPlan> plan)
+        : plan_(std::move(plan)) {}
+    bool Done() const override { return false; }
+    void Finish(const absl::Status& status) override {}
+    bool TryBeginOp() override { return true; }
+    void EndOp() override {}
+    absl::Status GetStatus() const override { return absl::OkStatus(); }
+    absl::Status AwaitForDone() override { return absl::OkStatus(); }
+    bool IsDraining() const override { return false; }
+    absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+      return unit % 2;
+    }
+    absl::Status OnDataReceived(size_t major_dimension_idx,
+                                absl::Span<const int> minor_dimension_indices,
+                                absl::Span<const int> shard_ids) override {
+      return absl::OkStatus();
+    }
+    tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+      return tsl::Future<>(absl::OkStatus());
+    }
+    absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+      return plan_;
+    }
+
+   private:
+    std::shared_ptr<const TransferPlan> plan_;
+  };
+  auto session = std::make_shared<StubPoolTransferSession>(
+      std::make_shared<const TransferPlan>(*std::move(plan)));
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session = [session](uint64_t uuid)
+      -> absl::StatusOr<std::shared_ptr<TransferSession>> { return session; };
+  manager.SetTransferEventHooks(std::move(hooks));
+
+  // Lease blocks 2 and 4 on storage 3 under uuid 42.
+  ABSL_ASSERT_OK(
+      manager.AcquirePoolStagingLease(42, 3, {2, 4}, absl::Milliseconds(50)));
+
+  // For pool 3, the hook returns host slot 1 (pool 3 % 2 = 1).
+  // Destination block 4 was leased as the 2nd block (slot 1 within the lease
+  // arena).
+  std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
+      /*layer_idx=*/3, /*shard_idx=*/0, {4}, /*total_bytes=*/16, /*uuid=*/42,
+      /*sender_node_id=*/0);
+  ASSERT_EQ(chunks.size(), 1u);
+  EXPECT_EQ(chunks[0].size, 16u);
+  uint8_t* expected_host_base = manager.GetHostPointer(/*layer_idx=*/1, 0);
+  EXPECT_EQ(chunks[0].ptr, expected_host_base + 1 * kStride);
+
+  manager.ReleasePoolStagingLeases(42);
+}
+
+TEST(PoolStagingTest, GetBlockChunksLargePlanLinearScaling) {
+  constexpr size_t kNumShards = 8;
+  constexpr size_t kNumFaPools = 6;
+  constexpr size_t kTotalPools = 93;
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kMaxBlocks = 4096;
+  constexpr int64_t kNumBlocks = 3072;
+  constexpr uint64_t kUuid = 101;
+  constexpr char kPeer[] = "127.0.0.1:1";
+
+  WithPlanSessions<StagingTestManager> receiver_host(1, kNumShards, kStride,
+                                                     /*host_blocks=*/1);
+  StagingTestManager& receiver = receiver_host.manager();
+  WithPlanSessions<StagingTestManager> sender_host(1, kNumShards, kStride,
+                                                   /*host_blocks=*/1);
+  StagingTestManager& sender = sender_host.manager();
+  const size_t storage_bytes = kTotalPools * kStride * kMaxBlocks;
+  receiver.SetDeviceBacked(0, storage_bytes);
+  sender.SetDeviceBacked(0, storage_bytes);
+
+  std::vector<PoolSpec> specs;
+  specs.reserve(kTotalPools);
+  for (size_t pool_idx = 0; pool_idx < kTotalPools; ++pool_idx) {
+    specs.push_back(DensePool("pool_" + std::to_string(pool_idx), 0,
+                              pool_idx * kStride * kMaxBlocks, kStride,
+                              kMaxBlocks, /*staging_blocks_per_request=*/0));
+  }
+  ABSL_ASSERT_OK(receiver.RegisterPools(specs, /*staging_leases=*/0));
+  ABSL_ASSERT_OK(sender.RegisterPools(specs, /*staging_leases=*/0));
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(kUuid);
+  request.set_req_id("req");
+  tpu_sync::rpc::PoolGroupProto* fa_group = request.add_pool_groups();
+  tpu_sync::rpc::PoolGroupProto* swa_group = request.add_pool_groups();
+  fa_group->set_expected_pushes(1);
+  swa_group->set_expected_pushes(1);
+  for (size_t pool_idx = 0; pool_idx < kTotalPools; ++pool_idx) {
+    request.add_transfer_pool_indices(pool_idx);
+    (pool_idx < kNumFaPools ? fa_group : swa_group)->add_pool_indices(pool_idx);
+  }
+
+  std::vector<int64_t> dst_blocks(kNumBlocks);
+  for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+    tpu_sync::rpc::ShardPushScheduleProto& schedule =
+        (*request.mutable_shard_push_schedules())[shard_idx];
+    for (int64_t block_id = 0; block_id < kNumBlocks; ++block_id) {
+      dst_blocks[block_id] = block_id + 100;
+      tpu_sync::rpc::ShardPushEntryProto* entry = schedule.add_entries();
+      entry->set_dst_peer(kPeer);
+      entry->set_dst_shard_idx(shard_idx);
+      entry->set_src_block_id(block_id);
+      entry->set_dst_block_id(dst_blocks[block_id]);
+      entry->set_size_bytes(kStride);
+      entry->set_pool_group(0);
+    }
+  }
+  ABSL_ASSERT_OK(
+      receiver_host.RegisterActivePlan(kUuid, request, /*is_sender=*/false));
+  for (size_t pool_idx = 0; pool_idx < kNumFaPools; ++pool_idx) {
+    TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto pool_addrs,
+                            receiver.PoolHostBaseAddrs(kUuid, pool_idx));
+    (*(*request.mutable_receiver_addrs())[kPeer].mutable_pools())[pool_idx] =
+        pool_addrs;
+  }
+  ABSL_ASSERT_OK(
+      sender_host.RegisterActivePlan(kUuid, request, /*is_sender=*/true));
+
+  for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+    for (size_t pool_idx = 0; pool_idx < kNumFaPools; ++pool_idx) {
+      std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
+          pool_idx, shard_idx, dst_blocks, kNumBlocks * kStride, kUuid,
+          /*sender_node_id=*/shard_idx);
+      ASSERT_EQ(recv_chunks.size(), static_cast<size_t>(kNumBlocks));
+      for (int64_t block_id = 0; block_id < kNumBlocks; ++block_id) {
+        std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
+            pool_idx, shard_idx, {block_id}, kStride, kUuid,
+            /*sender_node_id=*/-1, kPeer, block_id, dst_blocks[block_id]);
+        ASSERT_EQ(send_chunks.size(), 1u);
+        EXPECT_EQ(send_chunks[0].raddr, recv_chunks[block_id].ptr);
+      }
+    }
+  }
+  EXPECT_TRUE(receiver
+                  .GetBlockChunks(kNumFaPools, /*shard_idx=*/0, dst_blocks,
+                                  kNumBlocks * kStride, kUuid,
+                                  /*sender_node_id=*/0)
+                  .empty());
 }
 
 }  // namespace

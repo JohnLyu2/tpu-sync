@@ -111,12 +111,9 @@ class BlockTransportServerSession : public BlockTransportSession {
 class BlockTransportServerPushSession final
     : public BlockTransportServerSession {
  public:
-  using OnCompletedCallback = std::function<void(uint64_t uuid)>;
-
   BlockTransportServerPushSession(uint64_t uuid,
                                   BlockTransportDelegate* delegate,
-                                  const BlockTransportConfig& config,
-                                  OnCompletedCallback on_completed = nullptr);
+                                  const BlockTransportConfig& config);
 
   ~BlockTransportServerPushSession() override = default;
 
@@ -135,6 +132,7 @@ class BlockTransportServerPushSession final
       const lib::PostMetadata& post,
       absl::Span<const lib::RequestMetadata> requests);
 
+ private:
   // Accounting for stream and shard arrivals.
   absl::Status CompleteIncomingPush(
       uint32_t local_id, uint32_t remote_id, size_t num_streams,
@@ -142,7 +140,6 @@ class BlockTransportServerPushSession final
       const std::optional<PoolPushProgressSpec>& pool_progress_spec,
       bool is_peregrine = false);
 
- private:
   struct LayerProgress {
     size_t completed_chunks = 0;
     struct SenderStreams {
@@ -163,13 +160,11 @@ class BlockTransportServerPushSession final
   const uint64_t uuid_;
   BlockTransportDelegate* const delegate_;
   const BlockTransportConfig config_;
-  OnCompletedCallback on_completed_;
 
   mutable absl::Mutex mu_;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<int, LayerProgress> layer_progress_ ABSL_GUARDED_BY(mu_);
-  size_t layers_dispatched_ ABSL_GUARDED_BY(mu_) = 0;
 };
 
 // Server-side session managing incoming pull requests (op 2).

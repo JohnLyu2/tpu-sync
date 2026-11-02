@@ -49,6 +49,7 @@ namespace {
 
 using TensorList = std::vector<at::Tensor>;
 
+using ::tpu_raiden::torch::FoldedViews;
 using ::tpu_raiden::torch::UnpackTorchTensor;
 
 void DeleteHostBufferAllocation(void* ctx) {
@@ -229,7 +230,6 @@ void ValidateMajorDimLayout(const RaidenBufferHandle& buffer,
                      "the "
                      "outermost, physically contiguous dimension."));
   }
-  const int64_t slice = GetMajorSliceByteSize(shape);
   // Fallback to buffer->GetOnDeviceSizeInBytes() if available, but for now we
   // might not have it easily without deprecated buffer pointer if it's not
   // cached in handle.
@@ -241,6 +241,7 @@ void ValidateMajorDimLayout(const RaidenBufferHandle& buffer,
                 absl::StrCat(role, " physical buffer size for layout check"),
                 buffer.buffer->GetOnDeviceSizeInBytes())
           : xla::ShapeUtil::ByteSizeOf(shape);  // Fallback
+  const int64_t slice = GetMajorSliceByteSize(shape, physical_size);
 
   if (slice <= 0 || physical_size % slice != 0) {
     throw std::invalid_argument(
@@ -285,7 +286,8 @@ PjRtCopyFuture IssueD2HCopy(const RaidenBufferHandle& src_buffer,
           ? ValueOrThrow("Failed to get source physical buffer size",
                          src_buffer.buffer->GetOnDeviceSizeInBytes())
           : xla::ShapeUtil::ByteSizeOf(src_buffer.shape);
-  const int64_t slice_byte_size = GetMajorSliceByteSize(src_buffer.shape);
+  const int64_t slice_byte_size =
+      GetMajorSliceByteSize(src_buffer.shape, physical_size);
 
   if (is_partial) {
     tpu_raiden::ValidatePartialAlignment(src_buffer.shape, slice_byte_size);
@@ -336,7 +338,8 @@ PjRtCopyFuture IssueH2DCopy(const uint8_t* src_data, size_t src_size,
           ? ValueOrThrow("Failed to get destination physical buffer size",
                          dst_buffer.buffer->GetOnDeviceSizeInBytes())
           : xla::ShapeUtil::ByteSizeOf(dst_buffer.shape);
-  const int64_t slice_byte_size = GetMajorSliceByteSize(dst_buffer.shape);
+  const int64_t slice_byte_size =
+      GetMajorSliceByteSize(dst_buffer.shape, physical_size);
 
   if (is_partial) {
     tpu_raiden::ValidatePartialAlignment(dst_buffer.shape, slice_byte_size);
@@ -387,7 +390,10 @@ PjRtCopyFuture TransferD2HBatchAsync(
   futures.reserve(src_arrs.size());
   for (size_t i = 0; i < src_arrs.size(); ++i) {
     ValidateCpuTensor(dst_arrs[i], "Destination");
-    auto unpacked = UnpackTorchTensor(src_arrs[i], unsafe_skip_buffer_lock);
+    // Rejects folded views: the major-dimension offsets address the base
+    // buffer's leading dimension.
+    auto unpacked = UnpackTorchTensor(src_arrs[i], unsafe_skip_buffer_lock,
+                                      FoldedViews::kReject);
     AwaitReady(unpacked.buffer.buffer, "Source");
     const RaidenBufferHandle& src_buffer = unpacked.buffer;
 
@@ -400,6 +406,22 @@ PjRtCopyFuture TransferD2HBatchAsync(
         copy_sizes_major_dim, std::move(keep_alive)));
   }
   return JoinPjRtCopyFutures(absl::MakeSpan(futures));
+}
+
+int64_t MajorSliceBytes(const at::Tensor& tpu_tensor,
+                        bool unsafe_skip_buffer_lock) {
+  // Rejects folded views, like the transfers whose major-dimension units this
+  // reports: the slice below is one of the base buffer's leading dimension.
+  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock,
+                                    FoldedViews::kReject);
+  AwaitReady(unpacked.buffer.buffer, "Tensor");
+  const RaidenBufferHandle& buffer = unpacked.buffer;
+  ValidateMajorDimLayout(buffer, "Tensor");
+  const int64_t physical_size =
+      buffer.buffer ? ValueOrThrow("Failed to get physical buffer size",
+                                   buffer.buffer->GetOnDeviceSizeInBytes())
+                    : xla::ShapeUtil::ByteSizeOf(buffer.shape);
+  return GetMajorSliceByteSize(buffer.shape, physical_size);
 }
 
 PjRtCopyFuture TransferH2DBatchAsync(
@@ -417,7 +439,8 @@ PjRtCopyFuture TransferH2DBatchAsync(
   futures.reserve(src_arrs.size());
   for (size_t i = 0; i < src_arrs.size(); ++i) {
     ValidateCpuTensor(src_arrs[i], "Source");
-    auto unpacked = UnpackTorchTensor(dst_arrs[i], unsafe_skip_buffer_lock);
+    auto unpacked = UnpackTorchTensor(dst_arrs[i], unsafe_skip_buffer_lock,
+                                      FoldedViews::kReject);
     // The destination buffer's ready future signals that it is safe to write
     // into (allocation defined, no pending producer).
     AwaitReady(unpacked.buffer.buffer, "Destination");
@@ -463,7 +486,8 @@ PreparedTorchRawTransfer::PreparedTorchRawTransfer(
   if (!host_buffer_) {
     throw std::invalid_argument("host_buffer must not be None");
   }
-  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock);
+  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock,
+                                    FoldedViews::kReject);
   AwaitReady(unpacked.buffer.buffer, "TPU tensor");
   buffer_ = std::move(unpacked.buffer);
   buffer_ref_ = std::move(unpacked.ref);  // keep the materialized buffer alive

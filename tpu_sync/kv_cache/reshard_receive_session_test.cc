@@ -14,32 +14,53 @@
 
 #include "tpu_sync/kv_cache/reshard_receive_session.h"
 
+#include <chrono>  // NOLINT(build/c++11)
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 
 struct ReshardReceiveSessionTestPeer {
+  static absl::StatusOr<size_t> LookupStagingSlot(
+      const ReshardReceiveSession& session, size_t pool_idx) {
+    return session.LookupStagingSlot(pool_idx);
+  }
+
   static absl::Status ValidatePlan(
       const kv_cache::KVCacheManagerBase& base,
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> chip_blocks) {
     return ReshardReceiveSession::ValidatePlan(base, plan, chip_blocks);
   }
+
+  static std::optional<size_t> ReleaseStagingSlot(
+      ReshardReceiveSession& session, size_t pool_idx) {
+    return session.staging_layer_manager_.Release(pool_idx);
+  }
 };
 
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
 using ::tpu_sync::rpc::ShardPushEntryProto;
 using ::tpu_sync::rpc::StartTransferRequest;
@@ -436,6 +457,86 @@ TEST(ReshardReceiveSessionTest, GroupScopesDestinationBlocks) {
   ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
                     base, plan, std::vector<int64_t>{2, 3}),
                 "outside its group");
+}
+
+TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
+  kv_cache::KVCacheManagerBase base(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4),
+      /*parallelism=*/1, /*host_allocator=*/nullptr,
+      /*bind_ip=*/std::nullopt, /*num_staging_layers=*/1);
+  base.AttachPlaceholderDeviceHoldForTest();
+  ASSERT_EQ(base.num_host_layers(), 1u);
+  ASSERT_EQ(base.num_layers(), 2u);
+
+  std::vector<kv_cache::PoolSpec> pools = {
+      DensePool("fa", 128),
+      DensePool("state", 128),
+  };
+  pools[1].storage_index = 1;
+  ABSL_ASSERT_OK(base.RegisterPools(pools));
+
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/1301, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardReceiveSession> session,
+      ReshardReceiveSession::Create(
+          &base, allocator.get(), plan, std::vector<int64_t>{0},
+          std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+
+  // Pool 0 leases slot 0 (the only allocated host layer).
+  EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(0u));
+  EXPECT_THAT(ReshardReceiveSessionTestPeer::LookupStagingSlot(*session, 0),
+              IsOkAndHolds(0u));
+
+  // Pool 1 blocks waiting for slot 0 until pool 0 releases its lease.
+  absl::StatusOr<size_t> slot1;
+  std::thread release_waiter([&]() { slot1 = session->ResolveStagingSlot(1); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_EQ(ReshardReceiveSessionTestPeer::ReleaseStagingSlot(*session, 0),
+            std::make_optional(0u));
+  release_waiter.join();
+  EXPECT_THAT(slot1, IsOkAndHolds(0u));
+  EXPECT_THAT(ReshardReceiveSessionTestPeer::LookupStagingSlot(*session, 1),
+              IsOkAndHolds(0u));
+
+  // Cancelling the session while pool 0 is blocked in AcquireStagingSlot wakes
+  // the waiter with CancelledError and releases all held slots once settled.
+  absl::StatusOr<size_t> slot0_cancelled;
+  std::thread cancel_waiter(
+      [&]() { slot0_cancelled = session->ResolveStagingSlot(0); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  session->Finish(absl::CancelledError("cancelled"));
+  cancel_waiter.join();
+  EXPECT_THAT(slot0_cancelled, StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(ReshardReceiveSessionTestPeer::LookupStagingSlot(*session, 1),
+              StatusIs(absl::StatusCode::kCancelled));
+
+  // Pool 1 cannot lease while slot 0 is held by pool 0 and deadline expires;
+  // timeout terminally drains the session and releases all held slots.
+  StartTransferRequest timeout_plan = ValidPlan(
+      /*uuid=*/1302, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardReceiveSession> timeout_session,
+      ReshardReceiveSession::Create(
+          &base, allocator.get(), timeout_plan, std::vector<int64_t>{0},
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(30)));
+  EXPECT_THAT(timeout_session->ResolveStagingSlot(0), IsOkAndHolds(0u));
+  EXPECT_THAT(timeout_session->ResolveStagingSlot(1),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  EXPECT_TRUE(timeout_session->Done());
+  EXPECT_THAT(timeout_session->GetStatus(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  EXPECT_THAT(
+      ReshardReceiveSessionTestPeer::LookupStagingSlot(*timeout_session, 0),
+      StatusIs(absl::StatusCode::kCancelled));
 }
 
 }  // namespace

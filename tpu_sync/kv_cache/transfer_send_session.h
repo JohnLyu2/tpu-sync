@@ -26,19 +26,23 @@
 
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
-#include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 
@@ -64,6 +68,14 @@ class TransferSendSession
       std::chrono::steady_clock::time_point deadline,
       std::chrono::steady_clock::time_point register_start);
 
+  // Creates a send session for a block-addressed resharding plan, acquiring
+  // dynamic host staging when enabled.
+  static absl::StatusOr<std::shared_ptr<TransferSendSession>>
+  CreateFromActivePlan(kv_cache::KVCacheManagerBase* base,
+                       StagingBlockAllocator* absl_nullable staging_allocator,
+                       uint64_t uuid,
+                       const ::tpu_sync::rpc::StartTransferRequest& request);
+
   ~TransferSendSession() override { ReleaseStagingBlocks(); }
 
   bool Done() const override {
@@ -71,7 +83,19 @@ class TransferSendSession
     return done_;
   }
 
+  // The consumer's pull drives this send (see StartPush), so there is nothing
+  // to start.
+  absl::Status Start() override { return absl::OkStatus(); }
+
   void Finish(const absl::Status& status = absl::OkStatus()) override;
+
+  bool TryBeginOp() override { return false; }
+
+  // Counts one finished copy or push; marks the send done and releases its
+  // staging resources if it was draining and waiting for this operation.
+  // Under kPerTransfer that last operation first closes the idle data
+  // connections to the consumer's endpoints.
+  void EndOp() override;
 
   absl::Status GetStatus() const override {
     absl::MutexLock lock(mu_);
@@ -89,9 +113,11 @@ class TransferSendSession
     return draining_;
   }
 
-  bool HasStaging() const {
-    absl::MutexLock lock(mu_);
-    return !staging_.empty();
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    if (transfer_plan_ == nullptr || Done()) {
+      return absl::nullopt;
+    }
+    return transfer_plan_;
   }
 
   // Validates deadline, requested blocks, and single-pull invariant, then marks
@@ -100,23 +126,12 @@ class TransferSendSession
   void ValidateAndBeginPull(const std::vector<int64_t>& requested_block_ids,
                             std::chrono::steady_clock::time_point now);
 
-  // Returns true if |block_id| is registered in this session and StartPush has
-  // created |layer_idx|'s D2H future (its copy may not have been issued yet).
-  bool OwnsBlockWithReadyFuture(int block_id, size_t layer_idx) const;
-
-  // Registers |cb| to be invoked with |layer_idx|'s D2H copy status once the
-  // copy completes, or with the send's failure if the copy is never issued.
-  // Invokes |cb(OkStatus())| immediately if the session holds no future for
-  // |layer_idx| (StartPush has not run, or the send has settled).
-  void RegisterLayerReadinessCallback(
-      size_t layer_idx,
-      transport::BlockTransportDelegate::HostBlockReadyCallback cb);
-
-  // Counts one finished copy or push; marks the send done and releases its
-  // staging resources if it was draining and waiting for this operation.
-  // Under kPerTransfer that last operation first closes the idle data
-  // connections to the consumer's endpoints.
-  void EndSendOp();
+  // Returns layer |major_dimension_idx|'s D2H copy future once StartPush has
+  // created it (its copy may not have been issued yet): it resolves with the
+  // copy's status, or with the send's failure if the copy is never issued.
+  // Returns an already-OK future if the session holds no future for the layer
+  // (StartPush has not run, or the send released its staging).
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override;
 
   // Stages producer device blocks into host staging and executes the
   // multi-layer D2H copy and pipelined H2H push.
@@ -130,6 +145,24 @@ class TransferSendSession
       const std::vector<int64_t>& src_block_ids,
       const std::vector<int64_t>& dst_block_ids);
 
+  // Returns the buffer the device-to-host copy leased to |layer_idx|.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
+    return LookupStagingSlot(layer_idx);
+  }
+
+  // Always returns kFailedPrecondition: a send session never receives data.
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
+
+  const StagingLayerManager& staging_layer_manager() const {
+    return staging_layer_manager_;
+  }
+
+  const std::string& req_id() const { return req_id_; }
+  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
+
+ private:
   // Returns the host layer buffer leased to |layer_idx|, leasing one when it
   // has none and blocking while every buffer is in use. There is one buffer
   // per layer on a full host mirror, so the lease is then layer_idx itself
@@ -140,37 +173,13 @@ class TransferSendSession
   // kFailedPrecondition if |layer_idx| holds no lease.
   absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const;
 
-  const StagingLayerManager& staging_layer_manager() const {
-    return staging_layer_manager_;
-  }
-
-  const std::string& req_id() const { return req_id_; }
-  uint64_t uuid() const { return uuid_; }
-  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
-  std::chrono::steady_clock::time_point register_start() const {
-    return register_start_;
-  }
-
-  int64_t num_blocks() const {
-    absl::MutexLock lock(mu_);
-    return num_blocks_;
-  }
-  int64_t total_bytes() const {
-    absl::MutexLock lock(mu_);
-    return total_bytes_;
-  }
-  std::chrono::steady_clock::time_point d2h_done() const {
-    absl::MutexLock lock(mu_);
-    return d2h_done_;
-  }
-
- private:
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
                       StagingBlockAllocator* staging_allocator,
                       std::string req_id, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
                       std::chrono::steady_clock::time_point register_start,
-                      DataConnectionReuse data_connection_reuse);
+                      DataConnectionReuse data_connection_reuse,
+                      std::shared_ptr<const TransferPlan> plan = nullptr);
 
   // Describes a block ID that appears more than once in a single registration,
   // along with the indices of its first two occurrences.
@@ -180,9 +189,9 @@ class TransferSendSession
     size_t duplicate_index;
   };
 
-  // Populates `registered_block_ids_` and `registered_block_set_` from
-  // `block_ids`. Returns the first duplicate block ID and its indices if any
-  // duplicate is present, or `std::nullopt` when all IDs are unique.
+  // Populates `registered_block_set_` from `block_ids`. Returns the first
+  // duplicate block ID and its indices if any duplicate is present, or
+  // `std::nullopt` when all IDs are unique.
   std::optional<DuplicateBlock> PopulateRegisteredBlocks(
       absl::Span<const int64_t> block_ids);
   void ValidateRequestedBlocksLocked(
@@ -213,13 +222,9 @@ class TransferSendSession
   const std::chrono::steady_clock::time_point register_start_;
   // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
   const DataConnectionReuse data_connection_reuse_;
+  const std::shared_ptr<const TransferPlan> transfer_plan_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
-  int64_t num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
-  int64_t registered_num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
-  int64_t total_bytes_ ABSL_GUARDED_BY(mu_) = 0;
-  std::vector<int64_t> registered_block_ids_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
-  std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   // The transfer phase in which the send failed; populated when `status_` is
   // set to a non-OK status.

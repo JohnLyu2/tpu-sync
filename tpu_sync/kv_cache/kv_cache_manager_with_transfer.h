@@ -40,7 +40,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
-#include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -143,7 +143,8 @@ class KVCacheManagerWithTransfer {
       int parallelism, HostBufferAllocator host_allocator, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
+      std::optional<int> num_staging_layers = std::nullopt);
 
   // Metadata-based constructor for a heterogeneous registration:
   // slice_byte_sizes carries one stride per block array, in registration
@@ -228,17 +229,6 @@ class KVCacheManagerWithTransfer {
 
   virtual absl::Status WaitForPendingWork();
 
-  bool IsShuttingDown() const {
-    return shutting_down_.load(std::memory_order_relaxed);
-  }
-
-  // Transport callback: |shard_ids| of |block_ids| landed for |uuid|. Routed
-  // pushes report each block range once per shard subset; the receive session
-  // accumulates them.
-  virtual absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
-                                             absl::Span<const int> shard_ids,
-                                             uint64_t uuid = 0);
-
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
   // Endpoints for the block-transport DATA protocol (pulls and pushes),
@@ -257,8 +247,10 @@ class KVCacheManagerWithTransfer {
   virtual int local_control_port() const { return local_control_port_; }
   virtual int64_t node_id() const { return node_id_; }
 
-  // Bound on one control handshake, end to end, in seconds.
-  double control_timeout_s() const { return control_timeout_s_; }
+  // Returns the active transfer session registered under |uuid|, or kNotFound
+  // when no session holds it. Thread-safe.
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const;
 
  protected:
   KVCacheManagerWithTransfer(
@@ -274,36 +266,39 @@ class KVCacheManagerWithTransfer {
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
 
-  // Serializes plan registration and unregistration, so a plan is never
-  // published without its staging owner or torn down against a half-built
-  // registration.
-  absl::Mutex plan_lifecycle_mu_;
-  // Source of plan generations: the uuid names a transfer, a generation
-  // names one registration of it (the same uuid may come back, e.g. on a
-  // retry of the same transfer).
-  uint64_t plan_generation_counter_ ABSL_GUARDED_BY(plan_lifecycle_mu_) = 0;
-  // Host staging held by a plan: a sender's, or a receiver's whose
-  // destination is host memory. Released when the plan is unregistered.
-  absl::flat_hash_map<uint64_t, StagingAllocation> plan_staging_
-      ABSL_GUARDED_BY(mu_);
   absl::Status EmplaceRecvSessionLocked(
       uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
+  template <typename SessionT>
+  std::shared_ptr<SessionT> FindSessionLocked(uint64_t uuid) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    auto it = sessions_.find(uuid);
+    if (it == sessions_.end()) {
+      return nullptr;
+    }
+    return std::dynamic_pointer_cast<SessionT>(it->second);
+  }
+
+  // If |it->second| is already Done(), records its terminal completion into
+  // |done_sending_| / |done_recving_| / |failed_recving_| /
+  // |transfer_details_|, erases |it| from |sessions_|, and returns true.
+  // Otherwise returns false. Never calls Finish(): a caller that wants a
+  // ready-to-complete session retired must finish it first.
+  bool RetireSettledSessionLocked(
+      absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>>::iterator
+          it,
+      bool* retired_push_progress = nullptr,
+      bool* retired_pool_staging = nullptr) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   void StartControlServer();
   void StopControlServer();
-  virtual void RegisterBlockReadinessCallback(
-      size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-      transport::BlockTransportDelegate::HostBlockReadyCallback cb);
 
-  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferReceiveSession>>
-      active_recv_sessions_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
+      ABSL_GUARDED_BY(mu_);
 
-  absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardReceiveSession>>
-      active_pool_reshard_recvs_ ABSL_GUARDED_BY(mu_);
-
-  absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
-      active_pool_reshard_sends_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<uint64_t> pending_pool_reshard_recvs_
+      ABSL_GUARDED_BY(mu_);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 
@@ -312,8 +307,8 @@ class KVCacheManagerWithTransfer {
   int local_data_port_ = 0;
 
   // Pull-serve workers launched by ProcessPullStream. The destructor waits
-  // for them, and shutting_down_ ends a worker's staging wait early.
-  std::atomic<bool> shutting_down_{false};
+  // for them; staging_allocator_->Shutdown() ends a worker's staging wait
+  // early.
   absl::Mutex pull_workers_mu_;
   int active_pull_workers_ ABSL_GUARDED_BY(pull_workers_mu_) = 0;
   double timeout_s_ = 120.0;
@@ -323,11 +318,6 @@ class KVCacheManagerWithTransfer {
   double control_timeout_s_ = 10.0;
 
   std::unique_ptr<StagingBlockAllocator> staging_allocator_;
-  // TransferSendSession is shared across threads: created/timed-out/cleaned-up
-  // on the main thread, but accessed asynchronously in control worker threads
-  // handling pull connections.
-  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSendSession>>
-      send_sessions_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<uint64_t> pending_acks_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<std::string> done_sending_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<std::string> done_recving_ ABSL_GUARDED_BY(mu_);
@@ -378,7 +368,7 @@ class KVCacheManagerWithTransfer {
   // Fails stalled sub-plan chains and expires reported ones.
   void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
   absl::CondVar cv_;
   std::atomic<bool> stopping_{false};
   std::unique_ptr<ControlPlaneHandler> control_handler_;
@@ -390,15 +380,6 @@ class KVCacheManagerWithTransfer {
 
   void InitializeBaseHooks();
   void InitializeControlPlane();
-  // Drops the plan of a receive that has settled; a plan already gone, or
-  // a newer registration reusing the uuid, is left alone.
-  void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
-  void MaybeUnregisterSettledRecv(uint64_t uuid,
-                                  TransferReceiveSession& session);
-  // Drops the plan of a pool-reshard receive that has settled (its H2D
-  // uploads and every push it admitted have ended); a no-op before then.
-  void MaybeUnregisterSettledReshardRecv(uint64_t uuid,
-                                         ReshardReceiveSession& session);
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);

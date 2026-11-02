@@ -19,7 +19,7 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
-#include <future>  // NOLINT(build/c++11)
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,15 +29,19 @@
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 
 namespace tpu_sync {
@@ -58,10 +62,14 @@ class TransferReceiveSession
     : public TransferSession,
       public std::enable_shared_from_this<TransferReceiveSession> {
  public:
+  // Creates a pulled receive: Start() sends its pull request for
+  // |remote_block_ids| to the producer control endpoint |remote_endpoint|
+  // through |manager|'s control backend.
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
-      kv_cache::KVCacheManagerBase* base,
+      kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
+      const std::string& req_id, const std::string& remote_endpoint,
+      const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
       std::chrono::steady_clock::time_point deadline,
@@ -79,13 +87,16 @@ class TransferReceiveSession
   CreateFromActivePlan(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+      const ::tpu_sync::rpc::StartTransferRequest& request,
       std::chrono::steady_clock::time_point deadline,
-      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
-          host_block_of,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   ~TransferReceiveSession() override { ReleaseStaging(); }
+
+  // A pulled receive starts the consumer pull handshake through the control
+  // backend without blocking; the handshake's outcome updates session state.
+  // Every other receive only waits for pushes and returns OkStatus().
+  absl::Status Start() override;
 
   bool Done() const override {
     absl::MutexLock lock(mu_);
@@ -109,70 +120,41 @@ class TransferReceiveSession
     return draining_;
   }
 
-  // Releases any held staging slot or dynamic host blocks. Safe to call
-  // multiple times.
-  bool HasStaging() const {
-    absl::MutexLock lock(mu_);
-    return !staging_.empty();
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    if (transfer_plan_ == nullptr || Done()) {
+      return absl::nullopt;
+    }
+    return transfer_plan_;
   }
 
-  void ReleaseStaging();
-
-  bool TryBeginRecvOp() {
-    absl::MutexLock lock(mu_);
-    if (done_ || draining_) return false;
-    ++in_flight_;
-    return true;
-  }
-  void EndRecvOp();
-
-  // Marks the plan to be unregistered when the receive settles, returning true
-  // if the receive is still active and will unregister on settle, or false if
-  // it is already done.
-  bool DeferUnregisterOnSettle();
-
-  // Atomically claims any pending settle-unregister request and writes its
-  // plan generation to |generation|.
-  bool TakePendingUnregister(uint64_t* generation);
+  // Admits one incoming push unless the session is draining or done. The first
+  // admitted push records first-packet timing.
+  bool TryBeginOp() override;
+  void EndOp() override;
 
   // Returns true if network/layer transfer is complete and all H2D futures are
   // ready.
   bool IsReadyToComplete() const;
 
-  // Starts the consumer pull handshake through the control backend without
-  // blocking, and updates session state upon completion or error.
-  void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
-                          const std::string& remote_endpoint);
+  // With empty |minor_dimension_indices|, starts the H2D copy for layer
+  // |major_dimension_idx|, failing with kFailedPrecondition while this receive
+  // is live on a pool-addressed plan, which only a ReshardReceiveSession can
+  // execute; once every layer's copy has been issued, the network phase is
+  // complete (see ExecuteLayerH2d()). Otherwise records that |shard_ids| of
+  // |minor_dimension_indices| landed (see RecordBlockShards()).
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
 
-  // Peregrine receive hook: records first-packet timing the first time any
-  // Post for this session lands.
-  absl::Status OnRecvProgress();
+  // A receive session stages no outgoing data, so the future is already OK.
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
 
-  // Peregrine receive hook: marks the network phase complete and records
-  // last-packet timing once every layer's Posts have landed on this receiver.
-  absl::Status OnRecvNetworkComplete();
-
-  // Handles a transport report that |shard_ids| of |block_ids| landed. Each
-  // shard's progress is tracked separately; a shard completes once it has
-  // received every (layer, block) of the session, and the network phase
-  // completes once every shard has. Routed pushes report a block range once
-  // per shard subset, so a shard's count only advances on streams carrying it.
-  absl::Status OnBlockShardsReceived(KVCacheManagerWithTransfer& manager,
-                                     const std::vector<int>& block_ids,
-                                     absl::Span<const int> shard_ids);
-
-  // Issues H2D copy for |layer_idx| using |base_| and registers the completion
-  // callback. When fewer host layer buffers exist than layers, the copy reads
-  // the host layer buffer leased to |layer_idx| and the callback releases the
-  // lease.
-  absl::Status ExecuteLayerH2d(KVCacheManagerWithTransfer& manager,
-                               size_t layer_idx);
-
-  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
-  // has none and blocking while every buffer is in use. A timeout fails the
-  // receive. Callable from any thread; concurrent calls for the same layer
-  // (one per shard stream) observe one lease.
-  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);
+  // Leases a buffer to |layer_idx| on first use.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
+    return AcquireStagingSlot(layer_idx);
+  }
 
   const StagingLayerManager& staging_layer_manager() const {
     return staging_layer_manager_;
@@ -186,20 +168,56 @@ class TransferReceiveSession
     absl::MutexLock lock(mu_);
     return total_blocks_;
   }
+  bool tracks_completion() const {
+    absl::MutexLock lock(mu_);
+    return tracks_completion_;
+  }
+  bool HasPendingWork() const {
+    absl::MutexLock lock(mu_);
+    return (tracks_completion_ && !done_) || in_flight_ > 0;
+  }
   std::chrono::steady_clock::time_point deadline() const {
     absl::MutexLock lock(mu_);
     return deadline_;
   }
 
  private:
+  // Records a transport report that |shard_ids| of |block_ids| landed. Each
+  // shard's progress is tracked separately; a shard completes once it has
+  // received every (layer, block) of the session, and the network phase
+  // completes once every shard has. Routed pushes report a block range once
+  // per shard subset, so a shard's count only advances on streams carrying it.
+  absl::Status RecordBlockShards(absl::Span<const int> block_ids,
+                                 absl::Span<const int> shard_ids);
+
+  // Issues H2D copy for |layer_idx| using |base_| and registers the completion
+  // callback. When fewer host layer buffers exist than layers, the copy reads
+  // the host layer buffer leased to |layer_idx| and the callback releases the
+  // lease. Once copies have been issued for every distinct layer, marks the
+  // network phase complete and records last-packet timing, unless a block
+  // report already did or the receive is draining.
+  absl::Status ExecuteLayerH2d(size_t layer_idx);
+
+  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
+  // has none and blocking while every buffer is in use. A timeout fails the
+  // receive. Callable from any thread; concurrent calls for the same layer
+  // (one per shard stream) observe one lease.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);
+
+  // Returns the host layer buffer currently leased to |layer_idx|, or
+  // kFailedPrecondition if |layer_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const;
+
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
                          uint64_t uuid,
-                         std::shared_ptr<MetricsCollector> metrics_collector)
+                         std::shared_ptr<MetricsCollector> metrics_collector,
+                         std::shared_ptr<const TransferPlan> plan = nullptr)
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
         metrics_collector_(std::move(metrics_collector)),
+        transfer_plan_(std::move(plan)),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
         staging_layer_manager_(base != nullptr && base->num_host_layers() <
                                                       base->num_layers()
@@ -234,14 +252,12 @@ class TransferReceiveSession
     }
   }
 
-  // Initializes this receive session for an HBM destination active plan,
-  // allocating dynamic host staging via |staging_allocator_| when enabled.
-  absl::Status InitFromActivePlan(
-      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
-      std::chrono::steady_clock::time_point deadline,
-      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+  // Initializes this receive session for an HBM destination active plan.
+  void InitFromActivePlan(
+      const ::tpu_sync::rpc::StartTransferRequest& request,
+      std::chrono::steady_clock::time_point deadline, StagingAllocation staging,
+      const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
           host_block_of);
-
   // Allocates host staging for a consumer StartRead load plan via
   // |staging_allocator_| (unless |local_host_block_ids| is explicitly provided)
   // and populates |*host_block_ids|. Returns false if staging capacity is
@@ -260,9 +276,8 @@ class TransferReceiveSession
   // Initializes this receive session for a consumer StartRead load plan.
   void InitFromLoadPlan(const std::string& req_id, CopyPlan load_plan,
                         std::chrono::steady_clock::time_point deadline);
-  using H2dIssueFuture =
-      std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
+  void ReleaseStaging();
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   // Transitions the session into draining/completed state. If |status| is
   // non-OK and this is the first failure, records |status| and attributes the
@@ -278,7 +293,7 @@ class TransferReceiveSession
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  bool RecordBlockShardsReceivedLocked(const std::vector<int>& block_ids,
+  bool RecordBlockShardsReceivedLocked(absl::Span<const int> block_ids,
                                        absl::Span<const int> shard_ids,
                                        bool* first_packet,
                                        bool* network_just_completed)
@@ -291,6 +306,11 @@ class TransferReceiveSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* base_ = nullptr;
+  // Set only by the pulled-receive Create(), before the session is shared:
+  // the manager whose control backend Start() sends the pull through (null
+  // for every other receive) and the producer control endpoint it targets.
+  KVCacheManagerWithTransfer* pull_manager_ = nullptr;
+  std::string pull_endpoint_;
   StagingBlockAllocator* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
   std::shared_ptr<MetricsCollector> metrics_collector_;
@@ -298,18 +318,20 @@ class TransferReceiveSession
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   CopyPlan load_plan_ ABSL_GUARDED_BY(mu_);
   CopySpec h2d_copy_ ABSL_GUARDED_BY(mu_);
-  std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>
-      host_to_chip_ ABSL_GUARDED_BY(mu_);
-  std::vector<H2dIssueFuture> h2d_dispatch_futures_ ABSL_GUARDED_BY(mu_);
   int32_t total_blocks_ ABSL_GUARDED_BY(mu_) = 0;
+  bool tracks_completion_ ABSL_GUARDED_BY(mu_) = true;
   // Per-shard count of (layer, block) units reported so far, indexed by shard;
   // shard `s` is complete at total_blocks_ * num_layers.
   std::vector<int64_t> blocks_received_per_shard_ ABSL_GUARDED_BY(mu_);
   // Shards whose count reached completion; network done at num_shards.
   int32_t num_completed_shards_ ABSL_GUARDED_BY(mu_) = 0;
+  // True once first-packet timing is recorded: by the first push TryBeginOp()
+  // admits, or by the first RecordBlockShards() report if no push came first.
   bool any_blocks_received_ ABSL_GUARDED_BY(mu_) = false;
   int32_t num_completed_layers_ ABSL_GUARDED_BY(mu_) = 0;
+  // Distinct layers whose H2D copy has been issued; the network phase is
+  // complete once it holds every layer.
+  absl::flat_hash_set<size_t> dispatched_layers_ ABSL_GUARDED_BY(mu_);
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
@@ -325,19 +347,10 @@ class TransferReceiveSession
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
-  std::vector<int> accumulated_host_block_ids_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point deadline_ ABSL_GUARDED_BY(mu_);
+  const std::shared_ptr<const TransferPlan> transfer_plan_;
   std::chrono::steady_clock::time_point start_time_ ABSL_GUARDED_BY(mu_);
   std::vector<raiden::PjRtCopyFuture> h2d_futures_ ABSL_GUARDED_BY(mu_);
-  // The plan is dropped when this receive settles: set for every
-  // demand-staged receiver plan (whose mapping would otherwise outlive its
-  // freed blocks) and when an unregister arrives while the receive is in
-  // flight (the plan stays mapped until then so late pushes resolve
-  // through its blocks).
-  bool unregister_on_settle_ ABSL_GUARDED_BY(mu_) = false;
-  // Generation of the plan this receive belongs to; settlement cleanup
-  // only touches that registration.
-  uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;
   // staging_layer_manager_ synchronizes itself; cancelled_ mirrors draining_
   // so waiters in staging_layer_manager_.Acquire() can bail out without taking
   // mu_.

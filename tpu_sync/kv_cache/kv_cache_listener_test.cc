@@ -67,7 +67,7 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
 
   absl::Status PoolReshardPush(const StartTransferRequest& request,
                                absl::Span<const int64_t> src_block_ids,
-                               int parallelism) override {
+                               int parallelism) {
     request_ = request;
     local_block_ids_.assign(src_block_ids.begin(), src_block_ids.end());
     recorded_parallelism_ = parallelism;
@@ -77,7 +77,7 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
 
   absl::Status PoolReshardRegisterRecv(
       const StartTransferRequest& request,
-      absl::Span<const int64_t> chip_block_ids) override {
+      absl::Span<const int64_t> chip_block_ids) {
     request_ = request;
     local_block_ids_.assign(chip_block_ids.begin(), chip_block_ids.end());
     route_.store(Route::kPoolReshardRegisterRecv, std::memory_order_release);
@@ -86,13 +86,16 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
 
   absl::Status RegisterActivePlan(uint64_t uuid,
                                   const StartTransferRequest& request,
-                                  bool is_sender) override {
+                                  bool is_sender) {
     request_ = request;
     registered_uuid_ = uuid;
     registered_is_sender_ = is_sender;
     route_.store(Route::kRegisterActivePlan, std::memory_order_release);
     return absl::OkStatus();
   }
+
+  // KVCacheListener drains pending work on shutdown; this stub has none.
+  absl::Status WaitForPendingWork() { return absl::OkStatus(); }
 
   Route route() const { return route_.load(std::memory_order_acquire); }
   const StartTransferRequest& request() const { return request_; }
@@ -269,6 +272,24 @@ TEST(KVCacheListenerTest, PartiallyPopulatedPoolPlanStillRoutesToPoolPath) {
 
   EXPECT_TRUE(response.success()) << response.message();
   EXPECT_EQ(manager.route(), Route::kPoolReshardRegisterRecv);
+}
+
+TEST(KVCacheListenerTest, PoollessSenderIsRejected) {
+  RoutingKVCacheManager manager;
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+
+  ControlRequest request;
+  request.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  StartTransferRequest* plan = request.mutable_start_transfer_request();
+  plan->set_uuid(4321);
+  plan->set_is_sender(true);
+  auto* schedule = &(*plan->mutable_shard_push_schedules())[0];
+  schedule->add_entries()->set_src_block_id(1);
+
+  ControlResponse response = SendRequest(listener.listener_port(), request);
+
+  EXPECT_FALSE(response.success());
+  EXPECT_EQ(manager.route(), Route::kNone);
 }
 
 TEST(KVCacheListenerTest, PoollessReceiverPreservesRegisterActivePlan) {

@@ -46,9 +46,11 @@
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 
@@ -56,10 +58,10 @@ namespace tpu_raiden {
 // lease, so the source must NOT gate it on device-to-host readiness.
 //
 // Why a sentinel rather than 0: the readiness gate
-// (KVCacheManagerWithTransfer::RegisterBlockReadinessCallback) identifies a
+// (KVCacheManagerBase::RegisterBlockReadinessCallback) identifies a
 // transfer by uuid. Pulls historically sent 0, which is indistinguishable from
 // "no uuid supplied", so the gate could never match a pull to its own transfer
-// and always fell through to scanning every live send entry -- coupling the
+// and fell through to scanning every live send entry -- coupling the
 // pull to an unrelated transfer's D2H future. This value says something
 // specific and true instead: "the lease already ordered this read."
 //
@@ -117,7 +119,9 @@ using HostBlockId = int64_t;
 class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
  public:
   // Core C++ Constructor wrapping raw PJRT buffers directly (used by JAX and
-  // PyTorch E2E)
+  // PyTorch E2E). |num_staging_layers| bounds the host mirror along the layer
+  // dimension to that many host layer buffers, in [1, num_layers]; unset keeps
+  // one host buffer per layer. Throws std::invalid_argument when out of range.
   KVCacheManagerBase(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       std::optional<int> local_port = std::nullopt,
@@ -127,26 +131,30 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<std::string> bind_ip = std::nullopt,
       std::optional<size_t> logical_slice_byte_size = std::nullopt,
       std::vector<int64_t> logical_dimensions = {},
-      std::optional<size_t> logical_physical_size = std::nullopt);
+      std::optional<size_t> logical_physical_size = std::nullopt,
+      std::optional<int> num_staging_layers = std::nullopt);
 
-  // Standard CPU-only constructor for remote workers E2E.
+  // Standard CPU-only constructor for remote workers E2E. |num_staging_layers|
+  // as in the device-buffer constructor.
   KVCacheManagerBase(size_t num_layers, size_t num_shards,
                      size_t slice_byte_size,
                      std::optional<int> local_port = std::nullopt,
                      std::optional<int> host_blocks_to_allocate = std::nullopt,
                      int parallelism = 1,
                      HostBufferAllocator host_allocator = nullptr,
-                     std::optional<std::string> bind_ip = std::nullopt);
+                     std::optional<std::string> bind_ip = std::nullopt,
+                     std::optional<int> num_staging_layers = std::nullopt);
 
   // same as above, but with a vector of slice byte sizes for heterogeneous
-  // registration.
+  // registration. |num_staging_layers| as in the device-buffer constructor.
   KVCacheManagerBase(size_t num_layers, size_t num_shards,
                      std::vector<size_t> slice_byte_sizes,
                      std::optional<int> local_port = std::nullopt,
                      std::optional<int> host_blocks_to_allocate = std::nullopt,
                      int parallelism = 1,
                      HostBufferAllocator host_allocator = nullptr,
-                     std::optional<std::string> bind_ip = std::nullopt);
+                     std::optional<std::string> bind_ip = std::nullopt,
+                     std::optional<int> num_staging_layers = std::nullopt);
 
   ~KVCacheManagerBase() override;
 
@@ -155,50 +163,22 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // pool-reshard / plan lifecycle events without inheriting from
   // KVCacheManagerBase.
   struct TransferEventHooks {
-    std::function<void(
-        size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-        transport::BlockTransportDelegate::HostBlockReadyCallback cb)>
-        register_block_readiness_callback;
-    std::function<absl::Status(const std::vector<int>& block_ids,
-                               absl::Span<const int> shard_ids, uint64_t uuid)>
-        on_block_shards_received;
-    std::function<absl::Status(size_t layer_idx, uint64_t uuid)>
-        on_layer_received;
-    std::function<absl::Status(size_t pool_idx, uint64_t uuid)>
-        on_pool_received;
-    std::function<absl::Status(const ::tpu_sync::rpc::StartTransferRequest&,
-                               absl::Span<const int64_t>, int)>
-        pool_reshard_push;
-    std::function<absl::Status(const ::tpu_sync::rpc::StartTransferRequest&,
-                               absl::Span<const int64_t>)>
-        pool_reshard_register_recv;
-    std::function<absl::Status()> wait_for_pending_work;
-    std::function<absl::Status(uint64_t uuid,
-                               const ::tpu_sync::rpc::StartTransferRequest&,
-                               bool is_sender)>
-        register_active_plan;
-    std::function<absl::Status(uint64_t uuid)> unregister_active_plan;
-    std::function<int64_t()> get_node_id;
-    std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
-    std::function<absl::Status(uint64_t uuid, const absl::Status& status)>
-        end_incoming_push;
-    std::function<absl::Status(uint64_t uuid)> on_recv_progress;
-    std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
-    // Returns the host layer buffer the receive session of |uuid| leased to
-    // |layer_idx|, leasing one if needed and blocking while every buffer is in
-    // use.
-    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
-        acquire_recv_staging;
-    // Returns the host layer buffer the send session of |uuid| leased to
-    // |layer_idx|, or an error if |layer_idx| holds no lease.
-    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
-        lookup_send_staging;
+    // Returns the active transfer session registered under |uuid|, or
+    // kNotFound when no session holds it.
+    std::function<absl::StatusOr<std::shared_ptr<TransferSession>>(
+        uint64_t uuid)>
+        get_session;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
     transfer_hooks_ = std::move(hooks);
   }
 
+  // Invokes |cb| once block |block_id| of layer |layer_idx| is ready in host
+  // memory for the transport to read on behalf of transfer |uuid|: gates on
+  // the data-ready future of the live session registered under |uuid|.
+  // Invokes |cb(OkStatus())| immediately for a negative |block_id|, for
+  // kLeaseAuthorizedPullUuid, and when no live session holds |uuid|.
   void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
@@ -298,45 +278,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   H2hRead(std::string peer, const std::vector<int>& src_block_ids);
 
-  // Executes a distributed resharding push transfer based on precise
-  // centralized Controller schedules.
-  absl::Status PushKVCacheResharded(
-      const ::tpu_sync::rpc::StartTransferRequest& request);
-
-  // Pool-plan executor hooks used by KVCacheListener. Designed as the
-  // successor of PushKVCacheResharded/RegisterActivePlan for pool-addressed
-  // plans; managers without transfer support fail closed instead of falling
-  // back to the legacy whole-layer reshard path.
-  virtual absl::Status PoolReshardPush(
-      const ::tpu_sync::rpc::StartTransferRequest& request,
-      absl::Span<const int64_t> src_block_ids, int parallelism = 8) {
-    if (transfer_hooks_.pool_reshard_push) {
-      return transfer_hooks_.pool_reshard_push(request, src_block_ids,
-                                               parallelism);
-    }
-    return absl::UnimplementedError(
-        "pool reshard push is not supported by this manager");
-  }
-
-  virtual absl::Status PoolReshardRegisterRecv(
-      const ::tpu_sync::rpc::StartTransferRequest& request,
-      absl::Span<const int64_t> chip_block_ids) {
-    if (transfer_hooks_.pool_reshard_register_recv) {
-      return transfer_hooks_.pool_reshard_register_recv(request,
-                                                        chip_block_ids);
-    }
-    return absl::UnimplementedError(
-        "pool reshard receive is not supported by this manager");
-  }
-
-  // Blocks until all pending asynchronous transfers/copies are complete.
-  virtual absl::Status WaitForPendingWork() {
-    if (transfer_hooks_.wait_for_pending_work) {
-      return transfer_hooks_.wait_for_pending_work();
-    }
-    return absl::OkStatus();
-  }
-
   virtual std::string worker_id() const {
     if (!worker_id_.empty()) return worker_id_;
     return "";
@@ -344,12 +285,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   virtual void set_worker_id(std::string worker_id) {
     worker_id_ = std::move(worker_id);
   }
-  virtual int64_t node_id() const {
-    if (transfer_hooks_.get_node_id) {
-      return transfer_hooks_.get_node_id();
-    }
-    return -1;
-  }
+  // Returns the node id set by set_node_id(), or -1 if unset.
+  virtual int64_t node_id() const { return node_id_; }
+  // Sets the node id reported to the transport. A composing transfer manager
+  // (e.g. KVCacheManagerWithTransfer) calls this once at construction.
+  void set_node_id(int64_t node_id) { node_id_ = node_id; }
 
   // Returns the backend plugin registered for the specified backend name, or
   // nullptr if none.
@@ -622,10 +562,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                                      size_t shard_idx,
                                                      int block_id);
 
-  // Registers explicit block pools over the wrapped storages. Fails while
-  // active plans are registered. Until this is called the manager exposes one
-  // implicit pool per constructor storage (tag "opaque", base_offset 0,
-  // block_stride LayerBlockByteSize) and all legacy paths are unchanged.
+  // Registers explicit block pools over the wrapped storages. Until this is
+  // called the manager exposes one implicit pool per constructor storage (tag
+  // "opaque", base_offset 0, block_stride LayerBlockByteSize) and all legacy
+  // paths are unchanged.
   absl::Status RegisterPools(std::vector<PoolSpec> pools);
 
   // Same, with bounded host staging.
@@ -684,6 +624,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   const PoolSpec* pool(size_t pool_idx) const;
 
+  absl::Span<const PoolSpec> pools() const;
+
   size_t num_pools() const;
 
   bool has_explicit_pools() const;
@@ -699,20 +641,19 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
-      std::optional<uint64_t> uuid = std::nullopt);
+      std::optional<uint64_t> uuid = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt);
 
   // Inverse of D2hPoolBlocks: host mirror -> device storage.
   absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
-      std::optional<uint64_t> uuid = std::nullopt);
+      std::optional<uint64_t> uuid = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt);
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
-  absl::Status BeginIncomingPush(uint64_t uuid) override;
-  absl::Status EndIncomingPush(
-      uint64_t uuid, const absl::Status& status = absl::OkStatus()) override;
-  absl::Status OnRecvProgress(uint64_t uuid) override;
-  absl::Status OnRecvNetworkComplete(uint64_t uuid) override;
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override;
 
   absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
   GetPoolPushProgressSpec(size_t pool_idx, uint64_t uuid) const override;
@@ -721,45 +662,14 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // shard push schedule, each keyed by the sender node id that pushes it.
   std::optional<size_t> ExpectedPushSenders(uint64_t uuid) const override;
 
-  virtual absl::Status RegisterActivePlan(
-      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-      bool is_sender);
-  absl::Status RegisterActivePlanDirect(
-      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-      bool is_sender);
-  // Same, with the plan's device blocks staged in explicitly chosen host
-  // blocks instead of at their own ids: `host_block_of` maps each device
-  // block id the plan names on this side to the host block staging it.
-  // `generation` identifies this registration among transfers that reuse
-  // the same uuid (e.g. a retry); see RegisteredPlan::generation.
-  absl::Status RegisterActivePlan(
-      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-      bool is_sender,
-      absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of,
-      uint64_t generation = 0);
-
-  virtual absl::Status UnregisterActivePlan(uint64_t uuid);
-  absl::Status UnregisterActivePlanDirect(uint64_t uuid);
-
-  // Whether a transfer plan is currently registered under `uuid`.
-  bool HasActivePlan(uint64_t uuid) const {
-    absl::MutexLock l(plans_mu_);
-    return active_plans_.contains(uuid);
-  }
+  // Whether an active session under `uuid` carries a transfer plan.
+  bool HasActivePlan(uint64_t uuid) const;
 
   // Peer host addresses, one per layer, for plan-less pushes under `uuid`.
   void SetRemoteLayerAddrs(
       uint64_t uuid,
       std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs);
   void ClearRemoteLayerAddrs(uint64_t uuid);
-
-  // The generation of the plan registered under `uuid`, if any.
-  std::optional<uint64_t> ActivePlanGeneration(uint64_t uuid) const {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it == active_plans_.end()) return std::nullopt;
-    return it->second->generation;
-  }
 
   // Host blocks staging `block_ids` under plan `uuid`: the ids themselves
   // when the plan stages blocks at their own ids, otherwise the blocks the
@@ -795,7 +705,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                int block_id) override;
 
   // Returns the number of allocated host layer buffers (equals num_layers()
-  // unless bounded via TPU_RAIDEN_NUM_STAGING_LAYERS).
+  // unless bounded via the num_staging_layers constructor argument).
   size_t num_host_layers() const { return layers_.size(); }
 
   // Returns the total number of bytes allocated in host DRAM.
@@ -916,6 +826,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::shared_ptr<NumaThreadPool> push_pool_;
   std::unique_ptr<NumaThreadPool> pull_pool_;
   std::string worker_id_;
+  int64_t node_id_ = -1;
   TransferEventHooks transfer_hooks_;
 
   // One shard copy between device layer |layer_idx| (buffer_holds_) and host
@@ -995,7 +906,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<raiden::PjRtCopyFuture> CopyPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx, bool device_to_host,
-      std::optional<uint64_t> uuid);
+      std::optional<uint64_t> uuid,
+      std::optional<size_t> host_layer_idx = std::nullopt);
 
   // ---- Bounded pool staging ----
   // One storage's staging arena. Unbounded storages keep the full mirror and
@@ -1037,33 +949,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   HostBufferAllocator host_allocator_ = nullptr;
 
+  absl::StatusOr<std::shared_ptr<const TransferPlan>> GetTransferPlan(
+      uint64_t uuid) const;
+
   mutable absl::Mutex plans_mu_;
-  struct RegisteredPlan {
-    ::tpu_sync::rpc::StartTransferRequest request;
-    bool is_sender = false;
-    // Host block holding each device block the plan names on this side
-    // (src blocks for a sender, dst blocks for a receiver). Empty means the
-    // host mirror is addressed by device block id.
-    absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of;
-    // Device blocks the plan's schedules name on this side; the set
-    // PlanHostBlocks() answers for.
-    absl::flat_hash_set<int64_t> staged_device_blocks;
-    // Extension of the uuid for when the same uuid names more than one
-    // transfer over time (e.g. a retry of the same transfer): each
-    // registration gets its own generation, so cleanup queued for an old
-    // registration cannot touch a newer one under the same uuid. 0 when
-    // the caller keeps no generations; cleanup then matches by uuid alone.
-    uint64_t generation = 0;
-  };
-  // Plans are stored behind shared_ptr so the per-push readers
-  // (GetBlockChunks / GetPoolPushProgressSpec) snapshot with a refcount bump
-  // instead of deep-copying the schedule proto under plans_mu_: a pool-reshard
-  // receiver's plan carries one schedule entry per (pool, rank, page range)
-  // and the copy dominated per-push latency. Unregister drops the map entry
-  // while in-flight readers keep their snapshot alive, which preserves the
-  // previous copy semantics exactly.
-  absl::flat_hash_map<uint64_t, std::shared_ptr<const RegisteredPlan>>
-      active_plans_ ABSL_GUARDED_BY(plans_mu_);
 
   absl::flat_hash_map<
       uint64_t,

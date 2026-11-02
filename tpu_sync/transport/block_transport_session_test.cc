@@ -29,7 +29,9 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -103,6 +105,11 @@ class MockSessionDelegate : public BlockTransportDelegate {
     return base_remote_id + chunk_k;
   }
 
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    return absl::NotFoundError("Session not found");
+  }
+
   uint8_t* GetBlockArrayHostPointer(size_t layer, size_t shard) override {
     return buffers_[layer * num_shards_ + shard].data();
   }
@@ -141,57 +148,57 @@ class MockSessionDelegate : public BlockTransportDelegate {
   int layers_received_ = 0;
 };
 
-TEST(BlockTransportServerPushSessionTest, LifecycleAndStreamCompletion) {
+TEST(BlockTransportServerPushSessionTest, LifecycleAndPostCompletion) {
   MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4,
-                               /*num_layers=*/1, /*num_shards=*/1);
+                               /*num_layers=*/2, /*num_shards=*/1);
   BlockTransportConfig config;
-  bool completed_called = false;
-  uint64_t completed_uuid = 0;
+
+  auto unregistered_session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/42, &delegate, config);
+  EXPECT_THAT(unregistered_session->uuid(), Eq(42u));
+  EXPECT_THAT(
+      unregistered_session->OnPeregrinePostComplete(
+          lib::PostMetadata{
+              .uuid = 42, .remote_id = 0, .local_id = 0, .shard_mask = 0},
+          /*requests=*/{}),
+      StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_FALSE(unregistered_session->IsDone());
+  EXPECT_THAT(delegate.layers_received(), Eq(0));
 
   auto session = std::make_shared<BlockTransportServerPushSession>(
-      /*uuid=*/42, &delegate, config, [&](uint64_t uuid) {
-        completed_called = true;
-        completed_uuid = uuid;
-      });
+      /*uuid=*/0, &delegate, config);
 
-  EXPECT_THAT(session->uuid(), Eq(42u));
+  EXPECT_THAT(session->uuid(), Eq(0u));
   EXPECT_THAT(session->kind(), Eq(BlockTransportServerSession::Kind::kPush));
   EXPECT_FALSE(session->IsDone());
   EXPECT_THAT(session->status(), IsOk());
 
-  // 2 streams expected for layer 0 (num_streams = 2).
-  // First stream arrives:
-  ABSL_EXPECT_OK(session->CompleteIncomingPush(
-      /*local_id=*/0, /*remote_id=*/0, /*num_streams=*/2,
-      /*landed_shards=*/0, /*pool_progress_spec=*/std::nullopt));
+  // First layer arrives via Peregrine post:
+  lib::PostMetadata post0{
+      .uuid = 0, .remote_id = 0, .local_id = 0, .shard_mask = 0};
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post0, /*requests=*/{}));
   EXPECT_FALSE(session->IsDone());
-  EXPECT_FALSE(completed_called);
 
-  // Second stream arrives:
-  ABSL_EXPECT_OK(session->CompleteIncomingPush(
-      /*local_id=*/0, /*remote_id=*/0, /*num_streams=*/2,
-      /*landed_shards=*/0, /*pool_progress_spec=*/std::nullopt));
+  // Second layer arrives:
+  lib::PostMetadata post1{
+      .uuid = 0, .remote_id = 0, .local_id = 1, .shard_mask = 0};
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post1, /*requests=*/{}));
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), IsOk());
-  EXPECT_TRUE(completed_called);
-  EXPECT_THAT(completed_uuid, Eq(42u));
-  EXPECT_THAT(delegate.layers_received(), Eq(1));
+  EXPECT_THAT(delegate.layers_received(), Eq(2));
 }
 
 TEST(BlockTransportServerPushSessionTest, Cancel) {
   MockSessionDelegate delegate;
   BlockTransportConfig config;
-  bool completed_called = false;
 
   auto session = std::make_shared<BlockTransportServerPushSession>(
-      /*uuid=*/100, &delegate, config,
-      [&](uint64_t uuid) { completed_called = true; });
+      /*uuid=*/100, &delegate, config);
 
   EXPECT_FALSE(session->IsDone());
   session->Cancel();
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), StatusIs(absl::StatusCode::kCancelled));
-  EXPECT_TRUE(completed_called);
 }
 
 TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {

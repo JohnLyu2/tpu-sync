@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,10 +29,13 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
-#include "tpu_sync/core/raw_transfer_core.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 
 namespace tpu_sync {
@@ -42,7 +46,6 @@ class StartTransferRequest;
 
 namespace tpu_raiden {
 
-class KVCacheManagerWithTransfer;
 class StagingBlockAllocator;
 
 // Encapsulates the consumer-side state and execution lifecycle of a multi-tag
@@ -55,12 +58,9 @@ class ReshardReceiveSession
     : public TransferSession,
       public std::enable_shared_from_this<ReshardReceiveSession> {
  public:
-  // Creates and initializes a consumer pool-reshard receive session for |plan|.
-  // Claims |plan.uuid()| in |base|'s active plans (ALREADY_EXISTS if it is
-  // taken) and only then acquires bounded pool staging leases per storage via
-  // |staging_allocator|; a lease failure releases the claim again. Callers
-  // must not register the plan themselves. The claim is dropped by
-  // UnregisterActivePlan / UnregisterSettledPlan, not by this object.
+  // Creates and initializes a consumer pool-reshard receive session for |plan|
+  // and acquires bounded pool staging leases per storage via
+  // |staging_allocator|.
   static absl::StatusOr<std::shared_ptr<ReshardReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator,
@@ -75,7 +75,18 @@ class ReshardReceiveSession
     return done_;
   }
 
+  // A pool-reshard receive only waits for its senders' pushes.
+  absl::Status Start() override { return absl::OkStatus(); }
+
   void Finish(const absl::Status& status = absl::OkStatus()) override;
+
+  bool TryBeginOp() override {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) return false;
+    ++in_flight_;
+    return true;
+  }
+  void EndOp() override;
 
   absl::Status GetStatus() const override {
     absl::MutexLock lock(mu_);
@@ -89,49 +100,66 @@ class ReshardReceiveSession
     return draining_;
   }
 
-  const std::string& req_id() const { return req_id_; }
-  uint64_t uuid() const { return uuid_; }
+  const std::string& req_id() const { return request().req_id(); }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
   // Position in the request's sub-transfer chain (both zero for a
   // single-plan request); see StartTransferRequest.sub_plan_index.
-  int32_t sub_plan_index() const { return sub_plan_index_; }
-  int32_t sub_plan_count() const { return sub_plan_count_; }
+  int32_t sub_plan_index() const { return request().sub_plan_index(); }
+  int32_t sub_plan_count() const { return request().sub_plan_count(); }
 
-  // Releases any held pool staging leases for |uuid_|. Safe to call multiple
-  // times.
-  void ReleaseStaging();
-
-  bool TryBeginRecvOp() {
-    absl::MutexLock lock(mu_);
-    if (done_ || draining_) return false;
-    ++in_flight_;
-    return true;
+  // Handles completion of pool |major_dimension_idx| when
+  // |minor_dimension_indices| is empty. Block reports carry nothing this
+  // session tracks, so they succeed without effect.
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override {
+    if (!minor_dimension_indices.empty()) {
+      return absl::OkStatus();
+    }
+    return OnPoolReceived(major_dimension_idx);
   }
-  void EndRecvOp();
 
-  // Atomically claims any pending settle-unregister request and writes its
-  // plan generation (0 for pool-reshard plans) to |generation|.
-  bool TakePendingUnregister(uint64_t* generation);
+  // A receive session stages no outgoing data, so the future is already OK.
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
 
-  // Returns true if network/pool transfer is complete and all H2D futures are
-  // ready.
-  bool IsReadyToComplete() const;
+  // Leases a buffer to |pool_idx| on first use.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
+    return AcquireStagingSlot(pool_idx);
+  }
 
-  // Returns true if this session still has pending network or H2D work.
-  bool HasPendingWork() const;
-
-  // Handles pool completion notifications for this pool-reshard receive
-  // session.
-  absl::Status OnPoolReceived(KVCacheManagerWithTransfer& manager,
-                              size_t pool_idx);
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    if (transfer_plan_ == nullptr || Done()) {
+      return absl::nullopt;
+    }
+    return transfer_plan_;
+  }
 
  private:
   friend struct PoolReshardRecvTestPeer;
   friend struct ReshardReceiveSessionTestPeer;
 
+  // Handles pool completion notifications for this pool-reshard receive
+  // session.
+  absl::Status OnPoolReceived(size_t pool_idx);
+
+  // Returns the host staging buffer leased to |pool_idx|, leasing one when it
+  // has none and waiting until deadline when every slot is leased.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
+
+  // Returns the host staging buffer currently leased to |pool_idx|, or
+  // kFailedPrecondition if |pool_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
+
+  // The receiver plan this session executes; immutable for its lifetime.
+  const ::tpu_sync::rpc::StartTransferRequest& request() const {
+    return transfer_plan_->request();
+  }
+  uint64_t uuid() const { return request().uuid(); }
+
   ReshardReceiveSession(kv_cache::KVCacheManagerBase* base,
-                        StagingBlockAllocator* staging_allocator, uint64_t uuid,
-                        const ::tpu_sync::rpc::StartTransferRequest& plan,
+                        TransferPlan transfer_plan,
                         absl::Span<const int64_t> chip_blocks,
                         std::chrono::steady_clock::time_point deadline);
 
@@ -146,6 +174,7 @@ class ReshardReceiveSession
   absl::Status AcquireStagingLeases(
       const ::tpu_sync::rpc::StartTransferRequest& plan);
 
+  void ReleaseStaging();
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -153,37 +182,28 @@ class ReshardReceiveSession
 
   // Handles completion of |pool_idx|'s H2D upload and finalizes the
   // pool-reshard receive when all pools have completed or on error.
-  void FinishPoolH2d(KVCacheManagerWithTransfer& manager, size_t pool_idx,
-                     const absl::Status& status);
+  void FinishPoolH2d(size_t pool_idx, const absl::Status& status);
 
-  bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status RecordPoolReceivedLocked(size_t pool_idx)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   std::vector<std::pair<size_t, std::vector<int64_t>>>
   CollectEligiblePoolH2dsLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   bool RecordPoolH2dResultLocked(size_t pool_idx, const absl::Status& status)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void ExecuteEligiblePoolH2ds(KVCacheManagerWithTransfer& manager);
+  void ExecuteEligiblePoolH2ds();
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
-  StagingBlockAllocator* const staging_allocator_ = nullptr;
-  const uint64_t uuid_ = 0;
-  const std::string req_id_;
-  const int32_t sub_plan_index_ = 0;
-  const int32_t sub_plan_count_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point start_time_;
+  const std::shared_ptr<const TransferPlan> transfer_plan_;
   std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
   bool staging_released_ ABSL_GUARDED_BY(mu_) = true;
-  bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   bool reshard_finalizing_ ABSL_GUARDED_BY(mu_) = false;
-  bool unregister_on_settle_ ABSL_GUARDED_BY(mu_) = true;
-  std::vector<raiden::PjRtCopyFuture> h2d_futures_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> expected_pool_indices_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> started_pool_indices_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> completed_pool_indices_ ABSL_GUARDED_BY(mu_);
@@ -198,6 +218,8 @@ class ReshardReceiveSession
   // block ids (the flat chip_block_ids list concatenates all groups).
   absl::flat_hash_map<size_t, std::vector<int64_t>> pool_dst_block_ids_
       ABSL_GUARDED_BY(mu_);
+  StagingLayerManager staging_layer_manager_;
+  std::atomic<bool> cancelled_{false};
 };
 
 }  // namespace tpu_raiden

@@ -20,11 +20,14 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <ios>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -36,11 +39,14 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/types/optional.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
@@ -49,17 +55,20 @@
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
@@ -91,6 +100,33 @@ class TestKVCacheManager : public KVCacheManagerBase {
   using KVCacheManagerBase::buffer_holds_;
   using KVCacheManagerBase::layers_;
   using KVCacheManagerBase::UpdateAllocatedOccupancyMetric;
+};
+
+// Hosts a |Base| test manager behind KVCacheManagerWithTransfer so that
+// registered plans live in transfer sessions, the only place plans are
+// stored. Base-level plan calls on manager() route through its hooks.
+template <typename Base>
+class WithPlanSessions : public KVCacheManagerWithTransfer {
+ public:
+  template <typename... Args>
+  explicit WithPlanSessions(Args&&... args)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<Base>(std::forward<Args>(args)...)) {}
+
+  WithPlanSessions(std::unique_ptr<Base> base, double timeout_s)
+      : KVCacheManagerWithTransfer(std::move(base), /*node_id=*/0,
+                                   /*local_control_port=*/-1, /*max_blocks=*/0,
+                                   /*num_slots=*/0, timeout_s) {}
+
+  Base& manager() { return static_cast<Base&>(*base_); }
+
+  // Stages plans in per-transfer host blocks, as
+  // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does.
+  void EnableDemandStaging() {
+    staging_allocator_ = CreateStagingBlockAllocator(
+        base_.get(), staging_allocator_->num_slots(),
+        staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
+  }
 };
 
 // Pool with one strided live region per block: live [0, 32) and [64, 96)
@@ -240,23 +276,6 @@ TEST(KVCacheManagerTest, RegisterPoolsGrowsDeviceBackedHostMirror) {
   EXPECT_EQ(last_ref.ptr, grown + 3 * 64);
 }
 
-// The pool table is frozen while plans are active.
-TEST(KVCacheManagerTest, RegisterPoolsFailsAfterActivePlanRegistered) {
-  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128, /*host_blocks=*/1);
-  tpu_sync::rpc::StartTransferRequest request;
-  request.set_uuid(445566);
-  request.set_is_sender(true);
-
-  ABSL_ASSERT_OK(
-      manager.RegisterActivePlan(445566, request, /*is_sender=*/true));
-
-  absl::Status status =
-      manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 1)});
-  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
-  EXPECT_THAT(status.message(), testing::HasSubstr("active plans"));
-}
-
 TEST(KVCacheManagerTest, PoolIndicesWithTag) {
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
                              /*slice_byte_size=*/128, /*host_blocks=*/2);
@@ -274,8 +293,10 @@ TEST(KVCacheManagerTest, PoolIndicesWithTag) {
 }
 
 TEST(KVCacheManagerTest, RegisterActivePlanChecksPoolDtypeTags) {
-  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
-                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  WithPlanSessions<TestKVCacheManager> manager_host(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TestKVCacheManager& manager = manager_host.manager();
   PoolSpec pool_b = DensePool("kind_b", 1, 0, 128, 2);
   pool_b.dtype_tag = "dtype_b";
   ABSL_ASSERT_OK(manager.RegisterPools({
@@ -289,19 +310,20 @@ TEST(KVCacheManagerTest, RegisterActivePlanChecksPoolDtypeTags) {
   request.add_pool_dtype_tags("dtype_a");
   request.add_pool_dtype_tags("dtype_b");
   absl::Status status =
-      manager.RegisterActivePlan(777, request, /*is_sender=*/true);
+      manager_host.RegisterActivePlan(777, request, /*is_sender=*/true);
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(status.message(), testing::HasSubstr("pool_dtype_tags count"));
 
   request.add_pool_dtype_tags("dtype_a");
   request.set_pool_dtype_tags(1, "dtype_wrong");
-  status = manager.RegisterActivePlan(777, request, /*is_sender=*/true);
+  status = manager_host.RegisterActivePlan(777, request, /*is_sender=*/true);
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(status.message(), testing::HasSubstr("dtype tag mismatch"));
 
   request.set_pool_dtype_tags(1, "dtype_b");
-  ABSL_ASSERT_OK(manager.RegisterActivePlan(777, request, /*is_sender=*/true));
-  ABSL_EXPECT_OK(manager.UnregisterActivePlan(777));
+  ABSL_ASSERT_OK(
+      manager_host.RegisterActivePlan(777, request, /*is_sender=*/true));
+  ABSL_EXPECT_OK(manager_host.UnregisterActivePlan(777));
 }
 
 TEST(KVCacheManagerTest, ExplicitPoolAddressingUsesPoolBaseAndStride) {
@@ -337,8 +359,10 @@ TEST(KVCacheManagerTest,
      ExplicitPoolTransportUsesBackingStorageBaseAndPoolStride) {
   TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/1,
                             /*slice_byte_size=*/64, /*host_blocks=*/8);
-  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/1,
-                              /*slice_byte_size=*/64, /*host_blocks=*/8);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/64, /*host_blocks=*/8);
+  TestKVCacheManager& receiver = receiver_host.manager();
   const std::vector<PoolSpec> pools = {
       DensePool("kind_a", /*storage_index=*/1, /*base_offset=*/64,
                 /*stride=*/128, /*num_blocks=*/2),
@@ -362,7 +386,7 @@ TEST(KVCacheManagerTest,
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
   ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
@@ -398,8 +422,10 @@ TEST(KVCacheManagerTest,
      AliasedPoolTransportCopiesOnlyLiveRegionsAndPreservesPadding) {
   TestKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
                             /*slice_byte_size=*/128, /*host_blocks=*/2);
-  TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/128, /*host_blocks=*/2);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TestKVCacheManager& receiver = receiver_host.manager();
   const std::vector<PoolSpec> pools = {
       StridedPool("aliased", /*storage_index=*/0, /*base_offset=*/32,
                   /*stride=*/128, /*num_blocks=*/2),
@@ -428,7 +454,7 @@ TEST(KVCacheManagerTest,
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
   ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
@@ -444,8 +470,10 @@ TEST(KVCacheManagerTest,
 TEST(KVCacheManagerTest, ExplicitPoolTransportEnumeratesAllPools) {
   TestKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
                             /*slice_byte_size=*/64, /*host_blocks=*/8);
-  TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/64, /*host_blocks=*/8);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/64, /*host_blocks=*/8);
+  TestKVCacheManager& receiver = receiver_host.manager();
   const std::vector<PoolSpec> pools = {
       DensePool("kind_a", /*storage_index=*/0, /*base_offset=*/0,
                 /*stride=*/64, /*num_blocks=*/2),
@@ -468,7 +496,7 @@ TEST(KVCacheManagerTest, ExplicitPoolTransportEnumeratesAllPools) {
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
   ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
@@ -582,25 +610,27 @@ TEST(KVCacheManagerTest, ImplicitPoolsMirrorStorages) {
 }
 
 TEST(KVCacheManagerTest, UnregisterActivePlanAllowsUuidReuse) {
-  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128);
+  WithPlanSessions<TestKVCacheManager> manager_host(/*num_layers=*/1,
+                                                    /*num_shards=*/1,
+                                                    /*slice_byte_size=*/128);
+  TestKVCacheManager& manager = manager_host.manager();
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(112233);
   request.set_is_sender(true);
 
-  absl::Status status = manager.UnregisterActivePlan(112233);
+  absl::Status status = manager_host.UnregisterActivePlan(112233);
   EXPECT_EQ(status.code(), absl::StatusCode::kNotFound);
 
   ABSL_EXPECT_OK(
-      manager.RegisterActivePlan(112233, request, /*is_sender=*/true));
+      manager_host.RegisterActivePlan(112233, request, /*is_sender=*/true));
 
-  status = manager.RegisterActivePlan(112233, request, /*is_sender=*/true);
+  status = manager_host.RegisterActivePlan(112233, request, /*is_sender=*/true);
   EXPECT_EQ(status.code(), absl::StatusCode::kAlreadyExists);
 
-  ABSL_EXPECT_OK(manager.UnregisterActivePlan(112233));
+  ABSL_EXPECT_OK(manager_host.UnregisterActivePlan(112233));
 
   ABSL_EXPECT_OK(
-      manager.RegisterActivePlan(112233, request, /*is_sender=*/true));
+      manager_host.RegisterActivePlan(112233, request, /*is_sender=*/true));
 }
 
 TEST(KVCacheManagerTest, D2hFailsWithMismatchedCopySpecLengths) {
@@ -676,16 +706,20 @@ TEST(KVCacheManagerTest, H2hReadExplicitAcceptsParallelism) {
 
 TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
   // 1. Sender (Block size: 256 bytes)
-  TestKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/256);
+  WithPlanSessions<TestKVCacheManager> sender_host(/*num_layers=*/1,
+                                                   /*num_shards=*/1,
+                                                   /*slice_byte_size=*/256);
+  TestKVCacheManager& sender = sender_host.manager();
   std::vector<uint8_t> sender_buffer(256 * 10, 0);
   std::vector<const uint8_t*> sender_ptrs = {sender_buffer.data()};
   std::vector<size_t> sender_sizes = {sender_buffer.size()};
   sender.SetExternalHostPointers(sender_ptrs, sender_sizes);
 
   // 2. Receiver (Block size: 512 bytes)
-  TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/512);
+  WithPlanSessions<TestKVCacheManager> receiver_host(/*num_layers=*/1,
+                                                     /*num_shards=*/1,
+                                                     /*slice_byte_size=*/512);
+  TestKVCacheManager& receiver = receiver_host.manager();
   std::vector<uint8_t> receiver_buffer(512 * 10, 0);
   std::vector<const uint8_t*> receiver_ptrs = {receiver_buffer.data()};
   std::vector<size_t> receiver_sizes = {receiver_buffer.size()};
@@ -713,12 +747,12 @@ TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
 
   // Register active plan on both sides
   ABSL_ASSERT_OK(
-      sender.RegisterActivePlan(112233, request, /*is_sender=*/true));
+      sender_host.RegisterActivePlan(112233, request, /*is_sender=*/true));
 
   // Receiver schedule should be the same request but marked as is_sender=false
   request.set_is_sender(false);
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(112233, request, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(112233, request, /*is_sender=*/false));
 
   // 3. Resolve chunks on Sender (should return offset 64 from block 0 base)
   std::vector<int64_t> src_block_ids = {0};
@@ -783,10 +817,14 @@ TEST(KVCacheManagerTest, PlanlessPushRaddrUsesPeerLayerAddrs) {
 }
 
 TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverLayerAddrs) {
-  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/2,
-                              /*slice_byte_size=*/128, /*host_blocks=*/4);
-  TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/2,
-                            /*slice_byte_size=*/128, /*host_blocks=*/4);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& receiver = receiver_host.manager();
+  WithPlanSessions<TestKVCacheManager> sender_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& sender = sender_host.manager();
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(9);
   auto* entry = (*request.mutable_shard_push_schedules())[1].add_entries();
@@ -797,13 +835,15 @@ TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverLayerAddrs) {
   entry->set_size_bytes(64);
   entry->set_src_block_id(2);
   entry->set_dst_block_id(3);
-  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false));
+  ABSL_ASSERT_OK(
+      receiver_host.RegisterActivePlan(9, request, /*is_sender=*/false));
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
       receiver.LayerHostAddrs(/*uuid=*/9);
   ASSERT_EQ(layer_host_addrs.size(), 2u);
   auto& pools = *(*request.mutable_receiver_addrs())["peer"].mutable_pools();
   for (int32_t l = 0; l < 2; ++l) pools[l] = layer_host_addrs[l];
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(9, request, /*is_sender=*/true));
+  ABSL_ASSERT_OK(
+      sender_host.RegisterActivePlan(9, request, /*is_sender=*/true));
 
   std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
       /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{3},
@@ -816,14 +856,18 @@ TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverLayerAddrs) {
   EXPECT_EQ(send_chunks[0].raddr, recv_chunks[0].ptr);
 }
 
-// When a receiver plan stages device blocks in remapped host blocks
-// (host_block_of), LayerHostAddrs reports that map in host_slot_by_block and
+// When a receiver plan stages device blocks in remapped host blocks (demand
+// staging), LayerHostAddrs reports that map in host_slot_by_block and
 // the sender computes raddr at the remapped host block.
 TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverRemappedHostBlocks) {
-  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/2,
-                              /*slice_byte_size=*/128, /*host_blocks=*/4);
-  TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/2,
-                            /*slice_byte_size=*/128, /*host_blocks=*/4);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& receiver = receiver_host.manager();
+  WithPlanSessions<TestKVCacheManager> sender_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& sender = sender_host.manager();
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(9);
   auto* entry = (*request.mutable_shard_push_schedules())[1].add_entries();
@@ -834,14 +878,16 @@ TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverRemappedHostBlocks) {
   entry->set_size_bytes(64);
   entry->set_src_block_id(2);
   entry->set_dst_block_id(7);
-  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false,
-                                             /*host_block_of=*/{{7, 1}}));
+  receiver_host.EnableDemandStaging();
+  ABSL_ASSERT_OK(
+      receiver_host.RegisterActivePlan(9, request, /*is_sender=*/false));
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
       receiver.LayerHostAddrs(/*uuid=*/9);
   ASSERT_EQ(layer_host_addrs.size(), 2u);
   auto& pools = *(*request.mutable_receiver_addrs())["peer"].mutable_pools();
   for (int32_t l = 0; l < 2; ++l) pools[l] = layer_host_addrs[l];
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(9, request, /*is_sender=*/true));
+  ABSL_ASSERT_OK(
+      sender_host.RegisterActivePlan(9, request, /*is_sender=*/true));
 
   std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
       /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{7},
@@ -1766,12 +1812,12 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
 
   EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 2048);
 
-  // Calling RegisterPools grows layer 0 host mirror from 4*128 to 8*128 bytes
-  // per shard (2 shards = +1024 bytes -> 3072 bytes total).
+  // Calling RegisterPools grows both host staging layers from 4*128 to 8*128
+  // bytes per shard (2 layers * 2 shards = +2048 bytes -> 4096 bytes total).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(3072.0)))
+               testing::IsEmpty(), testing::DoubleEq(4096.0)))
       .Times(1);
   manager.SetLayerPhysicalSizeForTest(/*layer_idx=*/0,
                                       /*physical_size=*/1024,
@@ -1779,14 +1825,14 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   ABSL_ASSERT_OK(manager.RegisterPools(
       {DensePool("kind_a", /*storage_index=*/0, /*base_offset=*/0,
                  /*stride=*/128, /*num_blocks=*/8)}));
-  EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 3072);
+  EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 4096);
 
   // Subsequent call to UpdateAllocatedOccupancyMetric maintains and reports
-  // the running value (3072).
+  // the running value (4096).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(3072.0)))
+               testing::IsEmpty(), testing::DoubleEq(4096.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
 }
@@ -2406,20 +2452,22 @@ class ScopedEnvVar {
 
 struct BoundedStagingTestRig {
   static constexpr size_t kBlockBytes = 128;
+  static constexpr size_t kNumLayers = 2;
 
   std::unique_ptr<xla::PjRtClient> client;
   std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_handles;
   std::unique_ptr<KVCacheManagerBase> manager;
 
-  void Init() {
+  void InitDeviceLayers() {
     TF_ASSERT_OK_AND_ASSIGN(client,
                             xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
     TF_ASSERT_OK_AND_ASSIGN(
         xla::PjRtMemorySpace * memory_space,
         client->addressable_devices()[0]->default_memory_space());
 
-    std::vector<std::vector<raiden::RaidenBufferHandle>> layer_handles(2);
-    for (size_t layer = 0; layer < 2; ++layer) {
+    layer_handles.resize(kNumLayers);
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
       std::vector<uint8_t> init_data(kBlockBytes,
                                      static_cast<uint8_t>(0xA0 + layer));
       TF_ASSERT_OK_AND_ASSIGN(
@@ -2435,22 +2483,31 @@ struct BoundedStagingTestRig {
       pjrt_buffers.push_back(std::move(buf));
       layer_handles[layer].push_back(std::move(handle));
     }
+  }
 
-    manager = std::make_unique<KVCacheManagerBase>(
+  std::unique_ptr<KVCacheManagerBase> CreateManager(
+      std::optional<int> num_staging_layers) {
+    return std::make_unique<KVCacheManagerBase>(
         layer_handles, /*local_port=*/std::nullopt,
         /*host_blocks_to_allocate=*/1,
         /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
         /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
-        /*logical_slice_byte_size=*/kBlockBytes);
+        /*logical_slice_byte_size=*/kBlockBytes,
+        /*logical_dimensions=*/std::vector<int64_t>{},
+        /*logical_physical_size=*/std::nullopt, num_staging_layers);
+  }
+
+  void Init(int num_staging_layers) {
+    ASSERT_NO_FATAL_FAILURE(InitDeviceLayers());
+    manager = CreateManager(num_staging_layers);
   }
 };
 
 TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
-  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "1");
   ScopedEnvVar async_env("RAIDEN_ENABLE_ASYNC_DISPATCH", "1");
 
   BoundedStagingTestRig rig;
-  ASSERT_NO_FATAL_FAILURE(rig.Init());
+  ASSERT_NO_FATAL_FAILURE(rig.Init(/*num_staging_layers=*/1));
   ASSERT_EQ(rig.manager->num_host_layers(), 1);
 
   uint8_t* host_ptr =
@@ -2462,22 +2519,22 @@ TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
   // without issuing layer 0's copy or queueing a background task.
   EXPECT_THAT(rig.manager->H2dSyncDispatch({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->H2dSyncDispatch(),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->D2hSyncDispatch({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->D2hSyncDispatch(),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->H2d({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->D2h({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
 
   // Host buffer 0 was never overwritten by a partial D2H of layer 0, and
   // device layer 0 was never overwritten by a partial H2D of 0x55.
@@ -2496,11 +2553,10 @@ TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
 }
 
 TEST(KVCacheManagerTest, SingleLayerDispatchWithBoundedStagingSucceeds) {
-  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "1");
   ScopedEnvVar async_env("RAIDEN_ENABLE_ASYNC_DISPATCH", "1");
 
   BoundedStagingTestRig rig;
-  ASSERT_NO_FATAL_FAILURE(rig.Init());
+  ASSERT_NO_FATAL_FAILURE(rig.Init(/*num_staging_layers=*/1));
   ASSERT_EQ(rig.manager->num_host_layers(), 1);
 
   uint8_t* host_ptr =
@@ -2551,6 +2607,384 @@ TEST(KVCacheManagerTest, SingleLayerDispatchWithBoundedStagingSucceeds) {
             std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0xB1));
 }
 
+TEST(KVCacheManagerTest, NumStagingLayersBoundsHostLayerBuffers) {
+  BoundedStagingTestRig rig;
+  ASSERT_NO_FATAL_FAILURE(rig.InitDeviceLayers());
+
+  // Unset keeps one host buffer per layer; a value in [1, num_layers]
+  // allocates exactly that many.
+  EXPECT_EQ(rig.CreateManager(std::nullopt)->num_host_layers(),
+            BoundedStagingTestRig::kNumLayers);
+  EXPECT_EQ(
+      rig.CreateManager(BoundedStagingTestRig::kNumLayers)->num_host_layers(),
+      BoundedStagingTestRig::kNumLayers);
+  std::unique_ptr<KVCacheManagerBase> bounded = rig.CreateManager(1);
+  EXPECT_EQ(bounded->num_layers(), BoundedStagingTestRig::kNumLayers);
+  EXPECT_EQ(bounded->num_host_layers(), 1);
+  EXPECT_NE(bounded->GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0), nullptr);
+  EXPECT_EQ(bounded->GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0), nullptr);
+
+  // Out-of-range values are rejected rather than silently clamped.
+  EXPECT_THROW(rig.CreateManager(0), std::invalid_argument);
+  EXPECT_THROW(rig.CreateManager(-1), std::invalid_argument);
+  EXPECT_THROW(rig.CreateManager(BoundedStagingTestRig::kNumLayers + 1),
+               std::invalid_argument);
+
+  // Validation also runs for an empty cache, which otherwise returns early.
+  rig.layer_handles.clear();
+  EXPECT_THROW(rig.CreateManager(1), std::invalid_argument);
+}
+
+class StubTransferSession : public TransferSession {
+ public:
+  absl::Status Start() override { return absl::OkStatus(); }
+  bool Done() const override { return false; }
+  void Finish(const absl::Status& status) override {}
+  bool TryBeginOp() override { return true; }
+  void EndOp() override {}
+  absl::Status GetStatus() const override { return absl::OkStatus(); }
+  absl::Status AwaitForDone() override { return absl::OkStatus(); }
+  bool IsDraining() const override { return false; }
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+    return size_t{0};
+  }
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override {
+    return absl::OkStatus();
+  }
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    return absl::nullopt;
+  }
+};
+
+TEST(KVCacheManagerTest, GetSessionDefaultsToNotFoundAndDelegatesToHook) {
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/1);
+  EXPECT_THAT(manager.GetSession(/*uuid=*/42),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  auto expected_session = std::make_shared<StubTransferSession>();
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session =
+      [expected_session](
+          uint64_t uuid) -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+    if (uuid == 42) {
+      return expected_session;
+    }
+    return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
+  };
+  manager.SetTransferEventHooks(std::move(hooks));
+
+  EXPECT_THAT(manager.GetSession(/*uuid=*/42), IsOkAndHolds(expected_session));
+  EXPECT_THAT(manager.GetSession(/*uuid=*/99),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(KVCacheManagerTest,
+     ZeroBlockAndNonHbmReceiverActivePlansDoNotHangWaitOrTimeout) {
+  WithPlanSessions<TestKVCacheManager> host(
+      std::make_unique<TestKVCacheManager>(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*host_blocks=*/4),
+      /*timeout_s=*/0.05);
+  host.EnableDemandStaging();
+
+  // 1) Non-HBM receiver plan with 1 block in schedule (acquires demand staging
+  // while total_blocks() == 0).
+  ::tpu_sync::rpc::StartTransferRequest dram_plan;
+  dram_plan.set_uuid(9001);
+  dram_plan.set_req_id("dram_plan_9001");
+  dram_plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  auto* entry = (*dram_plan.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_src_block_id(0);
+  entry->set_dst_block_id(0);
+  ABSL_ASSERT_OK(host.RegisterActivePlan(9001, dram_plan, /*is_sender=*/false));
+
+  // 2) HBM receiver plan with 0 blocks (total_blocks() == 0).
+  ::tpu_sync::rpc::StartTransferRequest zero_hbm_plan;
+  zero_hbm_plan.set_uuid(9002);
+  zero_hbm_plan.set_req_id("zero_hbm_plan_9002");
+  zero_hbm_plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  ABSL_ASSERT_OK(
+      host.RegisterActivePlan(9002, zero_hbm_plan, /*is_sender=*/false));
+
+  ABSL_EXPECT_OK(host.WaitForPendingWork());
+
+  // Past the 50ms transfer timeout, neither plan times out or reports a false
+  // failure in CompleteReadWithDetails.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  CompleteReadResult completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, testing::IsEmpty());
+  EXPECT_THAT(completions.failed, testing::IsEmpty());
+  EXPECT_TRUE(host.manager().HasActivePlan(9001));
+  EXPECT_TRUE(host.manager().HasActivePlan(9002));
+
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9001));
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9002));
+  completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, testing::IsEmpty());
+  EXPECT_FALSE(host.manager().HasActivePlan(9001));
+  EXPECT_FALSE(host.manager().HasActivePlan(9002));
+}
+
+TEST(KVCacheManagerTest,
+     RegisterActivePlanReusingSettledUuidPreservesCompletionAndLivePlan) {
+  WithPlanSessions<TestKVCacheManager> host(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4);
+  ABSL_ASSERT_OK(host.manager().RegisterPools(
+      {DensePool("fa", /*storage_index=*/0, /*base_offset=*/0, /*stride=*/128,
+                 /*num_blocks=*/4)}));
+
+  // Subcase 1: Pool-reshard receive settles via UnregisterActivePlan before
+  // CompleteReadWithDetails is polled, then the same UUID is reused by
+  // RegisterActivePlan.
+  ::tpu_sync::rpc::StartTransferRequest pool_recv;
+  pool_recv.set_uuid(9101);
+  pool_recv.set_req_id("pool_recv_9101");
+  pool_recv.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  pool_recv.set_use_block_chunks(true);
+  pool_recv.set_parallelism(1);
+  pool_recv.add_transfer_pool_indices(0);
+  pool_recv.add_pool_dtype_tags("dtype_a");
+  auto* group = pool_recv.add_pool_groups();
+  group->add_pool_indices(0);
+  group->add_dst_device_block_ids(0);
+  group->set_expected_pushes(1);
+  group->add_dst_expected_extent_bytes(128);
+  auto* pool_entry =
+      (*pool_recv.mutable_shard_push_schedules())[0].add_entries();
+  pool_entry->set_dst_peer("127.0.0.1:1");
+  pool_entry->set_dst_shard_idx(0);
+  pool_entry->set_src_block_id(0);
+  pool_entry->set_dst_block_id(0);
+  pool_entry->set_size_bytes(128);
+  pool_entry->set_count(1);
+
+  ABSL_ASSERT_OK(
+      host.PoolReshardRegisterRecv(pool_recv, std::vector<int64_t>{0}));
+  ABSL_ASSERT_OK(host.UnregisterActivePlan(9101));
+  EXPECT_FALSE(host.manager().HasActivePlan(9101));
+
+  ::tpu_sync::rpc::StartTransferRequest sender_plan = pool_recv;
+  sender_plan.set_req_id("sender_plan_9101");
+  ABSL_ASSERT_OK(
+      host.RegisterActivePlan(9101, sender_plan, /*is_sender=*/true));
+  EXPECT_TRUE(host.manager().HasActivePlan(9101));
+
+  CompleteReadResult completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, testing::ElementsAre("pool_recv_9101"));
+  EXPECT_TRUE(host.manager().HasActivePlan(9101));
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9101));
+
+  // Subcase 2: Block receive settles via OnBlockShardsReceived before
+  // CompleteReadWithDetails is polled, then the same UUID is reused by a
+  // sender RegisterActivePlan.
+  ABSL_ASSERT_OK(host.RegisterRecv(/*uuid=*/9102, "block_recv_9102",
+                                   /*expected_block_count=*/1));
+  ABSL_ASSERT_OK(host.manager().OnBlockShardsReceived(
+      /*block_ids=*/{0}, /*shard_ids=*/{0}, /*uuid=*/9102));
+
+  sender_plan.set_uuid(9102);
+  sender_plan.set_req_id("sender_plan_9102");
+  ABSL_ASSERT_OK(
+      host.RegisterActivePlan(9102, sender_plan, /*is_sender=*/true));
+  EXPECT_TRUE(host.manager().HasActivePlan(9102));
+
+  completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, testing::ElementsAre("block_recv_9102"));
+  EXPECT_TRUE(host.manager().HasActivePlan(9102));
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9102));
+}
+
+class ConfigurableFakeKVBackend : public backends::KVBackend {
+ public:
+  explicit ConfigurableFakeKVBackend(
+      absl::Status write_status = absl::OkStatus(),
+      absl::Status read_status = absl::OkStatus(),
+      std::string fail_block_hash = "")
+      : write_status_(std::move(write_status)),
+        read_status_(std::move(read_status)),
+        fail_block_hash_(std::move(fail_block_hash)) {}
+
+  std::string name() const override { return "fake"; }
+
+  void WriteAsync(const backends::BlockKey& key,
+                  absl::Span<const backends::HostBufferDescriptor>, size_t,
+                  std::function<void(absl::Status)> callback) override {
+    if (!fail_block_hash_.empty() && key.block_hash != fail_block_hash_) {
+      callback(absl::OkStatus());
+      return;
+    }
+    callback(write_status_);
+  }
+
+  void ReadAsync(const backends::BlockKey& key,
+                 absl::Span<const backends::HostBufferDescriptor>, size_t,
+                 std::function<void(absl::Status)> callback) override {
+    if (!fail_block_hash_.empty() && key.block_hash != fail_block_hash_) {
+      callback(absl::OkStatus());
+      return;
+    }
+    callback(read_status_);
+  }
+
+  void BatchExistsAsync(absl::Span<const backends::BlockKey> keys,
+                        std::function<void(std::vector<absl::StatusOr<bool>>)>
+                            callback) override {
+    callback(std::vector<absl::StatusOr<bool>>(keys.size(), true));
+  }
+
+ private:
+  absl::Status write_status_;
+  absl::Status read_status_;
+  std::string fail_block_hash_;
+};
+
+auto StorageBytesLabels(absl::string_view direction,
+                        absl::string_view local_rank) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kDirection,
+                         std::string(direction)),
+      testing::FieldsAre(telemetry::metric_labels::kLocalRank,
+                         std::string(local_rank)));
+}
+
+TEST(KVCacheManagerTest,
+     D2hWriteToBackendAndH2dReadFromBackendEmitStorageBytesTotal) {
+  ScopedEnvVar restore_local_rank(telemetry::kLocalRankEnvVar, "3");
+
+  // 2 layers * 128 bytes/slice = 256 bytes per shard per block.
+  // For multi_shard_mgr (2 shards), each block has 512 total bytes across both
+  // shards (256 bytes for shard 0 and 256 bytes for shard 1).
+  TestKVCacheManager single_shard_mgr(/*num_layers=*/2, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2);
+  TestKVCacheManager multi_shard_mgr(/*num_layers=*/2, /*num_shards=*/2,
+                                     /*slice_byte_size=*/128,
+                                     /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(testing::Ne(telemetry::metric_names::kStorageBytesTotal),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  // 2 blocks transferred across the batch: completed bytes per shard are
+  // accumulated (256 * 2 = 512) and recorded once when the final chunk
+  // completes.
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(
+          telemetry::metric_names::kStorageBytesTotal,
+          StorageBytesLabels(telemetry::metric_labels::kDirectionWrite, "3"),
+          512))
+      .Times(1);
+  EXPECT_CALL(*raw_mock, IncrementCounter(
+                             telemetry::metric_names::kStorageBytesTotal,
+                             StorageBytesLabels(
+                                 telemetry::metric_labels::kDirectionRead, "3"),
+                             512))
+      .Times(1);
+
+  for (absl::string_view rank : {"0", "1"}) {
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(
+            telemetry::metric_names::kStorageBytesTotal,
+            StorageBytesLabels(telemetry::metric_labels::kDirectionWrite, rank),
+            512))
+        .Times(1);
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(
+            telemetry::metric_names::kStorageBytesTotal,
+            StorageBytesLabels(telemetry::metric_labels::kDirectionRead, rank),
+            512))
+        .Times(1);
+  }
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>();
+
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "k0", .resolved_key = "/tmp/k0"},
+      {.block_hash = "k1", .resolved_key = "/tmp/k1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture single_write,
+                       single_shard_mgr.D2hWriteToBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(single_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture single_read,
+                       single_shard_mgr.H2dReadFromBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(single_read.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_write,
+                       multi_shard_mgr.D2hWriteToBackend({fake_backend}, keys,
+                                                         block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_read,
+                       multi_shard_mgr.H2dReadFromBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_read.Await());
+}
+
+TEST(KVCacheManagerTest,
+     FailedStorageWriteOrReadDoesNotIncrementStorageBytesTotal) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(testing::Ne(telemetry::metric_names::kStorageBytesTotal),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kStorageBytesTotal,
+                               testing::_, testing::_))
+      .Times(0);
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  // Block "fail1" fails while block "ok0" succeeds to verify that partial batch
+  // completions do not emit metric increments on failure.
+  auto fail_backend = std::make_shared<ConfigurableFakeKVBackend>(
+      absl::UnavailableError("simulated storage write failure"),
+      absl::NotFoundError("simulated storage read failure"),
+      /*fail_block_hash=*/"fail1");
+
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "ok0", .resolved_key = "/tmp/ok0"},
+      {.block_hash = "fail1", .resolved_key = "/tmp/fail1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture write_fail,
+      manager.D2hWriteToBackend({fail_backend}, keys, block_ids, block_ids));
+  EXPECT_THAT(write_fail.Await(), StatusIs(absl::StatusCode::kUnavailable));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture read_fail,
+      manager.H2dReadFromBackend({fail_backend}, keys, block_ids, block_ids));
+  EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

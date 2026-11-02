@@ -20,7 +20,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>
@@ -44,12 +43,15 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
+#include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -59,10 +61,13 @@
 #include "tpu_sync/kv_cache/transfer_send_session.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::AllOf;
 using ::testing::Contains;
@@ -79,11 +84,13 @@ constexpr double kTimeoutS = 0.05;
 // A producer whose device-to-host copies complete when the test says so.
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS)
-      : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
-                                   /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+  explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS,
+                       std::optional<int> num_staging_layers = std::nullopt)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<TestBase>(num_layers, num_staging_layers, this),
+            /*node_id=*/0,
+            /*local_control_port=*/-1, /*max_blocks=*/1,
+            /*num_slots=*/kSlots, timeout_s) {}
 
   // Serves a pull for `uuid` the way ProcessPullStream does once the
   // consumer is acknowledged: the push runs on this thread and returns
@@ -92,7 +99,8 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
+      CHECK(session != nullptr);
     }
     session->StartPush({"127.0.0.1:1"}, /*src_block_ids=*/{0},
                        /*dst_block_ids=*/{0});
@@ -112,7 +120,8 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
+      CHECK(session != nullptr);
     }
     session->Finish(absl::CancelledError("send cancelled"));
   }
@@ -141,7 +150,8 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
+      CHECK(session != nullptr);
     }
     if (in_flight > 0) {
       ServePull(uuid);
@@ -156,19 +166,19 @@ class TestManager : public KVCacheManagerWithTransfer {
   }
 
   void End(const std::shared_ptr<TransferSendSession>& session) {
-    session->EndSendOp();
+    session->EndOp();
   }
 
   bool has_send(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = send_sessions_.find(uuid);
-    return it != send_sessions_.end() && !it->second->Done();
+    auto session = FindSessionLocked<TransferSendSession>(uuid);
+    return session != nullptr && !session->Done();
   }
 
   bool send_draining(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = send_sessions_.find(uuid);
-    return it != send_sessions_.end() && it->second->IsDraining();
+    auto session = FindSessionLocked<TransferSendSession>(uuid);
+    return session != nullptr && session->IsDraining();
   }
 
   // Host layer buffer the `index`-th copy issued writes to; -1 when the copy
@@ -220,14 +230,15 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   const StagingLayerManager& staging_layer_manager(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return send_sessions_.at(uuid)->staging_layer_manager();
+    return FindSessionLocked<TransferSendSession>(uuid)
+        ->staging_layer_manager();
   }
 
   absl::Status AwaitSendDone(uint64_t uuid) {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
     }
     return session->AwaitForDone();
   }
@@ -243,12 +254,15 @@ class TestManager : public KVCacheManagerWithTransfer {
  private:
   class TestBase : public kv_cache::KVCacheManagerBase {
    public:
-    TestBase(size_t num_layers, TestManager* owner)
+    TestBase(size_t num_layers, std::optional<int> num_staging_layers,
+             TestManager* owner)
         : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
                                        std::vector<size_t>(num_layers, 128),
                                        /*local_port=*/std::nullopt,
                                        /*host_blocks_to_allocate=*/kSlots,
-                                       /*parallelism=*/1, nullptr),
+                                       /*parallelism=*/1, nullptr,
+                                       /*bind_ip=*/std::nullopt,
+                                       num_staging_layers),
           owner_(owner) {}
 
     absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
@@ -317,11 +331,13 @@ class TestManager : public KVCacheManagerWithTransfer {
 // A consumer whose host-to-device copies complete when the test says so.
 class RecvTestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0)
-      : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
-                                   /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+  explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0,
+                           std::optional<int> num_staging_layers = std::nullopt)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<RecvBase>(num_layers, num_staging_layers, this),
+            /*node_id=*/0,
+            /*local_control_port=*/-1, /*max_blocks=*/1,
+            /*num_slots=*/kSlots, timeout_s) {}
 
   void AddRecv(const std::string& req_id, uint64_t uuid,
                int32_t blocks_per_layer = 1,
@@ -329,6 +345,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
                    std::nullopt) {
     ::tpu_sync::rpc::StartTransferRequest plan;
     plan.set_uuid(uuid);
+    plan.set_req_id(req_id);
+    plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
     plan.set_use_block_chunks(true);
     auto* entry = (*plan.mutable_shard_push_schedules())[0].add_entries();
     entry->set_dst_shard_idx(0);
@@ -336,9 +354,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     entry->set_dst_block_id(0);
     entry->set_size_bytes(base()->block_bytes(0));
     entry->set_count(blocks_per_layer);
-    CHECK_OK(RegisterActivePlan(uuid, plan, /*is_sender=*/false));
     absl::MutexLock lock(mu_);
-    active_recv_sessions_[uuid] = *TransferReceiveSession::Create(
+    sessions_[uuid] = *TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
         deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
   }
@@ -358,7 +375,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   absl::Status ReceiveBlocks(const std::vector<int>& blocks, uint64_t uuid) {
     std::vector<int> all_shards(base()->num_shards());
     std::iota(all_shards.begin(), all_shards.end(), 0);
-    return OnBlockShardsReceived(blocks, all_shards, uuid);
+    return base()->OnBlockShardsReceived(blocks, all_shards, uuid);
   }
 
   void FinishCopy(size_t index, absl::Status status) {
@@ -385,22 +402,22 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
 
   const StagingLayerManager& staging_layer_manager(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return active_recv_sessions_.at(uuid)->staging_layer_manager();
+    return FindSessionLocked<TransferReceiveSession>(uuid)
+        ->staging_layer_manager();
   }
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = active_recv_sessions_.find(uuid);
-    return it != active_recv_sessions_.end() && !it->second->Done();
+    auto session = FindSessionLocked<TransferReceiveSession>(uuid);
+    return session != nullptr && !session->Done();
   }
 
   void FailRecv(uint64_t uuid, absl::Status status) {
     std::shared_ptr<TransferReceiveSession> session;
     {
       absl::MutexLock lock(mu_);
-      auto it = active_recv_sessions_.find(uuid);
-      if (it == active_recv_sessions_.end()) return;
-      session = it->second;
+      session = FindSessionLocked<TransferReceiveSession>(uuid);
+      if (session == nullptr) return;
     }
     session->Finish(status);
   }
@@ -418,12 +435,15 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
  private:
   class RecvBase : public kv_cache::KVCacheManagerBase {
    public:
-    RecvBase(size_t num_layers, RecvTestManager* owner)
+    RecvBase(size_t num_layers, std::optional<int> num_staging_layers,
+             RecvTestManager* owner)
         : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
                                        std::vector<size_t>(num_layers, 128),
                                        /*local_port=*/std::nullopt,
                                        /*host_blocks_to_allocate=*/kSlots,
-                                       /*parallelism=*/1, nullptr),
+                                       /*parallelism=*/1, nullptr,
+                                       /*bind_ip=*/std::nullopt,
+                                       num_staging_layers),
           owner_(owner) {}
 
     absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
@@ -456,20 +476,6 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   std::atomic<bool> block_dispatch_{false};
   absl::Notification dispatch_entered_;
   absl::Notification release_dispatch_;
-};
-
-// Sets environment variable |name| to |value| until destroyed. The staging
-// geometry is read once when a manager is constructed, so the guard only has
-// to outlive construction.
-class ScopedEnv {
- public:
-  ScopedEnv(const char* name, const char* value) : name_(name) {
-    setenv(name, value, /*overwrite=*/1);
-  }
-  ~ScopedEnv() { unsetenv(name_); }
-
- private:
-  const char* name_;
 };
 
 class DispatchReleaseGuard {
@@ -550,6 +556,59 @@ TEST(SendDrainTest, FailedLayerWaitsForTheOtherLayersCopies) {
   EXPECT_THAT(DoneSending(after), IsEmpty());
   EXPECT_THAT(FailedRecving(after), Contains("req"));
   EXPECT_EQ(producer.free_slots(), kSlots);
+}
+
+// A transport read of a block for a live send waits for that send's
+// device-to-host copy of the layer and carries the copy's status. Reads that
+// name no live send, and lease-authorised reads, are not gated.
+TEST(SendDrainTest, BlockReadinessWaitsForTheSendsLayerCopy) {
+  TestManager producer(/*num_layers=*/2, /*timeout_s=*/5.0);
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/9, {0}), 0);
+  producer.ServePull(9);
+  ASSERT_EQ(producer.copies_issued(), 2);
+
+  auto register_readiness = [&](size_t layer_idx, uint64_t uuid,
+                                absl::Notification* done,
+                                absl::Status* status) {
+    producer.base()->RegisterBlockReadinessCallback(
+        layer_idx, /*shard_idx=*/0, /*block_id=*/0, uuid,
+        [done, status](absl::Status s) {
+          *status = std::move(s);
+          done->Notify();
+        });
+  };
+
+  absl::Notification unknown_done;
+  absl::Status unknown_status = absl::UnknownError("not called");
+  register_readiness(/*layer_idx=*/0, /*uuid=*/1234, &unknown_done,
+                     &unknown_status);
+  ASSERT_TRUE(unknown_done.HasBeenNotified());
+  ABSL_EXPECT_OK(unknown_status);
+
+  absl::Notification lease_done;
+  absl::Status lease_status = absl::UnknownError("not called");
+  register_readiness(/*layer_idx=*/0, kLeaseAuthorizedPullUuid, &lease_done,
+                     &lease_status);
+  ASSERT_TRUE(lease_done.HasBeenNotified());
+  ABSL_EXPECT_OK(lease_status);
+
+  absl::Notification layer0_done;
+  absl::Status layer0_status = absl::UnknownError("not called");
+  register_readiness(/*layer_idx=*/0, /*uuid=*/9, &layer0_done, &layer0_status);
+  absl::Notification layer1_done;
+  absl::Status layer1_status = absl::UnknownError("not called");
+  register_readiness(/*layer_idx=*/1, /*uuid=*/9, &layer1_done, &layer1_status);
+  EXPECT_FALSE(layer0_done.HasBeenNotified());
+  EXPECT_FALSE(layer1_done.HasBeenNotified());
+
+  producer.FinishCopy(0, absl::OkStatus());
+  ASSERT_TRUE(layer0_done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+  ABSL_EXPECT_OK(layer0_status);
+  EXPECT_FALSE(layer1_done.HasBeenNotified());
+
+  producer.FinishCopy(1, absl::InternalError("copy failed"));
+  ASSERT_TRUE(layer1_done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+  EXPECT_THAT(layer1_status, StatusIs(absl::StatusCode::kInternal));
 }
 
 TEST(SendDrainTest, SendNobodyPulledFailsAtItsDeadline) {
@@ -801,6 +860,26 @@ TEST(RecvLifecycleTest, NetworkCompletionWaitsForH2d) {
   EXPECT_EQ(consumer.free_slots(), kSlots);
 }
 
+TEST(RecvLifecycleTest, EmptyBlockReportIssuesNoH2d) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/24);
+
+  // An empty block report must not be read as a layer completion.
+  ABSL_ASSERT_OK(consumer.base()->OnBlockShardsReceived(
+      /*block_ids=*/{}, /*shard_ids=*/{0}, /*uuid=*/24));
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  EXPECT_TRUE(consumer.has_recv(24));
+
+  // The real completion and block report still drive the receive to done.
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/24));
+  EXPECT_EQ(consumer.copies_issued(), 1);
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/24));
+  consumer.FinishCopy(0, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(after), Contains("req"));
+  EXPECT_FALSE(consumer.has_recv(24));
+}
+
 TEST(RecvLifecycleTest, DetailsReportWhenTheLastH2dLanded) {
   RecvTestManager consumer(/*num_layers=*/1);
   consumer.AddRecv("req", /*uuid=*/26);
@@ -1013,6 +1092,63 @@ TEST(RecvDrainTest, DuplicateUuidIsRejectedUntilExpiredReceiveDrains) {
   EXPECT_THAT(FailedRecving(repeated), IsEmpty());
 }
 
+TEST(RecvLifecycleTest, RedeliveredStartReadLeavesAReadyReceiveToCompleteRead) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/30);
+  // Every shard's blocks arrive before any layer's H2D is issued: the network
+  // phase completes, no H2D is outstanding, and nothing finishes the receive.
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/30));
+  TF_ASSERT_OK_AND_ASSIGN(auto incumbent, consumer.GetSession(/*uuid=*/30));
+  auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(incumbent);
+  ASSERT_NE(recv, nullptr);
+  ASSERT_TRUE(recv->IsReadyToComplete());
+  ASSERT_FALSE(recv->IsDraining());
+
+  // A re-delivered announcement of the same request must neither finish the
+  // incumbent nor seat a second receive under its uuid.
+  consumer.StartRead("req", /*uuid=*/30, /*remote_endpoint=*/"unused:1",
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  EXPECT_THAT(consumer.GetSession(/*uuid=*/30), IsOkAndHolds(incumbent));
+  EXPECT_FALSE(recv->IsDraining());
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, ElementsAre("req"));
+  EXPECT_THAT(completions.failed, IsEmpty());
+  EXPECT_FALSE(consumer.has_recv(30));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  CompleteReadResult repeated = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(repeated.received, IsEmpty());
+  EXPECT_THAT(repeated.failed, IsEmpty());
+}
+
+TEST(RecvLifecycleTest, RegisterRecvFinishesAReadyIncumbentBeforeReplacingIt) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("old", /*uuid=*/31);
+  // Network completes before any H2D is issued, leaving the receive ready to
+  // complete but unfinished.
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/31));
+  TF_ASSERT_OK_AND_ASSIGN(auto incumbent, consumer.GetSession(/*uuid=*/31));
+  auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(incumbent);
+  ASSERT_NE(recv, nullptr);
+  ASSERT_TRUE(recv->IsReadyToComplete());
+  ASSERT_FALSE(recv->IsDraining());
+
+  ABSL_EXPECT_OK(consumer.RegisterRecv(/*uuid=*/31, "retry",
+                                       /*expected_block_count=*/1));
+  EXPECT_TRUE(recv->Done());
+  TF_ASSERT_OK_AND_ASSIGN(auto replacement, consumer.GetSession(/*uuid=*/31));
+  EXPECT_NE(replacement, incumbent);
+  EXPECT_TRUE(consumer.has_recv(31));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, ElementsAre("old"));
+  EXPECT_THAT(completions.failed, IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(31));
+}
+
 TEST(RecvDrainTest, FailedLayerWaitsForOtherH2dCopies) {
   RecvTestManager consumer(/*num_layers=*/2);
   consumer.AddRecv("req", /*uuid=*/26);
@@ -1114,9 +1250,10 @@ TEST(RecvLifecycleTest,
             std::chrono::steady_clock::now() + std::chrono::seconds(10),
             /*acquire_staging=*/true);
     weak_session = session;
-    EXPECT_TRUE(session->HasStaging());
     EXPECT_EQ(consumer.free_slots(), kSlots - 1);
-    ASSERT_THAT(session->ExecuteLayerH2d(consumer, /*layer_idx=*/0),
+    ASSERT_THAT(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                        /*minor_dimension_indices=*/{},
+                                        /*shard_ids=*/{}),
                 ::absl_testing::IsOk());
     ASSERT_EQ(consumer.copies_issued(), 1);
   }
@@ -1136,23 +1273,325 @@ TEST(RecvLifecycleTest,
   consumer.AddRecv("req_ingress_lease", /*uuid=*/91, /*blocks_per_layer=*/1);
   ASSERT_EQ(consumer.free_slots(), kSlots - 1);
 
-  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/999),
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/999),
               ::absl_testing::StatusIs(absl::StatusCode::kNotFound));
 
-  ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/91),
-              ::absl_testing::IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/91));
+  EXPECT_TRUE(session->TryBeginOp());
 
   // Failing/timing out mid-write marks the session draining and keeps staging
-  // pinned until EndIncomingPush finishes.
+  // pinned until EndOp finishes.
   consumer.FailRecv(/*uuid=*/91, absl::InternalError("simulated failure"));
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
-  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/91),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_FALSE(session->TryBeginOp());
 
-  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/91),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInternal));
   EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+TEST(RecvLifecycleTest, FirstAdmittedPushRecordsFirstPacketOnce) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/93, "req_first_packet", /*num_blocks=*/2,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/93,
+          "req_first_packet", /*total_blocks=*/2,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+  const std::string before_admission = metrics->DumpMetricsToString();
+
+  ASSERT_TRUE(session->TryBeginOp());
+  const std::string after_first_admission = metrics->DumpMetricsToString();
+  EXPECT_NE(after_first_admission, before_admission);
+
+  // Neither a second admitted push nor a partial block report re-stamps
+  // first-packet timing, even once the clock has moved on.
+  absl::SleepFor(absl::Milliseconds(2));
+  session->EndOp();
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_FALSE(session->Done());
+  EXPECT_EQ(metrics->DumpMetricsToString(), after_first_admission);
+  session->Finish();
+}
+
+TEST(RecvLifecycleTest, AdmissionRejectedByDoneSessionRecordsNoFirstPacket) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/94, "req_done", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  metrics->RecordStart(/*uuid=*/95, "req_live", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> done_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/94, "req_done", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> live_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/95, "req_live", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  done_session->Finish(absl::CancelledError("receive cancelled"));
+  ASSERT_TRUE(done_session->Done());
+  const std::string before_admission = metrics->DumpMetricsToString();
+
+  EXPECT_FALSE(done_session->TryBeginOp());
+  EXPECT_EQ(metrics->DumpMetricsToString(), before_admission);
+
+  // The same report does record an admitted push.
+  ASSERT_TRUE(live_session->TryBeginOp());
+  EXPECT_NE(metrics->DumpMetricsToString(), before_admission);
+  live_session->EndOp();
+  live_session->Finish();
+}
+
+TEST(RecvLifecycleTest,
+     AdmissionRejectedByDrainingSessionRecordsNoFirstPacket) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/96, "req_draining", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  metrics->RecordStart(/*uuid=*/97, "req_live", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> draining_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/96, "req_draining", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> live_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/97, "req_live", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  // A pending layer H2D copy keeps the cancelled receive draining, not done.
+  ABSL_ASSERT_OK(draining_session->OnDataReceived(
+      /*major_dimension_idx=*/0, /*minor_dimension_indices=*/{},
+      /*shard_ids=*/{}));
+  ASSERT_EQ(consumer.copies_issued(), 1);
+  draining_session->Finish(absl::CancelledError("receive cancelled"));
+  ASSERT_TRUE(draining_session->IsDraining());
+  ASSERT_FALSE(draining_session->Done());
+  const std::string before_admission = metrics->DumpMetricsToString();
+
+  EXPECT_FALSE(draining_session->TryBeginOp());
+  EXPECT_EQ(metrics->DumpMetricsToString(), before_admission);
+
+  // The same report does record an admitted push.
+  ASSERT_TRUE(live_session->TryBeginOp());
+  EXPECT_NE(metrics->DumpMetricsToString(), before_admission);
+  live_session->EndOp();
+  live_session->Finish();
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_TRUE(draining_session->Done());
+}
+
+// Returns the "network_transit_us" field (last-packet minus first-packet time)
+// of the one transfer in |metrics|'s report. It is negative while first-packet
+// is recorded and last-packet is not.
+int64_t NetworkTransitUs(MetricsCollector& metrics) {
+  const std::string report = metrics.DumpMetricsToString();
+  constexpr absl::string_view kField = "\"network_transit_us\": ";
+  const size_t field_start = report.find(kField);
+  CHECK_NE(field_start, std::string::npos) << report;
+  const size_t value_start = field_start + kField.size();
+  const size_t value_end = report.find(',', value_start);
+  int64_t transit_us = 0;
+  CHECK(absl::SimpleAtoi(report.substr(value_start, value_end - value_start),
+                         &transit_us))
+      << report;
+  return transit_us;
+}
+
+TEST(RecvLifecycleTest,
+     PeregrineLayerCompletionsRecordLastPacketOnceAndFinishAfterH2d) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/98, "req_peregrine", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/98,
+          "req_peregrine", /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+
+  // Each Post completes one layer; Peregrine sends no block reports.
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  session->EndOp();
+  EXPECT_LT(NetworkTransitUs(*metrics), 0);
+
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  session->EndOp();
+  const int64_t transit_us = NetworkTransitUs(*metrics);
+  EXPECT_GE(transit_us, 0);
+  ASSERT_EQ(consumer.copies_issued(), 2);
+  EXPECT_FALSE(session->Done());
+
+  absl::SleepFor(absl::Milliseconds(2));
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_FALSE(session->Done());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+}
+
+TEST(RecvLifecycleTest,
+     TcpLastLayerThenItsBlockReportRecordLastPacketOnceAndFinishOnce) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/99, "req_tcp", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/99, "req_tcp",
+          /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+
+  // A TCP stream completes its layer, then reports the layer's blocks.
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_LT(NetworkTransitUs(*metrics), 0);
+
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  const int64_t transit_us = NetworkTransitUs(*metrics);
+  EXPECT_GE(transit_us, 0);
+  // The block report that completes every shard does not re-record.
+  absl::SleepFor(absl::Milliseconds(2));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+  EXPECT_FALSE(session->Done());
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+}
+
+TEST(RecvLifecycleTest,
+     TcpH2dFinishingBeforeLastBlockReportRecordsLastPacketAndFinishesOnce) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/100, "req_tcp_h2d_first", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/100,
+          "req_tcp_h2d_first", /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+
+  // Both copies finish while the last stream still holds its push lease,
+  // before it reports its blocks.
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  const int64_t transit_us = NetworkTransitUs(*metrics);
+  EXPECT_GE(transit_us, 0);
+  consumer.FinishCopy(0, absl::OkStatus());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+
+  absl::SleepFor(absl::Milliseconds(2));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+}
+
+TEST(RecvLifecycleTest, RedeliveredLayerDoesNotCompleteNetworkPhase) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/101, "req_redelivered", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/101,
+          "req_redelivered", /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+  ASSERT_TRUE(session->TryBeginOp());
+
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ASSERT_EQ(consumer.copies_issued(), 2);
+  EXPECT_LT(NetworkTransitUs(*metrics), 0);
+
+  // The missing layer does complete it.
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  EXPECT_GE(NetworkTransitUs(*metrics), 0);
+
+  session->Finish(absl::CancelledError("receive cancelled"));
+  session->EndOp();
+  consumer.FinishCopy(0, absl::OkStatus());
+  consumer.FinishCopy(1, absl::OkStatus());
+  consumer.FinishCopy(2, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
 }
 
 TEST(RecvLifecycleTest,
@@ -1164,20 +1603,21 @@ TEST(RecvLifecycleTest,
   // Simulate BlockTransport::HandleIncomingPush holding the incoming push lease
   // across OnLayerReceived, synchronous H2D completion, and
   // OnBlockShardsReceived.
-  ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/92),
-              ::absl_testing::IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/92));
+  EXPECT_TRUE(session->TryBeginOp());
   ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/92),
               ::absl_testing::IsOk());
   consumer.FinishCopy(0, absl::OkStatus());
   // Even though the H2D copy finished, staging must remain pinned until
-  // OnBlockShardsReceived and EndIncomingPush complete.
+  // OnBlockShardsReceived and EndOp complete.
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
   ASSERT_THAT(consumer.ReceiveBlocks({0}, /*uuid=*/92), ::absl_testing::IsOk());
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
-  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/92),
-              ::absl_testing::IsOk());
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
   EXPECT_EQ(consumer.free_slots(), kSlots);
   Reports reports = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneReceiving(reports), Contains("req_handoff"));
@@ -1191,20 +1631,21 @@ TEST(
   consumer.AddRecv("req_push_died", /*uuid=*/93, /*blocks_per_layer=*/1);
   ASSERT_EQ(consumer.free_slots(), kSlots - 1);
 
-  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/93));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/93));
+  EXPECT_TRUE(session->TryBeginOp());
 
   // When an incoming push fails (e.g. socket read timeout or peer disconnect),
-  // EndIncomingPush receives the non-OK push status and immediately fails the
-  // session, releasing the staging slot without waiting for the 120s deadline.
-  EXPECT_THAT(
-      consumer.base()->EndIncomingPush(
-          /*uuid=*/93, absl::DeadlineExceededError("Socket read timed out")),
-      ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  // Finish + EndOp immediately fails the session, releasing the staging slot
+  // without waiting for the 120s deadline.
+  session->Finish(absl::DeadlineExceededError("Socket read timed out"));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(),
+              ::absl_testing::StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_EQ(consumer.free_slots(), kSlots);
 
   // Subsequent incoming pushes for the same uuid are immediately rejected.
-  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/93),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_FALSE(session->TryBeginOp());
 
   // CompleteReadRaw immediately reports the request in failed_recving and
   // retires the session before the 120s deadline.
@@ -1247,7 +1688,7 @@ TEST(RecvLifecycleTest,
   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 2)[0], 0xA5);
 
   // 3. Host-only (MEMORY_TYPE_DRAM) active plan push (op = 6, uuid = 42,
-  //    no TransferReceiveSession in active_recv_sessions_).
+  //    TransferReceiveSession in sessions_ with tracks_completion = false).
   ::tpu_sync::rpc::StartTransferRequest dram_plan;
   dram_plan.set_uuid(42);
   dram_plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
@@ -1278,9 +1719,9 @@ TEST(RecvLifecycleTest,
   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
 }
 
-// StagingLayerManager: TPU_RAIDEN_NUM_STAGING_LAYERS=4 leaves four host layer
-// buffers for a 64-layer cache. Layers lease them in arrival order, a fifth
-// layer waits for a release, and a released buffer goes to the waiting layer
+// StagingLayerManager: num_staging_layers=4 leaves four host layer buffers
+// for a 64-layer cache. Layers lease them in arrival order, a fifth layer
+// waits for a release, and a released buffer goes to the waiting layer
 // whichever layer freed it.
 TEST(RecvLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   constexpr size_t kNumLayers = 64;
@@ -1289,8 +1730,7 @@ TEST(RecvLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
       RecvTestManager(kNumLayers).base()->GetAllocatedHostDramBytes();
   ASSERT_GT(full_dram_bytes, 0);
 
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0);
+  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   kv_cache::KVCacheManagerBase* base = consumer.base();
   EXPECT_EQ(base->num_host_layers(), kNumStagingLayers);
   EXPECT_EQ(base->GetAllocatedHostDramBytes(),
@@ -1373,8 +1813,7 @@ TEST(RecvLifecycleTest,
      StagingLayerManagerReleasesAllResourcesAcrossFailureModes) {
   constexpr size_t kNumLayers = 16;
   constexpr size_t kNumStagingLayers = 4;
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0);
+  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   kv_cache::KVCacheManagerBase* base = consumer.base();
   const size_t block_bytes = base->block_bytes(0);
 
@@ -1432,7 +1871,8 @@ TEST(RecvLifecycleTest,
   //    releases both the layer lease and the staging block.
   consumer.AddRecv("req_push_abort_after_chunk", /*uuid=*/202);
   const StagingLayerManager& manager2 = consumer.staging_layer_manager(202);
-  ASSERT_THAT(base->BeginIncomingPush(/*uuid=*/202), ::absl_testing::IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(auto session202, base->GetSession(/*uuid=*/202));
+  EXPECT_TRUE(session202->TryBeginOp());
   std::vector<transport::BlockChunk> chunks = base->GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, /*block_ids=*/{0}, block_bytes,
       /*uuid=*/202);
@@ -1443,8 +1883,10 @@ TEST(RecvLifecycleTest,
   consumer.FailRecv(/*uuid=*/202, absl::UnavailableError("socket closed"));
   // Still pinned while the incoming push is in flight.
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
-  EXPECT_THAT(base->EndIncomingPush(/*uuid=*/202),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  session202->EndOp();
+  EXPECT_TRUE(session202->Done());
+  EXPECT_THAT(session202->GetStatus(),
+              ::absl_testing::StatusIs(absl::StatusCode::kUnavailable));
   EXPECT_EQ(manager2.num_free(), kNumStagingLayers);
   EXPECT_EQ(consumer.free_slots(), kSlots);
   Reports reports2 = consumer.CompleteReadRaw();
@@ -1479,9 +1921,9 @@ TEST(RecvLifecycleTest,
   EXPECT_FALSE(consumer.has_recv(203));
 }
 
-// Sender-side StagingLayerManager: with TPU_RAIDEN_NUM_STAGING_LAYERS=4 on a
-// 64-layer cache, StartPush leases the four host layer buffers for layers 0..3
-// and waits before issuing layer 4's D2H copy. Completing a layer's H2H push
+// Sender-side StagingLayerManager: with num_staging_layers=4 on a 64-layer
+// cache, StartPush leases the four host layer buffers for layers 0..3 and
+// waits before issuing layer 4's D2H copy. Completing a layer's H2H push
 // returns its host layer buffer to the manager so the next waiting layer can
 // D2H into it and H2H out of it.
 TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
@@ -1491,8 +1933,7 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
       TestManager(kNumLayers).base()->GetAllocatedHostDramBytes();
   ASSERT_GT(full_dram_bytes, 0);
 
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  TestManager producer(kNumLayers, /*timeout_s=*/10.0);
+  TestManager producer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   producer.SetManualH2h(true);
   kv_cache::KVCacheManagerBase* base = producer.base();
   EXPECT_EQ(base->num_host_layers(), kNumStagingLayers);
@@ -1588,8 +2029,7 @@ TEST(SendLifecycleTest,
      StagingLayerManagerReleasesAllResourcesAcrossFailureModes) {
   constexpr size_t kNumLayers = 16;
   constexpr size_t kNumStagingLayers = 4;
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  TestManager producer(kNumLayers, /*timeout_s=*/10.0);
+  TestManager producer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   producer.SetManualH2h(true);
   kv_cache::KVCacheManagerBase* base = producer.base();
   const size_t block_bytes = base->block_bytes(0);
@@ -1733,5 +2173,148 @@ TEST(SendLifecycleTest,
   EXPECT_EQ(producer.free_slots(), kSlots);
   EXPECT_FALSE(producer.has_send(404));
 }
+
+TEST(SendLifecycleTest,
+     GetSessionResolvesActiveSendAndReturnsNotFoundAfterRetirement) {
+  TestManager producer(/*num_layers=*/1);
+  EXPECT_THAT(producer.GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(producer.base()->GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  ASSERT_GT(producer.NotifyForRead("req_get_send", /*uuid=*/501,
+                                   /*block_ids=*/{0}),
+            0);
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      producer.GetSession(/*uuid=*/501);
+  ABSL_ASSERT_OK(session);
+  ASSERT_NE(*session, nullptr);
+  EXPECT_FALSE((*session)->Done());
+  EXPECT_THAT(producer.base()->GetSession(/*uuid=*/501),
+              IsOkAndHolds(*session));
+
+  producer.CancelSend(501);
+  Reports reports = producer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(reports), Contains("req_get_send"));
+  EXPECT_THAT(producer.GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(producer.base()->GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(RecvLifecycleTest,
+     GetSessionResolvesActiveRecvAndReturnsNotFoundAfterRetirement) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  EXPECT_THAT(consumer.GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  consumer.AddRecv("req_get_recv", /*uuid=*/502);
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      consumer.GetSession(/*uuid=*/502);
+  ABSL_ASSERT_OK(session);
+  ASSERT_NE(*session, nullptr);
+  EXPECT_FALSE((*session)->Done());
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/502),
+              IsOkAndHolds(*session));
+
+  consumer.FailRecv(502, absl::CancelledError("done"));
+  Reports reports = consumer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(reports), Contains("req_get_recv"));
+  EXPECT_THAT(consumer.GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+// ExecuteLayerH2d: H2dSyncDispatch fails. The receive finishes with the
+// dispatch error in the h2d phase, releases the op it took and settles at
+// once, since no copy was issued; the poll reports it failed.
+TEST(RecvLifecycleTest, FailedH2dDispatchFailsAndSettlesTheReceive) {
+  GetFaultInjector().Reset();
+  absl::Cleanup reset_faults = [] { GetFaultInjector().Reset(); };
+  FaultInjectionRule failed_dispatch;
+  failed_dispatch.hook = std::string(hooks::kTransferRecvSessionH2dDispatch);
+  failed_dispatch.probability = 1.0;
+  ABSL_ASSERT_OK(GetFaultInjector().Install({failed_dispatch}));
+
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/501);
+  EXPECT_FALSE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/501).ok());
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, IsEmpty());
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  EXPECT_EQ(completions.details["req"].phase, "h2d");
+  EXPECT_FALSE(consumer.has_recv(501));
+}
+
+// A second Finish(error) on a draining receive changes nothing: the first
+// error is the one reported, once, when the copy ends.
+TEST(RecvLifecycleTest, SecondFinishOnAFailedReceiveIsANoOp) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req", /*uuid=*/502);
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/502));
+  consumer.FailRecv(/*uuid=*/502, absl::InternalError("first"));
+  consumer.FailRecv(/*uuid=*/502, absl::UnavailableError("second"));
+  EXPECT_TRUE(consumer.has_recv(502));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  EXPECT_EQ(completions.details["req"].code, "INTERNAL");
+  EXPECT_EQ(completions.details["req"].reason, "first");
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  EXPECT_THAT(consumer.CompleteReadWithDetails().failed, IsEmpty());
+}
+
+// An incoming push lease that closes while the layer's copy is still
+// running, the usual order for an asynchronous H2D: the lease release
+// neither settles the receive nor returns its staging; the copy's
+// completion does.
+TEST(RecvLifecycleTest, PushLeaseClosingBeforeTheCopyEndsDoesNotSettle) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req", /*uuid=*/503);
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/503));
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/503));
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/503));
+  session->EndOp();
+
+  Reports during = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(during), IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(503));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(after), ElementsAre("req"));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+// A cancelled receive whose only copy then fails keeps the cancellation: the
+// copy's error is absorbed by the draining receive, its callback ends the
+// last op, and the receive settles and is reported failed once.
+TEST(RecvDrainTest, CancelledReceiveWhoseCopyThenFailsStaysCancelled) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req", /*uuid=*/504);
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/504));
+  consumer.FailRecv(/*uuid=*/504, absl::CancelledError("cancel"));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::InternalError("copy failed"));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  EXPECT_EQ(completions.details["req"].code, "CANCELLED");
+  EXPECT_THAT(consumer.CompleteReadWithDetails().failed, IsEmpty());
+}
+
 }  // namespace
 }  // namespace tpu_raiden

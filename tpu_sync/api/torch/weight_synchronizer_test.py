@@ -33,6 +33,53 @@ _SMALL_SLICE_BYTES = 1024 * 1024
 # is refused immediately, so this only bounds a hung handshake.
 _CONNECT_TIMEOUT_SECS = 5.0
 
+# Layer shapes for the bit-exact tests: one multiple of the TPU tile, and others
+# of several ranks that are not, so device layouts carry padding.
+_CORRECTNESS_SHAPES = ((256, 1024), (3, 100, 7), (1000,), (2, 3, 17, 130), (1,))
+
+# Integer dtype of the same width as each tested dtype, for bitwise comparison.
+_BITS_DTYPE = {
+    torch.float32: torch.int32,
+    torch.bfloat16: torch.int16,
+    torch.float16: torch.int16,
+    torch.int32: torch.int32,
+    torch.int8: torch.int8,
+}
+
+
+def _random_weights(
+    dtype: torch.dtype, num_shards: int, step: int
+) -> list[list[torch.Tensor]]:
+  """Returns CPU [layer][shard] tensors of random values for one sync step.
+
+  Every (step, layer, shard) gets its own seed, so a misplaced element, a
+  swapped shard or layer, or a stale step all show up as mismatches, unlike a
+  constant fill.
+
+  Args:
+    dtype: Element type of every tensor.
+    num_shards: Number of shards per layer.
+    step: Sync step, so that consecutive steps carry different values.
+  """
+  weights = []
+  for layer, shape in enumerate(_CORRECTNESS_SHAPES):
+    shards = []
+    for shard in range(num_shards):
+      generator = torch.Generator().manual_seed(
+          step * 1_000_003 + layer * 1_009 + shard
+      )
+      if dtype.is_floating_point:
+        shards.append(torch.randn(shape, generator=generator).to(dtype))
+      else:
+        info = torch.iinfo(dtype)
+        shards.append(
+            torch.randint(
+                info.min, info.max, shape, generator=generator, dtype=dtype
+            )
+        )
+    weights.append(shards)
+  return weights
+
 
 def _listener_accepts_connections(port: int) -> bool:
   """Returns whether a TCP listener accepts connections on 127.0.0.1:port."""
@@ -808,6 +855,470 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertEqual(m_reset["d2h_call_count"], 0)
     self.assertEqual(m_reset["total_h2d_bytes"], 0)
     self.assertEqual(m_reset["total_h2d_time_ms"], 0.0)
+
+  def _to_device(
+      self, weights: list[list[torch.Tensor]]
+  ) -> list[list[torch.Tensor]]:
+    return [[t.to(self.device) for t in shards] for shards in weights]
+
+  def _zeros_on_device(
+      self, weights: list[list[torch.Tensor]]
+  ) -> list[list[torch.Tensor]]:
+    return [
+        [torch.zeros_like(t, device=self.device) for t in shards]
+        for shards in weights
+    ]
+
+  def _copy_in_place(
+      self,
+      tensors: list[list[torch.Tensor]],
+      values: list[list[torch.Tensor]],
+  ) -> None:
+    """Overwrites device `tensors` in place, as an optimizer step does."""
+    for shards, new_shards in zip(tensors, values, strict=True):
+      for tensor, new_tensor in zip(shards, new_shards, strict=True):
+        tensor.copy_(new_tensor.to(self.device))
+
+  def _assert_bit_exact(
+      self,
+      actual: list[list[torch.Tensor]],
+      expected: list[list[torch.Tensor]],
+      label: str,
+  ) -> None:
+    """Asserts that device tensors hold exactly the bits of CPU tensors."""
+    for layer, (actual_shards, expected_shards) in enumerate(
+        zip(actual, expected, strict=True)
+    ):
+      for shard, (got, want) in enumerate(
+          zip(actual_shards, expected_shards, strict=True)
+      ):
+        got = got.cpu()
+        where = f"{label}: layer {layer} {tuple(want.shape)} shard {shard}"
+        self.assertEqual(got.shape, want.shape, where)
+        self.assertEqual(got.dtype, want.dtype, where)
+        bits = _BITS_DTYPE[want.dtype]
+        mismatches = (got.view(bits) != want.view(bits)).nonzero()
+        if mismatches.numel():
+          self.fail(
+              f"{where}: {mismatches.shape[0]} of {want.numel()} elements"
+              f" differ, first at index {tuple(mismatches[0].tolist())}"
+          )
+
+  def _send_control_request(
+      self, port: int, request: raiden_service_pb2.ControlRequest
+  ) -> None:
+    payload = request.SerializeToString()
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0) as sock:
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      response_len = int.from_bytes(sock.recv(4), "big")
+      response = raiden_service_pb2.ControlResponse()
+      response.ParseFromString(sock.recv(response_len))
+    self.assertTrue(response.success, response.message)
+
+  def _push_resharded(
+      self,
+      sender: WeightSynchronizer,
+      receiver: WeightSynchronizer,
+      weights: list[list[torch.Tensor]],
+      uuid: int,
+      host_tiling_mode: raiden_service_pb2.HostTilingMode,
+  ) -> None:
+    """Pushes every layer of every shard to the same shard of `receiver`.
+
+    Sends the requests the controller sends when sender and receiver have the
+    same sharding: the receiver is armed for one chunk per layer and shard, and
+    the sender gets one whole-layer entry per layer and shard.
+
+    Args:
+      sender: Synchronizer that pushes.
+      receiver: Synchronizer that receives.
+      weights: The [layer][shard] tensors being synchronized, for their sizes.
+      uuid: Transfer id.
+      host_tiling_mode: Layout the receiver keeps its host buffers in.
+    """
+    num_shards = len(weights[0])
+    self._send_control_request(
+        receiver.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=raiden_service_pb2.StartTransferRequest(
+                is_sender=False,
+                uuid=uuid,
+                expected_block_count=len(weights) * num_shards,
+                expected_layer_chunk_counts={
+                    layer: num_shards for layer in range(len(weights))
+                },
+                host_tiling_mode=host_tiling_mode,
+            ),
+        ),
+    )
+    request = raiden_service_pb2.StartTransferRequest(is_sender=True, uuid=uuid)
+    for shard in range(num_shards):
+      schedule = request.shard_push_schedules[shard]
+      for layer, shards in enumerate(weights):
+        entry = schedule.entries.add()
+        entry.dst_peer = f"127.0.0.1:{receiver.local_port}"
+        entry.dst_shard_idx = shard
+        entry.size_bytes = shards[shard].numel() * shards[shard].element_size()
+        entry.layer_idx = layer
+    self._send_control_request(
+        sender.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=request,
+        ),
+    )
+
+  def test_push_weights_sends_in_place_updates(self):
+    """Pushes send the values of in-place updates made after construction."""
+    dtype = torch.bfloat16
+    src_tensors = self._to_device(_random_weights(dtype, num_shards=2, step=0))
+    dst_tensors = self._zeros_on_device(src_tensors)
+    ws_source = WeightSynchronizer(
+        src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        dst_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    for step in range(1, 4):
+      expected = _random_weights(dtype, num_shards=2, step=step)
+      self._copy_in_place(src_tensors, expected)
+
+      ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+      ws_dest.h2d()
+
+      self._assert_bit_exact(dst_tensors, expected, f"step {step}")
+
+  def test_h2d_reaches_receiver_tensors_updated_in_place(self):
+    """H2D lands in receiver tensors that were updated in place after binding."""
+    dtype = torch.bfloat16
+    expected = _random_weights(dtype, num_shards=2, step=1)
+    src_tensors = self._to_device(expected)
+    dst_tensors = self._to_device(_random_weights(dtype, num_shards=2, step=0))
+    ws_source = WeightSynchronizer(
+        src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        dst_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    for shards in dst_tensors:
+      for tensor in shards:
+        tensor.zero_()
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact(dst_tensors, expected, "receiver")
+
+  @parameterized.named_parameters(
+      ("deferred_tiling", raiden_service_pb2.HOST_TILING_MODE_DEFERRED),
+      ("tiling_on_arrival", raiden_service_pb2.HOST_TILING_MODE_ON_ARRIVAL),
+  )
+  def test_resharded_push_with_auto_h2d_sends_in_place_updates(
+      self, host_tiling_mode
+  ):
+    """Controller-driven pushes with auto-H2D, as RL trainers and samplers run."""
+    dtype = torch.bfloat16
+    src_tensors = self._to_device(_random_weights(dtype, num_shards=2, step=0))
+    dst_tensors = self._zeros_on_device(src_tensors)
+    ws_source = WeightSynchronizer(
+        src_tensors,
+        local_port=0,
+        parallelism=2,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        dst_tensors,
+        local_port=0,
+        parallelism=2,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        auto_h2d=True,
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    for step in range(1, 3):
+      uuid = 81000 + step
+      expected = _random_weights(dtype, num_shards=2, step=step)
+      self._copy_in_place(src_tensors, expected)
+
+      self._push_resharded(
+          ws_source, ws_dest, expected, uuid, host_tiling_mode
+      )
+      ws_dest.wait_for_transfer_completion(uuid)
+
+      self._assert_bit_exact(dst_tensors, expected, f"step {step}")
+
+  @parameterized.named_parameters(
+      ("view_tiled", "view", False),
+      ("view_skip_tiling", "view", True),
+      ("view_clone_tiled", "view_clone", False),
+      ("view_clone_skip_tiling", "view_clone", True),
+      ("empty_copy_tiled", "empty_copy", False),
+      ("empty_copy_skip_tiling", "empty_copy", True),
+      ("times_one_tiled", "times_one", False),
+      ("times_one_skip_tiling", "times_one", True),
+      ("host_round_trip_tiled", "host_round_trip", False),
+      ("host_round_trip_skip_tiling", "host_round_trip", True),
+  )
+  def test_push_folded_expert_stack(self, variant, skip_tiling):
+    """Pushes an [E, F, D] expert stack folded to [E * F, D] each way.
+
+    verl sends MoE expert stacks folded this way. torch_tpu backs the view, its
+    clone and a copy into an empty tensor with the stack's storage buffer; the
+    product and the host round trip get buffers of their own.
+
+    Args:
+      variant: How the folded tensor is made from the stack.
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(101)
+    stack = torch.randn(8, 768, 2048, generator=generator).to(torch.bfloat16)
+    view = stack.to(self.device).reshape(8 * 768, 2048)
+    if variant == "view":
+      src = view
+    elif variant == "view_clone":
+      src = view.clone()
+    elif variant == "empty_copy":
+      src = torch.empty_like(view).copy_(view)
+    elif variant == "times_one":
+      src = view * 1
+    else:
+      src = view.cpu().to(self.device)
+    dst = torch.zeros(8 * 768, 2048, dtype=torch.bfloat16, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[src]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact(
+        [[dst]], [[stack.reshape(8 * 768, 2048)]], "receiver"
+    )
+
+  @parameterized.named_parameters(
+      ("fp32_tiled", torch.float32, False),
+      ("fp32_skip_tiling", torch.float32, True),
+      ("bf16_tiled", torch.bfloat16, False),
+      ("bf16_skip_tiling", torch.bfloat16, True),
+  )
+  def test_push_from_clone_of_folded_tensor(self, dtype, skip_tiling):
+    """Pushes a clone of an [E, F, D] expert stack folded to [E * F, D].
+
+    torch_tpu backs the clone with the stack's [E, F, D] storage buffer.
+    Skipping tiling sends that buffer's raw device bytes into the receiver's
+    [E * F, D] buffer.
+
+    Args:
+      dtype: Element type of the stack.
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(102)
+    stack = torch.randn(8, 64, 256, generator=generator).to(dtype)
+    src = stack.to(self.device).reshape(8 * 64, 256).clone()
+    dst = torch.zeros(8 * 64, 256, dtype=dtype, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[src]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact([[dst]], [[stack.reshape(8 * 64, 256)]], "receiver")
+    # Raw copies neither detile on the sender nor tile on the receiver.
+    self.assertEqual(
+        ws_source.get_metrics()["total_detiled_bytes"] == 0, skip_tiling
+    )
+    self.assertEqual(
+        ws_dest.get_metrics()["total_tiled_bytes"] == 0, skip_tiling
+    )
+
+  @parameterized.named_parameters(
+      ("tiled", False),
+      ("skip_tiling", True),
+  )
+  def test_push_from_folded_view_of_another_dtype(self, skip_tiling):
+    """Pushes an int32 [E * F, D] view of an f32 [E, F, D] stack.
+
+    The view is backed by the stack's f32 storage buffer, whose element type is
+    not the view's.
+
+    Args:
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(103)
+    stack = torch.randn(8, 64, 256, generator=generator)
+    src = stack.to(self.device).view(torch.int32).view(8 * 64, 256)
+    dst = torch.zeros(8 * 64, 256, dtype=torch.int32, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[src]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact(
+        [[dst]], [[stack.view(torch.int32).reshape(8 * 64, 256)]], "receiver"
+    )
+    self.assertEqual(
+        ws_source.get_metrics()["total_detiled_bytes"] == 0, skip_tiling
+    )
+    self.assertEqual(
+        ws_dest.get_metrics()["total_tiled_bytes"] == 0, skip_tiling
+    )
+
+  def test_bind_weights_to_view_folding_leading_dims(self):
+    """Pushes from a folded view bound in place of an unfolded tensor.
+
+    The view is backed by an [E, F, D] storage buffer, and every later transfer
+    resolves the device buffers of the bound tensors again.
+    """
+    generator = torch.Generator().manual_seed(104)
+    stack = torch.randn(8, 64, 256, generator=generator)
+    dst = torch.zeros(8 * 64, 256, dtype=torch.float32, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[torch.zeros(8 * 64, 256, dtype=torch.float32, device=self.device)]],
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    ws_source.bind_weights([[stack.to(self.device).view(8 * 64, 256)]])
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact([[dst]], [[stack.reshape(8 * 64, 256)]], "receiver")
+
+  @parameterized.named_parameters(
+      ("tiled", False),
+      ("skip_tiling", True),
+  )
+  def test_h2d_into_view_folding_leading_dims_updates_base(self, skip_tiling):
+    """H2D into an [E * F, D] view of an [E, F, D] tensor writes the tensor.
+
+    The view is backed by the [E, F, D] storage buffer.
+
+    Args:
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(105)
+    expected = torch.randn(8 * 64, 256, generator=generator)
+    base = torch.zeros(8, 64, 256, dtype=torch.float32, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[expected.to(self.device)]],
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[base.view(8 * 64, 256)]],
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact([[base]], [[expected.reshape(8, 64, 256)]], "base")
+    self.assertEqual(
+        ws_dest.get_metrics()["total_tiled_bytes"] == 0, skip_tiling
+    )
+
+  def test_rejects_folded_view_with_different_device_layout(self):
+    """Rejects a fold whose device bytes differ from a buffer of its shape's.
+
+    An f32 [4, 5, 256] buffer cannot hold its 5-row dimension the way a
+    [20, 256] buffer does, since 5 rows are not a whole (8, 128) tile, so raw
+    copies of the [20, 256] view would misplace rows.
+    """
+    base = torch.randn(4, 5, 256).to(self.device)
+    # The base itself is accepted, so the rejection below is about the view.
+    ws_base = WeightSynchronizer(
+        [[base]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_base.shutdown)
+
+    with self.assertRaises(RuntimeError) as raised:
+      WeightSynchronizer(
+          [[base.view(20, 256)]],
+          local_port=0,
+          parallelism=1,
+          bind_ip="127.0.0.1",
+      )
+
+    message = str(raised.exception)
+    self.assertIn("folds the leading dimensions", message)
+    self.assertIn(
+        "does not hold its bytes as a [20, 256] buffer would", message
+    )
+    self.assertIn("[20, 256]", message)
+    self.assertIn("[4, 5, 256]", message)
+
+  def test_rejects_view_that_does_not_fold_leading_dims(self):
+    """Rejects a view that regroups more than the leading dimensions."""
+    base = torch.randn(4, 8, 256).to(self.device)
+    # The base itself is accepted, so the rejection below is about the view.
+    ws_base = WeightSynchronizer(
+        [[base]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_base.shutdown)
+
+    with self.assertRaises(RuntimeError) as raised:
+      WeightSynchronizer(
+          [[base.view(64, 128)]],
+          local_port=0,
+          parallelism=1,
+          bind_ip="127.0.0.1",
+      )
+
+    message = str(raised.exception)
+    self.assertIn("leading (block) dimension does not match", message)
+    self.assertIn("[64, 128]", message)
+    self.assertIn("[4, 8, 256]", message)
 
 
 if __name__ == "__main__":

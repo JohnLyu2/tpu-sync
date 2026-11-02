@@ -28,6 +28,7 @@
 
 #include "absl/base/nullability.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -46,8 +47,7 @@
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
-#include "tpu_sync/kv_cache/transfer_session.h"
-#include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 
 namespace tpu_raiden {
 
@@ -88,12 +88,69 @@ TransferSendSession::Create(
   return session;
 }
 
+absl::StatusOr<std::shared_ptr<TransferSendSession>>
+TransferSendSession::CreateFromActivePlan(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+    const ::tpu_sync::rpc::StartTransferRequest& request) {
+  StagingAllocation staging;
+  absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
+      host_block_of;
+  if (staging_allocator != nullptr &&
+      staging_allocator->dynamic_host_staging() &&
+      request.pool_groups_size() == 0) {
+    std::vector<int64_t> device_blocks;
+    absl::flat_hash_set<int64_t> seen;
+    for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
+      for (const auto& e : schedule.entries()) {
+        int64_t id = e.src_block_id();
+        if (seen.insert(id).second) device_blocks.push_back(id);
+      }
+    }
+    if (!device_blocks.empty()) {
+      absl::StatusOr<StagingAllocation> allocated = staging_allocator->Acquire(
+          static_cast<int64_t>(device_blocks.size()));
+      if (!allocated.ok()) {
+        return absl::ResourceExhaustedError(absl::StrCat(
+            "cannot stage ", device_blocks.size(), " blocks for plan ", uuid,
+            ": ", allocated.status().message()));
+      }
+      staging = *std::move(allocated);
+      absl::Span<const int> plan_blocks = staging.block_ids();
+      for (size_t i = 0; i < device_blocks.size(); ++i) {
+        host_block_of[device_blocks[i]] = plan_blocks[i];
+      }
+    }
+  }
+  ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
+                        ResolveDataConnectionReuse());
+  ABSL_ASSIGN_OR_RETURN(
+      TransferPlan plan,
+      TransferPlan::Create(request, /*is_sender=*/true, base->num_pools(),
+                           base->has_explicit_pools(), base->pools(),
+                           std::move(host_block_of)));
+  const auto now = std::chrono::steady_clock::now();
+  std::string req_id = request.req_id().empty()
+                           ? absl::StrCat("resharded_transfer_", uuid)
+                           : request.req_id();
+  auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
+      base, staging_allocator, std::move(req_id), uuid,
+      std::chrono::steady_clock::time_point::max(), now, data_connection_reuse,
+      std::make_shared<const TransferPlan>(std::move(plan))));
+  {
+    absl::MutexLock lock(session->mu_);
+    session->staging_ = std::move(staging);
+  }
+  return session;
+}
+
 TransferSendSession::TransferSendSession(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start,
-    DataConnectionReuse data_connection_reuse)
+    DataConnectionReuse data_connection_reuse,
+    std::shared_ptr<const TransferPlan> plan)
     : base_(base),
       staging_allocator_(staging_allocator),
       req_id_(std::move(req_id)),
@@ -101,14 +158,13 @@ TransferSendSession::TransferSendSession(
       deadline_(deadline),
       register_start_(register_start),
       data_connection_reuse_(data_connection_reuse),
+      transfer_plan_(std::move(plan)),
       staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
 
 std::optional<TransferSendSession::DuplicateBlock>
 TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {
   absl::MutexLock lock(mu_);
-  registered_num_blocks_ = static_cast<int64_t>(block_ids.size());
-  registered_block_ids_.assign(block_ids.begin(), block_ids.end());
   registered_block_set_.clear();
   for (size_t i = 0; i < block_ids.size(); ++i) {
     if (registered_block_set_.insert(block_ids[i]).second) continue;
@@ -158,29 +214,13 @@ void TransferSendSession::ValidateAndBeginPull(
   pull_started_ = true;
 }
 
-bool TransferSendSession::OwnsBlockWithReadyFuture(int block_id,
-                                                   size_t layer_idx) const {
+tsl::Future<> TransferSendSession::GetDataReadyFuture(
+    size_t major_dimension_idx) {
   absl::MutexLock lock(mu_);
-  return registered_block_set_.find(block_id) != registered_block_set_.end() &&
-         layer_idx < d2h_layer_futures_.size();
-}
-
-void TransferSendSession::RegisterLayerReadinessCallback(
-    size_t layer_idx,
-    transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
-  std::optional<raiden::PjRtCopyFuture> future;
-  {
-    absl::MutexLock lock(mu_);
-    if (layer_idx < d2h_layer_futures_.size()) {
-      future = d2h_layer_futures_[layer_idx];
-    }
+  if (major_dimension_idx >= d2h_layer_futures_.size()) {
+    return tsl::Future<>(absl::OkStatus());
   }
-  if (!future.has_value()) {
-    cb(absl::OkStatus());
-    return;
-  }
-  future->OnReady(
-      [cb = std::move(cb)](auto status_or) { cb(status_or.status()); });
+  return d2h_layer_futures_[major_dimension_idx].future;
 }
 
 void TransferSendSession::ReleaseStagingBlocksLocked() {
@@ -236,6 +276,10 @@ absl::StatusOr<size_t> TransferSendSession::LookupStagingSlot(
   }
   std::optional<size_t> slot = staging_layer_manager_.Lookup(layer_idx);
   if (!slot.has_value()) {
+    // On a full host mirror a layer with no lease is addressed in place.
+    if (base_ == nullptr || base_->num_host_layers() >= base_->num_layers()) {
+      return absl::NotFoundError("no bounded host staging");
+    }
     return absl::FailedPreconditionError(absl::StrCat(
         "No staging slot leased for layer ", layer_idx, " (uuid=", uuid_, ")"));
   }
@@ -264,7 +308,7 @@ void TransferSendSession::Finish(const absl::Status& status) {
   // pushes start in SendNextLayer's push_pool task, each stays counted until
   // its completion has run, and the completion of the last layer calls
   // Finish() while still counted (a failed copy or push finishes under its
-  // own op). A send that pushed therefore settles in EndSendOp, which
+  // own op). A send that pushed therefore settles in EndOp, which
   // releases its data connections first.
   absl::MutexLock lock(mu_);
   FinishLocked(status);
@@ -274,6 +318,14 @@ absl::Status TransferSendSession::AwaitForDone() {
   absl::MutexLock lock(mu_);
   mu_.Await(absl::Condition(&done_));
   return status_;
+}
+
+absl::Status TransferSendSession::OnDataReceived(
+    size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+    absl::Span<const int> shard_ids) {
+  return absl::FailedPreconditionError(absl::StrCat(
+      "send session does not receive data: layer ", major_dimension_idx,
+      " reported received on send session for UUID ", uuid_));
 }
 
 TransferDetails TransferSendSession::Details() const {
@@ -313,7 +365,7 @@ void TransferSendSession::EndSendOpLocked() {
   }
 }
 
-void TransferSendSession::EndSendOp() {
+void TransferSendSession::EndOp() {
   // Under kPerTransfer the last op of a draining send closes the idle data
   // connections to the consumer's endpoints before it is counted out: every
   // push has returned its socket by now, and done_ cannot be set meanwhile,
@@ -542,9 +594,9 @@ void TransferSendSession::StartPush(
         FinishLocked(future.status());
       }
       // Earlier layers may already have been pushed, so this can be the
-      // send's last op: EndSendOp (unlike EndSendOpLocked) first closes the
+      // send's last op: EndOp (unlike EndSendOpLocked) first closes the
       // idle data connections under kPerTransfer.
-      EndSendOp();  // this copy never started
+      EndOp();  // this copy never started
       return;
     }
     raiden::PjRtCopyFuture layer_future = *std::move(future);
@@ -552,7 +604,7 @@ void TransferSendSession::StartPush(
         [self = shared_from_this(), promise = std::move(d2h_promises[l])](
             absl::StatusOr<raiden::BufferHolders> status_or) mutable {
           promise.Set(status_or.status());
-          self->EndSendOp();
+          self->EndOp();
         });
     next_layer = l + 1;
   }
@@ -582,7 +634,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
     if (status_or.ok() && !injected.ok()) {
       status_or = injected;
     }
-    absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+    absl::Cleanup end_op = [self]() { self->EndOp(); };
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
@@ -604,7 +656,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
 
     std::move(end_op).Cancel();
     self->base_->push_pool()->Schedule([self, l]() {
-      absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+      absl::Cleanup end_op = [self]() { self->EndOp(); };
       std::vector<std::string> remote_data_endpoints;
       std::vector<int> src_ints;
       std::vector<int> dst_ints;
@@ -626,7 +678,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
           remote_data_endpoints, src_ints, dst_ints, self->uuid_,
           static_cast<int>(l),
           [self, l](absl::StatusOr<std::vector<int>> push_res) {
-            absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+            absl::Cleanup end_op = [self]() { self->EndOp(); };
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();

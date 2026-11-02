@@ -56,6 +56,7 @@
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -282,6 +283,37 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
   };
 }
 
+absl::StatusOr<std::shared_ptr<TransferSession>> BeginIncomingPush(
+    BlockTransportDelegate* delegate, uint64_t uuid) {
+  if (uuid == 0) {
+    return nullptr;
+  }
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                        delegate->GetSession(uuid));
+  FaultInjectDelay(hooks::kBlockTransportRecvBeginPush);
+  if (!session->TryBeginOp()) {
+    return absl::CancelledError(
+        absl::StrCat("Session for uuid=", uuid,
+                     " is not accepting pushes (draining or a send session)"));
+  }
+  return session;
+}
+
+absl::Status EndIncomingPush(const std::shared_ptr<TransferSession>& session,
+                             const absl::Status& status = absl::OkStatus()) {
+  if (session == nullptr) {
+    return status;
+  }
+  if (!status.ok()) {
+    session->Finish(status);
+  }
+  session->EndOp();
+  if (!status.ok() || session->GetStatus().ok()) {
+    return status;
+  }
+  return absl::CancelledError(session->GetStatus().message());
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -290,11 +322,8 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
 
 BlockTransportServerPushSession::BlockTransportServerPushSession(
     uint64_t uuid, BlockTransportDelegate* delegate,
-    const BlockTransportConfig& config, OnCompletedCallback on_completed)
-    : uuid_(uuid),
-      delegate_(delegate),
-      config_(config),
-      on_completed_(std::move(on_completed)) {}
+    const BlockTransportConfig& config)
+    : uuid_(uuid), delegate_(delegate), config_(config) {}
 
 bool BlockTransportServerPushSession::IsDone() const {
   absl::MutexLock lock(mu_);
@@ -307,15 +336,10 @@ absl::Status BlockTransportServerPushSession::status() const {
 }
 
 void BlockTransportServerPushSession::Cancel() {
-  OnCompletedCallback cb;
-  {
-    absl::MutexLock lock(mu_);
-    if (done_) return;
-    done_ = true;
-    status_ = absl::CancelledError("Push session cancelled");
-    cb = std::move(on_completed_);
-  }
-  if (cb) cb(uuid_);
+  absl::MutexLock lock(mu_);
+  if (done_) return;
+  done_ = true;
+  status_ = absl::CancelledError("Push session cancelled");
 }
 
 absl::Status BlockTransportServerPushSession::StartStream(
@@ -329,13 +353,12 @@ absl::Status BlockTransportServerPushSession::StartStream(
 
   std::vector<int> allocated_ids;
   std::vector<int> src_block_ids;
-  ABSL_RETURN_IF_ERROR(delegate_->BeginIncomingPush(header.uuid));
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                        BeginIncomingPush(delegate_, header.uuid));
   bool incoming_push_lease_held = true;
   absl::Cleanup end_incoming_push = [&]() {
     if (incoming_push_lease_held) {
-      delegate_
-          ->EndIncomingPush(header.uuid,
-                            absl::InternalError("Incoming push failed"))
+      EndIncomingPush(session, absl::InternalError("Incoming push failed"))
           .IgnoreError();
     }
   };
@@ -446,7 +469,7 @@ absl::Status BlockTransportServerPushSession::StartStream(
   ABSL_RETURN_IF_ERROR(delegate_->OnBlockShardsReceived(
       allocated_ids, stream_shards, header.uuid));
   incoming_push_lease_held = false;
-  ABSL_RETURN_IF_ERROR(delegate_->EndIncomingPush(header.uuid));
+  ABSL_RETURN_IF_ERROR(EndIncomingPush(session));
   uint8_t ack = 1;
   FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);
   ABSL_RETURN_IF_ERROR(
@@ -482,16 +505,13 @@ absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
       ResolveIncomingPushSpec(delegate_, post.local_id,
                               /*is_explicit_dst_push=*/true, uuid_));
 
-  ABSL_RETURN_IF_ERROR(delegate_->BeginIncomingPush(uuid_));
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                        BeginIncomingPush(delegate_, uuid_));
   absl::Status s = CompleteIncomingPush(
       post.local_id, post.remote_id, /*num_streams=*/1,
       post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
       /*is_peregrine=*/true);
-  if (!s.ok()) {
-    delegate_->EndIncomingPush(uuid_, s).IgnoreError();
-    return s;
-  }
-  return delegate_->EndIncomingPush(uuid_);
+  return EndIncomingPush(session, s);
 }
 
 size_t BlockTransportServerPushSession::AccumulateLandedShards(
@@ -536,8 +556,6 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
   }
 
   bool trigger_completion = false;
-  bool session_all_done = false;
-  OnCompletedCallback completion_cb;
   {
     absl::MutexLock lock(mu_);
     auto& progress = layer_progress_[l];
@@ -645,7 +663,6 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
         if (completed_pools == pool_progress_spec->expected_pools) {
           layer_progress_.clear();
           done_ = true;
-          session_all_done = true;
         }
       } else {
         bool all_layers_called = true;
@@ -660,43 +677,19 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
         if (all_layers_called) {
           layer_progress_.clear();
           done_ = true;
-          session_all_done = true;
         }
       }
     }
-    if (session_all_done) {
-      completion_cb = std::move(on_completed_);
-    }
   }
 
-  // Telemetry-only hook: a failure must not block layer completion below.
-  if (is_peregrine && !plan_declared) {
-    if (absl::Status s = delegate_->OnRecvProgress(uuid_); !s.ok()) {
-      LOG(WARNING) << "OnRecvProgress failed for uuid " << uuid_ << ": " << s;
-    }
-  }
   if (trigger_completion) {
     ABSL_RETURN_IF_ERROR(
         FaultInjectStatus(hooks::kBlockTransportRecvLayerDone));
     if (plan_declared) {
       ABSL_RETURN_IF_ERROR(delegate_->OnPoolReceived(l, uuid_));
     } else {
-      absl::Status layer_status = delegate_->OnLayerReceived(l, uuid_);
-      bool all_layers_dispatched = false;
-      if (is_peregrine) {
-        absl::MutexLock lock(mu_);
-        if (++layers_dispatched_ >= delegate_->num_layers()) {
-          all_layers_dispatched = true;
-        }
-      }
-      ABSL_RETURN_IF_ERROR(layer_status);
-      if (all_layers_dispatched) {
-        ABSL_RETURN_IF_ERROR(delegate_->OnRecvNetworkComplete(uuid_));
-      }
+      ABSL_RETURN_IF_ERROR(delegate_->OnLayerReceived(l, uuid_));
     }
-  }
-  if (session_all_done && completion_cb) {
-    completion_cb(uuid_);
   }
   return absl::OkStatus();
 }

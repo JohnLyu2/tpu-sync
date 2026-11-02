@@ -190,6 +190,7 @@ cc_library(
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/transport:buffer_push_task",
+        "//tpu_sync/transport:transfer_session",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -348,10 +349,53 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
         # buildcleaner: keep
         "//third_party/jax:raiden_jax_version",
+    ],
+)
+
+cc_library(
+    name = "layout_utils",
+    srcs = ["layout_utils.cc"],
+    hdrs = ["layout_utils.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla:shape_util",
+    ],
+)
+
+cc_test(
+    name = "layout_utils_test",
+    size = "small",
+    srcs = ["layout_utils_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    tags = ["no_oss"],
+    deps = [
+        ":layout_utils",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla:shape_util",
+        "@xla//xla:xla_data_proto_cc",
+        "@xla//xla/hlo/parser:hlo_parser",
     ],
 )
 
@@ -383,6 +427,22 @@ cc_library(
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
         "//tpu_sync/common:trace",
         "//tpu_sync/transport:block_transport_delegate",
+    ],
+)
+
+cc_test(
+    name = "raw_transfer_slice_test",
+    srcs = ["raw_transfer_slice_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":raw_transfer_core",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla:shape_util",
+        "@xla//xla:xla_data_proto_cc",
     ],
 )
 

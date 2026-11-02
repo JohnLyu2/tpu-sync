@@ -105,7 +105,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   tsl::Future<> Save(absl::Span<const std::string> block_hashes,
                      absl::Span<const int64_t> src_device_block_ids,
                      absl::Span<const int32_t> dst_host_block_ids,
-                     BlockTracker* absl_nonnull save_tracker) override;
+                     BlockTracker* absl_nonnull save_tracker,
+                     const SaveOptions& options = {}) override;
 
   // --- WriteRemote & registry overrides ------------------------------------
   tsl::Future<> RegisterBlocksAsync(
@@ -215,6 +216,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // BackendConfig.kv_pool_group.
   const std::string kv_pool_group_;
   controller::RaidenController* raiden_controller_ = nullptr;
+  // Configured at construction, immutable afterwards.
+  const std::string dp_rank_str_;
 
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_
       ABSL_GUARDED_BY(mutex_);

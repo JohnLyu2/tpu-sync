@@ -32,10 +32,12 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/kv_cache/reshard_receive_session.h"
@@ -43,19 +45,20 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 
 struct PoolReshardRecvTestPeer {
-  static void FinishPoolH2d(ReshardReceiveSession& session,
-                            KVCacheManagerWithTransfer& manager,
-                            size_t pool_idx, const absl::Status& status) {
-    session.FinishPoolH2d(manager, pool_idx, status);
+  static void FinishPoolH2d(ReshardReceiveSession& session, size_t pool_idx,
+                            const absl::Status& status) {
+    session.FinishPoolH2d(pool_idx, status);
   }
 };
 
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::Contains;
@@ -82,11 +85,23 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<ReshardReceiveSession> session;
     {
       absl::MutexLock lock(mu_);
-      auto it = active_pool_reshard_recvs_.find(uuid);
-      if (it == active_pool_reshard_recvs_.end()) return;
-      session = it->second;
+      session = FindSessionLocked<ReshardReceiveSession>(uuid);
+      if (session == nullptr) return;
     }
-    PoolReshardRecvTestPeer::FinishPoolH2d(*session, *this, pool_idx, status);
+    PoolReshardRecvTestPeer::FinishPoolH2d(*session, pool_idx, status);
+  }
+  absl::Status AddPoolReshardSend(const StartTransferRequest& plan,
+                                  absl::Span<const int64_t> src_block_ids) {
+    absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
+        ReshardSendSession::Create(base(), staging_allocator_.get(),
+                                   src_block_ids,
+                                   /*parallelism=*/1, DeadlineFromNow(), plan);
+    if (!session.ok()) {
+      return session.status();
+    }
+    absl::MutexLock lock(mu_);
+    sessions_[plan.uuid()] = *std::move(session);
+    return absl::OkStatus();
   }
   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
 
@@ -266,6 +281,37 @@ TEST(ExpectedPushSendersTest, CountsReceiverPlanSchedules) {
 
   ASSERT_TRUE(manager.UnregisterActivePlan(1).ok());
   EXPECT_EQ(manager.base()->ExpectedPushSenders(1), std::nullopt);
+}
+
+// A sender plan's send session belongs to whoever registered the plan: the
+// CompleteReadWithDetails sweep never reports it, neither while it is
+// registered nor after unregistering cancels it.
+TEST(ActivePlanTest, SenderPlanIsNeverReportedAsATransfer) {
+  TestManager manager;
+  StartTransferRequest send_plan;
+  send_plan.set_uuid(7);
+  send_plan.set_req_id("sender_plan");
+  send_plan.set_is_sender(true);
+  send_plan.set_use_block_chunks(true);
+  auto* entry = (*send_plan.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer("127.0.0.1:1");
+  entry->set_src_block_id(0);
+  entry->set_dst_block_id(0);
+  entry->set_size_bytes(16);
+  entry->set_count(1);
+  ASSERT_TRUE(
+      manager.RegisterActivePlan(7, send_plan, /*is_sender=*/true).ok());
+
+  CompleteReadResult registered = manager.CompleteReadWithDetails();
+  EXPECT_THAT(registered.sent, IsEmpty());
+  EXPECT_THAT(registered.failed, IsEmpty());
+
+  ASSERT_TRUE(manager.UnregisterActivePlan(7).ok());
+  EXPECT_THAT(manager.GetSession(7), StatusIs(absl::StatusCode::kNotFound));
+  CompleteReadResult unregistered = manager.CompleteReadWithDetails();
+  EXPECT_THAT(unregistered.sent, IsEmpty());
+  EXPECT_THAT(unregistered.failed, IsEmpty());
+  EXPECT_FALSE(unregistered.details.contains("sender_plan"));
 }
 
 TEST(PoolReshardValidationTest, DeviceOnlyRejectionAtPublicEntryPoints) {
@@ -478,7 +524,8 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
   const auto staged = manager.base()->PlanHostBlocks(26, {2, 3});
   ASSERT_TRUE(staged.ok()) << staged.status();
   // The transport has admitted a push that is still writing.
-  ASSERT_TRUE(manager.base()->BeginIncomingPush(26).ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto session, manager.base()->GetSession(26));
+  EXPECT_TRUE(session->TryBeginOp());
 
   // Unregistering cancels the receive, but the admitted push keeps the
   // plan's mapping and its staging, so its writes still land in the plan's
@@ -489,13 +536,13 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
   EXPECT_EQ(*still_staged, *staged);
   EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
   // ... while no further push is admitted.
-  EXPECT_EQ(manager.base()->BeginIncomingPush(26).code(),
-            absl::StatusCode::kCancelled);
+  EXPECT_FALSE(session->TryBeginOp());
 
   // When the admitted push ends the receive settles, and the plan, its
   // staging and the receive session go together.
-  EXPECT_EQ(manager.base()->EndIncomingPush(26).code(),
-            absl::StatusCode::kCancelled);
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(session->GetStatus().code(), absl::StatusCode::kCancelled);
   EXPECT_EQ(manager.base()->PlanHostBlocks(26, {2, 3}).status().code(),
             absl::StatusCode::kNotFound);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
@@ -786,11 +833,13 @@ TEST(PoolReshardRecvTest,
   // A push that fails mid-stream (socket timeout, peer disconnect) is terminal
   // for the receive: the session must settle now, releasing its staging lease
   // and plan claim, rather than at the session deadline.
-  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/3003));
-  EXPECT_THAT(
-      manager.base()->EndIncomingPush(
-          /*uuid=*/3003, absl::DeadlineExceededError("Socket read timed out")),
-      StatusIs(absl::StatusCode::kCancelled));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, manager.base()->GetSession(/*uuid=*/3003));
+  EXPECT_TRUE(session->TryBeginOp());
+  session->Finish(absl::DeadlineExceededError("Socket read timed out"));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
   EXPECT_FALSE(manager.base()->HasActivePlan(3003));
 
@@ -964,6 +1013,119 @@ TEST(SubPlanChainTest, SinglePlanRequestsReportAtOnce) {
   manager.FinishPoolReshardRecvPool(5031, /*pool_idx=*/0, absl::OkStatus());
   const auto [sent, received, failed] = manager.CompleteReadRaw();
   EXPECT_THAT(received, Contains("pool_reshard_req_5031"));
+}
+
+TEST(PoolReshardSessionLookupTest,
+     GetSessionResolvesActiveReshardRecvUntilRetired) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/8001),
+                                                 std::vector<int64_t>{0}));
+  absl::StatusOr<std::shared_ptr<TransferSession>> recv_session =
+      manager.GetSession(/*uuid=*/8001);
+  ABSL_ASSERT_OK(recv_session);
+  ASSERT_NE(*recv_session, nullptr);
+  EXPECT_FALSE((*recv_session)->Done());
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8001),
+              IsOkAndHolds(*recv_session));
+
+  manager.FinishPoolReshardRecvPool(/*uuid=*/8001, /*pool_idx=*/0,
+                                    absl::OkStatus());
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(received, Contains("pool_reshard_req_8001"));
+    EXPECT_THAT(failed, IsEmpty());
+  }
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(PoolReshardSessionLookupTest,
+     GetSessionResolvesActiveReshardSendUntilRetired) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  ABSL_ASSERT_OK(manager.AddPoolReshardSend(ValidPlan(/*uuid=*/8002),
+                                            std::vector<int64_t>{0}));
+  absl::StatusOr<std::shared_ptr<TransferSession>> send_session =
+      manager.GetSession(/*uuid=*/8002);
+  ABSL_ASSERT_OK(send_session);
+  ASSERT_NE(*send_session, nullptr);
+  EXPECT_FALSE((*send_session)->Done());
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8002),
+              IsOkAndHolds(*send_session));
+
+  (*send_session)->Finish();
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(sent, Contains("pool_reshard_req_8002"));
+    EXPECT_THAT(failed, IsEmpty());
+  }
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+// A pool completion always belongs to an armed receiver: with no session for
+// the uuid it fails with kNotFound naming the uuid, while the same completion
+// for a registered receiver reaches its session.
+TEST(PoolReshardSessionLookupTest, PoolCompletionWithoutReceiverIsNotFound) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+
+  EXPECT_THAT(
+      manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/8004),
+      StatusIs(absl::StatusCode::kNotFound,
+               ::testing::HasSubstr("no active receiver for UUID 8004")));
+
+  ABSL_ASSERT_OK(manager.RegisterActivePlan(
+      /*uuid=*/8004, ValidPlan(/*uuid=*/8004), /*is_sender=*/false));
+  EXPECT_THAT(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/8004),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       ::testing::HasSubstr("armed on the legacy path")));
+  ABSL_EXPECT_OK(manager.UnregisterActivePlan(/*uuid=*/8004));
+}
+
+// A pool plan armed through RegisterActivePlan lands on a legacy
+// TransferReceiveSession, which cannot execute pool completions: the
+// completion is rejected before any H2D work, leaving the receive untouched.
+TEST(PoolReshardSessionLookupTest,
+     PoolCompletionOnLegacyArmedReceiverFailsWithoutH2d) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  ABSL_ASSERT_OK(manager.RegisterActivePlan(
+      /*uuid=*/8003, ValidPlan(/*uuid=*/8003), /*is_sender=*/false));
+  absl::StatusOr<std::shared_ptr<TransferSession>> recv_session =
+      manager.GetSession(/*uuid=*/8003);
+  ABSL_ASSERT_OK(recv_session);
+  ASSERT_NE(*recv_session, nullptr);
+
+  EXPECT_THAT(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/8003),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       ::testing::HasSubstr("armed on the legacy path")));
+
+  // The rejection precedes ExecuteLayerH2d, so the receive is still live and
+  // unfailed.
+  EXPECT_FALSE((*recv_session)->Done());
+  EXPECT_FALSE((*recv_session)->IsDraining());
+  ABSL_EXPECT_OK((*recv_session)->GetStatus());
+  ABSL_EXPECT_OK(manager.UnregisterActivePlan(/*uuid=*/8003));
 }
 
 }  // namespace
