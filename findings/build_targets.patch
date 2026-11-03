@@ -60,10 +60,10 @@ index a88ac487..f80746cd 100644
 +    ],
 +)
 diff --git a/tpu_sync/kv_cache/BUILD b/tpu_sync/kv_cache/BUILD
-index 261a47b6..05467a12 100644
+index 261a47b6..19861dc3 100644
 --- a/tpu_sync/kv_cache/BUILD
 +++ b/tpu_sync/kv_cache/BUILD
-@@ -1312,3 +1312,142 @@ cc_library(
+@@ -1312,3 +1312,175 @@ cc_library(
          "@com_google_absl//absl/types:span",
      ],
  )
@@ -204,6 +204,39 @@ index 261a47b6..05467a12 100644
 +        "@com_google_absl//absl/status:status_matchers",
 +        "@com_google_absl//absl/time",
 +        "@com_google_googletest//:gtest_main",
++    ],
++)
++
++cc_test(
++    name = "kv_transfer_uuid_and_reshard_push_bughunt_test",
++    srcs = ["kv_transfer_uuid_and_reshard_push_bughunt_test.cc"],
++    copts = [
++        "-fno-strict-aliasing",
++        "-fexceptions",
++    ],
++    features = [
++        "-use_header_modules",
++        "-layering_check",
++    ],
++    deps = [
++        ":kv_cache_manager_base",
++        ":kv_cache_manager_with_transfer",
++        ":pool_layout",
++        "//tpu_sync/core:control_plane_backend",
++        "//tpu_sync/core:raiden_transfer_endpoint",
++        "//tpu_sync/core:raw_transfer_core",
++        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "//tpu_sync/transport:block_transport",
++        "//tpu_sync/transport:transfer_session",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/synchronization",
++        "@com_google_absl//absl/time",
++        "@com_google_googletest//:gtest_main",
++        "@xla//xla:future",
++        "@xla//xla/tsl/concurrency:future",
 +    ],
 +)
 diff --git a/tpu_sync/kv_cache/reshard/BUILD b/tpu_sync/kv_cache/reshard/BUILD

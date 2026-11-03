@@ -62,7 +62,8 @@ here.
 | `pool_reshard_chain_bughunt_test.cc` | F12 (`PoolReshardChainBughunt`, `ChainClaimTest`) and F13 (`PoolReshardChainBughunt1B`): windowed pool-reshard sub-plan chains (`09a42d4e`) — a sender absent from some windows never reports `done_sending`; a chain failing after window 0 holds the registry claim until TTL; the first failing sub-plan is reported while sibling / later windows still run and can be reported twice |
 | `transfer_receive_late_finish_bughunt_test.cc` | F14 (`RecvLateFinishBughunt`): 1 control (`TransferSendSession`) + 4 failing cases driving `end_incoming_push`, `UnregisterActivePlan`, `ExecutePullRequest` `on_response`, and `ReshardReceiveSession` directly (entry points renamed at `56a0269d`; needs porting), where a late `Finish(error)` after every H2D completed OK flips `completions.received` to `completions.failed` (in production only the `on_response` path and a photo-finish deadline-sweep race reach it; see §F14) |
 | `reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc` | F15 (`ReshardRecvStagingSlotRankDeadlock`): 1 control (two host layer buffers for two pools: the rank-0 pool's first chunk resolves at once) + 1 failing case (one buffer: the rank-1 pool's first chunk takes it, its H2D is rank-gated, the rank-0 pool's first chunk blocks in `StagingLayerManager::Acquire` until `deadline_` and the receive fails `DEADLINE_EXCEEDED`); no device copy is issued, so it runs on CPU at `56a0269d` |
-| `build_targets.patch` | `cc_test` targets for the eight files above |
+| `kv_transfer_uuid_and_reshard_push_bughunt_test.cc` | F16 (`UuidRetirementBughunt`: 1 control + 3 failing cases covering `StartRead` inline retirement, `RegisterRecv` inline retirement, and `CompleteReadWithDetails`'s dead `std::erase_if` + unlocked `ForgetPushProgress(uuid)` race, each publishing silent corrupt `completions.received` with layer 0's HBM block unwritten) and F17 (`PoolReshardPushDuplicateUuidBughunt`: 1 control + 1 failing case where concurrent duplicate-UUID `PoolReshardPush` calls both succeed, overwrite `sessions_[uuid]`, and free the shared 1-slot `PoolStagingStorage` lease while the sibling push is still streaming, aliasing the slot to an unrelated transfer); runs on CPU at `56a0269d` |
+| `build_targets.patch` | `cc_test` targets for the nine files above |
 | `kv_cache_store_remote_write_bughunt_test.cc`, `kv_cache_store_fetch_bughunt_test.cc`, `host_block_manager_race_bughunt_test.cc`, `kv_cache_store_service_reactor_bughunt_test.cc` | 2026-10-29 store-path and host-block-manager audit reproducers (first three confirm store/allocator races, fourth refutes a `WriteRemoteServerReactor` `StartAck`/`OnCancel` hazard; write-ups and `build_targets.patch` rules deferred, see §History 2026-10-29) |
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
@@ -90,14 +91,17 @@ To run F14: copy `transfer_receive_late_finish_bughunt_test.cc` to
 To run F15: copy `reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc` to
 `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
 `bazel test --config=oss //tpu_sync/kv_cache:reshard_recv_staging_slot_rank_deadlock_bughunt_test`.
+To run F16 / F17: copy `kv_transfer_uuid_and_reshard_push_bughunt_test.cc` to
+`tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
+`bazel test --config=oss //tpu_sync/kv_cache:kv_transfer_uuid_and_reshard_push_bughunt_test`.
 F5 needs no repro file:
 its test is already in the tree as `DISABLED_`
 (`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
 --test_arg=--gtest_also_run_disabled_tests`); the fix patch that re-enabled it
 was retired on 2026-10-16 (see F5). All patches applied cleanly at
 `42dda542` (`git apply --check`, 2026-10-30; `build_targets.patch` updated
-2026-10-30 for F14; `candidate_fixes.patch` was last re-based at `2ed6f8f`).
-At `56a0269d` (`git apply --check` from the repo root, 2026-11-02)
+2026-11-03 for F15–F17; `candidate_fixes.patch` was last re-based at `2ed6f8f`).
+At `56a0269d` (`git apply --check` from the repo root, 2026-11-03)
 `build_targets.patch`, `candidate_fixes.patch`, `coverage_gap_send.patch`,
 `coverage_gap_read_remote_deadline.patch` and `coverage_gap_reshard_control.patch`
 still apply (the `transfer_send_session_test.cc` hunk at an offset of 33
@@ -136,6 +140,8 @@ have not been rebuilt since the runs their entries record.
 | F13 | Windowed pool reshard: `RecordPoolReshardTerminalLocked` emits `failed_recving` on the **first** failing sub-plan with no check for sibling sub-plans of the `req_id` still active (the check `SweepSubPlanChainsLocked` does make), `StartChain` sees only control-plane errors so it keeps arming and dispatching windows `1 .. K-1`, and `PoolReshardPush` / `PoolReshardRegisterRecv` seat them regardless of `chains[req_id].failed` (pinned by upstream's `FirstSubPlanFailureFailsTheRequestOnce`); the failed entry is swept after one `timeout_s_` of inactivity, so a later sub-plan starts a fresh unanchored chain that is failed again | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt1B` 4/4 failing on unmodified `42dda542`); **filed 2026-10-29** (bug 12 in `filed_bugs.md`); **still open at `56a0269d`** (`NoteSubPlanRegisteredLocked` / `RecordPoolReshardTerminalLocked` unchanged; `SweepSubPlanChainsLocked` now tests liveness as `sessions_.contains(uuid)` over the chain's `plan_uuids` instead of scanning per-type maps by `req_id`, same stall rule) | mid-DMA free: yes for any multi-window request whose first failure has another window active (the F11 shape on pool reshard, with the engine recomputing into / freeing the destination blocks on `failed_recving`); double report: a worker whose next sub-plan arrives > `timeout_s_` after the failure (a sender skipped in the intervening windows, cf. F12); same caller gate as F12 |
 | F14 | `TransferReceiveSession::FinishLocked` records any first error even while draining (needed: the poll can `Finish()` OK before a failed H2D's callback, whose error must win), so it also admits an *external* `Finish(error)` after every H2D completed OK and the completed receive is reported `failed` instead of `received`. `ReshardReceiveSession::FinishLocked` has the same shape | CONFIRMED (test) 2026-10-30 (`transfer_receive_late_finish_bughunt_test.cc`: 1 control passing + 4 cases failing on unmodified `42dda542`); audited 2026-10-30: low severity; not yet filed; **still open for both receivers at `56a0269d`** (`TransferReceiveSession::FinishLocked` and `ReshardReceiveSession::FinishLocked` still record the error before `if (draining_) return;`); the **sender half is fixed**: `1523b07d` moved `ReshardSendSession::Finish`'s `if (done_ \|\| finalizing_) return;` ahead of the status record (the fix proposed here), pinned by `ReshardSendSessionTest.FinishAfterLastPushFinalizingPreservesOkStatus`. The reproducer's `EndIncomingPush` / `UnregisterActivePlan` / `ExecutePullRequest` entry points were renamed (`BeginIncomingPush` + `EndIncomingPush` free functions in `block_transport_session.cc`, `TransferReceiveSession::Start`), so it needs porting before a re-run | in production only (3) an `ExecutePullRequest` control reply failing on the return leg after the detached push and every H2D completed (narrow; `control_timeout_s_` is sized to avoid it) and the deadline sweep's multi-lock-scope check-then-`Finish` window in `CompleteReadWithDetails` when the last H2D/push finishes right at `deadline()`. (1) `end_incoming_push` needs a duplicate stream (no in-tree sender); (2) receive-side `UnregisterActivePlan` has no caller in tpu-sync or the three connector repos; (4) `~KVCacheManagerWithTransfer` is never published |
 | F15 | `ReshardReceiveSession` leases one host staging slot per **pool** (`AcquireStagingSlot`, reached from `KVCacheManagerBase::GetBlockChunks` on the push thread) out of `num_host_layers()` slots, holds it until the pool's H2D completes, and gates a higher-`order_rank` pool's H2D behind every lower-rank pool (`CollectEligiblePoolH2dsLocked`). A plan with more pools than host layer buffers (a multi-tag plan whose tags' pools share storages; `BuildPoolReshardPlan` gives tag 0 rank 0 and every other tag rank 1) can deadlock once every slot is held by a gated rank-1 pool while some rank-0 pool has no slot: the rank-0 push thread blocks in `StagingLayerManager::Acquire` until `deadline_`, the rank-1 pools' H2Ds wait for it, and the receive fails `DEADLINE_EXCEEDED: Timed out waiting for a free staging slot` with every byte on its way | CONFIRMED (test) 2026-11-02 (`reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc`: 1 control passing + 1 case failing on unmodified `56a0269d`); **filed 2026-11-02** (bug 13 in `filed_bugs.md`) | yes, timing-dependent: needs more pools than storages (multi-tag single-uuid plans, as `vllm-torchtpu` Stage-3 sends) and every slot taken by gated rank-1 pools before some rank-0 pool's first chunk arrives from any sender — via concurrent per-pool pushes reordering on the wire and the rank-blind `Acquire` hand-off; slots are per pool, shared across senders; much likelier with `num_staging_layers < num_layers` |
+| F16 | `KVCacheManagerWithTransfer` UUID retirement omits `BlockTransport::ForgetPushProgress(uuid)` (and `ReleasePoolStagingLeases(uuid)`) when `StartRead` (`:920-921`) or `EmplaceRecvSessionLocked` (`:576`, via `RegisterRecv`) retires a settled session inline, and `CompleteReadWithDetails` (`:1046-1066`) guards its post-`mu_` `ForgetPushProgress(uuid)` / `ReleasePoolStagingLeases(uuid)` loop with a dead `std::erase_if` inside the same `mu_` critical section that just erased `uuid` from `sessions_` (`RegisterActivePlan` `:624`/`:635` → `:651` likewise seats the replacement under `mu_` and then calls `ForgetPushProgress(uuid)` unlocked). On a multi-layer receiver, stale or mid-transfer-wiped `layer_progress_` suppresses `OnLayerReceived` (H2D) on a layer while `OnBlockShardsReceived` still counts its blocks toward `network_completed_`, so `IsReadyToComplete()` returns `true` and `CompleteReadWithDetails` publishes `completions.received` (`done_recving`) with that layer's destination HBM blocks unwritten | CONFIRMED (test) 2026-11-03 (`kv_transfer_uuid_and_reshard_push_bughunt_test.cc`: `UuidRetirementBughunt` 1 control passing + 3 cases failing on unmodified `56a0269d`); not yet filed | gated on same-UUID reuse for the inline and cross-thread `CompleteReadWithDetails` cases (`tpu-inference`, `vllm-torchtpu` and `sglang-torchtpu` mint fresh 63/64-bit UUIDs per transfer today, though `KVCacheManagerWithTransfer` explicitly advertises settled-UUID reuse); `RegisterActivePlan`'s `:635` → `:651` unlocked `ForgetPushProgress(uuid)` after retiring a settled UUID can race against the first push of its *own* newly registered session with no third thread |
+| F17 | `KVCacheManagerWithTransfer::PoolReshardPush` (`:690-724`) checks `sessions_.find(plan.uuid())` under `mu_` (`:694`), drops `mu_` with no pending-UUID reservation while running `ReshardSendSession::Create` (`:711-715`, contrast `PoolReshardRegisterRecv`'s `pending_pool_reshard_recvs_` at `:744`), and then blindly overwrites `sessions_[plan.uuid()] = state` (`:718`). Two concurrent `PoolReshardPush` RPCs for the same `uuid` both return `OK`, orphan the first live `ReshardSendSession` from `sessions_`, share `uuid`'s bounded `PoolStagingStorage` slot via idempotent `AcquirePoolStagingLease`, and free that slot in `SettleLocked` (`reshard_send_session.cc:593`) when the first duplicate settles while the sibling push is still streaming from it, letting an unrelated transfer lease the same host staging memory (the F6 / F10 slot-aliasing shape) | CONFIRMED (test) 2026-11-03 (`kv_transfer_uuid_and_reshard_push_bughunt_test.cc`: `PoolReshardPushDuplicateUuidBughunt` 1 control passing + 1 case failing on unmodified `56a0269d`); not yet filed | needs two concurrent `START_TRANSFER` sender RPCs with the same `uuid` on one worker (e.g. gRPC/proxy retry on transient timeout while the first call is in `Create`, caller UUID collision, or two `src_units` routed to one worker endpoint); `ReshardCoordinator::RunSubPlan` dispatches once per `src_units[i]` with a fresh 63-bit `uuid` |
 | C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_dropFailed_*`, leaks absorbing, `contract_safe` / `mw_contract_safe` for `connectorTwoChannel`); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet); **fix open as [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)** (`f366ef52`, 2026-10-27, "[Disagg] Forward tpu-sync failed transfers in tpu_raiden_connector"; unmerged, not on `main` `7840339b` as of 2026-10-28, where the connector is still unchanged): a new `get_transfer_results()` forwards `failed_recving` as `finished_sending` on P and as `finished_recving` + `failed_recving` on D — an instance of `connectorTwoChannel` over `AggChannel.latchedReq` (`MultiWorker.lean`), with the D-side failure on vLLM's request-level `KVConnectorTransferResults.failed_recving` channel rather than `get_block_ids_with_load_errors` (requiring `ENABLE_MULTI_NUMA=0`, see F11, and a `get_transfer_results()`-capable vLLM ≥ `e7bb7e2f`); tpu-sync at `56a0269d` still files failed and expired sends in `failed_recving_` (`RetireSettledSessionLocked`) | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
@@ -1586,6 +1592,445 @@ have not been rebuilt since the runs their entries record.
 
 ---
 
+## F16. `KVCacheManagerWithTransfer` UUID retirement omits `BlockTransport::ForgetPushProgress` on inline replacement and sweeps it unlocked behind a dead `std::erase_if` guard, suppressing layer H2D and publishing silent corrupt `done_recving`
+
+- **Status:** **CONFIRMED (test)** 2026-11-03, on unmodified `56a0269d`:
+  `kv_transfer_uuid_and_reshard_push_bughunt_test.cc` (`UuidRetirementBughunt`,
+  1 control passing + 3 cases failing). Found during the `56a0269d`
+  model-to-code audit of `UuidTable.lean` (`retireAndReplace` / `sweepSettled`)
+  against `KVCacheManagerWithTransfer` (`10d181f6` / `1523b07d`).
+- **Root cause (`56a0269d`):** when `10d181f6` and `1523b07d` unified
+  `sessions_` under `TransferSession` and added inline settled-session
+  retirement on UUID reuse, transport push-progress cleanup
+  (`BlockTransport::ForgetPushProgress(uuid)`) and reshard pool-staging cleanup
+  (`KVCacheManagerBase::ReleasePoolStagingLeases(uuid)`) were split from the
+  `mu_` critical section in two broken ways:
+  1. *Omitted cleanup on inline retirement.* `RetireSettledSessionLocked`
+     (`kv_cache_manager_with_transfer.cc:436-511`) records
+     `*retired_push_progress = true` (`:447-449`) and
+     `*retired_pool_leases = true` (`:464-466`, `:499-501`) only when the caller
+     passes non-null out-parameters. Two inline-replacement callers invoke
+     `RetireSettledSessionLocked(existing)` with default `nullptr` arguments and
+     never call `ForgetPushProgress(uuid)` or `ReleasePoolStagingLeases(uuid)`
+     at all:
+     - `StartRead` (`:920-921`), when a pull reuses a `uuid` whose prior session
+       already settled (`existing->second->Done()`) before
+       `CompleteReadWithDetails` swept it;
+     - `EmplaceRecvSessionLocked` (`:576`), reached directly by `RegisterRecv`
+       (`:672`) under the same precondition (`RegisterActivePlan` checks before
+       calling `EmplaceRecvSessionLocked`, `:600-608`, so only `RegisterRecv`
+       hits `:576`).
+  2. *Dead `std::erase_if` guard + unlocked post-`mu_` cleanup.*
+     `CompleteReadWithDetails` (`:1039-1066`) erases settled entries from
+     `sessions_` inside `mu_` (`:1043`), immediately runs `std::erase_if` on
+     `retired_uuids` checking `sessions_.contains(uuid) ||
+     pending_pool_reshard_recvs_.contains(uuid)` **still inside that same `mu_`
+     critical section** (`:1046-1050` — no concurrent registration can run while
+     `mu_` is held, so the filter is dead code for every non-pending UUID it
+     just erased), unlocks `mu_` (`:1058`), and then calls
+     `ForgetPushProgress(entry.uuid)` and `ReleasePoolStagingLeases(entry.uuid)`
+     unlocked (`:1061-1066`). Any replacement session registered in the window
+     after `:1058` has its live push progress (or pool-staging lease) wiped
+     mid-transfer. For the same reason, `RegisterActivePlan` (`:624`/`635` →
+     `:649-653`), `PoolReshardPush` (`:702-709`), and `PoolReshardRegisterRecv`
+     (`:749-756`) drop `mu_` after seating or reserving the replacement `uuid`
+     before calling `ForgetPushProgress(uuid)` /
+     `ReleasePoolStagingLeases(uuid)`; in `RegisterActivePlan`, the new
+     `TransferReceiveSession` is already live in `sessions_` at `:624`/`:635`
+     before `:651` runs `ForgetPushProgress(uuid)`, so an eager push for the
+     newly registered plan can land in `[635, 651]` and be wiped by its *own*
+     registration call.
+  3. *Why stale or wiped `layer_progress_` causes silent HBM corruption.* In
+     `BlockTransportServerPushSession::StartStream`
+     (`block_transport_session.cc:461-471`), `CompleteIncomingPush` (`:609-684`)
+     fires `OnLayerReceived(layer_idx, uuid)` once per layer (marking
+     `progress.on_layer_received_called = true`, `:653-655`, `:660`) and clears
+     `layer_progress_` / marks the push session `done_` only when *every* layer
+     has completed (`:656-680`), while `StartStream` unconditionally calls
+     `delegate_->OnBlockShardsReceived(...)` (`:469-470`) on every stream.
+     - Under (1), if Attempt #1 received layer 0 (`on_layer_received_called =
+       true` on `layer_progress_[0]`) and then failed before layer 1 completed
+       (e.g. control pull error or chunk-validation error on layer 1), the
+       transport push session remains alive in `active_push_sessions_[uuid]`.
+       Attempt #2's layer-0 stream sees `on_layer_received_called == true` and
+       skips `OnLayerReceived` (no H2D for layer 0), yet `OnBlockShardsReceived`
+       still increments Attempt #2's per-shard block count; once layer 1's
+       stream lands and its H2D finishes, `RecordBlockShardsReceivedLocked` sets
+       `network_completed_ = true` (`transfer_receive_session.cc:580-594`),
+       `IsReadyToComplete()` (`:558-564`, `(network_completed_ ||
+       num_completed_layers_ == total_layers) && AllH2dDoneLocked()`) returns
+       `true` (`in_flight_ == 0`), and `CompleteReadWithDetails` publishes
+       Attempt #2 in `completions.received` (`done_recving`) with layer 0's HBM
+       blocks untouched.
+     - Under (2), on a 2-sender receiver plan (`ExpectedPushSenders == 2`,
+       `:648`), if `sender_0`'s layer-0 stream lands before the unlocked
+       `ForgetPushProgress(uuid)` wipes `active_push_sessions_[uuid]`,
+       `sender_1`'s layer-0 stream starts a fresh `layer_progress_[0]` with
+       `senders_complete == 1 < 2` (so layer 0's `OnLayerReceived` never fires),
+       while both senders' `OnBlockShardsReceived` callbacks still count toward
+       `network_completed_` on the `TransferReceiveSession`, again publishing
+       `completions.received` with layer 0's HBM blocks unwritten.
+- **C++ test output** (unmodified `56a0269d`, verbatim, 2026-11-03):
+  ```
+  [----------] 4 tests from UuidRetirementBughunt
+  [ RUN      ] UuidRetirementBughunt.Control_SweepBeforeSameUuidStartReadCopiesEveryLayer
+  WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+  I0000 00:00:1793730701.579221    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.579376    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.580308    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 38191, listening tcp socket 3: [::]:38191--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.580714    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.582288    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.582339    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.582727    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 32931, listening tcp socket 4: [::]:32931--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.582875    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.583872    1438 kv_cache_manager_with_transfer.cc:897] StartRead (initiate): req_id=req_1, uuid=7701, numa=-1
+  I0000 00:00:1793730701.584064    1438 transfer_receive_session.cc:642] StartRead (connecting): req_id=req_1, uuid=7701, numa=-1
+  I0000 00:00:1793730701.585099    1481 conn_util.cc:235] connected tcp socket 5: 127.0.0.1:48526--127.0.0.1:38191
+  I0000 00:00:1793730701.585348    1482 raw_buffer_transport.cc:717] accepted tcp socket 6: [::ffff:127.0.0.1]:38191--[::ffff:127.0.0.1]:48526
+  I0000 00:00:1793730701.585643    1482 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=6, op=6, uuid=7701, numa=0
+  I0000 00:00:1793730701.586200    1482 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 0: req_id=req_1, uuid=7701, numa=-1
+  I0000 00:00:1793730701.586308    1482 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 0: req_id=req_1, numa=-1
+  E0000 00:00:1793730701.586662    1438 transfer_receive_session.cc:672] Raiden consumer error during Hybrid Bridge StartRead connect: control pull request: producer died after layer 0
+  W0000 00:00:1793730701.586817    1438 kv_cache_manager_with_transfer.cc:1069] Transfer failed: req_id=req_1 code=UNAVAILABLE phase=connect peer=127.0.0.1:9 elapsed_ms=2.72844 reason=control pull request: producer died after layer 0
+  I0000 00:00:1793730701.586885    1438 kv_cache_manager_with_transfer.cc:897] StartRead (initiate): req_id=req_2, uuid=7701, numa=-1
+  I0000 00:00:1793730701.587001    1438 transfer_receive_session.cc:642] StartRead (connecting): req_id=req_2, uuid=7701, numa=-1
+  I0000 00:00:1793730701.587915    1482 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=6, op=6, uuid=7701, numa=0
+  I0000 00:00:1793730701.588360    1482 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 0: req_id=req_2, uuid=7701, numa=-1
+  I0000 00:00:1793730701.588419    1482 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 0: req_id=req_2, numa=-1
+  I0000 00:00:1793730701.588923    1482 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=6, op=6, uuid=7701, numa=0
+  I0000 00:00:1793730701.589239    1482 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 1: req_id=req_2, uuid=7701, numa=-1
+  I0000 00:00:1793730701.589311    1482 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 1: req_id=req_2, numa=-1
+  I0000 00:00:1793730701.589350    1482 transfer_receive_session.cc:927] All layers H2D copy complete: req_id=req_2
+  I0000 00:00:1793730701.590047    1482 raw_buffer_transport.cc:742] peer closed tcp socket 6: [::ffff:127.0.0.1]:38191--[::ffff:127.0.0.1]:48526
+  [       OK ] UuidRetirementBughunt.Control_SweepBeforeSameUuidStartReadCopiesEveryLayer (14 ms)
+  [ RUN      ] UuidRetirementBughunt.StartReadInlineRetirementSkipsLayerZeroH2dAndPublishesCorruptSuccess
+  I0000 00:00:1793730701.592093    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.592148    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.592513    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 44253, listening tcp socket 3: [::]:44253--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.592648    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.593766    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.593812    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.594378    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 33295, listening tcp socket 4: [::]:33295--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.594535    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.595475    1438 kv_cache_manager_with_transfer.cc:897] StartRead (initiate): req_id=req_1, uuid=7702, numa=-1
+  I0000 00:00:1793730701.595615    1438 transfer_receive_session.cc:642] StartRead (connecting): req_id=req_1, uuid=7702, numa=-1
+  I0000 00:00:1793730701.596117    1511 conn_util.cc:235] connected tcp socket 5: 127.0.0.1:46448--127.0.0.1:44253
+  I0000 00:00:1793730701.596337    1512 raw_buffer_transport.cc:717] accepted tcp socket 6: [::ffff:127.0.0.1]:44253--[::ffff:127.0.0.1]:46448
+  I0000 00:00:1793730701.596452    1512 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=6, op=6, uuid=7702, numa=0
+  I0000 00:00:1793730701.596768    1512 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 0: req_id=req_1, uuid=7702, numa=-1
+  I0000 00:00:1793730701.596837    1512 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 0: req_id=req_1, numa=-1
+  E0000 00:00:1793730701.597038    1438 transfer_receive_session.cc:672] Raiden consumer error during Hybrid Bridge StartRead connect: control pull request: producer died after layer 0
+  I0000 00:00:1793730701.597106    1438 kv_cache_manager_with_transfer.cc:897] StartRead (initiate): req_id=req_2, uuid=7702, numa=-1
+  I0000 00:00:1793730701.597261    1438 transfer_receive_session.cc:642] StartRead (connecting): req_id=req_2, uuid=7702, numa=-1
+  I0000 00:00:1793730701.597710    1512 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=6, op=6, uuid=7702, numa=0
+  I0000 00:00:1793730701.598329    1512 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=6, op=6, uuid=7702, numa=0
+  I0000 00:00:1793730701.598602    1512 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 1: req_id=req_2, uuid=7702, numa=-1
+  I0000 00:00:1793730701.598660    1512 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 1: req_id=req_2, numa=-1
+  I0000 00:00:1793730701.598942    1438 kv_cache_manager_with_transfer.cc:1022] CompleteReadRaw (polling completion): req_id=req_2
+  W0000 00:00:1793730701.599054    1438 kv_cache_manager_with_transfer.cc:1069] Transfer failed: req_id=req_1 code=UNAVAILABLE phase=connect peer=127.0.0.1:9 elapsed_ms=1.53439 reason=control pull request: producer died after layer 0
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:424: Failure
+  Value of: consumer.sim_base()->DispatchedLayers()
+  Expected: has 2 elements where
+  element #0 is equal to 0,
+  element #1 is equal to 1
+    Actual: { 1 }, which has 1 element
+  [F16] StartRead inline retirement omitted ForgetPushProgress(7702), suppressing layer 0's H2D on req_2
+
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:427: Failure
+  Expected equality of these values:
+    consumer.sim_base()->HbmByte( 0, 1)
+      Which is: '\xEE' (238)
+    0xB0
+      Which is: 176
+  [F16] req_2 was reported in completions.received (done_recving) with poison byte 0xEE still in layer 0's HBM block
+
+  I0000 00:00:1793730701.600523    1512 raw_buffer_transport.cc:742] peer closed tcp socket 6: [::ffff:127.0.0.1]:44253--[::ffff:127.0.0.1]:46448
+  [  FAILED  ] UuidRetirementBughunt.StartReadInlineRetirementSkipsLayerZeroH2dAndPublishesCorruptSuccess (10 ms)
+  [ RUN      ] UuidRetirementBughunt.RegisterRecvInlineRetirementSkipsLayerZeroH2dAndPublishesCorruptSuccess
+  I0000 00:00:1793730701.602332    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.602387    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.602914    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 37235, listening tcp socket 3: [::]:37235--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.603078    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.604202    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.604247    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.604622    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 36983, listening tcp socket 4: [::]:36983--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.604766    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.605860    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.605955    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.606338    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 41301, listening tcp socket 5: [::]:41301--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.606502    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.607849    1555 conn_util.cc:235] connected tcp socket 6: 127.0.0.1:38820--127.0.0.1:37235
+  I0000 00:00:1793730701.608017    1556 raw_buffer_transport.cc:717] accepted tcp socket 7: [::ffff:127.0.0.1]:37235--[::ffff:127.0.0.1]:38820
+  I0000 00:00:1793730701.608122    1556 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=7, op=6, uuid=7703, numa=0
+  I0000 00:00:1793730701.608412    1556 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 0: req_id=req_1, uuid=7703, numa=-1
+  I0000 00:00:1793730701.608495    1556 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 0: req_id=req_1, numa=-1
+  I0000 00:00:1793730701.608927    1556 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=7, op=6, uuid=7703, numa=0
+  E0000 00:00:1793730701.609201    1556 block_transport.cc:431] Incoming push rejected: uuid=7703 op=6 local_id=1: OUT_OF_RANGE: Chunk out of bounds. Chunk ptr: 93841372993792, size: 128, Block array base: 93841372865920, Block array size: 1024
+  === Source Location Trace: === 
+  tpu_sync/transport/block_transport_session.cc:148
+  tpu_sync/transport/block_transport_session.cc:452
+  tpu_sync/transport/block_transport_session.cc:181
+  tpu_sync/transport/block_transport_session.cc:452
+
+  E0000 00:00:1793730701.609274    1556 raw_buffer_transport.cc:749] ProcessPeerRequest failed: OUT_OF_RANGE: Chunk out of bounds. Chunk ptr: 93841372993792, size: 128, Block array base: 93841372865920, Block array size: 1024
+  === Source Location Trace: === 
+  tpu_sync/transport/block_transport_session.cc:148
+  tpu_sync/transport/block_transport_session.cc:452
+  tpu_sync/transport/block_transport_session.cc:181
+  tpu_sync/transport/block_transport_session.cc:452
+
+  I0000 00:00:1793730701.609937    1557 conn_util.cc:235] connected tcp socket 6: 127.0.0.1:38828--127.0.0.1:37235
+  I0000 00:00:1793730701.610126    1558 raw_buffer_transport.cc:717] accepted tcp socket 7: [::ffff:127.0.0.1]:37235--[::ffff:127.0.0.1]:38828
+  I0000 00:00:1793730701.610252    1558 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=7, op=6, uuid=7703, numa=0
+  I0000 00:00:1793730701.610946    1558 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=7, op=6, uuid=7703, numa=0
+  I0000 00:00:1793730701.611236    1558 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 1: req_id=req_2, uuid=7703, numa=-1
+  I0000 00:00:1793730701.611313    1558 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 1: req_id=req_2, numa=-1
+  I0000 00:00:1793730701.611495    1438 kv_cache_manager_with_transfer.cc:1022] CompleteReadRaw (polling completion): req_id=req_2
+  W0000 00:00:1793730701.611607    1438 kv_cache_manager_with_transfer.cc:1069] Transfer failed: req_id=req_1 code=INTERNAL phase=receive elapsed_ms=1.77906 reason=Incoming push failed
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:496: Failure
+  Value of: consumer.sim_base()->DispatchedLayers()
+  Expected: has 2 elements where
+  element #0 is equal to 0,
+  element #1 is equal to 1
+    Actual: { 1 }, which has 1 element
+  [F16] RegisterRecv inline retirement omitted ForgetPushProgress(7703), suppressing layer 0's H2D on req_2
+
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:499: Failure
+  Expected equality of these values:
+    consumer.sim_base()->HbmByte( 0, 0)
+      Which is: '\xEE' (238)
+    0xB0
+      Which is: 176
+  [F16] req_2 was reported in completions.received (done_recving) with poison byte 0xEE still in layer 0's HBM block
+
+  I0000 00:00:1793730701.612180    1558 raw_buffer_transport.cc:742] peer closed tcp socket 7: [::ffff:127.0.0.1]:37235--[::ffff:127.0.0.1]:38828
+  [  FAILED  ] UuidRetirementBughunt.RegisterRecvInlineRetirementSkipsLayerZeroH2dAndPublishesCorruptSuccess (12 ms)
+  [ RUN      ] UuidRetirementBughunt.CompleteReadSweepDeadEraseIfWipesLiveReplacementAndPublishesCorruptHbm
+  I0000 00:00:1793730701.614596    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.614644    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.615035    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 38987, listening tcp socket 3: [::]:38987--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.615187    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.616293    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.616338    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.616737    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 43235, listening tcp socket 4: [::]:43235--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.616889    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.618057    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.618105    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.618447    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 35555, listening tcp socket 5: [::]:35555--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.618595    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1793730701.631045    1438 kv_cache_manager_with_transfer.cc:641] RegisterActivePlan (Receiver): Populated sessions_ for UUID 8801 with 2 total physical block-pushes (including duplicates across sources) for automatic H2D.
+  I0000 00:00:1793730701.631568    1602 conn_util.cc:235] connected tcp socket 6: 127.0.0.1:58736--127.0.0.1:38987
+  I0000 00:00:1793730701.631810    1603 raw_buffer_transport.cc:717] accepted tcp socket 7: [::ffff:127.0.0.1]:38987--[::ffff:127.0.0.1]:58736
+  I0000 00:00:1793730701.631911    1603 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=7, op=6, uuid=8801, numa=0
+  W0000 00:00:1793730701.632463    1601 kv_cache_manager_with_transfer.cc:1069] Transfer failed: req_id=old_req code=DEADLINE_EXCEEDED phase=receive elapsed_ms=0.15066 reason=Receive session timed out
+  I0000 00:00:1793730701.632946    1604 conn_util.cc:235] connected tcp socket 8: 127.0.0.1:58752--127.0.0.1:38987
+  I0000 00:00:1793730701.633163    1605 raw_buffer_transport.cc:717] accepted tcp socket 9: [::ffff:127.0.0.1]:38987--[::ffff:127.0.0.1]:58752
+  I0000 00:00:1793730701.633403    1605 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=9, op=6, uuid=8801, numa=0
+  I0000 00:00:1793730701.634480    1603 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=7, op=6, uuid=8801, numa=0
+  I0000 00:00:1793730701.635081    1605 block_transport.cc:421] HandleCustomRequest (H2H read start): client_fd=9, op=6, uuid=8801, numa=0
+  I0000 00:00:1793730701.635387    1605 transfer_receive_session.cc:842] OnLayerReceived (H2D copy start) layer 1: req_id=new_req, uuid=8801, numa=-1
+  I0000 00:00:1793730701.635472    1605 transfer_receive_session.cc:900] OnLayerReceived (H2D copy complete) layer 1: req_id=new_req, numa=-1
+  I0000 00:00:1793730701.635690    1438 kv_cache_manager_with_transfer.cc:1022] CompleteReadRaw (polling completion): req_id=new_req
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:587: Failure
+  Value of: consumer.sim_base()->DispatchedLayers()
+  Expected: has 2 elements where
+  element #0 is equal to 0,
+  element #1 is equal to 1
+    Actual: { 1 }, which has 1 element
+  [F16] CompleteReadWithDetails post-mu_ ForgetPushProgress(8801) wiped live new_req's sender_0 layer-0 progress, suppressing layer 0's H2D
+
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:591: Failure
+  Expected equality of these values:
+    consumer.sim_base()->HbmByte( 0, 0)
+      Which is: '\xEE' (238)
+    0xC0
+      Which is: 192
+  [F16] new_req was reported in completions.received (done_recving) with poison byte 0xEE still in layer 0's HBM block
+
+  I0000 00:00:1793730701.636719    1605 raw_buffer_transport.cc:742] peer closed tcp socket 9: [::ffff:127.0.0.1]:38987--[::ffff:127.0.0.1]:58752
+  I0000 00:00:1793730701.638003    1603 raw_buffer_transport.cc:742] peer closed tcp socket 7: [::ffff:127.0.0.1]:38987--[::ffff:127.0.0.1]:58736
+  [  FAILED  ] UuidRetirementBughunt.CompleteReadSweepDeadEraseIfWipesLiveReplacementAndPublishesCorruptHbm (25 ms)
+  [----------] 4 tests from UuidRetirementBughunt (62 ms total)
+  ```
+- **Reachability:** the inline-retirement paths (`StartRead`, `RegisterRecv`)
+  and the cross-thread `CompleteReadWithDetails` race require reusing a settled
+  `uuid`. `tpu-inference`, `vllm-torchtpu`, and `sglang-torchtpu` mint fresh
+  63/64-bit UUIDs per transfer today (§Callers), so those three paths are gated
+  on callers that reuse settled UUIDs — a contract `KVCacheManagerWithTransfer`
+  explicitly supports and tests (`RegisterActivePlan`, `StartRead`,
+  `PoolReshardPush`, and `PoolReshardRegisterRecv` were all refactored in
+  `10d181f6` / `1523b07d` specifically to retire settled incumbents inline).
+  In addition, `RegisterActivePlan` (`:624`/`635` → `:651`) seats the newly
+  created `TransferReceiveSession` in `sessions_` under `mu_` and then calls
+  `ForgetPushProgress(uuid)` unlocked when an earlier settled session occupied
+  that `uuid`, so an incoming push for the *newly* registered plan landing in
+  `[635, 651]` is wiped by its own `RegisterActivePlan` call without needing a
+  third thread.
+- **Candidate fixes:**
+  1. Key `BlockTransport::active_push_sessions_` (or `ForgetPushProgress`) and
+     `PoolStagingStorage` leases by `(uuid, session_ptr)` or a monotonic
+     per-registration generation so retiring an old session can never erase or
+     release state belonging to a newer session.
+  2. Until (1) lands, pass `&retired_push_progress, &retired_pool_leases` in
+     every inline `RetireSettledSessionLocked` caller (`StartRead` `:920-921`,
+     `EmplaceRecvSessionLocked` `:576`), run `ForgetPushProgress(uuid)` /
+     `ReleasePoolStagingLeases(uuid)` **before** emplacing the replacement in
+     `sessions_` (while holding a pending-UUID reservation so no concurrent
+     registration or incoming push for the replacement is admitted yet), and
+     skip `ForgetPushProgress` / `ReleasePoolStagingLeases` in
+     `CompleteReadWithDetails` whenever `uuid` has been re-registered or
+     reserved since it was retired.
+  3. As defence in depth on the receiver, require
+     `num_completed_layers_ == total_layers` (not `network_completed_ ||
+     num_completed_layers_ == total_layers`) in
+     `TransferReceiveSession::IsReadyToComplete` (`transfer_receive_session.cc:558-564`)
+     whenever `automatic_h2d_` is active, so suppressed `OnLayerReceived`
+     callbacks can never publish `done_recving` with unwritten layers.
+- **Repro:** `kv_transfer_uuid_and_reshard_push_bughunt_test.cc`; copy to
+  `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
+  `bazel test --config=oss //tpu_sync/kv_cache:kv_transfer_uuid_and_reshard_push_bughunt_test`.
+
+---
+
+## F17. `KVCacheManagerWithTransfer::PoolReshardPush` lacks a pending-UUID reservation and blindly overwrites `sessions_[uuid]`, reopening bounded `PoolStagingStorage` slot aliasing on concurrent duplicate-UUID `START_TRANSFER` RPCs
+
+- **Status:** **CONFIRMED (test)** 2026-11-03, on unmodified `56a0269d`:
+  `kv_transfer_uuid_and_reshard_push_bughunt_test.cc`
+  (`PoolReshardPushDuplicateUuidBughunt`, 1 control passing + 1 case failing).
+  Found during the `56a0269d` model-to-code audit of `PoolReshardPush` against
+  `PoolReshardRegisterRecv` (`UuidTable.lean` / `Reshard/PoolStaging`).
+- **Root cause (`56a0269d`):** `PoolReshardRegisterRecv` (`:726-778`) closes the
+  unlocked `Create` window with `pending_pool_reshard_recvs_` (`:738-745`, added
+  when fixing F6 in `8653373`) and re-checks `sessions_.find(plan.uuid())`
+  before emplacing (`:765-772`). Its sender sibling `PoolReshardPush`
+  (`kv_cache_manager_with_transfer.cc:690-724`, rewritten in `1523b07d`) omits
+  both guards:
+  1. Under the first `mu_` lock (`:693-700`), it checks `sessions_.find(uuid)`
+     and returns `AlreadyExistsError` only if a live session is *already* in
+     `sessions_`, then unlocks `mu_` (`:701`) without inserting `uuid` into any
+     `pending_pool_reshard_sends_` set.
+  2. Outside `mu_`, it runs `ReshardSendSession::Create` (`:711-715`, which
+     calls `InitTransportServer()` at `reshard_send_session.cc:144` and launches
+     the detached `ExecutePushPipeline` task).
+  3. Under the second `mu_` lock (`:717-721`), it executes
+     `sessions_[plan.uuid()] = state;` (`:718`) with **no re-check** and calls
+     `NoteSubPlanRegisteredLocked(plan, /*is_sender=*/true)` (`:719-720`).
+  When two `PoolReshardPush` calls for the same `uuid` arrive concurrently, both
+  pass `:694`, both construct and launch live `ReshardSendSession` pipelines,
+  and the second overwrites `sessions_[uuid]` — orphaning the first live
+  `ReshardSendSession` from `sessions_` while double-registering `uuid` in the
+  sub-plan chain. Both detached pipelines call
+  `base_->AcquirePoolStagingLease(uuid(), ...)` (`reshard_send_session.cc:362-364`),
+  which is idempotent by `uuid` (`PoolStagingStorage::Acquire` returns the
+  already-leased slot to the second caller). As soon as the faster duplicate
+  settles (`SettleLocked`, `:593`), it calls
+  `base_->ReleasePoolStagingLeases(uuid())`, freeing that bounded
+  `PoolStagingStorage` slot while the slower duplicate is still mid-D2H or
+  mid-`AsyncPush` reading from it; an unrelated transfer then leases the exact
+  same host staging address (the F6 / F10 slot-aliasing hazard).
+- **C++ test output** (unmodified `56a0269d`, verbatim, 2026-11-03):
+  ```
+  [----------] 2 tests from PoolReshardPushDuplicateUuidBughunt
+  [ RUN      ] PoolReshardPushDuplicateUuidBughunt.Control_SequentialDuplicateUuidIsRejectedWhileFirstSendIsLive
+  I0000 00:00:1793730701.640539    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.640610    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.640991    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 33773, listening tcp socket 4: [::]:33773--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.641149    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=4, numa_send_adapters=0
+  I0000 00:00:1793730701.642496    1438 kv_cache_manager_base.cc:2143] KVCacheManagerBase: pool host staging configured: leases=1 bounded_storages=1 (128 B) full_mirror_storages=0 (0 B)
+  I0000 00:00:1793730701.643867    1625 conn_util.cc:235] connected tcp socket 6: 127.0.0.1:49946--127.0.0.1:36405
+  E0000 00:00:1793730701.644180    1625 reshard_send_session.cc:510] Pool reshard send failed uuid=9101 req_id=reshard_req_9101: INTERNAL: tcp socket recvmsg eof failed: fd=6 127.0.0.1:49946--*
+  === Source Location Trace: === 
+  external/peregrine+/peregrine/src/internal/socket/tcp_socket_util.cc:170
+
+  [       OK ] PoolReshardPushDuplicateUuidBughunt.Control_SequentialDuplicateUuidIsRejectedWhileFirstSendIsLive (5 ms)
+  [ RUN      ] PoolReshardPushDuplicateUuidBughunt.ConcurrentDuplicateUuidOverwritesSessionAndAliasesLivePoolStagingSlot
+  I0000 00:00:1793730701.645770    1438 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1793730701.645820    1438 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1793730701.646371    1438 raw_buffer_transport.cc:321] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 33729, listening tcp socket 3: [::]:33729--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1793730701.646518    1438 block_transport.cc:373] local_port=0, local_ips=127.0.0.1, parallelism=4, numa_send_adapters=0
+  I0000 00:00:1793730701.647787    1438 kv_cache_manager_base.cc:2143] KVCacheManagerBase: pool host staging configured: leases=1 bounded_storages=1 (128 B) full_mirror_storages=0 (0 B)
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:910: Failure
+  Value of: both_accepted
+    Actual: true
+  Expected: false
+  [F17] both concurrent PoolReshardPush calls for uuid=9201 returned OK (missing pending_pool_reshard_sends_ reservation and sessions_[uuid] overwrite)
+
+  I0000 00:00:1793730701.674595    1648 conn_util.cc:235] connected tcp socket 6: 127.0.0.1:45498--127.0.0.1:33441
+  I0000 00:00:1793730701.674617    1645 conn_util.cc:235] connected tcp socket 7: 127.0.0.1:45502--127.0.0.1:33441
+  E0000 00:00:1793730701.674916    1648 reshard_send_session.cc:510] Pool reshard send failed uuid=9201 req_id=reshard_req_9201: INTERNAL: FAILED_PRECONDITION: tcp socket sendmsg failed: fd=6 127.0.0.1:45498--*: Broken pipe
+  === Source Location Trace: === 
+  external/peregrine+/peregrine/src/internal/socket/tcp_socket_util.cc:123
+  tpu_sync/transport/lib/adapter/socket_transport_adapter.cc:632
+
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:927: Failure
+  Expected equality of these values:
+    manager.base()->PoolStagingSummary().at(0).free_slots
+      Which is: 1
+    0
+  [F17] settling duplicate send freed uuid=9201's PoolStagingStorage slot while the sibling send still has an open TCP push in flight
+
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:935: Failure
+  Value of: other_lease
+  Expected: has a status code that is equal to RESOURCE_EXHAUSTED, and has an error message that is anything
+    Actual: OK (of type absl::lts_20260526::Status), which is OK
+  [F17] unrelated uuid=9202 leased the 1-slot arena while uuid=9201 still has an active TCP push in flight
+
+  tpu_sync/kv_cache/kv_transfer_uuid_and_reshard_push_bughunt_test.cc:943: Failure
+  Expected: (other_addrs_or->host_base_addrs(0)) != (slot_0_addr), actual: 93841372925120 vs 93841372925120
+  [F17] unrelated uuid=9202 received the exact host staging address (0x555925b2ccc0) still in flight for uuid=9201
+
+  E0000 00:00:1793730701.676363    1645 reshard_send_session.cc:510] Pool reshard send failed uuid=9201 req_id=reshard_req_9201: INTERNAL: tcp socket recvmsg eof failed: fd=7 127.0.0.1:45502--*
+  === Source Location Trace: === 
+  external/peregrine+/peregrine/src/internal/socket/tcp_socket_util.cc:170
+
+  [  FAILED  ] PoolReshardPushDuplicateUuidBughunt.ConcurrentDuplicateUuidOverwritesSessionAndAliasesLivePoolStagingSlot (57 ms)
+  [----------] 2 tests from PoolReshardPushDuplicateUuidBughunt (63 ms total)
+  ```
+- **Reachability:** requires two concurrent sender `START_TRANSFER` RPCs with
+  the same `uuid` reaching one worker's `PoolReshardPush` while bounded pool
+  host staging (`staging_leases > 0`) is configured — e.g. a gRPC / proxy retry
+  after a transient deadline while the first call is still in `Create` (for
+  instance on first-call `InitTransportServer()`), two `src_units` misconfigured
+  onto the same worker endpoint, or a caller UUID collision. `ReshardCoordinator::RunSubPlan`
+  dispatches once per `src_units[i]` with a fresh 63-bit `uuid` today, and
+  neither `vllm-torchtpu` nor `sglang-torchtpu` retries post-arm (§Callers).
+- **Candidate fixes:** mirror `PoolReshardRegisterRecv`: reserve `plan.uuid()`
+  in a `pending_pool_reshard_sends_` set (or a single unified
+  `pending_uuids_` set across all registration entry points) under `mu_` before
+  dropping `mu_` for `ReshardSendSession::Create`, erase the reservation via a
+  cleanup guard, and `try_emplace` (never `operator[]` overwrite) under the
+  second `mu_` lock — or defer starting `ExecutePushPipeline` until after the
+  session is emplaced in `sessions_`.
+- **Repro:** `kv_transfer_uuid_and_reshard_push_bughunt_test.cc`; copy to
+  `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
+  `bazel test --config=oss //tpu_sync/kv_cache:kv_transfer_uuid_and_reshard_push_bughunt_test`.
+
+---
+
 ## C1. tpu-inference `tpu_raiden_connector`: failed and never-pulled transfers leak their KV blocks on both nodes
 
 - **Status:** **CONFIRMED (test)** 2026-10-20, on CPU, no TPU:
@@ -2191,6 +2636,48 @@ generation frees another holder's slots under uuid reuse") is a one-line
 reading of `ReleasePoolStagingLeases`, and `Reshard/PoolStaging/Registration.lean`
 already carries the F6 witness for the same slot-aliasing consequence.
 
+Re-read 2026-11-03 at `56a0269d`: `10d181f6` / `1523b07d` removed
+`UnregisterSettledPlan(uuid, generation)` (plans now live inside
+`TransferSession`) and replaced `CompleteReadWithDetails`'s generation check
+with `std::erase_if` over `retired_uuids` checking
+`sessions_.contains(entry.uuid) ||
+pending_pool_reshard_recvs_.contains(entry.uuid)` (`kv_cache_manager_with_transfer.cc:1046-1050`),
+followed after unlocking `mu_` (`:1058`) by unlocked
+`ForgetPushProgress(entry.uuid)` and `ReleasePoolStagingLeases(entry.uuid)`
+calls (`:1061-1066`). Because `std::erase_if` runs inside the *same* `mu_`
+critical section that just erased `entry.uuid` from `sessions_` (`:1043`), the
+guard is dead code for every non-pending UUID, widening this post-`mu_` sweep
+window to `ForgetPushProgress(uuid)` on prefill-to-decode and `RegisterActivePlan`
+receivers as well; reproduced end-to-end as **F16**
+(`UuidRetirementBughunt.CompleteReadSweepDeadEraseIfWipesLiveReplacementAndPublishesCorruptHbm`).
+
+### R-H. `ReshardCoordinator::RunSubPlan` `kController` `sender_status[i]` misindexing after a pre-RPC `continue`: low-severity error-attribution clobber (read, `56a0269d`)
+
+In `ReshardCoordinator::RunSubPlan`'s `WorkerDelivery::Mode::kController`
+sender-dispatch loop (`tpu_sync/kv_cache/reshard/reshard_coordinator.cc:818-854`),
+`sender_status` has size `N = plan.src_units.size()` (`:817`). If unit `k` hits
+either pre-RPC error branch — missing schedule in `src_schedule_keys`
+(`:831-835`) or `!compiled.ok()` from `CompileStartTransfer` (`:838-842`) — the
+loop sets `sender_status[k] = error` and executes `continue` **without** pushing
+into `futures`, while a subsequent unit `m > k` pushes its RPC future at
+`futures[m - skipped]` (`:843-844`). The collection loop (`:846-854`) then
+iterates `for (size_t i = 0; i < futures.size(); ++i)` and assigns
+`sender_status[i] = ...` (`:850`, `:852`), overwriting `sender_status[k]` with
+unit `m`'s `OK` status while leaving `sender_status[m]` default-constructed
+`absl::OkStatus()`. Consequently the final check loop (`:876-878`) sees all
+`OK` and `RunSubPlan` returns `absl::OkStatus()` despite unit `k` never having
+been dispatched (contrast `kDirectWorkerRpc` at `:855-874`, which pushes a
+ready `MakeErrorFuture` on error so `futures` stays 1:1 with `sender_status`).
+
+Why it stays here rather than as a numbered finding: both `continue` branches
+check invariants of the `PoolReshardPlan` that `BuildPoolReshardPlan` just built
+in-memory on lines `:755-762` (`src_units` vs `sender_plans` map keys and
+`CompileStartTransfer`), so neither `continue` is reachable from valid planner
+output today; it is latent defensive-code rot that would surface only if a
+future planner change violated its own invariant under `kController` delivery.
+Fix: push `tsl::MakeErrorFuture<absl::Status>(...)` (matching `kDirectWorkerRpc`)
+or store `(unit_idx, future)` pairs in `futures`.
+
 ### Open / not yet checked
 
 - `KVCacheStoreClient::Fetch` sets no RPC deadline
@@ -2775,3 +3262,36 @@ clone reset. Results, verbatim:
   the rank-blind `StagingLayerManager::Acquire` hand-off. Recommended fix moved
   to rank-ordered leasing; in-place staging on a full mirror flagged as unsafe
   (pools of different tags may share storage bytes). Filed tally 13.
+- 2026-11-03: **F16, F17, R-G re-read and R-H added** from the `56a0269d`
+  full-repo model-to-code audit (`kv_transfer_uuid_and_reshard_push_bughunt_test.cc`,
+  2 controls passing + 4 cases failing on unmodified `56a0269d`; target added
+  to `build_targets.patch`):
+  - **F16** (`UuidRetirementBughunt`, 1 control + 3 failing cases): inline
+    settled-session retirement in `StartRead` (`:920-921`) and
+    `EmplaceRecvSessionLocked` (`:576`, via `RegisterRecv`) omits
+    `BlockTransport::ForgetPushProgress(uuid)` (and
+    `ReleasePoolStagingLeases(uuid)`), and `CompleteReadWithDetails`
+    (`:1046-1066`) guards its post-`mu_` `ForgetPushProgress(uuid)` /
+    `ReleasePoolStagingLeases(uuid)` loop with a dead `std::erase_if` inside
+    the same `mu_` lock scope that just erased `uuid` from `sessions_`
+    (`RegisterActivePlan` `:635` → `:651` likewise calls `ForgetPushProgress`
+    unlocked after seating the replacement); stale or wiped `layer_progress_`
+    suppresses layer 0's `OnLayerReceived` (H2D) while `OnBlockShardsReceived`
+    still drives `network_completed_ = true`, publishing silent corrupt
+    `completions.received` (`done_recving`) with layer 0's HBM unwritten. Also
+    noted under **R-G** (`56a0269d` re-read).
+  - **F17** (`PoolReshardPushDuplicateUuidBughunt`, 1 control + 1 failing case):
+    `PoolReshardPush` (`:690-724`) lacks `PoolReshardRegisterRecv`'s pending-UUID
+    reservation across the unlocked `ReshardSendSession::Create` window and
+    blindly overwrites `sessions_[plan.uuid()] = state` (`:718`), so concurrent
+    duplicate-UUID `PoolReshardPush` calls both return `OK`, share `uuid`'s
+    bounded `PoolStagingStorage` lease, and free the slot on the faster
+    session's settle while the sibling push is still streaming from it (aliasing
+    the slot to an unrelated transfer).
+  - **R-H** (`CONFIRMED (read)` at `56a0269d`, low-severity defensive-code
+    hazard): `ReshardCoordinator::RunSubPlan` `WorkerDelivery::Mode::kController`
+    overwrites `sender_status[i]` by `futures` index (`:846-854`) after a
+    pre-RPC `continue` (`:831-842`) skips pushing to `futures`, clobbering the
+    skipped unit's error with a later unit's `OK` (unreachable from valid
+    `BuildPoolReshardPlan` output today).
+  Filed tally unchanged (F16 and F17 not yet filed).
