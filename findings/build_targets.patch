@@ -1,8 +1,8 @@
 diff --git a/tpu_sync/core/controller/BUILD b/tpu_sync/core/controller/BUILD
-index f809093..3bfdc6b 100644
+index 954554b9..1474b5c8 100644
 --- a/tpu_sync/core/controller/BUILD
 +++ b/tpu_sync/core/controller/BUILD
-@@ -362,3 +362,25 @@ py_library(
+@@ -369,3 +369,25 @@ py_library(
          "//tpu_sync/store_node:kv_cache_host_store_node_main",
      ],
  )
@@ -28,11 +28,42 @@ index f809093..3bfdc6b 100644
 +        "@xla//xla/tsl/platform:statusor",
 +    ],
 +)
+diff --git a/tpu_sync/frameworks/jax/BUILD b/tpu_sync/frameworks/jax/BUILD
+index a88ac487..f80746cd 100644
+--- a/tpu_sync/frameworks/jax/BUILD
++++ b/tpu_sync/frameworks/jax/BUILD
+@@ -908,3 +908,26 @@ cc_test(
+         "@xla//xla/tsl/platform:test_main",
+     ],
+ )
++
++cc_test(
++    name = "numa_kv_cache_manager_bughunt_test",
++    srcs = ["numa_kv_cache_manager_bughunt_test.cc"],
++    copts = [
++        "-DWITHOUT_PYTHON",
++        "-fexceptions",
++    ],
++    features = ["-use_header_modules"],
++    deps = [
++        ":kv_cache_manager_core_lib",
++        "//tpu_sync/core:raw_transfer_core",
++        "//tpu_sync/kv_cache:kv_cache_manager_base",
++        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
++        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/synchronization",
++        "@xla//xla/tsl/platform:statusor",
++        "@xla//xla/tsl/platform:test",
++        "@xla//xla/tsl/platform:test_main",
++    ],
++)
 diff --git a/tpu_sync/kv_cache/BUILD b/tpu_sync/kv_cache/BUILD
-index b6fd414..66bb611 100644
+index 261a47b6..05467a12 100644
 --- a/tpu_sync/kv_cache/BUILD
 +++ b/tpu_sync/kv_cache/BUILD
-@@ -1242,3 +1242,118 @@ cc_library(
+@@ -1312,3 +1312,142 @@ cc_library(
          "@com_google_absl//absl/types:span",
      ],
  )
@@ -151,10 +182,35 @@ index b6fd414..66bb611 100644
 +        "@xla//xla/tsl/concurrency:future",
 +    ],
 +)
++
++cc_test(
++    name = "reshard_recv_staging_slot_rank_deadlock_bughunt_test",
++    srcs = ["reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc"],
++    copts = [
++        "-fno-strict-aliasing",
++        "-fexceptions",
++    ],
++    features = [
++        "-use_header_modules",
++        "-layering_check",
++    ],
++    deps = [
++        ":kv_cache_manager_base",
++        ":kv_cache_manager_with_transfer",
++        ":pool_layout",
++        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "//tpu_sync/transport:transfer_session",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/time",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
 diff --git a/tpu_sync/kv_cache/reshard/BUILD b/tpu_sync/kv_cache/reshard/BUILD
+index aedc68b4..23c04448 100644
 --- a/tpu_sync/kv_cache/reshard/BUILD
 +++ b/tpu_sync/kv_cache/reshard/BUILD
-@@ -276,3 +276,31 @@ cc_library(
+@@ -278,3 +278,31 @@ cc_library(
          "@com_google_absl//absl/time",
      ],
  )
@@ -186,35 +242,3 @@ diff --git a/tpu_sync/kv_cache/reshard/BUILD b/tpu_sync/kv_cache/reshard/BUILD
 +        "@com_google_googletest//:gtest_main",
 +    ],
 +)
-diff --git a/tpu_sync/frameworks/jax/BUILD b/tpu_sync/frameworks/jax/BUILD
---- a/tpu_sync/frameworks/jax/BUILD
-+++ b/tpu_sync/frameworks/jax/BUILD
-@@ -907,4 +907,27 @@ cc_test(
-         "@xla//xla/tsl/platform:test",
-         "@xla//xla/tsl/platform:test_main",
-     ],
- )
-+
-+cc_test(
-+    name = "numa_kv_cache_manager_bughunt_test",
-+    srcs = ["numa_kv_cache_manager_bughunt_test.cc"],
-+    copts = [
-+        "-DWITHOUT_PYTHON",
-+        "-fexceptions",
-+    ],
-+    features = ["-use_header_modules"],
-+    deps = [
-+        ":kv_cache_manager_core_lib",
-+        "//tpu_sync/core:raw_transfer_core",
-+        "//tpu_sync/kv_cache:kv_cache_manager_base",
-+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
-+        "//tpu_sync/rpc:raiden_service_cc_proto",
-+        "@com_google_absl//absl/status",
-+        "@com_google_absl//absl/status:statusor",
-+        "@com_google_absl//absl/synchronization",
-+        "@xla//xla/tsl/platform:statusor",
-+        "@xla//xla/tsl/platform:test",
-+        "@xla//xla/tsl/platform:test_main",
-+    ],
-+)
-

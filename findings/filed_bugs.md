@@ -6,7 +6,8 @@ and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac1
 [`google/tpu-sync` @ `449b591`](https://github.com/google/tpu-sync/tree/449b591) for bug 7,
 [`google/tpu-sync` @ `2ed6f8f`](https://github.com/google/tpu-sync/tree/2ed6f8f) for bug 9,
 and [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) (plus [`vllm-project/tpu-inference` @ `f366ef52`](https://github.com/vllm-project/tpu-inference/tree/f366ef52) from [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)) for bug 10,
-and [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) for bugs 11–12.
+and [`google/tpu-sync` @ `42dda542`](https://github.com/google/tpu-sync/tree/42dda542) for bugs 11–12,
+and [`google/tpu-sync` @ `56a0269d`](https://github.com/google/tpu-sync/tree/56a0269d) for bug 13.
 Bug 8 is a caller-side defect and cites
 [`vllm-project/tpu-inference` @ `c2b062b`](https://github.com/vllm-project/tpu-inference/tree/c2b062b),
 [`vllm-project/vllm` @ `5ab4e44`](https://github.com/vllm-project/vllm/tree/5ab4e44)
@@ -14,7 +15,7 @@ and [`google/tpu-sync` @ `0ac16d1`](https://github.com/google/tpu-sync/tree/0ac1
 
 These are the write-ups as filed; the permalinks and line numbers are frozen at
 the commit each names (`50b0774` for bug 1, `1fa06d1` for bug 2, `0ac16d1` for
-bugs 3–6, `449b591` for bug 7, the three pins above for bug 8, `2ed6f8f` for bug 9, `42dda542` / `f366ef52` for bug 10, `42dda542` for bugs 11–12) and are not re-pinned on upstream syncs; the only edits are the italic
+bugs 3–6, `449b591` for bug 7, the three pins above for bug 8, `2ed6f8f` for bug 9, `42dda542` / `f366ef52` for bug 10, `42dda542` for bugs 11–12, `56a0269d` for bug 13) and are not re-pinned on upstream syncs; the only edits are the italic
 *Update* sentences and one internal tooling word replaced by "with the fix".
 Status updates go in [README.md](README.md) (§Summary, §History).
 
@@ -261,7 +262,7 @@ Confirmed by a unit test. Found during Lean formalization.
 **Proposed fix**
 Drop the early `UnregisterActivePlan` in `RecordPushCompletion` (keep `finalizing_` / `status_`); `EndOp` already unregisters at settle.
 
-Reproducer: `ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6` in [`reshard_send_session_bughunt_test.cc`](reshard_send_session_bughunt_test.cc).
+Reproducer: `ReshardSendSessionBughuntTest.R6_FirstFailedPushUnregistersPlanWhileSiblingInFlightAndReopensF6` in [`reshard_send_session_bughunt_test.cc`](reshard_send_session_bughunt_test.cc). *Update 2026-11-02: fixed upstream by `1523b07d` (2026-10-30, "Move active transfer plans into TransferSession without exposing StartTransferRequest"): the plan now lives in the session and `plan()` returns it until `Done()`, `RecordPushCompletion` and `EndOp` no longer call `UnregisterActivePlan` (the early unregister is gone), `Create` no longer registers a plan or acquires the uuid's lease (acquired per pool in `ExecutePushPipeline`), and `PoolReshardPush` refuses a same-uuid retry while the prior session is live (`RetireSettledSessionLocked` → `ALREADY_EXISTS`), closing the lease-aliasing half on the manager path; see README.md §F10.*
 
 
 ---
@@ -284,7 +285,7 @@ Confirmed by a unit test. Found during Lean formalization.
 - *Mid-DMA HBM reuse (`ENABLE_MULTI_NUMA=1`).* Each sub-manager drains its own DMAs before reporting `failed_recving`, but emitting `failed_recving` on the first sub-manager breaks that guarantee across sub-managers. Because [`tpu_raiden_connector`](https://github.com/vllm-project/tpu-inference/blob/f366ef52/tpu_inference/distributed/tpu_raiden_connector.py#L657-L676) forwards `failed_recving` to vLLM to free transfer-held blocks, vLLM recycles the request's HBM blocks while sibling sub-managers still have H2D or D2H DMAs reading or writing them.
 - *Map leak and `req_id`-reuse poisoning (`ENABLE_MULTI_NUMA=0` included).* `failed_recving_set_` grows on every failed or expired transfer. If a `req_id` is reused, `failed_recving_set_.insert(req).second` ([L669](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L669)) silently drops subsequent failures, [L662-665](https://github.com/google/tpu-sync/blob/42dda542/tpu_sync/frameworks/jax/kv_cache_manager.cc#L662-L665) suppresses healthy `done_recving`, and at `num_subs >= 2` stale `done_recving_counts_` entries cause premature `done_recving` before all sub-managers finish.
 
-Reproducer: [`numa_kv_cache_manager_bughunt_test.cc`](numa_kv_cache_manager_bughunt_test.cc) (4 cases).
+Reproducer: [`numa_kv_cache_manager_bughunt_test.cc`](numa_kv_cache_manager_bughunt_test.cc) (4 cases). *Update 2026-11-02: fixed upstream by `c0e8e686` (2026-10-29, "Barrier-wait failed transfers and clean up completion state in NumaAwareKVCacheManager"): `failed_recving_set_` is replaced by `failed_recving_counts_`, a `process_completion` lambda emits nothing until `done_sending_counts_ + done_recving_counts_ + failed_recving_counts_ >= expected`, reports `failed_recving` if any sub-manager failed, and erases all four per-request maps; five rewritten or new `KVCacheManagerWrapperTest` cases cover the barrier and cleanup (`FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`, `FailureWhenAllSubManagersFailEmitsFailedRecvingOnce`, `RecvFirstThenFailureWaitsForSubManagersAndEmitsFailure`, `SendFailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`, `SingleSubManagerFailureEmitsImmediatelyAndCleansUp`; the pre-existing `VotingConsensusPromotesDone{Recving,Sending}OnlyWhenAllAgree` still hold); the former `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks` was rewritten into the first of them. This is the `NumaPolicy.settledCounts` barrier of `tpu_sync/formal_verification/TpuSyncVerify/Transfer/Caller/NumaBarrier.lean`; see README.md §F11.*
 
 
 
@@ -333,3 +334,27 @@ A pool-reshard session reports `failed_recving` only once `Done()`, i.e. after i
 Confirmed by a unit test. Found during Lean formalization.
 
 Reproducer: `PoolReshardChainBughunt1B.*` (4 cases) in [`pool_reshard_chain_bughunt_test.cc`](pool_reshard_chain_bughunt_test.cc).
+
+
+---
+
+## 13. Pool reshard receive deadlocks on per-pool host staging slots when a higher-rank pool takes the last slot before a lower-rank pool (F15)
+
+Filed 2026-11-02. Permalinks: [`google/tpu-sync` @ `56a0269d`](https://github.com/google/tpu-sync/tree/56a0269d).
+
+A pool-reshard receive with more pools than host staging slots can deadlock: later-rank pools hold every slot while an earlier-rank pool waits for one. The receive stalls until its deadline and fails with `DEADLINE_EXCEEDED`, even though all its data was on the way.
+
+Confirmed by a unit test. Found during Lean formalization.
+
+**Cause**
+- *Each pool keeps its slot until its H2D finishes.* The receiver has one staging slot per storage ([`num_host_layers()`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/reshard_receive_session.cc#L398)). A pool takes a slot when its first chunk arrives ([`GetBlockChunks`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/kv_cache_manager_base.cc#L3140) → [`AcquireStagingSlot`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/reshard_receive_session.cc#L482-L506)) and returns it only when its H2D completes ([`ExecuteEligiblePoolH2ds`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/reshard_receive_session.cc#L677-L687)).
+- *A pool's H2D waits for every earlier-rank pool.* The planner puts the first tag (FA) at rank 0 and every other tag (the state classes) at rank 1 ([`BuildPoolReshardPlan`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/reshard/pool_reshard_planner.cc#L1262)). [`CollectEligiblePoolH2dsLocked`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/reshard_receive_session.cc#L566-L595) starts a rank-1 pool's H2D only after every rank-0 pool's H2D has completed. Until then the rank-1 pool keeps its slot.
+- *Rank-1 pools can take the last slots first.* When several tags' pools share a storage, a plan has more pools than slots. A rank-1 pool's first chunk can arrive before a rank-0 pool's: each sender stages its pools in rank order ([`ReshardSendSession::ExecutePushPipeline`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/reshard_send_session.cc#L309-L320)), but it pushes them concurrently. And [`StagingLayerManager::Acquire`](https://github.com/google/tpu-sync/blob/56a0269d/tpu_sync/kv_cache/transfer_receive_session.cc#L95-L124) hands a freed slot to any waiter, rank-1 or rank-0. Once rank-1 pools hold every slot, the waiting rank-0 pool can never get one.
+
+**Impact**
+- *Transfer fails after a long stall.* The rank-0 pool's push thread blocks until the session deadline (`timeout_s_`, 120 s by default). The receive then fails with `DEADLINE_EXCEEDED: Timed out waiting for a free staging slot` and is reported in `failed_recving`. Every sender's push for the stalled pools fails, and the receiver's transport threads for those streams stay blocked for the whole time.
+- *Reach.* vllm-torchtpu's Stage-3 connector sends FA and state tags in one transfer (GLM: `mla.nope` / `mla.rope` / `dsa.idx`; Kimi: `fa` + `gdn.conv` / `gdn.ssm`). Whether it fires depends on timing; more senders, tags and layers make it likelier, and bounded receive staging (`num_staging_layers`) much likelier. Single-tag transfers are not affected.
+
+**Note:** the per-pool slots also stop pools that share storage bytes from overwriting each other's host data before their H2Ds run, so staging pools in place would not be a safe fix.
+
+Reproducer: `ReshardRecvStagingSlotRankDeadlock.*` (1 control + 1 case) in [`reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc`](reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc).
