@@ -255,8 +255,8 @@ def coverageChecks : Bool :=
     univ.all (fun b => (movedOf b.1).all (· = .kvRight)) ∧
     univ.all (fun b => b.1 != .slotFault) ∧
     count .envOrHandshake = 5 ∧
-    count .sessionCovered = 12 ∧
-    count .sessionGap = 27 ∧
+    count .sessionCovered = 18 ∧
+    count .sessionGap = 21 ∧
     count .zeroSlots = 6 ∧
     count .stagingWindow = 6 ∧
     count .unaccounted = 0 ∧

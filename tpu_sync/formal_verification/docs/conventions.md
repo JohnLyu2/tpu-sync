@@ -93,7 +93,7 @@ name their parts after their sections instead.
 ## Staying faithful to the C++
 
 **Transcribe, do not paraphrase.** The settle logic the proofs rest on
-(`FinishLocked`, `EndRecvOpLocked`, `TryBeginRecvOp`) is transcribed into small
+(`FinishLocked`, `EndRecvOpLocked`, `TryBeginOp`) is transcribed into small
 Lean functions in `Transfer/Session.lean`, and every event is composed from
 them. No event re-derives `done` or `draining` by hand.
 
@@ -211,7 +211,7 @@ the model the tests exercise. `Common/Coverage.lean` holds the machinery and
   (data arriving before a pull reply). Check first whether an "open" order is
   in fact fixed by code outside the model: the sender's D2H callback resolves
   the per-layer promise (running `SendNextLayer`'s waiter inline) before its
-  own `EndSendOp`, which the send pairing had to establish;
+  own `EndOp`, which the send pairing had to establish;
 * tests whose stimulus is not an event of the model (a synthetic call with no
   production source) listed as `notReplayable` with the reason, not paired
   with the nearest trace;

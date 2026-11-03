@@ -76,18 +76,19 @@ def survivesFull (override : Recv → Ev → Option (Option Recv)) : Bool :=
 
 | # | C++ check | Event | Mutant | Verdict |
 |---|---|---|---|---|
-| G1 | `TryBeginRecvOp`: `if (done_ \|\| draining_) return false` | `pushBegin` | accept always | **killed** — `SettleSafe`: a push admitted on a settled session gives `done ∧ inFlight > 0` (its bytes land in staging another receive may own) |
-| G2 | `ExecuteLayerH2d`, first lock: `if (done_ \|\| draining_) return` | `h2dBegin` | take the op always | **killed** — `SettleSafe`, same as G1 |
+| G1 | `TryBeginOp`: `if (done_ \|\| draining_) return false` | `pushBegin` | accept always | **killed** — `SettleSafe`: a push admitted on a settled session gives `done ∧ inFlight > 0` (its bytes land in staging another receive may own) |
+| G2 | `ExecuteLayerH2d`, first lock: `if (done_ \|\| draining_ \|\| total_blocks_ == 0) return` | `h2dBegin` | take the op always | **killed** — `SettleSafe`, same as G1 (the `total_blocks_ == 0` disjunct is A2: a receive with nothing to receive issues no copy, and is not mutated) |
 | G2′ | … the `draining_` disjunct of G2 | `h2dBegin` | check `done_` only | **survives** — an op taken on a draining session is released by the re-check (G3); the first check's `draining_` saves a lock round-trip and a log line, nothing the properties state |
 | G3 | `ExecuteLayerH2d`, second lock: `if (done_ \|\| draining_) { EndRecvOpLocked(); return; }` | `h2dIssue` | dispatch regardless | **survives** — the copy's op keeps the session unsettled until its callback, so staging and HBM stay owned; `done_` cannot hold here (`in_flight_ > 0`); the check is "a finished receive starts no copy it does not need" (the C++ comment): wasted DMA, not safety. (`h2dIssueLeak` in `Traces.lean` is the *other* half: returning without `EndRecvOpLocked()` leaks the op) |
 | G4 | H2D callback: `if (self->done_) { LOG(DFATAL); return; }` | `h2dDone` | — | **assertion**, unreachable by `NoRetiredCallback`; not mutated |
 | G5 | H2D callback, last layer: `&& !self->draining_` before `FinishLocked()` | `h2dDone` | `FinishLocked()` on the last layer regardless | **survives** — `FinishLocked` with an OK status on a draining session returns at `if (draining_) return;` with `status_` untouched; the condition gates `all_layers_done`, i.e. the duration metric and `RecordEnd`, not the lifecycle |
-| G6 | `OnBlockShardsReceived`: `if (done_ \|\| draining_) return OkStatus()` | `netAccount` | account regardless | **survives** — `RecordNetworkCompleteLocked`'s `FinishLocked()` on a draining session is a no-op; what the check prevents is counting a dead receive's blocks (`accumulated_host_block_ids_`, `RecordLastPacket`) |
+| G6 | `RecordBlockShards`: `if (done_ \|\| draining_ \|\| total_blocks_ == 0) return OkStatus()` | `netAccount` | account regardless | **survives** — `RecordNetworkCompleteLocked`'s `FinishLocked()` on a draining session is a no-op; what the check prevents is counting a dead receive's blocks (`blocks_received_per_shard_`, `RecordLastPacket`) |
 | G7 | `CompleteReadWithDetails`: `!session->IsDraining()` before the readiness poll | `pollReady` | poll regardless | **survives** — `Finish()` with an OK status on a draining session is a no-op (`ReceivePoll.lean` shows the whole poll is redundant for the lifecycle) |
-| G8 | `CompleteReadWithDetails`: `if (session->Done())` before publishing | `publish` | publish once draining | **killed** — `PublishedQuiet`: `failed_recving` reported with an H2D op still open (`h2dBegin, cancel, publish`), and `Publication`: `done_recving` reported with a callback still outstanding. The `Safe` the module had killed this mutant only through the OK half; the failed half — the engine refilling decode HBM under a copy — was stated one module up (`Pipeline.DecodeHbmSafe`) and nowhere here. `PublishedQuiet` was added, as on the sender |
-| G9 | `EndRecvOpLocked`: `draining_ &&` in the settle condition | every `EndRecvOp` | settle at `in_flight_ == 0` regardless (the mutant also marks the session draining when it settles, keeping `Consistent.done_draining`; the kill does not depend on it) | **killed** — `Publication`: a receive settles OK the moment its first push lease (or handshake op) ends, before any layer |
+| G8 | `RetireSettledSessionLocked`: `if (!recv->Done()) return false;` before publishing | `publish` | publish once draining | **killed** — `PublishedQuiet`: `failed_recving` reported with an H2D op still open (`h2dBegin, cancel, publish`), and `Publication`: `done_recving` reported with a callback still outstanding. The `Safe` the module had killed this mutant only through the OK half; the failed half — the engine refilling decode HBM under a copy — was stated one module up (`Pipeline.DecodeHbmSafe`) and nowhere here. `PublishedQuiet` was added, as on the sender |
+| G9 | `EndRecvOpLocked`: `draining_ &&` in the settle condition | every `EndOp` | settle at `in_flight_ == 0` regardless (the mutant also marks the session draining when it settles, keeping `Consistent.done_draining`; the kill does not depend on it) | **killed** — `Publication`: a receive settles OK the moment its first push lease (or handshake op) ends, before any layer |
 | G10 | `FinishLocked`: `in_flight_ == 0 &&` in the settle condition | `cancel` | settle at once | **killed** — `cancelEager` in `Traces.lean` (`SettleSafe`) |
-| G11 | `TryBeginRecvOp`'s `done_` disjunct | `pushBegin` | check `draining_` only | **equivalent** on every reachable state (`Lifecycle.beginOp'_eq`, `Session.lean` §Redundant `done_` guards); not a mutant |
+| G11 | `TryBeginOp`'s `done_` disjunct | `pushBegin` | check `draining_` only | **equivalent** on every reachable state (`Lifecycle.beginOp'_eq`, `Session.lean` §Redundant `done_` guards); not a mutant |
+| G12 | `ExecuteLayerH2d`, third lock: `!network_completed_ && !done_ && !draining_` before `network_completed_ = true` | `h2dIssue` | — | **not a mutant**: `!network_completed_` is idempotence (the flag and `RecordLastPacket` once); `!done_ && !draining_` only matters when a `Finish` lands between `h2d_futures_.push_back` and this scope, which the model folds into `h2dIssue true` (`Receive.lean` §Lock scopes) — with every layer issued, `IsReadyToComplete` is sound whether or not the flag is set (`ReadinessSound`), and a draining session's flag is read only by `CurrentPhaseLocked` |
 
 Five checks are load-bearing (G1, G2, G8, G9, and G10 from `Traces.lean`);
 five survive — against the full `Safe` too (`survivesFull`), so none is a
@@ -98,7 +99,9 @@ accounting the model does not carry. None is a redundancy the C++ should
 lose — each has a purpose — but none is needed for what is proved, which is
 what a reader of `reachable_safe` should know. The G8 `Publication` schedule is
 the poll-before-callback window of `ReceivePoll.lean`: with `Done()` dropped, the
-poll's `Finish()` would publish a receive whose callback has not run. -/
+poll's `Finish()` would publish a receive whose callback has not run. Each
+mutant differs from `step` in the one check it names and keeps the rest,
+including the `netIssued` setter of `h2dIssue`. -/
 
 def g1 : Recv → Ev → Option (Option Recv)
   | s, .pushBegin => some (some { s with life := { s.life with inFlight := s.life.inFlight + 1 },
@@ -124,7 +127,8 @@ def g3 : Recv → Ev → Option (Option Recv)
     some (if s.pending = 0 then none
       else
         let s := { s with pending := s.pending - 1 }
-        if ok then some { s with issued := s.issued + 1 }
+        if ok then some { s with issued := s.issued + 1,
+                                 netIssued := s.netIssued || decide (s.issued + 1 = s.numLayers) }
         else some { s with life := (s.life.finishLocked false).endOpLocked })
   | _, _ => none
 
@@ -145,7 +149,7 @@ def g6 : Recv → Ev → Option (Option Recv)
   | s, .netAccount =>
     some (if s.layersAccounted < s.issued then
       let s := { s with layersAccounted := s.layersAccounted + 1 }
-      if networkCompleted s ∧ s.completed = s.numLayers then
+      if s.netIssued = false ∧ s.layersAccounted = s.numLayers ∧ s.completed = s.numLayers then
         some { s with life := s.life.finishLocked true }
       else some s
     else none)
@@ -182,7 +186,8 @@ def g9 : Recv → Ev → Option (Option Recv)
       else
         let s := { s with pending := s.pending - 1 }
         if s.life.done = true ∨ s.life.draining = true then some { s with life := endOpEager s.life }
-        else if ok then some { s with issued := s.issued + 1 }
+        else if ok then some { s with issued := s.issued + 1,
+                                      netIssued := s.netIssued || decide (s.issued + 1 = s.numLayers) }
         else some { s with life := endOpEager (s.life.finishLocked false) })
   | s, .h2dDone ok => some (if s.retired < s.ready then
       let s := { s with retired := s.retired + 1 }

@@ -31,9 +31,16 @@ def tr_normal : List Ev :=
    .pushBegin, .h2dBegin, .h2dIssue true, .netAccount, .pushEnd,
    .h2dReady, .h2dReady, .h2dDone true, .h2dDone true, .publish]
 
-/-- A two-layer push receive that completes through the last H2D callback and
-is published as done. -/
+/-- `RecvLifecycleTest.TcpLastLayerThenItsBlockReportRecordLastPacketOnceAndFinishOnce`:
+a two-layer push receive — each TCP stream issues its layer's copy, reports its
+blocks and closes its lease; the last dispatch completes the network phase
+(`netIssued`) and the last block report finds it complete (`!network_completed_`
+fails in `RecordBlockShardsReceivedLocked`, so nothing is re-recorded); the
+last H2D callback finishes the receive and it is published as done. -/
 theorem trace_normal :
+    ((sysPush 2).run (tr_normal.take 8)).map
+      (fun s => (s.netIssued, s.layersAccounted, s.life.done)) = some (true, 1, false) ∧
+    ((sysPush 2).run (tr_normal.take 12)).map (fun s => s.life.done) = some false ∧
     ((sysPush 2).run tr_normal).map
       (fun s => (s.life.done, s.published, s.completed)) = some (true, some true, 2) := by
   decide
@@ -148,16 +155,17 @@ def tr_late_net_account_after_retire : List Ev :=
   [.h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true, .publish]
 
 /-- `RecvLifecycleTest.LateBlockAccountingAfterRetirementIsANoOp`: a fast H2D
-callback finishes and retires the session before `OnBlockShardsReceived` runs; the
-late `netAccount` is ignored (`KVCacheManagerWithTransfer::OnBlockShardsReceived`
-returns `OkStatus()` on `it == active_recv_sessions_.end()` once the poll has
-dropped the session, and `TransferReceiveSession::OnBlockShardsReceived` returns
-`OkStatus()` on `done_ || draining_` while it is still seated). The same copy
+callback finishes and retires the session before the block report runs; the
+late `netAccount` is ignored (`KVCacheManagerBase::OnBlockShardsReceived`
+returns `OkStatus()` on `absl::IsNotFound(session.status())` once the poll has
+dropped the session from `sessions_`, and `TransferReceiveSession::RecordBlockShards`
+returns `OkStatus()` on `done_ || draining_` while it is still seated). The same copy
 without the poll is
 `RecvLifecycleTest.SessionRemainsValidAcrossAsyncH2dCallbacksAfterCallerDropsPtr`:
-the caller drops its `shared_ptr` after `ExecuteLayerH2d`, the pending callback
-keeps the session and its staging slot alive (`hasStaging` until `h2dDone`), and
-the callback's `FinishLocked()` settles it and returns the slot. -/
+the caller drops its `shared_ptr` after `OnDataReceived` issued the copy, the
+pending callback keeps the session and its staging slot alive (`hasStaging`
+until `h2dDone`), and the callback's `FinishLocked()` settles it and returns the
+slot. -/
 theorem trace_late_net_account_after_retire :
     ((sysPush 1).run (tr_late_net_account_after_retire.take 3)).map
       (fun s => (s.life.done, s.life.hasStaging)) = some (false, true) ∧
@@ -205,8 +213,8 @@ and `DemandStagingTest.UnregisteringInFlightReceiverDefersUntilItSettles`:
 an open incoming push lease (`pushBegin`) keeps staging pinned across `cancel`
 while rejecting new pushes, and releases staging when `pushEnd` completes.
 The `cancel, pushEnd` suffix is also what a failed push itself
-does (`hooks.end_incoming_push` finishes the session with the push's status, then
-ends the op):
+does (`EndIncomingPush` in `bts.cc` runs `session->Finish(status)` for a non-OK
+push status, then `session->EndOp()`):
 `RecvLifecycleTest.FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline`. -/
 theorem trace_push_lease_pins_staging_on_cancel :
     ((sysPush 1).run (tr_push_lease_pins_staging_on_cancel.take 2)).map
@@ -310,7 +318,8 @@ def h2dIssueLeak (ok : Bool) (s : Recv) : Option Recv :=
     if s.life.done = true ∨ s.life.draining = true then
       some s
     else if ok then
-      some { s with issued := s.issued + 1 }
+      some { s with issued := s.issued + 1,
+                    netIssued := s.netIssued || decide (s.issued + 1 = s.numLayers) }
     else
       some { s with life := (s.life.finishLocked false).endOpLocked }
 
@@ -339,7 +348,7 @@ inductive Phase
 /-- `CurrentPhaseLocked`. -/
 def phase (s : Recv) : Phase :=
   if s.pullPending then .connect
-  else if s.layersAccounted = s.numLayers then .h2d
+  else if networkCompleted s then .h2d
   else .receive
 
 /-- The phase `FinishLocked` latches when `e` fails in `s` while
@@ -366,16 +375,169 @@ def tr_details_failed_upload_in_h2d : List Ev :=
   [.h2dBegin, .h2dIssue true, .h2dReady, .h2dDone false, .publish]
 
 /-- `RecvLifecycleTest.DetailsSayAFailedUploadFailedInH2dWhileDataArrives`:
-layer 0's H2D copy fails before its blocks were accounted. `CurrentPhaseLocked`
-would say `receive` (`network_completed_` is false), but the callback passes
-`kH2dPhase` (`self->FinishLocked(status_or.status(), kH2dPhase)`), so the
-failure is reported in `h2d`. -/
+layer 0's H2D copy fails before its blocks were accounted. On the test's
+one-layer receive the dispatch of that copy already set `network_completed_`
+(`dispatched_layers_.size() == base_->num_layers()`), so `CurrentPhaseLocked`
+would say `h2d` by itself; with a second layer still undispatched it would say
+`receive`, and only the callback's explicit `kH2dPhase`
+(`self->FinishLocked(status_or.status(), kH2dPhase)`) reports the failure in
+`h2d`. -/
 theorem trace_details_failed_upload_in_h2d :
     let pre := tr_details_failed_upload_in_h2d.take 3
     ((sysPush 1).run pre).map (fun s => (phase s, failedPhase s (.h2dDone false))) =
+      some (.h2d, .h2d) ∧
+    ((sysPush 2).run pre).map (fun s => (phase s, failedPhase s (.h2dDone false))) =
       some (.receive, .h2d) ∧
     ((sysPush 1).run tr_details_failed_upload_in_h2d).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
+  decide
+
+/-- The only copy's `H2dSyncDispatch` fails. -/
+def tr_failed_h2d_dispatch : List Ev := [.h2dBegin, .h2dIssue false, .publish]
+
+/-- `RecvLifecycleTest.FailedH2dDispatchFailsAndSettlesTheReceive`
+(`hooks::kTransferRecvSessionH2dDispatch`): the dispatch fails
+(`FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`), no copy is
+issued, the op it took is released and the receive settles at once in `h2d`;
+the poll reports it failed. -/
+theorem trace_failed_h2d_dispatch :
+    ((sysPush 1).run (tr_failed_h2d_dispatch.take 1)).map
+      (fun s => failedPhase s (.h2dIssue false)) = some .h2d ∧
+    ((sysPush 1).run tr_failed_h2d_dispatch).map
+      (fun s => (s.issued, s.life.done, s.life.hasStaging, s.published)) =
+      some (0, true, false, some false) := by
+  decide
+
+/-- A second `Finish(error)` on a draining receive. -/
+def tr_second_finish_noop : List Ev :=
+  [.h2dBegin, .h2dIssue true, .cancel, .cancel, .h2dReady, .h2dDone true, .publish]
+
+/-- `RecvLifecycleTest.SecondFinishOnAFailedReceiveIsANoOp`: the second
+`Finish(error)` finds `status_` already set and `draining_` already true
+(`if (!status.ok() && status_.ok())`, `if (draining_) return;`), so the state
+after it is the state before it; the copy's callback settles the receive and it
+is reported failed once. -/
+theorem trace_second_finish_noop :
+    (sysPush 1).run (tr_second_finish_noop.take 4) = (sysPush 1).run (tr_second_finish_noop.take 3) ∧
+    ((sysPush 1).run tr_second_finish_noop).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
+  decide
+
+/-- The push lease closes while the layer's copy is still running. -/
+def tr_push_lease_closes_before_copy : List Ev :=
+  [.pushBegin, .h2dBegin, .h2dIssue true, .netAccount, .pushEnd, .h2dReady, .h2dDone true, .publish]
+
+/-- `RecvLifecycleTest.PushLeaseClosingBeforeTheCopyEndsDoesNotSettle`: the
+usual order for an asynchronous copy — `EndOp` for the push lease runs while
+the copy is in flight and neither settles the receive nor returns its staging
+(`pushEnd` on a session that is not draining is a no-op on the lifecycle); the
+callback does both. -/
+theorem trace_push_lease_closes_before_copy :
+    let pre := tr_push_lease_closes_before_copy.take 5
+    ((sysPush 1).run pre).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging, s.life.inFlight)) =
+      some (false, false, true, 1) ∧
+    (sysPush 1).run (pre ++ [.publish]) = none ∧
+    ((sysPush 1).run tr_push_lease_closes_before_copy).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) := by
+  decide
+
+/-- A cancelled receive whose only copy then fails. -/
+def tr_cancelled_then_copy_fails : List Ev :=
+  [.h2dBegin, .h2dIssue true, .cancel, .h2dReady, .h2dDone false, .publish]
+
+/-- `RecvDrainTest.CancelledReceiveWhoseCopyThenFailsStaysCancelled`: the
+callback's `FinishLocked(status_or.status(), kH2dPhase)` on a draining receive
+keeps the first error (`if (!status.ok() && status_.ok())` fails) and ends the
+last op, which settles the receive; it is reported failed once. The model does
+not distinguish the two errors; `Lifecycle.finishLocked` keeps the first. -/
+theorem trace_cancelled_then_copy_fails :
+    ((sysPush 1).run (tr_cancelled_then_copy_fails.take 3)).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    ((sysPush 1).run tr_cancelled_then_copy_fails).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) ∧
+    (sysPush 1).run (tr_cancelled_then_copy_fails ++ [.publish]) = none := by
+  decide
+
+/-- Two layers completed by Peregrine posts: every layer's copy is issued inside
+its own push lease and no block report ever arrives. -/
+def tr_peregrine_layers : List Ev :=
+  [.pushBegin, .h2dBegin, .h2dIssue true, .pushEnd,
+   .pushBegin, .h2dBegin, .h2dIssue true, .pushEnd,
+   .h2dReady, .h2dDone true, .h2dReady, .h2dDone true]
+
+/-- `RecvLifecycleTest.PeregrineLayerCompletionsRecordLastPacketOnceAndFinishAfterH2d`:
+with no block report, `network_completed_` is set by the dispatch of the last
+layer (`dispatched_layers_.size() == base_->num_layers()` in `ExecuteLayerH2d`,
+`netIssued`), not before; the receive still waits for both callbacks and the
+last one finishes it. -/
+theorem trace_peregrine_layers :
+    ((sysPush 2).run (tr_peregrine_layers.take 4)).map
+      (fun s => (s.netIssued, decide (networkCompleted s))) = some (false, false) ∧
+    ((sysPush 2).run (tr_peregrine_layers.take 8)).map
+      (fun s => (s.netIssued, decide (networkCompleted s), s.layersAccounted, s.life.done)) =
+      some (true, true, 0, false) ∧
+    ((sysPush 2).run (tr_peregrine_layers.take 10)).map (fun s => s.life.done) = some false ∧
+    ((sysPush 2).run tr_peregrine_layers).map
+      (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging)) = some (true, true, false) := by
+  decide
+
+/-- Both copies finish while the last TCP stream still holds its push lease,
+before that stream reports its blocks. -/
+def tr_tcp_h2d_before_last_report : List Ev :=
+  [.pushBegin, .h2dBegin, .h2dIssue true, .netAccount, .pushEnd,
+   .pushBegin, .h2dBegin, .h2dIssue true, .h2dReady, .h2dReady, .h2dDone true, .h2dDone true,
+   .pushEnd, .publish]
+
+/-- `RecvLifecycleTest.TcpH2dFinishingBeforeLastBlockReportRecordsLastPacketAndFinishesOnce`:
+the last layer's dispatch completes the network phase (`netIssued`); both
+callbacks run under the open push lease, the last finishes the receive
+(`draining`, not `done`: `pushes = 1`); the stream's late block report is
+ignored (`RecordBlockShards` returns at `if (done_ || draining_ || ...)`, so
+`netAccount` is refused) and `EndOp` for the lease settles it. (The sibling
+`RecvLifecycleTest.TcpLastLayerThenItsBlockReportRecordLastPacketOnceAndFinishOnce`,
+where the report precedes the copies, is `tr_normal`.) -/
+theorem trace_tcp_h2d_before_last_report :
+    let pre := tr_tcp_h2d_before_last_report.take 12
+    ((sysPush 2).run pre).map
+      (fun s => (s.life.draining, s.life.done, s.layersAccounted, s.netIssued)) =
+      some (true, false, 1, true) ∧
+    (sysPush 2).run (pre ++ [.netAccount]) = none ∧
+    ((sysPush 2).run tr_tcp_h2d_before_last_report).map
+      (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) := by
+  decide
+
+/-- The producer accepts the pull; the receive later fails in `receive`. -/
+def tr_accepted_pull : List Ev := [.pullReply true, .cancel, .publish]
+
+/-- `ControlHandshakeTest.AcceptedPullAdvancesReceivePhaseAndReleasesHandshakeOp`:
+an OK reply clears `handshake_pending_` and ends the handshake op without
+touching the status; a failure after it settles the receive at once in
+`receive` rather than leaving it draining in `connect`. -/
+theorem trace_accepted_pull :
+    ((sysLoad 1).run (tr_accepted_pull.take 1)).map
+      (fun s => (s.pullPending, s.life.inFlight, s.life.draining, phase s)) =
+      some (false, 0, false, .receive) ∧
+    ((sysLoad 1).run (tr_accepted_pull.take 2)).map
+      (fun s => (s.life.done, s.life.hasStaging)) = some (true, false) ∧
+    ((sysLoad 1).run tr_accepted_pull).map (fun s => s.published) = some (some false) := by
+  decide
+
+/-- The deadline sweep fails the receive while the handshake is pending; the
+producer then accepts. -/
+def tr_accepted_pull_after_deadline : List Ev := [.cancel, .pullReply true, .publish]
+
+/-- `ControlHandshakeTest.AcceptedPullAfterDeadlineSweepSettlesExpiredReceive`:
+the sweep's `Finish(DeadlineExceeded)` lands in `connect` and leaves the
+handshake op in flight; the OK reply keeps that status (`pullReply true` only
+ends the op) and settles the receive, which is reported failed. -/
+theorem trace_accepted_pull_after_deadline :
+    ((sysLoad 1).run []).map (fun s => failedPhase s .cancel) = some .connect ∧
+    ((sysLoad 1).run (tr_accepted_pull_after_deadline.take 1)).map
+      (fun s => (s.life.draining, s.life.done, s.life.hasStaging)) = some (true, false, true) ∧
+    ((sysLoad 1).run tr_accepted_pull_after_deadline).map
+      (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging, s.published)) =
+      some (true, false, false, some false) := by
   decide
 
 /-- The producer rejects the pull (or the connection is refused). -/
@@ -438,12 +600,31 @@ def paired : List (String × Recv × List Ev) :=
    ("ControlHandshakeTest.RejectedPullReportsWhyAndWhichProducerRejectedIt", initLoad 1,
      tr_details_rejected_pull),
    ("ControlHandshakeTest.RefusedConnectionKeepsItsStatusCode", initLoad 1,
-     tr_details_rejected_pull)]
+     tr_details_rejected_pull),
+   ("RecvLifecycleTest.TcpLastLayerThenItsBlockReportRecordLastPacketOnceAndFinishOnce",
+     initPush 2, tr_normal),
+   ("RecvLifecycleTest.TcpH2dFinishingBeforeLastBlockReportRecordsLastPacketAndFinishesOnce",
+     initPush 2, tr_tcp_h2d_before_last_report),
+   ("RecvLifecycleTest.PeregrineLayerCompletionsRecordLastPacketOnceAndFinishAfterH2d",
+     initPush 2, tr_peregrine_layers),
+   ("RecvLifecycleTest.FailedH2dDispatchFailsAndSettlesTheReceive", initPush 1,
+     tr_failed_h2d_dispatch),
+   ("RecvLifecycleTest.SecondFinishOnAFailedReceiveIsANoOp", initPush 1, tr_second_finish_noop),
+   ("RecvLifecycleTest.PushLeaseClosingBeforeTheCopyEndsDoesNotSettle", initPush 1,
+     tr_push_lease_closes_before_copy),
+   ("RecvDrainTest.CancelledReceiveWhoseCopyThenFailsStaysCancelled", initPush 1,
+     tr_cancelled_then_copy_fails),
+   ("RecvLifecycleTest.EmptyBlockReportIssuesNoH2d", initPush 1, tr_one_layer),
+   ("RecvLifecycleTest.GetSessionResolvesActiveRecvAndReturnsNotFoundAfterRetirement",
+     initPush 1, tr_idle_cancel),
+   ("ControlHandshakeTest.AcceptedPullAdvancesReceivePhaseAndReleasesHandshakeOp", initLoad 1,
+     tr_accepted_pull),
+   ("ControlHandshakeTest.AcceptedPullAfterDeadlineSweepSettlesExpiredReceive", initLoad 1,
+     tr_accepted_pull_after_deadline)]
 
 /-- Traces no upstream test replays: (what it shows, initial state, trace). -/
 def modelOnly : List (String × Recv × List Ev) :=
-  [("two-layer push receive, callbacks after both pushes", initPush 2, tr_normal),
-   ("deadline during the copy of a pulled receive", initLoad 1, tr_deadline_during_copy),
+  [("deadline during the copy of a pulled receive", initLoad 1, tr_deadline_during_copy),
    ("poll finishes before the callback", initPush 1, tr_poll_before_callbacks),
    ("Finish between the two locks of ExecuteLayerH2d", initPush 1, tr_finish_between_locks)]
 

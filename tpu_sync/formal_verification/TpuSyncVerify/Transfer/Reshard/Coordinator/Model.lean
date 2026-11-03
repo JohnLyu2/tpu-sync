@@ -39,8 +39,8 @@ inductive CoordPhase where
 structure DstUnitState where
   /-- Destination unit ID (`UnitKey`). -/
   unit : Nat
-  /-- True while `ReshardReceiveSession` is registered in
-      `active_pool_reshard_recvs_` with an armed plan in `active_plans_`. -/
+  /-- True while the `ReshardReceiveSession` is in `sessions_` and not
+      `Done()` (its `plan()` resolvable through `GetSession`). -/
   sessionArmed : Bool
   /-- True while the `PoolStagingLease` acquired by `AcquireStagingLeases`
       (`ReshardReceiveSession::Create` and `ReshardReceiveSession::AcquireStagingLeases`) is held. -/

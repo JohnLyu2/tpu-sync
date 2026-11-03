@@ -19,15 +19,24 @@ namespace Send
 outcomes (ignored on a finalizing session, first error, last scheduled push,
 another push to come) appear under each event that calls it. -/
 inductive Leaf
-  /-- `ExecutePush` loop: `D2hPoolBlocks` returned a future; `++in_flight_`. -/
-  | d2hIssueOk
-  /-- `ExecutePush` loop: lease or `D2hPoolBlocks` failed →
-  `RecordPushCompletion(error)` latches `finalizing_`, `EndOp()`, return. -/
-  | d2hIssueFail
+  /-- `Start`: `ValidatePushPreconditions` failed or the pipeline thread could
+  not start → `RecordPushCompletion(error)` latches `finalizing_`, the
+  `absl::Cleanup` `EndOp()` settles. -/
+  | startFail
   /-- Same, on an already finalizing session: `RecordPushCompletion` returns at
   `if (done_ || finalizing_) return;`. -/
+  | startFailFinalizing
+  /-- `ExecutePushPipeline` loop: `D2hPoolBlocks` returned a future; `++in_flight_`. -/
+  | d2hIssueOk
+  /-- `ExecutePushPipeline` loop: staging slot, lease or `D2hPoolBlocks` failed →
+  `RecordPushCompletion(error)` latches `finalizing_`, return; the thread's
+  `EndOp()`. -/
+  | d2hIssueFail
+  /-- Same, on an already finalizing session: `RecordPushCompletion` returns at
+  `if (done_ || finalizing_) return;` (or the loop's own
+  `if (done_ || finalizing_)` re-check returned first). -/
   | d2hIssueFailFinalizing
-  /-- `ExecutePush`'s closing `EndOp()`. -/
+  /-- The pipeline thread's closing `EndOp()`. -/
   | execFinish
   /-- D2H callback with an error: `RecordPushCompletion(error)`. -/
   | d2hDoneFail
@@ -45,7 +54,7 @@ inductive Leaf
   | pushDoneLast
   /-- `AsyncPush` callback OK, more pushes to come. -/
   | pushDoneMore
-  /-- External `Finish(error)` (deadline sweep, manager teardown). -/
+  /-- External `Finish(error)` (deadline sweep, manager teardown, `UnregisterActivePlan`). -/
   | cancel
   /-- The poll published a settled session. -/
   | publish
@@ -66,6 +75,10 @@ def pushLeaf (ok : Bool) (s : Send) : Leaf :=
 
 /-- `step` with the leaf it took. -/
 def stepT (s : Send) : Ev → Option (Send × Leaf)
+  | .startFail =>
+    (s.startFail).map (·,
+      if s.life.done = true ∨ s.life.draining = true then .startFailFinalizing
+      else .startFail)
   | .d2hIssue p ok =>
     (s.d2hIssue p ok).map (·,
       if ok then .d2hIssueOk
@@ -99,22 +112,33 @@ def allBranches : Option (List Branch) :=
 
 /-! ## Traces
 
-The send tests construct a session with `ReshardSendSession::Create` on a
+Most send tests construct a session with `ReshardSendSession::Create` on a
 placeholder-hold `MakeTestBase` (whose `buffer_holds_[0].holds` is empty, so
-`CopyPoolBlocks` cannot run on it) and stand in for `ExecutePush` and
+`CopyPoolBlocks` cannot run on it) and stand in for `ExecutePushPipeline` and
 `StartPoolPush`: `ReshardSendSessionTestPeer::BeginPush` takes one push op
 (`++in_flight_`), and `CompletePush` runs `RecordPushCompletion` + `EndOp()`
 as the `AsyncPush` callback does. After `BeginPush` the session is in the state
 the model reaches by `d2hIssue 0 true, execFinish, d2hDone 0 true` on one pool
 with one peer (`afterPushStart`); the paired traces start there, so only the
-steps the test really drives are counted. -/
+steps the test really drives are counted. `StartFailsFastWithoutTransportServer`
+and `PipelineSlotWaitTimeoutSettlesSendOutOfBand` run `Start` itself and start
+from `init`. -/
 
-/-- One pool, one peer, its push in flight, `ExecutePush` done. -/
+/-- One pool, one peer, its push in flight, the pipeline thread done. -/
 def afterPushStart : Send :=
   ((sys [1]).run (tr_parity_send.take 3)).getD (init [1])
 
 example : afterPushStart.pools = [{ peers := 1, stage := .pushing 1 }] ∧
     afterPushStart.life.inFlight = 1 ∧ afterPushStart.execActive = false := by decide
+
+/-- One pool, two peers, both pushes in flight
+(`ReshardSendSessionTestPeer::AcquireStagingSlot` + `StartPoolPush` on a
+two-peer schedule). -/
+def afterTwoPeerPushStart : Send :=
+  ((sys [2]).run (tr_parity_send.take 3)).getD (init [2])
+
+example : afterTwoPeerPushStart.pools = [{ peers := 2, stage := .pushing 2 }] ∧
+    afterTwoPeerPushStart.life.inFlight = 2 := by decide
 
 /-- `(upstream test, initial state, trace)`. -/
 def paired : List (String × Send × List Ev) :=
@@ -123,18 +147,30 @@ def paired : List (String × Send × List Ev) :=
    ("ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush",
       afterPushStart, [.cancel, .pushDone 0 true]),
    ("ReshardSendSessionTest.PooledPolicyKeepsIdlePeerConnections",
-      afterPushStart, [.pushDone 0 true])]
+      afterPushStart, [.pushDone 0 true]),
+   ("ReshardSendSessionTest.StartFailsFastWithoutTransportServer",
+      init [1], tr_start_fails_fast.take 1),
+   ("ReshardSendSessionTest.PipelineSlotWaitTimeoutSettlesSendOutOfBand",
+      init [1, 1], [.d2hIssue 0 false]),
+   ("ReshardSendSessionTest.StagingSlotReleasedAfterLastPeerPush",
+      afterTwoPeerPushStart, [.pushDone 0 true, .pushDone 0 true]),
+   ("ReshardSendSessionTest.FinishAfterLastPushFinalizingPreservesOkStatus",
+      afterPushStart, tr_finish_after_last_push.take 2)]
 
 def modelOnly : List (String × Send × List Ev) :=
   [("trace_reshard_send_session_test_parity", init [1], tr_parity_send),
    ("trace_multi_pool_multi_peer_send", init [2, 1], tr_multi_pool_multi_peer_send),
-   ("trace_cancel_unregisters_on_last_endOp", init [2], tr_cancel_unregisters_on_last_endOp),
-   ("trace_early_unregister_on_error", init [1, 1], tr_early_unregister_on_error)]
+   ("trace_start_fails_fast", init [1], tr_start_fails_fast),
+   ("trace_cancel_settles_on_last_endOp", init [2], tr_cancel_settles_on_last_endOp),
+   ("trace_partial_failure_keeps_plan", init [1, 1], tr_partial_failure_keeps_plan),
+   ("trace_finish_after_last_push", afterPushStart, tr_finish_after_last_push)]
 
 /-- Upstream tests on this C++ whose stimulus is not an event of the model. -/
 def notReplayable : List (String × String) :=
   [("ReshardSendSessionTest.CreateRejectsUnknownDataConnReuseValue",
       "Create's TPU_RAIDEN_DATA_CONN_REUSE parse; no session exists"),
+   ("ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease",
+      "StagingLayerManager slot waits through the test peer, and Finish on a session whose Start never ran (in_flight_ == 0, outside A2)"),
    ("PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront",
       "Create's CountPoolReshardSendSlots == 0 rejection (validSchedule)"),
    ("PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints",
@@ -146,22 +182,28 @@ def notReplayable : List (String × String) :=
 
 Every search exhausts its state space, so `allBranches` is exact for senders
 of one pool with one or two peers and of two pools with one peer each:
-**25 branches**, and every leaf of `Leaf` is in one. (`cancel` never settles an
-idle session here: `init` already holds `ExecutePush`'s caller op, `Send` A2.)
+**26 branches**, and every leaf of `Leaf` is in one. (`cancel` never settles an
+idle session here: `init` already holds `Start`'s caller op, `Send` A2; and it
+never changes the status of a finalizing session, `Finish`'s
+`if (done_ || finalizing_) return;`.)
 
-The three upstream tests in `paired` reach **3 of 25**: `pushDoneLast`
-(drains, settles), `cancel` (drains, errors) and `pushDoneFinalizing`
-(settles). The four `modelOnly` traces add 7 more. Of the 22 the tests miss:
+The seven upstream tests in `paired` reach **7 of 26**: `pushDoneLast`
+(drains, settles), `pushDoneMore`, `cancel` (drains, errors), `cancel` (no
+effect), `pushDoneFinalizing` (settles), `startFail` (drains, settles, errors)
+and `d2hIssueFail` (drains, settles, errors). The six `modelOnly` traces add 6
+more. Of the 19 the tests miss:
 
 | Class | Count | Branches | What it would take |
 |---|---|---|---|
-| **test** | 16 | `pushDoneFail` (drains+settles+errors; drains+errors), `pushDoneLast` (drains, another op held), `pushDoneMore`, `pushDoneFinalizing` (no effect), `cancel` (no effect; errors after an OK settle), `d2hIssueOk`, `d2hIssueFail` (drains+settles+errors; drains+errors), `d2hIssueFailFinalizing` (settles; no effect), `d2hDoneStartsPushes`, `execFinish` (no effect; settles), `publish` | 7 via `ReshardSendSessionTestPeer` alone (`CompletePush` with an error status for `pushDoneFail` — `RecordPushCompletion`'s early unregister — `BeginPush` twice, a two-peer plan, a second `Finish`); 9 via `PoolReshardPush` (`ExecutePush`) on `DeviceBackedTestBase`, whose default-constructed `RaidenBufferHandle` makes `raiden::IssueD2hShard` return an empty `PjRtCopyFuture` whose `OnReady` runs `StartPoolPush` synchronously after `ExecutePush` drops `mu_` (`device_size = 0` or `host_blocks = 0` fails `D2hPoolBlocks` synchronously; when pool 0's `AsyncPush` fails synchronously — e.g. `AdapterForOp` under `TPU_RAIDEN_TRANSPORT_BACKEND=peregrine` — `RecordPushCompletion` latches `finalizing_` inline inside `ExecutePush`, reaching `execFinish` settling on 1 pool and `d2hIssueFailFinalizing` on a second `device_size = 0` pool because `ExecutePush`'s loop does not re-check `finalizing_`) |
+| **test** | 13 | `pushDoneFail` (drains+settles+errors; drains+errors), `pushDoneLast` (drains, another op held), `pushDoneFinalizing` (no effect), `startFailFinalizing` (settles), `d2hIssueFail` (drains+errors), `d2hIssueFailFinalizing` (settles; no effect), `d2hIssueOk`, `d2hDoneStartsPushes`, `execFinish` (no effect; settles), `publish` | 5 via `ReshardSendSessionTestPeer` alone (`CompletePush` with an error status for `pushDoneFail`, `BeginPush` twice, `Finish` before `Start`); 8 via `PoolReshardPush` (`Start`) on `DeviceBackedTestBase` with a minimal `RawBuffer` test subclass seated via `RaidenBufferHandle::AcquireFromRaw` (`CopyPoolBlocks` queries `GetOnDeviceSizeInBytes()` before `IssueD2hShard`, so a default-constructed handle with `c_hold == nullptr` cannot execute a non-empty copy): returning an immediately-ready `xla::Future<>` from `CopyRawDeviceToHost` makes `OnReady` run `StartPoolPush` synchronously on the pipeline thread (`host_blocks = 0` or a `RawBuffer` device-size `0` fails `D2hPoolBlocks` synchronously; when pool 0's `AsyncPush` fails synchronously — e.g. `AdapterForOp` under `TPU_RAIDEN_TRANSPORT_BACKEND=peregrine` — `RecordPushCompletion` latches `finalizing_` inline inside `ExecutePushPipeline`, reaching `execFinish` settling on 1 pool and `d2hIssueFailFinalizing` on a second pool through the loop's `if (done_ \|\| finalizing_)` re-check) |
 | **future (stub)** | 6 | `d2hDoneFail` (drains+settles+errors; drains+errors), `d2hDoneFailFinalizing` (no effect; settles), `d2hDoneQuiesced` (no effect; settles) | a controllable `PjRtCopyFuture` fake (a `RawBuffer` / `PJRT_RawBuffer_Extension` test stub backed by `xla::Promise<>`) so an issued D2H copy can stay pending across `Finish` or resolve `OnReady` with an error on CPU |
 
-So no upstream test exercises `ExecutePush`, `StartPoolPush`, a D2H callback,
-or a failed push: `ReshardSendSessionTest` uses `MakeTestBase` +
+So no upstream test exercises a successful D2H issue, a D2H callback, or a
+failed push: `ReshardSendSessionTest` uses `MakeTestBase` +
 `AttachPlaceholderDeviceHoldForTest` (which leaves `buffer_holds_[0].holds`
-empty and drives `ReshardSendSessionTestPeer` instead of `DeviceBackedTestBase`),
+empty and drives `ReshardSendSessionTestPeer`, while `DeviceBackedTestBase` in
+`kv_cache_manager_with_transfer_pool_reshard_test.cc` leaves `c_hold == nullptr`
+without a `RawBuffer` test subclass),
 and `CompletePush` is called only with `OkStatus()` (`docs/transfer/reshard.md`
 §"C++ branch coverage of the anchored spans"). -/
 
@@ -181,10 +223,10 @@ inductive Gap where
 /-- The table above, as the `#guard` checks it. -/
 def gaps : List (Branch × Gap) :=
   [(br .pushDoneFail true true true, .test), (br .pushDoneFail true false true, .test),
-   (br .pushDoneLast true false false, .test), (br .pushDoneMore false false false, .test),
    (br .pushDoneFinalizing false false false, .test),
-   (br .cancel false false false, .test), (br .cancel false false true, .test),
-   (br .d2hIssueFail true true true, .test), (br .d2hIssueFail true false true, .test),
+   (br .pushDoneLast true false false, .test),
+   (br .startFailFinalizing false true false, .test),
+   (br .d2hIssueFail true false true, .test),
    (br .d2hIssueFailFinalizing false true false, .test),
    (br .d2hIssueFailFinalizing false false false, .test),
    (br .d2hIssueOk false false false, .test),
@@ -198,25 +240,25 @@ def gaps : List (Branch × Gap) :=
    (br .d2hDoneQuiesced false true false, .futureStub)]
 
 def allLeaves : List Leaf :=
-  [.d2hIssueOk, .d2hIssueFail, .d2hIssueFailFinalizing, .execFinish, .d2hDoneFail,
-   .d2hDoneFailFinalizing, .d2hDoneQuiesced, .d2hDoneStartsPushes, .pushDoneFail,
-   .pushDoneFinalizing, .pushDoneLast, .pushDoneMore, .cancel, .publish]
+  [.startFail, .startFailFinalizing, .d2hIssueOk, .d2hIssueFail, .d2hIssueFailFinalizing,
+   .execFinish, .d2hDoneFail, .d2hDoneFailFinalizing, .d2hDoneQuiesced, .d2hDoneStartsPushes,
+   .pushDoneFail, .pushDoneFinalizing, .pushDoneLast, .pushDoneMore, .cancel, .publish]
 
 def countGap (g : Gap) : Nat := (gaps.filter (·.2 = g)).length
 
-/-- One search, every check: the state space is exhausted; 25 branches; 3
-reached by paired traces, 10 with `modelOnly` (all within the universe, every
-trace running to completion); the uncovered set is the table (16 test, 6
+/-- One search, every check: the state space is exhausted; 26 branches; 7
+reached by paired traces, 13 with `modelOnly` (all within the universe, every
+trace running to completion); the uncovered set is the table (13 test, 6
 future-stub); every leaf fires; every gap has a witness schedule. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
   | some univ =>
     let uncoveredPaired := univ.filter (fun b => !coveredByPaired.contains b)
-    univ.length = 25 ∧ coveredByPaired.length = 3 ∧ coveredByAll.length = 10 ∧
+    univ.length = 26 ∧ coveredByPaired.length = 7 ∧ coveredByAll.length = 13 ∧
     coveredByPaired.all univ.contains ∧ coveredByAll.all univ.contains ∧
-    sameSet uncoveredPaired (gaps.map Prod.fst) ∧ gaps.length = 22 ∧
-    countGap .test = 16 ∧ countGap .futureStub = 6 ∧
+    sameSet uncoveredPaired (gaps.map Prod.fst) ∧ gaps.length = 19 ∧
+    countGap .test = 13 ∧ countGap .futureStub = 6 ∧
     allLeaves.all (fun l => univ.any (·.1 = l)) ∧
     (paired ++ modelOnly).all (fun (_, s, tr) =>
       ((⟨s, step⟩ : System Send Ev).run tr).isSome) ∧

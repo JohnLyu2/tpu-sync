@@ -151,9 +151,9 @@ structure ChainProgress where
   planUuids : List Nat := []
   deriving DecidableEq, Repr, Hashable
 
-/-- One session in `active_pool_reshard_recvs_` / `active_pool_reshard_sends_`
-for `req_id`, with its `sub_plan_index()` / `sub_plan_count()` and, once
-`Done()`, the status it settled with. -/
+/-- One `ReshardReceiveSession` / `ReshardSendSession` in `sessions_` for
+`req_id`, with its `sub_plan_index()` / `sub_plan_count()` and, once `Done()`,
+the status it settled with. -/
 structure SubSession where
   uuid : Nat
   index : Nat
@@ -174,7 +174,7 @@ structure WorkerState where
   doneLog : List (Nat × List Nat) := []
   /-- Ghost: UUIDs this worker has registered for `req_id` (A2). -/
   seenUuids : List Nat := []
-  /-- `active_pool_reshard_*` entries for `req_id`, in registration order. -/
+  /-- Reshard `sessions_` entries for `req_id`, in registration order. -/
   active : List SubSession := []
   chain : ChainProgress := {}
   deriving DecidableEq, Repr, Hashable

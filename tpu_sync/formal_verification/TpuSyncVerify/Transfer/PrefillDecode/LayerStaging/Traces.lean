@@ -47,7 +47,11 @@ def recvIssueH2d (l : Nat) : List Ev :=
 
 def recvFinishH2d (l : Nat) : List Ev := [.h2dReady l, .h2dDone l true]
 
-/-! ## Paired GTest replay traces (`send_drain_test.cc`) -/
+/-! ## Paired GTest replay traces (`send_drain_test.cc`)
+
+All four tests build their manager with `num_staging_layers = 4`
+(`kNumStagingLayers`) so that `base->num_host_layers() == 4` on a 64- or
+16-layer cache. -/
 
 /-- `SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` (`sys 4 2 2`). -/
 def traceSendCyclesEvs : List Ev :=
@@ -109,7 +113,12 @@ theorem trace_recv_fail_h2d_with_waiter :
       (s.recvMgr.numFree, s.pipe.recv.life.hasStaging, s.pipe.recv.published)) =
       some (2, false, some false) := by decide
 
-/-- `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 2 (`uuid = 202`). -/
+/-- `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 2 (`uuid = 202`).
+The test drives the push lease directly: `GetSession(202)` + `TryBeginOp()`
+(`recvPushBegin`), `GetBlockChunks` (the `recvAcquire*` steps), `FailRecv`
+(`recvCancel`), then `EndOp()` (`recvPushEnd`), after which the session is
+`Done()` with the injected `kUnavailable` status and every host layer buffer
+is back (`manager2.num_free() == kNumStagingLayers`). -/
 def traceRecvFailPushAbortEvs : List Ev :=
   [.beginPull, .recvPullReply true, .recvPushBegin] ++ recvAcquireOk 0 ++ [.recvCancel, .recvPushEnd, .recvPublish]
 

@@ -171,12 +171,12 @@ miss partition as:
   end-to-end (`examples/single_host_disagg/run_all.sh`) does, and
   `MultiRequest.lean` models it (`MultiRequestCoverage.lean`: no test
   reaches either recycle).
-* **covered at session level** (18: 10 `Send`, 8 `Recv`): the session branch
+* **covered at session level** (24: 12 `Send`, 12 `Recv`): the session branch
   inside the pipeline branch is reached by a session unit test
   (`Send.coveredByPaired` / `Recv.coveredByPaired`). The pipeline adds no C++
   to them — a failed copy, a cancelled receive — only the memory effect, which
   the session tests cannot observe.
-* **in the session gap tables** (28: 11 `Send`, 17 `Recv`): `Send.expectedUncovered`
+* **in the session gap tables** (22: 9 `Send`, 13 `Recv`): `Send.expectedUncovered`
   / `Recv.expectedUncovered`, classified there. (The four `pullReplyFail` rows
   also clear the pipeline's `pullWaiting`, `HandlePullStream`'s grace wait —
   control-plane code the session tables do not see; the C++ is the same
@@ -226,7 +226,7 @@ def movedOf : Leaf → Option Moved
 /-- One search, every check: exhausted; 74 branches; 25 reached by the paired
 traces within the universe (28 along them, the other 3 two-layer), 30 with
 `modelOnly`; every move is `kvRight`; the gaps partition into 3 environment,
-18 session-covered, 28 session-gap, none unaccounted; every paired trace runs
+24 session-covered, 22 session-gap, none unaccounted; every paired trace runs
 to its end; the `dispatchEarly` mutant moves junk into decode HBM (the mutant
 system borrows `stepT`'s tag where the original step is also enabled, which
 it is at that point; elsewhere the tag is a placeholder). -/
@@ -239,7 +239,7 @@ def coverageChecks : Bool :=
     univ.length = 74 ∧ (univ.filter coveredByPaired.contains).length = 25 ∧
     coveredByPaired.length = 28 ∧ (univ.filter coveredByAll.contains).length = 30 ∧
     univ.all (fun b => (movedOf b.1).all (· = .kvRight)) ∧
-    count .env = 3 ∧ count .sessionCovered = 18 ∧ count .sessionGap = 28 ∧
+    count .env = 3 ∧ count .sessionCovered = 24 ∧ count .sessionGap = 22 ∧
     count .unaccounted = 0 ∧
     paired.all (fun (_, s, tr) => ((⟨s, step⟩ : System Pipeline Ev).run tr).isSome) ∧
     (Coverage.witnessP { instr with stepT := fun s e =>

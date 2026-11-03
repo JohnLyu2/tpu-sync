@@ -191,14 +191,14 @@ def clobbersOf : Leaf → Bool
 
 /-! ## Result
 
-The search exhausts the one-pool state space (armed and unarmed): **59
+The search exhausts the one-pool state space (armed and unarmed): **60
 branches**. Every memory move is `kvRight` — the D2H copy, the push, the
 landing and the H2D copy only ever move the right pool's KV
 (`PublicationCorrect` read off the branch set) — and no H2D completion
 clobbers KV in a higher-rank slot (`clobbersKv = false`, `AliasedPageCorrect`).
 
 No upstream test runs a reshard transfer end to end on CPU, so `paired` is
-empty and all 59 are gaps; the two `modelOnly` traces reach 17 of them (20
+empty and all 60 are gaps; the two `modelOnly` traces reach 17 of them (20
 along the traces, three outside the one-pool universe). They partition as:
 
 * **environment** (3): `reclaim`, `reseatSrcStaging`, `reseatDstStaging` — the
@@ -210,11 +210,12 @@ along the traces, three outside the one-pool universe). They partition as:
 * **transport** (1): `landStream` — `CompleteIncomingPush` counting a stream
   against `expected_pushes`; the block-transport unit tests drive that
   accounting without a reshard session.
-* **covered at session level** (8: 4 `Send`, 4 `Recv`): the session branch
-  inside is reached by a session unit test (the push callbacks, `cancel`,
-  `pushBegin`, a failed push lease, `publish`); the pipeline adds only the
-  memory effect, which those tests cannot observe.
-* **in the session gap tables** (46: 20 `Send`, 26 `Recv`): `Send.gaps` /
+* **covered at session level** (11: 7 `Send`, 4 `Recv`): the session branch
+  inside is reached by a session unit test (the push callbacks, `cancel`, a
+  failed `Start`, a failed pipeline step, `pushBegin`, a failed push lease,
+  `publish`); the pipeline adds only the memory effect, which those tests
+  cannot observe.
+* **in the session gap tables** (44: 18 `Send`, 26 `Recv`): `Send.gaps` /
   `Recv.gaps`, classified there (`test`, `futureStub`, `window`).
 
 Nothing falls between the tables (`unaccounted = 0`).
@@ -227,21 +228,21 @@ no KV clobbered. The rank-blind mutant of `Traces.lean` (`stepRankBlind`)
 reaches `clobbersKv = true` in 17 steps from the same state
 (`Coverage.witnessP`). -/
 
-/-- One search, every check: exhausted; 59 branches; none paired; 17 reached by
+/-- One search, every check: exhausted; 60 branches; none paired; 17 reached by
 `modelOnly` within the universe; every move is `kvRight`; no KV clobbered; the
-gaps partition into 3 environment, 1 coordinator, 1 transport, 8
-session-covered, 46 session-gap, none unaccounted. -/
+gaps partition into 3 environment, 1 coordinator, 1 transport, 11
+session-covered, 44 session-gap, none unaccounted. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
   | some univ =>
     let count (c : GapClass) := (univ.filter (gapClass · = c)).length
-    univ.length = 59 ∧ coveredByPaired.length = 0 ∧
+    univ.length = 60 ∧ coveredByPaired.length = 0 ∧
     (univ.filter coveredByAll.contains).length = 17 ∧ coveredByAll.length = 20 ∧
     univ.all (fun b => (movedOf b.1).all (· = .kvRight)) ∧
     univ.all (fun b => !clobbersOf b.1) ∧
     count .env = 3 ∧ count .coordinator = 1 ∧ count .transport = 1 ∧
-    count .sessionCovered = 8 ∧ count .sessionGap = 46 ∧ count .unaccounted = 0 ∧
+    count .sessionCovered = 11 ∧ count .sessionGap = 44 ∧ count .unaccounted = 0 ∧
     modelOnly.all (fun (_, s, tr) => ((⟨s, step⟩ : System Pipeline Ev).run tr).isSome)
 
 #guard coverageChecks

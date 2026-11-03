@@ -32,7 +32,7 @@ def DstHbmSafe (s : Pipeline) : Prop :=
   s.recv.published ≠ none → Recv.poolOps s.recv.pools = 0
 
 /-- Once the sender is published (`done_sending_` or `failed_recving_`) or source
-HBM is reclaimed, neither `ExecutePush` nor any D2H/push op is active. -/
+HBM is reclaimed, neither the pipeline thread nor any D2H/push op is active. -/
 def SrcHbmSafe (s : Pipeline) : Prop :=
   (s.send.published ≠ none →
     s.send.execActive = false ∧ Send.poolOps s.send.pools = 0) ∧
@@ -291,7 +291,7 @@ theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
     cases hb : s.recv.published with
     | none => exact absurd hb hpub
     | some b =>
-      have ⟨hd, _⟩ := h.recvInv.published_done b hb
+      have hd := h.recvInv.published_done b hb
       exact hrecvSafe.2.1 hd
   · -- SrcHbmSafe
     refine ⟨?_, ?_⟩
@@ -370,6 +370,10 @@ theorem send_step_published_ne_none {r r' : Send} {e : Send.Ev}
     (hs : Send.step r e = some r') (hpub : r.published ≠ none) :
     r'.published ≠ none := by
   cases e with
+  | startFail =>
+    simp only [Send.step, Send.startFail] at hs
+    split at hs <;> try cases hs
+    simpa using hpub
   | d2hIssue p ok =>
     simp only [Send.step, Send.d2hIssue] at hs
     split at hs <;> try cases hs
@@ -404,6 +408,10 @@ theorem send_step_done_mono {r r' : Send} {e : Send.Ev}
     (hs : Send.step r e = some r') (hd : r.life.done = true) :
     r'.life.done = true := by
   cases e with
+  | startFail =>
+    simp only [Send.step, Send.startFail] at hs
+    split at hs <;> try cases hs
+    exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono false _ hd)
   | d2hIssue p ok =>
     simp only [Send.step, Send.d2hIssue] at hs
     split at hs <;> try cases hs
@@ -432,7 +440,7 @@ theorem send_step_done_mono {r r' : Send} {e : Send.Ev}
     exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono ok _ hd)
   | cancel =>
     simp only [Send.step, Send.cancel, Option.some.injEq] at hs
-    subst hs; exact Lifecycle.finishLocked_done_mono false hd
+    subst hs; exact Lifecycle.finishOnceLocked_done_mono false hd
   | publish =>
     simp only [Send.step, Send.publish] at hs
     split at hs <;> try cases hs
@@ -551,10 +559,6 @@ theorem recv_step_pools_length {pol : PushEndPolicy} {r r' : Recv} {e : Recv.Ev}
       · split at hs
         · cases hs; simp
         · split at hs <;> { cases hs; simp }
-  | pollReady =>
-    simp only [Recv.step, Recv.pollReady] at hs
-    split at hs <;> try cases hs
-    rfl
   | cancel =>
     simp only [Recv.step, Recv.cancel, Option.some.injEq] at hs
     subst hs; rfl
@@ -575,7 +579,6 @@ theorem recv_step_done_mono {pol : PushEndPolicy} {r r' : Recv} {e : Recv.Ev}
   | pushEnd ok =>
     simp only [Recv.step, Recv.pushEnd] at hs
     split at hs <;> try cases hs
-    simp only [Recv.maybeUnregisterSettled_life]
     apply Lifecycle.endOpLocked_done_mono
     split <;> simp [hd, Lifecycle.finishLocked_done_mono]
   | onPoolReceived p =>
@@ -601,10 +604,6 @@ theorem recv_step_done_mono {pol : PushEndPolicy} {r r' : Recv} {e : Recv.Ev}
     split at hs <;> try cases hs
     split at hs <;> try cases hs
     simp [Lifecycle.endOpLocked_done_mono hd]
-  | pollReady =>
-    simp only [Recv.step, Recv.pollReady] at hs
-    split at hs <;> try cases hs
-    exact Lifecycle.finishLocked_done_mono true hd
   | cancel =>
     simp only [Recv.step, Recv.cancel, Option.some.injEq] at hs
     subst hs; exact Lifecycle.finishLocked_done_mono false hd

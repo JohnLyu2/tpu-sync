@@ -31,9 +31,9 @@ namespace Recv
 /-- One leaf of `step`'s decision tree per event. Names follow the C++ path
 they stand for; the docstring of the event's `def` in `Model.lean` quotes it. -/
 inductive Leaf
-  /-- `TryBeginRecvOp` accepted a push. -/
+  /-- `TryBeginOp` accepted a push. -/
   | pushBegin
-  /-- `EndRecvOp` for a push. -/
+  /-- `EndOp` for a push. -/
   | pushEnd
   /-- `on_response` with an OK pull status. -/
   | pullReplyOk
@@ -60,9 +60,10 @@ inductive Leaf
   | h2dDoneLastDraining
   /-- Callback with an error: `FinishLocked(status, kH2dPhase)`. -/
   | h2dDoneFail
-  /-- `OnBlockShardsReceived` accounted a layer; more to come or copies pending. -/
+  /-- `RecordBlockShards` accounted a layer; more to come, copies pending, or
+  the network phase already completed by a dispatch. -/
   | netAccountPartial
-  /-- `OnBlockShardsReceived` completed the network side with every layer
+  /-- `RecordBlockShards` completed the network side with every layer
   copied: `RecordNetworkCompleteLocked` → `FinishLocked()`. -/
   | netAccountCompletes
   /-- The poll saw `IsReadyToComplete` and called `Finish()`. -/
@@ -101,7 +102,7 @@ def stepT (s : Recv) : Ev → Option (Recv × Leaf)
       else .h2dDoneFail)
   | .netAccount =>
     (s.netAccount).map (·,
-      if s.layersAccounted + 1 = s.numLayers ∧ s.completed = s.numLayers
+      if s.netIssued = false ∧ s.layersAccounted + 1 = s.numLayers ∧ s.completed = s.numLayers
       then .netAccountCompletes else .netAccountPartial)
   | .pollReady => (s.pollReady).map (·, .pollReady)
   | .cancel => (s.cancel).map (·, .cancel)
@@ -132,29 +133,28 @@ Two leaves of `Leaf` are in no reachable branch:
   `NoRetiredCallback` (`done → retired = issued`). The C++ `LOG(DFATAL)` is an
   assertion.
 * `netAccountCompletes` — `RecordNetworkCompleteLocked`'s `FinishLocked()`
-  arm, taken when the network completes after every layer was copied. The
-  callback that copies the last layer calls `FinishLocked()` itself unless
-  `draining_`, and `OnBlockShardsReceived` returns at `if (done_ || draining_)`
-  once it has; so by the time the network side could complete with
+  arm, taken when a block report completes the network side after every layer
+  was copied. The callback that copies the last layer calls `FinishLocked()`
+  itself unless `draining_`, and `RecordBlockShards` returns at
+  `if (done_ || draining_ || total_blocks_ == 0)` once it has; so by the time
+  the network side could complete with
   `num_completed_layers_ == total_layers`, the session is always draining. The
   arm is dead in the C++ for the same reason (`num_completed_layers_` is
   incremented nowhere else; at `total_layers == 0` the per-shard target is `0`,
   so with `num_shards() ≥ 1` no shard ever newly completes — a base with zero
-  shards and zero layers would reach it, and nothing constructs one).
+  shards and zero layers would reach it, and nothing constructs one). The
+  dispatch setter of `network_completed_` (`netIssued`) only narrows the arm
+  further: a report arriving after the last dispatch finds `!network_completed_`
+  false and never reaches `RecordNetworkCompleteLocked`.
 
-The 21 upstream tests in `paired` (13 named traces) reach **18 of 37**; the
-four `modelOnly` traces add 4 more. The 19 the tests miss, each with the
+The 32 upstream tests in `paired` (22 named traces) reach **24 of 37**; the
+three `modelOnly` traces add 2 more. The 13 the tests miss, each with the
 shortest schedule that reaches it (`Coverage.witness`) and what it would take:
 
 | Branch | Shortest schedule | Class |
 |---|---|---|
-| `h2dIssueFail` drains settles errors | push 1: `h2dBegin, h2dIssue false` | **test**: no upstream test fails `H2dSyncDispatch`; `RecvTestManager::RecvBase::H2dSyncDispatch` could be made to return an error, or `hooks::kTransferRecvSessionH2dDispatch` |
-| `h2dIssueFail` drains errors | push 1: `h2dBegin, pushBegin, h2dIssue false` | **test**: same, with a push lease open (`BeginIncomingPush`) |
-| `cancel` (no effect) | push 1: `cancel, cancel` | **test**: second `Finish(error)` on a failed session (`FailRecv` twice); reached unasserted at teardown of `IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining`, whose settled session `~KVCacheManagerWithTransfer` still `Finish(CancelledError)`es |
+| `h2dIssueFail` drains errors | push 1: `h2dBegin, pushBegin, h2dIssue false` | **test**: a failed `H2dSyncDispatch` (`hooks::kTransferRecvSessionH2dDispatch`, as in `FailedH2dDispatchFailsAndSettlesTheReceive`) with a push lease open (`BeginIncomingPush`) |
 | `cancel` errors | push 1: `h2dBegin, h2dIssue true, h2dReady, h2dDone true, cancel` | **test**: `Finish(error)` after the session settled OK flips `status_` (§"Late errors" in `Receive.lean`); `FailRecv` after `FinishCopy(ok)` and before the poll reaches it directly, production only through the sweep's and `UnregisterActivePlan`'s check-then-`Finish` |
-| `pushEnd` (no effect) | push 1: `pushBegin, pushEnd` | **test**: a push lease that closes while the receive continues (`tr_normal`; the four lease tests all close theirs on a draining session) |
-| `pullReplyOk` (no effect) | load 1: `pullReply true` | **test (stub)**: no consumer-side unit test completes a handshake — `RegisteredPullIsAcknowledged` is producer-side, and the control-plane tests' producers hold, drop or reject; needs a producer stub that answers (`tr_deadline_during_copy`, end-to-end tests) |
-| `pullReplyOk` settles | load 1: `cancel, pullReply true` | **test (stub)**: deadline during the handshake, then the producer accepts (`ExpiredReceiveKeepsStagingUntilHandshakeEnds` drops the client; `SilentProducer` cannot answer) |
 | `pullReplyFail` drains errors | load 1: `h2dBegin, pullReply false` | **ordering**: a layer dispatched before the pull reply arrives, then the reply fails |
 | `pullReplyFail` settles errors | load 1: `h2dBegin, h2dIssue true, h2dReady, h2dDone true, pullReply false` | **ordering**: every layer copied before the reply arrives, then it fails: the complete receive is published failed |
 | `pullReplyFail` errors | load 1: `h2dBegin, h2dIssue true, netAccount, h2dReady, pollReady, pullReply false` | **ordering** + window: the poll finishes the receive before the reply arrives, then it fails |
@@ -163,8 +163,7 @@ shortest schedule that reaches it (`Coverage.witness`) and what it would take:
 | `h2dIssueReleased` (no effect) | push 1: `h2dBegin, pushBegin, cancel, h2dIssue true` | **window**: same, with a push lease open |
 | `pollReady` drains | push 1: `h2dBegin, h2dIssue true, netAccount, h2dReady, pollReady` | **window**: the poll between a future's readiness and its callback (`tr_poll_before_callbacks`, `ReceivePoll.lean`); no harness point sits between `FinishCopy` making the future ready and the callback it runs |
 | `h2dDoneFail` settles errors | push 1: `h2dBegin, h2dIssue true, netAccount, h2dReady, pollReady, h2dDone false` | **window**: poll first, then the callback fails |
-| `h2dDoneFail` settles | push 1: `h2dBegin, h2dIssue true, cancel, h2dReady, h2dDone false` | **test**: cancelled receive whose only copy then fails (`ExpiredReceiveKeepsStagingUntilH2dEnds` completes it OK) |
-| `h2dDoneFail` (no effect) | push 1: `h2dBegin, h2dIssue true, pushBegin, cancel, h2dReady, h2dDone false` | **test**: same, with a push lease open |
+| `h2dDoneFail` (no effect) | push 1: `h2dBegin, h2dIssue true, pushBegin, cancel, h2dReady, h2dDone false` | **test**: `CancelledReceiveWhoseCopyThenFailsStaysCancelled` with a push lease open |
 | `h2dDoneFail` errors | push 1: `h2dBegin, h2dIssue true, h2dReady, pushBegin, netAccount, pollReady, h2dDone false` | **window**: poll first, callback fails, push lease open |
 | `h2dDoneLastDraining` (no effect) | push 1: `h2dBegin, h2dIssue true, pushBegin, cancel, h2dReady, h2dDone true` | **test**: cancelled receive whose last copy completes OK while a push lease is open (`ExpiredReceiveKeepsStagingUntilH2dEnds` without the lease) |
 
@@ -175,17 +174,34 @@ data connections while the reply comes back on the control path, so the model
 leaves the two unordered. What is not in this model is whether a reply can
 *fail* after its data landed (a control-path deadline or reset); if it can,
 the complete receive is published as failed. **window** branches (5) need an
-interleaving the test harness has no hook for. **test** branches (10) are
-schedules `RecvTestManager` can drive today (8), or could with a control-plane
-producer stub that answers on command (2).
+interleaving the test harness has no hook for. **test** branches (4) are
+schedules `RecvTestManager` can drive today, each a replayed test plus an open
+push lease or a late `FailRecv`.
 
-Two receive-lifecycle tests are not replayable in this full-mirror session
-model because their stimulus is bounded host-layer slot cycling:
-`RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` and
-`RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes`
-run under `TPU_RAIDEN_NUM_STAGING_LAYERS` and exercise the host layer buffer
-leases of `TransferReceiveSession::AcquireStagingSlot`; both are modelled and
-replayed in `PrefillDecode/LayerStaging.lean` (`LayerStaging/Traces.lean`). -/
+Not replayable in this model, and why:
+
+* `RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` and
+  `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes`
+  drive bounded host layer slot cycling (`num_staging_layers` below
+  `num_layers`) through `TransferReceiveSession::AcquireStagingSlot`; the
+  session model is the full host mirror. Both are modelled and replayed in
+  `PrefillDecode/LayerStaging.lean` (`LayerStaging/Traces.lean`).
+* `RecvLifecycleTest.RedeliveredLayerDoesNotCompleteNetworkPhase` delivers the
+  same layer twice, which A1 excludes (the model counts dispatches, not distinct
+  layers; the C++ issues a copy for the duplicate and `dispatched_layers_`, a
+  set, keeps the network phase open).
+* `RecvLifecycleTest.RedeliveredStartReadLeavesAReadyReceiveToCompleteRead` and
+  `RecvLifecycleTest.RegisterRecvFinishesAReadyIncumbentBeforeReplacingIt`
+  report every block before any layer's copy is issued, which A4 excludes
+  (`netAccount` needs `layersAccounted < issued`); they are about the uuid
+  table (`UuidTable.lean`).
+* `RecvLifecycleTest.FirstAdmittedPushRecordsFirstPacketOnce`,
+  `RecvLifecycleTest.AdmissionRejectedByDoneSessionRecordsNoFirstPacket` and
+  `RecvLifecycleTest.AdmissionRejectedByDrainingSessionRecordsNoFirstPacket`
+  assert on `RecordFirstPacket`, which the model does not carry; the first also
+  reports a partial layer (one of two blocks), which the per-layer `netAccount`
+  cannot express. Their lifecycle content is `pushBegin, pushEnd` and the
+  refusals `trace_no_push_after_finish` shows. -/
 
 /-- `(leaf, drains, settles, errors)`. -/
 def br (l : Leaf) (drains settles errors : Bool) : Branch := (l, ⟨drains, settles, errors⟩)
@@ -197,15 +213,13 @@ def coveredByAll : List Branch :=
 
 /-- The table above, as the `#guard`s check it. -/
 def expectedUncovered : List Branch :=
-  [br .h2dIssueFail true true true, br .h2dIssueFail true false true,
-   br .cancel false false false, br .cancel false false true,
-   br .pushEnd false false false,
-   br .pullReplyOk false false false, br .pullReplyOk false true false,
+  [br .h2dIssueFail true false true,
+   br .cancel false false true,
    br .pullReplyFail true false true, br .pullReplyFail false true true,
    br .pullReplyFail false false true, br .pullReplyFail false false false,
    br .h2dIssueReleased false true false, br .h2dIssueReleased false false false,
    br .pollReady true false false,
-   br .h2dDoneFail false true true, br .h2dDoneFail false true false,
+   br .h2dDoneFail false true true,
    br .h2dDoneFail false false false, br .h2dDoneFail false false true,
    br .h2dDoneLastDraining false false false]
 
@@ -218,8 +232,8 @@ def liveLeaves : List Leaf :=
    .h2dDoneFail, .netAccountPartial, .pollReady, .cancel, .publish]
 
 /-- One search, every check (a `#guard` per line would redo the search each
-time): the state space is exhausted; 37 branches; 18 reached by paired
-traces, 22 with `modelOnly`; the uncovered set is the table; the two
+time): the state space is exhausted; 37 branches; 24 reached by paired
+traces, 26 with `modelOnly`; the uncovered set is the table; the two
 unreachable leaves never fire and every other leaf does; every table row has a
 witness schedule. -/
 def coverageChecks : Bool :=
@@ -228,11 +242,10 @@ def coverageChecks : Bool :=
   | some univ =>
     let uncoveredPaired := univ.filter (fun b => !coveredByPaired.contains b)
     let uncoveredAll := univ.filter (fun b => !coveredByAll.contains b)
-    univ.length = 37 ∧ coveredByPaired.length = 18 ∧ coveredByAll.length = 22 ∧
+    univ.length = 37 ∧ coveredByPaired.length = 24 ∧ coveredByAll.length = 26 ∧
     sameSet uncoveredPaired expectedUncovered ∧
     sameSet uncoveredAll (expectedUncovered.filter fun b =>
-      b ∉ [br .pushEnd false false false, br .pullReplyOk false false false,
-           br .h2dIssueReleased false true false, br .pollReady true false false]) ∧
+      b ∉ [br .h2dIssueReleased false true false, br .pollReady true false false]) ∧
     univ.all (fun b => !unreachableLeaves.contains b.1) ∧
     liveLeaves.all (fun l => univ.any (·.1 = l)) ∧
     expectedUncovered.all (fun b => inits.any fun i => (Coverage.witness instr i events b).isSome)

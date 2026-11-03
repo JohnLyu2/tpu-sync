@@ -101,7 +101,7 @@ theorem trace_chunk_two_senders :
 /-- **Chunk-count contract, before retirement.** Layer 0 (one declared stream)
 lands twice; layer 1 never arrives. The duplicate is absorbed
 (`completed_chunks = 2 ≠ 1`, no second dispatch, no error) but still reported
-through `OnBlockShardsReceived`, so `network_completed_` is reached with
+through `OnBlockShardsReceived` → `RecordBlockShards`, so `network_completed_` is reached with
 layer 1's blocks never received. Once layer 0's copy lands, `IsReadyToComplete`
 is true, the poll's `Finish()` settles at once (`in_flight_ == 0`) and the
 receive is published in `done_recving_` with layer 1 never copied. -/
@@ -167,7 +167,9 @@ behaviour: (1) the chunk-count contract rejects a stream beyond the declared
 count, as the other two contracts already do (`if (plan_pushes > expected_chunks)`
 and `else if (streams.landed > streams.declared)` in `CompleteIncomingPush`);
 (2) `ExecuteLayerH2d` keeps a per-layer once-latch of its own, so a dispatch
-after the transport retired its entries is a no-op. `stepHardened` is `step`
+after the transport retired its entries is a no-op (`dispatched_layers_`
+already records every layer dispatched, but only to set `network_completed_`;
+nothing consults it before `++in_flight_` and the copy). `stepHardened` is `step`
 with exactly those two edits. The dishonest state space stays infinite (after
 retirement a fresh entry's first stream is within the declared count and is
 accepted, so the block count is unbounded), so the searches below are bounded:
@@ -249,11 +251,14 @@ tests whose stimulus is outside A3, calls `Cancel` or `ForgetPushProgress`, or
 exercises the plan-declared pool or Peregrine bitmask paths of
 `CompleteIncomingPush`. -/
 
-/-- `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion`: one
-layer, one sender declaring two streams (`num_streams = 2`), chunk-count
-contract. The first stream completes nothing; the second fires
-`OnLayerReceived` once (`layers_received() == 1`) and, every layer now called,
-retires the table (`IsDone()`, `on_completed_`). -/
+/-- One layer, one sender declaring two streams (`num_streams = 2`),
+chunk-count contract. The first stream completes nothing; the second fires
+`OnLayerReceived` once and, every layer now called, retires the table
+(`layer_progress_.clear()`, `done_ = true`, so `HandleIncomingPush` drops the
+push session). No upstream test drives this shape on the socket path:
+`BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` retires a
+two-layer session through `OnPeregrinePostComplete` (`is_peregrine = true`),
+which is `notReplayable` here. -/
 def tr_session_two_streams_complete : List Ev := [.stream 0 0, .stream 0 0]
 
 theorem trace_session_two_streams_complete :
@@ -327,14 +332,17 @@ theorem trace_undeclared_uuid_chunk_count :
 
 /-- (upstream test, configuration, trace). -/
 def paired : List (String × Cfg × List Ev) :=
-  [("BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion", cfgChunk 1 1 2 true,
-     tr_session_two_streams_complete),
-   ("BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender", cfgDeclared 2 2 1 false,
+  [("BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender", cfgDeclared 2 2 1 false,
      tr_declared_senders_then_reuse),
    ("BlockTransportTest.SenderOverDeliveryIsRejected", cfgDeclared 2 2 1 false,
      tr_sender_over_delivery_rejected),
    ("BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion", cfgChunk 1 2 1 true,
      tr_undeclared_uuid_chunk_count)]
+
+/-- Traces no upstream test replays: (what it shows, configuration, trace). -/
+def modelOnly : List (String × Cfg × List Ev) :=
+  [("chunk-count: two streams complete and retire one layer", cfgChunk 1 1 2 true,
+     tr_session_two_streams_complete)]
 
 /-- Transport tests of the same table whose stimulus is not an event of this
 model. `BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism` has
@@ -352,9 +360,12 @@ is not an event (`Transport.lean` §"Lock scopes"). The plan-declared pool
 contract (`BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
 `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
 `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration`) is
-`Reshard/Pipeline.lean`'s `landStream`, and `PeregrineRecvCompleteTest` exercises
+`Reshard/Pipeline.lean`'s `landStream`, and `PeregrineRecvCompleteTest` and
+`BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` exercise
 `OnPeregrinePostComplete` and the `is_peregrine = true` shard-bitmask branch of
-`CompleteIncomingPush`, neither a contract of this model. -/
+`CompleteIncomingPush` (`PeregrineRecvCompleteTest.RejectsSenderSession` the
+`TryBeginOp` refusal of a send session in `BeginIncomingPush`), neither a
+contract of this model. -/
 def notReplayable : List (String × String) :=
   [("BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism", "per-sender declarations (A3)"),
    ("BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected", "per-sender declarations (A3)"),
@@ -366,11 +377,13 @@ def notReplayable : List (String × String) :=
      "plan-declared pool contract (Reshard/Pipeline.lean)"),
    ("BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration",
      "plan-declared pool contract (Reshard/Pipeline.lean)"),
-   ("PeregrineRecvCompleteTest.* (9 tests)",
+   ("BlockTransportServerPushSessionTest.LifecycleAndPostCompletion",
+     "OnPeregrinePostComplete and is_peregrine = true branch"),
+   ("PeregrineRecvCompleteTest.* (10 tests)",
      "OnPeregrinePostComplete and is_peregrine = true shard-bitmask branch")]
 
--- Every paired trace runs to its end.
-#guard paired.all fun (_, c, tr) => ((sys c).run tr).isSome
+-- Every paired and model-only trace runs to its end.
+#guard (paired ++ modelOnly).all fun (_, c, tr) => ((sys c).run tr).isSome
 
 
 end TpuSyncVerify.Transfer.PrefillDecode.Transport

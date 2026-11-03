@@ -24,6 +24,7 @@ the comparison between `PushEndPolicy.endOpOnly` and
 `PushEndPolicy.finishOnError`. Each trace is a named `def` so that
 `Coverage.lean` measures the exact event lists proved here. -/
 
+
 def tr_rank1_arrives_before_rank0 : List Ev :=
   [.pushBegin, .onPoolReceived 1, .pushEnd true,
    .pushBegin, .onPoolReceived 0, .pushEnd true,
@@ -52,11 +53,10 @@ theorem trace_rank1_arrives_before_rank0 :
     (s.run (tr_rank1_arrives_before_rank0.take 9)).map
       (fun r => (r.pools.map Pool.stage, r.life.inFlight, r.life.done)) =
       some ([.completed, .queued], 1, false) ∧
-    -- Pool 1 now issues, finishes, settles, unregisters the plan, and publishes `done_recving`.
+    -- Pool 1 now issues, finishes, settles (its `plan()` goes with `done_`), and publishes `done_recving`.
     (s.run tr_rank1_arrives_before_rank0).map
-      (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered,
-                 r.durationRecorded, r.published)) =
-      some (true, false, true, true, some true) := by
+      (fun r => (r.life.done, r.life.hasStaging, r.durationRecorded, r.published)) =
+      some (true, false, true, some true) := by
   decide
 
 def tr_batch_launch_on_rank_wave : List Ev :=
@@ -95,9 +95,8 @@ theorem trace_cancel_between_batch_queue_and_issue :
       (fun r => (r.pools.map Pool.stage, r.life.inFlight, r.life.done, r.life.hasStaging)) =
       some ([.issued, .aborted], 1, false, true) ∧
     (s.run tr_cancel_between_batch_queue_and_issue).map
-      (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered,
-                 r.durationRecorded, r.published)) =
-      some (true, false, true, false, some false) := by
+      (fun r => (r.life.done, r.life.hasStaging, r.durationRecorded, r.published)) =
+      some (true, false, false, some false) := by
   decide
 
 /-- Receiver plan identity/pool validation (`ReshardReceiveSession::ValidatePlan`,
@@ -109,8 +108,8 @@ theorem trace_cancel_between_batch_queue_and_issue :
 - Rejects `enableHostStaging = false` (`!base->has_device_buffers()` in
   `ReshardReceiveSession::Create`,
   `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints`),
-- Registers the plan with `isSender = false`
-  (`base->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false)` in
+- Builds the receiver's plan with `isSender = false`
+  (`TransferPlan::Create(plan, /*is_sender=*/false, base->num_pools(),` in
   `ReshardReceiveSession::Create`) and rejects empty `ranks`
   (`if (plan.transfer_pool_indices().empty())` in
   `ValidateCommonPoolReshardPlan`),
@@ -171,8 +170,8 @@ def tr_parity_2pool : List Ev :=
    `ReshardReceiveSessionTest.AcceptsImplicitPools`) and a 2-group plan
    (`ranks = [0, 0]`, `ReshardReceiveSessionTest.HasNoTagPolicy` /
    `ReshardReceiveSessionTest.GroupScopesDestinationBlocks`) — when run through
-   the session, execute H2D, release staging leases, unregister the active
-   plan, and publish `done_recving`. The tests themselves only call
+   the session, execute H2D, release staging leases (the plan going with
+   `done_`), and publish `done_recving`. The tests themselves only call
    `ValidatePlan`; no upstream test runs these plans (`Coverage.lean`). -/
 theorem trace_reshard_receive_session_test_parity :
     validPlanPoolsAndBlocks false 2 16 [0] true [1] = false ∧
@@ -185,12 +184,11 @@ theorem trace_reshard_receive_session_test_parity :
     validPlanPoolsAndBlocks true 2 16 [0] true [16] = false ∧
     validPlanPoolsAndBlocks true 2 16 [0] true [1, 2] = true ∧
     ((sys [0]).run tr_parity_1pool).map
-      (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
-      some (true, false, true, some true) ∧
+      (fun r => (r.life.done, r.life.hasStaging, r.published)) =
+      some (true, false, some true) ∧
     ((sys [0, 0]).run tr_parity_2pool).map
-      (fun r => (r.pools.map Pool.stage, r.life.done, r.life.hasStaging,
-                 r.planUnregistered, r.published)) =
-      some ([.completed, .completed], true, false, true, some true) := by
+      (fun r => (r.pools.map Pool.stage, r.life.done, r.life.hasStaging, r.published)) =
+      some ([.completed, .completed], true, false, some true) := by
   decide
 
 def tr_duration_ok : List Ev :=
@@ -210,45 +208,46 @@ runs the upload path that call stands for. -/
 theorem trace_duration_metric_on_success_and_failure :
     let s := sys [0]
     ((s.run tr_duration_ok).map
-      (fun r => (r.published, r.durationRecorded, r.planUnregistered)) =
-      some (some true, true, true)) ∧
+      (fun r => (r.published, r.durationRecorded)) =
+      some (some true, true)) ∧
     ((s.run tr_duration_fail).map
-      (fun r => (r.published, r.durationRecorded, r.planUnregistered)) =
-      some (some false, false, true)) := by
+      (fun r => (r.published, r.durationRecorded)) =
+      some (some false, false)) := by
   decide
 
 def tr_failed_incoming_push : List Ev :=
   [.pushBegin, .pushEnd false, .publish]
 
-/-- `hooks.end_incoming_push` on a failed push
-(`KVCacheManagerWithTransfer::InitializeBaseHooks`). Under the `.endOpOnly`
-mutant the hook ends the op without finishing the session, leaving
-`draining = false`, `done = false`, `hasStaging = true`, and
-`planUnregistered = false` until the external deadline (`cancel`). Under
-`PushEndPolicy.finishOnError` — the shipping code, replaying
+/-- `EndIncomingPush` (`block_transport_session.cc`) on a failed push. Under
+the `.endOpOnly` mutant it ends the op without finishing the session, leaving
+`draining = false`, `done = false` and `hasStaging = true` (the plan still
+resolvable) until the external deadline (`cancel`). Under
+`PushEndPolicy.finishOnError` — the shipping code
+(`if (!status.ok()) session->Finish(status);` then `session->EndOp();`),
+replaying
 `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline` —
 `pushEnd false` immediately drains and settles the session, releasing the pool
-staging lease and unregistering the plan. -/
+staging lease (and with `done_`, the plan). -/
 theorem trace_failed_incoming_push :
     -- `.endOpOnly` mutant: after `[.pushBegin, .pushEnd false]`, session is still open and holds staging/plan.
     ((sys [0] .endOpOnly).run (tr_failed_incoming_push.take 2)).map
-      (fun r => (r.life.draining, r.life.done, r.life.hasStaging, r.planUnregistered)) =
-      some (false, false, true, false) ∧
+      (fun r => (r.life.draining, r.life.done, r.life.hasStaging)) =
+      some (false, false, true) ∧
     (sys [0] .endOpOnly).run tr_failed_incoming_push = none ∧
     -- Shipping (`finishOnError`): `tr_failed_incoming_push` settles at once and publishes failure.
     ((sys [0] .finishOnError).run tr_failed_incoming_push).map
-      (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
-      some (true, false, true, some false) := by
+      (fun r => (r.life.done, r.life.hasStaging, r.published)) =
+      some (true, false, some false) := by
   decide
 
 def events (numPools : Nat) : List Ev :=
-  [.pushBegin, .pushEnd true, .pushEnd false, .pollReady, .cancel, .publish] ++
+  [.pushBegin, .pushEnd true, .pushEnd false, .cancel, .publish] ++
   (List.range numPools).flatMap fun p =>
     [.onPoolReceived p, .h2dIssue p true, .h2dIssue p false,
      .h2dReady p, .h2dDone p true, .h2dDone p false]
 
 instance (pol : PushEndPolicy) (s : Recv) : Decidable (Safe pol s) := by
-  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity PlanIntegrity SettlesPromptly RankWaveOrder ReadinessSound Publication NoOpLeak
+  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly RankWaveOrder Publication NoOpLeak
   infer_instance
 
 /-- Executable negation of `Safe`, by construction: the bounded searches and the
@@ -297,20 +296,6 @@ def h2dIssueLeak (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
 #guard (match ModelCheck.check ⟨init [0], fun s e => match e with
           | .h2dIssue p ok => h2dIssueLeak p ok s
           | e => step .finishOnError s e⟩ (events 1) (violates .finishOnError) 5 with
-        | .counterexample _ => true
-        | _ => false)
-
-/-- Mutant 3 (`cancelUnregisterEarly`): external cancellation unregisters the
-active plan immediately when `Finish` sets `draining_` (`UnregisterActivePlan`),
-instead of deferring unregistration to `MaybeUnregisterSettledReshardRecv`
-(`TakePendingUnregister`) after open incoming pushes (`pushes > 0`) drain,
-violating `PlanIntegrity`. -/
-def cancelUnregisterEarly (s : Recv) : Option Recv :=
-  some { s with life := s.life.finishLocked false, planUnregistered := true }
-
-#guard (match ModelCheck.check ⟨init [0], fun s e => match e with
-          | .cancel => cancelUnregisterEarly s
-          | e => step .finishOnError s e⟩ (events 1) (violates .finishOnError) 4 with
         | .counterexample _ => true
         | _ => false)
 

@@ -16,7 +16,7 @@ data paths and machine-checked proofs about them.
   [`Transfer/LayerStaging.lean`](TpuSyncVerify/Transfer/LayerStaging.lean),
   [`Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/).
 - Proved: data correctness on publication (both full host mirror and bounded
-  host layer staging under `TPU_RAIDEN_NUM_STAGING_LAYERS`), HBM and staging
+  host layer staging under `num_staging_layers`), HBM and staging
   safety, host-slot conservation/exclusivity and `1`-slot sufficiency,
   drain-to-settle termination, cross-peer isolation.
 
@@ -64,7 +64,7 @@ lakefile.toml, lake-manifest.json, lean-toolchain
 Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest names (`Suite.TestName`); exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables. Those spans were
-last resolved at commit **`42dda54`**;
+last resolved at commit **`56a0269`**;
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py) `--check` re-verifies
 them against the working tree. The external callers that `Caller.lean`
 cites are pinned separately: tpu-inference `f366ef52`, vllm-torchtpu

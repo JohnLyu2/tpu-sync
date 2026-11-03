@@ -80,7 +80,8 @@ def init (n numSendSlots numRecvSlots : Nat) : BoundedPipeline :=
 def initUnregistered (n numSendSlots numRecvSlots : Nat) : BoundedPipeline :=
   { init n numSendSlots numRecvSlots with pipe := Pipeline.initUnregistered n }
 
-/-- `TransferSendSession::LookupStagingSlot(layer_idx)` (`send.cc`). -/
+/-- `TransferSendSession::LookupStagingSlot(layer_idx)` (`send.cc`), reached as
+`TransferSendSession::ResolveStagingSlot` from `KVCacheManagerBase::GetBlockChunks`. -/
 def sendLookupStagingSlot (s : BoundedPipeline) (l : Nat) : Option Nat :=
   if s.pipe.send.life.done || s.pipe.send.life.draining then none else s.sendMgr.lookup l
 
@@ -202,7 +203,8 @@ def h2hDone (s : BoundedPipeline) (l : Nat) (ok : Bool) : Option BoundedPipeline
         { base with wireB := s.wireB.set l (s.prefillSlots.getD slot .junk) }
     else base
 
-/-- `BeginIncomingPush` / `EndIncomingPush` on `TransferReceiveSession`. -/
+/-- `BeginIncomingPush` (`GetSession` + `TryBeginOp`) / `EndIncomingPush`
+(`EndOp`) on `TransferReceiveSession` (`bts.cc`). -/
 def recvPushBegin (s : BoundedPipeline) : Option BoundedPipeline :=
   (Pipeline.step s.pipe (.recv .pushBegin)).map fun p => { s with pipe := p, activeStreams := s.activeStreams + 1 }
 
@@ -261,7 +263,8 @@ def land (s : BoundedPipeline) (l : Nat) : Option BoundedPipeline :=
     | none => none
   else none
 
-/-- `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` `Lookup(l)` + first `mu_` lock (`recv.cc`). -/
+/-- `KVCacheManagerBase::OnLayerReceived(l)` → `OnDataReceived(l, {}, {})` →
+`ExecuteLayerH2d(l)` `Lookup(l)` + first `mu_` lock (`recv.cc`). -/
 def h2dBegin (s : BoundedPipeline) (l : Nat) : Option BoundedPipeline :=
   if 0 < s.activeStreams ∧ s.pipe.landedL[l]? = some true ∧
       s.pipe.claimedL[l]? = some false ∧ s.recvPhaseL[l]? = some .leasedForStream then
@@ -272,7 +275,9 @@ def h2dBegin (s : BoundedPipeline) (l : Nat) : Option BoundedPipeline :=
         { s with pipe := p, recvPhaseL := s.recvPhaseL.set l .h2dPending }
   else none
 
-/-- `ExecuteLayerH2d(l)` second `mu_` lock + `H2dSyncDispatch` (`recv.cc`). -/
+/-- `ExecuteLayerH2d(l)` second `mu_` lock + `H2dSyncDispatch` + the closing
+`dispatched_layers_.insert(layer_idx)` scope (`recv.cc`); the slot bookkeeping
+only depends on whether the copy was dispatched. -/
 def h2dIssue (s : BoundedPipeline) (l : Nat) (ok : Bool) : Option BoundedPipeline :=
   if s.recvPhaseL[l]? = some .h2dPending then
     (Pipeline.step s.pipe (.h2dIssue l ok)).map fun p =>

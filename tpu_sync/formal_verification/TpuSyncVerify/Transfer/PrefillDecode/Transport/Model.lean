@@ -72,10 +72,11 @@ structure Cfg.WF (c : Cfg) : Prop where
   blocks : 0 < c.blocksPerStream
   /-- The chunk-count contract is single-sender. On the `StartRead` path no
   receiver plan is registered at all and the pull goes to one endpoint
-  (`StartRead(remote_endpoint)` → `ExecutePullRequest`), so there is one sender;
-  on the plan path a plan with several `shard_push_schedules` makes
+  (`StartRead(remote_endpoint)` → `TransferReceiveSession::Start`), so there is
+  one sender; on the plan path a plan with several `shard_push_schedules` makes
   `ExpectedPushSenders` return their count
-  (`plan_snapshot->request.shard_push_schedules_size()`), selecting the
+  (`TransferPlan::ExpectedPushSenders`: `request_.shard_push_schedules_size()`),
+  selecting the
   sender-declared contract. `trace_chunk_two_senders` shows what the excluded
   instance does. -/
   chunkSingle : c.declared = false → c.numSenders = 1
@@ -160,10 +161,11 @@ def nextLayer (L : Layer) (p' : Progress) (sent' : List Nat) (fire : Bool) : Lay
     (nextLayer L p' s' f).pending = if f then L.pending + 1 else L.pending := rfl
 
 /-- The session side of one stream, given the transport's verdict. Push lease
-`TryBeginRecvOp` (`beginOp`, `hooks.begin_incoming_push`); on completion `ExecuteLayerH2d`
-takes the copy's op (`++in_flight_`, `fire`); a rejection runs the cleanup's
-`EndIncomingPush(InternalError)` → `Finish(status)` (`hooks.end_incoming_push`); the
-lease is returned by `EndRecvOp` (`hooks.end_incoming_push`, or `EndIncomingPush` on success). -/
+`TransferReceiveSession::TryBeginOp` (`beginOp`, from `BeginIncomingPush`); on
+completion `ExecuteLayerH2d` takes the copy's op (`++in_flight_`, `fire`); a
+rejection runs the cleanup's `EndIncomingPush(session, InternalError)` →
+`Finish(status)`; the lease is returned by `TransferReceiveSession::EndOp`
+(`EndIncomingPush`, on either path). -/
 def streamLife (l : Lifecycle) (fire reject : Bool) : Lifecycle :=
   let l := if fire then { l with inFlight := l.inFlight + 1 } else l
   let l := if reject then l.finishLocked false else l
@@ -198,7 +200,7 @@ def Layer.copyDone (L : Layer) : Layer := { L with pending := L.pending - 1 }
 /-- The H2D `future.OnReady` callback in `ExecuteLayerH2d`: on success
 `num_completed_layers_++` and, at `num_layers()` while not draining, the
 success `FinishLocked()`; on failure `FinishLocked(status_or.status(), kH2dPhase)`;
-then `absl::Cleanup end_op`'s `EndRecvOp()`. -/
+then `absl::Cleanup end_op`'s `EndOp()`. -/
 def callbackLife (c : Cfg) (l : Lifecycle) (ok : Bool) (completed : Nat) : Lifecycle :=
   let l :=
     if ok then

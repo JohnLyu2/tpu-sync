@@ -108,8 +108,8 @@ def armRecv (s : Pipeline) : Option Pipeline :=
     some { s with armed := true }
   else none
 
-/-- Sender transition (`ReshardSendSession::ExecutePush`, `StartPoolPush`,
-`EndOp`). Launching a D2H copy (`d2hIssue p true`) requires the receiver to be
+/-- Sender transition (`ReshardSendSession::Start`, `ExecutePushPipeline`,
+`StartPoolPush`, `EndOp`). Launching a D2H copy (`d2hIssue p true`) requires the receiver to be
 armed (`ReshardCoordinator::RunSubPlan`); `d2hDone p true` copies
 `srcHbm[p]` into `srcStaging[p]`; `pushDone p true` places `srcStaging[p]` on
 `wire[p]` and increments `sentStreams[p]`. -/
@@ -139,8 +139,8 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
 /-- Receiver transition (`ReshardReceiveSession::OnPoolReceived`,
 `ExecuteEligiblePoolH2ds`, `FinishPoolH2d`,
 `BlockTransportServerPushSession::CompleteIncomingPush`). `pushBegin` requires the receiver to be
-armed (`KVCacheManagerWithTransfer::InitializeBaseHooks`,
-`hooks.begin_incoming_push =`); `onPoolReceived p` requires all `peerCounts[p]`
+armed (`BeginIncomingPush` finds it through `delegate->GetSession(uuid)` →
+`KVCacheManagerWithTransfer::GetSession`); `onPoolReceived p` requires all `peerCounts[p]`
 expected streams to have landed (`BlockTransportServerPushSession::CompleteIncomingPush`);
 `h2dDone p true` writes `dstStaging[p]` to `dstHbm[p]` and clobbers any strictly
 higher-rank pool slots on the aliased page (`writePoolHbm`). -/

@@ -19,12 +19,12 @@ namespace Recv
 
 /-- One leaf of `step`'s decision tree per event. -/
 inductive Leaf
-  /-- `TryBeginRecvOp` accepted an incoming push (`hooks.begin_incoming_push`). -/
+  /-- `TryBeginOp` accepted an incoming push (`BeginIncomingPush` in
+  `block_transport_session.cc`). -/
   | pushBegin
-  /-- `hooks.end_incoming_push` with an OK push: `EndRecvOp()` only. -/
+  /-- `EndIncomingPush` with an OK push: `EndOp()` only. -/
   | pushEndOk
-  /-- `hooks.end_incoming_push` with a failed push: `Finish(status)`, then
-  `EndRecvOp()`. -/
+  /-- `EndIncomingPush` with a failed push: `Finish(status)`, then `EndOp()`. -/
   | pushEndFail
   /-- `OnPoolReceived`; `ExecuteEligiblePoolH2ds` launched at least one pool. -/
   | poolReceivedLaunches
@@ -37,14 +37,15 @@ inductive Leaf
   /-- The per-pool `if (done_ || draining_)` re-check in
   `ExecuteEligiblePoolH2ds` fired: `EndRecvOpLocked()`, no upload. -/
   | h2dIssueReleased
-  /-- `H2dPoolBlocks` returned a future; pushed into `h2d_futures_`. -/
+  /-- `H2dPoolBlocks` returned a future; its `OnReady` continuation attached. -/
   | h2dIssueOk
-  /-- `H2dPoolBlocks` failed: `FinishPoolH2d` → `Finish(status)`. -/
+  /-- No destination blocks, `LookupStagingSlot` or `H2dPoolBlocks` failed:
+  `FinishPoolH2d` → `Finish(status)`. -/
   | h2dIssueFail
-  /-- `H2dPoolBlocks` failed on an already finalizing session:
+  /-- Same, on an already finalizing session:
   `RecordPoolH2dResultLocked` returns `false`, no `Finish`. -/
   | h2dIssueFailFinalizing
-  /-- A pool's H2D future became ready. -/
+  /-- A pool's H2D copy finished on the device; its continuation has not run. -/
   | h2dReady
   /-- `FinishPoolH2d` on a settled session (`if (done_) return;`). -/
   | h2dDoneRetired
@@ -52,20 +53,18 @@ inductive Leaf
   | h2dDoneFinalizing
   /-- `FinishPoolH2d` with an error: `Finish(status)`. -/
   | h2dDoneFail
-  /-- `FinishPoolH2d` OK for the last pool: `network_completed_ = true`,
-  `Finish(OkStatus())`, duration recorded. -/
+  /-- `FinishPoolH2d` OK for the last pool: `Finish(OkStatus())`, duration
+  recorded. -/
   | h2dDoneLast
   /-- `FinishPoolH2d` OK, not the last pool; the chained
   `ExecuteEligiblePoolH2ds` launched the next rank wave. -/
   | h2dDoneChains
   /-- `FinishPoolH2d` OK, not the last pool; nothing new to launch. -/
   | h2dDoneMore
-  /-- The poll saw `IsReadyToComplete() && !IsDraining()`. -/
-  | pollReady
   /-- `Finish(error)` from outside (deadline sweep, `UnregisterActivePlan`,
-  manager teardown). -/
+  manager teardown, a staging wait that timed out). -/
   | cancel
-  /-- The poll published a settled session. -/
+  /-- The poll retired a settled session (`RetireSettledSessionLocked`). -/
   | publish
   deriving Repr, DecidableEq
 
@@ -85,7 +84,7 @@ def poolReceivedLeaf (p : Nat) (s s' : Recv) : Leaf :=
       else .poolReceivedGated
     | none => .poolReceivedGated
 
-/-- The leaf `FinishPoolH2d` + `EndRecvOp` took for pool `p`. -/
+/-- The leaf `FinishPoolH2d` + `EndOp` took for pool `p`. -/
 def h2dDoneLeaf (p : Nat) (ok : Bool) (s s' : Recv) : Leaf :=
   if s.life.done = true then .h2dDoneRetired
   else if s.finalizing = true then .h2dDoneFinalizing
@@ -113,7 +112,6 @@ def stepT (s : Recv) : Ev → Option (Recv × Leaf)
       else .h2dIssueFail)
   | .h2dReady p => (s.h2dReady p).map (·, .h2dReady)
   | .h2dDone p ok => (s.h2dDone p ok).map fun s' => (s', h2dDoneLeaf p ok s s')
-  | .pollReady => (s.pollReady).map (·, .pollReady)
   | .cancel => (s.cancel).map (·, .cancel)
   | .publish => (s.publish).map (·, .publish)
 
@@ -150,7 +148,13 @@ def paired : List (String × Recv × List Ev) :=
    -- `UnregisterActivePlan(3998)` / `(3999)` on the two idle blocker receivers:
    -- `Finish(CancelledError)` settles each at once and frees its staging slot.
    ("PoolStagingRecvRegistrationTest.ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease",
-      init [0], [.cancel])]
+      init [0], [.cancel]),
+   -- `session->Finish(Cancelled)` while a second pool waits in
+   -- `AcquireStagingSlot` (the wait's own op is nested and ends before the
+   -- assertion, A1); then a second session whose wait runs into its deadline
+   -- (`FinishLocked(slot.status())` from inside `AcquireStagingSlot`).
+   ("ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease",
+      init [0, 0], [.cancel, .publish])]
 
 def modelOnly : List (String × Recv × List Ev) :=
   [("trace_rank1_arrives_before_rank0", init [0, 1], tr_rank1_arrives_before_rank0),
@@ -165,7 +169,7 @@ def modelOnly : List (String × Recv × List Ev) :=
 /-- Upstream tests on this C++ whose stimulus is not an event of the model. -/
 def notReplayable : List (String × String) :=
   [("PoolReshardRecvTest.FinishPoolReshardRecvRecordsDurationMetric",
-      "calls FinishPoolH2d(OK) through PoolReshardRecvTestPeer on a pool that was never received, launched or issued (no op held); exercises h2dDoneLast's FinishPoolH2d body without its EndRecvOp"),
+      "calls FinishPoolH2d(OK) through PoolReshardRecvTestPeer on a pool that was never received, launched or issued (no op held); exercises h2dDoneLast's FinishPoolH2d body without its EndOp"),
    ("PoolReshardRecvTest.FinishPoolReshardRecvDoesNotRecordMetricOnFailure",
       "same, with an error status (h2dDoneFail's FinishPoolH2d body)"),
    ("SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan", "same synthetic FinishPoolH2d; asserts chain terminal aggregation, outside this model"),
@@ -177,16 +181,22 @@ def notReplayable : List (String × String) :=
       "registration and staging leases only (PoolStaging.lean); its sessions are cancelled unasserted at manager teardown"),
    ("PoolStagingRecvRegistrationTest.StagingAcquireFailureReleasesUuidClaim",
       "ReshardReceiveSession::Create rollback (PoolStaging.lean)"),
+   ("PoolReshardSessionLookupTest.GetSessionResolvesActiveReshardRecvUntilRetired",
+      "same synthetic FinishPoolH2d (h2dDoneLast's body), then asserts GetSession before and after RetireSettledSessionLocked"),
+   ("PoolReshardSessionLookupTest.PoolCompletionWithoutReceiverIsNotFound",
+      "KVCacheManagerBase::OnPoolReceived with no session (kNotFound) or a TransferReceiveSession; no ReshardReceiveSession exists"),
+   ("PoolReshardSessionLookupTest.PoolCompletionOnLegacyArmedReceiverFailsWithoutH2d",
+      "same: the uuid's session is a TransferReceiveSession"),
    ("PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints",
       "Create's has_device_buffers() rejection; no session exists"),
-   ("ReshardReceiveSessionTest.* (16 tests)",
+   ("ReshardReceiveSessionTest.* (16 ValidatePlan tests)",
       "ValidatePlan / ValidateReceiverCoverage only (validPlan, validPlanPoolsAndBlocks, Coverage.lean); no session runs")]
 
 /-! ## Result
 
 Every search exhausts its state space, so `allBranches` is exact for receivers
 of one pool, two pools of one rank, and two pools of ranks `[0, 1]`, with at
-most two open push leases: **36 branches**. Three leaves of `Leaf` are in no
+most two open push leases: **36 branches**. Two leaves of `Leaf` are in no
 reachable branch:
 
 * `h2dDoneRetired` — `FinishPoolH2d`'s `if (done_) return;` on a pool callback.
@@ -196,26 +206,23 @@ reachable branch:
   Every path that sets `reshard_finalizing_` (`h2dIssue` or `h2dDone` failing,
   the last pool completing) calls `Finish` in the same step, so a finalizing
   session is draining and the per-pool re-check releases the op first.
-* `pollReady` — `Recv.reachable_pollReady_disabled`: `FinishPoolH2d` sets
-  `network_completed_` and calls `Finish` together, so the poll never sees
-  `IsReadyToComplete() && !IsDraining()`.
 
-The two upstream tests in `paired` reach **4 of 36**: `pushBegin`,
+The three upstream tests in `paired` reach **4 of 36**: `pushBegin`,
 `pushEndFail` (drains, settles, errors), `cancel` (drains, settles, errors) and
 `publish`. The `modelOnly` traces add 12 more. Of the 32 the tests miss:
 
 | Class | Count | Branches | What it would take |
 |---|---|---|---|
-| **test** | 21 | `pushEndOk` (no effect; settles), `pushEndFail` (all five other effects: settles; drains+errors; no effect; settles+errors; errors), `cancel` (drains+errors with a push open; no effect; errors after an OK settle), `poolReceivedLaunches`, `poolReceivedGated`, `poolReceivedQuiesced`, `h2dIssueFail` (drains+settles+errors; drains+errors), `h2dIssueOk`, `h2dReady`, `h2dDoneLast` (drains+settles; drains with a push open), `h2dDoneChains`, `h2dDoneMore` (no effect) | `BoundedPoolTestManager` (`DeviceBackedTestBase`) in `pool_reshard_test.cc`: its default-constructed `RaidenBufferHandle` (`!hold.is_common_buffer && hold.c_hold == nullptr`) makes `raiden::IssueH2dShard` return an empty `PjRtCopyFuture` whose `OnReady` runs synchronously with `OkStatus()` after `ExecuteEligiblePoolH2ds` drops `mu_`, so calling `KVCacheManagerBase::OnPoolReceived` alongside `BeginIncomingPush` / `EndIncomingPush` / `UnregisterActivePlan` drives synchronous uploads, rank waves, and (`device_size = 0` or `host_blocks = 0`, not a bare `AttachPlaceholderDeviceHoldForTest` whose empty `holds` vector cannot be indexed) synchronous `H2dPoolBlocks` failures on CPU |
+| **test** | 21 | `pushEndOk` (no effect; settles), `pushEndFail` (all five other effects: settles; drains+errors; no effect; settles+errors; errors), `cancel` (drains+errors with a push open; no effect; errors after an OK settle), `poolReceivedLaunches`, `poolReceivedGated`, `poolReceivedQuiesced`, `h2dIssueFail` (drains+settles+errors; drains+errors), `h2dIssueOk`, `h2dReady`, `h2dDoneLast` (drains+settles; drains with a push open), `h2dDoneChains`, `h2dDoneMore` (no effect) | `BoundedPoolTestManager` (`DeviceBackedTestBase`) in `kv_cache_manager_with_transfer_pool_reshard_test.cc` with a minimal `RawBuffer` test subclass seated via `RaidenBufferHandle::AcquireFromRaw` (`CopyPoolBlocks` queries `GetOnDeviceSizeInBytes()` before `IssueH2dShard`, so `DeviceBackedTestBase`'s default-constructed `RaidenBufferHandle` with `c_hold == nullptr` cannot execute a non-empty copy): returning an immediately-ready `xla::Future<>` from `CopyRawHostToDevice` makes `OnReady` run synchronously with `OkStatus()` after `ExecuteEligiblePoolH2ds` drops `mu_`, so calling `KVCacheManagerBase::OnPoolReceived` alongside `BeginIncomingPush` / `EndIncomingPush` / `UnregisterActivePlan` drives synchronous uploads, rank waves, and (`host_blocks = 0` or a `RawBuffer` device-size `0`, not a bare `AttachPlaceholderDeviceHoldForTest` whose empty `holds` vector cannot be indexed) synchronous `H2dPoolBlocks` failures on CPU without production changes |
 | **future (stub)** | 9 | `h2dDoneLast` (settles; no effect — both already draining), `h2dDoneMore` (settles), `h2dDoneFail` (all four effects), `h2dDoneFinalizing` (no effect; settles) | a controllable `PjRtCopyFuture` fake (a `RawBuffer` / `PJRT_RawBuffer_Extension` test stub backed by `xla::Promise<>`) so an issued H2D copy can stay pending across `Finish` or resolve `OnReady` with an error on CPU |
 | **window** | 2 | `h2dIssueReleased` (no effect; settles) | `Finish` between `ExecuteEligiblePoolH2ds`'s opening lock and its per-pool `if (done_ \|\| draining_)` re-check on a 1–2 pool plan (a 3-pool `[0, 1, 1]` plan whose first rank-1 pool fails `H2dPoolBlocks` synchronously reaches the no-effect arm deterministically on the second rank-1 pool) |
 
 So no upstream test exercises `OnPoolReceived`, the rank-wave gate, the batch
-launch, an upload or its callback: `BoundedPoolTestManager` already carries the
-null-hold `DeviceBackedTestBase` setup that runs `IssueH2dShard` synchronously
-on CPU, but existing tests only use it for registration, staging leases, and
-incoming-push failure (`docs/transfer/reshard.md` §"C++ branch coverage of the
-anchored spans"). -/
+launch, an upload or its callback: `BoundedPoolTestManager`'s
+`DeviceBackedTestBase` leaves its `RaidenBufferHandle` default-constructed
+(`c_hold == nullptr`), and existing tests only use it for registration, staging
+leases, and incoming-push failure (`docs/transfer/reshard.md` §"C++ branch
+coverage of the anchored spans"). -/
 
 /-- `(leaf, drains, settles, errors)`. -/
 def br (l : Leaf) (drains settles errors : Bool) : Branch := (l, ⟨drains, settles, errors⟩)
@@ -257,7 +264,7 @@ def gaps : List (Branch × Gap) :=
    (br .h2dIssueReleased false false false, .window),
    (br .h2dIssueReleased false true false, .window)]
 
-def unreachableLeaves : List Leaf := [.h2dDoneRetired, .h2dIssueFailFinalizing, .pollReady]
+def unreachableLeaves : List Leaf := [.h2dDoneRetired, .h2dIssueFailFinalizing]
 
 def liveLeaves : List Leaf :=
   [.pushBegin, .pushEndOk, .pushEndFail, .poolReceivedLaunches, .poolReceivedGated,

@@ -86,7 +86,7 @@ def tr_one_layer_async_push : List Ev :=
 and `TransferSendSessionTest.AsyncCallbacksKeepSessionAliveAfterCallerDropsSharedPtr`:
 a one-layer send whose only push succeeds settles OK with its staging
 released, whichever of the push callback and the task tail runs first, and
-also if the pool task's tail ran before the copy's own `EndSendOp`. -/
+also if the pool task's tail ran before the copy's own `EndOp`. -/
 theorem trace_one_layer :
     ((sys 1).run tr_one_layer_sync_push).map
       (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging)) = some (true, true, false) ∧
@@ -348,7 +348,7 @@ three layers; layers 0 and 1 are copying while layer 2's `D2hSyncDispatch` is
 held inside `SetD2hDispatchHook` (`d2hBegin`); layer 0 completes and is pushed,
 `Finish(CancelledError)` cancels the send, layer 1's copy finishes (`Done()` is
 still `false` because layer 2's pending dispatch holds the last op), and when
-layer 2's dispatch returns an error (`d2hIssue false`), its `EndSendOp` settles
+layer 2's dispatch returns an error (`d2hIssue false`), its `EndOp` settles
 the session. (`WaitForH2hCalls` returns before the pool task's tail, so `Finish`
 may also land before `sendNext`, refusing `SendNextLayer(1)` instead of `wake`.) -/
 theorem trace_failed_dispatch_ends_send :
@@ -357,6 +357,51 @@ theorem trace_failed_dispatch_ends_send :
     ((sys 3).run tr_failed_dispatch_ends_send).map
       (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging, s.h2hIssued)) =
       some (true, false, false, 1) := by
+  decide
+
+/-- One layer; the first (only) dispatch fails and `fail_unissued_layers`
+resolves layer 0's promise with the failure. -/
+def tr_first_dispatch_fails : List Ev :=
+  [.beginPull, .start, .d2hBegin, .d2hIssue false, .wake false]
+
+/-- `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce`: one
+layer; `D2hSyncDispatch` fails for layer 0 (`d2hIssue false`), which fails the
+send and ends the copy's op while `SendNextLayer(0)`'s op, armed in `start`,
+keeps it unsettled; `fail_unissued_layers` then resolves layer 0's promise with
+the dispatch error inside `StartPush`, the armed callback runs `wake false`
+(`FinishLocked` ignores the repeat), and its `end_op` settles the send with
+nothing in flight and no push issued. -/
+theorem trace_first_dispatch_fails :
+    ((sys 1).run (tr_first_dispatch_fails.take 4)).map
+      (fun s => (s.life.draining, s.life.done, s.life.inFlight)) = some (true, false, 1) ∧
+    ((sys 1).run tr_first_dispatch_fails).map
+      (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging, s.h2hIssued)) =
+      some (true, false, false, 0) := by
+  decide
+
+/-- One layer; `Finish(error)` with the only push in flight, after which the
+push fails. -/
+def tr_cancel_then_push_fails : List Ev :=
+  [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady, .wake true, .d2hEnd,
+   .h2hIssue, .sendNext, .cancel, .h2hDone false]
+
+/-- `TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled`:
+the `h2hDone false` counterpart of `trace_ok_after_cancel_keeps_failure`. The
+send is cancelled while its only push is in flight (`WaitForH2hCalls(1)`,
+then `Finish(CancelledError)`); when the push then fails
+(`CompleteH2h(0, InternalError)`), `FinishLocked(push_res.status(), kPushPhase)`
+is ignored — the first `Finish` wins — and the push's `end_op` is what settles
+the send. (`WaitForH2hCalls` returns before the pool task's tail, so the
+`Finish` may also land before `sendNext`; the last layer's `SendNextLayer(1)`
+returns at its bounds check either way.) -/
+theorem trace_cancel_then_push_fails :
+    ((sys 1).run (tr_cancel_then_push_fails.take 10)).map
+      (fun s => (s.life.draining, s.life.done, s.life.inFlight)) = some (true, false, 1) ∧
+    ((sys 1).run tr_cancel_then_push_fails).map
+      (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging)) = some (true, false, false) ∧
+    ((sys 1).run [.beginPull, .start, .d2hBegin, .d2hIssue true, .d2hReady, .wake true, .d2hEnd,
+      .h2hIssue, .cancel, .sendNext, .h2hDone false]).map
+      (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging)) = some (true, false, false) := by
   decide
 
 def events : List Ev :=
@@ -462,7 +507,8 @@ explicit `phase` argument when the failing step knows it (`kD2hPhase` in
 `SendNextLayer`'s `layer_future->OnReady`, `kPushPhase` in
 `H2hWriteDirectAsync`'s callback) and otherwise from `CurrentPhaseLocked`,
 and `Details()` reports it to
-`CompleteReadWithDetails` (`transfer_details_[session->req_id()] = session->Details()`).
+`CompleteReadWithDetails` (`RetireSettledSessionLocked`:
+`transfer_details_[send->req_id()] = send->Details();`).
 Nothing in the lifecycle reads it, so
 it is not state here; `phase` below is `CurrentPhaseLocked` evaluated on the
 model, and `failedPhase s e` is the value `FinishLocked` latches when event `e`
@@ -580,7 +626,7 @@ theorem trace_details_failed_push_while_copies_run :
 `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend`,
 `TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue`) exercise
 `TPU_RAIDEN_DATA_CONN_REUSE` parsing and the transport's idle-connection
-counts, which are unmodelled: under `per_transfer` the last `EndSendOp` of a
+counts, which are unmodelled: under `per_transfer` the last `EndOp` of a
 draining send closes connections in a window where `in_flight_ == 1`,
 `draining_` and `!done_` are all fixed (`ReleaseDataConnectionsAfterSend`, A7),
 so the model's atomic `endOp` is unchanged. Their lifecycle content is
@@ -647,7 +693,11 @@ def paired : List (String × Send × List Ev) :=
    ("TransferSendSessionTest.D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies", init 3,
      tr_d2h_dispatch_fail_drains_issued),
    ("TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend",
-     init 3, tr_failed_dispatch_ends_send)]
+     init 3, tr_failed_dispatch_ends_send),
+   ("TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce", init 1,
+     tr_first_dispatch_fails),
+   ("TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled", init 1,
+     tr_cancel_then_push_fails)]
 
 /-- Traces no upstream test replays: (what it shows, initial state, trace). -/
 def modelOnly : List (String × Send × List Ev) :=
@@ -664,10 +714,16 @@ external `Finish(OkStatus())` (`TestManager::Decide(failed = false)`,
 consumer-Ack path `AckSend` that A5 excludes as dead; pulls rejected by
 `ValidateRequestedBlocksLocked` before `pull_started_` is claimed — refusals,
 not lifecycle steps (the idle send is then settled by the manager's
-destructor); and bounded host-layer staging (`TPU_RAIDEN_NUM_STAGING_LAYERS`,
+destructor); bounded host-layer staging (a manager built with
+`num_staging_layers` below `num_layers`,
 exercising `TransferSendSession::AcquireStagingSlot`, which this full-mirror
 session model delegates to `PrefillDecode/LayerStaging.lean` — both tests are
-replayed there in `LayerStaging/Traces.lean`). -/
+replayed there in `LayerStaging/Traces.lean`); and the transport's
+block-readiness gate (`KVCacheManagerBase::RegisterBlockReadinessCallback` →
+`TransferSendSession::GetDataReadyFuture`), whose test registers callbacks on
+the layer futures and drives the copies only to resolve them (layer 0's push
+goes to an unconnected endpoint, so the send's own outcome is a race the test
+does not observe). -/
 def notReplayable : List (String × String) :=
   [("SendLifecycleTest.SuccessfulSendWithoutWorkSettlesImmediately", "external Finish(OkStatus())"),
    ("SendLifecycleTest.SuccessfulSendWaitsForEveryOperation", "external Finish(OkStatus())"),
@@ -680,7 +736,8 @@ def notReplayable : List (String × String) :=
    ("ControlHandshakeTest.EmptyPullIsRejected", "pull rejected before pull_started_"),
    ("SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers", "bounded StagingLayerManager"),
    ("SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes",
-     "bounded StagingLayerManager")]
+     "bounded StagingLayerManager"),
+   ("SendDrainTest.BlockReadinessWaitsForTheSendsLayerCopy", "block-readiness gate (GetDataReadyFuture)")]
 
 
 end Send

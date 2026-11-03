@@ -19,7 +19,8 @@ while any copy or push is still running. Memory contents are in `Pipeline.lean`.
 `send.h`/`send.cc` are `tpu_sync/kv_cache/transfer_send_session.{h,cc}`;
 `mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_base.cc`; `bt.cc` is
-`tpu_sync/transport/block_transport.cc`. Exact line ranges for every symbol,
+`tpu_sync/transport/block_transport.cc`; `bts.cc` is
+`tpu_sync/transport/block_transport_session.cc`. Exact line ranges for every symbol,
 sub-block, and test are in the generated `## Source map` table below.
 
 ## How a send runs
@@ -32,7 +33,12 @@ sub-block, and test are in the generated `## Source map` table below.
 D2H copy per layer in a loop (`for (size_t l = 0; l < total_layers; ++l)`),
 each counted in `in_flight_` from before its dispatch until its future's
 `layer_future.OnReady` callback resolves `d2h_promises[l]` and ends the op
-(`self->EndSendOp()`). When the loop returns early on a draining session, a
+(`self->EndOp()`). The transport's block-readiness gate reads the same
+futures through `TransferSendSession::GetDataReadyFuture(l)`, which returns
+`d2h_layer_futures_[l].future`, or an already-OK future when the session holds
+no future for `l` (before `StartPush`'s locked section, or after
+`ReleaseStagingBlocksLocked` cleared them at settle). When the loop returns
+early on a draining session, a
 failed layer-buffer lease, or a failed dispatch, its `absl::Cleanup
 fail_unissued_layers` resolves `d2h_promises[next_layer..total_layers-1]` with
 the session's error status so an already-armed `SendNextLayer` callback wakes
@@ -73,7 +79,7 @@ The settle protocol is `Transfer.Lifecycle`. On top of it:
 | `chaining`   | ghost                                           | pool tasks that issued their push and still hold the `SendNextLayer` op (`H2hWriteDirectAsync` .. `SendNextLayer(l + 1)`) |
 | `h2hRetired` | ghost                                           | push callbacks (`H2hWriteDirectAsync` callback) that have run |
 | `h2hOk`      | `num_layers - remaining_h2h_layers_` (`TransferSendSession`) | pushes that completed OK |
-| `published`  | membership in `done_sending_` / `failed_recving_` (`CompleteReadWithDetails`) | what `poll_stats()` shows the engine |
+| `published`  | membership in `done_sending_` / `failed_recving_` (`RetireSettledSessionLocked`, from `CompleteReadWithDetails`) | what `poll_stats()` shows the engine |
 | `underflow`  | —                                               | `EndSendOpLocked` ran with `in_flight_ == 0` |
 
 Ghost fields record where each unit of `in_flight_` came from, which is what
@@ -88,15 +94,23 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
 | `beginPull`    | `ValidateAndBeginPull` (called from `HandlePullStream`): rejects if `deadline_ <= now` (modelled together with pre-pull cancellation via `draining`/`done`) or `pull_started_` is already set, otherwise sets `pull_started_ = true` |
 | `start`        | `StartPush` from the acquisition (`AcquireStagingWithRetry`) through its locked section and `SendNextLayer(0)` (A6), spawned after `ValidateAndBeginPull`: a zero-layer send (`total_layers == 0`) calls `FinishLocked(absl::OkStatus())` at once; a positive-layer send populates `d2h_promises` / `d2h_layer_futures_` and attempts `SendNextLayer(0)` |
 | `d2hBegin`     | one iteration of `StartPush`'s D2H loop up to `++in_flight_` (`if (draining_) { staging_layer_manager_.Release(l); return; } ++in_flight_;`) |
-| `d2hIssue ok`  | the dispatch (`D2hSyncDispatch`): failure finishes the session and ends the op (`FinishLocked(future.status());` then `EndSendOp();`); success registers `layer_future.OnReady` to resolve `d2h_promises[l]` and call `EndSendOp()`, and advances `next_layer = l + 1` |
+| `d2hIssue ok`  | the dispatch (`D2hSyncDispatch`): failure finishes the session and ends the op (`FinishLocked(future.status());` then `EndOp();`); success registers `layer_future.OnReady` to resolve `d2h_promises[l]` and call `EndOp()`, and advances `next_layer = l + 1` |
 | `d2hReady`     | the device finishes an issued copy: its `layer_future.OnReady` resolves `d2h_promises[l]` (`IsReady()`) |
-| `d2hEnd`       | the copy's `layer_future.OnReady` in `StartPush` ends its op via `EndSendOp` |
+| `d2hEnd`       | the copy's `layer_future.OnReady` in `StartPush` ends its op via `EndOp` |
 | `wake ok`      | `SendNextLayer`'s `layer_future->OnReady` callback (either after an issued copy resolved `d2h_promises[l]`, or — with `ok = false` — after the D2H loop exited early while `draining_` and `fail_unissued_layers` resolved `d2h_promises[next_layer..total_layers-1]` with an error): a failed copy or failed unissued promise finishes the session (`self->FinishLocked(status_or.status(), kD2hPhase)`); a draining session drops the layer (`if (self->draining_)`); otherwise the layer is scheduled on `push_pool()->Schedule` and `std::move(end_op).Cancel()` carries the op over |
 | `h2hIssue`     | the `push_pool` task up to the push: a draining session (`if (self->draining_)`) drops the layer and ends the op via `absl::Cleanup end_op`; otherwise a second op is taken (`++self->in_flight_`) and the push issued (`H2hWriteDirectAsync` → `BlockTransport::AsyncPush`, which fans a layer out into one stream group per source NUMA node via `AsyncPushShards` and joins them via `tsl::JoinFutures` into this one callback; the callback may even run inline on an argument error) |
 | `sendNext`     | the pool task's `SendNextLayer(l + 1)` followed by the release of the carried-over op (`absl::Cleanup end_op`) |
 | `h2hDone ok`   | the `H2hWriteDirectAsync` push callback: failure finishes the session (`self->FinishLocked(push_res.status(), kPushPhase)`); the last OK push (`remaining_h2h_layers_.fetch_sub(1) == 1`) finishes it OK (`self->Finish()`); the op ends either way |
 | `cancel`       | any `Finish(error)` from outside the data path: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), pull-worker spawn failure (`HandlePullStream`'s `counter_cleanup`), staging acquisition failure (`!acquire_status.ok()`), layer-buffer lease failure (`!host_layer_idx.ok()`), bad arguments in `StartPush` (`src_block_ids.empty() || ...`), pull-worker exceptions (`HandlePullStream`'s `catch`) |
-| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`session->Done()`) into `done_sending_` or `failed_recving_` by its status and erases it from `send_sessions_` |
+| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`send->Done()` in `RetireSettledSessionLocked`) into `done_sending_` or `failed_recving_` by its status (`(failed ? failed_recving_ : done_sending_).insert(send->req_id());`) and erases it from `sessions_` |
+
+The `TransferSession` interface calls that `KVCacheManagerWithTransfer` and the
+transport make on a send are not events: `TransferSendSession::Start`, called
+by `NotifyForRead` after `sessions_.try_emplace`, returns OK and changes nothing
+(the consumer's pull drives the send), and `TransferSendSession::TryBeginOp`
+returns `false`, so an incoming data push addressed to a send's uuid is refused
+by `BeginIncomingPush` in `block_transport_session.cc` before it touches the
+session (A8).
 
 ## Lock scopes
 
@@ -105,7 +119,7 @@ Every mutable field of `TransferSendSession` is `ABSL_GUARDED_BY(mu_)` except
 `cancelled_` (an atomic set in `FinishLocked` to wake `StagingLayerManager`),
 and `staging_layer_manager_` (internally synchronized); `base_`,
 `staging_allocator_`, `req_id_`, `uuid_`, `deadline_`, `register_start_` and
-`data_connection_reuse_` are `const`. Every `EndSendOp` below is one `mu_` scope
+`data_connection_reuse_` are `const`. Every `EndOp` below is one `mu_` scope
 under the default `pooled` connection policy and the A7 window under
 `per_transfer`.
 
@@ -114,23 +128,23 @@ under the default `pooled` connection policy and the A7 window under
 | `beginPull`    | 1: `ValidateAndBeginPull` | — (`deadline_` is `const`) |
 | `start`        | `StartPush`'s locked section (`if (draining_ || done_) return;` through `dst_ints_.assign`, populating `d2h_promises` and `d2h_layer_futures_`) plus `SendNextLayer(0)`'s scope (A6), preceded by `remote_data_endpoints_ =` and the scopes of `AcquireStagingWithRetry` (which touch only `remote_data_endpoints_` and `staging_`) | a `Finish` during `AcquireWithTimeout` hits `if (draining_ || done_)` in `AcquireStagingWithRetry` and drops the local `StagingAllocation` before `staging_` is assigned; a `Finish` between `staging_ = *std::move(acquired)` and `StartPush`'s locked section settles the idle session and releases `staging_` (`FinishLocked` runs `ReleaseStagingBlocksLocked()` at `in_flight_ == 0`), after which the locked section returns — both match `cancel` before `start`. A failed acquisition or bad arguments call `Finish(error)` (`cancel`) |
 | `d2hBegin`     | 1 deciding scope: the loop's `session_lock` (`if (draining_) { staging_layer_manager_.Release(l); return; } ++in_flight_;`), preceded by `AcquireStagingSlot` (below) | if the loop returns here (or earlier on `!host_layer_idx.ok()`), `fail_unissued_layers` resolves `d2h_promises[next_layer..total_layers-1]` with the session's error status so any armed `SendNextLayer` callback can run `wake false` |
-| `d2hIssue`     | on success, 0 `mu_` scopes (`D2hSyncDispatch` and `layer_future.OnReady` run outside `mu_`, since `d2h_promises[l]` was pre-allocated in `start`); on failure, `FinishLocked(future.status())` (1 scope) followed by `EndSendOp()` | a `Finish` during `D2hSyncDispatch` finds the op `d2hBegin` took and cannot settle; `layer_future.OnReady` is registered regardless of `draining_` (matching `d2hIssue true`), and the copy drains through `d2hEnd` (`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`). On `!future.ok()`, `fail_unissued_layers` resolves `d2h_promises[l..total_layers-1]` after `EndSendOp()`. If `layer_future` is already ready when `OnReady` is registered, the callback runs inline (`d2hReady` then `d2hEnd`) |
+| `d2hIssue`     | on success, 0 `mu_` scopes (`D2hSyncDispatch` and `layer_future.OnReady` run outside `mu_`, since `d2h_promises[l]` was pre-allocated in `start`); on failure, `FinishLocked(future.status())` (1 scope) followed by `EndOp()` | a `Finish` during `D2hSyncDispatch` finds the op `d2hBegin` took and cannot settle; `layer_future.OnReady` is registered regardless of `draining_` (matching `d2hIssue true`), and the copy drains through `d2hEnd` (`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`). On `!future.ok()`, `fail_unissued_layers` resolves `d2h_promises[l..total_layers-1]` after `EndOp()`. If `layer_future` is already ready when `OnReady` is registered, the callback runs inline (`d2hReady` then `d2hEnd`) |
 | `d2hReady`     | 0 (`d2h_promises[l].Set(status_or.status())` in `StartPush`'s `layer_future.OnReady`) | — |
-| `d2hEnd`       | 1: `EndSendOp` | — |
-| `wake`         | on `ok = false` or `draining_`: 2 (`FinishLocked` or the `if (self->draining_)` check, then `EndSendOp` from `absl::Cleanup end_op`); otherwise 1 (`if (self->draining_)` check, then `std::move(end_op).Cancel()` carries the op into the unlocked `push_pool()->Schedule`) | a `Finish` after the check and before the pool task runs is caught by the task's own `if (self->draining_)` check (`wake true`, `cancel`, `h2hIssue` ending the op) |
-| `h2hIssue`     | when draining: 2 (the task's `if (self->draining_)` check, then `EndSendOp` from `end_op`); otherwise 1 (the check through `++self->in_flight_`, followed by the unlocked `H2hWriteDirectAsync`) | a `Finish` between `++self->in_flight_` and `H2hWriteDirectAsync` does not stop the push (matching `h2hIssue`), and the push callback later retires the op (`Finish()` on the last OK push is a no-op once draining). Splitting the pool task into `h2hIssue` and `sendNext` via `chaining` also admits a push callback that runs before `SendNextLayer(l + 1)`, including inline (`h2hIssue`, `h2hDone`, `sendNext`) |
-| `sendNext`     | for `l + 1 < num_layers`: 2 (`SendNextLayer(l + 1)`'s scope from `if (draining_ || l >= d2h_layer_futures_.size()) return;` to `++in_flight_;`, then `EndSendOp` from the pool task's `end_op`); for the last layer, `SendNextLayer` returns before its lock (`if (l >= base_->num_layers()) return;`), leaving only `EndSendOp` | an `EndSendOp` tail, below |
-| `h2hDone`      | on `ok = false`: 2 (`FinishLocked(push_res.status(), kPushPhase)`, then `EndSendOp` from `end_op`); on `ok = true`: lock-free `remaining_h2h_layers_.fetch_sub(1)`, then `Finish()` (1 scope) if it was the last layer, then `EndSendOp` | nothing else reads `remaining_h2h_layers_`, so any step between `fetch_sub` and `Finish()` orders before `h2hDone` (a `cancel` in that gap wins, matching `cancel` then `h2hDone true` because `finishOnceLocked` ignores the later OK); after `Finish()`, an `EndSendOp` tail |
+| `d2hEnd`       | 1: `EndOp` | — |
+| `wake`         | on `ok = false` or `draining_`: 2 (`FinishLocked` or the `if (self->draining_)` check, then `EndOp` from `absl::Cleanup end_op`); otherwise 1 (`if (self->draining_)` check, then `std::move(end_op).Cancel()` carries the op into the unlocked `push_pool()->Schedule`) | a `Finish` after the check and before the pool task runs is caught by the task's own `if (self->draining_)` check (`wake true`, `cancel`, `h2hIssue` ending the op) |
+| `h2hIssue`     | when draining: 2 (the task's `if (self->draining_)` check, then `EndOp` from `end_op`); otherwise 1 (the check through `++self->in_flight_`, followed by the unlocked `H2hWriteDirectAsync`) | a `Finish` between `++self->in_flight_` and `H2hWriteDirectAsync` does not stop the push (matching `h2hIssue`), and the push callback later retires the op (`Finish()` on the last OK push is a no-op once draining). Splitting the pool task into `h2hIssue` and `sendNext` via `chaining` also admits a push callback that runs before `SendNextLayer(l + 1)`, including inline (`h2hIssue`, `h2hDone`, `sendNext`) |
+| `sendNext`     | for `l + 1 < num_layers`: 2 (`SendNextLayer(l + 1)`'s scope from `if (draining_ || l >= d2h_layer_futures_.size()) return;` to `++in_flight_;`, then `EndOp` from the pool task's `end_op`); for the last layer, `SendNextLayer` returns before its lock (`if (l >= base_->num_layers()) return;`), leaving only `EndOp` | an `EndOp` tail, below |
+| `h2hDone`      | on `ok = false`: 2 (`FinishLocked(push_res.status(), kPushPhase)`, then `EndOp` from `end_op`); on `ok = true`: lock-free `remaining_h2h_layers_.fetch_sub(1)`, then `Finish()` (1 scope) if it was the last layer, then `EndOp` | nothing else reads `remaining_h2h_layers_`, so any step between `fetch_sub` and `Finish()` orders before `h2hDone` (a `cancel` in that gap wins, matching `cancel` then `h2hDone true` because `finishOnceLocked` ignores the later OK); after `Finish()`, an `EndOp` tail |
 | `cancel`       | 1: `Finish(error)` (for the deadline sweep, `!IsDraining()` is checked in an earlier scope; `deadline()` is `const`) | `TransferSendSession::FinishLocked` ignores every call after the first (`if (draining_ || done_) return;`), so a stale sweep is a no-op (`trace_cancel_after_ok_finish`, `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess`) |
 | `publish`      | under manager `mu_`: `Done()`, `GetStatus()`, `Details()` | nothing changes on a settled sender (`TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone`), so no late error can split the published set from `transfer_details_` |
 
-**`EndSendOp` tails.** `d2hIssue false`, `wake`, `h2hIssue`, `sendNext` and
-`h2hDone` all run `EndSendOp` after releasing the deciding scope's lock.
+**`EndOp` tails.** `d2hIssue false`, `wake`, `h2hIssue`, `sendNext` and
+`h2hDone` all run `EndOp` after releasing the deciding scope's lock.
 Between the two scopes, `in_flight_` still counts the op. Because only the
 settle checks in `FinishLocked` and `EndSendOpLocked` (and A7's `release_due`)
 read `in_flight_`, any step in the gap makes the same decision as after
-`EndSendOp`, except that a `Finish` in the gap leaves the final settle to
-`EndSendOp` with the same resulting `draining_`, `done_` and `status_`. Every
+`EndOp`, except that a `Finish` in the gap leaves the final settle to
+`EndOp` with the same resulting `draining_`, `done_` and `status_`. Every
 such interleaving therefore reaches the same state as running the whole event
 first, keeping the ghost counters (`d2hRetired`, `woken`, `pooled`, `chaining`,
 `h2hRetired`) sound.
@@ -142,10 +156,10 @@ re-reads `draining_`; the model matches this directly, so a `cancel` between
 is admitted in the same order. The only multi-scope fold across distinct
 operations is A6 (`SendNextLayer(0)` folded into `start`).
 
-### Bounded host layer staging (`TPU_RAIDEN_NUM_STAGING_LAYERS`)
+### Bounded host layer staging (`num_staging_layers`)
 
-When `TPU_RAIDEN_NUM_STAGING_LAYERS` is set below `num_layers`
-(`ResolveEnvNumStagingLayers` in `base.cc`), the host mirror has fewer layer
+When the manager is constructed with `num_staging_layers` below `num_layers`
+(`ResolveNumStagingLayers` in `base.cc`), the host mirror has fewer layer
 buffers than `num_layers` and each `TransferSendSession` arbitrates them
 through `staging_layer_manager_` (`StagingLayerManager`). Before `d2hBegin`,
 each D2H loop iteration calls `TransferSendSession::AcquireStagingSlot(l)`,
@@ -157,7 +171,9 @@ calls `FinishLocked(slot.status(), kStagingPhase)` on a non-cancelled failure,
 and under `mu_` returns a lease won after `done_ || draining_`; if
 `AcquireStagingSlot` fails, `StartPush` calls `Finish(host_layer_idx.status())`
 and returns (triggering `fail_unissued_layers`). While pushing, `BlockTransport`
-resolves layer `l`'s host pointer through `hooks.lookup_send_staging` →
+resolves layer `l`'s host pointer through `KVCacheManagerBase::GetBlockChunks`,
+which looks the session up (`GetSession(uuid)`, the manager's `sessions_` map)
+and calls `session->ResolveStagingSlot(layer_idx)` →
 `TransferSendSession::LookupStagingSlot(l)` (`staging_layer_manager_.Lookup`).
 Each leased buffer is released on early return (`d2hBegin` `if (draining_)`,
 `d2hIssue` `!future.ok()`, `wake` error or `draining_`, `h2hIssue` `draining_`),
@@ -203,7 +219,8 @@ drain-to-settle termination, and the `1`-slot sufficiency witness
   sends an Ack (`SendAck` has only test callers), so it is not an
   event; nor is the ack-first path of `NotifyForRead`, which reports
   `done_sending` without registering the session when `pending_acks_.erase(uuid) > 0`
-  (filled only by `AckSend` when `it == send_sessions_.end()`). With it,
+  (filled only by `AckSend` when `FindSessionLocked<TransferSendSession>(uuid)`
+  returns `nullptr`). With it,
   `Publication` below would read "the consumer acked", not "every layer was
   pushed".
 * **A6 (fold of `SendNextLayer(0)` into `start`).** Between `StartPush`'s locked
@@ -216,7 +233,7 @@ drain-to-settle termination, and the `1`-slot sufficiency witness
   `if (draining_)` — the exact state reached by `cancel` before `start`. The
   locked section and `SendNextLayer(0)` therefore fold into one event `start`.
 
-* **A7 (connection release window).** `EndSendOp`
+* **A7 (connection release window).** `EndOp`
   is modelled as the atomic `endOp`. Under `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer`
   (default `pooled`, which never enters this branch) the last op of a draining
   send first drops `mu_` to close the idle data connections to the consumer
@@ -232,8 +249,16 @@ drain-to-settle termination, and the `1`-slot sufficiency witness
   Every op exit — including `!future.ok()` in `StartPush`, which can be the
   last op when earlier layers already pushed
   (`TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend`) —
-  goes through `EndSendOp()`. The window delays `done_`, which every trace
+  goes through `EndOp()`. The window delays `done_`, which every trace
   already allows between events.
+* **A8 (no incoming push on a send).** `TransferSendSession::TryBeginOp`
+  returns `false` unconditionally, so `BeginIncomingPush` in
+  `block_transport_session.cc` refuses a data push whose uuid names a send
+  with `absl::CancelledError` before calling anything else on it, and
+  `TransferSendSession::OnDataReceived` always returns
+  `absl::FailedPreconditionError`. Neither takes an op or changes a field, so
+  the model has no event for them; the receiver's `TryBeginOp` / `EndOp` pair
+  is `PrefillDecode/Transport.lean`'s business.
 
 ## Properties
 
@@ -247,7 +272,10 @@ All proved on every reachable state (`reachable_safe`):
   what the comments on `in_flight_` (`TransferSendSession`) and the
   send-deadline loop in `CompleteReadWithDetails` promise.
 * **Staging integrity.** `hasStaging = !done`: staging, once acquired, is held
-  exactly until the session settles.
+  exactly until the session settles (`hasStaging` stands for
+  `!staging_.empty()`, which `CurrentPhaseLocked` reads; `ReleaseStagingBlocksLocked`
+  clears it at the two settle sites, `FinishLocked` and `EndSendOpLocked`, and
+  in `~TransferSendSession`).
 * **Prompt settle.** `draining → inFlight = 0 → done`.
 * **No underflow.** `EndSendOpLocked` never runs on an idle session.
 * **Publication.** `published = some true → h2hOk = numLayers`: when the
@@ -290,8 +318,8 @@ already-armed `SendNextLayer` callback wakes via `wake false` and retires its op
 exercise, as `Receive/Coverage.lean` does (branch = leaf of an event's
 decision tree with its lifecycle effect; `stepT_step` proves agreement with
 `step`). On 0–2 layers, `step` has 40 reachable branches (every leaf live); the
-31 paired upstream tests reach 27, and the remaining 13 are classified into
-missing upstream tests (5), lock-gap windows no harness hook reaches (6), or
+33 paired upstream tests reach 29, and the remaining 11 are classified into
+missing upstream tests (3), lock-gap windows no harness hook reaches (6), or
 callback orderings where the model admits both orders (2). The `#guard` at the
 end of `Coverage.lean` fails if a branch, a trace or a classification changes.
 
@@ -316,69 +344,77 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `send.h` | `TransferSendSession::Done` | `:69-72` |
-| `send.h` | `TransferSendSession::GetStatus` | `:76-79` |
-| `send.h` | `TransferSendSession::IsDraining` | `:87-90` |
-| `send.h` | `TransferSendSession::deadline` | `:149` |
-| `send.h` | `TransferSendSession` (`mutable absl::Mutex mu_;` .. `const DataConnectionReuse data_connection_reuse_;`) | `:207-215` |
-| `send.h` | `TransferSendSession` (`bool pull_started_` .. `StagingLayerManager staging_layer_manager_;`) | `:227-245` |
+| `send.h` | `TransferSendSession::Done` | `:81-84` |
+| `send.h` | `TransferSendSession::GetStatus` | `:100-103` |
+| `send.h` | `TransferSendSession::IsDraining` | `:111-114` |
+| `send.h` | `TransferSendSession::Start` | `:88` |
+| `send.h` | `TransferSendSession::TryBeginOp` | `:92` |
+| `send.h` | `TransferSendSession::deadline` | `:163` |
+| `send.h` | `TransferSendSession` (`mutable absl::Mutex mu_;` .. `const DataConnectionReuse data_connection_reuse_;`) | `:216-224` |
+| `send.h` | `TransferSendSession` (`bool pull_started_` .. `StagingLayerManager staging_layer_manager_;`) | `:232-250` |
 | `send.cc` | `*` (`constexpr absl::string_view kAwaitPullPhase` .. `constexpr absl::string_view kPushPhase`) | `:57-60` |
-| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:145-159` |
-| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:186-190` |
-| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:197-226` |
-| `send.cc` | `TransferSendSession::LookupStagingSlot` | `:228-243` |
-| `send.cc` | `TransferSendSession::FinishLocked` | `:245-260` |
-| `send.cc` | `TransferSendSession::Finish` | `:262-271` |
-| `send.cc` | `TransferSendSession::Details` | `:279-295` |
-| `send.cc` | `TransferSendSession::CurrentPhaseLocked` | `:297-305` |
-| `send.cc` | `TransferSendSession::EndSendOpLocked` | `:307-314` |
-| `send.cc` | `TransferSendSession::EndSendOp` | `:316-343` |
-| `send.cc` | `TransferSendSession::AcquireStagingWithRetry` | `:376-410` |
-| `send.cc` | `TransferSendSession::StartPush` | `:412-559` |
-| `send.cc` | `TransferSendSession::StartPush` (`if (src_block_ids.empty()`) | `:423-428` |
-| `send.cc` | `TransferSendSession::StartPush` (`remote_data_endpoints_ = remote_data_endpoints;`) | `:431` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `dst_ints_.assign`) | `:434-467` |
-| `send.cc` | `TransferSendSession::StartPush` (`SendNextLayer(0);` .. `for (size_t l = next_layer; l < total_layers; ++l)`) | `:483-503` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::StatusOr<size_t> host_layer_idx = AcquireStagingSlot(l);` .. `next_layer = l + 1;`) | `:508-557` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::MutexLock session_lock(mu_);` .. `++in_flight_;`) | `:514-521` |
-| `send.cc` | `TransferSendSession::StartPush` (`if (!future.ok())`) | `:533-549` |
-| `send.cc` | `TransferSendSession::StartPush` (`layer_future.OnReady`) | `:551-556` |
-| `send.cc` | `TransferSendSession::SendNextLayer` | `:561-660` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`if (l >= base_->num_layers())` .. `++in_flight_;`) | `:564-576` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future->OnReady`) | `:579-659` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!status_or.ok())`) | `:586-595` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`absl::MutexLock session_lock(self->mu_);` .. `std::move(end_op).Cancel();`) | `:597-605` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->push_pool()->Schedule`) | `:606-658` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`remote_data_endpoints = self->remote_data_endpoints_;` .. `++self->in_flight_;`) | `:617-620` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:625-653` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!push_res.ok())`) | `:630-639` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;`) | `:648` |
-| `base.cc` | `*` (`size_t ResolveEnvNumStagingLayers(size_t num_layers) {` .. `return requested;`) | `:420-429` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`slot = transfer_hooks_.lookup_send_staging(uuid, layer_idx);`) | `:3341` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.lookup_send_staging =`) | `:475-488` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : send_sessions_)`) | `:568-572` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:654-701` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();`) | `:1159-1181` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1431-1557` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`absl::Cleanup counter_cleanup` .. `std::move(counter_cleanup).Cancel();`) | `:1516-1539` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandleAck` | `:1559-1562` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::AckSend` | `:1625-1648` |
-| `bt.cc` | `BlockTransport::AsyncPush` | `:499-548` |
-| `send_drain_test.cc` | `SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds` | `:509-533` |
-| `send_drain_test.cc` | `SendDrainTest.SendNobodyPulledFailsAtItsDeadline` | `:555-564` |
-| `send_drain_test.cc` | `SendDrainTest.FailedLayerWaitsForTheOtherLayersCopies` | `:535-553` |
-| `send_drain_test.cc` | `SendLifecycleTest.FailedSendWithoutWorkSettlesImmediately` | `:620-630` |
-| `send_drain_test.cc` | `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess` | `:652-664` |
-| `send_drain_test.cc` | `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure` | `:666-678` |
-| `send_drain_test.cc` | `SendLifecycleTest.DetailsSayAnUnpulledSendTimedOutAwaitingItsPull` | `:698-719` |
-| `send_drain_test.cc` | `SendDrainTest.DetailsSayAnExpiredSendWasStillCopying` | `:721-738` |
-| `send_drain_test.cc` | `SendDrainTest.DetailsCarryTheErrorOfAFailedCopy` | `:740-753` |
-| `send_drain_test.cc` | `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun` | `:755-782` |
-| `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` | `:1487-1585` |
-| `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` | `:1587-1735` |
-| `pool_reshard_test.cc` | `SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` | `:369-378` |
-| `control_test.cc` | `ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected` | `:311-333` |
-| `control_test.cc` | `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement` | `:370-382` |
+| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:201-215` |
+| `send.cc` | `TransferSendSession::GetDataReadyFuture` | `:217-224` |
+| `send.cc` | `TransferSendSession::OnDataReceived` | `:323-329` |
+| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:226-230` |
+| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:237-266` |
+| `send.cc` | `TransferSendSession::LookupStagingSlot` | `:268-287` |
+| `send.cc` | `TransferSendSession::FinishLocked` | `:289-304` |
+| `send.cc` | `TransferSendSession::Finish` | `:306-315` |
+| `send.cc` | `TransferSendSession::Details` | `:331-347` |
+| `send.cc` | `TransferSendSession::CurrentPhaseLocked` | `:349-357` |
+| `send.cc` | `TransferSendSession::EndSendOpLocked` | `:359-366` |
+| `send.cc` | `TransferSendSession::EndOp` | `:368-395` |
+| `send.cc` | `TransferSendSession::AcquireStagingWithRetry` | `:428-462` |
+| `send.cc` | `TransferSendSession::StartPush` | `:464-611` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (src_block_ids.empty()`) | `:475-480` |
+| `send.cc` | `TransferSendSession::StartPush` (`remote_data_endpoints_ = remote_data_endpoints;`) | `:483` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `dst_ints_.assign`) | `:486-519` |
+| `send.cc` | `TransferSendSession::StartPush` (`SendNextLayer(0);` .. `for (size_t l = next_layer; l < total_layers; ++l)`) | `:535-555` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::StatusOr<size_t> host_layer_idx = AcquireStagingSlot(l);` .. `next_layer = l + 1;`) | `:560-609` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::MutexLock session_lock(mu_);` .. `++in_flight_;`) | `:566-573` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (!future.ok())`) | `:585-601` |
+| `send.cc` | `TransferSendSession::StartPush` (`layer_future.OnReady`) | `:603-608` |
+| `send.cc` | `TransferSendSession::SendNextLayer` | `:613-712` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (l >= base_->num_layers())` .. `++in_flight_;`) | `:616-628` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future->OnReady`) | `:631-711` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!status_or.ok())`) | `:638-647` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`absl::MutexLock session_lock(self->mu_);` .. `std::move(end_op).Cancel();`) | `:649-657` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->push_pool()->Schedule`) | `:658-710` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`remote_data_endpoints = self->remote_data_endpoints_;` .. `++self->in_flight_;`) | `:669-672` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:677-705` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!push_res.ok())`) | `:682-691` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;`) | `:700` |
+| `base.cc` | `*` (`size_t ResolveNumStagingLayers(size_t num_layers,` .. `return requested;`) | `:429-445` |
+| `base.cc` | `KVCacheManagerBase::GetSession` | `:2716-2722` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`absl::StatusOr<size_t> slot = session->ResolveStagingSlot(layer_idx);`) | `:3172` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.get_session =`) | `:276` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:280-287` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : sessions_)`) | `:368-372` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:513-566` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin(); it != sessions_.end();)`) | `:999-1044` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` (`if (auto send = std::dynamic_pointer_cast<TransferSendSession>(it->second)) {` .. `base_->ClearRemoteLayerAddrs(uuid);`) | `:475-485` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1164-1289` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`absl::Cleanup counter_cleanup` .. `std::move(counter_cleanup).Cancel();`) | `:1248-1271` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandleAck` | `:1291-1294` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::AckSend` | `:1337-1352` |
+| `bt.cc` | `BlockTransport::AsyncPush` | `:513-562` |
+| `bts.cc` | `BeginIncomingPush` | `:286-300` |
+| `send_drain_test.cc` | `SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds` | `:515-539` |
+| `send_drain_test.cc` | `SendDrainTest.SendNobodyPulledFailsAtItsDeadline` | `:614-623` |
+| `send_drain_test.cc` | `SendDrainTest.FailedLayerWaitsForTheOtherLayersCopies` | `:541-559` |
+| `send_drain_test.cc` | `SendLifecycleTest.FailedSendWithoutWorkSettlesImmediately` | `:679-689` |
+| `send_drain_test.cc` | `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess` | `:711-723` |
+| `send_drain_test.cc` | `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure` | `:725-737` |
+| `send_drain_test.cc` | `SendLifecycleTest.DetailsSayAnUnpulledSendTimedOutAwaitingItsPull` | `:757-778` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsSayAnExpiredSendWasStillCopying` | `:780-797` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsCarryTheErrorOfAFailedCopy` | `:799-812` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun` | `:814-841` |
+| `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` | `:1929-2026` |
+| `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` | `:2028-2175` |
+| `pool_reshard_test.cc` | `SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` | `:415-424` |
+| `control_test.cc` | `ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected` | `:320-342` |
+| `control_test.cc` | `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement` | `:379-391` |
 | `transfer_send_session_test.cc` | `FakeSendBase::CompleteH2h` | `:97-104` |
 | `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone` | `:219-242` |
 | `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:244-264` |
@@ -386,12 +422,15 @@ Generated by `tools/resolve_anchors.py`.
 | `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush` | `:300-326` |
 | `transfer_send_session_test.cc` | `TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:328-343` |
 | `transfer_send_session_test.cc` | `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface` | `:345-375` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator` | `:410-453` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm` | `:455-482` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `:484-541` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang` | `:580-599` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone` | `:622-652` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies` | `:683-736` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend` | `:742-797` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator` | `:408-451` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm` | `:453-479` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `:481-534` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang` | `:573-591` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone` | `:613-643` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies` | `:678-716` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend` | `:722-776` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce` | `:782-802` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled` | `:808-830` |
+| `send_drain_test.cc` | `SendDrainTest.BlockReadinessWaitsForTheSendsLayerCopy` | `:564-612` |
 <!-- source-map:end -->
 -/

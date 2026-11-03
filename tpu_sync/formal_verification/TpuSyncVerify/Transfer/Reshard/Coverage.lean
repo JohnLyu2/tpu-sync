@@ -10,7 +10,7 @@ byte-interval coverage and multi-sender push-stream accounting:
 * `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (`ValidateSpanCoverage`,
   `EmitSpanSchedule` `expected_pushes` computation, `DefaultTransferStreams`,
   and `BuildPoolReshardPlan`)
-* `tpu_sync/kv_cache/reshard_send_session.cc` (`ReshardSendSession::ExecutePush` /
+* `tpu_sync/kv_cache/reshard_send_session.cc` (`ReshardSendSession::ExecutePushPipeline` /
   `ReshardSendSession::StartPoolPush` per-peer `(src_block_id, dst_block_id)`
   deduplication)
 * `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`)
@@ -76,37 +76,39 @@ What this module proves:
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |------|-----------------|-------|
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:67-144` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` | `:146-349` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`const int64_t parallelism = plan.parallelism();`) | `:188` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)`) | `:245-258` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:286-305` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:314-319` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:328-339` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:69-146` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` | `:148-351` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`const int64_t parallelism = plan.parallelism();`) | `:190` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)`) | `:247-260` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:288-307` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:316-321` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:330-341` |
 | `planner.h` | `*` (`inline constexpr char kTransferStreamsEnvVar[]`) | `:163` |
 | `planner.cc` | `ValidateSpanCoverage` | `:350-487` |
 | `planner.cc` | `EmitSpanSchedule` | `:503-607` |
 | `planner.cc` | `DefaultTransferStreams` | `:611-628` |
 | `planner.cc` | `BuildPoolReshardPlan` (`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`) | `:984-994` |
 | `planner.cc` | `BuildPoolReshardPlan` (`expected_pushes_by_dst;` .. `if (expected_pushes_by_dst.at(dst_unit_id) <= 0)`) | `:1234-1246` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`for (int32_t encoded_pool_idx : plan_.transfer_pool_indices())` .. `if (pool_src_block_ids.empty())`) | `:204-217` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:267-349` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`for (size_t pool_idx : ordered_pools)` .. `if (pool_src_block_ids.empty())`) | `:322-334` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:398-501` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:423-427` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:506-702` |
-| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:568-598` |
-| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2700-2743` |
-| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2745-2762` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:227-255` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:278-289` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:291-302` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsShortCoverage` | `:304-314` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsNonPrefixExtents` | `:316-330` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingExtents` | `:332-341` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingParallelism` | `:343-352` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:354-363` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:365-403` |
-| `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:222-269` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:446-450` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:526-695` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:582-612` |
+| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2736-2745` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2747-2755` |
+| `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::GetPoolPushProgressSpec` | `:241-271` |
+| `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::ExpectedPushSenders` | `:273-279` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:248-276` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:299-310` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:312-323` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsShortCoverage` | `:325-335` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsNonPrefixExtents` | `:337-351` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingExtents` | `:353-362` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingParallelism` | `:364-373` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:375-384` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:386-424` |
+| `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:237-284` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.SingleDestinationIsPoolsTimesOnePeer` | `:49-55` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ReplicatedDestinationsIsPoolsTimesPeers` | `:57-65` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ShardedGroupCountsOnlyItsPeers` | `:67-76` |
@@ -164,7 +166,7 @@ def senderPairs (entries : List ScheduleEntry) (sender : Nat) : List (Nat × Nat
 /-- Number of TCP push streams opened by `sender` under `parallelism`:
 `BlockTransport::AsyncPushShards` clamps `P = min(parallelism, num_blocks)`
 (`block_transport.cc`), and a sender with zero pairs opens no streams
-(`ReshardSendSession::ExecutePush` `if (pool_src_block_ids.empty())` in
+(`ReshardSendSession::ExecutePushPipeline` `if (pool_src_block_ids.empty())` in
 `reshard_send_session.cc`). -/
 def senderStreams (parallelism : Nat) (entries : List ScheduleEntry) (sender : Nat) : Nat :=
   Nat.min parallelism (senderPairs entries sender).length
@@ -640,12 +642,14 @@ def validGroupExtents (liveBytes : Nat) : List Nat → Bool
   | e :: rest => decide (e = liveBytes) && validGroupExtents liveBytes rest
 
 /-- `KVCacheManagerBase::ExpectedPushSenders`
-(`tpu_sync/kv_cache/kv_cache_manager_base.cc`):
-returns `some schedules.length` when the active plan is a block-addressed
-receiver plan (`!isSender` and `pool_groups_size() == 0`) with non-empty
+(`tpu_sync/kv_cache/kv_cache_manager_base.cc`, resolving the uuid's session
+plan through `GetTransferPlan` and answering with
+`TransferPlan::ExpectedPushSenders` in `tpu_sync/kv_cache/transfer_plan.cc`):
+returns `some schedules.length` when the plan is a block-addressed receiver
+plan (`!is_sender_` and `pool_groups_size() == 0`) with non-empty
 `shard_push_schedules`, and `none` for sender plans, pool-grouped plans (which
-use `KVCacheManagerBase::GetPoolPushProgressSpec`), bare plans, or after
-`UnregisterActivePlan`. -/
+use `TransferPlan::GetPoolPushProgressSpec`), bare plans, or once the session
+is gone (`UnregisterActivePlan`, `GetSession` failing). -/
 def expectedPushSenders (isSender : Bool) (schedules : List (Nat × List ScheduleEntry)) :
     Option Nat :=
   if isSender || schedules.isEmpty then none

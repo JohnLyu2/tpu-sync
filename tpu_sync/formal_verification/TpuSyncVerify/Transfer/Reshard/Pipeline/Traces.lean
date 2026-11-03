@@ -31,7 +31,7 @@ stream:
 -/
 
 def outOfOrderPrefix : List Ev :=
-  [ -- Sender issues D2H for pool 0 (1 peer) and pool 1 (2 peers), finishes ExecutePush,
+  [ -- Sender issues D2H for pool 0 (1 peer) and pool 1 (2 peers), finishes ExecutePushPipeline,
     -- and completes all 3 peer pushes onto the wire.
     .send (.d2hIssue 0 true), .send (.d2hIssue 1 true), .send .execFinish,
     .send (.d2hDone 0 true), .send (.d2hDone 1 true),

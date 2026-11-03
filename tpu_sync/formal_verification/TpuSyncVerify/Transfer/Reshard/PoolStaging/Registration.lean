@@ -14,14 +14,17 @@ We now model the interaction between `KVCacheManagerWithTransfer::PoolReshardReg
 `ReshardReceiveSession` (`ReshardReceiveSession::Create`,
 `ReshardReceiveSession::AcquireStagingLeases`, `ReshardReceiveSession::ReleaseStaging`),
 and `PoolStagingStorage` across two registration policies:
-- `RegistrationPolicy.reserveBeforeLease` (shipping): `ReshardReceiveSession::Create`
-  claims `uuid` via `base->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false)`
-  before constructing the session and calling `AcquirePoolStagingLease`, rolling
-  back the claim on lease failure (`session->ReleaseStaging(); base->UnregisterActivePlanDirect(plan.uuid()).IgnoreError();`).
+- `RegistrationPolicy.reserveBeforeLease` (shipping): `PoolReshardRegisterRecv`
+  claims `uuid` in `pending_pool_reshard_recvs_` under its `mu_`
+  (`if (!pending_pool_reshard_recvs_.insert(plan.uuid()).second)`) before
+  `ReshardReceiveSession::Create` constructs the session and calls
+  `AcquirePoolStagingLease`, releasing the partial lease
+  (`session->ReleaseStaging();`) and dropping the claim
+  (`absl::Cleanup clear_pending`) on lease failure.
 - `RegistrationPolicy.leaseBeforeReserve` (mutant):
-  `AcquirePoolStagingLease` runs before `RegisterActivePlanDirect` claims `uuid`,
-  so a rejected duplicate registration's destructor releases the active session's
-  staging lease. -/
+  `AcquirePoolStagingLease` runs before the uuid is claimed, so a rejected
+  duplicate registration's destructor releases the active session's staging
+  lease. -/
 
 inductive RegistrationPolicy where
   | reserveBeforeLease
@@ -29,9 +32,9 @@ inductive RegistrationPolicy where
   deriving DecidableEq, Repr
 
 /-- A pending `PoolReshardRegisterRecv` call that has passed Phase 1 (the initial
-`active_pool_reshard_recvs_` check and, under `reserveBeforeLease`,
-`RegisterActivePlanDirect`) and is currently executing Phase 2
-(`AcquireStagingLeases`) or Phase 3 (`active_pool_reshard_recvs_` insertion). -/
+`sessions_` check and, under `reserveBeforeLease`, the
+`pending_pool_reshard_recvs_` claim) and is currently executing Phase 2
+(`AcquireStagingLeases`) or Phase 3 (`sessions_` insertion). -/
 structure InFlightArm where
   callId : Nat
   uuid : Nat
@@ -42,8 +45,8 @@ structure InFlightArm where
 /-- State of the receive-registration + bounded-staging subsystem. -/
 structure RegState where
   arena : Arena
-  /-- UUIDs currently registered in `active_pool_reshard_recvs_` and
-  `RegisterActivePlanDirect`, paired with their required destination block IDs. -/
+  /-- UUIDs whose `ReshardReceiveSession` is in `sessions_`, paired with their
+  required destination block IDs. -/
   activeSessions : List (Nat × List Nat)
   /-- Concurrent `PoolReshardRegisterRecv` calls in flight between Phase 1 and
   Phase 3. -/
@@ -51,24 +54,27 @@ structure RegState where
   deriving DecidableEq, Repr
 
 inductive RegEv where
-  /-- Phase 1 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-  `ReshardReceiveSession::Create`): check if `uuid` is already active;
-  under `.reserveBeforeLease`, also claim `uuid` via `RegisterActivePlanDirect`
-  against concurrent arms immediately. -/
+  /-- Phase 1 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`): check if
+  `uuid` is already active in `sessions_`; under `.reserveBeforeLease`, also
+  claim `uuid` in `pending_pool_reshard_recvs_` against concurrent arms
+  immediately. -/
   | beginArm (callId uuid : Nat) (blocks : List Nat)
   /-- Phase 2 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
   `ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`): call
   `AcquirePoolStagingLease(uuid, blocks)` outside `mu_`. -/
   | acquireArmLease (callId : Nat)
   /-- Phase 3 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`): finish registration
-  and insert into `active_pool_reshard_recvs_`. Under `.leaseBeforeReserve`, if
-  `uuid` is already in `activeSessions`, `RegisterActivePlanDirect` returns
-  `AlreadyExistsError` and the temporary `ReshardReceiveSession` destructor runs
+  and insert into `sessions_`. Under `.leaseBeforeReserve`, if `uuid` is already
+  in `activeSessions`, the registration is refused (`AlreadyExistsError`) and
+  the temporary `ReshardReceiveSession` destructor runs
   `ReleasePoolStagingLeases(uuid)` (`ReshardReceiveSession::~ReshardReceiveSession`,
   `ReshardReceiveSession::ReleaseStagingLocked`). -/
   | finishArm (callId : Nat)
-  /-- Normal session completion (`FinishPoolH2d` / `UnregisterActivePlan`):
-  releases `uuid`'s staging lease and removes `uuid` from `activeSessions`. -/
+  /-- Normal session completion (`FinishPoolH2d` / `UnregisterActivePlan`, then
+  `RetireSettledSessionLocked`): releases `uuid`'s staging lease and removes
+  `uuid` from `activeSessions`. Under `.reserveBeforeLease` the poll skips the
+  release while an arm for `uuid` is in flight (`CompleteReadWithDetails`,
+  `pending_pool_reshard_recvs_.contains(uuid)`). -/
   | settleSession (uuid : Nat)
   deriving DecidableEq, Repr
 
@@ -108,7 +114,7 @@ def RegState.step (policy : RegistrationPolicy) (s : RegState) (e : RegEv) : Opt
         | none =>
           -- Phase 2 `AcquireStagingLeases` failed (`ResourceExhausted`):
           -- `ReshardReceiveSession::Create` releases any partial lease and
-          -- rolls back `UnregisterActivePlanDirect`
+          -- `PoolReshardRegisterRecv`'s cleanup drops the pending claim
           -- (`ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`, `ReshardReceiveSession::ReleaseStagingLocked`).
           some { s with
             arena := s.arena.releaseLease arm.uuid
@@ -124,9 +130,9 @@ def RegState.step (policy : RegistrationPolicy) (s : RegState) (e : RegEv) : Opt
     | some arm =>
       if !arm.leasedInPhase2 then none
       else if s.hasActiveUuid arm.uuid then
-        -- Under `.leaseBeforeReserve`, `RegisterActivePlanDirect` returns
-        -- `AlreadyExistsError` (`active_plans_.try_emplace` in `KVCacheManagerBase::RegisterActivePlan`) after
-        -- `Create` already acquired the lease, and the temporary
+        -- Under `.leaseBeforeReserve`, the registration is refused with
+        -- `AlreadyExistsError` after `Create` already acquired the lease, and
+        -- the temporary
         -- `ReshardReceiveSession` destructor calls
         -- `ReleasePoolStagingLeases(arm.uuid)`.
         some { s with
@@ -166,7 +172,7 @@ Under the unreserved mutant `.leaseBeforeReserve`:
    Phase 3 (`finishArm 1`), becoming an active receive session.
 3. Call 2 executes Phase 2 (`acquireArmLease 2`), which succeeds idempotently on
    `uuid = 7`'s existing lease (`KVCacheManagerBase::AcquirePoolStagingLease`), and then
-   reaches Phase 3 (`finishArm 2`). `RegisterActivePlanDirect` rejects Call 2
+   reaches Phase 3 (`finishArm 2`). The registration rejects Call 2
    with `AlreadyExistsError`, and Call 2's `~ReshardReceiveSession` runs
    `ReleasePoolStagingLeases(7)` — freeing Call 1's slot `0` back to `freeSlots`
    while Call 1 (`uuid = 7`) is still in `activeSessions`!
