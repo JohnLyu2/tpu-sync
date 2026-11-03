@@ -13,7 +13,7 @@ citations live there; this note is what to keep in mind when touching the code.
 `draining_`, `done_`, `in_flight_` and the host-staging lease move together
 (`done → draining`, `done → in_flight_ == 0`; `Lifecycle.Consistent`). Every
 "is this callback safe?" question in `TransferSendSession` /
-`TransferReceiveSession` reduces to: is the op counted (`TryBeginRecvOp` /
+`TransferReceiveSession` reduces to: is the op counted (`TryBeginOp` /
 `++in_flight_` under `mu_`, Lean `Lifecycle.beginOp`)
 before `mu_` is released, and un-counted (`EndRecvOpLocked` / `EndSendOpLocked`) on every exit path,
 early returns included? The regression for the one non-obvious exit is

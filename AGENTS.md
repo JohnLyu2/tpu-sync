@@ -16,7 +16,7 @@ work. Before non-trivial work read `notes/AGENTS.md`, the last entry of
 
 ## Code map
 
-- Transfer sessions: `tpu_sync/kv_cache/transfer_send_session.{h,cc}`, `tpu_sync/kv_cache/transfer_receive_session.{h,cc}` (moved from `tpu_sync/core/` in upstream `5afe1ef`, 2026-10-07)
+- Transfer sessions: `tpu_sync/kv_cache/transfer_send_session.{h,cc}`, `tpu_sync/kv_cache/transfer_receive_session.{h,cc}` (moved from `tpu_sync/core/` in upstream `5afe1ef`, 2026-10-07); common interface `TransferSession`: `tpu_sync/transport/transfer_session.h` (upstream `10d181f6`.., 2026-10-30); `StagingLayerManager`: `tpu_sync/kv_cache/transfer_session.h`; pool-reshard sessions `tpu_sync/kv_cache/reshard_{send,receive}_session.{h,cc}`
 - Transfer manager, stats polling (`CompleteReadWithDetails`): `tpu_sync/kv_cache/kv_cache_manager_with_transfer.{h,cc}` (`tpu_sync/core/kv_cache_manager_with_transfer.h` is a forwarding shim); host-staging pool `StagingBlockAllocator`: `tpu_sync/core/staging_arena.{h,cc}` (moved there in upstream `fc8cff9`, 2026-10-12); staging memory `tpu_sync/core/host_memory_allocator.{h,cc}`
 - TCP block transport: `tpu_sync/transport/block_transport.{h,cc}`, `tpu_sync/transport/block_transport_session.{h,cc}`
 - KV-cache store, host offload, store RPC service/client: `tpu_sync/kv_cache/{kv_cache_store,host_offload_backend,kv_cache_store_service,kv_cache_store_client}.{h,cc}`
