@@ -37,7 +37,7 @@ inductive CoordPhase where
 `CreateReshardReceiveSession`, `ReshardReceiveSession::AcquireStagingLeases`,
 `ReshardReceiveSession::ReleaseStaging`). -/
 structure DstUnitState where
-  /-- Destination unit ID (`UnitKey`). -/
+  /-- Destination unit ID (`RaidenId`). -/
   unit : Nat
   /-- True while the `ReshardReceiveSession` is in `sessions_` and not
       `Done()` (its `plan()` resolvable through `GetSession`). -/

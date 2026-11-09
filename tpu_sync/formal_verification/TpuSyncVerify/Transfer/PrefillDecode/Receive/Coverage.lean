@@ -184,8 +184,10 @@ leaves the two unordered. A reply that fails after its data landed (a
 control-path deadline or reset) does not change the verdict: `on_response`
 runs `FinishLocked(pull_status)` only `if (!pull_status.ok() && !self->draining_)`,
 so a receive that already settled is published as it settled
-(`tr_late_reply_failure_keeps_verdict`, `pullReplyFailDraining` settles, is
-model-only: no upstream test fails a reply after the data). **window**
+(`tr_late_reply_failure_keeps_verdict` is model-only as a trace: no upstream
+test fails a pull reply *after* OK data settled, whereas
+`ExpiredReceiveKeepsStagingUntilHandshakeEnds` already covers
+`pullReplyFailDraining` settling after a deadline `Finish`). **window**
 branches (5) need an interleaving the test harness has no hook for. **test**
 branches (4) are schedules `RecvTestManager` can drive today, each a replayed
 test plus an open push lease or a late `FailRecv`.

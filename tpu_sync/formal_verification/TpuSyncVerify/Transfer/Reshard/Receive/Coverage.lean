@@ -165,12 +165,17 @@ def paired : List (String × Recv × List Ev) :=
       init [0], [.cancel]),
    -- Pool 0 leases the only buffer; `OnDataReceived(0)` uploads it at once
    -- (`FakeH2dBase`), returning the buffer to pool 1's waiting
-   -- `ResolveStagingSlot` (the wait's own op is nested and ends before the
-   -- assertion, A1); `Finish(Cancelled)` then settles the idle session.
+   -- `ResolveStagingSlot`; `cancel_waiter` then blocks in `AcquireStagingSlot`
+   -- for pool 0 (`in_flight_ == 1`) while `Finish(Cancelled)` drains the
+   -- session and wakes the waiter to settle via `EndRecvOpLocked()` (the
+   -- slot-wait ops are projected away in this slot-free model per
+   -- `Receive.lean` §"Bounded host layer staging").
    ("ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease",
       init [0, 0], [.onPoolReceived 0, .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true, .cancel]),
-   -- The second session's slot wait runs into its deadline
-   -- (`FinishLocked(slot.status())` from inside `AcquireStagingSlot`).
+   -- `timeout_session`'s `ResolveStagingSlot(1)` times out inside
+   -- `AcquireStagingSlot` while holding its slot-wait op (`in_flight_ == 1`),
+   -- calling `FinishLocked(slot.status())` and `EndRecvOpLocked()` (likewise
+   -- projected to `.cancel` per `Receive.lean` §"Bounded host layer staging").
    ("ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease (timeout_session)",
       init [0, 0], [.cancel]),
    -- Pool 1 lands and uploads before pool 0 (both rank 0).

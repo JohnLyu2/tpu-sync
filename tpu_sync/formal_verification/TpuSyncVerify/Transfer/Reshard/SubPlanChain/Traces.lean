@@ -105,18 +105,25 @@ theorem trace_sub_plan_uuid_positive_and_distinct :
 
 /-! ## Part II — Worker chain folding -/
 
+/-- `TestManager::FinishPoolReshardRecvPool` (`pool_reshard_test.cc`):
+`OnDataReceived` starts the pool upload (`++in_flight_`), `FinishPoolH2d` calls
+`Finish(terminal_status)` latching `draining_` while the upload op is counted,
+and `self->EndOp()` settles `done_ = true` preserving the latched status. -/
+def finishRecvPool (uuid : Nat) (ok : Bool) : List WorkerEv :=
+  [.beginOp uuid, .latchDrain uuid ok, .settleSession uuid true]
+
 /-- Replays `SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan`
 (`pool_reshard_test.cc`): sub-plans `0`, `2`, `1` of `count = 3` settle out of
-order; `done_recving` is inserted only once the third settles
-(`settled_count == progress.sub_sessions.size()`), polling again does not
-re-insert it (`progress.completed`), and the entry stays, completed, until the
-sweep expires it. -/
+order via `FinishPoolReshardRecvPool`; `done_recving` is inserted only once the
+third settles (`settled_count == progress.sub_sessions.size()`), polling again
+does not re-insert it (`progress.completed`), and the entry stays, completed,
+until the sweep expires it. -/
 theorem trace_recv_terminal_waits_for_last_sub_plan :
     let tr1 : List WorkerEv :=
-      [ .registerSubPlan 5001 0 3, .settleSession 5001 true, .poll false,
-        .registerSubPlan 5003 2 3, .settleSession 5003 true, .poll false ]
+      [.registerSubPlan 5001 0 3] ++ finishRecvPool 5001 true ++ [.poll false,
+       .registerSubPlan 5003 2 3] ++ finishRecvPool 5003 true ++ [.poll false]
     let tr2 : List WorkerEv :=
-      tr1 ++ [ .registerSubPlan 5002 1 3, .settleSession 5002 true, .poll false, .poll false ]
+      tr1 ++ [.registerSubPlan 5002 1 3] ++ finishRecvPool 5002 true ++ [.poll false, .poll false]
     (WorkerState.sys.run tr1).map (fun w => (w.doneReports, w.failReports)) = some (0, 0) ∧
     (WorkerState.sys.run tr2).map
         (fun w => (w.doneReports, w.failReports, w.chain.present, w.chain.completed)) =
@@ -125,9 +132,9 @@ theorem trace_recv_terminal_waits_for_last_sub_plan :
 
 /-- Replays `SubPlanChainTest.SendTerminalWaitsForTheLastSubPlan`
 (`pool_reshard_test.cc`): sub-plan `0` of `2` (`5041`, a send session seated by
-`AddPoolReshardSend` with `SessionRole::kPoolReshardSend`) settles OK and
-`done_sending` stays empty; the request is inserted once sub-plan `1` (`5042`)
-settles. -/
+`AddPoolReshardSend` with `SessionRole::kPoolReshardSend` and `in_flight_ == 0`)
+settles OK on `Finish()` and `done_sending` stays empty; the request is inserted
+once sub-plan `1` (`5042`) settles. -/
 theorem trace_send_terminal_waits_for_last_sub_plan :
     let tr1 : List WorkerEv :=
       [ .registerSubPlan 5041 0 2, .settleSession 5041 true, .poll false ]
@@ -143,8 +150,8 @@ inserted once; sub-plan `1` is still seated afterwards and its clean settlement
 is swallowed (`if (progress.failed || progress.completed) return;`). -/
 theorem trace_first_sub_plan_failure_fails_once :
     let tr : List WorkerEv :=
-      [ .registerSubPlan 5011 0 2, .settleSession 5011 false, .poll false,
-        .registerSubPlan 5012 1 2, .settleSession 5012 true, .poll false ]
+      [.registerSubPlan 5011 0 2] ++ finishRecvPool 5011 false ++ [.poll false,
+       .registerSubPlan 5012 1 2] ++ finishRecvPool 5012 true ++ [.poll false]
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.chain.failed)) =
       some (0, 1, true) := by
   decide
@@ -158,12 +165,12 @@ entry is anchored), and the retry inserts `done` once `7001` and `7002`
 settle. -/
 theorem trace_retry_same_req_id_tracked_as_new_chain :
     let tr : List WorkerEv :=
-      [ .registerSubPlan 6001 0 2, .settleSession 6001 false, .poll false,
-        .registerSubPlan 6002 1 2,
-        .registerSubPlan 7001 0 2,
-        .settleSession 6002 true, .poll false,
-        .settleSession 7001 true, .poll false,
-        .registerSubPlan 7002 1 2, .settleSession 7002 true, .poll false ]
+      [.registerSubPlan 6001 0 2] ++ finishRecvPool 6001 false ++ [.poll false,
+       .registerSubPlan 6002 1 2,
+       .registerSubPlan 7001 0 2] ++
+      finishRecvPool 6002 true ++ [.poll false] ++
+      finishRecvPool 7001 true ++ [.poll false,
+       .registerSubPlan 7002 1 2] ++ finishRecvPool 7002 true ++ [.poll false]
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (1, 1) := by
   decide
 
@@ -173,7 +180,7 @@ theorem trace_retry_same_req_id_tracked_as_new_chain :
 `SweepSubPlanChainsLocked` inserts `failed_recving`. -/
 theorem trace_stalled_chain_fails_after_timeout :
     let tr : List WorkerEv :=
-      [ .registerSubPlan 5021 0 2, .settleSession 5021 true, .poll false, .poll true ]
+      [.registerSubPlan 5021 0 2] ++ finishRecvPool 5021 true ++ [.poll false, .poll true]
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (0, 1) := by
   decide
 
@@ -182,7 +189,7 @@ theorem trace_stalled_chain_fails_after_timeout :
 without a `sub_plan_chains_` entry. -/
 theorem trace_single_plan_reports_at_once :
     let tr : List WorkerEv :=
-      [ .registerSubPlan 5031 0 1, .settleSession 5031 true, .poll false ]
+      [.registerSubPlan 5031 0 1] ++ finishRecvPool 5031 true ++ [.poll false]
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.chain.present)) =
       some (1, 0, false) := by
   decide
@@ -239,32 +246,65 @@ theorem trace_late_sub_plan_after_sweep_reports_failure_twice :
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (0, 2) := by
   decide
 
-/-- A sub-plan still seated when its failed entry is erased by the sweep has
-passed its own deadline (A5): the same `CompleteReadWithDetails` fails it, and
-its settlement is reported through the no-entry arm as a second
-`failed_recving`, never as `done`. -/
+/-- A sub-plan with an op in flight (`beginOp 7501`: `in_flight_ > 0`) when its
+failed entry is erased by the sweep has passed its own deadline (A5a):
+`CompleteReadWithDetails` latches `draining` with error while leaving `!Done()`
+across `RetireSettledSessionLocked`, `SweepSubPlanChainsLocked` erases the
+failed tombstone, and once `EndOp` settles `7501` the next poll reports it
+through `it == sub_plan_chains_.end()` as a second `failed_recving`, never as
+`done`. -/
 theorem trace_sub_plan_seated_at_sweep_is_failed_not_done :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7500 0 2, .settleSession 7500 false, .poll false,
-        .registerSubPlan 7501 1 2, .poll true,
+        .registerSubPlan 7501 1 2, .beginOp 7501, .poll true,
         .settleSession 7501 true, .poll false ]
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.chain.present)) =
       some (0, 2, false) := by
   decide
 
-/-- The stall sweep keeps an entry while a slot's session is still open
-(`active`: `last_activity = now`); that session has outlived its own deadline
-(A5), so the same `CompleteReadWithDetails` fails it and its settlement is the
+/-- The stall sweep keeps a live entry while a slot's session still has an op
+in flight (`beginOp 9101`: `in_flight_ > 0` stays `!Done()` across
+`RetireSettledSessionLocked` into `SweepSubPlanChainsLocked`, which refreshes
+`last_activity = now`); `CompleteReadWithDetails`'s deadline arm already latched
+error on `9101` (A5a), so once `EndOp` settles it the next poll reports the
 chain's first failure. -/
 theorem trace_stall_sweep_keeps_entry_with_open_session :
     let tr : List WorkerEv :=
       [ .registerSubPlan 9100 0 2, .registerSubPlan 9101 1 2,
-        .settleSession 9100 true, .poll false, .poll true ]
+        .settleSession 9100 true, .poll false, .beginOp 9101, .poll true ]
     (WorkerState.sys.run tr).map
         (fun w => (w.doneReports, w.failReports, w.chain.failed, w.active.map (·.ok))) =
       some (0, 0, false, [false]) ∧
     (WorkerState.sys.run (tr ++ [.settleSession 9101 true, .poll false])).map
         (fun w => (w.doneReports, w.failReports, w.chain.failed)) = some (0, 1, true) := by
+  decide
+
+/-- An idle (`inFlight = false`, `in_flight_ == 0`) session past its deadline at
+`poll true` settles synchronously inside `Finish(DeadlineExceeded)` (`"One
+nobody pulled is reported now"`): `RetireSettledSessionLocked` records the
+chain failure (`failReports = 1`), retires `9201` (`active = []`), and refreshes
+`last_activity = now` (`touched = true`) before `SweepSubPlanChainsLocked`
+runs. -/
+theorem trace_idle_seated_session_settles_at_deadline_poll :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 9200 0 2, .registerSubPlan 9201 1 2,
+        .settleSession 9200 true, .poll false, .poll true ]
+    (WorkerState.sys.run tr).map
+        (fun w => (w.doneReports, w.failReports, w.chain.present, w.chain.failed, w.active)) =
+      some (0, 1, true, true, []) := by
+  decide
+
+/-- On a live (`!failed && !completed`) chain, a sub-plan already in
+`IsDraining() && !Done()` with `OkStatus()` (`beginOp 9300, latchDrain 9300 true`)
+is skipped by `if (!session->IsDraining())` at `poll true` while
+`SweepSubPlanChainsLocked` sees `!sub_session->Done()` and keeps the entry
+(`activeKeeps`); `EndOp` and sub-plan `1` then complete the chain cleanly. -/
+theorem trace_draining_session_on_live_chain_survives_stalled_poll :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 9300 0 2, .beginOp 9300, .latchDrain 9300 true, .poll true,
+        .settleSession 9300 true, .poll false,
+        .registerSubPlan 9301 1 2, .settleSession 9301 true, .poll false ]
+    (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (1, 0) := by
   decide
 
 /-- A single-plan session seated before a chained sub-plan `1` of the same
@@ -291,11 +331,23 @@ def workerViolates (w : WorkerState) : Bool := !decide (WorkerSafe w)
 theorem workerViolates_iff (w : WorkerState) : workerViolates w = false ↔ WorkerSafe w := by
   simp [workerViolates]
 
+/-- Two sub-plans of a `K = 2` request with every session lifecycle transition
+(`beginOp`, `latchDrain`, `settleSession`) and both poll modes. -/
+def chain2CheckEvents : List WorkerEv :=
+  [ .registerSubPlan 10 0 2, .registerSubPlan 11 1 2,
+    .beginOp 10, .beginOp 11,
+    .latchDrain 10 true, .latchDrain 10 false,
+    .latchDrain 11 true, .latchDrain 11 false,
+    .settleSession 10 true, .settleSession 10 false,
+    .settleSession 11 true, .settleSession 11 false,
+    .poll false, .poll true ]
+
 /-- Two sub-plans of a `K = 2` request and a re-anchoring index-`0` sub-plan
-(a retry under the same `req_id`), each settling either way; polls with and
-without the stall sweep. -/
+(a retry under the same `req_id`), with in-flight / draining transitions on the
+sibling sub-plan `11` and polls with and without the stall sweep. -/
 def workerCheckEvents : List WorkerEv :=
   [ .registerSubPlan 10 0 2, .registerSubPlan 11 1 2, .registerSubPlan 13 0 2,
+    .beginOp 11, .latchDrain 11 true, .latchDrain 11 false,
     .settleSession 10 true, .settleSession 10 false,
     .settleSession 11 true, .settleSession 11 false,
     .settleSession 13 true, .settleSession 13 false,
@@ -304,11 +356,13 @@ def workerCheckEvents : List WorkerEv :=
 /-- A single-plan request beside a `K = 2` chain under the same `req_id`. -/
 def mixedCheckEvents : List WorkerEv :=
   [ .registerSubPlan 20 0 1, .registerSubPlan 10 0 2, .registerSubPlan 11 1 2,
+    .beginOp 11, .latchDrain 11 true, .latchDrain 11 false,
     .settleSession 20 true, .settleSession 20 false,
     .settleSession 10 true, .settleSession 10 false,
     .settleSession 11 true, .settleSession 11 false,
     .poll false, .poll true ]
 
+#guard ModelCheck.check WorkerState.sys chain2CheckEvents workerViolates 32 = .safe
 #guard ModelCheck.check WorkerState.sys workerCheckEvents workerViolates 32 = .safe
 #guard ModelCheck.check WorkerState.sys mixedCheckEvents workerViolates 32 = .safe
 
@@ -374,15 +428,15 @@ theorem mutant_no_reanchor_never_reports_retry_done :
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (1, 1) := by
   decide
 
-/-- Without A5 (`stepG { deadlineArm := false }`): a sub-plan still seated when
-the sweep erases its failed entry later settles OK and, finding no entry, is
-reported as the request's `done` (`doneLog = [(2, [1])]`): a `done_recving` for
-a two-plan request with one sub-plan settled. The shipping step fails that
-session at the sweep. -/
+/-- Without A5a (`stepG { deadlineArm := false }`): an in-flight `!IsDraining()`
+sub-plan still seated when the sweep erases its failed entry later settles OK
+and, finding no entry, is reported as the request's `done` (`doneLog = [(2, [1])]`):
+a `done_recving` for a two-plan request with one sub-plan settled. With A5a on,
+the deadline arm latches error on that session at the sweep. -/
 theorem mutant_no_deadline_arm_reports_done_after_sweep :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7500 0 2, .settleSession 7500 false, .poll false,
-        .registerSubPlan 7501 1 2, .poll true,
+        .registerSubPlan 7501 1 2, .beginOp 7501, .poll true,
         .settleSession 7501 true, .poll false ]
     ((⟨WorkerState.init, WorkerState.stepG { deadlineArm := false }⟩ :
         System WorkerState WorkerEv).run tr).map
@@ -394,11 +448,90 @@ theorem mutant_no_deadline_arm_reports_done_after_sweep :
 #guard (ModelCheck.check (⟨WorkerState.init, WorkerState.stepG { deadlineArm := false }⟩ :
     System WorkerState WorkerEv) workerCheckEvents workerViolates 32 matches .counterexample _)
 
+/-- Without A5b (`stepG { noDrainingOkAtSweep := false }`, the unguarded C++
+interleaving on a single non-retried 2-sub-plan chain): sub-plan `0` (`7510`)
+fails on poll 1 (`failReports = 1`, `chain.failed = true`), while sub-plan `1`
+(`7511`) has already latched clean drain (`beginOp 7511, latchDrain 7511 true`,
+e.g. `ReshardSendSession::RecordPushCompletion` setting `finalizing_ = true`
+before `EndOp` finishes `ReleaseDataConnectionsAfterSend`, or
+`ReshardReceiveSession::FinishPoolH2d` setting `draining_ = true` before
+`self->EndOp()`). On poll 2 (`poll true`), `if (!session->IsDraining())` skips
+`7511` and `SweepSubPlanChainsLocked` unconditionally erases the `failed`
+tombstone; once `EndOp` sets `done_ = true`, poll 3 hits
+`it == sub_plan_chains_.end()` and emits `done` (`doneLog = [(2, [1])]`) after
+failure. Under A5b (`WorkerState.step`), the guarded step excludes poll 2; the
+candidate fix `WorkerState.sysSweepWaitsForOpen` keeps the tombstone until
+`7511` settles and swallows its terminal (`(0, 1, [])`). -/
+theorem mutant_draining_ok_at_sweep_reports_done_after_failure :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 7510 0 2, .settleSession 7510 false, .poll false,
+        .registerSubPlan 7511 1 2, .beginOp 7511, .latchDrain 7511 true,
+        .poll true,
+        .settleSession 7511 true, .poll false ]
+    ((⟨WorkerState.init, WorkerState.stepG { noDrainingOkAtSweep := false }⟩ :
+        System WorkerState WorkerEv).run tr).map
+        (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (1, 1, [(2, [1])]) ∧
+    WorkerState.sys.run tr = none ∧
+    (WorkerState.sysSweepWaitsForOpen.run tr).map
+        (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (0, 1, []) := by
+  decide
+
+/-- `chain2CheckEvents` plus intra-poll `session->mu_` `EndOp` settlements
+between `RetireSettledSessionLocked` and `SweepSubPlanChainsLocked`. -/
+def chain2MidSettleEvents : List WorkerEv :=
+  chain2CheckEvents ++
+    [ .pollMidSettle true [10], .pollMidSettle true [11], .pollMidSettle true [10, 11],
+      .pollMidSettle false [10], .pollMidSettle false [11], .pollMidSettle false [10, 11] ]
+
+/-- `workerCheckEvents` plus intra-poll `EndOp` settlements on `11`. -/
+def workerMidSettleEvents : List WorkerEv :=
+  workerCheckEvents ++ [ .pollMidSettle true [11], .pollMidSettle false [11] ]
+
+#guard (ModelCheck.check (⟨WorkerState.init, WorkerState.stepG { noDrainingOkAtSweep := false }⟩ :
+    System WorkerState WorkerEv) chain2CheckEvents workerViolates 32 matches .counterexample _)
+
+/-- Without A5c (`stepG { noSettleBetweenRetireAndSweep := false }`, while A5a,
+A5b, A6, and A7 all hold): an unanchored sub-plan `1` (`11`, `index = 1,
+count = 2`, `anchored = false`) latches clean drain (`beginOp 11,
+latchDrain 11 true`) right as `timeout_s_` elapses. In `CompleteReadWithDetails`
+(`pollMidSettle true [11]`), `!session->IsDraining()` skips `11` and
+`RetireSettledSessionLocked` sees `Done() == false`; before
+`SweepSubPlanChainsLocked` runs, `11->EndOp()` sets `done_ = true` under
+`11->mu_`, so `!sub_session->Done()` is `false` and the sweep declares the live
+chain stalled (`failed_recving_.insert(req_id); progress.failed = true;
+progress.sub_sessions.clear()`) with `anchored` still `false`. On the next poll
+(`poll false`), `RecordPoolReshardTerminalLocked` checks
+`sub_it == progress.sub_sessions.end()` before
+`if (progress.failed || progress.completed) return;`, hits `!progress.anchored`,
+and emits `done` (`doneLog = [(2, [1])]`) after failure. Under A5c
+(`WorkerState.step`), the guarded step excludes the mid-poll settle; the
+candidate fix `WorkerState.sysSweepWaitsForOpen` checks `failed || completed`
+before `!anchored` and keeps tombstones while `sessions_` holds any unretired
+entry (`(0, 1, [])`). -/
+theorem mutant_mid_poll_endop_unanchored_reports_done_after_stall :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 11 1 2, .beginOp 11, .latchDrain 11 true,
+        .pollMidSettle true [11], .poll false ]
+    ((⟨WorkerState.init, WorkerState.stepG { noSettleBetweenRetireAndSweep := false }⟩ :
+        System WorkerState WorkerEv).run tr).map
+        (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (1, 1, [(2, [1])]) ∧
+    WorkerState.sys.run tr = none ∧
+    (WorkerState.sysSweepWaitsForOpen.run tr).map
+        (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (0, 1, []) := by
+  decide
+
+#guard (ModelCheck.check (⟨WorkerState.init,
+    WorkerState.stepG { noSettleBetweenRetireAndSweep := false }⟩ :
+    System WorkerState WorkerEv) chain2MidSettleEvents workerViolates 32 matches .counterexample _)
+#guard ModelCheck.check WorkerState.sysSweepWaitsForOpen chain2MidSettleEvents workerViolates 32 = .safe
+#guard ModelCheck.check WorkerState.sysSweepWaitsForOpen workerMidSettleEvents workerViolates 32 = .safe
+#guard ModelCheck.check WorkerState.sysSweepWaitsForOpen mixedCheckEvents workerViolates 32 = .safe
+
 /-- Without A6 (`stepG { noSingleWhileSeated := false }`): a single-plan
 registration under the `req_id` of a chain in flight erases the chain's entry,
 and the chained sub-plan's clean settlement is then reported as the request's
-`done` while the single-plan session is still open. The shipping step refuses
-the registration. -/
+`done` while the single-plan session is still open. Under A6 (`WorkerState.step`),
+the guarded step excludes the registration. -/
 theorem mutant_single_plan_registration_erases_live_chain :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7700 0 2, .registerSubPlan 7701 0 1,
@@ -416,7 +549,8 @@ theorem mutant_single_plan_registration_erases_live_chain :
 /-- Without A7 (`stepG { oneSessionPerSlot := false }`): a second sub-plan `1`
 registered into an unanchored entry overwrites the slot; the first session,
 no longer in `sub_sessions`, settles into the `stray` arm and is reported as
-the request's `done`. The shipping step refuses the second registration. -/
+the request's `done`. Under A7 (`WorkerState.step`), the guarded step excludes
+the second registration. -/
 theorem mutant_slot_overwrite_reports_stray_done :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7800 1 2, .registerSubPlan 7801 1 2,
@@ -434,8 +568,8 @@ theorem mutant_slot_overwrite_reports_stray_done :
 (`reshard_service_test.cc`): 2 source ranks `{0, 1}`, 4 single-page windows
 `[[0], [0], [1], [1]]`, 1 destination `10`; each window arms `10` then dispatches
 its owning rank under a single registry claim (`claimOwner = 1`), ending at
-`transferStatus = .completed` with the registration still `.claimed` until both
-ranks vote `Complete`. -/
+`transferStatus = .completed` with the registration still `.claimed` so
+`CancelIfUnclaimed` returns `false` (`cancelled = false`). -/
 theorem trace_windowed_request_chains_one_sub_transfer_per_window :
     let tr : List ChainEv :=
       [ .registerProducer 0, .registerProducer 1, .startChainCoordination,
@@ -446,9 +580,11 @@ theorem trace_windowed_request_chains_one_sub_transfer_per_window :
         .startWindowPlan true, .armDstResult 10 .ok, .finishWindowArm,
         .sendSrcResult 1 true, .finishWindowSend, .settleDispatchedRecv 10,
         .startWindowPlan true, .armDstResult 10 .ok, .finishWindowArm,
-        .sendSrcResult 1 true, .finishWindowSend ]
+        .sendSrcResult 1 true, .finishWindowSend,
+        .cancelIfUnclaimed ]
     ((CoordChainState.sys [0, 1] [[0], [0], [1], [1]] [10] 1).run tr).map
-        (fun s => (s.transferStatus, s.reg.status)) = some (.completed, .claimed) := by
+        (fun s => (s.transferStatus, s.reg.status, s.reg.cancelled)) =
+      some (.completed, .claimed, false) := by
   decide
 
 /-- Replays `ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries`
@@ -467,22 +603,32 @@ theorem trace_window_clips_straddling_spans_at_window_boundaries :
   decide
 
 /-- Replays `ReshardStackTest.WindowComposesWithPrefixClip`
-(`reshard_service_test.cc`): prefix clip plus a 2-page window dispatches `[0, 1]`
-in window `0` and `[1]` in window `1`; rank `0`, absent from window `1`, may
-vote `Complete` as soon as its window-0 push settles, and the claim stays until
-rank `1` votes after the chain ends. -/
+(`reshard_service_test.cc`) and continues it with sender `Complete` votes:
+prefix clip plus a 2-page window dispatches `[0, 1]` in window `0` and `[1]` in
+window `1`; rank `0`, absent from window `1`, may vote `Complete` as soon as its
+window-0 push settles, and the claim stays until rank `1` votes after the chain
+ends. -/
 theorem trace_window_composes_with_prefix_clip :
-    let tr : List ChainEv :=
+    let trReplay : List ChainEv :=
+      [ .registerProducer 0, .registerProducer 1, .startChainCoordination,
+        .startWindowPlan true, .armDstResult 10 .ok, .finishWindowArm,
+        .sendSrcResult 0 true, .sendSrcResult 1 true, .finishWindowSend,
+        .settleDispatchedRecv 10,
+        .startWindowPlan true, .armDstResult 10 .ok, .finishWindowArm,
+        .sendSrcResult 1 true, .finishWindowSend ]
+    let trVote0 : List ChainEv :=
       [ .registerProducer 0, .registerProducer 1, .startChainCoordination,
         .startWindowPlan true, .armDstResult 10 .ok, .finishWindowArm,
         .sendSrcResult 0 true, .sendSrcResult 1 true, .finishWindowSend,
         .settleDispatchedRecv 10, .senderVoteComplete 0,
         .startWindowPlan true, .armDstResult 10 .ok, .finishWindowArm,
         .sendSrcResult 1 true, .finishWindowSend ]
-    ((CoordChainState.sys [0, 1] [[0, 1], [1]] [10] 1).run tr).map
+    ((CoordChainState.sys [0, 1] [[0, 1], [1]] [10] 1).run trReplay).map
+        (fun s => (s.transferStatus, s.activeSenders)) = some (.completed, [0, 1]) ∧
+    ((CoordChainState.sys [0, 1] [[0, 1], [1]] [10] 1).run trVote0).map
         (fun s => (s.transferStatus, s.reg.status, s.activeSenders)) =
       some (.completed, .claimed, [1]) ∧
-    ((CoordChainState.sys [0, 1] [[0, 1], [1]] [10] 1).run (tr ++ [.senderVoteComplete 1])).map
+    ((CoordChainState.sys [0, 1] [[0, 1], [1]] [10] 1).run (trVote0 ++ [.senderVoteComplete 1])).map
         (fun s => (s.reg.status, s.reg.retired)) = some (.unknown, true) := by
   decide
 
@@ -506,9 +652,9 @@ theorem trace_chained_arm_retries_while_receiver_staging_busy :
         (fun s => (s.transferStatus, s.armAttempts)) = some (.completed, 2) := by
   decide
 
-/-- With `kChainArmAttempts = 2`, the second busy refusal is final:
-`finishWindowArm` aborts the chain (`.failed`) and the claim is kept
-(`index == 1`). -/
+/-- With `maxArmAttempts = 2` (parameterizing `kChainArmAttempts = 12`), the
+second busy refusal is final: `finishWindowArm` aborts the chain (`.failed`)
+and the claim is kept (`index == 1`). -/
 theorem trace_busy_refusals_exhaust_arm_attempts :
     let tr : List ChainEv :=
       [ .registerProducer 0, .registerProducer 1, .startChainCoordination,

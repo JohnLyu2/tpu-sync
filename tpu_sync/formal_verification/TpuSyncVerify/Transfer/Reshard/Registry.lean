@@ -14,6 +14,7 @@ completion voting, and unclaimed cancellation tombstones.
 File aliases used in the source map below:
 `reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`),
 `coord.cc` (`tpu_sync/kv_cache/reshard/reshard_coordinator.cc`),
+`planner.cc` (`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`),
 `reshard_service.cc` (`tpu_sync/kv_cache/reshard/reshard_service.cc`),
 `reshard_client.cc` (`tpu_sync/kv_cache/reshard/reshard_client.cc`), and
 `reshard_service_test.cc` (`tpu_sync/kv_cache/reshard/reshard_service_test.cc`).
@@ -96,6 +97,36 @@ File aliases used in the source map below:
   | `cancelIfUnclaimed` | 1 `RequestBlockRegistry::mu_` scope (runs `PurgeExpiredLifecycleLocked` on entry) | — |
   | `abandonClaim` | 1 `RequestBlockRegistry::mu_` scope | — |
 
+  ## Scope and Abstractions
+
+  1. **Caller-enforced non-empty, deduplicated `units` vs. C++ set comparison:**
+     `RegGen.step` rejects an empty `units` list in `.lookupAndClaim`
+     (`units.isEmpty`) and `compatibleClaim` compares `existing == units` as a
+     canonical list. In C++, `RequestBlockRegistry::Register` accepts an empty
+     registration and `RequestBlockRegistry::LookupAndClaim` itself does not
+     reject empty `units`, instead converting `units` into
+     `std::set<RaidenId, RaidenIdLess> claimed_units(units.begin(), units.end());`
+     before comparing `existing_units_it->second != claimed_units`; non-empty
+     and duplicate-free `src_units` are enforced upstream by callers
+     (`ReshardCoordinator::StartPoolReshard` rejects `args.src_units.empty()`,
+     and `BuildPoolReshardPlan` rejects duplicate `request.src_units` before
+     calling `LookupAndClaim`), so canonical sorted/deduplicated `units` lists
+     in Lean match C++'s `std::set` equality.
+  2. **Pre-claim `Complete` guard checks `block_ids` only:**
+     `RegGen.step` abstracts a registration's payload emptiness as
+     `nonEmpty : Bool` and rejects pre-claim `.complete` when `nonEmpty = true`.
+     In `RequestBlockRegistry::Complete`, the pre-claim guard checks
+     `!registration_it->second.block_ids.empty()` only (not `pool_spans`),
+     matching `nonEmpty = !block_ids.empty()` because callers populate
+     `block_ids` alongside or instead of `pool_spans`.
+  3. **Worker-restart invalidation (`InvalidateUnitLocked`) outside scope:**
+     `RequestBlockRegistry::InvalidateUnitLocked` (invoked under the shared
+     controller lock when a worker re-registers in
+     `ReshardService::HandleRaidenCommand` for `COMMAND_REGISTER_WORK_UNIT`,
+     erasing `request_blocks_` entries for `unit` while leaving `claimed_`,
+     `claimed_units_`, `claimed_owners_`, `completed_units_`, and `cancelled_`
+     in place) is outside this single-worker-generation model.
+
   ## Main results
 
   - `reachable_safe` (`Inv`): proves inductively across all reachable registry
@@ -156,14 +187,19 @@ File aliases used in the source map below:
   | `reg.cc` | `RequestBlockRegistry::Status` | `:407-436` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` | `:439-491` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`) | `:448-452` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`std::set<RaidenId, RaidenIdLess> claimed_units(units.begin(), units.end());`) | `:453` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (existing_units_it != claimed_units_.end() &&`) | `:455-460` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`for (const RaidenId& unit : units)`) | `:462-470` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`claimed_[lifecycle_key] = now + ttl_s_;` .. `claimed_owners_[lifecycle_key].insert(claim_owner);`) | `:473-475` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (completion_it != completed_units_.end())`) | `:477-489` |
   | `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:493-509` |
   | `reg.cc` | `RequestBlockRegistry::AbandonClaim` (`if (owner_it->second.empty())`) | `:503-507` |
+  | `reg.cc` | `RequestBlockRegistry::InvalidateUnitLocked` | `:511-519` |
+  | `coord.cc` | `ReshardCoordinator::StartPoolReshard` (`if (args.src_units.empty())`) | `:476-478` |
   | `coord.cc` | `ReshardCoordinator::RunSubPlan` | `:678-932` |
+  | `planner.cc` | `BuildPoolReshardPlan` (`if (unique_src.size() != request.src_units.size())`) | `:651-654` |
   | `reshard_service.cc` | `ReshardService::HandleControllerCommand` | `:167-353` |
+  | `reshard_service.cc` | `ReshardService::HandleRaidenCommand` (`registry_->InvalidateUnitLocked(registration.unit);`) | `:415` |
   | `reshard_client.cc` | `ReshardClient::BuildReleaseRequestBlocks` | `:179-189` |
   | `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:801-875` |
   | `reshard_service_test.cc` | `ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries` | `:877-918` |
@@ -313,7 +349,7 @@ def compatibleClaim (cur : Option (List Nat)) (units : List Nat) : Bool :=
 
 /-- Whether `unit` is in the claimed unit set `cur`
 (`RequestBlockRegistry::Complete`
-`expected_it->second.find(unit) != expected_it->second.end()`). -/
+`expected_it->second.count(unit) > 0`). -/
 def inClaimedUnits (cur : Option (List Nat)) (unit : Nat) : Bool :=
   match cur with
   | none => false
@@ -349,8 +385,8 @@ def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
     else
       match s.lookupUnit unit with
       | some curNonEmpty =>
-        -- Conflicting payload is rejected (`ExistingRegistrationMatches`);
-        -- identical payload is an idempotent refresh (`existing->second.expires_at = now + ttl_s_;`).
+        -- Conflicting payload is rejected (`if (current.uuid != uuid || current.block_ids != normalized || current.pool_spans != normalized_pool_spans)`);
+        -- identical payload is an idempotent refresh (`registration.expires_at = now + ttl_s_;`, `request_blocks_[key] = std::move(registration);`).
         if curNonEmpty != nonEmpty then none else some s
       | none =>
         some { s with registeredUnits := s.registeredUnits ++ [(unit, nonEmpty)] }

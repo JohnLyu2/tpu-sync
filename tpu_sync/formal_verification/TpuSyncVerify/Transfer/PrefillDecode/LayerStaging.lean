@@ -29,8 +29,12 @@ session's `StagingLayerManager` (`TpuSyncVerify/Transfer/LayerStaging.lean`).
   session started draining in the unlocked gap). Once `D2hSyncDispatch` runs,
   layer `l` owns its slot across D2H completion (`d2hReady l`), `SendNextLayer`'s
   `push_pool` task (`LookupStagingSlot(l)`, reached as
-  `TransferSendSession::ResolveStagingSlot` from
-  `KVCacheManagerBase::GetBlockChunks` in `BlockTransport::BuildBlockRequests`),
+  `TransferSendSession::ResolveStagingSlot` from both
+  `KVCacheManagerBase::GetBlockChunks` and `ValidateChunks` →
+  `KVCacheManagerBase::GetBlockArrayHostSpan` →
+  `KVCacheManagerBase::ResolveBlockArrayHostLayer` in
+  `BlockTransport::BuildBlockRequests`, each taking
+  `KVCacheManagerWithTransfer::mu_` in `GetSession(uuid)`),
   and `H2hWriteDirectAsync`, releasing it only inside the H2H
   completion callback (`h2hDone l ok`), on an earlier error/draining exit
   (`sendD2hBegin`, `sendD2hIssue false`, `sendWake`, `sendH2hIssue`), or
@@ -39,16 +43,25 @@ session's `StagingLayerManager` (`TpuSyncVerify/Transfer/LayerStaging.lean`).
   layers' H2H pushes complete and return host buffers while the D2H loop is
   blocked in `AcquireStagingSlot` for a later layer.
 * **Consumer (`TransferReceiveSession`).** When an incoming push stream addresses
-  layer `l`'s host memory in `KVCacheManagerBase::GetBlockChunks`
-  (`GetSession(uuid)`, then `session->ResolveStagingSlot(layer_idx)` =
-  `TransferReceiveSession::AcquireStagingSlot`),
+  and validates layer `l`'s host memory in
+  `BlockTransportServerPushSession::StartStream` — each chunk running
+  `KVCacheManagerBase::GetBlockChunks` followed by `ValidateChunks` →
+  `KVCacheManagerBase::GetBlockArrayHostSpan` →
+  `KVCacheManagerBase::ResolveBlockArrayHostLayer`, each taking
+  `KVCacheManagerWithTransfer::mu_` in `GetSession(uuid)` and calling
+  `session->ResolveStagingSlot(layer_idx)` =
+  `TransferReceiveSession::AcquireStagingSlot` —
   `AcquireStagingSlot(l)` refuses if `done_ || draining_`, takes an `in_flight_`
   op, waits in `StagingLayerManager::Acquire(l, deadline, &cancelled_)` (returning
-  the existing slot immediately on additional chunks/shards of an already-leased
-  layer), fails the session on timeout or zero-slot error, releases `l` if the
-  session started draining in the unlocked gap, and ends its `in_flight_` op.
-  (On a full host mirror both `ResolveStagingSlot`s return `NotFound` and
-  `GetBlockChunks` addresses the layer's own buffer.)
+  the existing slot immediately on `ValidateChunks` and on additional
+  chunks/shards of an already-leased layer), fails the session on timeout or
+  zero-slot error, releases `l` if the session started draining in the unlocked
+  gap, and ends its `in_flight_` op. (On a full host mirror `GetBlockChunks` and
+  `ResolveBlockArrayHostLayer` address the layer's own buffer directly without
+  calling `ResolveStagingSlot` when `!explicit_pools_`;
+  `TransferReceiveSession::ResolveStagingSlot` returns `NotFound` unconditionally
+  on a full mirror, while `TransferSendSession::ResolveStagingSlot` returns
+  `*slot` while leased and `NotFound` when unleased.)
   `ForEachPayload` lands layer `l` into `decodeSlots[slot]` inside the outer
   `BeginIncomingPush` .. `EndIncomingPush` lease (`GetSession` + `TryBeginOp`,
   `EndOp`); still inside that stream lease,
@@ -117,12 +130,14 @@ freed slot on a failing session.
 Inherits `Pipeline` A1–A4 (`Pipeline.lean` §Assumptions), plus:
 
 * **LS1 (single stream / monotonic pre-land touches per consumer layer).** Under
-  `Pipeline` A3 (one sender stream per layer), `GetBlockChunks(l)` is called
-  only before `CompleteIncomingPush` marks layer `l` landed (`landedL[l] = false`),
-  and at most one thread calls `AcquireStagingSlot(l)` for a given `l` at a time.
-  Multiple chunks or shards of layer `l` within that stream may call
-  `AcquireStagingSlot(l)` repeatedly (`recvAcquireBegin` from `.leasedForStream`,
-  exercised in `trace_recv_cycles_host_layer_buffers`).
+  `Pipeline` A3 (one sender stream per layer), `GetBlockChunks(l)` and its
+  companion `ValidateChunks` → `GetBlockArrayHostSpan` →
+  `ResolveBlockArrayHostLayer` are called only before `CompleteIncomingPush`
+  marks layer `l` landed (`landedL[l] = false`), and at most one thread calls
+  `AcquireStagingSlot(l)` for a given `l` at a time. Multiple chunks or shards
+  of layer `l` within that stream (and `ValidateChunks` after each
+  `GetBlockChunks`) call `AcquireStagingSlot(l)` repeatedly (`recvAcquireBegin`
+  from `.leasedForStream`, exercised in `trace_recv_cycles_host_layer_buffers`).
 * **LS2 (`StagingLayerManager::mu_` ordering on error callbacks).** In C++,
   `FinishLocked` (`Shutdown()`) and `Release(l)` acquire `StagingLayerManager::mu_`
   in separate scopes; because `Shutdown()` runs first and sets `shutdown_ = true`
@@ -141,8 +156,8 @@ Inherits `Pipeline` A1–A4 (`Pipeline.lean` §Assumptions), plus:
   - `PublicationCorrect`: `s.pipe.recv.published = some true → s.decodeHbmB = Pipeline.good n`
     — multiplexing `n` layers over arbitrarily few host buffers never aliases or
     corrupts another layer's KV data;
-  - `NoSlotFault`: `s.slotFault = false` — every active D2H write, `GetBlockChunks`
-    send lookup, H2H read, stream landing, `ExecuteLayerH2d` lookup, and H2D read
+  - `NoSlotFault`: `s.slotFault = false` — every active D2H write, `GetBlockChunks` /
+    `ValidateChunks` send lookup, H2H read, stream landing, `ExecuteLayerH2d` lookup, and H2D read
     finds a live in-bounds physical host slot;
   - `SlotManagersValid`: `free.length + leases.length = numSlots` and `allSlots.Nodup`
     on both sessions' `StagingLayerManager`s;
@@ -151,8 +166,8 @@ Inherits `Pipeline` A1–A4 (`Pipeline.lean` §Assumptions), plus:
   - `DrainingShutsDown`: `draining = true → shutdown = true` on both sessions.
 * **Lookup resolution & exclusivity (`sendLookupStagingSlot_active`,
   `recvLookupStagingSlot_active`, `sendLookupStagingSlot_injective`,
-  `recvLookupStagingSlot_injective`).** Every active non-draining `GetBlockChunks`
-  producer lookup and every open-stream `ExecuteLayerH2d` consumer precheck (even
+  `recvLookupStagingSlot_injective`).** Every active non-draining `GetBlockChunks` /
+  `ValidateChunks` producer lookup and every open-stream `ExecuteLayerH2d` consumer precheck (even
   on a concurrently draining session) resolves an in-bounds physical host slot
   holding `.kv l`, and distinct live layers never alias to the same physical slot.
 * **Eventual settlement (`reachable_can_settle`).** From every reachable state
@@ -210,12 +225,16 @@ Generated by `tools/resolve_anchors.py`.
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.get_session =`) | `:306` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CheckHostMemoryTransferSupported` | `:1393-1405` |
+| `base.cc` | `KVCacheManagerBase::ResolveBlockArrayHostLayer` | `:2134-2192` |
+| `base.cc` | `KVCacheManagerBase::GetBlockArrayHostSpan` | `:2194-2256` |
 | `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`size_t host_layer_idx = layer_idx;` .. `base_host_ptr = GetHostPointer(host_layer_idx, shard_idx);`) | `:3479-3490` |
 | `base.cc` | `KVCacheManagerBase::OnLayerReceived` | `:3334-3343` |
 | `base.cc` | `*` (`size_t ResolveNumStagingLayers(size_t num_layers,` .. `return requested;`) | `:717-733` |
-| `bt.cc` | `BlockTransport::BuildBlockRequests` (`std::vector<BlockChunk> chunks = block_delegate_->GetBlockChunks(`) | `:804-807` |
+| `bt.cc` | `BlockTransport::BuildBlockRequests` (`std::vector<BlockChunk> chunks = block_delegate_->GetBlockChunks(` .. `ValidateChunks(block_delegate_, l, sh, uuid, chunks));`) | `:804-814` |
 | `bts.cc` | `BeginIncomingPush` | `:242-256` |
 | `bts.cc` | `EndIncomingPush` | `:258-271` |
+| `bts.cc` | `ValidateChunks` | `:275-304` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`std::vector<BlockChunk> chunks = delegate_->GetBlockChunks(` .. `ValidateChunks(delegate_, l, sh, header.uuid, chunks));`) | `:443-453` |
 | `send_drain_test.cc` | `RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` | `:1721-1803` |
 | `send_drain_test.cc` | `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` | `:1805-1911` |
 | `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` | `:1918-2022` |

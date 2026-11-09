@@ -19,7 +19,7 @@ with the transport's block accounting, the readiness predicate
 `Send.lean` and `Pipeline.lean`.
 
 `recv.h`/`recv.cc` are `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`;
-`mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.cc`
+`mgr.h`/`mgr.cc` are `tpu_sync/kv_cache/kv_cache_manager_with_transfer.{h,cc}`; `base.cc`
 is `tpu_sync/kv_cache/kv_cache_manager_base.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`; `bts.cc` is
 `tpu_sync/transport/block_transport_session.cc`;
@@ -85,7 +85,7 @@ reads `it->second.req_id`.
 |----------------|-----|
 | `pushBegin`    | `TryBeginOp` from `BeginIncomingPush` in `bts.cc` (`delegate->GetSession(uuid)` then `session->TryBeginOp()`; a `false` becomes `CancelledError`), called in `BlockTransportServerPushSession::StartStream` — the stream's entry point is `BlockTransport::HandleIncomingPush`, which looks the uuid's push session up and delegates to it |
 | `pushEnd`      | `EndOp` from `EndIncomingPush` in `bts.cc`, called at the end of `StartStream` and from its `absl::Cleanup end_incoming_push` on any early return. `EndIncomingPush` takes the push's status and, when it is not OK, runs `session->Finish(status)` before `session->EndOp()` (the cleanup passes `InternalError("Incoming push failed")`) — in the model, `cancel` followed by `pushEnd`, see `trace_push_lease_pins_staging_on_cancel` |
-| `pullReply ok` | `on_response` of `Start`: a transport failure keeps its status code, a producer rejection (`response->status != 0`) becomes `FailedPrecondition`; under `mu_` the error runs `FinishLocked(pull_status)` only while the receive is not already draining (`if (!pull_status.ok() && !self->draining_)` — a receive that settled before its reply keeps its verdict) and clears `handshake_pending_ = false`, then the `absl::Cleanup end_op` ends the op. Also the fault-injected `session->Finish(status); session->EndOp();` in `StartRead` (`kKvCacheManagerApiStartReadSubmitPull`) |
+| `pullReply ok` | `on_response` of `Start`: a transport failure keeps its status code, a producer rejection (`response->status != 0`) becomes `FailedPrecondition`; under `mu_` the error runs `FinishLocked(pull_status)` only while the receive is not already draining (`if (!pull_status.ok() && !self->draining_)` — a receive that settled before its reply keeps its verdict) and clears `handshake_pending_ = false`, then the `absl::Cleanup end_op` ends the op. In `StartRead`, the fault-injected `kKvCacheManagerApiStartReadSubmitPull` path (and the defensive `!started.ok()` check after `session->Start()`) runs `session->Finish(status); session->EndOp();` after `EmplaceRecvSessionLocked` released manager `mu_` — calling `Finish(status)` unconditionally without `on_response`'s `!self->draining_` guard, which in the model is `cancel` followed by `pullReply false` (matching `pullReply false` alone whenever `draining = false`, and forcing `statusOk := false` even if a concurrent caller already set `draining = true`) |
 | `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`++in_flight_`), from `OnDataReceived` with no block ids (`KVCacheManagerBase::OnLayerReceived` → `session->OnDataReceived(layer_idx, {}, {})`, called from `BlockTransportServerPushSession::CompleteIncomingPush` → `delegate_->OnLayerReceived`); `OnDataReceived` routes a host destination to `SettleHostLayer` instead (§"Host destination") |
 | `h2dIssue ok`  | `ExecuteLayerH2d` from the `done_ \|\| draining_` re-check through `H2dSyncDispatch`, `h2d_futures_.push_back(future)` and the `dispatched_layers_` scope that may set `network_completed_` |
 | `h2dReady`     | the device finishes a copy: its future becomes `IsReady()` |
@@ -111,7 +111,7 @@ other state an event reads outside `mu_`.
 |----------------|--------------|--------------|
 | `pushBegin`    | 1: `TryBeginOp` | preceded by `BeginIncomingPush`'s `delegate->GetSession(uuid)` (`KVCacheManagerBase::GetSession` → `hooks.get_session` → `KVCacheManagerWithTransfer::GetSession`, a `sessions_` lookup under manager `mu_`); a session retired in between is `done_` and refuses the op (`none`); a send session seated under the uuid refuses it too (`TransferSendSession::TryBeginOp` returns `false`) and is not a state of this model |
 | `pushEnd`      | 1: `EndOp` (`EndRecvOpLocked`), plus one read-only `GetStatus()` scope in `EndIncomingPush` for its return value | on a failed push, `EndIncomingPush`'s `session->Finish(status)` is an earlier scope (`cancel` before `pushEnd`) |
-| `pullReply`    | 2: `on_response`'s `absl::MutexLock lock(self->mu_)` (`FinishLocked(pull_status)` on a failure that finds `!self->draining_`, `handshake_pending_ = false`), then `EndOp()` from `absl::Cleanup end_op` after `lock` is released (`Start` also takes an initial `mu_` scope before scheduling to read `load_plan_` and set `peer_endpoint_`; the fault-injected `session->Finish(status); session->EndOp();` in `StartRead`, and the same pair after a `Start()` that returns an error — which `Start` never does — are the same two scopes without `on_response`, leaving `handshake_pending_ = true` on a settled session) | an `EndOp` tail, below |
+| `pullReply`    | 2: `on_response`'s `absl::MutexLock lock(self->mu_)` (`FinishLocked(pull_status)` on a failure that finds `!self->draining_`, `handshake_pending_ = false`), then `EndOp()` from `absl::Cleanup end_op` after `lock` is released (`Start` also takes an initial `mu_` scope before scheduling to read `load_plan_` and set `peer_endpoint_`; the fault-injected `session->Finish(status); session->EndOp();` in `StartRead`, and the same pair after a `Start()` that returns an error — which `Start` never does — run an unconditional `Finish(status)` scope followed by `EndOp()`, i.e. `cancel` then `pullReply false`, leaving `handshake_pending_ = true` on a draining or settled session) | an `EndOp` tail, below |
 | `h2dBegin`     | 1: first scope of `ExecuteLayerH2d` (after the unlocked `LookupStagingSlot` under bounded staging, below) | — |
 | `h2dIssue`     | 1–3 in `ExecuteLayerH2d`: the `done_ \|\| draining_` re-check (`EndRecvOpLocked()` and return in 1 scope when draining); then `h2d_futures_.push_back(future)` after the unlocked `H2dSyncDispatch` (or, on dispatch failure, `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`); then, after `future.OnReady` is registered, `dispatched_layers_.insert(layer_idx)` and `network_completed_ = true` if the set is full and `!network_completed_ && !done_ && !draining_` | during `H2dSyncDispatch` the copy is not yet in `h2d_futures_`, so `AllH2dDoneLocked` does not see it. Harmless by A4: this thread calls `RecordBlockShards` only after `ExecuteLayerH2d` returns, so `network_completed_` cannot be set in the gap, and `num_completed_layers_ == total_layers` is false while a layer is unissued, keeping `IsReadyToComplete` false. A `Finish(error)` before the re-check is `cancel` then `h2dIssue` (`trace_finish_between_locks`); one during the dispatch finds the op `h2dBegin` took, cannot settle, and commutes with `push_back`, i.e. `h2dIssue true` then `cancel` (`trace_deadline_during_copy`, `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`). Between `push_back` and the third scope a `cancel`, or the copy's own `h2dDone` (the future may already be ready), finds exactly the model's state after `h2dIssue true`: the copy counted in `h2d_futures_` and `in_flight_`. The one thing the third scope then does differently is to leave `network_completed_` false (`!done_ && !draining_` fails) where the model has set `netIssued`; a draining session's flag is read by nothing the model tracks — `RecordBlockShards` and `TryBeginOp` refuse, `IsReadyToComplete` is consulted only behind `!IsDraining()` (`CompleteReadWithDetails`, `EmplaceRecvSessionLocked`, `RegisterActivePlan`), and `CurrentPhaseLocked` reads it only for `Details()` — so `h2dIssue true` followed by that `cancel` / `h2dDone` reaches the same lifecycle state with the same enabled events, and folding the third scope into `h2dIssue true` is exact for everything proved (`ReadinessSound` holds from `netIssued` through `Inv.netIssued_issued`, independently of the flag's timing) |
 | `h2dReady`     | 0 (device) | — |
@@ -144,20 +144,27 @@ so `FinishLocked` returns at `if (draining_) return;` without touching
 **Late errors.** `FinishLocked` records a non-OK status before testing
 `draining_`, so a `Finish(error)` after an OK settle still flips `status_`;
 `Lifecycle.finishLocked` does the same, which is why `cancel` is unguarded and
-a subsequent `publish` reports `some false`. Three callers can do this: the
+a subsequent `publish` reports `some false`. Four callers can do this: the
 deadline sweep's `Finish(DeadlineExceeded)` if the last H2D callback settled the
 session after `IsReadyToComplete()` returned false; `UnregisterActivePlan`,
 whose `!session->Done()` check and `Finish(CancelledError)` both run after it
-released manager `mu_`; and `~KVCacheManagerWithTransfer`, which finishes every
-seated session unconditionally. In the second case, `Finish(CancelledError)`
+released manager `mu_`; `~KVCacheManagerWithTransfer`, which finishes every
+seated session unconditionally; and `StartRead`'s synchronous pre-`Start()`
+`kKvCacheManagerApiStartReadSubmitPull` (or `!started.ok()`) error path, which
+calls `session->Finish(status)` unconditionally after `EmplaceRecvSessionLocked`
+published the session in `sessions_` (`cancel` before `pullReply false`, flipping
+`status_` if a concurrent caller already finished the session OK in that unlocked
+window). In the `UnregisterActivePlan` (or `StartRead`) case, `Finish(error)`
 can land during `RetireSettledSessionLocked` between the `GetStatus()` that
 selects `done_recving_` and the `Details()` stored in `transfer_details_`,
 producing a `done_recving_` entry whose details carry an error
 (`transfer_details_` is outside the model's state; on the modelled fields every
-interleaving is `cancel` before or after `publish`). The pull reply is not such
-a caller: `on_response` tests `!self->draining_` before `FinishLocked(pull_status)`
-under the same `mu_`, so a receive whose data outran a failing control reply
-keeps its OK verdict (`pullReply false` on a draining session only ends the op;
+interleaving is `cancel` before or after `publish`). By contrast, `Start`'s
+`on_response` callback is not such a caller: `on_response` tests
+`!self->draining_` before `FinishLocked(pull_status)` under the same `mu_`, so
+once `Start()` has scheduled the pull, a receive whose data (or zero-layer
+readiness poll) outran a failing control reply keeps its OK verdict
+(`pullReply false` on a draining session only ends the op;
 `trace_late_reply_failure_keeps_verdict`).
 
 **Bounded host layer staging.** The model is the full host mirror, one host
@@ -165,12 +172,15 @@ layer buffer per layer (`KVCacheManagerBase::num_host_layers() == num_layers()`,
 the default; the `num_staging_layers` constructor argument, checked by
 `ResolveNumStagingLayers`, bounds it). When fewer buffers than layers exist, a
 layer's payload is written into a buffer leased from the session's
-`StagingLayerManager`: each chunk's `KVCacheManagerBase::GetBlockChunks`
-(inside the push lease, from `StartStream`'s payload loop) calls
-`session->ResolveStagingSlot(layer_idx)` →
-`TransferReceiveSession::AcquireStagingSlot` (on a full mirror it returns
-`NotFound`, "no bounded host staging", and the chunk addresses the layer's own
-buffer), which takes an op (`if (done_ || draining_)` refusal, `++in_flight_`,
+`StagingLayerManager`: each chunk's `KVCacheManagerBase::GetBlockChunks` and
+companion `ValidateChunks` → `KVCacheManagerBase::GetBlockArrayHostSpan` →
+`KVCacheManagerBase::ResolveBlockArrayHostLayer` (both inside the push lease,
+from `StartStream`'s payload loop, each taking `KVCacheManagerWithTransfer::mu_`
+in `GetSession(uuid)`) call `session->ResolveStagingSlot(layer_idx)` →
+`TransferReceiveSession::AcquireStagingSlot` (on a full mirror `GetBlockChunks`
+and `ResolveBlockArrayHostLayer` address the layer's own buffer directly when
+`!explicit_pools_`, and `AcquireStagingSlot` itself returns `NotFound`, "no
+bounded host staging"), which takes an op (`if (done_ || draining_)` refusal, `++in_flight_`,
 the pattern of `TryBeginOp`), waits in `StagingLayerManager::Acquire` until a
 buffer is free, the layer already holds one, the session's `deadline_` passes
 or `cancelled_` is set (`FinishLocked` also calls
@@ -219,10 +229,16 @@ which `CountersOrdered` forbids. What the model's properties say about it
 follows by inspection rather than by proof: the lifecycle is `pushBegin`,
 `pushEnd`, `pullReply`, `cancel`, `publish` and one `FinishLocked()` on the
 last layer, so `SettleSafe`, `StagingIntegrity`, `SettlesPromptly` and
-`NoOpLeak` are the `Lifecycle` facts; `IsReadyToComplete` is false until that
-`FinishLocked()` (`num_completed_layers_ < num_layers` and `network_completed_`
-unset) and the receive is draining from then on, so the poll never finishes a
-host receive; and `done_recving` requires `num_completed_layers_ ==
+`NoOpLeak` are the `Lifecycle` facts; for `num_layers() > 0`, `IsReadyToComplete`
+is false until that `FinishLocked()` (`num_completed_layers_ < num_layers` and
+`network_completed_` unset) and the receive is draining from then on, so the
+readiness poll never finishes a host receive when `num_layers() > 0` (at
+`num_layers() == 0`, `num_completed_layers_ == 0 == total_layers` makes
+`IsReadyToComplete()` true from construction, so an intervening poll calls
+`Finish(OkStatus())` and sets `draining_ = true` while the pull handshake op is
+still in flight, causing `Start`'s `on_response`
+`if (!pull_status.ok() && !self->draining_)` check to ignore a failed pull
+handshake); and `done_recving` requires `num_completed_layers_ ==
 num_layers`, counted once per `OnLayerReceived` — A1 is what makes that "every
 layer landed" (`SettleHostLayer` keeps no `dispatched_layers_`-style set, so a
 re-delivered layer would count twice; the same reliance as the device
@@ -446,6 +462,8 @@ Generated by `tools/resolve_anchors.py`.
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin();`) | `:1079-1104` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`if (auto recv =` .. `absl::DeadlineExceededError("Transfer session timed out"));`) | `:1083-1095` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`auto current = it++;` .. `retired_uuids.push_back(uuid);`) | `:1098-1102` |
+| `base.cc` | `KVCacheManagerBase::ResolveBlockArrayHostLayer` | `:2134-2192` |
+| `base.cc` | `KVCacheManagerBase::GetBlockArrayHostSpan` | `:2194-2256` |
 | `base.cc` | `KVCacheManagerBase::GetSession` | `:3070-3076` |
 | `base.cc` | `KVCacheManagerBase::OnBlockShardsReceived` | `:3312-3330` |
 | `base.cc` | `KVCacheManagerBase::OnLayerReceived` | `:3334-3343` |
@@ -455,8 +473,10 @@ Generated by `tools/resolve_anchors.py`.
 | `bt.cc` | `BlockTransport::HandleIncomingPush` | `:443-452` |
 | `bts.cc` | `BeginIncomingPush` | `:242-256` |
 | `bts.cc` | `EndIncomingPush` | `:258-271` |
+| `bts.cc` | `ValidateChunks` | `:275-304` |
 | `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:365-499` |
 | `bts.cc` | `BlockTransportServerPushSession::StartStream` (`absl::Cleanup end_incoming_push`) | `:379-384` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`std::vector<BlockChunk> chunks = delegate_->GetBlockChunks(` .. `ValidateChunks(delegate_, l, sh, header.uuid, chunks));`) | `:443-453` |
 | `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` |
 | `send_drain_test.cc` | `RecvLifecycleTest.OutOfOrderLayersSettleAfterEveryH2d` | `:964-983` |
 | `send_drain_test.cc` | `RecvLifecycleTest.DetailsReportWhenTheLastH2dLanded` | `:879-894` |

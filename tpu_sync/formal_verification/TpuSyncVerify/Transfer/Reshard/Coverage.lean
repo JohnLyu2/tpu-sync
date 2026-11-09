@@ -157,7 +157,8 @@ structure ScheduleEntry where
   deriving Repr, DecidableEq
 
 /-- Distinct `(srcBlock, dstBlock)` pairs scheduled for `sender`
-(`ReshardSendSession::StartPoolPush` `block_pairs` in `reshard_send_session.cc`,
+(`ReshardSendSession::StartPoolPush` `transfers_by_peer` / `seen_by_peer` in
+`reshard_send_session.cc`,
 `ReshardReceiveSession::ValidateReceiverCoverage` `state.pairs_by_sender[source_rank].insert`
 in `reshard_receive_session.cc`). -/
 def senderPairs (entries : List ScheduleEntry) (sender : Nat) : List (Nat × Nat) :=
@@ -650,9 +651,9 @@ plan (`!is_sender_` and `pool_groups_size() == 0`) with non-empty
 `shard_push_schedules`, and `none` for sender plans, pool-grouped plans (which
 use `TransferPlan::GetPoolPushProgressSpec`), bare plans, or once the session
 is gone (`UnregisterActivePlan`, `GetSession` failing). -/
-def expectedPushSenders (isSender : Bool) (schedules : List (Nat × List ScheduleEntry)) :
-    Option Nat :=
-  if isSender || schedules.isEmpty then none
+def expectedPushSenders (isSender hasPoolGroups : Bool)
+    (schedules : List (Nat × List ScheduleEntry)) : Option Nat :=
+  if isSender || hasPoolGroups || schedules.isEmpty then none
   else some schedules.length
 
 /-- Replay of `ReshardReceiveSessionTest` coverage and push-count unit tests
@@ -692,17 +693,21 @@ theorem trace_reshard_receive_coverage_test_parity :
   decide
 
 /-- Replay of `ExpectedPushSendersTest.CountsReceiverPlanSchedules`
-(`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`):
-- Receiver plan (`isSender = false`) with 2 source schedules (`ranks 4 and 5`)
-  reports `some 2`.
+(`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`) and
+`TransferPlan::ExpectedPushSenders` (`tpu_sync/kv_cache/transfer_plan.cc`):
+- Block-addressed receiver plan (`isSender = false`, `hasPoolGroups = false`)
+  with 2 source schedules (`ranks 4 and 5`) reports `some 2`.
+- Pool-grouped receiver plan (`isSender = false`, `hasPoolGroups = true`,
+  `request_.pool_groups_size() > 0`) reports `none`.
 - Sender plan (`isSender = true`) reports `none`.
 - Bare plan (`schedules = []`) reports `none`. -/
 theorem trace_expected_push_senders_test_parity :
     let sched4 : List ScheduleEntry := [⟨4, 0, 1, ⟨0, 16⟩⟩]
     let sched5 : List ScheduleEntry := [⟨5, 0, 2, ⟨0, 16⟩⟩]
-    expectedPushSenders false [(4, sched4), (5, sched5)] = some 2 ∧
-    expectedPushSenders true [(0, sched4)] = none ∧
-    expectedPushSenders false [] = none := by
+    expectedPushSenders false false [(4, sched4), (5, sched5)] = some 2 ∧
+    expectedPushSenders false true [(4, sched4), (5, sched5)] = none ∧
+    expectedPushSenders true false [(0, sched4)] = none ∧
+    expectedPushSenders false false [] = none := by
   decide
 
 /-- Replay of the per-destination routing tests of `ReshardStackTest`

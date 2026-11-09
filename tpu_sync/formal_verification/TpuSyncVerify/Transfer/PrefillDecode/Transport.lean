@@ -16,7 +16,8 @@ issued"), and to state exactly what they rest on.
 Abbreviations: `bt.cc` = `tpu_sync/transport/block_transport.cc`, `bt.h` =
 `tpu_sync/transport/block_transport.h`, `bts.cc` =
 `tpu_sync/transport/block_transport_session.cc`, `bts.h` =
-`tpu_sync/transport/block_transport_session.h`, `recv.cc` =
+`tpu_sync/transport/block_transport_session.h`, `recv.h` =
+`tpu_sync/kv_cache/transfer_receive_session.h`, `recv.cc` =
 `tpu_sync/kv_cache/transfer_receive_session.cc`, `mgr.cc` =
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`, `send.cc` =
 `tpu_sync/kv_cache/transfer_send_session.cc`, `base.cc` =
@@ -148,8 +149,11 @@ the prefill-to-decode models: it spans all four. In order on the push thread:
 uuid's first stream), `BeginIncomingPush` = `delegate_->GetSession(uuid)`
 (manager `mu_`, returning the `shared_ptr` the rest of the stream holds) then
 `TryBeginOp` (receive-session `mu_`), the payload write (unlocked; under
-bounded host layer staging each chunk's `GetBlockChunks` also runs
-`TransferReceiveSession::AcquireStagingSlot`, audited in `Receive.lean`), the
+bounded host layer staging each chunk's `KVCacheManagerBase::GetBlockChunks`
+and companion `ValidateChunks` → `KVCacheManagerBase::GetBlockArrayHostSpan` →
+`KVCacheManagerBase::ResolveBlockArrayHostLayer` each look the session up under
+manager `mu_` via `GetSession(uuid)` and run `session->ResolveStagingSlot` =
+`TransferReceiveSession::AcquireStagingSlot`, audited in `LayerStaging.lean`), the
 `expected_senders` lookup (push-session `mu_`), the unlocked
 `ExpectedPushSenders` check (A2), the `layer_progress_` update with the
 once-latch and retirement (push-session `mu_`, A1), then `OnLayerReceived` →
@@ -182,24 +186,56 @@ Peregrine path's lease bookkeeping) and otherwise seats a fresh
 drops a session that `IsDone()` once `StartStream` has returned (after the
 delegate callbacks, `EndIncomingPush` and the ack) through
 `DeletePushSession(session)`, which erases the map entry only if it still holds
-that session. So a later stream starts a fresh table: `Layer.entry = none` is
-that fresh table, and `retire` sets it at the retiring stream. A stream of the
-same uuid that took the `shared_ptr` before retirement and reaches
-`CompleteIncomingPush` after it finds the retired table's latched entry
-(`StartStream` and `CompleteIncomingPush` never test `done_`), so it counts into
-a dead table and cannot dispatch again; the model, which gives it a fresh
-entry, admits a dispatch there that the C++ does not — an over-approximation on
-the dishonest side only, since under A4 no such stream exists.
-`BlockTransport::ForgetPushProgress` removes the uuid's session from
+that session. Under both **A4** (`honest = true`) and `Cfg.WF.chunkSingle`
+(`c.declared = false → c.numSenders = 1`), every sender's declared streams for
+every layer have already landed when `all_layers_called` sets `done_`, so no
+stream arrives at or after retirement. When `honest = false`, `retire`
+(`Layer.entry := none`) models the fresh-lookup path: a stream arriving *after*
+`active_push_sessions_` dropped or replaced the retired
+`BlockTransportServerPushSession` enters through `GetOrCreatePushSession` on a
+fresh table (`entry = none`). By contrast, an in-flight stream that already
+took `shared_ptr<BlockTransportServerPushSession>` before `done_` was set and
+reaches `CompleteIncomingPush` afterwards (`StartStream` and
+`CompleteIncomingPush` never test `done_`) operates on the retained
+pre-retirement `layer_progress_`: on the chunk-count contract it increments the
+latched entry (`on_layer_received_called == true`) harmlessly without
+dispatching again, whereas on the sender-declared contract (`streams.landed`
+already at `streams.declared`) `++streams.landed` hits
+`streams.landed > streams.declared` (`AlreadyExistsError`) and fails the
+`TransferReceiveSession` through `absl::Cleanup end_incoming_push` →
+`EndIncomingPush` (even when `numStreams ≥ 2`, where a fresh table accepts the
+first post-retirement stream without error; `entry := none` is therefore a
+fresh-lookup model rather than a pure over-approximation of `shared_ptr`
+retention on sender-declared pushes).
+`BlockTransport::ForgetPushProgress(uuid)` removes `uuid`'s session from
 `active_push_sessions_` (under `server_sessions_mu_`) and `Cancel()`s it
 (`ReleaseAdmittedPosts`: `done_`, `status_ = CancelledError`, and the release of
-any Peregrine leases), from
-`KVCacheManagerWithTransfer::CompleteReadWithDetails` (for each uuid
-`RetireSettledSessionLocked` retired with `retired_push_progress`: a settled
-receive, or a failed send), `UnregisterActivePlan` (only once `Done()`) and
-`RegisterActivePlan` (when it retires a settled incumbent); no stream passes
-`TryBeginOp` on a settled receive, and a stream already past the gate that
-recreates an entry finds the receive session draining. It is not an event.
+any Peregrine leases). `KVCacheManagerWithTransfer` calls it at five sites,
+always *outside* `KVCacheManagerWithTransfer::mu_`: `CompleteReadWithDetails`
+(for each uuid `RetireSettledSessionLocked` retired with
+`retired_push_progress` that is not currently in `sessions_` or
+`pending_pool_reshard_recvs_`: a settled receive, a settled pool-reshard
+receive, or a failed send of either kind), `UnregisterActivePlan` (once
+`session->Done()`), `RegisterActivePlan` (when it retires a settled incumbent —
+after already seating the new `send_session` or `recv_session` in `sessions_`
+before releasing `mu_`), `PoolReshardPush` (after retiring a settled incumbent
+and before seating the new reshard send), and `PoolReshardRegisterRecv` (after
+retiring a settled incumbent under `pending_pool_reshard_recvs_` and before
+seating the new reshard receive). By contrast, inline retirement in
+`StartRead(remote_endpoint)` and in `RegisterRecv` (via `EmplaceRecvSessionLocked`;
+`RegisterActivePlan` already retired `existing` with `&retired_existing` before
+calling `EmplaceRecvSessionLocked`) invokes `RetireSettledSessionLocked` with
+`retired_push_progress = nullptr`, leaving any unretired
+`active_push_sessions_[uuid]` entry in place. Because
+`ForgetPushProgress(uuid)` keys `active_push_sessions_` by integer `uuid` and
+runs unlocked, reusing a `uuid` across generations could either inherit stale
+`active_push_sessions_[uuid]` progress (after inline retirement of a partial
+receive) or have an unlocked `ForgetPushProgress(uuid)` from the retired
+generation erase/cancel progress of streams already admitted into the new
+live receive (e.g. in `RegisterActivePlan`). Cross-generation `uuid` reuse is
+excluded by **A5** below; within a single `uuid` generation,
+`ForgetPushProgress(uuid)` runs only once the receive session is `Done()`,
+when `TryBeginOp` already refuses every further stream, so it is not an event.
 
 ## Assumptions
 
@@ -277,6 +313,11 @@ recreates an entry finds the receive session draining. It is not an event.
   is the assumption the C++ does **not** enforce on the chunk-count contract,
   nor on any contract after the table entries are retired
   (`if (all_layers_called)` in `CompleteIncomingPush`); the traces at the end drop it.
+* **A5 (single transfer generation / fresh `uuid`).** `init` (`Layer.entry =
+  none` on every layer) models a fresh `uuid` with no prior
+  `active_push_sessions_[uuid]` residue from an earlier unretired push session
+  and no concurrent unlocked `BlockTransport::ForgetPushProgress(uuid)` still
+  in flight from retiring an earlier plan or session on the same `uuid`.
 
 ## Properties
 
@@ -347,7 +388,9 @@ Generated by `tools/resolve_anchors.py`.
 | `bt.cc` | `BlockTransport::BuildBlockRequests` (`const uint32_t remote_id =` .. `static_cast<uint32_t>(header_layer_idx);`) | `:733-739` |
 | `recv.h` | `TransferReceiveSession::Done` | `:103-106` |
 | `recv.h` | `TransferReceiveSession::IsDraining` | `:120-123` |
+| `recv.h` | `TransferReceiveSession::ResolveStagingSlot` | `:159-161` |
 | `recv.cc` | `TransferReceiveSession::TryBeginOp` | `:541-552` |
+| `recv.cc` | `TransferReceiveSession::AcquireStagingSlot` | `:763-792` |
 | `recv.cc` | `TransferReceiveSession::FinishLocked` | `:475-490` |
 | `recv.cc` | `TransferReceiveSession::Finish` | `:492-495` |
 | `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:528-539` |
@@ -375,11 +418,18 @@ Generated by `tools/resolve_anchors.py`.
 | `block_transport_test.cc` | `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration` | `:1377-1404` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.get_session =`) | `:306` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |
+| `base.cc` | `KVCacheManagerBase::ResolveBlockArrayHostLayer` | `:2134-2192` |
+| `base.cc` | `KVCacheManagerBase::GetBlockArrayHostSpan` | `:2194-2256` |
 | `base.cc` | `KVCacheManagerBase::GetSession` | `:3070-3076` |
 | `base.cc` | `KVCacheManagerBase::GetTransferPlan` | `:3078-3088` |
 | `base.cc` | `KVCacheManagerBase::OnLayerReceived` | `:3334-3343` |
 | `base.cc` | `KVCacheManagerBase::OnBlockShardsReceived` | `:3312-3330` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`size_t host_layer_idx = layer_idx;` .. `base_host_ptr = GetHostPointer(host_layer_idx, shard_idx);`) | `:3479-3490` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked` | `:604-625` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:627-706` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterRecv` | `:708-730` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:732-774` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:776-825` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:827-873` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_descriptors)` | `:909-935` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:937-1069` |

@@ -71,10 +71,14 @@ inductive RegEv where
   `ReshardReceiveSession::ReleaseStagingLocked`). -/
   | finishArm (callId : Nat)
   /-- Normal session completion (`FinishPoolH2d` / `UnregisterActivePlan`, then
-  `RetireSettledSessionLocked`): releases `uuid`'s staging lease and removes
-  `uuid` from `activeSessions`. Under `.reserveBeforeLease` the poll skips the
-  release while an arm for `uuid` is in flight (`CompleteReadWithDetails`,
-  `pending_pool_reshard_recvs_.contains(uuid)`). -/
+  `RetireSettledSessionLocked` and `CompleteReadWithDetails`'s unlocked
+  post-poll `ReleasePoolStagingLeases(uuid)`): releases `uuid`'s staging lease
+  and removes `uuid` from `activeSessions`. Assumes fresh UUIDs across poll
+  retirement (because `RetireSettledSessionLocked` and the
+  `pending_pool_reshard_recvs_` filter run under the same `mu_` hold while
+  `ReleasePoolStagingLeases(uuid)` runs after releasing `mu_`, a `uuid` being
+  retired by `CompleteReadWithDetails` must not be concurrently re-registered
+  during the unlocked cleanup). -/
   | settleSession (uuid : Nat)
   deriving DecidableEq, Repr
 
@@ -144,7 +148,6 @@ def RegState.step (policy : RegistrationPolicy) (s : RegState) (e : RegEv) : Opt
           inFlightArms := s.removeArm callId }
   | .settleSession uuid =>
     if !s.hasActiveUuid uuid then none
-    else if policy == .reserveBeforeLease && s.hasInFlightUuid uuid then none
     else
       some { s with
         arena := s.arena.releaseLease uuid

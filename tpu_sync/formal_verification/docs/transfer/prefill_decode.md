@@ -140,7 +140,7 @@ unwritten KV (`Caller.contract_safe`, `Caller.mw_contract_safe`); dropping
 `failed_recving` or omitting either channel on failure violates safety
 (`trace_dropFailed_*`, `trace_mw_dropFailed_partial_failure_leaks`,
 `trace_naive_decodes`, `trace_loadErrorOnly_*`). Below the connector, a worker
-built with `TPU_RAIDEN_ENABLE_MULTI_NUMA=1` runs one `KVCacheManagerWithTransfer`
+built with `ENABLE_MULTI_NUMA=1` runs one `KVCacheManagerWithTransfer`
 per NUMA node under `NumaAwareKVCacheManager`, whose `CompleteReadRaw` folds the
 sub-managers' reports into one worker-level publication: `process_completion`
 counts `done_sending_counts_`, `done_recving_counts_` and
@@ -169,8 +169,9 @@ incoming-push op (`BeginIncomingPush` = `GetSession` + `TryBeginOp`,
 in `bts.cc` called from `StartStream`) that pins staging across session expiry
 (a send session's `TryBeginOp` returns `false`, so a push aimed at it is
 `Cancelled`), bounded host layer staging (`ResolveStagingSlot` in
-`GetBlockChunks` → `TransferReceiveSession::AcquireStagingSlot` /
-`TransferSendSession::LookupStagingSlot` and `StagingLayerManager` in
+`GetBlockChunks` and in `ValidateChunks` via `GetBlockArrayHostSpan` →
+`ResolveBlockArrayHostLayer` → `TransferReceiveSession::AcquireStagingSlot` /
+`TransferSendSession::LookupStagingSlot`, plus `StagingLayerManager` in
 `PrefillDecode/LayerStaging.lean` and `Transfer/LayerStaging.lean`), the two
 forms of `OnDataReceived` — a layer completion
 (`KVCacheManagerBase::OnLayerReceived` → `ExecuteLayerH2d`) before the block
@@ -211,8 +212,8 @@ behaviour.
 
 ## Assumptions and how each is discharged
 
-Every module numbers its assumptions (`Receive` A1–A4, `Send` A1–A7, `Pipeline`
-A1–A4, `LayerStaging` LS1–LS2, `Transport` A1–A4, `Caller` B1–B3); the full statements and arguments
+Every module numbers its assumptions (`Receive` A1–A4, `Send` A1–A8, `Pipeline`
+A1–A4, `LayerStaging` LS1–LS2, `Transport` A1–A5, `Caller` B1–B3); the full statements and arguments
 are in the module docstrings. This table is the index: what each one says in a
 line, and whether it is discharged by another Lean module, enforced by C++
 control flow, or an external contract.
@@ -221,7 +222,7 @@ control flow, or an external contract.
 |---|---|---|
 | Pipeline A4 — engine contract | Decode reads destination HBM only after `done_recving`; prefill frees source HBM only after every registered transfer settled. | External contract; encoded as the guards of `.recyclePrefill` / `.nextRequest` in `MultiRequest.lean`. The other direction is `Caller.lean`. |
 | Receive A4 / Pipeline A3 — transport ordering, one sender per layer | For the stream that completes a layer, the layer completion (`OnLayerReceived` → `OnDataReceived` → `ExecuteLayerH2d`) runs before the block report (`OnBlockShardsReceived` → `OnDataReceived` → `RecordBlockShards`) on the same thread; a layer's blocks are accounted once its copy is issued. | Ordering: C++ control flow in `BlockTransportServerPushSession::StartStream` (`CompleteIncomingPush` before `delegate_->OnBlockShardsReceived`). Coarsening: discharged by `Transport.NetworkSound` under `Transport` A4 (honest senders); mutant `Recv.netAccountUnordered` shows what breaks without it. Needed only for the block-accounting setter of `network_completed_`: the setter in `ExecuteLayerH2d` (`dispatched_layers_.size() == num_layers()`, `Recv.netIssued`) is this thread's own, so readiness through it needs no ordering. |
-| Receive A1 — one dispatch per layer | `CompleteIncomingPush` fires `OnLayerReceived` once per layer (`on_layer_received_called`), marks the push session `done_` on `all_layers_called`, and `BlockTransport::HandleIncomingPush` drops it (`DeletePushSession(session)`), so a later push to the uuid gets a fresh table from `GetOrCreatePushSession`. | Discharged by `Transport.OnceDispatched` under `Transport` A2 (a layer's contract is latched by its first stream), A4 (honest senders) and `Cfg.WF.chunkSingle`; `trace_dup_after_retirement` and `trace_chunk_two_senders` are the exceptions. |
+| Receive A1 — one dispatch per layer | `CompleteIncomingPush` fires `OnLayerReceived` once per layer (`on_layer_received_called`), marks the push session `done_` on `all_layers_called`, and `BlockTransport::HandleIncomingPush` drops it (`DeletePushSession(session)`), so a later push to the uuid gets a fresh table from `GetOrCreatePushSession`. | Discharged by `Transport.OnceDispatched` under `Transport` A2 (a layer's contract is latched by its first stream), A4 (honest senders), A5 (single transfer generation per `uuid`) and `Cfg.WF.chunkSingle`; `trace_dup_after_retirement` and `trace_chunk_two_senders` are the exceptions. |
 | Receive A2 — registration | External `ReleaseStaging()` runs only on registration failure, before the plan is published. | C++ init discipline; the tables are `UuidTable.lean`. |
 | Receive A3 / Send A4 — no double end | Each `in_flight_` op ends at most once. | C++ callback and RAII discipline. |
 | Send A1 — at-most-once `StartPush` | After `NotifyForRead` registration and the `pull_started_` claim in `ValidateAndBeginPull`. | Discharged: `Send.PullClaimed`, `Pipeline.HandshakeSafe`, `BlockOrdering.validateRequestedBlocks_iff`. |
@@ -229,11 +230,12 @@ control flow, or an external contract.
 | Send A3 — layers interchangeable | `Send.lean` counts copies and pushes without layer indices. | Discharged: `Pipeline.lean` indexes every memory event by layer. |
 | Send A5 — no consumer Ack | `SendAck` has no non-test caller, so `HandleAck → AckSend → Finish()` is excluded. | Dead path. |
 | Send A7 — connection-release window | Under `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer` the last `TransferSendSession::EndOp` drops `mu_` before `EndSendOpLocked`; nothing modelled changes in the window. | Soundness argument in `Send.lean`. |
+| Send A8 — no incoming push on a send | `TransferSendSession::TryBeginOp` returns `false` unconditionally (`BeginIncomingPush` refuses with `CancelledError`), and `TransferSendSession::OnDataReceived` returns `FailedPreconditionError`. | Enforced by C++ (`TransferSendSession`). |
 | Pipeline A1 — whole-layer cells | A layer moves as one unit. | Discharged: `BlockOrdering.BlockPipeline.step_pipe` (lockstep simulation over blocks). |
 | Pipeline A2 — delivery after the push callback | The model lands a layer at or after its push callback; C++ lands it before the ack. Sound because the push pins staging. | Soundness argument in `Pipeline.lean`. |
-| LayerStaging LS1–LS2 — pre-land consumer `AcquireStagingSlot` touches; `Shutdown` before `Release` on error callbacks | Under `Pipeline` A3, `GetBlockChunks(l)` runs only before `CompleteIncomingPush` marks `l` landed (possibly repeatedly across chunks/shards); on callback error `FinishLocked` sets `shutdown_ = true` monotonically before `Release(l)` wakes waiters. | LS1 follows from `Pipeline` A3 (`StartStream` payload loop precedes `CompleteIncomingPush`); LS2 enforced by C++ call order in `TransferSendSession` and `TransferReceiveSession`. |
-| Transport A1–A4 — one lock, contract latched by the first stream, uniform declaration, honest senders | `Transport.lean` §Assumptions. | Stated there: `ExpectedPushSenders` enters `sender_streams` only on non-pool receiver `RegisterActivePlan` plans (`pool_groups_size() == 0` with `shard_push_schedules_size() > 0`); A2 holds whenever senders are dispatched after `RegisterActivePlan` returns (as on in-repo controller hops that arm receivers before dispatching senders) and is assumed only against concurrent or pre-registration pushes; A3 is bypassed on pool reshard (which checks unique contiguous `transfer_rank`s) and store transfers, and is unchecked on legacy non-pool `RegisterActivePlan` plans; A4 is the one the C++ does not enforce and the traces drop. |
-| Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`) with one settled outcome per worker (`TPU_RAIDEN_ENABLE_MULTI_NUMA=0`), whole-transfer failure, no preemption/prefix caching/chunked prefill | `Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly for both `AggChannel.latchedReq` (`_failed_recving_pending`) and `AggChannel.eagerBlock` (`invalid_block_ids`) in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_eager_eq_latched`, `applyRecv_staggered_eq_batch`; `trace_mw_overcounted_expected_leaks` shows what breaks when `get_finished_count()` exceeds participating workers), and `Caller/NumaBarrier.lean` models the intra-worker `NumaAwareKVCacheManager::CompleteReadRaw` barrier (`process_completion` over `done_sending_counts_` / `done_recving_counts_` / `failed_recving_counts_`; assuming one report per sub-manager, its N1, and proving `NumaPolicy.settledCounts` aggregates them into one worker-level publication under `ENABLE_MULTI_NUMA=1` and `req_id` reuse); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
+| LayerStaging LS1–LS2 — pre-land consumer `AcquireStagingSlot` touches; `Shutdown` before `Release` on error callbacks | Under `Pipeline` A3, `GetBlockChunks(l)` and `ValidateChunks` (`GetBlockArrayHostSpan` → `ResolveBlockArrayHostLayer`) run only before `CompleteIncomingPush` marks `l` landed (possibly repeatedly across chunks/shards); on callback error `FinishLocked` sets `shutdown_ = true` monotonically before `Release(l)` wakes waiters. | LS1 follows from `Pipeline` A3 (`StartStream` payload loop precedes `CompleteIncomingPush`); LS2 enforced by C++ call order in `TransferSendSession` and `TransferReceiveSession`. |
+| Transport A1–A5 — one lock, contract latched by the first stream, uniform declaration, honest senders, single transfer generation per `uuid` | `Transport.lean` §Assumptions. | Stated there: `ExpectedPushSenders` enters `sender_streams` only on non-pool receiver `RegisterActivePlan` plans (`pool_groups_size() == 0` with `shard_push_schedules_size() > 0`); A2 holds whenever senders are dispatched after `RegisterActivePlan` returns (as on in-repo controller hops that arm receivers before dispatching senders) and is assumed only against concurrent or pre-registration pushes; A3 is bypassed on pool reshard (which checks unique contiguous `transfer_rank`s) and store transfers, and is unchecked on legacy non-pool `RegisterActivePlan` plans; A4 is the one the C++ does not enforce and the traces drop; A5 assumes a fresh `uuid` per transfer generation (`init` starts with `entry = none` and no concurrent unlocked `ForgetPushProgress(uuid)` runs from a prior retired plan or session on the same `uuid`). |
+| Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`) with one settled outcome per worker (`ENABLE_MULTI_NUMA=0`), whole-transfer failure, no preemption/prefix caching/chunked prefill | `Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly for both `AggChannel.latchedReq` (`_failed_recving_pending`) and `AggChannel.eagerBlock` (`invalid_block_ids`) in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_eager_eq_latched`, `applyRecv_staggered_eq_batch`; `trace_mw_overcounted_expected_leaks` shows what breaks when `get_finished_count()` exceeds participating workers), and `Caller/NumaBarrier.lean` models the intra-worker `NumaAwareKVCacheManager::CompleteReadRaw` barrier (`process_completion` over `done_sending_counts_` / `done_recving_counts_` / `failed_recving_counts_`; assuming one report per sub-manager, its N1, and proving `NumaPolicy.settledCounts` aggregates them into one worker-level publication under `ENABLE_MULTI_NUMA=1` and `req_id` reuse); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
 
 ## Shipping C++ vs. modelled design alternatives
 
@@ -305,7 +307,7 @@ missing upstream test), **window** (an interleaving no harness hook reaches),
 
 What the tests miss, in one sentence per model: no upstream test fails an
 H2D dispatch while a push lease is open or a consumer-side push mid-copy; on the
-sender, no upstream test fails layer 0's D2H dispatch or an H2H push as the last op; the end-to-end tests
+sender, no upstream test fails a D2H copy after the send has already expired or fails an H2H push callback as the last op of a live device send; the end-to-end tests
 exercise exactly the happy paths and the handshake rejections, every failure or
 window branch being accounted for at the session level; no test in the suite
 recycles a released buffer under an earlier request.
@@ -313,32 +315,22 @@ recycles a released buffer under an earlier request.
 ## C++ branch coverage of the anchored spans
 
 The converse check ([conventions.md](../conventions.md) §Coverage):
-`tools/resolve_anchors.py --coverage` intersects `llvm-cov` branch counts from
-every OSS-buildable CPU unit-test binary, last measured at `42dda542` (the
-spans below are re-resolved at the commit in `README.md`; the counts are not,
-and the suite has since gained the `BlockLocation::kHost` cases —
-`TransferSendSessionTest.HostSource*` and
-`kv_cache_manager_with_transfer_host_memory_test.cc` — which the groups below
-predate), with the C++ spans in each module's source map. At that measurement
-`Receive.lean` spans 234 branches, `Send.lean` 109 and `Pipeline.lean` 112
-(the spans overlap: `ExecuteLayerH2d`, `StartStream` and `CompleteIncomingPush`
-are cited by both `Receive.lean` and `Pipeline.lean`), and every branch in
-`Pipeline.lean`'s spans is reached on at least one side. Branches expanded
-from `RETURN_IF_ERROR` / `ASSIGN_OR_RETURN` are not counted, so error returns
-written that way are outside this check. `--coverage -v` lists every one-sided
-or unreached branch; they fall into these groups:
+`tools/resolve_anchors.py --coverage` intersects `llvm-cov` branch records from
+every OSS-buildable CPU unit-test binary with the C++ spans in each module's
+source map (the spans overlap where `ExecuteLayerH2d`, `StartStream` and
+`CompleteIncomingPush` are cited by both `Receive.lean` and `Pipeline.lean`).
+Branches expanded from `RETURN_IF_ERROR` / `ASSIGN_OR_RETURN` are not counted,
+so error returns written that way are outside this check. `--coverage -v` lists
+every one-sided or unreached branch; across the current CPU test suite they fall
+into these groups:
 
-* **Model gaps confirmed in C++:** in `TransferReceiveSession`, `!future_or.ok()`
-  in `ExecuteLayerH2d` and `pull_status.ok()` in `Start`'s `on_response` are never
-  true, `!f.IsReady()` in `AllH2dDoneLocked` is never false (in the tests,
-  `AllH2dDoneLocked` returns `true` only with an empty `h2d_futures_`, never
-  after an H2D future has become ready), and the second-lock
-  `if (done_ || draining_)` re-check in `ExecuteLayerH2d` is never taken; in
-  `TransferSendSession`, the pool-task `if (self->draining_)` re-check in
-  `SendNextLayer` and the per-layer `if (draining_)` exit in `StartPush` are
-  never taken (and `fail_unissued_layers` only runs after an error finish where
-  `!status_.ok()`), while `CompleteReadWithDetails` only visits non-draining
-  sends whose `session->deadline() <= now` already holds.
+* **Model gaps confirmed in C++:** in `TransferReceiveSession`, `!f.IsReady()`
+  in `AllH2dDoneLocked` is never false (`AllH2dDoneLocked` returns `true` only
+  with an empty `h2d_futures_`, never after an H2D future has become ready), and
+  the second-lock `if (done_ || draining_)` re-check in `ExecuteLayerH2d` is
+  never taken; in `TransferSendSession`, the per-layer `if (draining_)` exit in
+  `StartPush` is never taken (and `fail_unissued_layers` only runs after an
+  error finish where `!status_.ok()`).
 * **Proved invariants and dead C++ arms (the dead side is never taken):** in
   `TransferSendSession`, `done_` is never true when `draining_` is false in
   `if (draining_ || done_)` (`FinishLocked`, `AcquireStagingWithRetry`,
@@ -346,28 +338,32 @@ or unreached branch; they fall into these groups:
   `if (draining_ && in_flight_ == 0 && !done_)` (`EndSendOpLocked`,
   `EndRecvOpLocked`) nor in `TransferReceiveSession::FinishLocked`'s
   `if (in_flight_ == 0 && !done_)`; all three match `Lifecycle.Consistent`.
-  `if (self->done_)` in `ExecuteLayerH2d`'s callback (`NoRetiredCallback`) and
-  the `FinishLocked()` arm of `RecordNetworkCompleteLocked` (`!all_complete` is
-  always true when `RecordBlockShards` calls it; the arm's only other caller is
-  `SettleHostLayer` on a `BlockLocation::kHost` destination, outside the model)
-  are never entered. In `TransferSendSession`,
-  `l >= d2h_layer_futures_.size()` in `SendNextLayer` (after
-  `l >= base_->num_layers()`) and `d2h_layer_futures_.size() < base_->num_layers()`
-  in `CurrentPhaseLocked` are never true because `StartPush` pre-populates every
-  layer's future before `SendNextLayer(0)`.
+  `if (self->done_)` in `ExecuteLayerH2d`'s callback (`NoRetiredCallback`) is
+  never entered (whereas `RecordNetworkCompleteLocked`'s `FinishLocked()` arm,
+  never entered from `RecordBlockShards` on a device destination, is exercised
+  on CPU through `SettleHostLayer` in `HostMemoryTransferTest`). In
+  `TransferSendSession`, `l >= d2h_layer_futures_.size()` in `SendNextLayer`
+  (after `l >= base_->num_layers()`) and
+  `d2h_layer_futures_.size() < base_->num_layers()` in `CurrentPhaseLocked` are
+  never true because `StartPush` pre-populates every layer's future before
+  `SendNextLayer(0)`.
 * **Assumed, not proved:** `if (in_flight_ <= 0)` in `EndRecvOpLocked` is never
   entered, consistent with Receive A3 (no double end).
 * **The rest:** lock-gap early-drain windows under bounded layer staging
-  (`AcquireStagingSlot` / `LookupStagingSlot`, classified in
+  (`AcquireStagingSlot` / `LookupStagingSlot`, including the nested
+  `!status_.ok()` ternaries inside `TransferSendSession`'s untaken
+  `done_ || draining_` guards and the bounded-staging arm of
+  `ResolveBlockArrayHostLayer`, since the bounded-staging CPU tests stub
+  `H2hWriteDirectAsync` rather than running over `BlockTransport`; classified in
   `LayerStaging.expectedStagingWindows`), documented boundaries
   (`AcquireStagingWithRetry`'s non-`ResourceExhausted` and deadline loop exits,
   unused `AckSend`, the Peregrine `OnPeregrinePostComplete` path), the
-  `transfer_plan_->request().pool_groups_size() > 0` misuse check in
-  `OnDataReceived`, input-validation and setup guards (`InitFromActivePlan`,
-  `NotifyForRead`, `HandlePullStream`), unused fault-injection and metrics
-  hooks, and bookkeeping arms the tests drive one way only (the
-  `RetireSettledSessionLocked` arms for session kinds a given test never
-  registers).
+  `!Done()` conjunct of the `transfer_plan_->request().pool_groups_size() > 0 && !Done()`
+  misuse check in `OnDataReceived`, input-validation and setup guards
+  (`InitFromActivePlan`, `NotifyForRead`, `HandlePullStream`), unused
+  fault-injection and metrics hooks, and bookkeeping arms the tests drive one
+  way only (the `RetireSettledSessionLocked` arms for session kinds a given test
+  never registers).
 
 ## C++ → Lean routing index
 
@@ -403,6 +399,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `recv.cc` | `TransferReceiveSession::Start` | `:626-710` | `PrefillDecode/Receive.lean`, `PrefillDecode/PeerIsolation.lean` | the pull handshake (`SendPullRequest` from `push_pool_`; `on_response` runs `FinishLocked(pull_status)` only `if (!pull_status.ok() && !self->draining_)` — a receive that settled before its pull reply keeps its verdict, and `pullReply false` on a draining session only ends the handshake op — then `EndOp`): `Recv.Ev.pullReply`, `PeerIsolation.Ev.dispatchPull`, `PeerIsolation.Ev.sessStep idx (.pullReply ok)`; a no-op (`pull_manager_ == nullptr`) for push receives | `Recv.trace_deadline_during_handshake`, `Recv.trace_details_rejected_pull`, `PeerIsolation.trace_consumer_gives_up_and_drains` |
 | `recv.cc` | `TransferReceiveSession::RecordBlockShards` | `:712-761` | `PrefillDecode/Receive.lean`, `PrefillDecode/ReceivePoll.lean` | `Recv.Ev.netAccount` (the block report of `OnDataReceived`) | `Recv.netAccount_frame`, `Recv.trace_late_net_account_after_retire` |
 | `recv.cc` | `TransferReceiveSession::OnDataReceived` | `:804-823` | `PrefillDecode/Receive.lean` | routes a block report (`minor_dimension_indices` non-empty) to `RecordBlockShards` and a layer completion to `ExecuteLayerH2d` (or, on a `BlockLocation::kHost` destination, to `SettleHostLayer`; §Boundaries) | `Recv.ReadinessSound` |
+| `recv.cc` | `TransferReceiveSession::SettleHostLayer` | `:825-852` | `Transfer/Session.lean`, `PrefillDecode/Receive.lean` | `BlockLocation::kHost` layer completion (`if (done_ \|\| draining_)`, `num_completed_layers_`, `RecordNetworkCompleteLocked` on the last layer; §Boundaries) | `Lifecycle.Consistent.done_or_draining` |
 | `recv.cc` | `TransferReceiveSession::AcquireStagingSlot` | `:763-792` | `PrefillDecode/LayerStaging.lean` | `recvAcquireBegin`, `recvAcquireWait`, `recvAcquireFinish` | `LayerStaging.reachable_safe`, `recvLookupStagingSlot_injective`, `reachable_can_settle`, `trace_recv_cycles_host_layer_buffers`, `trace_recv_fail_*` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:854-986` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/LayerStaging.lean` | `h2dBegin`, `h2dIssue` (its third `mu_` scope inserts `dispatched_layers_` and sets `network_completed_` on the last layer: `Recv.netIssued`), `h2dReady`, `h2dDone`, `recvLookupStagingSlot` | `Recv.NoOpLeak`, `Recv.NoRetiredCallback`, `Pipeline.DecodeHbmSafe`, `LayerStaging.PublicationCorrect`, mutants `Recv.h2dIssueLeak`, `mutant_early_recv_release_corrupts_hbm` |
 <!-- source-map:end -->
@@ -427,7 +424,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `send.cc` | `TransferSendSession::EndOp` | `:368-395` | `PrefillDecode/Send.lean` | `EndOp` (`TPU_RAIDEN_DATA_CONN_REUSE=per_transfer` connection-close window, Send A7) | `Send.reachable_safe` |
 | `send.cc` | `TransferSendSession::GetDataReadyFuture` | `:215-222` | `PrefillDecode/Send.lean` | the per-layer D2H future a `BlockTransportServerPullSession::TriggerNextSendStep` waits on before serving a pulled block (`d2hReady`); on a `BlockLocation::kHost` source `StartPush` seeds every layer's future already OK | `Send.reachable_can_settle` |
 | `send.cc` | `TransferSendSession::BuildCoalescedCopySpec` | `:397-426` | `PrefillDecode/BlockOrdering.lean` | `buildCoalescedSpec` | `BlockOrdering.execCoalesced_buildCoalescedSpec` |
-| `send.cc` | `TransferSendSession::StartPush` | `:464-635` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/LayerStaging.lean` | `start` (pre-creates `d2h_promises` and calls `SendNextLayer(0)` after the D2H loop; the `BlockLocation::kHost` arm seeds every layer's future already OK and calls `SendNextLayer(0)` at once, §Boundaries), `sendAcquireBegin`, `sendAcquireDone`, `sendD2hBegin`, `d2hIssue`, `d2hReady`, `d2hEnd`, `fail_unissued_layers` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe`, `LayerStaging.exists_complete_trace`, mutants `Send.startUncounted`, `Send.stepWithoutFailUnissued` |
+| `send.cc` | `TransferSendSession::StartPush` | `:464-635` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/LayerStaging.lean` | `start` (pre-creates `d2h_promises` and calls `SendNextLayer(0)` before the D2H loop; the `BlockLocation::kHost` arm seeds every layer's future already OK and calls `SendNextLayer(0)` at once, §Boundaries), `sendAcquireBegin`, `sendAcquireDone`, `sendD2hBegin`, `d2hIssue`, `d2hReady`, `d2hEnd`, `fail_unissued_layers` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe`, `LayerStaging.exists_complete_trace`, mutants `Send.startUncounted`, `Send.stepWithoutFailUnissued` |
 | `send.cc` | `TransferSendSession::SendNextLayer` | `:637-736` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/LayerStaging.lean` | `wake`, `h2hIssue`, `sendNext`, `h2hDone` | `Send.reachable_can_settle`, `LayerStaging.PublicationCorrect`, mutants `Send.sendNextUncounted`, `Send.sendNextUnbounded`, `mutant_early_send_release_corrupts_hbm` |
 <!-- source-map:end -->
 
@@ -453,6 +450,8 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1224-1349` | `PrefillDecode/Pipeline.lean`, `PrefillDecode/PipelineChecks.lean`, `PrefillDecode/Send.lean` | `Pipeline.Ev.pullWait`, `Send.Ev.beginPull`, `Send.Ev.cancel` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe`, `Pipeline.trace_pull_ahead_of_registration`, `Pipeline.trace_unregistered_pull_rejected`, `Send.trace_pull_spawn_failure_cleanup` |
 | `base.cc` | `ResolveNumStagingLayers(std::optional<int> num_staging_layers)` | `:717-734` | `Transfer/LayerStaging.lean` | `Transfer.resolveNumStagingLayers` (the `num_staging_layers` constructor parameter: `none` is the full mirror, a value outside `[1, num_layers]` is the `std::invalid_argument` throw) | `Transfer.resolveNumStagingLayers_bounds` |
 | `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:3101-3109` | `PrefillDecode/Transport.lean` | sender-declared vs. chunk-count contract | `Transport.trace_chunk_two_senders`, `Transport.trace_dup_declared_rejected` |
+| `base.cc` | `KVCacheManagerBase::ResolveBlockArrayHostLayer` | `:2134-2192` | `PrefillDecode/LayerStaging.lean` | resolves `host_layer_idx` via `GetSession(uuid)` → `session->ResolveStagingSlot(block_array_idx)` for `GetBlockArrayHostSpan` | `LayerStaging.reachable_safe`, `NoSlotFault` |
+| `base.cc` | `KVCacheManagerBase::GetBlockArrayHostSpan` | `:2194-2256` | `PrefillDecode/LayerStaging.lean` | host buffer span lookup called per chunk by `ValidateChunks` | `LayerStaging.reachable_safe`, `NoSlotFault` |
 | `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`size_t host_layer_idx = layer_idx;` .. `base_host_ptr = GetHostPointer(host_layer_idx, shard_idx);`) | `:3479-3490` | `PrefillDecode/LayerStaging.lean` | `session->ResolveStagingSlot(layer_idx)`: `sendLookupStagingSlot`, `recvAcquireBegin` / `recvAcquireWait` / `recvAcquireFinish` | `LayerStaging.reachable_safe`, `NoSlotFault`, `trace_recv_cycles_host_layer_buffers`, `trace_send_cycles_host_layer_buffers` |
 | `tpu_sync/frameworks/jax/kv_cache_manager.h` | `NumaAwareKVCacheManager` (`std::map<std::string, int> done_sending_counts_;` .. `std::map<std::string, int> req_expected_counts_;`) | `:287-290` | `Transfer/Caller.lean` | `NumaMgr` (`doneSendingCounts`, `doneRecvingCounts`, `failedRecvingCounts`, `reqExpected`) | `Caller.numa_settledCounts_maps_clean` |
 | `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_descriptors)` | `:574-618` | `Transfer/Caller.lean` | `NumaCfg.setExpected = true`, `numaInitDExpected` | `Caller.numaProcessSettled_expected_numSubs_eq_none`, `Caller.numa_settledCounts_safe` |
@@ -468,6 +467,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `bts.h` | `BlockTransportServerPushSession` (`struct LayerProgress` .. `absl::flat_hash_map<int, LayerProgress> layer_progress_ ABSL_GUARDED_BY(mu_);`) | `:158-201` | `PrefillDecode/Transport.lean` | `LayerProgress` / `layer_progress_` / `done_` under the push session's `mu_`, one session per uuid | `Transport.reachable_safe` |
 | `bts.cc` | `BeginIncomingPush` | `:242-256` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean` | `pushBegin`: `delegate->GetSession(uuid)` then `TryBeginOp()`; `false` (draining, done, or a send session) is `Cancelled`; uuid 0 holds no op | `Recv.StagingIntegrity`, `Recv.trace_push_lease_pins_staging_on_cancel`, `Recv.trace_push_lease_outlives_h2d`, `Pipeline.StagingSafe` |
 | `bts.cc` | `EndIncomingPush` | `:258-271` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean` | `pushEnd`: `Finish(status)` when `!status.ok()`, then `EndOp()` | `Recv.StagingIntegrity`, `Recv.trace_push_lease_pins_staging_on_cancel`, `Pipeline.StagingSafe` |
+| `bts.cc` | `ValidateChunks` | `:275-304` | `PrefillDecode/LayerStaging.lean`, `PrefillDecode/Transport.lean` | per-chunk span check after `GetBlockChunks` (`GetBlockArrayHostSpan` → `ResolveBlockArrayHostLayer` → `ResolveStagingSlot`) | `LayerStaging.reachable_safe`, `NoSlotFault` |
 | `bt.h` | `BlockTransport` (`absl::Mutex server_sessions_mu_;` .. `active_push_sessions_ ABSL_GUARDED_BY(server_sessions_mu_);`) | `:292-295` | `PrefillDecode/Transport.lean` | the uuid → push-session map (`GetOrCreatePushSession`, `ForgetPushProgress`) | — |
 | `bt.cc` | `BlockTransport::GetOrCreatePushSession` | `:415-426` | `PrefillDecode/Transport.lean` | first stream of a uuid creates its session; later streams share it while it is live (`!IsDone()`, or `HasAdmittedPosts()` on the Peregrine path); a stream after retirement gets a fresh session | `Transport.reachable_safe` |
 | `bt.cc` | `BlockTransport::HandleIncomingPush` | `:443-452` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/Transport.lean` | entry point of a stream: looks the uuid's push session up (`GetOrCreatePushSession`), delegates to `StartStream`, and drops that session (`DeletePushSession(session)`) once `IsDone()` | — |
@@ -475,7 +475,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `bt.cc` | `BlockTransport::OnRecvComplete` | `:468-480` | `PrefillDecode/Transport.lean` | Peregrine receive entry point (→ `OnPeregrinePostComplete` with the Post's `post_status`, unmodelled) | — |
 | `bts.cc` | `BlockTransportServerPushSession::OnPeregrinePostComplete` | `:657-707` | `PrefillDecode/Transport.lean` | Peregrine receive path: takes the op either from the `PostLease` admitted earlier by `ResolveRecvBuffer` or from `BeginIncomingPush` here, then `CompleteIncomingPush(..., /*is_peregrine=*/true)` and `EndIncomingPush` (unmodelled) | — |
 | `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` | `PrefillDecode/Transport.lean`, `PrefillDecode/Receive.lean` | `Transport.Ev.stream l s`, `completePush`, `retire`, `nextLayer`; on a layer's completion a plan-declared push calls `session->OnDataReceived(l, {}, {})` on the session `BeginIncomingPush` returned, a header-declared one `delegate_->OnLayerReceived(l, uuid_)` | `Transport.reachable_safe` (`OnceDispatched`, `NetworkSound`, `CompleteOnSuccess`), `trace_dup_chunk_publishes_missing_layer`, `trace_dup_after_retirement`, `stepHardened` |
-| `bt.cc` | `BlockTransport::ForgetPushProgress` | `:1020-1034` | `PrefillDecode/Transport.lean` | plan retirement drops the uuid's push session (`Cancel()`); not an event | — |
+| `bt.cc` | `BlockTransport::ForgetPushProgress` | `:1020-1034` | `PrefillDecode/Transport.lean` | plan/session retirement erases and `Cancel()`s `active_push_sessions_[uuid]` outside manager `mu_`; outside single-uuid-generation scope under `Transport` A5 | — |
 <!-- source-map:end -->
 
 ### Control plane

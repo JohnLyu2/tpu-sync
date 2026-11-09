@@ -398,14 +398,34 @@ private theorem sweep_slot0 (c : ChainProgress) (b : Bool) (h0 : Slot0Anchored c
   repeat' split
   all_goals first | exact h0 | (intro _; rfl)
 
+private theorem applyDeadlineArm_shape (t0 : SubSession) :
+    let t := applyDeadlineArm t0
+    t.uuid = t0.uuid ∧ t.index = t0.index ∧ t.count = t0.count ∧ t.retired = t0.retired ∧
+    (t.ok = true → t0.ok = true) ∧
+    (t.retired = false → t.done = false → t.ok = true → t.draining = true) := by
+  rcases t0 with ⟨_, _, _, dr, inf, dn, _, ret⟩
+  cases ret <;> cases dn <;> cases dr <;> cases inf <;> simp [applyDeadlineArm]
+
+private theorem anyOpenSlot_of_contains {ss : List SubSession} {slots : List (Option Nat)}
+    {s : SubSession} (hs : s ∈ ss) (hopen : s.done = false)
+    (hcont : slots.contains (some s.uuid) = true) :
+    anyOpenSlot ss slots = true := by
+  unfold anyOpenSlot
+  rw [List.any_eq_true]
+  refine ⟨some s.uuid, List.contains_iff_mem.mp hcont, ?_⟩
+  rw [List.any_eq_true]
+  exact ⟨s, hs, by simp [hopen]⟩
+
 theorem WorkerInv.toSafe {w : WorkerState} (h : WorkerInv w) : WorkerSafe w := h.safe
 
 /-! ### Per-event preservation -/
 
-private theorem step_registerSubPlan {w w' : WorkerState} {uuid index count : Nat}
+private theorem stepG_registerSubPlan {g : WorkerState.Guards} {w w' : WorkerState}
+    {uuid index count : Nat}
+    (hg6 : g.noSingleWhileSeated = true) (hg7 : g.oneSessionPerSlot = true)
     (hinv : WorkerInv w)
-    (hstep : WorkerState.step w (.registerSubPlan uuid index count) = some w') : WorkerInv w' := by
-  simp only [WorkerState.step, WorkerState.stepG] at hstep
+    (hstep : WorkerState.stepG g w (.registerSubPlan uuid index count) = some w') : WorkerInv w' := by
+  simp only [WorkerState.stepG, hg6, hg7] at hstep
   split at hstep; · cases hstep
   split at hstep; · cases hstep
   rename_i hidx
@@ -477,10 +497,27 @@ private theorem step_registerSubPlan {w w' : WorkerState} {uuid index count : Na
     · simp only [List.mem_singleton] at hs; subst hs
       simp at hc; omega
 
-private theorem step_settleSession {w w' : WorkerState} {uuid : Nat} {ok : Bool}
+private theorem stepG_beginOp {g : WorkerState.Guards} {w w' : WorkerState} {uuid : Nat}
     (hinv : WorkerInv w)
-    (hstep : WorkerState.step w (.settleSession uuid ok) = some w') : WorkerInv w' := by
-  simp only [WorkerState.step, WorkerState.stepG] at hstep
+    (hstep : WorkerState.stepG g w (.beginOp uuid) = some w') : WorkerInv w' := by
+  simp only [WorkerState.stepG] at hstep
+  split at hstep; · cases hstep
+  injection hstep with h; subst h
+  refine ⟨⟨hinv.safe.doneAfterAll⟩, ?_, hinv.slot0, ?_⟩
+  · intro s' hs'
+    obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+    have := hinv.sessionIndex s hs
+    split <;> simpa using this
+  · intro s' hs'
+    obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+    have ht := hinv.tracked s hs
+    split <;> exact ht
+
+private theorem stepG_latchDrain {g : WorkerState.Guards} {w w' : WorkerState}
+    {uuid : Nat} {ok : Bool}
+    (hinv : WorkerInv w)
+    (hstep : WorkerState.stepG g w (.latchDrain uuid ok) = some w') : WorkerInv w' := by
+  simp only [WorkerState.stepG] at hstep
   split at hstep; · cases hstep
   injection hstep with h; subst h
   refine ⟨⟨hinv.safe.doneAfterAll⟩, ?_, hinv.slot0, ?_⟩
@@ -497,12 +534,37 @@ private theorem step_settleSession {w w' : WorkerState} {uuid : Nat} {ok : Bool}
       exact ht hc hr ho.1
     · exact ht
 
+private theorem stepG_settleSession {g : WorkerState.Guards} {w w' : WorkerState}
+    {uuid : Nat} {ok : Bool}
+    (hinv : WorkerInv w)
+    (hstep : WorkerState.stepG g w (.settleSession uuid ok) = some w') : WorkerInv w' := by
+  simp only [WorkerState.stepG] at hstep
+  split at hstep; · cases hstep
+  injection hstep with h; subst h
+  refine ⟨⟨hinv.safe.doneAfterAll⟩, ?_, hinv.slot0, ?_⟩
+  · intro s' hs'
+    obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+    have := hinv.sessionIndex s hs
+    split <;> simpa using this
+  · intro s' hs'
+    obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+    have ht := hinv.tracked s hs
+    split
+    · intro hc hr ho
+      simp only [Bool.and_eq_true] at ho
+      exact ht hc hr ho.1
+    · exact ht
+
+private theorem applyMidSettle_empty : WorkerState.applyMidSettle [] = id := by
+  funext s; simp [WorkerState.applyMidSettle]
+
 private theorem step_poll {w w' : WorkerState} {stalled : Bool}
     (hinv : WorkerInv w) (hstep : WorkerState.step w (.poll stalled) = some w') : WorkerInv w' := by
-  simp only [WorkerState.step, WorkerState.stepG] at hstep
-  -- the sessions after the deadline arm
-  generalize hss : (if (true && stalled && w.chain.present) = true then
-      w.sessions.map fun s => if s.done then s else { s with ok := false }
+  simp only [WorkerState.step, WorkerState.stepG, WorkerState.pollCore,
+    WorkerState.validMidSettle, List.isEmpty_nil, Bool.and_false, ↓reduceIte, List.all_nil,
+    Bool.not_true, Bool.false_eq_true, applyMidSettle_empty, List.map_id] at hstep
+  generalize hss : (if (true && stalled) = true then
+      w.sessions.map applyDeadlineArm
     else w.sessions) = ss at hstep
   have hss_shape : ∀ t ∈ ss, ∃ t0 ∈ w.sessions,
       t.uuid = t0.uuid ∧ t.index = t0.index ∧ t.count = t0.count ∧ t.retired = t0.retired ∧
@@ -511,8 +573,8 @@ private theorem step_poll {w w' : WorkerState} {stalled : Bool}
     split at hss
     · subst hss
       obtain ⟨t0, ht0, rfl⟩ := List.mem_map.mp ht
-      refine ⟨t0, ht0, ?_⟩
-      split <;> simp
+      obtain ⟨hu, hi, hc, hr, ho, _⟩ := applyDeadlineArm_shape t0
+      exact ⟨t0, ht0, hu, hi, hc, hr, ho⟩
     · subst hss; exact ⟨t, ht, rfl, rfl, rfl, rfl, fun h => h⟩
   have hidx : ∀ t ∈ ss, t.index < max 1 t.count := by
     intro t ht
@@ -536,6 +598,19 @@ private theorem step_poll {w w' : WorkerState} {stalled : Bool}
       hinv.slot0 hsettled (fun s hs => htr s (List.mem_filter.mp hs).1) htr
   generalize hr : WorkerState.recordAll w.chain ss (ss.filter (fun s => s.done && !s.retired)) = r
     at hstep hpres h0 htr' hlog
+  split at hstep; · cases hstep
+  rename_i hnoDrainOk
+  have hanyEq : anyOpenSlot (ss.map fun s => if s.done then { s with retired := true } else s)
+      r.chain.subSessions = anyOpenSlot ss r.chain.subSessions := by
+    unfold anyOpenSlot
+    congr 1; funext opt
+    cases opt with
+    | none => rfl
+    | some u =>
+      simp only [List.any_map]
+      congr 1; funext s
+      cases hd : s.done <;> simp [hd]
+  rw [hanyEq] at hstep
   generalize hr2 : (if stalled && !r.touched then
       sweepStalledChain r.chain (anyOpenSlot ss r.chain.subSessions)
     else (r.chain, .notSwept)) = r2 at hstep
@@ -555,8 +630,6 @@ private theorem step_poll {w w' : WorkerState} {stalled : Bool}
   · intro s' hs'
     obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
     intro hc hret hok
-    -- a session left seated is open; after a stalled poll on a present entry
-    -- the deadline arm failed it, so it is not OK.
     have hopen : s.done = false := by
       cases hd : s.done with
       | true => simp [hd] at hret
@@ -566,38 +639,57 @@ private theorem step_poll {w w' : WorkerState} {stalled : Bool}
     have hcount : 1 < s.count := hc
     have hok' : s.ok = true := hok
     have hret' : s.retired = false := hret
-    by_cases hcase : (true && stalled && w.chain.present) = true
-    · -- every open session was failed by the deadline arm
-      exfalso
-      rw [if_pos hcase] at hss
-      subst hss
-      obtain ⟨t0, _, rfl⟩ := List.mem_map.mp hs
-      cases ht0 : t0.done with
-      | true => simp [ht0] at hopen
-      | false => simp [ht0] at hok'
-    · rw [if_neg hcase] at hss
-      have hc2 : c2 = r.chain := by
-        have hnot : (stalled && w.chain.present) = false := by simpa using hcase
+    obtain ⟨hrpres, hin⟩ := htr' s hs hcount hret' hok'
+    cases hst : stalled with
+    | false =>
+      simp only [hst, Bool.false_and, Bool.false_eq_true, ↓reduceIte] at hr2
+      injection hr2 with h _; subst h
+      exact ⟨hrpres, hin⟩
+    | true =>
+      have hcase : (true && true) = true := rfl
+      rw [hst, if_pos hcase] at hss
+      have hdraining : s.draining = true := by
+        subst hss
+        obtain ⟨t0, _, rfl⟩ := List.mem_map.mp hs
+        exact (applyDeadlineArm_shape t0).2.2.2.2.2 hret' hopen hok'
+      rw [hst] at hr2
+      split at hr2
+      · rename_i hquiet
+        have hnotRep : (r.chain.failed || r.chain.completed) = false := by
+          cases hfc : (r.chain.failed || r.chain.completed) with
+          | false => rfl
+          | true =>
+            exfalso
+            apply hnoDrainOk
+            simp only [hst, Bool.true_and, Bool.and_eq_true] at hquiet ⊢
+            refine ⟨⟨⟨hquiet, hrpres⟩, hfc⟩, ?_⟩
+            rw [List.any_eq_true]
+            exact ⟨s, hs, by simp [hcount, hret', hdraining, hopen, hok']⟩
+        unfold sweepStalledChain at hr2
+        rw [hrpres, hnotRep] at hr2
+        simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hr2
         split at hr2
-        · rename_i hcond
-          -- stalled, so the entry is absent and the sweep does nothing
-          have hst : stalled = true := by simpa using (Bool.and_eq_true _ _ |>.mp hcond).1
-          have hwp : w.chain.present = false := by simpa [hst] using hnot
-          have hrp : r.chain.present = false := by rw [hpres, hwp]
-          unfold sweepStalledChain at hr2
-          rw [hrp] at hr2
-          simp only [Bool.not_false, ↓reduceIte] at hr2
-          injection hr2 with h _; exact h.symm
-        · injection hr2 with h _; exact h.symm
-      rw [hc2]
-      exact htr' s hs hcount hret' hok'
+        · injection hr2 with h _; subst h
+          exact ⟨hrpres, hin⟩
+        · rename_i hnoOpen
+          injection hr2 with h _; subst h
+          rcases hin with hcont | hanch
+          · exact absurd (anyOpenSlot_of_contains hs hopen hcont) hnoOpen
+          · exact ⟨rfl, Or.inr hanch⟩
+      · injection hr2 with h _; subst h
+        exact ⟨hrpres, hin⟩
 
 theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
     (hinv : WorkerInv w) (hstep : WorkerState.step w e = some w') : WorkerInv w' := by
   cases e with
-  | registerSubPlan uuid index count => exact step_registerSubPlan hinv hstep
-  | settleSession uuid ok => exact step_settleSession hinv hstep
+  | registerSubPlan uuid index count => exact stepG_registerSubPlan rfl rfl hinv hstep
+  | beginOp uuid => exact stepG_beginOp hinv hstep
+  | latchDrain uuid ok => exact stepG_latchDrain hinv hstep
+  | settleSession uuid ok => exact stepG_settleSession hinv hstep
   | poll stalled => exact step_poll hinv hstep
+  | pollMidSettle stalled midSettle =>
+    simp only [WorkerState.step, WorkerState.stepG, WorkerState.pollCore, Bool.true_and] at hstep
+    cases hne : midSettle.isEmpty <;> simp [hne] at hstep
 
 /-- **Main worker theorem (`reachable_worker_safe`)**: in every reachable state of
 `WorkerState.step`, `DoneAfterAllSubPlans` holds. -/
@@ -605,6 +697,368 @@ theorem reachable_worker_safe {w : WorkerState} (hr : WorkerState.sys.Reachable 
     WorkerSafe w :=
   (WorkerState.sys.reachable_induction init_workerInv
     (fun _ _ _ hinv hstep => step_preserves_workerInv hinv hstep) hr).toSafe
+
+/-! ### Candidate sweep fix (`stepSweepWaitsForOpen`) without A5b and without A5c -/
+
+/-- Strengthened tracking invariant for `stepSweepWaitsForOpen`: an unretired
+OK chained session is covered by a present entry through `sub_sessions`,
+`anchored`, or a terminal flag `failed` / `completed` (checked before
+`!anchored` in `recordTerminalWaitOpen` and retained by
+`sweepStalledChainWaitOpen` while `sessions_` holds any unretired entry). -/
+def ChainedTrackedWaitOpen (c : ChainProgress) (s : SubSession) : Prop :=
+  1 < s.count → s.retired = false → s.ok = true →
+    c.present = true ∧
+    (c.subSessions.contains (some s.uuid) = true ∨ c.anchored = true ∨
+      c.failed = true ∨ c.completed = true)
+
+structure WorkerWaitOpenInv (w : WorkerState) : Prop where
+  safe : WorkerSafe w
+  sessionIndex : ∀ s ∈ w.sessions, s.index < max 1 s.count
+  tracked : ∀ s ∈ w.sessions, ChainedTrackedWaitOpen w.chain s
+
+theorem init_workerWaitOpenInv : WorkerWaitOpenInv WorkerState.init where
+  safe := ⟨fun _ h => by cases h⟩
+  sessionIndex := fun _ h => by cases h
+  tracked := fun _ h => by cases h
+
+private theorem recordTerminalWaitOpen_shape (c : ChainProgress) (ss : List SubSession)
+    (s : SubSession) (hidx : s.index < max 1 s.count) (hret : s.retired = false)
+    (hs : ChainedTrackedWaitOpen c s) :
+    let r := recordTerminalWaitOpen c ss s
+    r.1.present = c.present ∧
+    (∀ t, ChainedTrackedWaitOpen c t → ChainedTrackedWaitOpen r.1 t) ∧
+    (∀ k idx, r.2 = .done k idx → GoodEntry (k, idx)) ∧
+    (∀ ok, r.2 = .direct ok ∨ r.2 = .stray ok → ok = true → GoodEntry (max 1 s.count, [s.index])) := by
+  have hsingle : ∀ ok,
+      (recordTerminalWaitOpen c ss s).2 = .direct ok ∨ (recordTerminalWaitOpen c ss s).2 = .stray ok →
+      ok = true → GoodEntry (max 1 s.count, [s.index]) := by
+    intro ok hok htrue
+    subst htrue
+    have hok' : s.ok = true := by
+      unfold recordTerminalWaitOpen at hok
+      rcases hok with hok | hok <;> (repeat' split at hok) <;> simp_all
+    have hcount : s.count ≤ 1 := by
+      rcases Nat.lt_or_ge 1 s.count with hgt | hle
+      · exfalso
+        obtain ⟨hpres, hin⟩ := hs hgt hret hok'
+        unfold recordTerminalWaitOpen at hok
+        rw [hpres] at hok
+        simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hok
+        rcases hin with hin | hin | hfail | hcomp
+        · rw [hin] at hok
+          simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hok
+          rcases hok with hok | hok <;> (repeat' split at hok) <;> simp_all
+        · rw [hin] at hok
+          rcases hok with hok | hok <;> (repeat' split at hok) <;> simp_all
+        · rw [hfail] at hok
+          rcases hok with hok | hok <;> (repeat' split at hok) <;> simp_all
+        · rw [hcomp] at hok
+          rcases hok with hok | hok <;> (repeat' split at hok) <;> simp_all
+      · exact hle
+    have hidx0 : s.index = 0 := by
+      have : max 1 s.count = 1 := by omega
+      omega
+    refine ⟨by simp, ?_, by simp only [List.length_singleton]; omega⟩
+    intro i hi
+    simp only [List.mem_singleton] at hi
+    subst hi; omega
+  refine ⟨?_, ?_, ?_, hsingle⟩
+  all_goals unfold recordTerminalWaitOpen
+  all_goals (try dsimp only)
+  · repeat' split
+    all_goals rfl
+  · intro t ht hc hr ho
+    obtain ⟨hp, hin⟩ := ht hc hr ho
+    repeat' split
+    all_goals first
+      | exact ⟨hp, hin⟩
+      | exact ⟨hp, Or.inr (Or.inr (Or.inl rfl))⟩
+      | exact ⟨hp, Or.inr (Or.inr (Or.inr rfl))⟩
+  · intro k idx h
+    repeat' split at h
+    all_goals (try cases h)
+    rename_i hall
+    have heq : (settledSlots ss c.subSessions).length = c.subSessions.length := by simpa using hall
+    exact ⟨settledSlots_nodup _ _, settledSlots_lt _ _, Nat.le_of_eq heq.symm⟩
+
+private theorem foldRecordWaitOpen_shape (ss : List SubSession) (settled : List SubSession) :
+    ∀ (acc : WorkerState.SweepAcc),
+      (∀ s ∈ settled, s.index < max 1 s.count ∧ s.retired = false) →
+      (∀ s ∈ settled, ChainedTrackedWaitOpen acc.chain s) →
+      (∀ t ∈ ss, ChainedTrackedWaitOpen acc.chain t) →
+      (∀ e ∈ acc.log, GoodEntry e) →
+      let r := settled.foldl (WorkerState.recordStepWaitOpen ss) acc
+      r.chain.present = acc.chain.present ∧
+      (∀ t ∈ ss, ChainedTrackedWaitOpen r.chain t) ∧ ∀ e ∈ r.log, GoodEntry e := by
+  induction settled with
+  | nil =>
+    intro acc _ _ htr hlog
+    exact ⟨rfl, htr, hlog⟩
+  | cons s rest ih =>
+    intro acc hs hsettled htr hlog
+    obtain ⟨hidx, hret⟩ := hs s (List.mem_cons_self ..)
+    have hrest : ∀ s' ∈ rest, s'.index < max 1 s'.count ∧ s'.retired = false :=
+      fun s' h => hs s' (List.mem_cons_of_mem _ h)
+    obtain ⟨hpres, hkeep, hgood, hsingle⟩ :=
+      recordTerminalWaitOpen_shape acc.chain ss s hidx hret (hsettled s (List.mem_cons_self ..))
+    simp only [List.foldl_cons]
+    have hstep : ∀ acc' : WorkerState.SweepAcc, WorkerState.recordStepWaitOpen ss acc s = acc' →
+        acc'.chain = (recordTerminalWaitOpen acc.chain ss s).1 ∧
+        ∀ e ∈ acc'.log, GoodEntry e := by
+      intro acc' h
+      unfold WorkerState.recordStepWaitOpen at h
+      rcases hrt : recordTerminalWaitOpen acc.chain ss s with ⟨c', t⟩
+      rw [hrt] at h hgood hsingle
+      have hlog' : ∀ (extra : List (Nat × List Nat)), (∀ e ∈ extra, GoodEntry e) →
+          ∀ e ∈ acc.log ++ extra, GoodEntry e := by
+        intro extra hextra e he
+        rcases List.mem_append.mp he with he | he
+        · exact hlog e he
+        · exact hextra e he
+      cases t with
+      | done k idx =>
+        subst h
+        exact ⟨rfl, hlog' _ fun e he => by
+          simp only [List.mem_singleton] at he; subst he; exact hgood k idx rfl⟩
+      | direct ok =>
+        cases ok
+        · subst h; exact ⟨rfl, hlog⟩
+        · subst h
+          exact ⟨rfl, hlog' _ fun e he => by
+            simp only [List.mem_singleton] at he; subst he; exact hsingle true (Or.inl rfl) rfl⟩
+      | stray ok =>
+        cases ok
+        · subst h; exact ⟨rfl, hlog⟩
+        · subst h
+          exact ⟨rfl, hlog' _ fun e he => by
+            simp only [List.mem_singleton] at he; subst he; exact hsingle true (Or.inr rfl) rfl⟩
+      | _ => subst h; exact ⟨rfl, hlog⟩
+    obtain ⟨hchain, hlog1⟩ := hstep _ rfl
+    obtain ⟨hp', htr'', hlog''⟩ := ih _ hrest
+      (fun s' hs' => by rw [hchain]; exact hkeep s' (hsettled s' (List.mem_cons_of_mem _ hs')))
+      (fun t ht => by rw [hchain]; exact hkeep t (htr t ht)) hlog1
+    exact ⟨by rw [hp', hchain, hpres], htr'', hlog''⟩
+
+private theorem stepWaitOpen_registerSubPlan {g : WorkerState.Guards} {w w' : WorkerState}
+    {uuid index count : Nat}
+    (hg6 : g.noSingleWhileSeated = true) (hg7 : g.oneSessionPerSlot = true)
+    (hinv : WorkerWaitOpenInv w)
+    (hstep : WorkerState.stepG g w (.registerSubPlan uuid index count) = some w') :
+    WorkerWaitOpenInv w' := by
+  simp only [WorkerState.stepG, hg6, hg7] at hstep
+  split at hstep; · cases hstep
+  split at hstep; · cases hstep
+  rename_i hidx
+  split at hstep; · cases hstep
+  rename_i hA6
+  split at hstep; · cases hstep
+  rename_i hA7
+  injection hstep with h; subst h
+  simp only [Bool.true_and, Bool.and_eq_true, Bool.not_eq_true', decide_eq_true_eq, bne_iff_ne,
+    ne_eq, Bool.not_eq_true, not_and, Option.isSome_eq_false_iff, Option.isNone_iff_eq_none,
+    List.any_eq_false] at hA6 hA7
+  have hidx' : index < max 1 count := Nat.lt_of_not_ge hidx
+  have hsessIdx : ∀ s ∈ w.sessions ++ [{ uuid := uuid, index := index, count := count }],
+      s.index < max 1 s.count := by
+    intro s hs
+    rcases List.mem_append.mp hs with hs | hs
+    · exact hinv.sessionIndex s hs
+    · simp only [List.mem_singleton] at hs; subst hs; exact hidx'
+  rcases Nat.lt_or_ge 1 count with hgt | hle
+  · by_cases hi : index = 0
+    · subst hi
+      rw [note_anchor _ _ _ hgt]
+      refine ⟨⟨hinv.safe.doneAfterAll⟩, hsessIdx, ?_⟩
+      intro s hs _ _ _
+      refine ⟨rfl, ?_⟩
+      rcases List.mem_append.mp hs with _ | hs
+      · exact Or.inr (Or.inl rfl)
+      · simp only [List.mem_singleton] at hs; subst hs
+        exact Or.inl (contains_iff_getD.mpr ⟨0, getD_set_self _
+          (Nat.lt_of_lt_of_le (by omega) (length_growTo _ _)) _⟩)
+    · by_cases hp : w.chain.present = true
+      · rw [note_into _ _ _ _ hgt hi hp]
+        have hempty : w.chain.subSessions.getD index none = none := hA7 ⟨⟨hgt, hi⟩, hp⟩
+        refine ⟨⟨hinv.safe.doneAfterAll⟩, hsessIdx, ?_⟩
+        intro s hs hc hr ho
+        rcases List.mem_append.mp hs with hs | hs
+        · obtain ⟨_, hin⟩ := hinv.tracked s hs hc hr ho
+          refine ⟨hp, ?_⟩
+          rcases hin with hin | hanch | hfail | hcomp
+          · exact Or.inl (contains_set_of_empty hempty hin)
+          · exact Or.inr (Or.inl hanch)
+          · exact Or.inr (Or.inr (Or.inl hfail))
+          · exact Or.inr (Or.inr (Or.inr hcomp))
+        · simp only [List.mem_singleton] at hs; subst hs
+          exact ⟨hp, Or.inl (contains_iff_getD.mpr ⟨index, getD_set_self _
+            (Nat.lt_of_lt_of_le (by omega) (length_growTo _ _)) _⟩)⟩
+      · have hp' : w.chain.present = false := by simpa using hp
+        rw [note_unanchored _ _ _ _ hgt hi hp']
+        refine ⟨⟨hinv.safe.doneAfterAll⟩, hsessIdx, ?_⟩
+        intro s hs hc hr ho
+        rcases List.mem_append.mp hs with hs | hs
+        · obtain ⟨hpres, _⟩ := hinv.tracked s hs hc hr ho
+          rw [hpres] at hp'; cases hp'
+        · simp only [List.mem_singleton] at hs; subst hs
+          exact ⟨rfl, Or.inl (contains_iff_getD.mpr ⟨index, getD_set_self _
+            (Nat.lt_of_lt_of_le (by omega) (length_growTo _ _)) _⟩)⟩
+  · rw [note_single _ _ _ _ hle]
+    refine ⟨⟨hinv.safe.doneAfterAll⟩, hsessIdx, ?_⟩
+    intro s hs hc hr _
+    rcases List.mem_append.mp hs with hs | hs
+    · exact absurd hr (hA6 hle s hs hc)
+    · simp only [List.mem_singleton] at hs; subst hs
+      simp at hc; omega
+
+private theorem pollWaitOpenCore_preserves {w w' : WorkerState} {stalled : Bool}
+    {midSettle : List Nat}
+    (hinv : WorkerWaitOpenInv w)
+    (hstep : WorkerState.pollWaitOpenCore w stalled midSettle = some w') :
+    WorkerWaitOpenInv w' := by
+  simp only [WorkerState.pollWaitOpenCore] at hstep
+  generalize hss : (if stalled = true then w.sessions.map applyDeadlineArm else w.sessions) = ss
+    at hstep
+  split at hstep; · cases hstep
+  have hss_shape : ∀ t ∈ ss, ∃ t0 ∈ w.sessions,
+      t.uuid = t0.uuid ∧ t.index = t0.index ∧ t.count = t0.count ∧ t.retired = t0.retired ∧
+      (t.ok = true → t0.ok = true) := by
+    intro t ht
+    split at hss
+    · subst hss
+      obtain ⟨t0, ht0, rfl⟩ := List.mem_map.mp ht
+      obtain ⟨hu, hi, hc, hr, ho, _⟩ := applyDeadlineArm_shape t0
+      exact ⟨t0, ht0, hu, hi, hc, hr, ho⟩
+    · subst hss; exact ⟨t, ht, rfl, rfl, rfl, rfl, fun h => h⟩
+  have hidx : ∀ t ∈ ss, t.index < max 1 t.count := by
+    intro t ht
+    obtain ⟨t0, ht0, _, hi, hc, _, _⟩ := hss_shape t ht
+    rw [hi, hc]; exact hinv.sessionIndex t0 ht0
+  have htr : ∀ t ∈ ss, ChainedTrackedWaitOpen w.chain t := by
+    intro t ht hc hr ho
+    obtain ⟨t0, ht0, hu, _, hcnt, hret, hok⟩ := hss_shape t ht
+    rw [hu]
+    exact hinv.tracked t0 ht0 (hcnt ▸ hc) (hret ▸ hr) (hok ho)
+  have hsettled : ∀ s ∈ ss.filter (fun s => s.done && !s.retired),
+      s.index < max 1 s.count ∧ s.retired = false := by
+    intro s hs
+    have hm := List.mem_filter.mp hs
+    refine ⟨hidx s hm.1, ?_⟩
+    have := hm.2
+    simp only [Bool.and_eq_true, Bool.not_eq_true'] at this
+    exact this.2
+  have hrec : (WorkerState.recordAllWaitOpen w.chain ss
+        (ss.filter (fun s => s.done && !s.retired))).chain.present = w.chain.present ∧
+      (∀ t ∈ ss, ChainedTrackedWaitOpen
+        (WorkerState.recordAllWaitOpen w.chain ss
+          (ss.filter (fun s => s.done && !s.retired))).chain t) ∧
+      ∀ e ∈ (WorkerState.recordAllWaitOpen w.chain ss
+        (ss.filter (fun s => s.done && !s.retired))).log, GoodEntry e :=
+    foldRecordWaitOpen_shape ss (ss.filter (fun s => s.done && !s.retired)) { chain := w.chain }
+      hsettled (fun s hs => htr s (List.mem_filter.mp hs).1) htr (fun _ h => by cases h)
+  obtain ⟨hpres, htr', hlog⟩ := hrec
+  generalize hr : WorkerState.recordAllWaitOpen w.chain ss
+      (ss.filter (fun s => s.done && !s.retired)) = r at hstep hpres htr' hlog
+  generalize hssMid : ((ss.map fun s => if s.done then { s with retired := true } else s).map
+      (WorkerState.applyMidSettle midSettle)) = ssMid at hstep
+  generalize hr2 : (if stalled && !r.touched then
+      sweepStalledChainWaitOpen r.chain (anyOpenSlot ssMid r.chain.subSessions)
+        (ssMid.any fun s => !s.retired)
+    else (r.chain, .notSwept)) = r2 at hstep
+  rcases r2 with ⟨c2, sweep⟩
+  injection hstep with h; subst h
+  refine ⟨⟨fun e he => (List.mem_append.mp he).elim (hinv.safe.doneAfterAll e) (hlog e)⟩, ?_, ?_⟩
+  · intro s'' hs''
+    subst hssMid
+    obtain ⟨s', hs', rfl⟩ := List.mem_map.mp hs''
+    obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+    have := hidx s hs
+    unfold WorkerState.applyMidSettle
+    cases hd : s.done <;> cases hmc : midSettle.contains s.uuid <;> simp_all
+  · intro s'' hs'' hc hret hok
+    have hanyReq : (ssMid.any fun t => !t.retired) = true :=
+      List.any_eq_true.mpr ⟨s'', hs'', by simp [hret]⟩
+    have hm : s'' ∈ (ss.map fun s => if s.done then { s with retired := true } else s).map
+        (WorkerState.applyMidSettle midSettle) := hssMid ▸ hs''
+    obtain ⟨s', hs', hs''_eq⟩ := List.mem_map.mp hm
+    obtain ⟨s, hs, hs'_eq⟩ := List.mem_map.mp hs'
+    have hpreserve : s''.uuid = s.uuid ∧ s''.count = s.count ∧ s.retired = false ∧ s.ok = true := by
+      subst hs''_eq; subst hs'_eq
+      unfold WorkerState.applyMidSettle at hret hok ⊢
+      cases hd : s.done <;> cases hmc : midSettle.contains s.uuid <;> simp_all
+    obtain ⟨hu, hcnt, hsret, hsok⟩ := hpreserve
+    obtain ⟨hrpres, hin⟩ := htr' s hs (hcnt ▸ hc) hsret hsok
+    rw [hu]
+    split at hr2
+    · unfold sweepStalledChainWaitOpen at hr2
+      rw [hrpres, hanyReq] at hr2
+      simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hr2
+      split at hr2
+      · injection hr2 with h _; subst h; exact ⟨hrpres, hin⟩
+      · split at hr2
+        · injection hr2 with h _; subst h; exact ⟨hrpres, hin⟩
+        · injection hr2 with h _; subst h
+          exact ⟨rfl, Or.inr (Or.inr (Or.inl rfl))⟩
+    · injection hr2 with h _; subst h
+      exact ⟨hrpres, hin⟩
+
+theorem stepSweepWaitsForOpen_preserves_inv {w w' : WorkerState} {e : WorkerEv}
+    (hinv : WorkerWaitOpenInv w) (hstep : WorkerState.stepSweepWaitsForOpen w e = some w') :
+    WorkerWaitOpenInv w' := by
+  cases e with
+  | registerSubPlan uuid index count =>
+    dsimp only [WorkerState.stepSweepWaitsForOpen] at hstep
+    exact stepWaitOpen_registerSubPlan rfl rfl hinv hstep
+  | beginOp uuid =>
+    simp only [WorkerState.stepSweepWaitsForOpen, WorkerState.stepG] at hstep
+    split at hstep; · cases hstep
+    injection hstep with h; subst h
+    refine ⟨⟨hinv.safe.doneAfterAll⟩, ?_, ?_⟩
+    · intro s' hs'; obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+      have := hinv.sessionIndex s hs; split <;> simpa using this
+    · intro s' hs'; obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+      have ht := hinv.tracked s hs; split <;> exact ht
+  | latchDrain uuid ok =>
+    simp only [WorkerState.stepSweepWaitsForOpen, WorkerState.stepG] at hstep
+    split at hstep; · cases hstep
+    injection hstep with h; subst h
+    refine ⟨⟨hinv.safe.doneAfterAll⟩, ?_, ?_⟩
+    · intro s' hs'; obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+      have := hinv.sessionIndex s hs; split <;> simpa using this
+    · intro s' hs'; obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+      have ht := hinv.tracked s hs
+      split
+      · intro hc hr ho; simp only [Bool.and_eq_true] at ho; exact ht hc hr ho.1
+      · exact ht
+  | settleSession uuid ok =>
+    simp only [WorkerState.stepSweepWaitsForOpen, WorkerState.stepG] at hstep
+    split at hstep; · cases hstep
+    injection hstep with h; subst h
+    refine ⟨⟨hinv.safe.doneAfterAll⟩, ?_, ?_⟩
+    · intro s' hs'; obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+      have := hinv.sessionIndex s hs; split <;> simpa using this
+    · intro s' hs'; obtain ⟨s, hs, rfl⟩ := List.mem_map.mp hs'
+      have ht := hinv.tracked s hs
+      split
+      · intro hc hr ho; simp only [Bool.and_eq_true] at ho; exact ht hc hr ho.1
+      · exact ht
+  | poll stalled =>
+    dsimp only [WorkerState.stepSweepWaitsForOpen] at hstep
+    exact pollWaitOpenCore_preserves hinv hstep
+  | pollMidSettle stalled midSettle =>
+    dsimp only [WorkerState.stepSweepWaitsForOpen] at hstep
+    split at hstep; · cases hstep
+    exact pollWaitOpenCore_preserves hinv hstep
+
+/-- **Candidate sweep fix theorem (`reachable_sweepWaitsForOpen_safe`)**: gating
+tombstone erasure on `!anyReqUnretired` and checking `failed || completed` before
+the `!anchored` stray arm (`stepSweepWaitsForOpen`) satisfies
+`DoneAfterAllSubPlans` in every reachable state without assuming A5b
+(`noDrainingOkAtSweep = false`) or A5c
+(`noSettleBetweenRetireAndSweep = false`). -/
+theorem reachable_sweepWaitsForOpen_safe {w : WorkerState}
+    (hr : WorkerState.sysSweepWaitsForOpen.Reachable w) : WorkerSafe w :=
+  (WorkerState.sysSweepWaitsForOpen.reachable_induction init_workerWaitOpenInv
+    (fun _ _ _ hinv hstep => stepSweepWaitsForOpen_preserves_inv hinv hstep) hr).safe
 
 /-! ## Part III — Coordinator multi-window chain -/
 

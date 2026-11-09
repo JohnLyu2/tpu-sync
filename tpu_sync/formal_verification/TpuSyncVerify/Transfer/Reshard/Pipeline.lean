@@ -30,6 +30,7 @@ File aliases used in the source map below:
 * `base.h` / `base.cc` — `tpu_sync/kv_cache/kv_cache_manager_base.{h,cc}`
 * `coord.cc` — `tpu_sync/kv_cache/reshard/reshard_coordinator.cc`
 * `utils.h` — `tpu_sync/core/utils.h`
+* `reshard_send_test.cc` — `tpu_sync/kv_cache/reshard_send_session_test.cc`
 
 ## Scope: one plan
 
@@ -135,5 +136,7 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:638-647` |
 | `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:741-877` |
 | `utils.h` | `ValidateCommonPoolReshardPlan` (`if (plan.transfer_pool_indices().empty())` .. `if (group.expected_pushes() <= 0)`) | `:367-377` |
+| `reshard_send_test.cc` | `RecordingH2dReceiverBase` | `:829-886` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks` | `:888-948` |
 <!-- source-map:end -->
 -/

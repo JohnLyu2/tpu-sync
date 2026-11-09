@@ -127,7 +127,7 @@ theorem violates_iff {s : Pipeline} : violates s = false ↔ Safe s := by
    `BlockTransportServerPushSession::CompleteIncomingPush` fires the pool completion
    (`session->OnDataReceived` → `ReshardReceiveSession::OnPoolReceived(p)`) on the first
    arriving stream (`0 < landedStreams[p]`) instead of waiting for all
-   `peerCounts[p]` streams (`progress.completed_chunks >= progress.expected_chunks`),
+   `peerCounts[p]` streams (`plan_pushes == expected_chunks`),
    `StreamAccountingSafe` is violated.
 3. **Premature producer reclamation (`stepReclaimEarly`)**: if producer HBM is
    reclaimed before `send.published ≠ none`, D2H copies `.junk` into destination

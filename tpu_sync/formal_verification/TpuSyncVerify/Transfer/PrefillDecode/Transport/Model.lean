@@ -84,6 +84,9 @@ structure Cfg.WF (c : Cfg) : Prop where
 def freshLayer (c : Cfg) : Layer :=
   { entry := none, sent := List.replicate c.numSenders 0, dispatched := 0, pending := 0 }
 
+/-- Initial state for a fresh `uuid` (**A5**): no prior `active_push_sessions_[uuid]`
+entry (`entry = none` on every layer) and no concurrent `ForgetPushProgress(uuid)`
+in flight from retiring an earlier session or plan on the same `uuid`. -/
 def init (c : Cfg) : S :=
   { layers := List.replicate c.numLayers (freshLayer c),
     blocks := 0, completedLayers := 0, life := {} }
@@ -107,7 +110,7 @@ def freshProgress (c : Cfg) : Progress :=
   { completedChunks := 0, landed := List.replicate c.numSenders 0,
     sendersComplete := 0, called := false }
 
-/-- `CompleteIncomingPush` on one table entry (`auto& progress = layer_progress_[{uuid, l}]` ..
+/-- `CompleteIncomingPush` on one table entry (`auto& progress = layer_progress_[l]` ..
 `trigger_completion = true;`). Returns the updated entry, whether this stream
 completed the layer (`trigger_completion`), and whether the push was rejected.
 In the sender-declared contract the `++streams.landed` increment persists even

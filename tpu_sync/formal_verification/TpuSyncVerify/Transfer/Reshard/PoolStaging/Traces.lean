@@ -82,9 +82,11 @@ theorem trace_shared_storage_pools_share_lease :
   decide
 
 /-- Bounded vs. full-mirror storage configuration
-(`KVCacheManagerBase::ConfigurePoolStaging` in `base.cc`):
-allocates a bounded arena of `blocksPerLease * leases` slots (`some numSlots`)
-if and only if `0 < blocksPerLease`, `0 < leases`, all pools sharing the
+(`KVCacheManagerBase::ConfigurePoolStaging` in `base.cc`): for a device-backed
+storage whose pools agree on `num_blocks > 0` and all declare positive
+`staging_blocks_per_request` (`agg.hint_min > 0`, with `blocksPerLease =
+agg.hint_max`), allocates a bounded arena of `blocksPerLease * leases` slots
+(`some numSlots`) when `0 < blocksPerLease`, `0 < leases`, all pools sharing the
 storage have equal `block_stride_bytes` (`stridesEqual`), and
 `blocksPerLease * leases < maxPoolBlocks`; otherwise falls back to full-mirror
 identity addressing (`none`). -/

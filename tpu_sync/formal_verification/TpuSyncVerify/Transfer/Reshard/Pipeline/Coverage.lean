@@ -133,9 +133,31 @@ def allBranches : Option (List Branch) :=
   inits.foldlM (fun acc (i, evs) =>
     (Coverage.reachableBranches instr i evs 64).map (·.foldl insertNew acc)) []
 
-/-- No upstream test runs a reshard transfer end to end on CPU (`Send` and
-`Recv` coverage). -/
-def paired : List (String × Pipeline × List Ev) := []
+/-- Replay of
+`ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks`
+(`reshard_send_session_test.cc`): `CreateReshardReceiveSession` (on
+`RecordingH2dReceiverBase`) + `CreateReshardSendSession` (on `FakeD2hBase`) run
+two rank-0 pools of one stream each end to end over `BlockTransport`
+(`SocketTransportAdapter`). Ready `FakeD2hBase` futures run `StartPoolPush` inline
+inside `ExecutePushPipeline` before `execFinish`; each pool's push stream lands
+(`CompleteIncomingPush` → `OnDataReceived`) and `RecordingH2dReceiverBase`
+uploads it inline inside the stream's `pushBegin`..`pushEnd` op. -/
+def tr_inverted_pool_order : List Ev :=
+  [.send (.d2hIssue 0 true), .send (.d2hDone 0 true),
+   .send (.d2hIssue 1 true), .send (.d2hDone 1 true),
+   .send .execFinish,
+   .send (.pushDone 0 true),
+   .recv .pushBegin, .landStream 0, .recv (.onPoolReceived 0),
+   .recv (.h2dIssue 0 true), .recv (.h2dReady 0), .recv (.h2dDone 0 true),
+   .recv (.pushEnd true),
+   .send (.pushDone 1 true),
+   .recv .pushBegin, .landStream 1, .recv (.onPoolReceived 1),
+   .recv (.h2dIssue 1 true), .recv (.h2dReady 1), .recv (.h2dDone 1 true),
+   .recv (.pushEnd true)]
+
+def paired : List (String × Pipeline × List Ev) :=
+  [("ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks",
+      init [0, 0] [1, 1], tr_inverted_pool_order)]
 
 def modelOnly : List (String × Pipeline × List Ev) :=
   [("trace_aliased_page_out_of_order_arrival", init [0, 1] [1, 2],
@@ -152,14 +174,12 @@ def coveredByPaired : List Branch :=
 def coveredByAll : List Branch :=
   Coverage.coveredBy instr ((paired ++ modelOnly).map fun (_, s, tr) => (s, tr))
 
-/-- Where a pipeline gap is accounted for. -/
+/-- Where an uncovered pipeline branch is accounted for. -/
 inductive GapClass
   /-- The engine or allocator: `reclaim`, the two reseats. -/
   | env
   /-- `ReshardCoordinator::RunSubPlan`'s Phase 1, modelled in `Coordinator.lean`. -/
   | coordinator
-  /-- `BlockTransportServerPushSession::CompleteIncomingPush` landing a stream. -/
-  | transport
   /-- The session branch inside is reached by a session unit test. -/
   | sessionCovered
   /-- The session branch inside is in that session's gap table. -/
@@ -171,13 +191,13 @@ def gapClass (b : Branch) : GapClass :=
   match b.1 with
   | .armRecv => .coordinator
   | .reclaim | .reseatSrcStaging | .reseatDstStaging => .env
-  | .landStream _ => .transport
   | .send sl _ =>
     if Send.coveredByPaired.contains (sl, b.2) then .sessionCovered
     else if (Send.gaps.map Prod.fst).contains (sl, b.2) then .sessionGap else .unaccounted
   | .recv rl _ _ =>
     if Recv.coveredByPaired.contains (rl, b.2) then .sessionCovered
     else if (Recv.gaps.map Prod.fst).contains (rl, b.2) then .sessionGap else .unaccounted
+  | _ => .unaccounted
 
 def movedOf : Leaf → Option Moved
   | .send _ mv => mv
@@ -197,9 +217,16 @@ landing and the H2D copy only ever move the right pool's KV
 (`PublicationCorrect` read off the branch set) — and no H2D completion
 clobbers KV in a higher-rank slot (`clobbersKv = false`, `AliasedPageCorrect`).
 
-No upstream test runs a reshard transfer end to end on CPU, so `paired` is
-empty and all 60 are gaps; the two `modelOnly` traces reach 17 of them (20
-along the traces, three outside the one-pool universe). They partition as:
+One upstream test
+(`ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks`)
+runs `CreateReshardReceiveSession` + `CreateReshardSendSession` end to end over
+`BlockTransport` (`SocketTransportAdapter`) across two rank-0 pools of one stream
+each: it reaches **12 of the 60** one-pool branches (`landStream .kvRight`, 4
+`Send` happy-path branches, and 7 `Recv` happy-path branches) plus 2 multi-pool
+branches outside the one-pool universe (`send .pushDoneMore` and
+`recv .h2dDoneMore`), 14 along the trace in all. Adding the two `modelOnly`
+traces reaches 18 of 60 within the universe (22 in all). The **48** one-pool
+branches missed by `paired` partition as:
 
 * **environment** (3): `reclaim`, `reseatSrcStaging`, `reseatDstStaging` — the
   engine freeing producer HBM and the arena handing a released lease to the
@@ -207,18 +234,17 @@ along the traces, three outside the one-pool universe). They partition as:
 * **coordinator** (1): `armRecv`, Phase 1 of `ReshardCoordinator::RunSubPlan`
   (`Coordinator.lean`; paired at the coordinator level in
   `Coordinator/Coverage.lean`).
-* **transport** (1): `landStream` — `CompleteIncomingPush` counting a stream
-  against `expected_pushes`; the block-transport unit tests drive that
-  accounting without a reshard session.
-* **covered at session level** (19: 7 `Send`, 12 `Recv`): the session branch
-  inside is reached by a session unit test (the push callbacks, `cancel`, a
-  failed `Start`, a failed pipeline step, `pushBegin`, a failed push lease,
-  `publish`, and the receiver's pool completion and H2D callbacks); the
-  pipeline adds only the memory effect, which those tests cannot observe.
+* **covered at session level** (8: 3 `Send`, 5 `Recv`): the session branch
+  inside is reached by a session unit test (`cancel` on either side, a failed
+  `Start`, a D2H copy returning after `Finish`, a failed push lease, an unframed
+  last-pool H2D completion settling at once, a failed H2D callback, or `Recv`
+  `publish`); the pipeline adds only the memory effect, which those tests
+  cannot observe.
 * **in the session gap tables** (36: 18 `Send`, 18 `Recv`): `Send.gaps` /
   `Recv.gaps`, classified there (`test`, `copyError` / `heldUpload`, `window`).
 
-Nothing falls between the tables (`unaccounted = 0`).
+Nothing falls between the tables (`unaccounted = 0`, which also checks that
+`landStream` is covered by `paired`).
 
 Two pools of ranks `[0, 1]` add 7 branches (an `init [0, 1] [1, 1]` search,
 about 5 s, too slow next to the other `#guard`s; re-run with
@@ -228,22 +254,28 @@ no KV clobbered. The rank-blind mutant of `Traces.lean` (`stepRankBlind`)
 reaches `clobbersKv = true` in 17 steps from the same state
 (`Coverage.witnessP`). -/
 
-/-- One search, every check: exhausted; 60 branches; none paired; 17 reached by
-`modelOnly` within the universe; every move is `kvRight`; no KV clobbered; the
-gaps partition into 3 environment, 1 coordinator, 1 transport, 19
-session-covered, 36 session-gap, none unaccounted. -/
+/-- One search, every check: exhausted; 60 branches; 12 reached by `paired`
+within the one-pool universe (14 along the trace, 2 multi-pool), 18 with
+`modelOnly` (22 in all); every move is `kvRight`; no KV clobbered; the 48
+uncovered one-pool branches partition into 3 environment, 1 coordinator, 8
+session-covered, 36 session-gap, none unaccounted; every trace runs to
+completion. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
   | some univ =>
-    let count (c : GapClass) := (univ.filter (gapClass · = c)).length
-    univ.length = 60 ∧ coveredByPaired.length = 0 ∧
-    (univ.filter coveredByAll.contains).length = 17 ∧ coveredByAll.length = 20 ∧
+    let gaps := univ.filter (fun b => !coveredByPaired.contains b)
+    let count (c : GapClass) := (gaps.filter (gapClass · = c)).length
+    univ.length = 60 ∧ (univ.filter coveredByPaired.contains).length = 12 ∧
+    coveredByPaired.length = 14 ∧
+    (univ.filter coveredByAll.contains).length = 18 ∧ coveredByAll.length = 22 ∧
     univ.all (fun b => (movedOf b.1).all (· = .kvRight)) ∧
     univ.all (fun b => !clobbersOf b.1) ∧
-    count .env = 3 ∧ count .coordinator = 1 ∧ count .transport = 1 ∧
-    count .sessionCovered = 19 ∧ count .sessionGap = 36 ∧ count .unaccounted = 0 ∧
-    modelOnly.all (fun (_, s, tr) => ((⟨s, step⟩ : System Pipeline Ev).run tr).isSome)
+    gaps.length = 48 ∧
+    count .env = 3 ∧ count .coordinator = 1 ∧
+    count .sessionCovered = 8 ∧ count .sessionGap = 36 ∧ count .unaccounted = 0 ∧
+    (paired ++ modelOnly).all (fun (_, s, tr) =>
+      ((⟨s, step⟩ : System Pipeline Ev).run tr).isSome)
 
 #guard coverageChecks
 
