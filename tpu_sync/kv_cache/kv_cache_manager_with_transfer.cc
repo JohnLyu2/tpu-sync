@@ -145,59 +145,80 @@ TransferDetails DetailsFromStatus(const absl::Status& status) {
 }
 
 void KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked(
-    bool is_recv, const std::string& req_id, uint64_t uuid,
+    const std::string& req_id, const std::shared_ptr<TransferSession>& session,
     int32_t sub_plan_index, int32_t sub_plan_count) {
-  if (sub_plan_count <= 1) return;
-  auto& chains = is_recv ? recv_chains_ : send_chains_;
+  if (sub_plan_count <= 1 || sub_plan_index < 0) {
+    sub_plan_chains_.erase(req_id);
+    return;
+  }
+  auto [it, inserted] = sub_plan_chains_.try_emplace(req_id);
+  SubPlanChainProgress& progress = it->second;
   if (sub_plan_index == 0) {
     // Sub-plan 0 is armed before any other sub-plan of its chain: a new
     // chain for this req_id (e.g. a retry) starts from a fresh entry.
-    auto it = chains.find(req_id);
-    if (it != chains.end() && !it->second.failed) {
-      LOG(WARNING) << "Pool reshard " << (is_recv ? "receive" : "send")
-                   << " req_id=" << req_id
+    if (!inserted && !progress.failed && !progress.completed) {
+      size_t settled_count = 0;
+      for (const auto& sub_session : progress.sub_sessions) {
+        if (sub_session != nullptr && sub_session->Done()) {
+          ++settled_count;
+        }
+      }
+      LOG(WARNING) << "Pool reshard req_id=" << req_id
                    << ": sub-plan 0 of a new chain registered while the "
                       "previous chain was still unsettled ("
-                   << it->second.settled.size() << " of " << it->second.count
+                   << settled_count << " of " << progress.sub_sessions.size()
                    << " sub-plans settled); tracking the new chain";
     }
-    chains[req_id] = SubPlanChainProgress{};
-    chains[req_id].anchored = true;
+    progress = SubPlanChainProgress{};
+    progress.anchored = true;
   }
-  SubPlanChainProgress& progress = chains[req_id];
-  progress.plan_uuids.insert(uuid);
-  progress.count = std::max(progress.count, sub_plan_count);
+  const size_t needed_size = std::max<size_t>(
+      progress.sub_sessions.size(),
+      static_cast<size_t>(std::max(sub_plan_count, sub_plan_index + 1)));
+  if (progress.sub_sessions.size() < needed_size) {
+    progress.sub_sessions.resize(needed_size);
+  }
+  progress.sub_sessions[sub_plan_index] = session;
   progress.last_activity = std::chrono::steady_clock::now();
 }
 
 void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
     bool is_recv, const std::string& req_id, uint64_t uuid,
-    int32_t sub_plan_index, int32_t sub_plan_count,
+    const std::shared_ptr<TransferSession>& session,
     const absl::Status& status) {
   absl::flat_hash_set<std::string>& done =
       is_recv ? done_recving_ : done_sending_;
-  if (sub_plan_count <= 1) {
+  auto it = sub_plan_chains_.find(req_id);
+  if (it == sub_plan_chains_.end()) {
     // A single-plan request: the session's terminal is the request's.
     (status.ok() ? done : failed_recving_).insert(req_id);
     if (!status.ok()) transfer_details_[req_id] = DetailsFromStatus(status);
     return;
   }
-  auto& chains = is_recv ? recv_chains_ : send_chains_;
-  if (auto it = chains.find(req_id);
-      it != chains.end() && it->second.anchored &&
-      !it->second.plan_uuids.contains(uuid)) {
-    // A sub-plan of an earlier chain under the same req_id settling after a
-    // new chain (a retry) started: that chain was already reported.
-    VLOG(1) << "Pool reshard " << (is_recv ? "receive" : "send")
-            << " req_id=" << req_id << " uuid=" << uuid
-            << ": ignoring sub-plan " << sub_plan_index
-            << " of a superseded chain (" << status << ")";
+  SubPlanChainProgress& progress = it->second;
+  auto sub_it = std::find(progress.sub_sessions.begin(),
+                          progress.sub_sessions.end(), session);
+  if (sub_it == progress.sub_sessions.end()) {
+    if (progress.anchored) {
+      // A sub-plan of an earlier chain under the same req_id settling after a
+      // new chain (a retry) started, or after the chain completed: ignore it.
+      VLOG(1) << "Pool reshard " << (is_recv ? "receive" : "send")
+              << " req_id=" << req_id << " uuid=" << uuid
+              << ": ignoring sub-plan of a superseded chain (" << status << ")";
+      return;
+    }
+    (status.ok() ? done : failed_recving_).insert(req_id);
+    if (!status.ok()) transfer_details_[req_id] = DetailsFromStatus(status);
     return;
   }
-  SubPlanChainProgress& progress = chains[req_id];
+  const int32_t sub_plan_index =
+      static_cast<int32_t>(sub_it - progress.sub_sessions.begin());
+  const int32_t sub_plan_count =
+      static_cast<int32_t>(progress.sub_sessions.size());
   progress.last_activity = std::chrono::steady_clock::now();
-  if (progress.failed) return;  // the request's failure was already reported
-  progress.count = std::max(progress.count, sub_plan_count);
+  if (progress.failed || progress.completed) {
+    return;  // the request's terminal was already reported
+  }
   if (!status.ok()) {
     progress.failed = true;
     failed_recving_.insert(req_id);
@@ -211,63 +232,72 @@ void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
                  << status;
     return;
   }
-  progress.settled.insert(sub_plan_index);
+  size_t settled_count = 0;
+  for (const auto& sub_session : progress.sub_sessions) {
+    if (sub_session != nullptr && sub_session->Done() &&
+        sub_session->GetStatus().ok()) {
+      ++settled_count;
+    }
+  }
   VLOG(1) << "Pool reshard " << (is_recv ? "receive" : "send")
           << " req_id=" << req_id << " sub-plan " << sub_plan_index << " of "
-          << sub_plan_count << " settled (" << progress.settled.size()
+          << sub_plan_count << " settled (" << settled_count
           << " settled so far)";
-  if (static_cast<int32_t>(progress.settled.size()) >= progress.count) {
+  if (settled_count == progress.sub_sessions.size()) {
     done.insert(req_id);
-    chains.erase(req_id);
+    progress.completed = true;
+    progress.sub_sessions.clear();
   }
 }
 
 void KVCacheManagerWithTransfer::SweepSubPlanChainsLocked(
     std::chrono::steady_clock::time_point now) {
-  if (recv_chains_.empty() && send_chains_.empty()) return;
+  if (sub_plan_chains_.empty()) return;
   const auto stall = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>(timeout_s_));
-  for (auto* chains : {&recv_chains_, &send_chains_}) {
-    for (auto it = chains->begin(); it != chains->end();) {
-      SubPlanChainProgress& progress = it->second;
-      if (now - progress.last_activity <= stall) {
-        ++it;
-        continue;
+  for (auto it = sub_plan_chains_.begin(); it != sub_plan_chains_.end();) {
+    SubPlanChainProgress& progress = it->second;
+    if (now - progress.last_activity <= stall) {
+      ++it;
+      continue;
+    }
+    if (progress.failed || progress.completed) {
+      // The terminal was reported; late sub-plans of a failed or superseded
+      // request were swallowed for one timeout, which is as long as any of
+      // them can live.
+      sub_plan_chains_.erase(it++);
+      continue;
+    }
+    // Quiet for a whole timeout: unless a sub-plan of the request is
+    // still active, its chain has stalled (the coordinator never armed or
+    // dispatched the next sub-plan).
+    bool active = false;
+    size_t settled_count = 0;
+    for (const auto& sub_session : progress.sub_sessions) {
+      if (sub_session == nullptr) continue;
+      if (!sub_session->Done()) {
+        active = true;
+      } else {
+        ++settled_count;
       }
-      if (progress.failed) {
-        // The failure was reported; late sub-plans of the doomed request
-        // were swallowed for one timeout, which is as long as any of them
-        // can live.
-        chains->erase(it++);
-        continue;
-      }
-      // Quiet for a whole timeout: unless a sub-plan of the request is
-      // still active, its chain has stalled (the coordinator never armed or
-      // dispatched the next sub-plan).
-      bool active = false;
-      for (uint64_t uuid : progress.plan_uuids) {
-        if (sessions_.contains(uuid)) {
-          active = true;
-          break;
-        }
-      }
-      if (active) {
-        progress.last_activity = now;
-        ++it;
-        continue;
-      }
-      const absl::Status status = absl::DeadlineExceededError(absl::StrCat(
-          "pool reshard sub-plan chain stalled: ", progress.settled.size(),
-          " of ", progress.count, " sub-plans settled, none active for ",
-          timeout_s_, "s"));
-      failed_recving_.insert(it->first);
-      transfer_details_[it->first] = DetailsFromStatus(status);
-      LOG(WARNING) << "Pool reshard req_id=" << it->first << ": "
-                   << status.message();
-      progress.failed = true;
+    }
+    if (active) {
       progress.last_activity = now;
       ++it;
+      continue;
     }
+    const absl::Status status = absl::DeadlineExceededError(
+        absl::StrCat("pool reshard sub-plan chain stalled: ", settled_count,
+                     " of ", progress.sub_sessions.size(),
+                     " sub-plans settled, none active for ", timeout_s_, "s"));
+    failed_recving_.insert(it->first);
+    transfer_details_[it->first] = DetailsFromStatus(status);
+    LOG(WARNING) << "Pool reshard req_id=" << it->first << ": "
+                 << status.message();
+    progress.failed = true;
+    progress.sub_sessions.clear();
+    progress.last_activity = now;
+    ++it;
   }
 }
 
@@ -281,7 +311,7 @@ absl::StatusOr<std::shared_ptr<TransferSession>>
 KVCacheManagerWithTransfer::GetSession(uint64_t uuid) const {
   absl::MutexLock lock(mu_);
   if (auto it = sessions_.find(uuid); it != sessions_.end()) {
-    return it->second;
+    return it->second.session;
   }
   return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
 }
@@ -365,10 +395,10 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
     sessions_to_wait.reserve(sessions_.size());
     const absl::Status cancel_status =
         absl::CancelledError("KVCacheManagerWithTransfer shutting down");
-    for (const auto& [uuid, session] : sessions_) {
+    for (const auto& [uuid, entry] : sessions_) {
       (void)uuid;
-      session->Finish(cancel_status);
-      sessions_to_wait.push_back(session);
+      entry.session->Finish(cancel_status);
+      sessions_to_wait.push_back(entry.session);
     }
   }
   if (staging_allocator_) {
@@ -392,6 +422,7 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   {
     absl::MutexLock lock(mu_);
     sessions_.clear();
+    sub_plan_chains_.clear();
   }
   staging_allocator_.reset();
 }
@@ -416,16 +447,19 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     return;
   }
   if (local_control_port_ >= 0) {
-    if (max_blocks <= 0) {
-      throw std::invalid_argument("max_blocks must be positive");
-    }
-    if (num_slots <= 0) {
-      throw std::invalid_argument("num_slots must be positive");
-    }
-    if (base_->num_layers() > 0) {
-      ConfigureDataPortFromKvTransfer();
+    // A control server serves pulls out of staging slots, or, on a manager
+    // built over a host pool alone, host-resident reads of that pool.
+    const bool has_staging = max_blocks > 0 && num_slots > 0;
+    const bool has_host_pool = max_blocks == 0 && num_slots == 0 &&
+                               base_->host_block_manager()->total_blocks() > 0;
+    if (!has_staging && !has_host_pool) {
+      throw std::invalid_argument(
+          "a control server needs staging slots (max_blocks > 0 and "
+          "num_slots > 0) or a host pool alone (both 0, host blocks > 0)");
     }
   }
+  // Wire the data port for pull requests even without a control server.
+  ConfigureDataPortFromKvTransfer();
   staging_allocator_ =
       CreateStagingBlockAllocator(base_.get(), num_slots, max_blocks);
   if (local_control_port_ >= 0) {
@@ -434,19 +468,19 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
 }
 
 bool KVCacheManagerWithTransfer::RetireSettledSessionLocked(
-    absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>>::iterator
-        it,
+    absl::flat_hash_map<uint64_t, SessionEntry>::iterator it,
     bool* retired_push_progress, bool* retired_pool_staging) {
   const uint64_t uuid = it->first;
-  if (auto recv =
-          std::dynamic_pointer_cast<TransferReceiveSession>(it->second)) {
+  const std::string& req_id = it->second.req_id;
+  if (auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(
+          it->second.session)) {
     if (!recv->Done()) {
       return false;
     }
     if (recv->tracks_completion()) {
       (!recv->GetStatus().ok() ? failed_recving_ : done_recving_)
-          .insert(recv->req_id());
-      transfer_details_[recv->req_id()] = recv->Details();
+          .insert(req_id);
+      transfer_details_[req_id] = recv->Details();
     }
     if (retired_push_progress != nullptr) {
       *retired_push_progress = true;
@@ -454,49 +488,18 @@ bool KVCacheManagerWithTransfer::RetireSettledSessionLocked(
     sessions_.erase(it);
     return true;
   }
-  if (auto reshard_recv =
-          std::dynamic_pointer_cast<ReshardReceiveSession>(it->second)) {
-    if (!reshard_recv->Done()) {
+  if (it->second.role == SessionRole::kPoolReshardSend ||
+      it->second.role == SessionRole::kPoolReshardReceive) {
+    const std::shared_ptr<TransferSession>& reshard = it->second.session;
+    if (!reshard->Done()) {
       return false;
     }
-    RecordPoolReshardTerminalLocked(
-        /*is_recv=*/true, reshard_recv->req_id(), uuid,
-        reshard_recv->sub_plan_index(), reshard_recv->sub_plan_count(),
-        reshard_recv->GetStatus());
-    if (retired_push_progress != nullptr) {
-      *retired_push_progress = true;
-    }
-    if (retired_pool_staging != nullptr) {
-      *retired_pool_staging = true;
-    }
-    sessions_.erase(it);
-    return true;
-  }
-  if (auto send = std::dynamic_pointer_cast<TransferSendSession>(it->second)) {
-    if (!send->Done()) {
-      return false;
-    }
-    const bool failed = !send->GetStatus().ok();
-    (failed ? failed_recving_ : done_sending_).insert(send->req_id());
-    transfer_details_[send->req_id()] = send->Details();
-    if (failed && retired_push_progress != nullptr) {
-      *retired_push_progress = true;
-    }
-    base_->ClearRemoteLayerAddrs(uuid);
-    sessions_.erase(it);
-    return true;
-  }
-  if (auto reshard_send =
-          std::dynamic_pointer_cast<ReshardSendSession>(it->second)) {
-    if (!reshard_send->Done()) {
-      return false;
-    }
-    const bool failed = !reshard_send->GetStatus().ok();
-    RecordPoolReshardTerminalLocked(
-        /*is_recv=*/false, reshard_send->req_id(), uuid,
-        reshard_send->sub_plan_index(), reshard_send->sub_plan_count(),
-        reshard_send->GetStatus());
-    if (failed) {
+    const bool is_recv = it->second.role == SessionRole::kPoolReshardReceive;
+    const absl::Status status = reshard->GetStatus();
+    RecordPoolReshardTerminalLocked(is_recv, req_id, uuid, reshard, status);
+    // A retired receive always leaves push progress and pool staging behind;
+    // a send leaves them only when it failed.
+    if (is_recv || !status.ok()) {
       if (retired_push_progress != nullptr) {
         *retired_push_progress = true;
       }
@@ -507,13 +510,29 @@ bool KVCacheManagerWithTransfer::RetireSettledSessionLocked(
     sessions_.erase(it);
     return true;
   }
+  if (auto send =
+          std::dynamic_pointer_cast<TransferSendSession>(it->second.session)) {
+    if (!send->Done()) {
+      return false;
+    }
+    const bool failed = !send->GetStatus().ok();
+    (failed ? failed_recving_ : done_sending_).insert(req_id);
+    transfer_details_[req_id] = send->Details();
+    if (failed && retired_push_progress != nullptr) {
+      *retired_push_progress = true;
+    }
+    base_->ClearRemoteLayerAddrs(uuid);
+    sessions_.erase(it);
+    return true;
+  }
   return false;
 }
 
 int64_t KVCacheManagerWithTransfer::NotifyForRead(
     const std::string& req_id, uint64_t uuid,
     const std::vector<int64_t>& block_ids,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    BlockLocation source) {
   RAIDEN_TRACE_FN("KVTransfer::NotifyForRead", [&]() {
     return absl::StrCat("req=", req_id, " uuid=", uuid,
                         " blocks=", block_ids.size());
@@ -522,16 +541,30 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
   if (block_ids.empty()) {
     return 0;
   }
+  const std::string context = absl::StrCat("NotifyForRead req_id=", req_id);
+  if (source == BlockLocation::kHost) {
+    CheckHostMemoryTransferSupported(context);
+    // Duplicates are reported, with their positions, by the session below.
+    CheckHostBlockIds(block_ids, context, HostBlockIdPolicy::kAllowRepeats);
+  } else if (ServesHostPoolReadsOnly()) {
+    // Serving a device read would lease staging out of the host pool this
+    // manager's caller addresses by block id, and copy device blocks over
+    // whatever the caller keeps there. Refuse up front rather than at the
+    // pull, where the caller would only learn of it through poll_stats.
+    throw std::invalid_argument(absl::StrCat(
+        context, ": this manager serves host reads only (source=host)"));
+  }
 
   absl::StatusOr<std::shared_ptr<TransferSendSession>> created =
       TransferSendSession::Create(
-          base_.get(), staging_allocator_.get(), req_id, uuid, block_ids,
-          deadline.value_or(DeadlineFromNow()), register_start);
+          base_.get(), staging_allocator_.get(), uuid, block_ids,
+          deadline.value_or(DeadlineFromNow()), register_start, source);
   // An invalid registration is a caller bug rather than an empty transfer:
   // throw immediately instead of returning 0, which callers interpret as
   // "nothing to send" and then wait until the consumer's pull times out.
   if (!created.ok()) {
-    throw std::invalid_argument(std::string(created.status().message()));
+    throw std::invalid_argument(
+        absl::StrCat(created.status().message(), " (req_id=", req_id, ")"));
   }
   std::shared_ptr<TransferSendSession> session = *std::move(created);
 
@@ -541,7 +574,10 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
       done_sending_.insert(req_id);
       return 0;
     }
-    if (!sessions_.try_emplace(uuid, session).second) {
+    if (!sessions_
+             .try_emplace(uuid,
+                          SessionEntry{session, req_id, SessionRole::kTransfer})
+             .second) {
       throw std::runtime_error(
           absl::StrCat("NotifyForRead rejected duplicate uuid=", uuid,
                        " for req_id=", req_id, ": a read is still registered"));
@@ -566,10 +602,11 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
 }
 
 absl::Status KVCacheManagerWithTransfer::EmplaceRecvSessionLocked(
-    uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session) {
+    uint64_t uuid, absl::string_view req_id,
+    const std::shared_ptr<TransferReceiveSession>& session) {
   if (auto existing = sessions_.find(uuid); existing != sessions_.end()) {
-    if (auto recv =
-            std::dynamic_pointer_cast<TransferReceiveSession>(existing->second);
+    if (auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(
+            existing->second.session);
         recv != nullptr && !recv->IsDraining() && recv->IsReadyToComplete()) {
       recv->Finish();
     }
@@ -577,7 +614,10 @@ absl::Status KVCacheManagerWithTransfer::EmplaceRecvSessionLocked(
   }
   // try_emplace leaves session untouched on a duplicate. Callers rely on that
   // guarantee to release staging owned by the rejected session.
-  if (!sessions_.try_emplace(uuid, session).second) {
+  if (!sessions_
+           .try_emplace(uuid, SessionEntry{session, std::string(req_id),
+                                           SessionRole::kTransfer})
+           .second) {
     return absl::AlreadyExistsError(
         absl::StrCat("Receive with UUID ", uuid, " is already registered"));
   }
@@ -593,24 +633,28 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
   {
     absl::MutexLock lock(mu_);
     auto existing = sessions_.find(uuid);
-    if ((existing != sessions_.end() && existing->second->plan().has_value()) ||
+    if ((existing != sessions_.end() &&
+         existing->second.session->plan().has_value()) ||
         pending_pool_reshard_recvs_.contains(uuid)) {
       return absl::AlreadyExistsError(
           absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
     }
     if (existing != sessions_.end()) {
       if (auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(
-              existing->second);
+              existing->second.session);
           recv != nullptr && !recv->IsDraining() && recv->IsReadyToComplete()) {
         recv->Finish();
       }
-      if (!existing->second->Done()) {
+      if (!existing->second.session->Done()) {
         return absl::AlreadyExistsError(
             absl::StrCat(is_sender ? "Send" : "Receive", " with UUID ", uuid,
                          " is already registered"));
       }
     }
 
+    const std::string req_id = request.req_id().empty()
+                                   ? absl::StrCat("resharded_transfer_", uuid)
+                                   : request.req_id();
     if (is_sender) {
       ABSL_ASSIGN_OR_RETURN(
           std::shared_ptr<TransferSendSession> send_session,
@@ -621,7 +665,10 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
                                    &retired_pool_staging);
       }
       registered = send_session;
-      sessions_.emplace(uuid, std::move(send_session));
+      // The incumbent was retired under this lock, so the insert cannot fail.
+      (void)sessions_.try_emplace(uuid,
+                                  SessionEntry{std::move(send_session), req_id,
+                                               SessionRole::kTransfer});
     } else {
       ABSL_ASSIGN_OR_RETURN(
           std::shared_ptr<TransferReceiveSession> recv_session,
@@ -632,7 +679,8 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
         RetireSettledSessionLocked(existing, &retired_existing,
                                    &retired_pool_staging);
       }
-      absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
+      absl::Status inserted =
+          EmplaceRecvSessionLocked(uuid, req_id, recv_session);
       if (!inserted.ok()) {
         return inserted;
       }
@@ -666,10 +714,11 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
     ASSIGN_OR_RETURN(
         recv_session,
         TransferReceiveSession::Create(
-            base_.get(), staging_allocator_.get(), uuid, req_id,
-            expected_block_count, deadline.value_or(DeadlineFromNow()),
+            base_.get(), staging_allocator_.get(), uuid, expected_block_count,
+            deadline.value_or(DeadlineFromNow()),
             /*acquire_staging=*/false, metrics_collector_));
-    absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
+    absl::Status inserted =
+        EmplaceRecvSessionLocked(uuid, req_id, recv_session);
     if (!inserted.ok()) {
       return inserted;
     }
@@ -709,15 +758,16 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
   }
 
   ABSL_ASSIGN_OR_RETURN(
-      std::shared_ptr<ReshardSendSession> state,
-      ReshardSendSession::Create(base_.get(), staging_allocator_.get(),
-                                 src_block_ids, parallelism, DeadlineFromNow(),
-                                 plan));
+      std::shared_ptr<TransferSession> state,
+      CreateReshardSendSession(base_.get(), staging_allocator_.get(),
+                               src_block_ids, parallelism, DeadlineFromNow(),
+                               plan));
   {
     absl::MutexLock lock(mu_);
-    sessions_[plan.uuid()] = state;
-    NoteSubPlanRegisteredLocked(/*is_recv=*/false, plan.req_id(), plan.uuid(),
-                                plan.sub_plan_index(), plan.sub_plan_count());
+    sessions_[plan.uuid()] =
+        SessionEntry{state, plan.req_id(), SessionRole::kPoolReshardSend};
+    NoteSubPlanRegisteredLocked(plan.req_id(), state, plan.sub_plan_index(),
+                                plan.sub_plan_count());
   }
 
   return state->Start();
@@ -760,14 +810,15 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
   };
 
   ABSL_ASSIGN_OR_RETURN(
-      std::shared_ptr<ReshardReceiveSession> recv_session,
-      ReshardReceiveSession::Create(base_.get(), staging_allocator_.get(), plan,
-                                    chip_block_ids, DeadlineFromNow()));
+      std::shared_ptr<TransferSession> recv_session,
+      CreateReshardReceiveSession(base_.get(), staging_allocator_.get(), plan,
+                                  chip_block_ids, DeadlineFromNow()));
   {
     absl::MutexLock lock(mu_);
     pending_pool_reshard_recvs_.erase(plan.uuid());
-    sessions_[plan.uuid()] = recv_session;
-    NoteSubPlanRegisteredLocked(/*is_recv=*/true, plan.req_id(), plan.uuid(),
+    sessions_[plan.uuid()] = SessionEntry{recv_session, plan.req_id(),
+                                          SessionRole::kPoolReshardReceive};
+    NoteSubPlanRegisteredLocked(plan.req_id(), recv_session,
                                 plan.sub_plan_index(), plan.sub_plan_count());
   }
   return recv_session->Start();
@@ -777,18 +828,18 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
   std::shared_ptr<TransferSession> session;
   std::shared_ptr<TransferSendSession> send;
   std::shared_ptr<TransferReceiveSession> recv;
-  std::shared_ptr<ReshardSendSession> reshard_send;
+  bool is_pool_reshard_send = false;
   {
     absl::MutexLock lock(mu_);
     auto it = sessions_.find(uuid);
-    if (it == sessions_.end() || !it->second->plan().has_value()) {
+    if (it == sessions_.end() || !it->second.session->plan().has_value()) {
       return absl::NotFoundError(
           absl::StrCat("No active plan with UUID ", uuid));
     }
-    session = it->second;
+    session = it->second.session;
     send = std::dynamic_pointer_cast<TransferSendSession>(session);
     recv = std::dynamic_pointer_cast<TransferReceiveSession>(session);
-    reshard_send = std::dynamic_pointer_cast<ReshardSendSession>(session);
+    is_pool_reshard_send = it->second.role == SessionRole::kPoolReshardSend;
     if (send != nullptr) {
       // The plan's registrant, not the CompleteReadWithDetails sweep, owns
       // its send session: drop it before finishing it so the sweep never
@@ -796,7 +847,7 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
       sessions_.erase(it);
     }
   }
-  if (send != nullptr || reshard_send != nullptr) {
+  if (send != nullptr || is_pool_reshard_send) {
     if (!session->Done()) {
       session->Finish(absl::CancelledError("send plan unregistered"));
     }
@@ -811,7 +862,7 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
   if (recv != nullptr && !recv->tracks_completion()) {
     absl::MutexLock lock(mu_);
     auto it = sessions_.find(uuid);
-    if (it != sessions_.end() && it->second == recv) {
+    if (it != sessions_.end() && it->second.session == recv) {
       sessions_.erase(it);
     }
   }
@@ -860,7 +911,8 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<RaidenTransferEndpoint>& remote_descriptors,
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
-    std::optional<std::vector<int64_t>> local_host_block_ids) {
+    std::optional<std::vector<int64_t>> local_host_block_ids,
+    BlockLocation destination) {
   RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
     return absl::StrCat("req=", req_id, " uuid=", uuid,
                         " blocks=", remote_block_ids.size());
@@ -878,7 +930,8 @@ void KVCacheManagerWithTransfer::StartRead(
             << " descriptors, selecting first endpoint.";
   }
   StartRead(req_id, uuid, remote_descriptors[0].endpoint, remote_block_ids,
-            local_block_ids, parallelism, std::move(local_host_block_ids));
+            local_block_ids, parallelism, std::move(local_host_block_ids),
+            /*deadline=*/std::nullopt, destination);
 }
 
 void KVCacheManagerWithTransfer::StartRead(
@@ -887,7 +940,8 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
     std::optional<std::vector<int64_t>> local_host_block_ids,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    BlockLocation destination) {
   RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
     return absl::StrCat("req=", req_id, " uuid=", uuid,
                         " blocks=", remote_block_ids.size());
@@ -901,6 +955,28 @@ void KVCacheManagerWithTransfer::StartRead(
           << req_id << ", uuid: " << uuid << ", remote: " << remote_endpoint
           << ", Thread: " << std::this_thread::get_id();
   FaultInjectThrow(hooks::kKvCacheManagerApiStartRead);
+  const std::string context = absl::StrCat("StartRead req_id=", req_id);
+  if (destination == BlockLocation::kHost) {
+    CheckHostMemoryTransferSupported(context);
+    // `<local_block_ids, destination>` is the whole interface for a host
+    // destination: the destination says which pool the ids address.
+    if (local_host_block_ids.has_value()) {
+      throw std::invalid_argument(absl::StrCat(
+          context,
+          ": a host destination lands in local_block_ids; local_host_block_ids "
+          "must not be given"));
+    }
+    local_host_block_ids = local_block_ids;
+  }
+  if (local_host_block_ids.has_value()) {
+    // A host destination lands blocks in these for good, so one block may not
+    // receive two; staging for a device destination is overwritten by its
+    // H2D anyway, and a device block may legitimately repeat.
+    CheckHostBlockIds(*local_host_block_ids, context,
+                      destination == BlockLocation::kHost
+                          ? HostBlockIdPolicy::kRequireUnique
+                          : HostBlockIdPolicy::kAllowRepeats);
+  }
   if (remote_block_ids.size() != local_block_ids.size() ||
       (local_host_block_ids.has_value() &&
        local_host_block_ids->size() != local_block_ids.size())) {
@@ -908,11 +984,13 @@ void KVCacheManagerWithTransfer::StartRead(
         "remote_block_ids, local_block_ids, and local_host_block_ids must have "
         "same length");
   }
-  // local_block_ids index the consumer's DEVICE KV cache, not the host staging
-  // pool; reusing them as host indices overflows the host buffer once a device
-  // block id exceeds num_host_blocks. If the caller didn't supply explicit host
-  // indices, borrow a staging slot and stage into its reserved host blocks
-  // (slot.block_ids -- the real, possibly non-contiguous host blocks).
+  // For a device destination, local_block_ids index the consumer's DEVICE KV
+  // cache, not the host staging pool; reusing them as host indices overflows
+  // the host buffer once a device block id exceeds num_host_blocks. If the
+  // caller didn't supply explicit host indices, borrow a staging slot and stage
+  // into its reserved host blocks (slot.block_ids -- the real, possibly
+  // non-contiguous host blocks). A host destination named its host blocks in
+  // local_host_block_ids above.
   std::shared_ptr<TransferReceiveSession> session;
   {
     absl::MutexLock lock(mu_);
@@ -923,15 +1001,15 @@ void KVCacheManagerWithTransfer::StartRead(
                  << " for req_id=" << req_id;
       // Re-delivery of the same announcement is idempotent. The incumbent
       // remains responsible for producing this request's one terminal report.
-      auto recv_incumbent =
-          std::dynamic_pointer_cast<TransferReceiveSession>(incumbent->second);
-      if (recv_incumbent == nullptr || recv_incumbent->req_id() != req_id) {
+      auto recv_incumbent = std::dynamic_pointer_cast<TransferReceiveSession>(
+          incumbent->second.session);
+      const std::string& incumbent_req_id = incumbent->second.req_id;
+      if (recv_incumbent == nullptr || incumbent_req_id != req_id) {
         failed_recving_.insert(req_id);
         transfer_details_[req_id] = DetailsFromStatus(absl::AlreadyExistsError(
             recv_incumbent != nullptr
-                ? absl::StrCat(
-                      "StartRead rejected duplicate uuid=", uuid,
-                      ", already receiving req_id=", recv_incumbent->req_id())
+                ? absl::StrCat("StartRead rejected duplicate uuid=", uuid,
+                               ", already receiving req_id=", incumbent_req_id)
                 : absl::StrCat("StartRead rejected duplicate uuid=", uuid)));
       }
       return;
@@ -939,17 +1017,19 @@ void KVCacheManagerWithTransfer::StartRead(
 
     absl::StatusOr<std::shared_ptr<TransferReceiveSession>> created =
         TransferReceiveSession::Create(
-            base_.get(), this, staging_allocator_.get(), uuid, req_id,
-            remote_endpoint, remote_block_ids, local_block_ids,
-            local_host_block_ids, effective_deadline, metrics_collector_);
+            base_.get(), this, staging_allocator_.get(), uuid, remote_endpoint,
+            remote_block_ids, local_block_ids, local_host_block_ids,
+            effective_deadline, metrics_collector_, destination);
     if (!created.ok()) {
       failed_recving_.insert(req_id);
-      transfer_details_[req_id] = DetailsFromStatus(created.status());
+      transfer_details_[req_id] = DetailsFromStatus(absl::Status(
+          created.status().code(),
+          absl::StrCat(created.status().message(), " (req_id=", req_id, ")")));
       return;
     }
     session = *std::move(created);
 
-    absl::Status inserted = EmplaceRecvSessionLocked(uuid, session);
+    absl::Status inserted = EmplaceRecvSessionLocked(uuid, req_id, session);
     if (!inserted.ok()) {
       failed_recving_.insert(req_id);
       transfer_details_[req_id] = DetailsFromStatus(inserted);
@@ -998,41 +1078,21 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
     const auto now = std::chrono::steady_clock::now();
     for (auto it = sessions_.begin(); it != sessions_.end();) {
       const uint64_t uuid = it->first;
-      const std::shared_ptr<TransferSession> session = it->second;
+      const std::shared_ptr<TransferSession> session = it->second.session;
       if (!session->IsDraining()) {
-        if (auto send =
-                std::dynamic_pointer_cast<TransferSendSession>(session)) {
-          if (send->deadline() <= now) {
-            // Past its deadline the transfer failed. One nobody pulled is
-            // reported now; one whose copies or pushes still run keeps its
-            // staging until they end, so the next transfer is never seated on
-            // memory a copy still writes.
-            send->Finish(absl::DeadlineExceededError("Send session timed out"));
-          }
-        } else if (auto reshard_send =
-                       std::dynamic_pointer_cast<ReshardSendSession>(session)) {
-          if (reshard_send->deadline() <= now) {
-            reshard_send->Finish(
-                absl::DeadlineExceededError("Pool reshard send timed out"));
-          }
-        } else if (auto recv =
-                       std::dynamic_pointer_cast<TransferReceiveSession>(
-                           session)) {
-          if (recv->IsReadyToComplete()) {
-            LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
-                      << recv->req_id();
-            recv->Finish();
-          } else if (recv->deadline() <= now) {
-            recv->Finish(
-                absl::DeadlineExceededError("Receive session timed out"));
-          }
-        } else if (auto reshard_recv =
-                       std::dynamic_pointer_cast<ReshardReceiveSession>(
-                           session)) {
-          if (reshard_recv->deadline() <= now) {
-            reshard_recv->Finish(
-                absl::DeadlineExceededError("Pool reshard receive timed out"));
-          }
+        if (auto recv =
+                std::dynamic_pointer_cast<TransferReceiveSession>(session);
+            recv != nullptr && recv->IsReadyToComplete()) {
+          LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
+                    << it->second.req_id;
+          recv->Finish();
+        } else if (session->deadline() <= now) {
+          // Past its deadline the transfer failed. One nobody pulled is
+          // reported now; one whose copies or pushes still run keeps its
+          // staging until they end, so the next transfer is never seated on
+          // memory a copy still writes.
+          session->Finish(
+              absl::DeadlineExceededError("Transfer session timed out"));
         }
       }
       auto current = it++;
@@ -1294,8 +1354,61 @@ absl::Status KVCacheManagerWithTransfer::HandleAck(uint64_t uuid) {
 }
 
 uint64_t KVCacheManagerWithTransfer::MaxPullStreamBlocks() const {
-  return static_cast<uint64_t>(
-      std::max<int64_t>(0, staging_allocator_->capacity()));
+  const int64_t staging_capacity = staging_allocator_->capacity();
+  if (staging_capacity > 0) {
+    return static_cast<uint64_t>(staging_capacity);
+  }
+  // No staging slots, and no dynamic staging either (whose capacity is the
+  // host pool): only host-resident reads can be served, and the host pool
+  // bounds those.
+  return static_cast<uint64_t>(std::max<int64_t>(0, NumHostBlocks()));
+}
+
+int64_t KVCacheManagerWithTransfer::NumHostBlocks() const {
+  // A base built without buffers has no host pool at all.
+  const kv_cache::LogicalBlockManager* host_blocks =
+      base_->host_block_manager();
+  return host_blocks != nullptr ? host_blocks->total_blocks() : 0;
+}
+
+void KVCacheManagerWithTransfer::CheckHostBlockIds(
+    absl::Span<const int64_t> block_ids, absl::string_view context,
+    HostBlockIdPolicy policy) const {
+  const int64_t num_host_blocks = NumHostBlocks();
+  absl::flat_hash_set<int64_t> seen;
+  for (int64_t block_id : block_ids) {
+    if (block_id < 0 || block_id >= num_host_blocks) {
+      throw std::invalid_argument(absl::StrCat(
+          context, ": host block ", block_id, " is outside the host pool of ",
+          num_host_blocks, " blocks"));
+    }
+    if (policy == HostBlockIdPolicy::kRequireUnique &&
+        !seen.insert(block_id).second) {
+      throw std::invalid_argument(absl::StrCat(
+          context, ": host block ", block_id, " is named more than once"));
+    }
+  }
+}
+
+void KVCacheManagerWithTransfer::CheckHostMemoryTransferSupported(
+    absl::string_view context) const {
+  // Rationale for both checks: see the declaration.
+  if (base_->num_host_layers() < base_->num_layers()) {
+    throw std::invalid_argument(absl::StrCat(
+        context, ": host transfers require num_staging_layers == num_layers"));
+  }
+  if (staging_allocator_->LeasesHostBlocks()) {
+    throw std::invalid_argument(absl::StrCat(
+        context,
+        ": host transfers require num_slots == 0 and no dynamic host staging"));
+  }
+}
+
+bool KVCacheManagerWithTransfer::ServesHostPoolReadsOnly() const {
+  // The constructor admits a control server only over staging slots or over a
+  // host pool alone, so a server over a pool nothing stages through serves
+  // the pool itself.
+  return local_control_port_ >= 0 && !staging_allocator_->LeasesHostBlocks();
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
@@ -1306,15 +1419,15 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
     {
       absl::MutexLock lock(mu_);
       bool pending = false;
-      for (const auto& [uuid, session] : sessions_) {
+      for (const auto& [uuid, entry] : sessions_) {
         (void)uuid;
-        if (auto recv =
-                std::dynamic_pointer_cast<TransferReceiveSession>(session)) {
+        if (auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(
+                entry.session)) {
           if (recv->HasPendingWork()) {
             pending = true;
             break;
           }
-        } else if (!session->Done()) {
+        } else if (!entry.session->Done()) {
           pending = true;
           break;
         }
@@ -1336,17 +1449,23 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
 
 void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
   std::shared_ptr<TransferSendSession> session;
+  std::string req_id;
   {
     absl::MutexLock lock(mu_);
-    session = FindSessionLocked<TransferSendSession>(uuid);
+    auto it = sessions_.find(uuid);
+    if (it != sessions_.end()) {
+      session =
+          std::dynamic_pointer_cast<TransferSendSession>(it->second.session);
+    }
     if (session == nullptr) {
       pending_acks_.insert(uuid);
       return;
     }
+    req_id = it->second.req_id;
   }
   session->Finish();
   LOG(INFO) << "RAIDEN_TIMING event=producer_ack"
-            << " req_id=" << session->req_id() << " uuid=" << uuid
+            << " req_id=" << req_id << " uuid=" << uuid
             << " node_id=" << node_id_
             << " failed=" << (!session->GetStatus().ok() ? 1 : 0);
 }

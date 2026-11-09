@@ -18,12 +18,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>  // NOLINT(build/c++17)
+#include <fstream>
 #include <functional>
 #include <future>  // NOLINT(build/c++11)
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -31,10 +35,12 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>  // NOLINT
+#include <system_error>  // NOLINT(build/c++11)
+#include <thread>        // NOLINT
 #include <utility>
 #include <vector>
 
+#include "absl/base/const_init.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
@@ -45,6 +51,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -68,6 +75,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/host_meminfo.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -82,6 +90,23 @@
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
+
+constexpr int64_t kHostMemorySampleIntervalNs = 5'000'000'000LL;
+constexpr int64_t kHostNumaMemorySampleIntervalNs = 5'000'000'000LL;
+
+static_assert(std::atomic<int64_t>::is_always_lock_free,
+              "std::atomic<int64_t> must be lock-free");
+
+// Last Unix timestamp in nanoseconds when `host_memory_breakdown_bytes` was
+// sampled, used to throttle periodic refreshes on transfer paths.
+std::atomic<int64_t> g_last_host_mem_sample_ns{
+    std::numeric_limits<int64_t>::min()};
+
+// Tracks the last per-NUMA-node memory sample timestamp (in monotonic
+// nanoseconds) per sysfs node directory.
+absl::Mutex g_numa_mem_mu(absl::kConstInit);
+absl::flat_hash_map<std::string, int64_t> g_last_numa_mem_sample_ns
+    ABSL_GUARDED_BY(g_numa_mem_mu);
 
 absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
                                      const std::vector<int64_t>& dst_offsets,
@@ -213,6 +238,9 @@ void RecordStorageBytes(absl::Span<const std::string> shard_local_ranks,
 struct TransferPipelinedState {
   size_t total_chunks = 0;
   std::atomic<size_t> completed_chunks{0};
+  std::atomic<size_t> completed_storage_io_chunks{0};
+  std::atomic<int64_t> first_storage_io_start_ns{
+      std::numeric_limits<int64_t>::max()};
   std::atomic<bool> has_failed{false};
   std::atomic<bool> promise_fulfilled{false};
 
@@ -280,6 +308,24 @@ struct TransferPipelinedState {
   }
 
   bool HasFailed() const { return has_failed.load(std::memory_order_acquire); }
+
+  void RecordStorageIoStart(int64_t start_ns) {
+    int64_t prev = first_storage_io_start_ns.load(std::memory_order_relaxed);
+    while (start_ns < prev && !first_storage_io_start_ns.compare_exchange_weak(
+                                  prev, start_ns, std::memory_order_release,
+                                  std::memory_order_relaxed)) {
+    }
+  }
+
+  bool MarkStorageIoChunkComplete() {
+    return completed_storage_io_chunks.fetch_add(1, std::memory_order_acq_rel) +
+               1 ==
+           total_chunks;
+  }
+
+  int64_t StorageIoStartNs() const {
+    return first_storage_io_start_ns.load(std::memory_order_acquire);
+  }
 };
 
 // Computes the total bytes transferred per shard across the active layers.
@@ -353,6 +399,247 @@ double ComputeDmaTransferTimeMs(absl::string_view dma_metric,
   return std::max(0.0, absl::ToDoubleMilliseconds(end_time - effective_start));
 }
 
+// Samples `manager.proc_meminfo_path()` (`/proc/meminfo` in production) and
+// updates the `host_memory_breakdown_bytes` gauge across `kv_pool`,
+// `process_heap`, `page_cache`, and `free` on the primary local worker
+// (`local_rank == "0"`).
+void UpdateHostMemoryBreakdownMetrics(const KVCacheManagerBase& manager,
+                                      size_t kv_pool_bytes) {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  std::ifstream file{std::string(manager.proc_meminfo_path())};
+  if (!file.is_open()) {
+    return;
+  }
+  const std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+  const std::optional<HostMemoryBreakdown> breakdown =
+      ParseHostMemoryBreakdown(content, kv_pool_bytes);
+  if (!breakdown.has_value()) {
+    return;
+  }
+  g_last_host_mem_sample_ns.store(absl::GetCurrentTimeNanos(),
+                                  std::memory_order_relaxed);
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  static constexpr telemetry::MetricLabel kKvPoolLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentKvPool}};
+  static constexpr telemetry::MetricLabel kProcessHeapLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentProcessHeap}};
+  static constexpr telemetry::MetricLabel kPageCacheLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentPageCache}};
+  static constexpr telemetry::MetricLabel kFreeLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentFree}};
+
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kKvPoolLabel, static_cast<double>(breakdown->kv_pool_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kProcessHeapLabel,
+                 static_cast<double>(breakdown->process_heap_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kPageCacheLabel,
+                 static_cast<double>(breakdown->page_cache_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes, kFreeLabel,
+                 static_cast<double>(breakdown->free_bytes));
+}
+
+// Throttled wrapper around `UpdateHostMemoryBreakdownMetrics` that samples
+// `/proc/meminfo` at most once every `kHostMemorySampleIntervalNs` (5s).
+// TODO: Replace periodic timestamp-throttled sampling on the transfer path
+// with scrape-time collection or event-driven updates once all telemetry
+// backends support pull callbacks.
+void MaybeUpdateHostMemoryBreakdownMetrics(const KVCacheManagerBase& manager,
+                                           int64_t now_ns) {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  int64_t last_ns = g_last_host_mem_sample_ns.load(std::memory_order_relaxed);
+  if (last_ns != std::numeric_limits<int64_t>::min() &&
+      (now_ns <= last_ns ||
+       static_cast<uint64_t>(now_ns) - static_cast<uint64_t>(last_ns) <
+           static_cast<uint64_t>(kHostMemorySampleIntervalNs))) {
+    return;
+  }
+  if (!g_last_host_mem_sample_ns.compare_exchange_strong(
+          last_ns, now_ns, std::memory_order_relaxed)) {
+    return;
+  }
+  UpdateHostMemoryBreakdownMetrics(manager,
+                                   manager.GetAllocatedHostDramBytes());
+}
+
+// Samples per-NUMA-node host DRAM usage (used, free, total) in bytes from
+// `<sysfs_node_dir>/node<N>/meminfo` and updates the
+// `host_numa_memory_bytes` gauge.
+void RecordHostNumaMemoryMetrics(absl::string_view sysfs_node_dir) {
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends() || sysfs_node_dir.empty()) {
+    return;
+  }
+
+  std::error_code ec;
+  std::filesystem::directory_iterator dir_it(
+      std::filesystem::path(std::string(sysfs_node_dir)), ec);
+  if (ec) {
+    return;
+  }
+
+  std::vector<std::pair<int, std::filesystem::path>> node_dirs;
+  for (const std::filesystem::directory_entry& entry : dir_it) {
+    std::error_code is_dir_ec;
+    if (!entry.is_directory(is_dir_ec) || is_dir_ec) {
+      continue;
+    }
+    const std::string dirname = entry.path().filename().string();
+    if (!absl::StartsWith(dirname, "node")) {
+      continue;
+    }
+    const absl::string_view node_id_view = absl::string_view(dirname).substr(4);
+    int node_id = -1;
+    if (node_id_view.empty() ||
+        (node_id_view.size() > 1 && node_id_view[0] == '0') ||
+        !std::all_of(node_id_view.begin(), node_id_view.end(),
+                     absl::ascii_isdigit) ||
+        !absl::SimpleAtoi(node_id_view, &node_id) || node_id < 0) {
+      continue;
+    }
+    node_dirs.emplace_back(node_id, entry.path());
+  }
+
+  std::sort(node_dirs.begin(), node_dirs.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  for (const auto& [node_id, node_path] : node_dirs) {
+    std::ifstream meminfo_file(node_path / "meminfo");
+    if (!meminfo_file.is_open()) {
+      continue;
+    }
+    const std::string content((std::istreambuf_iterator<char>(meminfo_file)),
+                              std::istreambuf_iterator<char>());
+    const std::optional<NumaNodeMemory> mem =
+        ParseNumaNodeMeminfo(node_id, content);
+    if (!mem.has_value()) {
+      continue;
+    }
+
+    const std::string node_id_str = absl::StrCat(node_id);
+    const telemetry::MetricLabel used_labels[] = {
+        {telemetry::metric_labels::kNumaNode, node_id_str},
+        {telemetry::metric_labels::kState,
+         telemetry::metric_labels::kStateUsed}};
+    const telemetry::MetricLabel free_labels[] = {
+        {telemetry::metric_labels::kNumaNode, node_id_str},
+        {telemetry::metric_labels::kState,
+         telemetry::metric_labels::kStateFree}};
+    const telemetry::MetricLabel total_labels[] = {
+        {telemetry::metric_labels::kNumaNode, node_id_str},
+        {telemetry::metric_labels::kState,
+         telemetry::metric_labels::kStateTotal}};
+    store.SetGauge(telemetry::metric_names::kHostNumaMemoryBytes, used_labels,
+                   static_cast<double>(mem->used_bytes));
+    store.SetGauge(telemetry::metric_names::kHostNumaMemoryBytes, free_labels,
+                   static_cast<double>(mem->free_bytes));
+    store.SetGauge(telemetry::metric_names::kHostNumaMemoryBytes, total_labels,
+                   static_cast<double>(mem->total_bytes));
+  }
+}
+
+// Samples `manager.sysfs_node_dir()` (`/sys/devices/system/node` in
+// production) at most once every 5 seconds per directory. NUMA memory is
+// host-wide, so only the primary local worker (`local_rank == "0"`) emits it;
+// otherwise every worker would export a duplicate series (or, without
+// `local_rank`, a summed one).
+// TODO: Replace periodic timestamp-throttled sampling with scrape-time
+// collection or event-driven updates once all telemetry backends support
+// pull callbacks.
+void MaybeRecordHostNumaMemoryMetrics(const KVCacheManagerBase& manager) {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  const absl::string_view sysfs_node_dir = manager.sysfs_node_dir();
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  {
+    absl::MutexLock lock(g_numa_mem_mu);
+    auto it = g_last_numa_mem_sample_ns.find(sysfs_node_dir);
+    if (it != g_last_numa_mem_sample_ns.end() &&
+        now_ns - it->second < kHostNumaMemorySampleIntervalNs) {
+      return;
+    }
+    g_last_numa_mem_sample_ns[sysfs_node_dir] = now_ns;
+  }
+  RecordHostNumaMemoryMetrics(sysfs_node_dir);
+}
+
+int64_t SteadyClockNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Secondary storage backends execute read and write requests across a shared
+// worker thread pool. Clamping each batch's start timestamp against the
+// previous completion watermark per direction recovers the non-overlapping
+// active storage I/O duration without overcounting concurrent batches.
+double ComputeStorageIoTimeMs(absl::string_view direction, int64_t start_ns,
+                              int64_t end_ns) {
+  static_assert(std::atomic<int64_t>::is_always_lock_free);
+  static std::atomic<int64_t> write_busy_until_ns{
+      std::numeric_limits<int64_t>::min()};
+  static std::atomic<int64_t> read_busy_until_ns{
+      std::numeric_limits<int64_t>::min()};
+  std::atomic<int64_t>& busy_until_ns =
+      (direction == telemetry::metric_labels::kDirectionWrite)
+          ? write_busy_until_ns
+          : read_busy_until_ns;
+  int64_t prev_busy_ns = busy_until_ns.load(std::memory_order_relaxed);
+  while (end_ns > prev_busy_ns &&
+         !busy_until_ns.compare_exchange_weak(prev_busy_ns, end_ns,
+                                              std::memory_order_relaxed)) {
+  }
+  const int64_t effective_start_ns = std::max(start_ns, prev_busy_ns);
+  return std::max(0.0, static_cast<double>(end_ns - effective_start_ns) / 1e6);
+}
+
+void RecordStorageIoTimeMs(absl::Span<const std::string> shard_local_ranks,
+                           absl::string_view direction, int64_t start_ns) {
+  if (start_ns == std::numeric_limits<int64_t>::max() ||
+      shard_local_ranks.empty()) {
+    return;
+  }
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  const int64_t end_ns = SteadyClockNowNs();
+  const double io_time_ms = ComputeStorageIoTimeMs(direction, start_ns, end_ns);
+  for (absl::string_view local_rank : shard_local_ranks) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kLocalRank, local_rank},
+        {telemetry::metric_labels::kDirection, direction}};
+    store.ObserveHistogram(telemetry::metric_names::kStorageIoTimeMs, labels,
+                           io_time_ms);
+  }
+}
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
 // bytes transferred if telemetry is enabled.
 raiden::PjRtCopyFuture JoinAndRecordTelemetry(
@@ -366,6 +653,7 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
       futures.empty()) {
     return joined_future;
   }
+  MaybeUpdateHostMemoryBreakdownMetrics(manager, absl::ToUnixNanos(start_time));
 
   const size_t num_shards = manager.num_shards();
   const size_t start_shard = single_shard_idx.value_or(0);
@@ -1843,36 +2131,94 @@ size_t KVCacheManagerBase::block_bytes(size_t block_array_idx) const {
   return static_cast<size_t>(pools_[block_array_idx].block_stride_bytes);
 }
 
-uint8_t* KVCacheManagerBase::GetBlockArrayHostPointer(size_t block_array_idx,
-                                                      size_t shard_idx) {
+absl::StatusOr<size_t> KVCacheManagerBase::ResolveBlockArrayHostLayer(
+    size_t block_array_idx, uint64_t uuid) const {
   if (!explicit_pools_) {
-    // When fewer host buffers exist than layers, a layer's bytes sit in a
-    // leased buffer rather than at its own layer index.
-    if (layers_.size() < num_layers_) {
-      return nullptr;
+    if (block_array_idx >= num_layers_) {
+      return absl::OutOfRangeError(
+          absl::StrCat("block_array_idx ", block_array_idx,
+                       " out of range for num_layers ", num_layers_));
     }
-    return GetHostPointer(block_array_idx, shard_idx);
+    if (layers_.size() < num_layers_) {
+      if (uuid == 0) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Cannot resolve host layer for layer ", block_array_idx,
+            " without transfer uuid when num_host_layers (", layers_.size(),
+            ") < num_layers (", num_layers_, ")"));
+      }
+      ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                            GetSession(uuid));
+      if (session == nullptr) {
+        return absl::NotFoundError(
+            absl::StrCat("Null session for uuid ", uuid));
+      }
+      return session->ResolveStagingSlot(block_array_idx);
+    }
+    return block_array_idx;
   }
   if (block_array_idx >= pools_.size()) {
-    return nullptr;
+    return absl::OutOfRangeError(
+        absl::StrCat("block_array_idx ", block_array_idx,
+                     " out of range for num_pools ", pools_.size()));
   }
-  const PoolSpec& pool = pools_[block_array_idx];
-  uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
-  if (storage_base == nullptr) {
-    return nullptr;
+  size_t host_layer_idx = pools_[block_array_idx].storage_index;
+  if (uuid != 0) {
+    absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
+    if (!session.ok() && !absl::IsNotFound(session.status())) {
+      return session.status();
+    }
+    absl::StatusOr<size_t> slot =
+        absl::NotFoundError(absl::StrCat("Session not found for uuid ", uuid));
+    if (session.ok() && *session != nullptr) {
+      slot = (*session)->ResolveStagingSlot(block_array_idx);
+    }
+    if (slot.ok()) {
+      host_layer_idx = *slot;
+    } else if (!absl::IsNotFound(slot.status())) {
+      return slot.status();
+    } else if (layers_.size() < num_layers_) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("No staging slot leased for pool ", block_array_idx,
+                       " on uuid ", uuid, " when num_host_layers (",
+                       layers_.size(), ") < num_layers (", num_layers_, ")"));
+    }
+  } else if (layers_.size() < num_layers_) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Cannot resolve host layer for pool ", block_array_idx,
+                     " without transfer uuid when num_host_layers (",
+                     layers_.size(), ") < num_layers (", num_layers_, ")"));
   }
-  return storage_base + pool.base_offset_bytes;
+  return host_layer_idx;
 }
 
-size_t KVCacheManagerBase::GetBlockArrayHostSize(size_t block_array_idx,
-                                                 size_t shard_idx) {
+absl::StatusOr<absl::Span<const char>>
+KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
+                                          size_t shard_idx, uint64_t uuid) {
+  ABSL_ASSIGN_OR_RETURN(const size_t host_layer_idx,
+                        ResolveBlockArrayHostLayer(block_array_idx, uuid));
+  const uint8_t* storage_base = GetHostPointer(host_layer_idx, shard_idx);
   if (!explicit_pools_) {
-    return GetHostSize(block_array_idx, shard_idx);
-  }
-  if (block_array_idx >= pools_.size() || shard_idx >= num_shards_) {
-    return 0;
+    if (storage_base == nullptr) {
+      // Same contract as the delegate default: no flat host base.
+      return absl::Span<const char>();
+    }
+    return absl::Span<const char>(reinterpret_cast<const char*>(storage_base),
+                                  GetHostSize(host_layer_idx, shard_idx));
   }
   const PoolSpec& pool = pools_[block_array_idx];
+  if (shard_idx >= num_shards_) {
+    return absl::OutOfRangeError(
+        absl::StrCat("shard_idx ", shard_idx, " out of range for num_shards ",
+                     num_shards_, " on pool ", block_array_idx));
+  }
+  if (storage_base == nullptr) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("pool ", block_array_idx, " storage ", pool.storage_index,
+                     " host layer ", host_layer_idx, " shard ", shard_idx,
+                     " has no host buffer"));
+  }
+  const char* ptr =
+      reinterpret_cast<const char*>(storage_base) + pool.base_offset_bytes;
   const size_t base_offset = static_cast<size_t>(pool.base_offset_bytes);
   {
     // Bounded staging: the addressable host span is the whole arena (leased
@@ -1883,22 +2229,30 @@ size_t KVCacheManagerBase::GetBlockArrayHostSize(size_t block_array_idx,
       const PoolStagingStorage& st = pool_staging_[pool.storage_index];
       const uint64_t arena = static_cast<uint64_t>(st.num_slots) *
                              static_cast<uint64_t>(st.stride_bytes);
-      const size_t host_buffer_size =
-          layers_.size() == 0 ? 0 : layers_[0].shards[shard_idx].host_size;
+      const size_t host_buffer_size = GetHostSize(host_layer_idx, shard_idx);
       if (arena > host_buffer_size || base_offset > arena) {
-        return 0;
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Staging arena of pool ", block_array_idx, " (", arena,
+            " bytes, base_offset ", base_offset, ") does not fit host layer ",
+            host_layer_idx, " shard ", shard_idx, " (", host_buffer_size,
+            " bytes)"));
       }
-      return static_cast<size_t>(arena - base_offset);
+      return absl::Span<const char>(ptr,
+                                    static_cast<size_t>(arena - base_offset));
     }
   }
-  const size_t storage_size = GetHostSize(pool.storage_index, shard_idx);
+  const size_t storage_size = GetHostSize(host_layer_idx, shard_idx);
   const int64_t storage_end = pool.storage_extent_end_bytes();
   if (storage_end < pool.base_offset_bytes ||
       static_cast<uint64_t>(storage_end) > storage_size ||
       base_offset > storage_size) {
-    return 0;
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Storage extent [", pool.base_offset_bytes, ", ", storage_end,
+        ") of pool ", block_array_idx, " does not fit host layer ",
+        host_layer_idx, " shard ", shard_idx, " (", storage_size, " bytes)"));
   }
-  return static_cast<size_t>(storage_end - pool.base_offset_bytes);
+  return absl::Span<const char>(
+      ptr, static_cast<size_t>(storage_end - pool.base_offset_bytes));
 }
 
 int64_t KVCacheManagerBase::LayerBlockByteSize(size_t layer_idx) const {
@@ -2952,35 +3306,6 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
   return local_futures;
 }
 
-// A lease-authorised pull (kLeaseAuthorizedPullUuid) reads blocks this node
-// already published as host-resident: their device-to-host copy provably
-// completed before the lease was granted, and the pin keeps them from being
-// reused for the duration of the read, so it is never gated. A uuid with no
-// live session (e.g. a pull that did not identify itself) has no copy to wait
-// on either.
-void KVCacheManagerBase::RegisterBlockReadinessCallback(
-    size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-    transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
-  if (block_id < 0 || uuid == kLeaseAuthorizedPullUuid) {
-    cb(absl::OkStatus());
-    return;
-  }
-  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
-  if (absl::IsNotFound(session.status())) {
-    cb(absl::OkStatus());
-    return;
-  }
-  if (!session.ok()) {
-    cb(session.status());
-    return;
-  }
-  if ((*session)->Done()) {
-    cb(absl::OkStatus());
-    return;
-  }
-  (*session)->GetDataReadyFuture(layer_idx).OnReady(std::move(cb));
-}
-
 // The transport's block report carries no unit index, and sessions ignore the
 // index of a block report, so 0 is passed. A uuid with no session (e.g. uuid 0
 // or a planless push) has no blocks to account here.
@@ -3014,20 +3339,6 @@ absl::Status KVCacheManagerBase::OnLayerReceived(size_t layer_idx,
   }
   ABSL_RETURN_IF_ERROR(session.status());
   return (*session)->OnDataReceived(layer_idx, /*minor_dimension_indices=*/{},
-                                    /*shard_ids=*/{});
-}
-
-// A pool completion always belongs to an armed receiver, so a uuid with no
-// session fails with kNotFound.
-absl::Status KVCacheManagerBase::OnPoolReceived(size_t pool_idx,
-                                                uint64_t uuid) {
-  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
-  if (absl::IsNotFound(session.status())) {
-    return absl::NotFoundError(
-        absl::StrCat("no active receiver for UUID ", uuid));
-  }
-  ABSL_RETURN_IF_ERROR(session.status());
-  return (*session)->OnDataReceived(pool_idx, /*minor_dimension_indices=*/{},
                                     /*shard_ids=*/{});
 }
 
@@ -3116,6 +3427,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
   // inside its storage. Otherwise the legacy uniform layer addressing applies.
   size_t block_size_bytes = block_bytes(layer_idx);
   uint8_t* base_host_ptr = nullptr;
+  uint8_t* storage_base = nullptr;
   // Bounded host staging: on a bounded
   // storage a block's host bytes live in the slot leased to this uuid, not at
   // block_id * stride. `staging_lease` is the snapshot used below; null means
@@ -3148,7 +3460,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     } else if (layers_.size() < num_layers_) {
       return {};
     }
-    uint8_t* storage_base = GetHostPointer(host_layer_idx, shard_idx);
+    storage_base = GetHostPointer(host_layer_idx, shard_idx);
     if (storage_base == nullptr) {
       return {};
     }
@@ -3207,8 +3519,6 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
         auto extents_status = ComputePoolBlockCopyExtents(
             pool, absl::MakeConstSpan(&block_id, 1));
         if (!extents_status.ok()) return {};
-        uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
-        if (storage_base == nullptr) return {};
         for (const PoolBlockCopyExtent& extent : *extents_status) {
           if (accumulated_bytes >= total_bytes) break;
           const size_t size = std::min(static_cast<size_t>(extent.size_bytes),
@@ -3375,6 +3685,8 @@ void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
       telemetry::metric_names::kBufferAllocatedBytes, {},
       static_cast<double>(total_host_dram));
+  UpdateHostMemoryBreakdownMetrics(*this, total_host_dram);
+  MaybeRecordHostNumaMemoryMetrics(*this);
 }
 
 std::shared_ptr<backends::KVBackend> KVCacheManagerBase::GetKVBackend(
@@ -3530,6 +3842,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
           const uint64_t bytes_per_shard =
               num_shards_ > 0 ? static_cast<uint64_t>(total_bytes / num_shards_)
                               : 0;
+          state->RecordStorageIoStart(SteadyClockNowNs());
           backend->WriteAsync(
               key, slices, total_bytes,
               [state, bytes_per_shard](absl::Status s) {
@@ -3538,6 +3851,12 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
                 } else {
                   state->completed_bytes_per_shard.fetch_add(
                       bytes_per_shard, std::memory_order_relaxed);
+                  if (state->MarkStorageIoChunkComplete()) {
+                    RecordStorageIoTimeMs(
+                        state->shard_local_ranks,
+                        telemetry::metric_labels::kDirectionWrite,
+                        state->StorageIoStartNs());
+                  }
                 }
                 state->MarkChunkComplete();
               });
@@ -3581,6 +3900,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
   auto [promise, aggregate_future] = xla::MakePromise();
   auto state = std::make_shared<TransferPipelinedState>(
       num_chunks, std::move(promise), /*holds=*/raiden::BufferHolders{});
+
+  if (telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    state->RecordStorageIoStart(SteadyClockNowNs());
+  }
   state->shard_local_ranks = GetActiveShardLocalRanks(*this);
   state->storage_direction = telemetry::metric_labels::kDirectionRead;
 
@@ -3609,6 +3932,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
           }
           state->completed_bytes_per_shard.fetch_add(
               bytes_per_shard, std::memory_order_relaxed);
+          if (state->MarkStorageIoChunkComplete()) {
+            RecordStorageIoTimeMs(state->shard_local_ranks,
+                                  telemetry::metric_labels::kDirectionRead,
+                                  state->StorageIoStartNs());
+          }
           auto h2d_fut_or = H2d({staging_block_idx}, {device_block_idx}, {1});
           if (!h2d_fut_or.ok()) {
             state->SetError(h2d_fut_or.status());

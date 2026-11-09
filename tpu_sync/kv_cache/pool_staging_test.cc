@@ -17,6 +17,7 @@
 // full-mirror fallbacks. Host-only manager with device-backed storages declared
 // via physical sizes (no TPU needed).
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -48,6 +49,7 @@ namespace kv_cache {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 
 class StagingTestManager : public KVCacheManagerBase {
  public:
@@ -150,6 +152,97 @@ PoolSpec StridedPool(const std::string& tag, size_t storage_index,
   };
 }
 
+TEST(PoolStagingTest, BlockArrayHostSpanRejectsShardPastNumShards) {
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 4;
+  StagingTestManager manager(/*num_layers=*/1, /*num_shards=*/2,
+                             /*slice_byte_size=*/kStride,
+                             /*host_blocks=*/kNumBlocks);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "fa", /*storage_index=*/0, /*base_offset=*/0, kStride, kNumBlocks,
+      /*staging_blocks_per_request=*/0)}));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      const absl::Span<const char> last_shard_span,
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/1));
+  EXPECT_EQ(last_shard_span.data(),
+            reinterpret_cast<const char*>(manager.GetHostPointer(0, 1)));
+  EXPECT_EQ(last_shard_span.size(), static_cast<size_t>(kStride * kNumBlocks));
+  EXPECT_THAT(
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/2),
+      StatusIs(absl::StatusCode::kOutOfRange,
+               HasSubstr("shard_idx 2 out of range for num_shards 2")));
+}
+
+TEST(PoolStagingTest, BlockArrayHostSpanRejectsPoolStorageWithoutHostBuffer) {
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 4;
+  StagingTestManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/kStride,
+                             /*host_blocks=*/kNumBlocks);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "fa", /*storage_index=*/0, /*base_offset=*/0, kStride, kNumBlocks,
+      /*staging_blocks_per_request=*/0)}));
+  ABSL_ASSERT_OK(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0));
+
+  manager.SetExternalHostPointers({nullptr}, {kStride * kNumBlocks});
+
+  EXPECT_THAT(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("pool 0 storage 0 host layer 0 shard 0 has "
+                                 "no host buffer")));
+}
+
+TEST(PoolStagingTest, BlockArrayHostSpanRejectsStorageExtentPastHostBuffer) {
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 4;
+  StagingTestManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/kStride,
+                             /*host_blocks=*/kNumBlocks);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "fa", /*storage_index=*/0, /*base_offset=*/0, kStride, kNumBlocks,
+      /*staging_blocks_per_request=*/0)}));
+  ABSL_ASSERT_OK(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0));
+
+  // One byte short of the pool's 256-byte storage extent.
+  std::vector<uint8_t> short_host_buffer(kStride * kNumBlocks - 1);
+  manager.SetExternalHostPointers({short_host_buffer.data()},
+                                  {short_host_buffer.size()});
+
+  EXPECT_THAT(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("Storage extent [0, 256) of pool 0 does not "
+                                 "fit host layer 0 shard 0 (255 bytes)")));
+}
+
+TEST(PoolStagingTest, BlockArrayHostSpanRejectsStagingArenaPastHostBuffer) {
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 16;
+  WithPlanSessions<StagingTestManager> manager_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& manager = manager_host.manager();
+  manager.SetDeviceBacked(0, kStride * kNumBlocks);
+  // 2 leases x 2 blocks per lease = a 4-slot (256-byte) arena.
+  ABSL_ASSERT_OK(
+      manager.RegisterPools({DensePool("fa", 0, 0, kStride, kNumBlocks,
+                                       /*staging_blocks_per_request=*/2)},
+                            /*staging_leases=*/2));
+  ASSERT_TRUE(manager.PoolStorageStagingBounded(0));
+  ABSL_ASSERT_OK(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0));
+
+  // One byte short of the arena.
+  std::vector<uint8_t> short_host_buffer(4 * kStride - 1);
+  manager.SetExternalHostPointers({short_host_buffer.data()},
+                                  {short_host_buffer.size()});
+
+  EXPECT_THAT(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("Staging arena of pool 0 (256 bytes, "
+                                 "base_offset 0) does not fit host layer 0 "
+                                 "shard 0 (255 bytes)")));
+}
+
 TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   constexpr int64_t kStride = 64;
   constexpr int64_t kNumBlocks = 16;
@@ -175,8 +268,9 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   EXPECT_EQ(summary[0].blocks_per_lease, 2);
   EXPECT_EQ(summary[0].free_slots, 4);
   // The transport's bounds span is the whole arena.
-  EXPECT_EQ(manager.GetBlockArrayHostSize(/*block_array_idx=*/0, 0),
-            static_cast<size_t>(4 * kStride));
+  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> arena_span,
+                       manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0));
+  EXPECT_EQ(arena_span.size(), static_cast<size_t>(4 * kStride));
 
   // No standing host residency on a bounded storage.
   EXPECT_THAT(manager.GetPoolBlockRef(0, 0, 5),
@@ -598,8 +692,9 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   ABSL_ASSERT_OK(manager.RegisterPools(pools, /*staging_leases=*/2));
 
   for (size_t i = 0; i < kNumLayers; ++i) {
-    EXPECT_EQ(manager.GetBlockArrayHostSize(i, 0),
-              static_cast<size_t>(4 * kStride));
+    EXPECT_THAT(manager.GetBlockArrayHostSpan(i, 0),
+                StatusIs(absl::StatusCode::kFailedPrecondition,
+                         HasSubstr("without transfer uuid")));
   }
 
   // Receiver plan for uuid 42.
@@ -646,6 +741,9 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
       return plan_;
     }
+    std::chrono::steady_clock::time_point deadline() const override {
+      return std::chrono::steady_clock::time_point::max();
+    }
 
    private:
     std::shared_ptr<const TransferPlan> plan_;
@@ -671,8 +769,100 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   EXPECT_EQ(chunks[0].size, 16u);
   uint8_t* expected_host_base = manager.GetHostPointer(/*layer_idx=*/1, 0);
   EXPECT_EQ(chunks[0].ptr, expected_host_base + 1 * kStride);
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> span,
+                         manager.GetBlockArrayHostSpan(i, 0, /*uuid=*/42));
+    EXPECT_EQ(span.data(),
+              reinterpret_cast<const char*>(manager.GetHostPointer(i % 2, 0)));
+    EXPECT_EQ(span.size(), static_cast<size_t>(4 * kStride));
+  }
+  TF_ASSERT_OK_AND_ASSIGN(
+      const absl::Span<const char> span3,
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/42));
+  const char* chunk_begin = reinterpret_cast<const char*>(chunks[0].ptr);
+  ASSERT_EQ(span3.data(), reinterpret_cast<const char*>(expected_host_base));
+  EXPECT_EQ(span3.size(), static_cast<size_t>(4 * kStride));
+  EXPECT_GE(chunk_begin, span3.data());
+  EXPECT_LE(chunk_begin + chunks[0].size, span3.data() + span3.size());
 
   manager.ReleasePoolStagingLeases(42);
+}
+
+TEST(PoolStagingTest, BoundedHostLayersUnboundedPoolBlocksHostPointerAndSize) {
+  constexpr int64_t kBaseOffset = 32;
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 8;
+  constexpr size_t kNumLayers = 4;
+  StagingTestManager manager(
+      /*num_layers=*/kNumLayers, /*num_shards=*/1,
+      /*slice_byte_size=*/kBaseOffset + kStride * kNumBlocks,
+      /*host_blocks=*/1, /*num_staging_layers=*/2);
+
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    manager.SetDeviceBacked(i, kBaseOffset + kStride * kNumBlocks);
+  }
+
+  std::vector<PoolSpec> pools;
+  pools.reserve(kNumLayers);
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    pools.push_back(DensePool("pool_" + std::to_string(i), /*storage_index=*/i,
+                              kBaseOffset, kStride, kNumBlocks,
+                              /*staging_blocks_per_request=*/0));
+  }
+  ABSL_ASSERT_OK(manager.RegisterPools(pools, /*staging_leases=*/0));
+  ASSERT_FALSE(manager.PoolStorageStagingBounded(3));
+
+  class StubPoolTransferSession : public TransferSession {
+   public:
+    absl::Status Start() override { return absl::OkStatus(); }
+    bool Done() const override { return false; }
+    void Finish(const absl::Status& status) override {}
+    bool TryBeginOp() override { return true; }
+    void EndOp() override {}
+    absl::Status GetStatus() const override { return absl::OkStatus(); }
+    absl::Status AwaitForDone() override { return absl::OkStatus(); }
+    bool IsDraining() const override { return false; }
+    absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+      return unit % 2;
+    }
+    absl::Status OnDataReceived(size_t major_dimension_idx,
+                                absl::Span<const int> minor_dimension_indices,
+                                absl::Span<const int> shard_ids) override {
+      return absl::OkStatus();
+    }
+    tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+      return tsl::Future<>(absl::OkStatus());
+    }
+    absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+      return absl::nullopt;
+    }
+    std::chrono::steady_clock::time_point deadline() const override {
+      return std::chrono::steady_clock::time_point::max();
+    }
+  };
+  auto session = std::make_shared<StubPoolTransferSession>();
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session =
+      [session](
+          uint64_t uuid) -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+    if (uuid == 42) {
+      return session;
+    }
+    return absl::NotFoundError("no session");
+  };
+  manager.SetTransferEventHooks(std::move(hooks));
+
+  EXPECT_THAT(
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/0),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               HasSubstr("without transfer uuid")));
+  uint8_t* expected_base = manager.GetHostPointer(/*layer_idx=*/1, 0) +
+                           static_cast<size_t>(kBaseOffset);
+  TF_ASSERT_OK_AND_ASSIGN(
+      const absl::Span<const char> leased_span,
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/42));
+  EXPECT_EQ(leased_span.data(), reinterpret_cast<const char*>(expected_base));
+  EXPECT_EQ(leased_span.size(), static_cast<size_t>(kStride * kNumBlocks));
 }
 
 TEST(PoolStagingTest, GetBlockChunksLargePlanLinearScaling) {

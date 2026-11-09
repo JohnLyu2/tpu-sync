@@ -61,6 +61,8 @@ check_disk_space "/tmp" "Temporary Directory (/tmp)"
 # the --override_module flags that name them.
 # shellcheck source=tools/jax/module_overrides.sh
 source "${WORKSPACE_DIR}/tools/jax/module_overrides.sh"
+# shellcheck source=tools/stage_artifacts_utils.sh
+source "${WORKSPACE_DIR}/tools/stage_artifacts_utils.sh"
 
 echo "=== Navigating to workspace directory ==="
 cd "${WORKSPACE_DIR}"
@@ -86,6 +88,8 @@ fi
 # Default behavior based on auto-detection
 BUILD_JAX=true
 BUILD_TORCH=true
+SKIP_SERVER_BINARIES=false
+SKIP_PIP_INSTALL=false
 
 
 # Parse command line arguments
@@ -110,11 +114,26 @@ if [ "$#" -gt 0 ]; then
       # Standard Bazel/environment flags: keep defaults and do not shift.
       ;;
     *)
-      echo "Usage: $0 [jax|torch|both] [bazel_flags...]"
+      echo "Usage: $0 [jax|torch|both] [--skip-server-binaries] [--skip-pip-install] [bazel_flags...]"
       exit 1
       ;;
   esac
 fi
+
+BAZEL_EXTRA_ARGS=()
+for arg in "$@"; do
+  case "${arg}" in
+    --skip-server-binaries|--skip-servers|--only-extensions)
+      SKIP_SERVER_BINARIES=true
+      ;;
+    --skip-pip-install|--skip-pip)
+      SKIP_PIP_INSTALL=true
+      ;;
+    *)
+      BAZEL_EXTRA_ARGS+=("${arg}")
+      ;;
+  esac
+done
 
 if [ "${BUILD_TORCH}" = true ]; then
   # Ensure clang-18 is installed on the host (required for PyTorch C++ extensions)
@@ -137,18 +156,12 @@ if [ "${BUILD_TORCH}" = true ]; then
   fi
 fi
 
-BAZEL_TARGETS=(
-  "//tpu_sync/rpc:raiden_service_py_pb2"
-  "//tpu_sync/rpc:coordination_py_pb2"
-  "//tpu_sync/proto:control_pipe_py_pb2"
-  "//tpu_sync/proto:control_pipe_py_pb2_grpc"
-  "//tpu_sync/rpc:coordination_py_pb2_grpc"
-  "//tpu_sync/rpc:controller_service_py_pb2"
+BAZEL_TARGETS=("${RAIDEN_PROTO_BAZEL_TARGETS[@]}")
+if [ "${SKIP_SERVER_BINARIES}" = false ]; then
   # C++ control-plane service binaries. These do not depend on JAX or Torch,
-  # so they are always built.
-  "//tpu_sync/kv_cache/global_registry:global_registry_server"
-  "//tpu_sync/store_node:kv_cache_host_store_node_main"
-)
+  # so they are built unless --skip-server-binaries (or --skip-servers) is requested.
+  BAZEL_TARGETS+=("${RAIDEN_SERVER_BAZEL_TARGETS[@]}")
+fi
 DEFINE_FLAGS=" --define raiden_wheel_build=true"
 BAZEL_MODULE_FLAGS=()
 TORCH_REPO_ENV_FLAGS=()
@@ -156,10 +169,7 @@ VISIBILITY_FLAGS=()
 
 if [ "$BUILD_JAX" = true ]; then
   echo "Configuring build for JAX..."
-  BAZEL_TARGETS+=(
-    "//tpu_sync/frameworks/jax:_tpu_raiden_jax"
-    "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi"
-  )
+  BAZEL_TARGETS+=("${RAIDEN_JAX_EXTENSION_BAZEL_TARGETS[@]}")
 else
   DEFINE_FLAGS+=" --define with_jax=false"
 fi
@@ -383,38 +393,18 @@ printf 'module override: %s\n' "${BAZEL_MODULE_FLAGS[@]#--override_module=}"
   ${DEFINE_FLAGS} \
   --disk_cache=${BAZEL_DISK_CACHE} \
   --repository_cache=${BAZEL_REPO_CACHE} \
-  "$@"
+  "${BAZEL_EXTRA_ARGS[@]}"
 
 
-echo "=== Copying generated protobuf Python modules ==="
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/raiden_service_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/coordination_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/coordination_pb2_grpc.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/controller_service_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2_grpc.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
+raiden_stage_proto_artifacts "${WORKSPACE_DIR}"
 
-echo "=== Linking C++ control-plane service binaries into source tree ==="
-# The KVCacheStore tests (kv_cache_store_test.py / kv_cache_store_e2e_test.py)
-# launch these binaries from their SOURCE-tree path, but Bazel emits them under
-# bazel-bin/. Symlink them so a fresh checkout can run the tests without extra
-# steps.
-link_service_binary() {
-  local rel="$1"
-  local src="${WORKSPACE_DIR}/bazel-bin/${rel}"
-  local dst="${WORKSPACE_DIR}/${rel}"
-  if [ -e "${src}" ]; then
-    ln -sf "${src}" "${dst}"
-  fi
-}
-link_service_binary "tpu_sync/kv_cache/global_registry/global_registry_server"
-link_service_binary "tpu_sync/store_node/kv_cache_host_store_node_main"
+if [ "${SKIP_SERVER_BINARIES}" = false ]; then
+  raiden_stage_server_binaries "${WORKSPACE_DIR}"
+fi
 
 echo "=== Copying compiled shared libraries to source directory ==="
 if [ "$BUILD_JAX" = true ]; then
-  echo "Copying JAX artifacts..."
-  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
-  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
+  raiden_stage_jax_artifacts "${WORKSPACE_DIR}"
 fi
 
 if [ "${BUILD_TORCH}" = true ]; then
@@ -457,28 +447,32 @@ if [ "$BUILD_TORCH" = true ]; then
   echo "Torch Artifacts are located in: ${WORKSPACE_DIR}/tpu_sync/frameworks/torch/"
 fi
 
-echo "=== Install Python Dependencies! ==="
-echo "Using Python interpreter: $(which python3) ($(python3 --version))"
-REQUIREMENTS_FILE="${WORKSPACE_DIR}/requirements.txt"
-if [ "$BUILD_JAX" = true ]; then
-  # The built version's requirements, not the top-level file as written. A
-  # 0.10.x build that installed the default version's jax would leave a .so
-  # compiled against one jaxlib's headers and loaded against another's ABI.
-  # That does not fail; it corrupts. The version supplies only the three specs
-  # that move with jax. Everything else comes from the top-level file, so a
-  # dependency added there reaches every version.
-  #
-  # For the default version this renders the top-level file unchanged, which
-  # check_jax_deps.sh is what guarantees. A torch-only build installs that file
-  # directly, exactly as it did before versions were selectable.
-  RENDERED_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/raiden_requirements.XXXXXX")"
-  trap 'rm -f "${RENDERED_REQUIREMENTS}"' EXIT
-  raiden_jax_render_requirements "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION}" \
-    "${RENDERED_REQUIREMENTS}"
-  REQUIREMENTS_FILE="${RENDERED_REQUIREMENTS}"
-  echo "Installing requirements for JAX ${RAIDEN_JAX_VERSION}:"
-  grep -E '^(jax|jaxlib|libtpu)==' "${REQUIREMENTS_FILE}" | sed 's/^/  /'
-fi
-python3 -m pip install --index-url=https://pypi.org/simple -r "${REQUIREMENTS_FILE}" || echo "Warning: pip installation returned a non-zero status. Proceeding anyway."
+if [ "${SKIP_PIP_INSTALL}" = true ]; then
+  echo "=== Skipping Python dependency installation (--skip-pip-install) ==="
+else
+  echo "=== Install Python Dependencies! ==="
+  echo "Using Python interpreter: $(which python3) ($(python3 --version))"
+  REQUIREMENTS_FILE="${WORKSPACE_DIR}/requirements.txt"
+  if [ "$BUILD_JAX" = true ]; then
+    # The built version's requirements, not the top-level file as written. A
+    # 0.10.x build that installed the default version's jax would leave a .so
+    # compiled against one jaxlib's headers and loaded against another's ABI.
+    # That does not fail; it corrupts. The version supplies only the three specs
+    # that move with jax. Everything else comes from the top-level file, so a
+    # dependency added there reaches every version.
+    #
+    # For the default version this renders the top-level file unchanged, which
+    # check_jax_deps.sh is what guarantees. A torch-only build installs that file
+    # directly, exactly as it did before versions were selectable.
+    RENDERED_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/raiden_requirements.XXXXXX")"
+    trap 'rm -f "${RENDERED_REQUIREMENTS}"' EXIT
+    raiden_jax_render_requirements "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION}" \
+      "${RENDERED_REQUIREMENTS}"
+    REQUIREMENTS_FILE="${RENDERED_REQUIREMENTS}"
+    echo "Installing requirements for JAX ${RAIDEN_JAX_VERSION}:"
+    grep -E '^(jax|jaxlib|libtpu)==' "${REQUIREMENTS_FILE}" | sed 's/^/  /'
+  fi
+  python3 -m pip install --index-url=https://pypi.org/simple -r "${REQUIREMENTS_FILE}" || echo "Warning: pip installation returned a non-zero status. Proceeding anyway."
 
-echo "=== Installation Complete! ==="
+  echo "=== Installation Complete! ==="
+fi

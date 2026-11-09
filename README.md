@@ -17,8 +17,8 @@
 > TPU Raiden codebase has graduated into TPU Sync.
 
 > [!IMPORTANT]
-> TPU Sync is currently under active development and is not yet recommended for general use.
-> If you are interested in adopting this library, please reach out to the owners first to discuss compatibility, or proceed at your own risk.
+> TPU Sync is under active development and its APIs are evolving rapidly. For stable deployments, we recommend pinning to a tagged release or the verified commit in [`lkg.version`](lkg.version) rather than tracking `main` directly.
+> If you are integrating TPU Sync into a custom serving or RL stack, feel free to open a GitHub issue to discuss compatibility and workload requirements with the maintainers.
 
 ## 🚀 What is TPU Sync?
 
@@ -58,7 +58,7 @@ TPU Sync is actively validated and optimized for the following accelerator gener
 
 ### Supported JAX versions
 
-tpu-raiden builds against one JAX version at a time, chosen at build time (defaults to 0.11.2). All
+TPU Sync builds against one JAX version at a time, chosen at build time (defaults to 0.11.2). All
 seven are validated the same way: the extension builds, `raw_transfer_test`
 passes, and the full `run_tests.sh jax` suite passes on TPU.
 
@@ -84,7 +84,7 @@ top-level `requirements.txt` with `jax`, `jaxlib` and `libtpu` swapped for the
 version's -- so the environment matches what the extension was compiled
 against, and the tests then run against whatever the build left behind.
 
-That matching is not cosmetic. raiden's extension and jaxlib load into the same
+That matching is not cosmetic. TPU Sync's extension and jaxlib load into the same
 process, and an XLA or abseil that disagrees with the installed jaxlib does not
 fail to compile -- it crashes at run time, usually far from the cause. `pip`
 installs into whatever `python3` resolves to, so activate the environment you
@@ -146,38 +146,42 @@ sudo apt-get install -y patchelf
 
 ###  Installing or Building `tpu_sync`
 
-#### Option 1: Direct installation from Google Artifact Registry
+#### Option 1: Install from PyPI
 
-> [!NOTE]
-> The pre-built `tpu_sync` wheel will be available on PyPI to the public shortly.
+Pre-built wheels are published to PyPI as
+[`tpu-sync-jax`](https://pypi.org/project/tpu-sync-jax/) and
+[`tpu-sync-torch`](https://pypi.org/project/tpu-sync-torch/). Until the first
+stable release is cut, only `.dev` nightlies exist, so pass `--pre`:
 
-You can install the pre-built `tpu_sync` wheel directly from our Google Artifact Registry:
+* For JAX version (self-contained; pulls the pinned `jax`/`jaxlib`/`libtpu` stack):
 
-1. Install the Artifact Registry keyring helper to enable authenticated pip downloads:
-   ```bash
-   pip install keyrings.google-artifactregistry-auth
-   ```
-2. Install the framework-specific wheel:
+  ```bash
+  pip install --pre tpu-sync-jax
+  ```
+* For PyTorch version:
 
-   * For JAX version:
+  ```bash
+  pip install --pre tpu-sync-torch
+  ```
+  > [!IMPORTANT]
+  > Unlike the JAX wheel, the torch wheel does not pull `torch` or `torch_tpu`
+  > (they are not on a public index). Install a matching `torch_tpu` and its exact
+  > `torch` pin (e.g. `torch==2.11.0`) first — the TPU Sync torch extension is
+  > ABI-locked to the `torch`/`torch_tpu` build it was compiled against. See
+  > [RELEASING.md](RELEASING.md#the-torch_tpu-pairing) for the `torch_tpu`
+  > registry and the version paired with each release.
 
-     ```bash
-     pip install tpu-raiden-jax --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/
-     ```
-   * For PyTorch version:
+  > [!NOTE]
+  > The torch wheel's release process is not yet gated on end-to-end
+  > performance tests (the torch path is still maturing).
 
-     ```bash
-     pip install tpu-raiden-torch --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/
-     ```
-     > [!IMPORTANT]
-     > Unlike the JAX wheel, the torch wheel does not pull `torch` or `torch_tpu`
-     > (they are not on a public index). Install a matching `torch_tpu` and its exact
-     > `torch` pin (e.g. `torch==2.11.0`) first — the raiden torch extension is
-     > ABI-locked to the `torch`/`torch_tpu` build it was compiled against.
-
-     > [!NOTE]
-     > The torch wheel's release process is not yet gated on end-to-end
-     > performance tests (the torch path is still maturing).
+> [!WARNING]
+> The former distribution names `tpu-raiden-jax` and `tpu-raiden-torch` are
+> retired and are **not** controlled by this project on PyPI. Do not install
+> them. Do not combine a PyPI install with `--extra-index-url` pointing at a
+> private registry: pip resolves across all configured indexes and will pick
+> the highest version from any of them, which enables dependency-confusion
+> attacks.
 
 #### Option 2: Building from source
 

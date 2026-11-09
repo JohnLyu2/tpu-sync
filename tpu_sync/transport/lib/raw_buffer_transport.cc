@@ -49,6 +49,7 @@
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -60,27 +61,22 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/conn_pool.h"
+#include "peregrine/src/api/v1/histogram.h"
+#include "peregrine/src/api/v1/ip_util.h"
+#include "peregrine/src/api/v1/psp/psp.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
-#include "tpu_sync/transport/buffer_push_task.h"
-
-#ifndef IOV_MAX
-#define IOV_MAX 1024
-#endif
-#include "absl/status/status_macros.h"
-#include "peregrine/src/api/v1/conn_pool.h"
-#include "peregrine/src/api/v1/histogram.h"
-#include "peregrine/src/api/v1/ip_util.h"
-#include "peregrine/src/api/v1/rate_limiter.h"
-#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 
 namespace tpu_raiden::transport::lib {
@@ -88,6 +84,9 @@ namespace tpu_raiden::transport::lib {
 using ::peregrine::v1::GetAddrPortPair;
 using ::peregrine::v1::Histogram;
 using ::peregrine::v1::IsEnvVarEnabled;
+using ::peregrine::v1::IsPspEnabled;
+using ::peregrine::v1::PspRegisterPeer;
+using ::peregrine::v1::PspToken;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
 using ::peregrine::v1::SourceIpRoutesToPeer;
@@ -292,7 +291,7 @@ RawBufferTransport::RawBufferTransport(
       bound_ip_(local_ips.empty() ? "127.0.0.1" : local_ips[0]),
       local_ips_(local_ips),
       local_port_(local_port),
-      require_psp_tcp_(absl::GetFlag(FLAGS_require_psp_tcp)),
+      require_psp_tcp_(absl::GetFlag(FLAGS_peregrine_enable_psp_tcp)),
       pin_recv_threads_to_nic_numa_(PinRecvThreadsToNicNumaEnabled()),
       server_fd_(-1),
       stopping_(false),
@@ -495,6 +494,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
   } else if (header.op == kOpBufferPushBatched) {  // peer batched push request
     const uint32_t batch_size = header.count_or_size;
+    static_assert(IOV_MAX == 1024);
     if (batch_size > IOV_MAX) {
       return absl::InvalidArgumentError(absl::StrCat(
           "Batch size ", batch_size, " exceeds IOV_MAX (", IOV_MAX, ")"));
@@ -759,7 +759,7 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
   close(client_fd);
 }
 
-absl::StatusOr<PspPeerKey> RawBufferTransport::RegisterPspPeer(
+absl::StatusOr<PspToken> RawBufferTransport::RegisterPspPeer(
     uint32_t client_spi, absl::string_view client_key,
     absl::string_view peer_target) {
   if (!require_psp_tcp_) {
@@ -772,7 +772,7 @@ absl::StatusOr<PspPeerKey> RawBufferTransport::RegisterPspPeer(
         "Transport is stopping or listening socket is not initialized.");
   }
 
-  return RegisterPspPeerKey(server_fd_, client_spi, client_key, peer_target);
+  return PspRegisterPeer(server_fd_, client_spi, client_key, peer_target);
 }
 
 void RawBufferTransport::ListenerLoop() {
@@ -810,7 +810,7 @@ void RawBufferTransport::ListenerLoop() {
         }
         break;
       }
-      if (require_psp_tcp_ && !PspEnabled(client_fd)) {
+      if (require_psp_tcp_ && !IsPspEnabled(client_fd)) {
         close(client_fd);
         LOG_EVERY_N_SEC(ERROR, 1)
             << "Unencrypted TCP connection rejected on PSP listener";

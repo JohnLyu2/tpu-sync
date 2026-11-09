@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>  // NOLINT
 #include <cstddef>
@@ -28,6 +30,7 @@
 #include <string>
 #include <system_error>
 #include <thread>  // NOLINT(build/c++11)
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -448,7 +451,11 @@ TEST(KVCacheManagerTest,
                                              /*pool_idx=*/0, /*shard_idx=*/0,
                                              /*block_id=*/1));
   EXPECT_EQ(last_ref.ptr, src + 160);
-  EXPECT_EQ(sender.GetBlockArrayHostSize(/*pool_idx=*/0, /*shard_idx=*/0), 224);
+  TF_ASSERT_OK_AND_ASSIGN(
+      const absl::Span<const char> pool_span,
+      sender.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0));
+  EXPECT_EQ(pool_span.data(), reinterpret_cast<const char*>(src + 32));
+  EXPECT_EQ(pool_span.size(), 224);
 
   const std::optional<int> receiver_port = receiver.local_port();
   ASSERT_TRUE(receiver_port.has_value());
@@ -1786,6 +1793,16 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetry) {
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
                testing::IsEmpty(), testing::DoubleEq(2048.0)))
       .Times(testing::AtLeast(1));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::Ge(0.0)))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
 
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
                              /*slice_byte_size=*/128,
@@ -1799,12 +1816,23 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
 
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::Ge(0.0)))
+      .Times(testing::AnyNumber());
+
   // Initial gauge set in constructor (2 * 2 * 4 * 128 = 2048 bytes).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
                testing::IsEmpty(), testing::DoubleEq(2048.0)))
       .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
 
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
                              /*slice_byte_size=*/128,
@@ -1835,6 +1863,272 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
                testing::IsEmpty(), testing::DoubleEq(4096.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
+}
+
+auto HostMemoryComponentLabel(absl::string_view component) {
+  return testing::ElementsAre(testing::FieldsAre(
+      telemetry::metric_labels::kComponent, std::string(component)));
+}
+
+// Points `host_memory_breakdown_bytes` telemetry at `meminfo_path` instead of
+// `/proc/meminfo`. Overriding the path is allowed only in tests.
+class FakeMeminfoKVCacheManager : public TestKVCacheManager {
+ public:
+  FakeMeminfoKVCacheManager(size_t num_layers, size_t num_shards,
+                            size_t slice_byte_size, int host_blocks,
+                            std::string meminfo_path)
+      : TestKVCacheManager(num_layers, num_shards, slice_byte_size,
+                           host_blocks) {
+    proc_meminfo_path_ = std::move(meminfo_path);
+  }
+};
+
+// Writes `content` to a fresh file under the test temp directory and returns
+// its path.
+std::string WriteFakeMeminfo(absl::string_view name,
+                             absl::string_view content) {
+  const std::string path =
+      absl::StrCat(testing::TempDir(), "/", name, "_", getpid());
+  std::ofstream(path) << content;
+  return path;
+}
+
+constexpr absl::string_view kFakeProcMeminfo = R"(MemTotal:       16384000 kB
+MemFree:         4096000 kB
+Buffers:          512000 kB
+Cached:          2048000 kB
+AnonPages:       3072000 kB
+)";
+
+TEST(KVCacheManagerTest, AllocatedOccupancyMetricEmitsHostMemoryBreakdown) {
+  ScopedUnsetLocalRank unset_local_rank;
+  FakeMeminfoKVCacheManager manager(
+      /*num_layers=*/2, /*num_shards=*/2, /*slice_byte_size=*/128,
+      /*host_blocks=*/4, WriteFakeMeminfo("meminfo_rank0", kFakeProcMeminfo));
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(2048.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentKvPool),
+                       testing::DoubleEq(2048.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentProcessHeap),
+                       testing::DoubleEq(3072000.0 * 1024 - 2048)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentPageCache),
+                       testing::DoubleEq((512000.0 + 2048000.0) * 1024)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentFree),
+                       testing::DoubleEq(4096000.0 * 1024)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedWhenMeminfoMissing) {
+  ScopedUnsetLocalRank unset_local_rank;
+  FakeMeminfoKVCacheManager manager(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4,
+      absl::StrCat(testing::TempDir(), "/missing_meminfo_", getpid()));
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(512.0)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::_))
+      .Times(0);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedOnNonZeroLocalRank) {
+  ScopedUnsetLocalRank restore_local_rank;
+  setenv(telemetry::kLocalRankEnvVar, "1", 1);
+
+  FakeMeminfoKVCacheManager worker1_mgr(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4, WriteFakeMeminfo("meminfo_rank1", kFakeProcMeminfo));
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(512.0)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::_))
+      .Times(0);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(0);
+
+  worker1_mgr.UpdateAllocatedOccupancyMetric();
+}
+
+// Builds a fake `/sys/devices/system/node` tree under a fresh temp directory
+// and removes it on destruction.
+class FakeSysfsNodeDir {
+ public:
+  explicit FakeSysfsNodeDir(absl::string_view name)
+      : root_(absl::StrCat(testing::TempDir(), "/", name, "_", getpid())) {
+    std::filesystem::remove_all(root_);
+    std::filesystem::create_directories(root_);
+  }
+  ~FakeSysfsNodeDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  // Creates `<root>/<dirname>/` and, if `meminfo` is set, its `meminfo` file.
+  void AddDir(absl::string_view dirname,
+              std::optional<absl::string_view> meminfo = std::nullopt) {
+    const std::filesystem::path dir = root_ / std::string(dirname);
+    std::filesystem::create_directories(dir);
+    if (meminfo.has_value()) {
+      std::ofstream(dir / "meminfo") << *meminfo;
+    }
+  }
+
+  std::string path() const { return root_.string(); }
+
+ private:
+  std::filesystem::path root_;
+};
+
+// Points `host_numa_memory_bytes` telemetry at `sysfs_node_dir` instead of
+// `/sys/devices/system/node`. Overriding the directory is allowed only in
+// tests.
+class FakeSysfsKVCacheManager : public TestKVCacheManager {
+ public:
+  FakeSysfsKVCacheManager(size_t num_layers, size_t num_shards,
+                          size_t slice_byte_size, int host_blocks,
+                          std::string sysfs_node_dir)
+      : TestKVCacheManager(num_layers, num_shards, slice_byte_size,
+                           host_blocks) {
+    sysfs_node_dir_ = std::move(sysfs_node_dir);
+  }
+};
+
+auto NumaStateLabels(absl::string_view node, absl::string_view state) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kNumaNode,
+                         std::string(node)),
+      testing::FieldsAre(telemetry::metric_labels::kState, std::string(state)));
+}
+
+TEST(KVCacheManagerTest, AllocatedOccupancyMetricEmitsHostNumaMemoryPerNode) {
+  ScopedUnsetLocalRank unset_local_rank;
+  FakeSysfsNodeDir sysfs("numa_sysfs_rank0");
+  sysfs.AddDir("node0",
+               "Node 0 MemTotal: 1000 kB\n"
+               "Node 0 MemFree:   400 kB\n"
+               "Node 0 MemUsed:   600 kB\n");
+  // MemUsed absent: used falls back to MemTotal - MemFree.
+  sysfs.AddDir("node1",
+               "Node 1 MemTotal: 2000 kB\n"
+               "Node 1 MemFree:   500 kB\n");
+  // Skipped: non-node directories, a leading-zero id, a node without
+  // meminfo, and a node whose meminfo lacks MemFree.
+  sysfs.AddDir("cpu0", "Node 9 MemTotal: 1 kB\nNode 9 MemFree: 1 kB\n");
+  sysfs.AddDir("node01", "Node 1 MemTotal: 1 kB\nNode 1 MemFree: 1 kB\n");
+  sysfs.AddDir("node2");
+  sysfs.AddDir("node3", "Node 3 MemTotal: 1000 kB\n");
+  FakeSysfsKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                                  /*slice_byte_size=*/128, /*host_blocks=*/2,
+                                  sysfs.path());
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Ne(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock, SetGauge(telemetry::metric_names::kHostNumaMemoryBytes,
+                                  testing::_, testing::_))
+      .Times(0);
+  for (const auto& [node, state, kib] :
+       std::vector<std::tuple<std::string, absl::string_view, double>>{
+           {"0", telemetry::metric_labels::kStateUsed, 600},
+           {"0", telemetry::metric_labels::kStateFree, 400},
+           {"0", telemetry::metric_labels::kStateTotal, 1000},
+           {"1", telemetry::metric_labels::kStateUsed, 1500},
+           {"1", telemetry::metric_labels::kStateFree, 500},
+           {"1", telemetry::metric_labels::kStateTotal, 2000}}) {
+    EXPECT_CALL(
+        *raw_mock,
+        SetGauge(telemetry::metric_names::kHostNumaMemoryBytes,
+                 NumaStateLabels(node, state), testing::DoubleEq(kib * 1024.0)))
+        .Times(1);
+  }
+
+  manager.UpdateAllocatedOccupancyMetric();
+  // An immediate second update is throttled and emits no more NUMA samples.
+  manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, HostNumaMemoryMetricsSkippedOnNonZeroLocalRank) {
+  ScopedUnsetLocalRank restore_local_rank;
+  setenv(telemetry::kLocalRankEnvVar, "1", 1);
+  FakeSysfsNodeDir sysfs("numa_sysfs_rank1");
+  sysfs.AddDir("node0", "Node 0 MemTotal: 1000 kB\nNode 0 MemFree: 400 kB\n");
+  FakeSysfsKVCacheManager worker1_mgr(/*num_layers=*/1, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2, sysfs.path());
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Ne(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock, SetGauge(telemetry::metric_names::kHostNumaMemoryBytes,
+                                  testing::_, testing::_))
+      .Times(0);
+
+  worker1_mgr.UpdateAllocatedOccupancyMetric();
 }
 
 // ===========================================================================
@@ -2659,6 +2953,9 @@ class StubTransferSession : public TransferSession {
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return absl::nullopt;
   }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return std::chrono::steady_clock::time_point::max();
+  }
 };
 
 TEST(KVCacheManagerTest, GetSessionDefaultsToNotFoundAndDelegatesToHook) {
@@ -2801,8 +3098,53 @@ TEST(KVCacheManagerTest,
   ABSL_EXPECT_OK(host.UnregisterActivePlan(9102));
 }
 
+TEST(KVCacheManagerTest, ActivePlanWithoutReqIdReportsUnderDefaultReqId) {
+  WithPlanSessions<TestKVCacheManager> sender_host(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4);
+  ::tpu_sync::rpc::StartTransferRequest plan;
+  plan.set_uuid(9201);
+  plan.clear_req_id();
+  plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  auto* entry = (*plan.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer("127.0.0.1:1");
+  entry->set_dst_shard_idx(0);
+  entry->set_src_block_id(0);
+  entry->set_dst_block_id(1);
+  entry->set_size_bytes(128);
+  ASSERT_TRUE(plan.req_id().empty());
+  ABSL_ASSERT_OK(sender_host.RegisterActivePlan(9201, plan,
+                                                /*is_sender=*/true));
+  ABSL_ASSERT_OK(receiver_host.RegisterActivePlan(9201, plan,
+                                                  /*is_sender=*/false));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> send_session,
+                       sender_host.GetSession(9201));
+  send_session->Finish();
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> recv_session,
+                       receiver_host.GetSession(9201));
+  recv_session->Finish();
+
+  CompleteReadResult sent = sender_host.CompleteReadWithDetails();
+  EXPECT_THAT(sent.sent, testing::ElementsAre("resharded_transfer_9201"));
+  EXPECT_THAT(sent.failed, testing::IsEmpty());
+  EXPECT_THAT(sent.details,
+              testing::ElementsAre(testing::Key("resharded_transfer_9201")));
+  CompleteReadResult received = receiver_host.CompleteReadWithDetails();
+  EXPECT_THAT(received.received,
+              testing::ElementsAre("resharded_transfer_9201"));
+  EXPECT_THAT(received.failed, testing::IsEmpty());
+  EXPECT_THAT(received.details,
+              testing::ElementsAre(testing::Key("resharded_transfer_9201")));
+}
+
 class ConfigurableFakeKVBackend : public backends::KVBackend {
  public:
+  using Handler = std::function<void(std::function<void(absl::Status)>)>;
+
   explicit ConfigurableFakeKVBackend(
       absl::Status write_status = absl::OkStatus(),
       absl::Status read_status = absl::OkStatus(),
@@ -2811,11 +3153,22 @@ class ConfigurableFakeKVBackend : public backends::KVBackend {
         read_status_(std::move(read_status)),
         fail_block_hash_(std::move(fail_block_hash)) {}
 
+  ConfigurableFakeKVBackend(Handler write_handler, Handler read_handler)
+      : write_handler_(std::move(write_handler)),
+        read_handler_(std::move(read_handler)) {}
+
+  explicit ConfigurableFakeKVBackend(Handler handler)
+      : write_handler_(handler), read_handler_(std::move(handler)) {}
+
   std::string name() const override { return "fake"; }
 
   void WriteAsync(const backends::BlockKey& key,
                   absl::Span<const backends::HostBufferDescriptor>, size_t,
                   std::function<void(absl::Status)> callback) override {
+    if (write_handler_) {
+      write_handler_(std::move(callback));
+      return;
+    }
     if (!fail_block_hash_.empty() && key.block_hash != fail_block_hash_) {
       callback(absl::OkStatus());
       return;
@@ -2826,6 +3179,10 @@ class ConfigurableFakeKVBackend : public backends::KVBackend {
   void ReadAsync(const backends::BlockKey& key,
                  absl::Span<const backends::HostBufferDescriptor>, size_t,
                  std::function<void(absl::Status)> callback) override {
+    if (read_handler_) {
+      read_handler_(std::move(callback));
+      return;
+    }
     if (!fail_block_hash_.empty() && key.block_hash != fail_block_hash_) {
       callback(absl::OkStatus());
       return;
@@ -2843,6 +3200,8 @@ class ConfigurableFakeKVBackend : public backends::KVBackend {
   absl::Status write_status_;
   absl::Status read_status_;
   std::string fail_block_hash_;
+  Handler write_handler_;
+  Handler read_handler_;
 };
 
 auto StorageBytesLabels(absl::string_view direction,
@@ -2983,6 +3342,269 @@ TEST(KVCacheManagerTest,
   TF_ASSERT_OK_AND_ASSIGN(
       raiden::PjRtCopyFuture read_fail,
       manager.H2dReadFromBackend({fail_backend}, keys, block_ids, block_ids));
+  EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
+}
+
+void AdvanceSteadyClock(std::chrono::nanoseconds delta) {
+  const std::chrono::steady_clock::time_point start =
+      std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() < start + delta) {
+  }
+}
+
+// Matches the {local_rank, direction} labels of kStorageIoTimeMs.
+auto StorageIoLabels(absl::string_view local_rank,
+                     absl::string_view direction) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kLocalRank,
+                         std::string(local_rank)),
+      testing::FieldsAre(telemetry::metric_labels::kDirection,
+                         std::string(direction)));
+}
+
+TEST(KVCacheManagerTest,
+     D2hWriteToBackendAndH2dReadFromBackendEmitStorageIoTimeMs) {
+  // LOCAL_RANK=3 so a single-shard label taken from the shard index instead of
+  // the rank env var fails.
+  ScopedEnvVar restore_local_rank(telemetry::kLocalRankEnvVar, "3");
+
+  TestKVCacheManager single_shard_mgr(/*num_layers=*/1, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2);
+  TestKVCacheManager multi_shard_mgr(/*num_layers=*/1, /*num_shards=*/2,
+                                     /*slice_byte_size=*/128,
+                                     /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(testing::Ne(telemetry::metric_names::kStorageIoTimeMs),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  double shard0_write_ms = 0.0;
+  double shard1_write_ms = 0.0;
+
+  // Single-shard write must read local rank from env var ("3").
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(
+          telemetry::metric_names::kStorageIoTimeMs,
+          StorageIoLabels("3", telemetry::metric_labels::kDirectionWrite),
+          testing::Gt(0.0)));
+  // Multi-shard write records one observation per shard with the same duration.
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(
+          telemetry::metric_names::kStorageIoTimeMs,
+          StorageIoLabels("0", telemetry::metric_labels::kDirectionWrite),
+          testing::Gt(0.0)))
+      .WillOnce(testing::SaveArg<2>(&shard0_write_ms));
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(
+          telemetry::metric_names::kStorageIoTimeMs,
+          StorageIoLabels("1", telemetry::metric_labels::kDirectionWrite),
+          testing::Gt(0.0)))
+      .WillOnce(testing::SaveArg<2>(&shard1_write_ms));
+  // Multi-shard read records one observation per shard with direction="read".
+  EXPECT_CALL(*raw_mock, ObserveHistogram(
+                             telemetry::metric_names::kStorageIoTimeMs,
+                             StorageIoLabels(
+                                 "0", telemetry::metric_labels::kDirectionRead),
+                             testing::Gt(0.0)));
+  EXPECT_CALL(*raw_mock, ObserveHistogram(
+                             telemetry::metric_names::kStorageIoTimeMs,
+                             StorageIoLabels(
+                                 "1", telemetry::metric_labels::kDirectionRead),
+                             testing::Gt(0.0)));
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>(
+      [](std::function<void(absl::Status)> cb) {
+        AdvanceSteadyClock(std::chrono::microseconds(100));
+        cb(absl::OkStatus());
+      });
+
+  const std::vector<backends::BlockKey> keys = {{.block_hash = "k0"},
+                                                {.block_hash = "k1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture single_write,
+                       single_shard_mgr.D2hWriteToBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(single_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_write,
+                       multi_shard_mgr.D2hWriteToBackend({fake_backend}, keys,
+                                                         block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_read,
+                       multi_shard_mgr.H2dReadFromBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_read.Await());
+
+  // Both shards in a multi-shard manager must observe the exact same non-zero
+  // batch duration (shard 0 must not clamp shard 1 to 0.0 ms).
+  EXPECT_DOUBLE_EQ(shard0_write_ms, shard1_write_ms);
+}
+
+TEST(KVCacheManagerTest,
+     StorageIoTimeMsClampsOverlappingBatchesAndSeparatesDirections) {
+  ScopedUnsetLocalRank unset_local_rank;
+
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/3);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(testing::Ne(telemetry::metric_names::kStorageIoTimeMs),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  double write_sample_1 = 0.0;
+  double write_sample_2 = 0.0;
+  double read_sample = 0.0;
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(
+          telemetry::metric_names::kStorageIoTimeMs,
+          StorageIoLabels("0", telemetry::metric_labels::kDirectionWrite),
+          testing::Ge(0.0)))
+      .WillOnce(testing::SaveArg<2>(&write_sample_1))
+      .WillOnce(testing::SaveArg<2>(&write_sample_2));
+  EXPECT_CALL(*raw_mock, ObserveHistogram(
+                             telemetry::metric_names::kStorageIoTimeMs,
+                             StorageIoLabels(
+                                 "0", telemetry::metric_labels::kDirectionRead),
+                             testing::Ge(0.0)))
+      .WillOnce(testing::SaveArg<2>(&read_sample));
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  absl::Mutex cb_mu;
+  std::vector<std::function<void(absl::Status)>> pending_write_cbs;
+  std::function<void(absl::Status)> pending_read_cb;
+
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>(
+      [&](std::function<void(absl::Status)> cb) {
+        absl::MutexLock lock(cb_mu);
+        pending_write_cbs.push_back(std::move(cb));
+      },
+      [&](std::function<void(absl::Status)> cb) {
+        absl::MutexLock lock(cb_mu);
+        pending_read_cb = std::move(cb);
+      });
+
+  // Start two overlapping write batches and one overlapping read batch so all
+  // three capture their start_ns before any batch completes.
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture write_fut1,
+                       manager.D2hWriteToBackend(
+                           {fake_backend}, {{.block_hash = "w0"}}, {0}, {0}));
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture write_fut2,
+                       manager.D2hWriteToBackend(
+                           {fake_backend}, {{.block_hash = "w1"}}, {1}, {1}));
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture read_fut,
+                       manager.H2dReadFromBackend(
+                           {fake_backend}, {{.block_hash = "r0"}}, {2}, {2}));
+
+  {
+    absl::MutexLock lock(cb_mu);
+    auto all_enqueued = [&]() {
+      return pending_write_cbs.size() == 2 && pending_read_cb != nullptr;
+    };
+    cb_mu.Await(absl::Condition(&all_enqueued));
+  }
+
+  AdvanceSteadyClock(std::chrono::milliseconds(15));
+
+  std::function<void(absl::Status)> w_cb1;
+  std::function<void(absl::Status)> w_cb2;
+  std::function<void(absl::Status)> r_cb;
+  {
+    absl::MutexLock lock(cb_mu);
+    w_cb1 = std::move(pending_write_cbs[0]);
+    w_cb2 = std::move(pending_write_cbs[1]);
+    r_cb = std::move(pending_read_cb);
+  }
+
+  // Complete write batch 1 first (advances write_busy_until_ns after ~15 ms),
+  // then immediately complete write batch 2 and the read batch.
+  const std::chrono::steady_clock::time_point pre_cb =
+      std::chrono::steady_clock::now();
+  w_cb1(absl::OkStatus());
+  w_cb2(absl::OkStatus());
+  const std::chrono::steady_clock::time_point post_cb =
+      std::chrono::steady_clock::now();
+  r_cb(absl::OkStatus());
+
+  ABSL_EXPECT_OK(write_fut1.Await());
+  ABSL_EXPECT_OK(write_fut2.Await());
+  ABSL_EXPECT_OK(read_fut.Await());
+
+  const double cb_window_ms =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(post_cb - pre_cb)
+          .count() /
+      1e6;
+
+  EXPECT_GE(write_sample_1, 10.0);
+  // Write batch 2 started >= 10 ms before pre_cb, so an unclamped batch 2
+  // duration would exceed cb_window_ms by >= 10 ms; clamping against batch 1's
+  // completion watermark bounds write_sample_2 to [pre_cb, post_cb].
+  EXPECT_LE(write_sample_2, cb_window_ms + 1e-3);
+  // Read direction uses an independent watermark and is not clamped by write.
+  EXPECT_GE(read_sample, 10.0);
+}
+
+TEST(KVCacheManagerTest, StorageIoTimeMsSkippedOnFailedTransfers) {
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(testing::Ne(telemetry::metric_names::kStorageIoTimeMs),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kStorageIoTimeMs,
+                               testing::_, testing::_))
+      .Times(0);
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+
+  // Partial batch failure: chunk 0 ("fail") fails while chunk 1 ("ok")
+  // succeeds, so a failed chunk that incremented completed_storage_io_chunks
+  // would let the succeeding chunk reach total_chunks and emit a sample.
+  auto partial_fail_backend = std::make_shared<ConfigurableFakeKVBackend>(
+      absl::UnavailableError("simulated storage write failure"),
+      absl::NotFoundError("simulated storage read failure"),
+      /*fail_block_hash=*/"fail");
+
+  const std::vector<backends::BlockKey> keys = {{.block_hash = "fail"},
+                                                {.block_hash = "ok"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture write_fail,
+                       manager.D2hWriteToBackend({partial_fail_backend}, keys,
+                                                 block_ids, block_ids));
+  EXPECT_THAT(write_fail.Await(), StatusIs(absl::StatusCode::kUnavailable));
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture read_fail,
+                       manager.H2dReadFromBackend({partial_fail_backend}, keys,
+                                                  block_ids, block_ids));
   EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
 }
 }  // namespace

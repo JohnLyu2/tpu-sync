@@ -174,19 +174,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     transfer_hooks_ = std::move(hooks);
   }
 
-  // Invokes |cb| once block |block_id| of layer |layer_idx| is ready in host
-  // memory for the transport to read on behalf of transfer |uuid|: gates on
-  // the data-ready future of the live session registered under |uuid|.
-  // Invokes |cb(OkStatus())| immediately for a negative |block_id|, for
-  // kLeaseAuthorizedPullUuid, and when no live session holds |uuid|.
-  void RegisterBlockReadinessCallback(
-      size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-      transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
   absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
                                      absl::Span<const int> shard_ids,
                                      uint64_t uuid = 0) override;
   absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid = 0) override;
-  absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid = 0) override;
   void ScheduleAsyncTask(std::function<void()> task) override;
 
   // Async on-chip H2D offloads returning PJRT copy future E2E.
@@ -548,10 +539,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // constructor storages otherwise.
   size_t num_block_arrays() const override;
   size_t block_bytes(size_t block_array_idx) const override;
-  uint8_t* GetBlockArrayHostPointer(size_t block_array_idx,
-                                    size_t shard_idx) override;
-  size_t GetBlockArrayHostSize(size_t block_array_idx,
-                               size_t shard_idx) override;
+  // Returns the host span of |block_array_idx|: the pool's storage extent, or
+  // the whole staging arena on a bounded storage. Propagates
+  // ResolveBlockArrayHostLayer() errors for |uuid|. With explicit pools,
+  // returns kOutOfRange when |shard_idx| is past num_shards(), and
+  // kFailedPrecondition when the storage has no host buffer or the pool does
+  // not fit it. Without explicit pools, returns an OK empty span when the
+  // storage has no host buffer.
+  absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
+      size_t block_array_idx, size_t shard_idx, uint64_t uuid = 0) override;
 
   int64_t LayerBlockByteSize(size_t layer_idx) const;
 
@@ -637,15 +633,18 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Padding and live regions belonging only to aliased sibling pools are
   // preserved. All shards unless shard_idx is given.
   // `uuid` selects the staging lease on bounded storages (required there);
-  // unbounded storages ignore it.
-  absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
+  // unbounded storages ignore it. Virtual only as a test seam: CPU tests
+  // override it to drive pool-reshard sends without device copies.
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
       std::optional<uint64_t> uuid = std::nullopt,
       std::optional<size_t> host_layer_idx = std::nullopt);
 
-  // Inverse of D2hPoolBlocks: host mirror -> device storage.
-  absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
+  // Inverse of D2hPoolBlocks: host mirror -> device storage. Virtual only as a
+  // test seam: CPU tests override it to drive pool-reshard receives without
+  // device copies.
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
       std::optional<uint64_t> uuid = std::nullopt,
@@ -778,7 +777,25 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return server_.get();
   }
 
+  // Path of the meminfo file read by `host_memory_breakdown_bytes` telemetry.
+  absl::string_view proc_meminfo_path() const { return proc_meminfo_path_; }
+
+  // Directory of per-NUMA-node `node<N>/meminfo` files read by
+  // `host_numa_memory_bytes` telemetry.
+  absl::string_view sysfs_node_dir() const { return sysfs_node_dir_; }
+
  protected:
+  // Meminfo file read by `host_memory_breakdown_bytes` telemetry. Changing it
+  // is allowed only in tests, to point at a fake meminfo file; production code
+  // must keep the default `/proc/meminfo`.
+  std::string proc_meminfo_path_ = "/proc/meminfo";
+
+  // Directory of per-NUMA-node `node<N>/meminfo` files read by
+  // `host_numa_memory_bytes` telemetry. Changing it is allowed only in tests,
+  // to point at a fake sysfs tree; production code must keep the default
+  // `/sys/devices/system/node`.
+  std::string sysfs_node_dir_ = "/sys/devices/system/node";
+
   size_t max_physical_size_ = 0;
   int64_t staging_num_slots_ = 0;
   int64_t staging_max_major_per_slot_ = 0;
@@ -895,6 +912,14 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Lazily materializes one implicit pool per storage when RegisterPools was
   // never called (or the host buffers were replaced since).
   void EnsureImplicitPools() const;
+
+  // Resolves the host layer buffer index backing |block_array_idx| for
+  // transfer |uuid|, consulting the active TransferSession's staging lease
+  // when |uuid| is non-zero. Returns an error status when |block_array_idx|
+  // is out of range, |uuid| is unleased under bounded host staging, or
+  // session/slot resolution fails.
+  absl::StatusOr<size_t> ResolveBlockArrayHostLayer(size_t block_array_idx,
+                                                    uint64_t uuid) const;
 
   // Grows a storage's host mirror so pool D2H/H2D and block refs can address
   // the last declared live byte at storage offsets. Host staging is sized at

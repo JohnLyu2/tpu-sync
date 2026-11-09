@@ -4289,7 +4289,8 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
   // as the loads below fail while resolving or querying the peer.
   BlockTracker tracker;
   auto first =
-      backend->Load(peer_rid, {"h"}, {0}, /*slices=*/{}, &tracker).Await();
+      backend->Load({"h"}, {0}, &tracker, LoadOptions{.remote_id = peer_rid})
+          .Await();
   ASSERT_FALSE(first.ok());
   ASSERT_TRUE(absl::IsUnavailable(first)) << first.ToString();
 
@@ -4306,7 +4307,8 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
   // the hash, because Fetch validates its arguments before it looks anything
   // up, and this store registers no workers to name as endpoints.
   auto second =
-      backend->Load(peer_rid, {"h"}, {0}, /*slices=*/{}, &tracker).Await();
+      backend->Load({"h"}, {0}, &tracker, LoadOptions{.remote_id = peer_rid})
+          .Await();
   EXPECT_TRUE(absl::IsInvalidArgument(second))
       << "expected the restarted peer to answer; got " << second.ToString()
       << " -- the cached client still points at the address it had";
@@ -4451,7 +4453,7 @@ class FakeDestinationService
 
     proto::WriteRemoteEvent ack_event;
     auto* ack = ack_event.mutable_ack();
-    ack->set_operation_id(kOperationId);
+    ack->set_operation_id(operation_id_override_.value_or(kOperationId));
     ack->set_exist_state(exist_state_);
     ack->set_granted_deadline_ms(granted_deadline_ms_override_ > 0
                                      ? granted_deadline_ms_override_
@@ -4591,6 +4593,11 @@ class FakeDestinationService
     granted_deadline_ms_override_ = ms;
   }
 
+  void SetOperationId(uint64_t id) {
+    absl::MutexLock lock(mutex_);
+    operation_id_override_ = id;
+  }
+
   int write_calls() const {
     absl::MutexLock lock(mutex_);
     return write_calls_;
@@ -4624,6 +4631,7 @@ class FakeDestinationService
   int poll_calls_ ABSL_GUARDED_BY(mutex_) = 0;
   int64_t requested_deadline_ms_ ABSL_GUARDED_BY(mutex_) = 0;
   int64_t granted_deadline_ms_override_ ABSL_GUARDED_BY(mutex_) = 0;
+  std::optional<uint64_t> operation_id_override_ ABSL_GUARDED_BY(mutex_);
 };
 
 class RemoteWriteSourceTest : public StoreDiscoveryTest {
@@ -6058,6 +6066,19 @@ TEST(KVCacheStoreConstructionRulesTest, CreateRejectsZeroShards) {
       << store_result.status();
 }
 
+TEST(KVCacheStoreConstructionRulesTest, CreateRejectsNegativeDataReplicaIdx) {
+  RaidenId invalid_id{"invalid_dp_job", "0", "kv_cache", -1};
+  BackendConfig cfg;
+  cfg.type = "HostOffloadBackend";
+  cfg.capacity = 4;
+  cfg.raiden_id = invalid_id;
+  EXPECT_THAT(KVCacheStore::Create(cfg, /*capacity=*/4,
+                                   /*global_registry_address=*/"", invalid_id,
+                                   /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                                   /*store_server_ip=*/"127.0.0.1"),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 TEST(KVCacheStoreConstructionRulesDeathTest, CapacityCtorDiesOnEmptyIp) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
@@ -6116,14 +6137,6 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override {
     return absl::InternalError("Backend lookup failed");
-  }
-  tsl::Future<> Load(const RaidenId& remote_id,
-                     absl::Span<const std::string> block_hashes,
-                     absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices,
-                     BlockTracker* absl_nonnull load_tracker) override {
-    CHECK(load_tracker != nullptr);
-    return {};
   }
   bool Insert(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices,
@@ -7120,15 +7133,29 @@ struct StorageRecallTransferManager
   absl::Mutex mu;
   bool fail_recall = false;
   bool fail_recall_not_found = false;
+  // Stall every host-to-device copy (`h2d_delay`) or storage read
+  // (`recall_delay`) by this long before it is issued. Set from the test
+  // thread, read on the worker service thread.
+  absl::Duration h2d_delay ABSL_GUARDED_BY(mu) = absl::ZeroDuration();
+  absl::Duration recall_delay ABSL_GUARDED_BY(mu) = absl::ZeroDuration();
   std::vector<std::vector<int64_t>> h2d_dst_batches ABSL_GUARDED_BY(mu);
+
+  void SetDelays(absl::Duration h2d, absl::Duration recall) {
+    absl::MutexLock lock(mu);
+    h2d_delay = h2d;
+    recall_delay = recall;
+  }
 
   Result H2d(const std::vector<int64_t>& src_offsets,
              const std::vector<int64_t>& dst_offsets,
              const std::vector<int64_t>& copy_sizes) {
+    absl::Duration delay;
     {
       absl::MutexLock lock(mu);
       h2d_dst_batches.push_back(dst_offsets);
+      delay = h2d_delay;
     }
+    absl::SleepFor(delay);
     return Base::H2d(src_offsets, dst_offsets, copy_sizes);
   }
 
@@ -7137,6 +7164,12 @@ struct StorageRecallTransferManager
       const std::vector<backends::BlockKey>& block_keys,
       const std::vector<int64_t>& src_host_block_ids,
       const std::vector<int64_t>& dst_device_block_ids) {
+    absl::Duration delay;
+    {
+      absl::MutexLock lock(mu);
+      delay = recall_delay;
+    }
+    absl::SleepFor(delay);
     if (fail_recall_not_found) {
       ++h2d_read_from_backend_calls;
       return raiden::PjRtCopyFuture(
@@ -8190,8 +8223,12 @@ class KVRecallBlocksMetricsTest : public ReadRemoteTest {
     metrics_reset_.reset();
   }
 
+  // Expects one `kv_recall_blocks_total` increment of `count` and one
+  // `kv_recall_duration_ms` sample in [`min_duration_ms`, 60 s), both labeled
+  // with (`dp_rank`, `tier`, `outcome`).
   void ExpectRecallBlocks(absl::string_view tier, absl::string_view outcome,
-                          uint64_t count, absl::string_view dp_rank = "0") {
+                          uint64_t count, absl::string_view dp_rank = "0",
+                          double min_duration_ms = 0) {
     const telemetry::MetricLabel expected_labels[] = {
         {telemetry::metric_labels::kDpRank, dp_rank},
         {telemetry::metric_labels::kTier, tier},
@@ -8206,6 +8243,21 @@ class KVRecallBlocksMetricsTest : public ReadRemoteTest {
                     testing::Ne(telemetry::metric_names::kKvRecallBlocksTotal),
                     testing::_, testing::_))
         .Times(testing::AnyNumber());
+    // Other histograms are not under test here.
+    EXPECT_CALL(*mock_metrics_,
+                ObserveHistogram(
+                    testing::Ne(telemetry::metric_names::kKvRecallDurationMs),
+                    testing::_, testing::_))
+        .Times(testing::AnyNumber());
+    // Exactly one duration sample per counted batch, with the same labels.
+    EXPECT_CALL(*mock_metrics_,
+                ObserveHistogram(telemetry::metric_names::kKvRecallDurationMs,
+                                 UnorderedElementsAreArray(expected_labels),
+                                 // The upper bound catches a start time that
+                                 // was never set (a default `time_point` reads
+                                 // as time since boot).
+                                 testing::AllOf(testing::Ge(min_duration_ms),
+                                                testing::Lt(60'000.0))));
   }
 
   StagingExhaustionGuard ExhaustStagingBlocks() {
@@ -8328,6 +8380,62 @@ TEST_F(KVRecallBlocksMetricsTest, SharedStorageRecallOutcomes) {
   mgr_.fail_recall = false;
 }
 
+// Each duration sample spans its tier's whole recall, not just the dispatch:
+// stalling the H2D copy (`local_dram`, `remote_dram`) or the storage read
+// (`shared_storage`) by `kDelay` yields a sample of at least `kDelay`, for both
+// successful and failed recalls across all three tiers.
+TEST_F(KVRecallBlocksMetricsTest, DurationSpansWholeRecallPerTier) {
+  constexpr absl::Duration kDelay = absl::Milliseconds(50);
+  const double delay_ms = absl::ToDoubleMilliseconds(kDelay);
+  MakeStore({.peer_hashes = {"r0"}});
+
+  EXPECT_CALL(*mock_metrics_, IncrementCounter).Times(0);
+  EXPECT_CALL(*mock_metrics_, ObserveHistogram).Times(0);
+  ABSL_ASSERT_OK(store_->Load(/*block_hashes=*/{}, /*device_block_ids=*/{}));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  for (bool fail : {false, true}) {
+    SCOPED_TRACE(fail);
+    const absl::string_view outcome =
+        fail ? telemetry::metric_labels::kOutcomeTransferFailed
+             : telemetry::metric_labels::kOutcomeOk;
+    const auto expect_slow = [&](absl::string_view tier, uint64_t count) {
+      ExpectRecallBlocks(tier, outcome, count, /*dp_rank=*/"0",
+                         /*min_duration_ms=*/delay_ms);
+    };
+
+    // local_dram & remote_dram: stall the H2D copy.
+    mgr_.SetDelays(/*h2d=*/kDelay, /*recall=*/absl::ZeroDuration());
+    mgr_.fail_transfers = fail;
+    const std::string local_hash = fail ? "l1" : "l0";
+    AddPinnedLocal({local_hash});
+    expect_slow(telemetry::metric_labels::kTierLocalDram, 1);
+    ABSL_ASSERT_OK(store_->Load({local_hash}, {2}));
+    WaitForLoadSettled(*store_, 1);
+    if (fail) {
+      store_->Release({local_hash});
+    }
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+    expect_slow(telemetry::metric_labels::kTierRemoteDram, 1);
+    ABSL_ASSERT_OK(store_->ReadRemote({"r0"}, {PeerSlice(peer_a_, 0)}, {3}));
+    WaitForLoadSettled(*store_, 1);
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+    mgr_.fail_transfers = false;
+
+    // shared_storage: stall the storage read.
+    mgr_.SetDelays(/*h2d=*/absl::ZeroDuration(), /*recall=*/kDelay);
+    mgr_.fail_recall = fail;
+    expect_slow(telemetry::metric_labels::kTierSharedStorage, 1);
+    ABSL_ASSERT_OK(
+        store_->ReadRemote({fail ? "s1" : "s0"}, {StorageSlice()}, {4}));
+    WaitForLoadSettled(*store_, 1);
+    mgr_.fail_recall = false;
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+  }
+  mgr_.SetDelays(absl::ZeroDuration(), absl::ZeroDuration());
+}
+
 TEST_F(KVRecallBlocksMetricsTest, DpRankAttribution) {
   MakeStore({.dp_rank = 7});
   AddPinnedLocal({"l0"});
@@ -8363,6 +8471,586 @@ TEST_F(KVRecallBlocksMetricsTest, DpRankAttribution) {
   ABSL_EXPECT_OK(create_store(9));
 }
 
+void WaitForSaveDone(KVCacheStore& store, size_t expected) {
+  const absl::Time deadline = absl::Now() + absl::Seconds(30);
+  size_t settled = 0;
+  while (settled < expected && absl::Now() < deadline) {
+    auto [done, failed, pending, existing, unregistered] =
+        store.PollSaveStatus();
+    settled += done.size() + failed.size();
+    if (settled < expected) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+}
+
+class KVSaveBlocksMetricsTest : public KVRecallBlocksMetricsTest {
+ protected:
+  void ExpectSaveBlocks(absl::string_view tier, absl::string_view outcome,
+                        uint64_t count, absl::string_view dp_rank = "0") {
+    const telemetry::MetricLabel expected_labels[] = {
+        {telemetry::metric_labels::kDpRank, dp_rank},
+        {telemetry::metric_labels::kTier, tier},
+        {telemetry::metric_labels::kOutcome, outcome},
+    };
+    EXPECT_CALL(
+        *mock_metrics_,
+        IncrementCounter(telemetry::metric_names::kKvSaveBlocksTotal,
+                         UnorderedElementsAreArray(expected_labels), count));
+  }
+
+  RaidenBlockId HbmSlice(int dev_id) const {
+    return RaidenBlockId(local_id_, /*host_block_id=*/-1, dev_id,
+                         BlockStatus::HBM);
+  }
+};
+
+TEST_F(KVSaveBlocksMetricsTest, LocalDramSaveOutcomes) {
+  MakeStore({.with_storage = false, .dp_rank = 2});
+
+  // Insert admission rejected when all LRU slots are pinned.
+  std::vector<std::string> filler_hashes;
+  std::vector<RaidenBlockId> filler_slices;
+  for (int i = 0; i < 10; ++i) {
+    filler_hashes.push_back(absl::StrCat("f", i));
+    filler_slices.push_back(LocalSlice(i));
+  }
+  ABSL_ASSERT_OK(
+      store_->Insert(filler_hashes, filler_slices, /*on_host=*/true));
+  ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                   telemetry::metric_labels::kOutcomeRejected, 2, "2");
+  EXPECT_THAT(store_->Insert({"overflow_0", "overflow_1"},
+                             {LocalSlice(10), LocalSlice(11)},
+                             /*on_host=*/true),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+  store_->Release(filler_hashes);
+  store_->backend()->Delete(filler_hashes);
+
+  // SaveLocal admission rejected when host blocks cannot be allocated.
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ABSL_ASSERT_OK(store_->Insert({"hbm0", "hbm1"}, {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                   telemetry::metric_labels::kOutcomeRejected, 2, "2");
+  EXPECT_THAT(store_->Save({"hbm0", "hbm1"}),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Exercises success and transfer failure for both host-only and
+  // storage write-through saves.
+  for (bool with_storage : {false, true}) {
+    SCOPED_TRACE(absl::StrCat("with_storage=", with_storage));
+    MakeStore({.with_storage = with_storage, .dp_rank = 2});
+
+    mgr_.fail_transfers = false;
+    ABSL_ASSERT_OK(store_->Insert({"s0", "s1"}, {HbmSlice(0), HbmSlice(1)},
+                                  /*on_host=*/false));
+    ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeOk, 2, "2");
+    ABSL_ASSERT_OK(store_->Save({"s0", "s1"}));
+    WaitForSaveDone(*store_, /*expected=*/2);
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+    mgr_.fail_transfers = true;
+    ABSL_ASSERT_OK(store_->Insert({"s2", "s3"}, {HbmSlice(2), HbmSlice(3)},
+                                  /*on_host=*/false));
+    ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeFailed, 2, "2");
+    ABSL_ASSERT_OK(store_->Save({"s2", "s3"}));
+    WaitForSaveDone(*store_, /*expected=*/2);
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+  }
+}
+
+class KVRemoteSaveBlocksMetricsTest : public RemoteWriteSourceTest {
+ protected:
+  void SetUp() override {
+    auto mock_backend =
+        std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+    mock_metrics_ = mock_backend.get();
+    metrics_reset_ = std::make_unique<telemetry::ScopedMetricsBackendReset>(
+        std::move(mock_backend));
+    RemoteWriteSourceTest::SetUp();
+  }
+
+  void TearDown() override {
+    src_store_.reset();
+    RemoteWriteSourceTest::TearDown();
+    mock_metrics_ = nullptr;
+    metrics_reset_.reset();
+  }
+
+  void InitSourceAndDestination(const std::vector<std::string>& hashes,
+                                int src_dp_rank = 5,
+                                bool start_destination = true) {
+    src_ = RaidenId{"rw_metrics_src", "0", "kv", src_dp_rank};
+    dst_ = RaidenId{"rw_metrics_dst", "0", "kv", 0};
+    src_store_ = MakeStore(src_);
+    Populate(*src_store_, src_, hashes);
+    if (start_destination) {
+      StartFakeDestination(dst_);
+    }
+  }
+
+  void ExpectRemoteSaveBlocks(absl::string_view outcome, uint64_t count,
+                              absl::string_view dp_rank = "5") {
+    const telemetry::MetricLabel expected_labels[] = {
+        {telemetry::metric_labels::kDpRank, dp_rank},
+        {telemetry::metric_labels::kTier,
+         telemetry::metric_labels::kTierRemoteDram},
+        {telemetry::metric_labels::kOutcome, outcome},
+    };
+    EXPECT_CALL(
+        *mock_metrics_,
+        IncrementCounter(telemetry::metric_names::kKvSaveBlocksTotal,
+                         UnorderedElementsAreArray(expected_labels), count));
+  }
+
+  RaidenId src_;
+  RaidenId dst_;
+  std::unique_ptr<KVCacheStore> src_store_;
+  telemetry::MockMetricsBackend* mock_metrics_ = nullptr;
+  std::unique_ptr<telemetry::ScopedMetricsBackendReset> metrics_reset_;
+};
+
+TEST_F(KVRemoteSaveBlocksMetricsTest, RemoteDramOfferOutcomes) {
+  InitSourceAndDestination({"r0", "r1"});
+
+  // Peer RESOURCE_EXHAUSTED -> outcome="rejected".
+  fake_destination_.SetWriteRemoteStatus(
+      grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "peer full"));
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeRejected, 2);
+  EXPECT_THAT(src_store_->Save({"r0", "r1"}, dst_),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Peer UNAVAILABLE transport error -> outcome="failed".
+  fake_destination_.SetWriteRemoteStatus(
+      grpc::Status(grpc::StatusCode::UNAVAILABLE, "peer unreachable"));
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  EXPECT_THAT(src_store_->Save({"r0", "r1"}, dst_),
+              StatusIs(absl::StatusCode::kUnavailable));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // WRITE_ALL_EXIST ack -> outcome="ok".
+  fake_destination_.SetWriteRemoteStatus(grpc::Status::OK);
+  fake_destination_.SetWriteExistState(proto::WRITE_ALL_EXIST);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"r0", "r1"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // WRITE_PARTIAL_EXIST ack -> outcome="failed" for the full batch size.
+  Populate(*src_store_, src_, {"s2", "s3"});
+  fake_destination_.SetWriteExistState(proto::WRITE_PARTIAL_EXIST);
+  fake_destination_.SetExistingHashes({"s2"});
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"s2", "s3"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // ack.operation_id == 0 -> outcome="failed".
+  Populate(*src_store_, src_, {"s4", "s5"});
+  fake_destination_.SetWriteExistState(proto::WRITE_EXIST_STATE_UNSPECIFIED);
+  fake_destination_.SetOperationId(0);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  EXPECT_THAT(src_store_->Save({"s4", "s5"}, dst_),
+              StatusIs(absl::StatusCode::kInternal));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Null raiden_controller_ in BeginWriteRemote -> outcome="failed".
+  auto null_ctrl = std::make_shared<TestHostOffloadBackend>(
+      /*capacity=*/4, /*metadata=*/std::nullopt, /*raiden_id=*/src_,
+      /*raiden_controller=*/nullptr, /*registry_client=*/nullptr);
+  BlockTracker tracker;
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  EXPECT_THAT(
+      null_ctrl->BeginWriteRemote(dst_, {"s0", "s1"}, {0, 1}, absl::Seconds(5),
+                                  absl::Seconds(5), &tracker),
+      StatusIs(absl::StatusCode::kFailedPrecondition));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+}
+
+TEST_F(KVRemoteSaveBlocksMetricsTest, RemoteDramPollOutcomes) {
+  InitSourceAndDestination({"p0", "p1"});
+
+  // Peer FAILED verdict -> outcome="failed".
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::FAILED);
+  fake_destination_.SetPollResponse(verdict);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"p0", "p1"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Peer COMMITTED verdict -> outcome="ok".
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  verdict.add_committed_hashes("p0");
+  verdict.add_committed_hashes("p1");
+  fake_destination_.SetPollResponse(verdict);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"p0", "p1"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+}
+
+class KVEvictedBlocksMetricsTest : public KVSaveBlocksMetricsTest {
+ protected:
+  void SetUp() override {
+    KVSaveBlocksMetricsTest::SetUp();
+    EXPECT_CALL(*mock_metrics_,
+                IncrementCounter(
+                    testing::Ne(telemetry::metric_names::kKvEvictedBlocksTotal),
+                    testing::_, testing::_))
+        .Times(testing::AnyNumber());
+  }
+
+  void ExpectEvictedBlocks(uint64_t count, absl::string_view dp_rank = "0") {
+    const telemetry::MetricLabel expected_labels[] = {
+        {telemetry::metric_labels::kDpRank, dp_rank},
+    };
+    EXPECT_CALL(
+        *mock_metrics_,
+        IncrementCounter(telemetry::metric_names::kKvEvictedBlocksTotal,
+                         UnorderedElementsAreArray(expected_labels), count));
+  }
+
+  void InsertColdHostBlocks(const std::vector<std::string>& hashes) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::vector<int> ids,
+        KVCacheStoreTest::AllocateBlockIds(*store_, hashes.size()));
+    std::vector<RaidenBlockId> slices;
+    for (int id : ids) {
+      slices.emplace_back(local_id_, id, /*device_block_id=*/-1,
+                          BlockStatus::HOST);
+    }
+    ABSL_ASSERT_OK(store_->Insert(hashes, slices, /*on_host=*/true));
+    store_->Release(hashes);
+  }
+};
+
+TEST_F(KVEvictedBlocksMetricsTest,
+       DirectEvictFiltersNonEvictableAndCountsUniqueHostBlocks) {
+  MakeStore({.num_host_blocks = 4, .with_storage = false, .dp_rank = 3});
+
+  // Empty Evict emits no counters.
+  EXPECT_EQ(KVCacheStoreTest::Evict(*store_, /*block_hashes=*/{}), 0);
+
+  // Populate unpinned HBM block and mixed pinned/unpinned host blocks.
+  ABSL_ASSERT_OK(store_->Insert({"hbm0"}, {HbmSlice(0)}, /*on_host=*/false));
+  store_->Release({"hbm0"});
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> ids,
+                          KVCacheStoreTest::AllocateBlockIds(*store_, 3));
+  ABSL_ASSERT_OK(
+      store_->Insert({"pinned0", "host0", "host1"},
+                     {RaidenBlockId(local_id_, ids[0], /*device_block_id=*/-1,
+                                    BlockStatus::HOST),
+                      RaidenBlockId(local_id_, ids[1], /*device_block_id=*/-1,
+                                    BlockStatus::HOST),
+                      RaidenBlockId(local_id_, ids[2], /*device_block_id=*/-1,
+                                    BlockStatus::HOST)},
+                     /*on_host=*/true));
+  store_->Release({"host0", "host1"});
+
+  // Mixed batch with HBM-only, pinned, and duplicate unpinned host hashes
+  // counts only the 2 unique evicted host blocks.
+  ExpectEvictedBlocks(2, /*dp_rank=*/"3");
+  EXPECT_EQ(KVCacheStoreTest::Evict(
+                *store_, {"hbm0", "pinned0", "host0", "host0", "host1"}),
+            2);
+}
+
+TEST_F(KVEvictedBlocksMetricsTest, AllocationDrivenEvictionOnHostExhaustion) {
+  MakeStore({.num_host_blocks = 4, .with_storage = false, .dp_rank = 2});
+  InsertColdHostBlocks({"c0", "c1", "c2", "c3"});
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  // Local Save with 0 free host blocks evicts 2 cold LRU blocks via
+  // AllocateBlockIds.
+  ABSL_ASSERT_OK(store_->Insert({"s_hbm0", "s_hbm1"},
+                                {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ExpectEvictedBlocks(2, /*dp_rank=*/"2");
+  ABSL_ASSERT_OK(store_->Save({"s_hbm0", "s_hbm1"}));
+  WaitForSaveDone(*store_, /*expected=*/2);
+}
+
+TEST_F(KVEvictedBlocksMetricsTest,
+       NonEvictionDeallocationsDoNotEmitEvictedBlocks) {
+  MakeStore({.num_host_blocks = 4, .with_storage = false, .dp_rank = 1});
+
+  // Failed local save rolls back newly allocated host blocks via
+  // DeallocateBlockIds without emitting eviction counters.
+  mgr_.fail_transfers = true;
+  ABSL_ASSERT_OK(
+      store_->Insert({"fail_save0"}, {HbmSlice(0)}, /*on_host=*/false));
+  ABSL_ASSERT_OK(store_->Save({"fail_save0"}));
+  WaitForSaveDone(*store_, /*expected=*/1);
+}
+
+using KVEvictedBlocksSweepMetricsTest = EvictSweepTest;
+
+TEST_F(KVEvictedBlocksSweepMetricsTest, SweepEvictionEmitsEvictedBlocks) {
+  auto mock_backend =
+      std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* mock_metrics = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset metrics_reset(std::move(mock_backend));
+
+  const telemetry::MetricLabel labels[] = {
+      {telemetry::metric_labels::kDpRank, "3"},
+  };
+  EXPECT_CALL(*mock_metrics,
+              IncrementCounter(telemetry::metric_names::kKvEvictedBlocksTotal,
+                               UnorderedElementsAreArray(labels), 4));
+  EXPECT_CALL(*mock_metrics,
+              IncrementCounter(
+                  testing::Ne(telemetry::metric_names::kKvEvictedBlocksTotal),
+                  testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  RaidenId src{"sweep_src_drop", "0", "kv", /*data_replica_idx=*/3};
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheStore> store,
+                          MakeSweepStore(src, "sweepgroup_bottom"));
+  PopulateCold(*store, src, {"a", "b", "c", "d", "e", "f"});
+  AwaitSweepFreed(*store, 6);
+  EXPECT_EQ(fake_destination_.write_calls(), 0);
+}
+
+class KVHostPoolBlocksMetricsTest : public ReadRemoteTest {
+ protected:
+  RaidenBlockId HbmSlice(int dev_id) const {
+    return RaidenBlockId(local_id_, -1, dev_id, BlockStatus::HBM);
+  }
+
+  void SetUp() override {
+    auto mock_backend =
+        std::make_unique<::testing::NiceMock<telemetry::MockMetricsBackend>>();
+    ON_CALL(*mock_backend, SetGauge(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault([this](absl::string_view name,
+                              telemetry::LabelSpan labels, double val) {
+          if (name != telemetry::metric_names::kHostPoolBlocks) return;
+          std::string state;
+          std::string dp_rank;
+          for (const auto& label : labels) {
+            if (label.key == telemetry::metric_labels::kState) {
+              state = std::string(label.value);
+            } else if (label.key == telemetry::metric_labels::kDpRank) {
+              dp_rank = std::string(label.value);
+            }
+          }
+          absl::MutexLock lock(gauge_mu_);
+          latest_rank_state_values_[dp_rank][state] = val;
+          if (state == telemetry::metric_labels::kStateUsed) {
+            double& max_used = max_rank_used_values_[dp_rank];
+            max_used = std::max(max_used, val);
+          }
+        });
+    metrics_reset_ = std::make_unique<telemetry::ScopedMetricsBackendReset>(
+        std::move(mock_backend));
+    ReadRemoteTest::SetUp();
+  }
+
+  void TearDown() override {
+    ReadRemoteTest::TearDown();
+    metrics_reset_.reset();
+  }
+
+  double GetRankStateGauge(absl::string_view dp_rank, absl::string_view state) {
+    absl::MutexLock lock(gauge_mu_);
+    auto rank_it = latest_rank_state_values_.find(dp_rank);
+    if (rank_it == latest_rank_state_values_.end()) return -1.0;
+    auto state_it = rank_it->second.find(state);
+    return state_it == rank_it->second.end() ? -1.0 : state_it->second;
+  }
+
+  // Latest {total, used, pinned} values published for `dp_rank` (-1 if unset).
+  std::tuple<double, double, double> PoolGauges(absl::string_view dp_rank) {
+    return {GetRankStateGauge(dp_rank, telemetry::metric_labels::kStateTotal),
+            GetRankStateGauge(dp_rank, telemetry::metric_labels::kStateUsed),
+            GetRankStateGauge(dp_rank, telemetry::metric_labels::kStatePinned)};
+  }
+
+  // Polls PoolGauges(dp_rank) until it equals `expected` or a 10s deadline
+  // passes, and returns the last value. Some releases (e.g. Save's caller pin,
+  // WriteRemote landing blocks) land asynchronously after the operation is
+  // reported as settled.
+  std::tuple<double, double, double> WaitForPoolGauges(
+      absl::string_view dp_rank, std::tuple<double, double, double> expected) {
+    const absl::Time deadline = absl::Now() + absl::Seconds(10);
+    std::tuple<double, double, double> gauges = PoolGauges(dp_rank);
+    while (gauges != expected && absl::Now() < deadline) {
+      absl::SleepFor(absl::Milliseconds(10));
+      gauges = PoolGauges(dp_rank);
+    }
+    return gauges;
+  }
+
+  // Returns the largest `used` value published for `dp_rank`, or -1 if none.
+  double GetMaxRankUsedGauge(absl::string_view dp_rank) {
+    absl::MutexLock lock(gauge_mu_);
+    auto it = max_rank_used_values_.find(dp_rank);
+    return it == max_rank_used_values_.end() ? -1.0 : it->second;
+  }
+
+  absl::Mutex gauge_mu_;
+  absl::flat_hash_map<std::string, absl::flat_hash_map<std::string, double>>
+      latest_rank_state_values_ ABSL_GUARDED_BY(gauge_mu_);
+  absl::flat_hash_map<std::string, double> max_rank_used_values_
+      ABSL_GUARDED_BY(gauge_mu_);
+  std::unique_ptr<telemetry::ScopedMetricsBackendReset> metrics_reset_;
+};
+
+TEST_F(KVHostPoolBlocksMetricsTest, TotalUsedAndPinnedStatesStayConsistent) {
+  MakeStore({.num_host_blocks = 6, .with_storage = false, .dp_rank = 1});
+
+  // 1. After store initialization: total=6, used=0, pinned=0.
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 0.0, 0.0));
+
+  // 2. Save 2 HBM-only blocks to local DRAM. Once settled, Save releases the
+  // caller pin, so 2 blocks are used and 0 are pinned (evictable = 2).
+  ABSL_ASSERT_OK(store_->Insert({"hp0", "hp1"}, {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ABSL_ASSERT_OK(store_->Save({"hp0", "hp1"}));
+  WaitForSaveDone(*store_, /*expected=*/2);
+  EXPECT_THAT(WaitForPoolGauges("1", {6.0, 2.0, 0.0}),
+              ::testing::FieldsAre(6.0, 2.0, 0.0));
+
+  // 3. Pin 2 blocks via Lookup: used=2, pinned=2 (evictable = 0).
+  ABSL_ASSERT_OK(store_->Lookup({"hp0", "hp1"}));
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 2.0, 2.0));
+
+  // 4. Release 1 block: used=2, pinned=1 (evictable = 1).
+  store_->Release({"hp0"});
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 2.0, 1.0));
+  store_->Release({"hp1"});
+
+  // 5. Evicting hp0 and hp1 frees both host blocks: used=0, pinned=0.
+  EXPECT_EQ(KVCacheStoreTest::Evict(*store_, {"hp0", "hp1"}), 2);
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 0.0, 0.0));
+}
+
+TEST_F(KVHostPoolBlocksMetricsTest,
+       RecoverFromLocalManifestUpdatesHostPoolGauges) {
+  // Crash recovery from a local manifest populates unpinned HOST blocks and
+  // refreshes total, used, and pinned gauges.
+  RaidenId rid{"manifest_gauge_job", "0", "kv_cache", 5};
+  MetadataRegion region(8);
+  TF_ASSERT_OK_AND_ASSIGN(KVCacheMetadata metadata,
+                       KVCacheMetadata::Format(region.span(), 8));
+  ABSL_ASSERT_OK(metadata.Set(1, "rec_a", 1));
+  ABSL_ASSERT_OK(metadata.Set(4, "rec_b", 2));
+  ABSL_ASSERT_OK(metadata.Set(6, "rec_c", 3));
+
+  auto controller = MakeRecoveryController(rid, 8);
+  KVCacheStore recovery_store(8, std::move(controller),
+                              /*global_registry_address=*/"", rid, metadata,
+                              /*store_server_ip=*/"127.0.0.1");
+  ABSL_ASSERT_OK(recovery_store.RecoverFromLocalManifest());
+  EXPECT_THAT(PoolGauges("5"), ::testing::FieldsAre(8.0, 3.0, 0.0));
+}
+
+TEST_F(KVHostPoolBlocksMetricsTest, StorageRecallUpdatesHostPoolGauges) {
+  // Storage recall allocates staging blocks and publishes them as unpinned
+  // HOST_AND_HBM entries on completion.
+  MakeStore({.num_host_blocks = 6, .with_storage = true, .dp_rank = 6});
+  ABSL_ASSERT_OK(
+      store_->Load({"s0", "s1"}, {StorageSlice(), StorageSlice()}, {0, 1}));
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("s0", "s1"));
+  EXPECT_THAT(WaitForPoolGauges("6", {6.0, 2.0, 0.0}),
+              ::testing::FieldsAre(6.0, 2.0, 0.0));
+}
+
+TEST_F(KVHostPoolBlocksMetricsTest,
+       DestinationWriteRemoteLandingBlocksUpdateHostPoolGaugesOnRelease) {
+  // Set up a destination store (dp_rank=7) with 4 host blocks but no registered
+  // workers so its incoming WriteRemote pull fails after allocating landing
+  // blocks, exercising ReleaseLandingBlocks -> RecordHostPoolMetrics.
+  RaidenId dst_id{"dst_gauge_job", "0", "kv_cache", 7};
+  BackendConfig dst_config;
+  dst_config.type = "HostOffloadBackend";
+  dst_config.capacity = 4;
+  dst_config.raiden_id = dst_id;
+  dst_config.global_registry_address = registry_address_;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheStore> dst_store,
+      KVCacheStore::Create(dst_config, /*capacity=*/4, registry_address_,
+                           dst_id, /*num_shards=*/1,
+                           /*shard_size_bytes=*/1024,
+                           /*store_server_ip=*/"127.0.0.1",
+                           /*raiden_controller_port=*/0,
+                           /*metadata=*/std::nullopt,
+                           /*expected_worker_count=*/0,
+                           /*secondary_backend_configs=*/{}));
+
+  // Source store (dp_rank=1) offers 2 blocks to dst_store.
+  MakeStore({.num_host_blocks = 4,
+             .with_empty_registry = true,
+             .with_storage = false,
+             .dp_rank = 1});
+  ABSL_ASSERT_OK(store_->Insert({"w0", "w1"}, {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ABSL_ASSERT_OK(store_->Save({"w0", "w1"}));
+  WaitForSaveDone(*store_, /*expected=*/2);
+  ABSL_ASSERT_OK(store_->Lookup({"w0", "w1"}));
+
+  ABSL_ASSERT_OK(store_->Save({"w0", "w1"}, dst_id));
+  WaitForSaveDone(*store_, /*expected=*/2);
+
+  // The destination must have allocated both landing blocks before its pull
+  // failed; otherwise the release path below was never exercised.
+  EXPECT_DOUBLE_EQ(GetMaxRankUsedGauge("7"), 2.0);
+
+  // After the destination's pull fails and ReleaseLandingBlocks returns the
+  // landing blocks to dst_store's pool, dst_store's gauges must be back to 0.
+  EXPECT_THAT(WaitForPoolGauges("7", {4.0, 0.0, 0.0}),
+              ::testing::FieldsAre(4.0, 0.0, 0.0));
+}
+
+TEST_F(SecondaryBackendTopologyTest,
+       PropagatesRaidenIdDpRankToSecondaryPosixBackend) {
+  BackendConfig host_cfg;
+  host_cfg.type = "HostOffloadBackend";
+  host_cfg.capacity = 16;
+  BackendConfig posix_cfg = PosixConfig();
+  posix_cfg.parallelism.tp_size = 1;
+  const BackendConfig configs[] = {host_cfg, posix_cfg};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      store_, KVCacheStore::Create(absl::MakeConstSpan(configs),
+                                   /*capacity=*/16,
+                                   /*global_registry_address=*/"",
+                                   RaidenId{"topology_job", "0", "kv",
+                                            /*data_replica_idx=*/7},
+                                   /*num_shards=*/1, /*shard_size_bytes=*/512,
+                                   /*store_server_ip=*/"127.0.0.1"));
+  ASSERT_EQ(store_->backends().size(), 2);
+  auto tier =
+      std::dynamic_pointer_cast<backends::storage::PosixKVCacheStoreBackend>(
+          store_->backends()[1]);
+  ASSERT_NE(tier, nullptr);
+  EXPECT_EQ(tier->dp_rank(), "7");
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_backend = mock_backend.get();
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(
+          telemetry::metric_names::kStorageMetadataCheckTotal,
+          testing::ElementsAre(
+              testing::FieldsAre(telemetry::metric_labels::kDpRank, "7"),
+              testing::FieldsAre(telemetry::metric_labels::kResult,
+                                 telemetry::metric_labels::kResultStatMiss)),
+          1));
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result, store_->Lookup({"missing"}));
+  EXPECT_TRUE(result.empty());
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

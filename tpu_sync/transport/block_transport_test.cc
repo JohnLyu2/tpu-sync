@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,6 +46,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
@@ -56,18 +58,19 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "peregrine/src/api/v1/conn_util.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/prometheus_exporter.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/block_transport_session.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -76,6 +79,7 @@ namespace {
 
 using ::absl_testing::StatusIs;
 using ::peregrine::v1::ConnectToPeer;
+using ::peregrine::v1::IsPspSupported;
 using ::peregrine::v1::ReadExact;
 using ::testing::Each;
 using ::testing::Eq;
@@ -125,9 +129,16 @@ struct ScopedPrometheusBackend {
 
 class StubReceiveSession : public TransferSession {
  public:
+  StubReceiveSession() = default;
+  explicit StubReceiveSession(std::function<void()> on_data_received)
+      : on_data_received_(std::move(on_data_received)) {}
+
   absl::Status Start() override { return absl::OkStatus(); }
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return std::nullopt;
+  }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return std::chrono::steady_clock::time_point::max();
   }
   bool Done() const override {
     absl::MutexLock lock(mu_);
@@ -175,6 +186,9 @@ class StubReceiveSession : public TransferSession {
   absl::Status OnDataReceived(size_t major_dimension_idx,
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override {
+    if (on_data_received_) {
+      on_data_received_();
+    }
     return absl::OkStatus();
   }
   tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
@@ -184,8 +198,13 @@ class StubReceiveSession : public TransferSession {
     absl::MutexLock lock(mu_);
     return mu_.AwaitWithTimeout(absl::Condition(&done_), timeout);
   }
+  int in_flight() const {
+    absl::MutexLock lock(mu_);
+    return in_flight_;
+  }
 
  private:
+  std::function<void()> on_data_received_;
   mutable absl::Mutex mu_;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
@@ -250,13 +269,6 @@ class MockDelegate : public BlockTransportDelegate {
     };
   }
 
-  absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid) override {
-    (void)pool_idx;
-    (void)uuid;
-    ++pool_completion_count_;
-    return absl::OkStatus();
-  }
-
   void SetPoolPushProgress(uint64_t uuid, size_t expected_pushes_per_pool,
                            std::vector<size_t> transfer_pool_indices) {
     pool_progress_uuid_ = uuid;
@@ -264,14 +276,21 @@ class MockDelegate : public BlockTransportDelegate {
     transfer_pool_indices_ = std::move(transfer_pool_indices);
   }
 
-  void RegisterBlockReadinessCallback(size_t layer_idx, size_t shard_idx,
-                                      int block_id, uint64_t uuid,
-                                      HostBlockReadyCallback cb) override {
-    {
+  std::vector<BlockChunk> GetBlockChunks(size_t layer_idx, size_t shard_idx,
+                                         absl::Span<const int64_t> block_ids,
+                                         size_t total_bytes, uint64_t uuid,
+                                         int64_t sender_node_id = -1,
+                                         absl::string_view peer = "",
+                                         int64_t src_block_id = -1,
+                                         int64_t dst_block_id = -1) override {
+    if (!block_ids.empty()) {
       absl::MutexLock lock(wait_events_mu_);
-      wait_events_.push_back(std::make_tuple(layer_idx, shard_idx, block_id));
+      wait_events_.push_back(std::make_tuple(layer_idx, shard_idx,
+                                             static_cast<int>(block_ids[0])));
     }
-    cb(absl::OkStatus());
+    return BlockTransportDelegate::GetBlockChunks(
+        layer_idx, shard_idx, block_ids, total_bytes, uuid, sender_node_id,
+        peer, src_block_id, dst_block_id);
   }
 
   void SetPeerChannel(absl::string_view peer,
@@ -376,7 +395,8 @@ class MockDelegate : public BlockTransportDelegate {
   std::vector<std::tuple<size_t, size_t, int>> wait_events_;
   mutable absl::Mutex sessions_mu_;
   std::shared_ptr<TransferSession> default_session_ =
-      std::make_shared<StubReceiveSession>();
+      std::make_shared<StubReceiveSession>(
+          [this]() { ++pool_completion_count_; });
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
       ABSL_GUARDED_BY(sessions_mu_);
   mutable absl::Mutex peer_channels_mu_;
@@ -461,10 +481,10 @@ class PlanRequiringDelegate : public MockDelegate {
 class BlockTransportTest : public ::testing::TestWithParam<bool> {
  protected:
   void SetUp() override {
-    if (GetParam() && !lib::IsPspSupported()) {
+    if (GetParam() && !IsPspSupported()) {
       GTEST_SKIP() << "PSP-TCP is unimplemented.";
     }
-    absl::SetFlag(&FLAGS_require_psp_tcp, GetParam());
+    absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, GetParam());
   }
 
   void TearDown() override {
@@ -690,6 +710,26 @@ TEST_P(BlockTransportTest, PushNamesTheReceiversArrayByWireLayerIndex) {
   EXPECT_EQ(receiver_delegate.data(1)[63], 0xAB);
   EXPECT_EQ(receiver_delegate.data(0)[0], 0x00);
 }
+
+// Delegate whose blocks resolve to two non-adjacent 32-byte chunks (bytes
+// [0,32) and [64,96) of a 128-byte block), on both the sender and the receiver.
+// Block 3's second chunk runs past the end of the array (a bad delegate).
+class SplitChunkDelegate : public MockDelegate {
+ public:
+  SplitChunkDelegate() : MockDelegate(/*slice_size=*/128, /*max_blocks=*/4) {}
+
+  std::vector<BlockChunk> GetBlockChunks(size_t layer_idx, size_t shard_idx,
+                                         absl::Span<const int64_t> block_ids,
+                                         size_t, uint64_t, int64_t,
+                                         absl::string_view, int64_t,
+                                         int64_t dst_block_id) override {
+    const int64_t block = dst_block_id >= 0 ? dst_block_id : block_ids[0];
+    if (block < 0 || block >= 4) return {};
+    uint8_t* base = data(layer_idx, shard_idx) + block * 128;
+    const uint32_t second = block == 3 ? 96 : 32;
+    return {{.ptr = base, .size = 32}, {.ptr = base + 64, .size = second}};
+  }
+};
 
 // Receiver delegate recording every OnBlockShardsReceived report as
 // (block_ids, shard_ids).
@@ -2561,17 +2601,17 @@ TEST(PeregrineRecvCompleteTest, AllLayerPushIsRejected) {
   EXPECT_EQ(delegate.layer_completion_count(), 0);
 }
 
-TEST(PeregrineRecvCompleteTest, PerRequestMetadataIsNotInterpretedYet) {
+TEST(PeregrineRecvCompleteTest, PerRequestMetadataIsAcceptedAtCompletion) {
+  // Peregrine hands the Post's request list to the completion callback; it
+  // was consumed by ResolveRecvBuffer and completion is accounted per Post.
   MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1, /*num_layers=*/1,
                         /*num_shards=*/2);
   BlockTransport transport(&delegate, 0);
   const std::vector<lib::RequestMetadata> requests = {{.shard = 0}};
 
-  EXPECT_THAT(transport.OnRecvComplete(
-                  lib::PostMetadata{.uuid = 0, .remote_id = 1, .local_id = 0},
-                  requests),
-              StatusIs(absl::StatusCode::kUnimplemented));
-  EXPECT_EQ(delegate.layer_completion_count(), 0);
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{.uuid = 0, .remote_id = 1, .local_id = 0}, requests));
+  EXPECT_EQ(delegate.layer_completion_count(), 1);
 }
 
 // A send session admits no incoming push: TryBeginOp() refuses it, so the
@@ -2582,6 +2622,9 @@ TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
     absl::Status Start() override { return absl::OkStatus(); }
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
       return std::nullopt;
+    }
+    std::chrono::steady_clock::time_point deadline() const override {
+      return std::chrono::steady_clock::time_point::max();
     }
     bool Done() const override { return false; }
     void Finish(const absl::Status& status) override {}
@@ -2619,6 +2662,335 @@ TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
                   /*requests=*/{}),
               StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
+}
+
+TEST(PeregrineResolveRecvBufferTest, ResolvesBlockChunk) {
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/2,
+                        /*num_shards=*/2);
+  BlockTransport transport(&delegate, 0);
+  const lib::PostMetadata post{.uuid = 11, .remote_id = 1, .local_id = 1};
+  // The default delegate resolves one chunk per block.
+  EXPECT_EQ(transport.ResolveRecvBuffer(post, {.shard = 1,
+                                               .block_id = 2,
+                                               .src_block_id = -1,
+                                               .chunk_idx = 0,
+                                               .len = 64}),
+            delegate.block_data(2, /*layer_idx=*/1, /*shard_idx=*/1));
+  EXPECT_EQ(transport.ResolveRecvBuffer(post, {.shard = 0,
+                                               .block_id = 3,
+                                               .src_block_id = 7,
+                                               .chunk_idx = 0,
+                                               .len = 64}),
+            delegate.block_data(3, /*layer_idx=*/1, /*shard_idx=*/0));
+}
+
+TEST(PeregrineResolveRecvBufferTest, ResolvesChunksOfSplitBlock) {
+  // SplitChunkDelegate resolves a 128-byte block to two 32-byte chunks at
+  // offsets 0 and 64, and nothing for a block past its 4 blocks.
+  SplitChunkDelegate delegate;
+  BlockTransport transport(&delegate, 0);
+  const lib::PostMetadata post{.uuid = 11, .remote_id = 1, .local_id = 0};
+  uint8_t* base = delegate.data() + 2 * 128;
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 0, .len = 32}),
+            base);
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 1, .len = 32}),
+            base + 64);
+  // Past the chunk list; longer than the chunk; block with no chunks.
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 2, .len = 32}),
+            nullptr);
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 1, .len = 33}),
+            nullptr);
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 4, .chunk_idx = 0, .len = 32}),
+            nullptr);
+  // A chunk list that runs past the array fails ValidateChunks.
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 3, .chunk_idx = 0, .len = 32}),
+            nullptr);
+}
+
+TEST(PeregrineResolveRecvBufferTest, RejectsOutOfRangeRequests) {
+  const lib::PostMetadata post{.uuid = 11, .remote_id = 1, .local_id = 0};
+  // A refusal fails the uuid's transfer session, so each probe is isolated.
+  auto resolve = [](const lib::PostMetadata& p,
+                    const lib::RequestMetadata& req) {
+    MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4,
+                          /*num_layers=*/2, /*num_shards=*/2);
+    BlockTransport transport(&delegate, 0);
+    return transport.ResolveRecvBuffer(p, req);
+  };
+  EXPECT_NE(resolve(post, {.shard = 0, .block_id = 0, .len = 64}), nullptr);
+
+  // Block array (from the Post) out of range, including the all-layer
+  // sentinel.
+  EXPECT_EQ(
+      resolve(lib::PostMetadata{.uuid = 11, .remote_id = 1, .local_id = 2},
+              {.shard = 0, .block_id = 0, .len = 64}),
+      nullptr);
+  EXPECT_EQ(resolve(
+                lib::PostMetadata{
+                    .uuid = 11, .remote_id = 1, .local_id = 0xFFFF'FFFF},
+                {.shard = 0, .block_id = 0, .len = 64}),
+            nullptr);
+  // The sentinel is refused even when it would expand to exactly one array.
+  MockDelegate one_array(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/1,
+                         /*num_shards=*/2);
+  BlockTransport one_array_transport(&one_array, 0);
+  EXPECT_EQ(one_array_transport.ResolveRecvBuffer(
+                lib::PostMetadata{
+                    .uuid = 11, .remote_id = 1, .local_id = 0xFFFF'FFFF},
+                {.shard = 0, .block_id = 0, .len = 64}),
+            nullptr);
+  EXPECT_NE(one_array_transport.ResolveRecvBuffer(
+                lib::PostMetadata{.uuid = 11, .remote_id = 1, .local_id = 0},
+                {.shard = 0, .block_id = 0, .len = 64}),
+            nullptr);
+  // Shard mask addressing a shard the receiver does not have; a request
+  // whose shard is outside its Post's mask (mask 0 is every shard).
+  EXPECT_EQ(resolve(
+                lib::PostMetadata{
+                    .uuid = 11, .remote_id = 1, .local_id = 0, .shard_mask = 4},
+                {.shard = 0, .block_id = 0, .len = 64}),
+            nullptr);
+  const lib::PostMetadata shard0_only{
+      .uuid = 11, .remote_id = 1, .local_id = 0, .shard_mask = 1};
+  EXPECT_NE(resolve(shard0_only, {.shard = 0, .block_id = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(resolve(shard0_only, {.shard = 1, .block_id = 0, .len = 64}),
+            nullptr);
+}
+
+TEST(PeregrineResolveRecvBufferTest, AppliesIncomingPushAdmissionChecks) {
+  // Same gates as the socket receive path, before any byte lands.
+  // Pool-mode worker: a push whose uuid has no registered plan is refused.
+  PlanRequiringDelegate pool_mode(/*slice_size=*/64, /*max_blocks=*/4);
+  BlockTransport pool_transport(&pool_mode, 0);
+  EXPECT_EQ(pool_transport.ResolveRecvBuffer(
+                lib::PostMetadata{.uuid = 11, .remote_id = 1, .local_id = 0},
+                {.shard = 0, .block_id = 0, .len = 64}),
+            nullptr);
+
+  // Plan-keyed uuid: only the pools in the plan's transfer set are writable.
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/2);
+  delegate.SetPoolPushProgress(/*uuid=*/12, /*expected_pushes_per_pool=*/1,
+                               /*transfer_pool_indices=*/{1});
+  BlockTransport transport(&delegate, 0);
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                lib::PostMetadata{.uuid = 12, .remote_id = 1, .local_id = 1},
+                {.shard = 0, .block_id = 0, .len = 64}),
+            delegate.block_data(0, /*layer_idx=*/1));
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                lib::PostMetadata{.uuid = 12, .remote_id = 1, .local_id = 0},
+                {.shard = 0, .block_id = 0, .len = 64}),
+            nullptr);
+}
+
+// The transfer session's in-flight op is held from a Post's first resolved
+// request until the Post completes.
+TEST(PeregrineResolveRecvBufferLeaseTest, HeldFromFirstRequestToCompletion) {
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/3,
+                        /*num_shards=*/2);
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(31, session);
+  BlockTransport transport(&delegate, 0);
+  const lib::PostMetadata post{.uuid = 31, .remote_id = 1, .local_id = 0};
+
+  EXPECT_NE(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 1);
+  // Further requests of the same Post reuse the op.
+  EXPECT_NE(transport.ResolveRecvBuffer(
+                post, {.shard = 1, .block_id = 2, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 1);
+  // A different Post of the same uuid (the other layer) takes its own op.
+  const lib::PostMetadata other{.uuid = 31, .remote_id = 1, .local_id = 1};
+  EXPECT_NE(transport.ResolveRecvBuffer(
+                other, {.shard = 0, .block_id = 1, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 2);
+
+  // Completion releases exactly that Post's op (once per Post, not per
+  // request) and does not take another.
+  ABSL_EXPECT_OK(transport.OnRecvComplete(post, /*requests=*/{}));
+  EXPECT_EQ(session->in_flight(), 1);
+  ABSL_EXPECT_OK(session->GetStatus());
+  // A completion that cannot be accounted (here: a second sender on a layer
+  // that expects one) still releases the Post's op, with the error.
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{.uuid = 31, .remote_id = 2, .local_id = 1},
+      /*requests=*/{}));
+  EXPECT_EQ(session->in_flight(), 1);
+  EXPECT_THAT(transport.OnRecvComplete(other, /*requests=*/{}),
+              StatusIs(absl::StatusCode::kAlreadyExists));
+  EXPECT_EQ(session->in_flight(), 0);
+  EXPECT_FALSE(session->GetStatus().ok());
+}
+
+TEST(PeregrineResolveRecvBufferLeaseTest, ConcurrentRequestsAdmitOnce) {
+  // Concurrent requests of one Post admit it exactly once.
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/1,
+                        /*num_shards=*/4);
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(36, session);
+  BlockTransport transport(&delegate, 0);
+  const lib::PostMetadata post{.uuid = 36, .remote_id = 1, .local_id = 0};
+
+  constexpr int kThreads = 16;
+  std::vector<std::thread> threads;
+  std::vector<uint8_t*> addrs(kThreads, nullptr);
+  absl::Notification go;
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      go.WaitForNotification();
+      addrs[i] = transport.ResolveRecvBuffer(
+          post, {.shard = static_cast<uint32_t>(i % 4),
+                 .block_id = i % 4,
+                 .chunk_idx = 0,
+                 .len = 64});
+    });
+  }
+  go.Notify();
+  for (std::thread& t : threads) t.join();
+
+  for (int i = 0; i < kThreads; ++i) {
+    EXPECT_EQ(addrs[i], delegate.block_data(i % 4, /*layer_idx=*/0,
+                                            /*shard_idx=*/i % 4))
+        << "request " << i;
+  }
+  EXPECT_EQ(session->in_flight(), 1);
+  ABSL_EXPECT_OK(transport.OnRecvComplete(post, /*requests=*/{}));
+  EXPECT_EQ(session->in_flight(), 0);
+}
+
+TEST(PeregrineResolveRecvBufferLeaseTest, ReleasedWhenARequestIsRefused) {
+  MockDelegate delegate(64, 4, 1, 1);
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(32, session);
+  BlockTransport transport(&delegate, 0);
+  const lib::PostMetadata post{.uuid = 32, .remote_id = 1, .local_id = 0};
+
+  EXPECT_NE(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 1);
+  // A bad request of an admitted Post: Peregrine drops the whole Post and
+  // will never complete it, so the op is released now and the session fails.
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 9, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 0);
+  EXPECT_FALSE(session->GetStatus().ok());
+  // Later requests of the refused Post re-run the gates, which the failed
+  // transfer session refuses; a completion of it is not counted as a landing.
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 0);
+  EXPECT_THAT(transport.OnRecvComplete(post, {}),
+              StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(session->in_flight(), 0);
+
+  // uuid 0 has no transfer session to fail: a refused Post must not poison
+  // the next push of the same layer.
+  const lib::PostMetadata legacy{.uuid = 0, .remote_id = 1, .local_id = 0};
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                legacy, {.shard = 0, .block_id = 9, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_NE(transport.ResolveRecvBuffer(
+                legacy, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+            nullptr);
+
+  // Mid-Post transport failure reported through OnRecvComplete releases the
+  // held op and fails the transfer session.
+  auto dropped_session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(37, dropped_session);
+  const lib::PostMetadata dropped{.uuid = 37, .remote_id = 1, .local_id = 0};
+  EXPECT_NE(transport.ResolveRecvBuffer(
+                dropped,
+                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(dropped_session->in_flight(), 1);
+  EXPECT_THAT(transport.OnRecvComplete(
+                  dropped, /*requests=*/{},
+                  absl::UnavailableError("sender dropped mid-post")),
+              StatusIs(absl::StatusCode::kUnavailable));
+  EXPECT_EQ(dropped_session->in_flight(), 0);
+  EXPECT_THAT(dropped_session->GetStatus(),
+              StatusIs(absl::StatusCode::kUnavailable));
+}
+
+TEST(PeregrineResolveRecvBufferLeaseTest, NotTakenWhenSessionIsDraining) {
+  MockDelegate delegate(64, 4, 1, 1);
+  auto session = std::make_shared<StubReceiveSession>();
+  session->Finish(absl::CancelledError("draining"));
+  delegate.RegisterSession(33, session);
+  BlockTransport transport(&delegate, 0);
+  EXPECT_EQ(transport.ResolveRecvBuffer(
+                {.uuid = 33, .remote_id = 1, .local_id = 0},
+                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 0);
+}
+
+TEST(PeregrineResolveRecvBufferLeaseTest, ReleasedByForgetPushProgress) {
+  MockDelegate delegate(64, 4, 1, 1);
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(34, session);
+  BlockTransport transport(&delegate, 0);
+  EXPECT_NE(transport.ResolveRecvBuffer(
+                {.uuid = 34, .remote_id = 1, .local_id = 0},
+                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+            nullptr);
+  EXPECT_EQ(session->in_flight(), 1);
+  // The transfer is torn down (failure / timeout) with the Post in flight.
+  transport.ForgetPushProgress(34);
+  EXPECT_EQ(session->in_flight(), 0);
+  EXPECT_FALSE(session->GetStatus().ok());
+
+  // A new transfer reuses the uuid. Late traffic of the old one is handled as
+  // a fresh Post against the new transfer and leaves it balanced.
+  auto reused = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(34, reused);
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      {.uuid = 34, .remote_id = 1, .local_id = 0}, /*requests=*/{}));
+  EXPECT_EQ(reused->in_flight(), 0);
+  ABSL_EXPECT_OK(reused->GetStatus());
+}
+
+TEST(PeregrineResolveRecvBufferLeaseTest,
+     CompletionWithoutResolutionBracketsItself) {
+  // A Post whose addresses the sender supplied never calls the resolver; its
+  // completion takes and releases the op around the accounting, as before.
+  MockDelegate delegate(64, 4, 1, 1);
+  auto session = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(35, session);
+  BlockTransport transport(&delegate, 0);
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      {.uuid = 35, .remote_id = 1, .local_id = 0}, /*requests=*/{}));
+  EXPECT_EQ(session->in_flight(), 0);
+  ABSL_EXPECT_OK(session->GetStatus());
+
+  // A push session that completes while another Post it admitted is still in
+  // flight keeps that Post's op until the Post completes.
+  auto other = std::make_shared<StubReceiveSession>();
+  delegate.RegisterSession(36, other);
+  const lib::PostMetadata admitted{.uuid = 36, .remote_id = 1, .local_id = 0};
+  EXPECT_NE(
+      transport.ResolveRecvBuffer(
+          admitted, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
+      nullptr);
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      {.uuid = 36, .remote_id = 2, .local_id = 0}, /*requests=*/{}));
+  EXPECT_EQ(other->in_flight(), 1);
+  EXPECT_THAT(transport.OnRecvComplete(admitted, /*requests=*/{}),
+              StatusIs(absl::StatusCode::kAlreadyExists));
+  EXPECT_EQ(other->in_flight(), 0);
 }
 
 }  // namespace

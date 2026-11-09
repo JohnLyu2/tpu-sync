@@ -290,6 +290,27 @@ cc_library(
 )
 
 cc_library(
+    name = "host_meminfo",
+    srcs = ["host_meminfo.cc"],
+    hdrs = ["host_meminfo.h"],
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_test(
+    name = "host_meminfo_test",
+    srcs = ["host_meminfo_test.cc"],
+    deps = [
+        ":host_meminfo",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "kv_cache_manager_base",
     srcs = [
         "kv_cache_manager_base.cc",
@@ -304,6 +325,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":host_meminfo",
         ":kv_cache_store_backend_factory",
         ":logical_block_manager",
         ":pool_layout",
@@ -460,10 +482,13 @@ cc_test(
         ":kv_cache_manager_base",
         ":kv_cache_manager_with_transfer",
         ":pool_layout",
+        "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
         "//tpu_sync/transport:transfer_session",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
@@ -471,6 +496,7 @@ cc_test(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla:future",
     ],
 )
 
@@ -490,12 +516,15 @@ cc_test(
         ":kv_cache_manager_base",
         ":kv_cache_manager_with_transfer",
         ":pool_layout",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:staging_arena",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla:future",
         "@xla//xla/tsl/platform:statusor",
     ],
 )
@@ -517,17 +546,22 @@ cc_test(
         ":kv_cache_manager_with_transfer",
         ":pool_layout",
         ":transfer_plan",
+        "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:staging_arena",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:transfer_session",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla:future",
         "@xla//xla/tsl/concurrency:future",
         "@xla//xla/tsl/platform:statusor",
     ],
@@ -569,6 +603,7 @@ cc_test(
         ":kv_cache_manager_base",
         ":kv_cache_manager_with_transfer",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:staging_arena",
         "//tpu_sync/transport:block_transport",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
@@ -608,6 +643,32 @@ cc_test(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "kv_cache_manager_with_transfer_host_memory_test",
+    size = "small",
+    srcs = ["kv_cache_manager_with_transfer_host_memory_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":kv_cache_manager_base",
+        ":kv_cache_manager_with_transfer",
+        "//tpu_sync/core:metrics_collector",
+        "//tpu_sync/fault_injection:hooks",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -729,7 +790,10 @@ cc_test(
 cc_library(
     name = "lru_cache",
     hdrs = ["lru_cache.h"],
-    deps = ["@com_google_absl//absl/container:flat_hash_map"],
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:check",
+    ],
 )
 
 cc_test(
@@ -754,6 +818,7 @@ cc_library(
     hdrs = ["kv_cache_store_backend.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":block_tracker",
         "//tpu_sync/common:raiden_id",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/log:check",
@@ -797,10 +862,12 @@ cc_library(
         "//tpu_sync/proto:kv_cache_store_service_cc_proto",
         "//tpu_sync/proto:worker_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/functional:any_invocable",
@@ -1001,6 +1068,7 @@ cc_library(
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
         "//tpu_sync/kv_cache/reshard:reshard_service",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
@@ -1041,6 +1109,7 @@ cc_test(
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
         ":kv_cache_store_server",
+        ":kv_cache_telemetry",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raiden_transfer_endpoint",
@@ -1054,6 +1123,7 @@ cc_test(
         "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
+        "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
@@ -1103,11 +1173,16 @@ cc_test(
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",

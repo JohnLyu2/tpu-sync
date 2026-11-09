@@ -51,8 +51,6 @@ class StartTransferRequest;
 namespace tpu_raiden {
 
 class MetricsCollector;
-class ReshardReceiveSession;
-class ReshardSendSession;
 class TransferSendSession;
 class TransferReceiveSession;
 
@@ -91,6 +89,15 @@ struct CompleteReadResult {
   absl::flat_hash_map<std::string, TransferDetails> details;
 };
 
+// Where the blocks of a transfer live on this manager: in the device buffers
+// it wraps, or in its host pool. A device send is staged device-to-host
+// before it is pushed; a host send is pushed straight from the named host
+// blocks. A device receive lands in host staging and is copied
+// host-to-device; a host receive lands in the named host blocks and settles
+// there, so a consumer whose KV lives in host memory (e.g. a hierarchical
+// cache) takes it without a round trip through its device.
+enum class BlockLocation { kDevice, kHost };
+
 struct CopySpec {
   std::vector<int64_t> src_offsets;
   std::vector<int64_t> dst_offsets;
@@ -124,7 +131,6 @@ std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
 class KVCacheManagerWithTransfer {
  public:
   friend class TransferReceiveSession;
-  friend class ReshardReceiveSession;
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -177,15 +183,31 @@ class KVCacheManagerWithTransfer {
 
   // Registers `block_ids` to be served when a consumer pulls `uuid`. Returns
   // `uuid`, or 0 when there is nothing to send (`block_ids` is empty, or the
-  // consumer has already acknowledged the transfer). Throws
-  // `std::invalid_argument` if `block_ids` contains duplicate block IDs, and
+  // consumer has already acknowledged the transfer). With `source` kHost the
+  // ids name blocks of this manager's host pool, pushed as they are (no
+  // staging, no device-to-host copy): the caller's own writes into them must
+  // have completed before the call, and the caller keeps them unchanged until
+  // the send settles. Throws `std::invalid_argument` on duplicate or
+  // out-of-pool block ids, on kHost where `CheckHostMemoryTransferSupported`
+  // fails, and on kDevice where `ServesHostPoolReadsOnly()`; throws
   // `std::runtime_error` if `uuid` already has an active registered read.
   virtual int64_t NotifyForRead(
       const std::string& req_id, uint64_t uuid,
       const std::vector<int64_t>& block_ids,
       std::optional<std::chrono::steady_clock::time_point> deadline =
-          std::nullopt);
+          std::nullopt,
+      BlockLocation source = BlockLocation::kDevice);
 
+  // Pulls `remote_block_ids` of the producer at `remote_endpoint` into
+  // `local_block_ids`. With `destination` kDevice the blocks land in host
+  // staging (`local_host_block_ids` when given, else blocks leased from the
+  // staging pool) and are copied into the device blocks `local_block_ids`.
+  // With kHost they land in the host blocks `local_block_ids` (no repeats,
+  // `local_host_block_ids` must be empty) and the read settles once every
+  // layer has arrived. Throws `std::invalid_argument` on a bad block id list
+  // and on kHost where `CheckHostMemoryTransferSupported` fails. Only the
+  // producer needs a control server: this manager advertises its data port in
+  // the pull request whether or not it serves pulls itself.
   virtual void StartRead(
       const std::string& req_id, uint64_t uuid,
       const std::string& remote_endpoint,
@@ -193,7 +215,8 @@ class KVCacheManagerWithTransfer {
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
       std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
       std::optional<std::chrono::steady_clock::time_point> deadline =
-          std::nullopt);
+          std::nullopt,
+      BlockLocation destination = BlockLocation::kDevice);
 
   // Reports each transfer settled since the previous poll, exactly once, with
   // its details.
@@ -242,7 +265,8 @@ class KVCacheManagerWithTransfer {
       const std::vector<RaidenTransferEndpoint>& remote_descriptors,
       const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
-      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
+      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
+      BlockLocation destination = BlockLocation::kDevice);
 
   virtual int local_control_port() const { return local_control_port_; }
   virtual int64_t node_id() const { return node_id_; }
@@ -266,8 +290,27 @@ class KVCacheManagerWithTransfer {
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
 
+  // What a registered session does. The pool-reshard session types are
+  // private to their .cc files, so the manager tells them apart by role.
+  enum class SessionRole {
+    kTransfer,            // TransferSendSession or TransferReceiveSession.
+    kPoolReshardSend,     // Registered by PoolReshardPush.
+    kPoolReshardReceive,  // Registered by PoolReshardRegisterRecv.
+  };
+
+  // A registered session and the req_id its terminal is reported under.
+  // Every construction states |role| explicitly; an omitted |role| would
+  // value-initialize to kTransfer.
+  struct SessionEntry {
+    std::shared_ptr<TransferSession> session;
+    std::string req_id;
+    SessionRole role;
+  };
+
+  // Registers |session| under |uuid|, recording |req_id| as its req_id.
   absl::Status EmplaceRecvSessionLocked(
-      uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
+      uint64_t uuid, absl::string_view req_id,
+      const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   template <typename SessionT>
@@ -277,25 +320,23 @@ class KVCacheManagerWithTransfer {
     if (it == sessions_.end()) {
       return nullptr;
     }
-    return std::dynamic_pointer_cast<SessionT>(it->second);
+    return std::dynamic_pointer_cast<SessionT>(it->second.session);
   }
 
-  // If |it->second| is already Done(), records its terminal completion into
+  // If |it|'s session is already Done(), records its terminal completion into
   // |done_sending_| / |done_recving_| / |failed_recving_| /
   // |transfer_details_|, erases |it| from |sessions_|, and returns true.
   // Otherwise returns false. Never calls Finish(): a caller that wants a
   // ready-to-complete session retired must finish it first.
   bool RetireSettledSessionLocked(
-      absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>>::iterator
-          it,
+      absl::flat_hash_map<uint64_t, SessionEntry>::iterator it,
       bool* retired_push_progress = nullptr,
       bool* retired_pool_staging = nullptr) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   void StartControlServer();
   void StopControlServer();
 
-  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
-      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, SessionEntry> sessions_ ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_set<uint64_t> pending_pool_reshard_recvs_
       ABSL_GUARDED_BY(mu_);
@@ -335,36 +376,34 @@ class KVCacheManagerWithTransfer {
   // Registering sub-plan 0 of a chain starts a fresh entry for its req_id
   // (the coordinator arms sub-plan 0 before any other sub-plan of the
   // chain), so a retry under a reused req_id is tracked on its own; only
-  // sessions registered into the current entry (`plan_uuids`) count toward
+  // sessions registered into the current entry (`sub_sessions`) count toward
   // it, and late terminals of an earlier chain's sub-plans are ignored.
   struct SubPlanChainProgress {
-    int32_t count = 0;
-    absl::flat_hash_set<int32_t> settled;
+    // Indexed by sub_plan_index; nullptr slots await registration. Cleared
+    // once the chain's terminal is reported.
+    std::vector<std::shared_ptr<TransferSession>> sub_sessions;
+    bool completed = false;
     bool failed = false;
     std::chrono::steady_clock::time_point last_activity;
     // Set once sub-plan 0 of the chain has registered here; from then on
-    // only sessions in `plan_uuids` belong to this chain.
+    // only sessions in `sub_sessions` belong to this chain.
     bool anchored = false;
-    absl::flat_hash_set<uint64_t> plan_uuids;
   };
-  absl::flat_hash_map<std::string, SubPlanChainProgress> recv_chains_
+  absl::flat_hash_map<std::string, SubPlanChainProgress> sub_plan_chains_
       ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<std::string, SubPlanChainProgress> send_chains_
-      ABSL_GUARDED_BY(mu_);
-  // Records a newly registered pool-reshard session of plan `uuid` into its
-  // request's sub-plan chain (no-op for single-plan requests).
-  void NoteSubPlanRegisteredLocked(bool is_recv, const std::string& req_id,
-                                   uint64_t uuid, int32_t sub_plan_index,
-                                   int32_t sub_plan_count)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  // Records a settled pool-reshard session of plan `uuid` (`is_recv` selects
+  // Records a newly registered pool-reshard |session| into its request's
+  // sub-plan chain (clears any stale chain entry for single-plan requests).
+  void NoteSubPlanRegisteredLocked(
+      const std::string& req_id,
+      const std::shared_ptr<TransferSession>& session, int32_t sub_plan_index,
+      int32_t sub_plan_count) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Records a settled pool-reshard |session| of plan `uuid` (`is_recv` selects
   // the role) into the terminal sets, aggregating per request across its
   // sub-plans.
-  void RecordPoolReshardTerminalLocked(bool is_recv, const std::string& req_id,
-                                       uint64_t uuid, int32_t sub_plan_index,
-                                       int32_t sub_plan_count,
-                                       const absl::Status& status)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void RecordPoolReshardTerminalLocked(
+      bool is_recv, const std::string& req_id, uint64_t uuid,
+      const std::shared_ptr<TransferSession>& session,
+      const absl::Status& status) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   // Fails stalled sub-plan chains and expires reported ones.
   void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -384,6 +423,32 @@ class KVCacheManagerWithTransfer {
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);
   uint64_t MaxPullStreamBlocks() const;
+  // Blocks of this manager's host pool, as a transfer may name them.
+  int64_t NumHostBlocks() const;
+  // How `CheckHostBlockIds` treats a block id named more than once.
+  enum class HostBlockIdPolicy { kAllowRepeats, kRequireUnique };
+  // Throws `std::invalid_argument` when a block id falls outside the host
+  // pool, or, with `kRequireUnique`, when a block id repeats. `context` opens
+  // the message (e.g. "StartRead req_id=...").
+  void CheckHostBlockIds(absl::Span<const int64_t> block_ids,
+                         absl::string_view context,
+                         HostBlockIdPolicy policy) const;
+  // Throws `std::invalid_argument` unless this manager can hold a host-memory
+  // transfer, i.e. a transfer whose blocks the caller names by host block id.
+  // That needs (1) one host buffer per layer: bounded host staging
+  // (`num_staging_layers`) leases buffers per layer and a host transfer never
+  // frees one, so the transport would wait forever; and (2) a host pool that
+  // nothing stages through (`StagingBlockAllocator::LeasesHostBlocks()` is
+  // false): a fixed slot or a dynamic lease could otherwise alias the very
+  // block a host transfer names, corrupting KV silently.
+  void CheckHostMemoryTransferSupported(absl::string_view context) const;
+
+  // True when this manager's control server sits over a host pool that
+  // nothing stages through. Such a server serves host reads only: a device
+  // read would stage through the pool its caller addresses by block id.
+  // Without a control server nothing is served, and a device registration
+  // merely expires.
+  bool ServesHostPoolReadsOnly() const;
 };
 
 }  // namespace tpu_raiden

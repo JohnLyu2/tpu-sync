@@ -47,6 +47,41 @@ cc_library(
     ],
 )
 
+flatbuffer_cc_library(
+    name = "metadata_cc_fbs",
+    srcs = ["metadata.fbs"],
+)
+
+cc_library(
+    name = "metadata",
+    srcs = ["metadata.cc"],
+    hdrs = ["metadata.h"],
+    deps = [
+        ":metadata_cc_fbs",
+        ":transport_adapter",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_test(
+    name = "metadata_test",
+    srcs = ["metadata_test.cc"],
+    deps = [
+        ":metadata",
+        ":transport_adapter",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "chunk_serializer_test",
     srcs = ["chunk_serializer_test.cc"],
@@ -241,7 +276,6 @@ cc_library(
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:buffer_push_task",
-        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -263,6 +297,7 @@ cc_library(
         "@peregrine//peregrine/src/api/v1:conn_pool",
         "@peregrine//peregrine/src/api/v1:histogram",
         "@peregrine//peregrine/src/api/v1:ip_util",
+        "@peregrine//peregrine/src/api/v1:psp",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@peregrine//peregrine/src/api/v1:socket_util",
     ],
@@ -288,7 +323,6 @@ cc_test(
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib/psp:peregrine_control_service",
         "//tpu_sync/transport/lib/psp:psp_syscall_mock",
-        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -307,6 +341,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api/v1:conn_util",
+        "@peregrine//peregrine/src/api/v1:psp",
         "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )

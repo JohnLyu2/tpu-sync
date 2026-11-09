@@ -23,7 +23,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -46,7 +45,6 @@
 #include "absl/types/span.h"
 #include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
-#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/label_util.h"
@@ -74,19 +72,6 @@ using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
-
-void RecordTransferFailure(const absl::Status& status,
-                           absl::string_view direction, uint64_t count = 1) {
-  RaidenMetricStore& store = RaidenMetricStore::GetGlobalMetricStore();
-  if (status.ok() || !store.HasBackends()) return;
-  const absl::string_view error_code =
-      absl::StatusCodeToStringView(status.code());
-  const MetricLabel labels[] = {
-      {metric_labels::kErrorCode, error_code},
-      {metric_labels::kDirection, direction},
-  };
-  store.IncrementCounter(metric_names::kTransferFailuresTotal, labels, count);
-}
 
 constexpr MetricLabel kPushLabels[] = {
     {.key = metric_labels::kDirection, .value = metric_labels::kDirectionPush},
@@ -124,35 +109,6 @@ std::vector<struct iovec> ToIovec(const std::vector<BlockChunk>& chunks) {
     }
   }
   return iov;
-}
-
-absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
-                            size_t sh, const std::vector<BlockChunk>& chunks) {
-  uint8_t* base = delegate->GetBlockArrayHostPointer(l, sh);
-  // Some legacy delegates intentionally expose only scattered per-block
-  // pointers and no flat array base. Preserve that contract; pool-aware
-  // managers always expose their exact pool span here.
-  if (base != nullptr) {
-    const size_t host_size = delegate->GetBlockArrayHostSize(l, sh);
-    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
-    for (const auto& chunk : chunks) {
-      const uintptr_t chunk_addr = reinterpret_cast<uintptr_t>(chunk.ptr);
-      if (chunk_addr < base_addr) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-      const size_t offset = chunk_addr - base_addr;
-      if (offset > host_size || chunk.size > host_size - offset) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-    }
-  }
-  return absl::OkStatus();
 }
 
 absl::StatusOr<MajorOrder> ParseMajorOrder(uint8_t value) {
@@ -230,7 +186,7 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
     BlockTransportDelegate* delegate, uint32_t local_id,
     bool is_explicit_dst_push, uint64_t uuid) {
   std::vector<int> target_layers;
-  if (local_id == 0xFFFFFFFF) {
+  if (local_id == lib::kUnspecifiedLocalId) {
     target_layers.resize(delegate->num_block_arrays());
     std::iota(target_layers.begin(), target_layers.end(), 0);
   } else {
@@ -316,9 +272,45 @@ absl::Status EndIncomingPush(const std::shared_ptr<TransferSession>& session,
 
 }  // namespace
 
+absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
+                            size_t sh, uint64_t uuid,
+                            absl::Span<const BlockChunk> chunks) {
+  ABSL_ASSIGN_OR_RETURN(const absl::Span<const char> span,
+                        delegate->GetBlockArrayHostSpan(l, sh, uuid));
+  // Some legacy delegates intentionally expose only scattered per-block
+  // pointers and no flat array base. Preserve that contract; pool-aware
+  // managers always expose their exact pool span here.
+  if (span.data() == nullptr) {
+    return absl::OkStatus();
+  }
+  const uintptr_t base_addr = reinterpret_cast<uintptr_t>(span.data());
+  for (const auto& chunk : chunks) {
+    const uintptr_t chunk_addr = reinterpret_cast<uintptr_t>(chunk.ptr);
+    if (chunk_addr < base_addr) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "Chunk out of bounds. Chunk ptr: ", chunk_addr,
+          ", size: ", chunk.size, ", Block array base: ", base_addr,
+          ", Block array size: ", span.size()));
+    }
+    const size_t offset = chunk_addr - base_addr;
+    if (offset > span.size() || chunk.size > span.size() - offset) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "Chunk out of bounds. Chunk ptr: ", chunk_addr,
+          ", size: ", chunk.size, ", Block array base: ", base_addr,
+          ", Block array size: ", span.size()));
+    }
+  }
+  return absl::OkStatus();
+}
+
 // ===========================================================================
 // BlockTransportServerPushSession
 // ===========================================================================
+
+BlockTransportServerPushSession::PostKey
+BlockTransportServerPushSession::PostKeyOf(const lib::PostMetadata& post) {
+  return {post.remote_id, post.local_id, post.shard_mask};
+}
 
 BlockTransportServerPushSession::BlockTransportServerPushSession(
     uint64_t uuid, BlockTransportDelegate* delegate,
@@ -335,11 +327,39 @@ absl::Status BlockTransportServerPushSession::status() const {
   return status_;
 }
 
-void BlockTransportServerPushSession::Cancel() {
+BlockTransportServerPushSession::~BlockTransportServerPushSession() {
+  ReleaseAdmittedPosts();
+}
+
+void BlockTransportServerPushSession::Cancel() { ReleaseAdmittedPosts(); }
+
+bool BlockTransportServerPushSession::HasAdmittedPosts() const {
   absl::MutexLock lock(mu_);
-  if (done_) return;
-  done_ = true;
-  status_ = absl::CancelledError("Push session cancelled");
+  return !peregrine_posts_.empty();
+}
+
+void BlockTransportServerPushSession::ReleaseAdmittedPosts() {
+  absl::Status status;
+  std::vector<std::shared_ptr<TransferSession>> held;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ && peregrine_posts_.empty()) return;
+    done_ = true;
+    if (status_.ok()) {
+      status_ = absl::CancelledError("Push session cancelled");
+    }
+    status = status_;
+    for (auto& [key, lease] : peregrine_posts_) {
+      if (lease->state == PostLease::State::kAdmitted) {
+        held.push_back(std::move(lease->session));
+        lease->state = PostLease::State::kReleased;
+      }
+    }
+    peregrine_posts_.clear();
+  }
+  for (const auto& session : held) {
+    EndIncomingPush(session, status).IgnoreError();
+  }
 }
 
 absl::Status BlockTransportServerPushSession::StartStream(
@@ -429,7 +449,8 @@ absl::Status BlockTransportServerPushSession::StartStream(
               absl::StrCat("No transfer chunks found for block ", dst_id,
                            " and uuid ", header.uuid));
         }
-        ABSL_RETURN_IF_ERROR(ValidateChunks(delegate_, l, sh, chunks));
+        ABSL_RETURN_IF_ERROR(
+            ValidateChunks(delegate_, l, sh, header.uuid, chunks));
 
         uint32_t expected_size = 0;
         for (const auto& chunk : chunks) {
@@ -458,10 +479,10 @@ absl::Status BlockTransportServerPushSession::StartStream(
         metric_names::kReceivedBytesTotal, kPushLabels, total_received_bytes);
   }
 
-  ABSL_RETURN_IF_ERROR(
-      CompleteIncomingPush(header.local_id, header.remote_id, header.reserved,
-                           header.buffer_id == 0 ? 0 : stream_shards.size(),
-                           push_spec.pool_progress_spec));
+  ABSL_RETURN_IF_ERROR(CompleteIncomingPush(
+      session, header.local_id, header.remote_id, header.reserved,
+      header.buffer_id == 0 ? 0 : stream_shards.size(),
+      push_spec.pool_progress_spec));
 
   // Report exactly the shards this stream carried: every shard for a legacy
   // stream, one route's subset for a routed stream. The delegate owns
@@ -480,38 +501,209 @@ absl::Status BlockTransportServerPushSession::StartStream(
 // ---------------------------------------------------------------------------
 // Peregrine receive path.
 // ---------------------------------------------------------------------------
+uint8_t* BlockTransportServerPushSession::ResolveRecvBuffer(
+    const lib::PostMetadata& post, const lib::RequestMetadata& req) {
+  const uint32_t layer = post.local_id;
+
+  absl::Status admitted;
+  std::shared_ptr<PostLease> lease;
+  {
+    absl::MutexLock lock(mu_);
+    if (!status_.ok()) {
+      admitted = status_;
+    } else if (auto it = peregrine_posts_.find(PostKeyOf(post));
+               it == peregrine_posts_.end()) {
+      if (done_) {
+        admitted = absl::CancelledError("Push session already completed");
+      } else {
+        lease = std::make_shared<PostLease>();
+        peregrine_posts_.emplace(PostKeyOf(post), lease);
+      }
+    } else {
+      // Another request of this Post is being admitted.
+      std::shared_ptr<PostLease> current = it->second;
+      AwaitSettled(*current);
+      if (!status_.ok()) {
+        admitted = status_;
+      } else if (current->state != PostLease::State::kAdmitted) {
+        admitted =
+            !current->status.ok()
+                ? current->status
+                : absl::FailedPreconditionError("Post already completed");
+      }
+    }
+  }
+  if (lease != nullptr) {
+    absl::StatusOr<std::shared_ptr<TransferSession>> session =
+        [&]() -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+      if (layer == lib::kUnspecifiedLocalId) {
+        return absl::InvalidArgumentError(
+            "Peregrine post requires an explicit layer/pool index");
+      }
+      ABSL_RETURN_IF_ERROR(
+          ShardsFromMask(post.shard_mask, delegate_->num_shards()).status());
+      ABSL_RETURN_IF_ERROR(
+          ResolveIncomingPushSpec(delegate_, layer,
+                                  /*is_explicit_dst_push=*/true, uuid_)
+              .status());
+      return BeginIncomingPush(delegate_, uuid_);
+    }();
+    admitted = session.status();
+    std::shared_ptr<TransferSession> release;
+    {
+      absl::MutexLock lock(mu_);
+      if (!session.ok()) {
+        lease->status = admitted;
+        DropLeaseLocked(post, lease);
+      } else if (!status_.ok() || done_) {
+        // Cancelled or completed while admitting: hand the op back without
+        // failing the transfer, which may already belong to a reused uuid.
+        admitted = !status_.ok()
+                       ? status_
+                       : absl::CancelledError("Push session already completed");
+        lease->status = admitted;
+        DropLeaseLocked(post, lease);
+        release = *std::move(session);
+      } else {
+        lease->session = *std::move(session);
+        lease->state = PostLease::State::kAdmitted;
+      }
+    }
+    if (release != nullptr) {
+      EndIncomingPush(release).IgnoreError();
+    }
+  }
+
+  // A request must address one of the shards its Post declared.
+  const bool shard_in_post =
+      req.shard < delegate_->num_shards() &&
+      (post.shard_mask == 0 ||
+       (req.shard < static_cast<uint32_t>(kMaxShardMaskBits) &&
+        ((post.shard_mask >> req.shard) & 1u)));
+  uint8_t* addr = nullptr;
+  absl::Status status = admitted;
+  if (status.ok()) {
+    if (!shard_in_post || req.block_id < 0 || req.len == 0) {
+      status = absl::InvalidArgumentError(
+          !shard_in_post ? "shard not in post" : "invalid block_id or len");
+    } else {
+      const int64_t block_id = req.block_id;
+      // Full block: the same chunk list the sender resolved, so `chunk_idx`
+      // means the same on both ends.
+      std::vector<BlockChunk> chunks = delegate_->GetBlockChunks(
+          layer, req.shard, absl::MakeConstSpan(&block_id, 1),
+          delegate_->block_bytes(layer), uuid_,
+          static_cast<int64_t>(post.remote_id), /*peer=*/"", req.src_block_id);
+      if (req.chunk_idx >= chunks.size() ||
+          chunks[req.chunk_idx].ptr == nullptr) {
+        status = absl::OutOfRangeError("chunk_idx out of range or null");
+      } else if (chunks[req.chunk_idx].size != req.len) {
+        status = absl::InvalidArgumentError("chunk length mismatch");
+      } else if (status =
+                     ValidateChunks(delegate_, layer, req.shard, uuid_, chunks);
+                 status.ok()) {
+        addr = chunks[req.chunk_idx].ptr;
+      }
+    }
+  }
+  if (addr == nullptr) {
+    status = absl::Status(
+        status.code(),
+        absl::StrCat("Peregrine request rejected: uuid=", uuid_,
+                     " remote=", post.remote_id, " array=", layer,
+                     " shard_mask=", post.shard_mask, " shard=", req.shard,
+                     " block=", req.block_id, " src_block=", req.src_block_id,
+                     " chunk=", req.chunk_idx, " len=", req.len, ": ",
+                     status.message()));
+    LOG_EVERY_N_SEC(ERROR, 1) << status;
+    if (admitted.ok()) RejectPost(post, status);
+  }
+  return addr;
+}
+
+void BlockTransportServerPushSession::AwaitSettled(const PostLease& lease) {
+  mu_.Await(absl::Condition(&lease, &PostLease::settled));
+}
+
+void BlockTransportServerPushSession::DropLeaseLocked(
+    const lib::PostMetadata& post, std::shared_ptr<PostLease> lease) {
+  lease->state = PostLease::State::kReleased;
+  auto it = peregrine_posts_.find(PostKeyOf(post));
+  if (it != peregrine_posts_.end() && it->second == lease) {
+    peregrine_posts_.erase(it);
+  }
+}
+
+void BlockTransportServerPushSession::RejectPost(const lib::PostMetadata& post,
+                                                 const absl::Status& status) {
+  std::shared_ptr<TransferSession> session;
+  bool release = false;
+  {
+    absl::MutexLock lock(mu_);
+    auto it = peregrine_posts_.find(PostKeyOf(post));
+    if (it != peregrine_posts_.end() &&
+        it->second->state == PostLease::State::kAdmitted) {
+      session = std::move(it->second->session);
+      release = true;
+      it->second->status = status;
+      DropLeaseLocked(post, it->second);
+    }
+  }
+  if (release) {
+    EndIncomingPush(session, status).IgnoreError();
+  }
+}
+
 absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
     const lib::PostMetadata& post,
-    absl::Span<const lib::RequestMetadata> requests) {
-  // Today the sender issues one Post per block array and describes it entirely
-  // in the post metadata; per-request metadata is not interpreted yet.
-  if (!requests.empty()) {
-    return absl::UnimplementedError(
-        "OnRecvComplete does not interpret per-request metadata yet");
+    absl::Span<const lib::RequestMetadata> requests,
+    const absl::Status& post_status) {
+  // Take the lease first so every exit releases a held op.
+  std::shared_ptr<TransferSession> session;
+  bool held = false;
+  {
+    absl::MutexLock lock(mu_);
+    if (!status_.ok()) return status_;
+    if (auto it = peregrine_posts_.find(PostKeyOf(post));
+        it != peregrine_posts_.end()) {
+      std::shared_ptr<PostLease> lease = it->second;
+      AwaitSettled(*lease);
+      if (lease->state == PostLease::State::kAdmitted) {
+        held = true;
+        session = std::move(lease->session);
+        lease->status = post_status;
+        DropLeaseLocked(post, lease);
+      }
+    }
+    if (!status_.ok()) return status_;
   }
-  if (post.local_id == 0xFFFF'FFFF) {
-    return absl::InvalidArgumentError(
-        "OnRecvComplete requires an explicit layer/pool index in post "
-        "metadata");
-  }
-  // Shards this Post carried: every shard for a legacy push, one NUMA group's
-  // subset for a push split by source NUMA node.
-  ABSL_ASSIGN_OR_RETURN(
-      const std::vector<int> shards,
-      ShardsFromMask(post.shard_mask, delegate_->num_shards()));
 
-  ABSL_ASSIGN_OR_RETURN(
-      IncomingPushSpec push_spec,
-      ResolveIncomingPushSpec(delegate_, post.local_id,
-                              /*is_explicit_dst_push=*/true, uuid_));
-
-  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
-                        BeginIncomingPush(delegate_, uuid_));
-  absl::Status s = CompleteIncomingPush(
-      post.local_id, post.remote_id, /*num_streams=*/1,
-      post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
-      /*is_peregrine=*/true);
-  return EndIncomingPush(session, s);
+  absl::Status status = [&]() -> absl::Status {
+    ABSL_RETURN_IF_ERROR(post_status);
+    if (post.local_id == lib::kUnspecifiedLocalId) {
+      return absl::InvalidArgumentError(
+          "OnRecvComplete requires an explicit layer/pool index in post "
+          "metadata");
+    }
+    // Shards this Post carried: every shard for a legacy push, one NUMA
+    // group's subset for a push split by source NUMA node.
+    ABSL_ASSIGN_OR_RETURN(
+        const std::vector<int> shards,
+        ShardsFromMask(post.shard_mask, delegate_->num_shards()));
+    ABSL_ASSIGN_OR_RETURN(
+        IncomingPushSpec push_spec,
+        ResolveIncomingPushSpec(delegate_, post.local_id,
+                                /*is_explicit_dst_push=*/true, uuid_));
+    // A Post whose addresses the sender supplied takes the op here.
+    if (!held) {
+      ABSL_ASSIGN_OR_RETURN(session, BeginIncomingPush(delegate_, uuid_));
+    }
+    return CompleteIncomingPush(
+        session, post.local_id, post.remote_id, /*num_streams=*/1,
+        post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
+        /*is_peregrine=*/true);
+  }();
+  return EndIncomingPush(session, status);
 }
 
 size_t BlockTransportServerPushSession::AccumulateLandedShards(
@@ -524,8 +716,8 @@ size_t BlockTransportServerPushSession::AccumulateLandedShards(
 }
 
 absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
-    uint32_t local_id, uint32_t remote_id, size_t num_streams,
-    size_t landed_shards,
+    std::shared_ptr<TransferSession> session, uint32_t local_id,
+    uint32_t remote_id, size_t num_streams, size_t landed_shards,
     const std::optional<PoolPushProgressSpec>& pool_progress_spec,
     bool is_peregrine) {
   // Unified receive accounting: one progress map and one increment path for
@@ -535,7 +727,8 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
   // complete; header-declared (legacy) mode counts this push's parallelism
   // from num_streams and retires the uuid when all constructor layers
   // complete.
-  const int l = (local_id == 0xFFFFFFFF) ? 0 : static_cast<int>(local_id);
+  const int l =
+      (local_id == lib::kUnspecifiedLocalId) ? 0 : static_cast<int>(local_id);
   const bool plan_declared = pool_progress_spec.has_value();
   const size_t expected_chunks =
       plan_declared ? pool_progress_spec->expected_pushes : num_streams;
@@ -661,7 +854,6 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
           }
         }
         if (completed_pools == pool_progress_spec->expected_pools) {
-          layer_progress_.clear();
           done_ = true;
         }
       } else {
@@ -675,7 +867,6 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
           }
         }
         if (all_layers_called) {
-          layer_progress_.clear();
           done_ = true;
         }
       }
@@ -686,7 +877,8 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
     ABSL_RETURN_IF_ERROR(
         FaultInjectStatus(hooks::kBlockTransportRecvLayerDone));
     if (plan_declared) {
-      ABSL_RETURN_IF_ERROR(delegate_->OnPoolReceived(l, uuid_));
+      ABSL_RETURN_IF_ERROR(session->OnDataReceived(
+          l, /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
     } else {
       ABSL_RETURN_IF_ERROR(delegate_->OnLayerReceived(l, uuid_));
     }
@@ -871,69 +1063,85 @@ void BlockTransportServerPullSession::TriggerNextSendStep() {
   int block_id = remote_id_ + static_cast<int>(k);
 
   auto self = shared_from_this();
-  delegate_->RegisterBlockReadinessCallback(
-      l, sh, block_id, uuid_,
-      [self, l, sh, block_id, step](absl::Status ready_status) {
-        if (!ready_status.ok()) {
-          LOG(ERROR) << "Pull response failed at step " << step << " for uuid "
-                     << self->uuid_ << ", status: " << ready_status;
-          self->Finish(ready_status);
-          return;
-        }
+  auto on_ready = [self, l, sh, block_id, step](absl::Status ready_status) {
+    if (!ready_status.ok()) {
+      LOG(ERROR) << "Pull response failed at step " << step << " for uuid "
+                 << self->uuid_ << ", status: " << ready_status;
+      self->Finish(ready_status);
+      return;
+    }
 
-        self->delegate_->ScheduleAsyncTask([self, l, sh, block_id]() {
-          const int64_t block_id_val = block_id;
-          std::vector<BlockChunk> chunks = self->delegate_->GetBlockChunks(
-              l, sh, absl::MakeConstSpan(&block_id_val, 1),
-              self->delegate_->block_bytes(l), self->uuid_);
-          if (chunks.empty()) {
-            LOG(ERROR) << "No transfer chunks found for block " << block_id
-                       << " and uuid " << self->uuid_;
-            self->Finish(absl::NotFoundError(
-                absl::StrCat("No chunks for block ", block_id)));
-            return;
-          }
-          absl::Status s = ValidateChunks(self->delegate_, l, sh, chunks);
-          if (!s.ok()) {
-            LOG(ERROR) << "Chunks validation failed: " << s;
-            self->Finish(s);
-            return;
-          }
+    self->delegate_->ScheduleAsyncTask([self, l, sh, block_id]() {
+      const int64_t block_id_val = block_id;
+      std::vector<BlockChunk> chunks = self->delegate_->GetBlockChunks(
+          l, sh, absl::MakeConstSpan(&block_id_val, 1),
+          self->delegate_->block_bytes(l), self->uuid_);
+      if (chunks.empty()) {
+        LOG(ERROR) << "No transfer chunks found for block " << block_id
+                   << " and uuid " << self->uuid_;
+        self->Finish(absl::NotFoundError(
+            absl::StrCat("No chunks for block ", block_id)));
+        return;
+      }
+      absl::Status s =
+          ValidateChunks(self->delegate_, l, sh, self->uuid_, chunks);
+      if (!s.ok()) {
+        LOG(ERROR) << "Chunks validation failed: " << s;
+        self->Finish(s);
+        return;
+      }
 
-          uint32_t total_size = self->GetChunksTotalSize(chunks);
-          const std::array<uint8_t, lib::kChunkSizeFieldSize> s_size =
-              lib::SerializeChunkSize(total_size);
-          s = WriteExact(self->client_fd_, s_size.data(), s_size.size(),
-                         self->config_.payload_write_timeout_ms);
-          if (!s.ok()) {
-            LOG(ERROR) << "Write size failed: " << s;
-            self->Finish(s);
-            return;
-          }
-          if (total_size > 0) {
-            s = WriteVExact(self->client_fd_, ToIovec(chunks),
-                            self->config_.payload_write_timeout_ms);
-          }
-          if (!s.ok()) {
-            LOG(ERROR) << "Write payload failed: " << s;
-            self->Finish(s);
-            return;
-          }
+      uint32_t total_size = self->GetChunksTotalSize(chunks);
+      const std::array<uint8_t, lib::kChunkSizeFieldSize> s_size =
+          lib::SerializeChunkSize(total_size);
+      s = WriteExact(self->client_fd_, s_size.data(), s_size.size(),
+                     self->config_.payload_write_timeout_ms);
+      if (!s.ok()) {
+        LOG(ERROR) << "Write size failed: " << s;
+        self->Finish(s);
+        return;
+      }
+      if (total_size > 0) {
+        s = WriteVExact(self->client_fd_, ToIovec(chunks),
+                        self->config_.payload_write_timeout_ms);
+      }
+      if (!s.ok()) {
+        LOG(ERROR) << "Write payload failed: " << s;
+        self->Finish(s);
+        return;
+      }
 
-          if (total_size > 0) {
-            // TODO: Add interface name (e.g. eth0, lo) using
-            // GetSocketLocalNic(client_fd_) as a label key.
-            RecordPullResponseSentBytes(self->client_fd_, self->local_ips_,
-                                        total_size);
-          }
+      if (total_size > 0) {
+        // TODO: Add interface name (e.g. eth0, lo) using
+        // GetSocketLocalNic(client_fd_) as a label key.
+        RecordPullResponseSentBytes(self->client_fd_, self->local_ips_,
+                                    total_size);
+      }
 
-          {
-            absl::MutexLock lock(self->mu_);
-            self->current_step_++;
-          }
-          self->TriggerNextSendStep();
-        });
-      });
+      {
+        absl::MutexLock lock(self->mu_);
+        self->current_step_++;
+      }
+      self->TriggerNextSendStep();
+    });
+  };
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      delegate_->GetSession(uuid_);
+  if (absl::IsNotFound(session.status()) ||
+      absl::IsUnimplemented(session.status())) {
+    on_ready(absl::OkStatus());
+    return;
+  }
+  if (!session.ok()) {
+    on_ready(session.status());
+    return;
+  }
+  if (*session == nullptr || (*session)->Done()) {
+    on_ready(absl::OkStatus());
+    return;
+  }
+  (*session)->GetDataReadyFuture(l).OnReady(std::move(on_ready));
 }
 
 }  // namespace transport

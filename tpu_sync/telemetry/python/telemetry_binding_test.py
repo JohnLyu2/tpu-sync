@@ -264,9 +264,17 @@ class TelemetryBindingTest(absltest.TestCase):
         metrics_by_name["storage_filesystem_bytes"].label_names,
         ["mount", "state"],
     )
+    self.assertEqual(
+        metrics_by_name["storage_io_time_ms"].label_names,
+        ["local_rank", "direction"],
+    )
+    self.assertEqual(
+        metrics_by_name["host_pool_blocks"].label_names,
+        ["dp_rank", "state"],
+    )
 
     # Verify weight sync metrics
-    self.assertLen(metrics, 33)
+    self.assertLen(metrics, 39)
     self.assertEqual(
         metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
     )
@@ -315,26 +323,73 @@ class TelemetryBindingTest(absltest.TestCase):
     )
     self.assertEqual(metrics_by_name["peregrine_bytes_total"].label_names, [])
     self.assertEqual(metrics_by_name["peregrine_errors_total"].label_names, [])
+    self.assertEqual(
+        metrics_by_name["storage_metadata_check_total"].label_names,
+        ["dp_rank", "result"],
+    )
 
     # Verify KV cache store metrics
     self.assertEqual(
         metrics_by_name["kv_recall_blocks_total"].label_names,
         ["dp_rank", "tier", "outcome"],
     )
+    self.assertEqual(
+        metrics_by_name["kv_save_blocks_total"].label_names,
+        ["dp_rank", "tier", "outcome"],
+    )
+    self.assertEqual(
+        metrics_by_name["kv_evicted_blocks_total"].label_names,
+        ["dp_rank"],
+    )
+    self.assertEqual(
+        metrics_by_name["kv_recall_duration_ms"].label_names,
+        ["dp_rank", "tier", "outcome"],
+    )
 
   def test_increment_counter_and_observe_in_buffered_backend(self):
     telemetry_ext.configure_telemetry(["buffered"])
+    telemetry_ext.set_gauge(
+        "host_pool_blocks",
+        64.0,
+        {"dp_rank": "0", "state": "total"},
+    )
     telemetry_ext.increment_counter("weight_sync_sent_bytes_total", 4096)
     telemetry_ext.increment_counter("weight_sync_sent_bytes_total", 2048)
+    telemetry_ext.increment_counter(
+        "kv_evicted_blocks_total", 5, {"dp_rank": "0"}
+    )
     telemetry_ext.set_gauge("weight_sync_buffer_allocated_bytes", 1048576.0)
     telemetry_ext.observe_histogram(
         "weight_sync_p2p_transfer_time_ms", 12.5, {"direction": "push"}
     )
+    telemetry_ext.observe_histogram(
+        "kv_recall_duration_ms",
+        4.5,
+        {"dp_rank": "0", "tier": "local_dram", "outcome": "ok"},
+    )
 
     samples = telemetry_ext.get_and_reset_metric_samples()
+    self.assertIn(
+        'tpu_raiden_host_pool_blocks{dp_rank="0",state="total"}',
+        samples,
+    )
+    self.assertEqual(
+        samples[
+            'tpu_raiden_host_pool_blocks{dp_rank="0",state="total"}'
+        ][-1],
+        64.0,
+    )
     self.assertIn("tpu_raiden_weight_sync_sent_bytes_total", samples)
     self.assertEqual(
         sum(samples["tpu_raiden_weight_sync_sent_bytes_total"]), 6144
+    )
+    self.assertIn(
+        'tpu_raiden_kv_evicted_blocks_total{dp_rank="0"}',
+        samples,
+    )
+    self.assertEqual(
+        samples['tpu_raiden_kv_evicted_blocks_total{dp_rank="0"}'],
+        [5],
     )
     self.assertIn("tpu_raiden_weight_sync_buffer_allocated_bytes", samples)
     self.assertEqual(
@@ -348,6 +403,12 @@ class TelemetryBindingTest(absltest.TestCase):
             'tpu_raiden_weight_sync_p2p_transfer_time_ms{direction="push"}'
         ],
         [12.5],
+    )
+    self.assertEqual(
+        samples[
+            'tpu_raiden_kv_recall_duration_ms{dp_rank="0",outcome="ok",tier="local_dram"}'
+        ],
+        [4.5],
     )
 
     samples_after = telemetry_ext.get_and_reset_metric_samples()

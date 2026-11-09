@@ -24,10 +24,13 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "grpcpp/create_channel.h"
@@ -47,6 +50,8 @@
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/telemetry/mock_metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -921,8 +926,8 @@ TEST(HostOffloadBackendTest, LoadMismatchedDeviceBlockCount) {
   std::vector<std::string> hashes = {"hash1", "hash2"};
   std::vector<int32_t> dev_ids = {10};  // Mismatched count
   BlockTracker tracker;
-  auto load_future =
-      backend->Load(node_id, hashes, dev_ids, /*slices=*/{}, &tracker);
+  auto load_future = backend->Load(hashes, dev_ids, &tracker,
+                                   LoadOptions{.remote_id = node_id});
   EXPECT_THAT(load_future.Await(),
               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
 }
@@ -1020,8 +1025,8 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
   std::vector<std::string> hashes = {"load_hash_1"};
   std::vector<int32_t> dev_ids = {5};
   BlockTracker tracker;
-  auto load_future =
-      backend->Load(remote_node_id, hashes, dev_ids, /*slices=*/{}, &tracker);
+  auto load_future = backend->Load(hashes, dev_ids, &tracker,
+                                   LoadOptions{.remote_id = remote_node_id});
   ABSL_EXPECT_OK(load_future.Await());
 
   remote_server->Shutdown();
@@ -1065,8 +1070,7 @@ TEST(HostOffloadBackendTest, LoadLocalSuccess) {
                   {RaidenBlockId(node_id, 10, BlockStatus::HOST)});
 
   BlockTracker tracker1;
-  auto load_future = backend->Load(RaidenId{}, {"local_hash_1"}, {5},
-                                   /*slices=*/{}, &tracker1);
+  auto load_future = backend->Load({"local_hash_1"}, {5}, &tracker1);
   ABSL_EXPECT_OK(load_future.Await());
 }
 
@@ -1093,8 +1097,7 @@ TEST(HostOffloadBackendTest, LoadLocalMissingBlockError) {
   ASSERT_NE(backend, nullptr);
 
   BlockTracker tracker2;
-  auto load_future = backend->Load(RaidenId{}, {"missing_hash"}, {5},
-                                   /*slices=*/{}, &tracker2);
+  auto load_future = backend->Load({"missing_hash"}, {5}, &tracker2);
   EXPECT_THAT(load_future.Await(),
               absl_testing::StatusIs(absl::StatusCode::kNotFound));
 }
@@ -1126,10 +1129,135 @@ TEST(HostOffloadBackendTest, LoadLocalNonHostBlockError) {
                   {RaidenBlockId(remote_id, 10, BlockStatus::REMOTE)});
 
   BlockTracker tracker3;
-  auto load_future =
-      backend->Load(RaidenId{}, {"remote_hash"}, {5}, /*slices=*/{}, &tracker3);
+  auto load_future = backend->Load({"remote_hash"}, {5}, &tracker3);
   EXPECT_THAT(load_future.Await(),
               absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST(HostOffloadBackendTest, LoadWithOptionsOverload) {
+  // Setup GlobalRegistry and register remote block
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+  std::string server_address = reg_server->server_address;
+
+  auto channel =
+      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  auto registry_client =
+      std::make_shared<global_registry::GlobalRegistryClient>(channel);
+
+  RaidenId remote_node_id{"remote_job", "0", "remote_data", 0};
+  RaidenId local_node_id{"local_job", "0", "local_data", 0};
+
+  std::vector<global_registry::Registration> regs = {
+      {.prefix_hash = "remote_hash_1",
+       .raiden_id = remote_node_id,
+       .block_id = 42},
+  };
+  ABSL_ASSERT_OK(registry_client->Register(regs));
+
+  // Setup local RaidenController
+  ::tpu_sync::rpc::RaidenIdProto local_unit;
+  local_unit.set_job_name(local_node_id.job_name);
+  local_unit.set_job_replica_id(local_node_id.job_replica_id);
+  local_unit.set_data_name(local_node_id.data_name);
+  local_unit.set_data_replica_idx(local_node_id.data_replica_idx);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      controller::RaidenController::Create(local_unit, /*num_blocks=*/100,
+                                           /*num_shards=*/1,
+                                           /*shard_size_bytes=*/1024,
+                                           /*raiden_controller_address=*/""));
+
+  // Setup fake server for remote node to process Fetch
+  BackendConfig remote_config;
+  remote_config.type = "HostOffloadBackend";
+  remote_config.capacity = 100;
+  remote_config.global_registry_address = server_address;
+  remote_config.raiden_id = remote_node_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto remote_backend_base,
+      HostOffloadBackend::Create(remote_config, controller.get()));
+  auto remote_backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(remote_backend_base);
+  ASSERT_NE(remote_backend, nullptr);
+
+  std::vector<RaidenBlockId> remote_slices = {
+      RaidenBlockId(remote_node_id, 42, BlockStatus::HOST),
+  };
+  remote_backend->Insert({"remote_hash_1"}, remote_slices);
+
+  auto remote_server = KVCacheStoreServer::Create();
+  ABSL_ASSERT_OK(remote_server->StartServer(remote_backend.get(),
+                                            controller.get(), "127.0.0.1"));
+
+  ABSL_ASSERT_OK(registry_client->RegisterStore(
+      remote_node_id, remote_server->GetServerAddress(),
+      controller->controller_address()));
+
+  BackendConfig local_config;
+  local_config.type = "HostOffloadBackend";
+  local_config.capacity = 100;
+  local_config.global_registry_address = server_address;
+  local_config.raiden_id = local_node_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto local_backend_base,
+      HostOffloadBackend::Create(local_config, controller.get()));
+  auto backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(local_backend_base);
+  ASSERT_NE(backend, nullptr);
+
+  // Register local worker in controller
+  auto test_worker_server = controller::CreateTestWorkerServer();
+  auto dst_transfer_mock =
+      std::make_unique<controller::ShardAwareMockTransferManager>();
+  test_worker_server->service->SetTransferManager(
+      KVManagerHolder(dst_transfer_mock.get()));
+
+  core::controller::RaidenControllerClient controller_client(
+      controller->controller_address());
+  ABSL_ASSERT_OK(controller_client.RegisterWorker(
+      "worker_0", test_worker_server->server_address,
+      {{test_worker_server->server_address, {}}}));
+
+  backend->Insert({"local_hash_1"},
+                  {RaidenBlockId(local_node_id, 10, BlockStatus::HOST)});
+
+  // 1. Exercise 4-arg Load with default options (both implicit and explicit).
+  BlockTracker tracker1;
+  tracker1.AddPending("local_hash_1");
+  auto load_future1 = backend->Load({"local_hash_1"}, {5}, &tracker1);
+  ABSL_EXPECT_OK(load_future1.Await());
+  EXPECT_THAT(tracker1.Poll().done, UnorderedElementsAre("local_hash_1"));
+
+  BlockTracker tracker1_opt;
+  tracker1_opt.AddPending("local_hash_1");
+  auto load_future1_opt =
+      backend->Load({"local_hash_1"}, {5}, &tracker1_opt, LoadOptions{});
+  ABSL_EXPECT_OK(load_future1_opt.Await());
+  EXPECT_THAT(tracker1_opt.Poll().done, UnorderedElementsAre("local_hash_1"));
+
+  // 2. Exercise 4-arg Load with explicit slices.
+  std::vector<RaidenBlockId> explicit_slices = {
+      RaidenBlockId(local_node_id, 10, BlockStatus::HOST),
+  };
+  BlockTracker tracker2;
+  tracker2.AddPending("local_hash_1");
+  auto load_future2 = backend->Load({"local_hash_1"}, {6}, &tracker2,
+                                    LoadOptions{.slices = explicit_slices});
+  ABSL_EXPECT_OK(load_future2.Await());
+  EXPECT_THAT(tracker2.Poll().done, UnorderedElementsAre("local_hash_1"));
+
+  // 3. Exercise 4-arg Load with explicit remote_id.
+  BlockTracker tracker3;
+  tracker3.AddPending("remote_hash_1");
+  auto load_future3 = backend->Load({"remote_hash_1"}, {7}, &tracker3,
+                                    LoadOptions{.remote_id = remote_node_id});
+  ABSL_EXPECT_OK(load_future3.Await());
+  EXPECT_THAT(tracker3.Poll().done, UnorderedElementsAre("remote_hash_1"));
+
+  remote_server->Shutdown();
 }
 
 // --- Remote write backend primitives ---------------------------------------
@@ -1731,7 +1859,7 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
   BlockTracker success_tracker;
   success_tracker.AddPending("load_success_1");
   auto success_future =
-      backend->Load(RaidenId{}, {"load_success_1"}, {5}, {}, &success_tracker);
+      backend->Load({"load_success_1"}, {5}, &success_tracker);
   ABSL_EXPECT_OK(success_future.Await());
 
   BlockTracker::StatusResult success_res = success_tracker.Poll();
@@ -1745,8 +1873,7 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
 
   BlockTracker failure_tracker;
   failure_tracker.AddPending("load_fail_1");
-  auto failure_future =
-      backend->Load(RaidenId{}, {"load_fail_1"}, {6}, {}, &failure_tracker);
+  auto failure_future = backend->Load({"load_fail_1"}, {6}, &failure_tracker);
   EXPECT_FALSE(failure_future.Await().ok());
 
   BlockTracker::StatusResult failure_res = failure_tracker.Poll();
@@ -1820,6 +1947,140 @@ TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
   BlockTracker::StatusResult failure_res = failure_tracker.Poll();
   EXPECT_TRUE(failure_res.done.empty());
   EXPECT_THAT(failure_res.failed, UnorderedElementsAre("save_fail_1"));
+}
+
+TEST(HostOffloadBackendTest, NumEvictableHostBlocksTracksPinsAndResidency) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  ASSERT_TRUE(backend.Insert(
+      {"host", "host_and_hbm", "hbm_only"},
+      {RaidenBlockId(id, 10, BlockStatus::HOST),
+       RaidenBlockId(id, 11, BlockStatus::HOST_AND_HBM),
+       RaidenBlockId(id, -1, /*device_block_id=*/3, BlockStatus::HBM)}));
+  // HBM-only entries hold no host block, so only two entries are counted.
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 2);
+
+  ASSERT_TRUE(backend.Pin({"host"}));
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 1);
+
+  backend.Release({"host"});
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 2);
+
+  backend.Delete({"host_and_hbm"}, DeleteOptions::EvictHostResident(nullptr));
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 1);
+}
+
+// Captures the latest `host_pool_blocks` value per `state` and verifies the
+// label set is exactly {dp_rank, state}.
+class HostPoolGaugeRecorder {
+ public:
+  explicit HostPoolGaugeRecorder(absl::string_view expected_dp_rank) {
+    auto mock =
+        std::make_unique<::testing::NiceMock<telemetry::MockMetricsBackend>>();
+    ON_CALL(*mock, SetGauge(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault([this, dp_rank = std::string(expected_dp_rank)](
+                           absl::string_view name, telemetry::LabelSpan labels,
+                           double val) {
+          if (name != telemetry::metric_names::kHostPoolBlocks) return;
+          std::string state;
+          absl::MutexLock lock(mu_);
+          ++num_calls_;
+          for (const auto& label : labels) {
+            if (label.key == telemetry::metric_labels::kState) {
+              state = std::string(label.value);
+            } else if (label.key == telemetry::metric_labels::kDpRank) {
+              EXPECT_EQ(label.value, dp_rank);
+            } else {
+              ADD_FAILURE() << "Unexpected label: " << label.key;
+            }
+          }
+          latest_[state] = val;
+        });
+    reset_ =
+        std::make_unique<telemetry::ScopedMetricsBackendReset>(std::move(mock));
+  }
+
+  double Get(absl::string_view state) {
+    absl::MutexLock lock(mu_);
+    auto it = latest_.find(state);
+    return it == latest_.end() ? -1.0 : it->second;
+  }
+
+  int num_calls() {
+    absl::MutexLock lock(mu_);
+    return num_calls_;
+  }
+
+ private:
+  std::unique_ptr<telemetry::ScopedMetricsBackendReset> reset_;
+  absl::Mutex mu_;
+  absl::flat_hash_map<std::string, double> latest_ ABSL_GUARDED_BY(mu_);
+  int num_calls_ ABSL_GUARDED_BY(mu_) = 0;
+};
+
+TEST(HostOffloadBackendTest, RecordsHostPoolBlocksGauge) {
+  HostPoolGaugeRecorder gauges(/*expected_dp_rank=*/"3");
+  RaidenId node_id{"node_job", "0", "data", 3};
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<controller::RaidenController> controller,
+      controller::RaidenController::Create(unit_proto, /*num_blocks=*/8,
+                                           /*num_shards=*/1,
+                                           /*shard_size_bytes=*/1024));
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 8;
+  config.raiden_id = node_id;
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<KVCacheStoreBackend> backend_base,
+                       HostOffloadBackend::Create(config, controller.get()));
+  auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
+  ASSERT_NE(backend, nullptr);
+
+  // Construction publishes the empty pool.
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateTotal), 8.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 0.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+
+  // Two allocated host blocks inserted unpinned: used, but evictable.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> ids, controller->AllocateBlockIds(2));
+  ASSERT_TRUE(backend->Insert(
+      {"a", "b"}, {RaidenBlockId(node_id, ids[0], BlockStatus::HOST),
+                   RaidenBlockId(node_id, ids[1], BlockStatus::HOST)}));
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 2.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+
+  // Pin / Release move a block in and out of `pinned`.
+  ASSERT_TRUE(backend->Pin({"a"}));
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 1.0);
+  backend->Release({"a"});
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+
+  // An allocated block the LRU does not track (e.g. a staging block) is not
+  // evictable, so it counts as pinned.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                       controller->AllocateBlockIds(1));
+  backend->RecordHostPoolMetrics();
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 3.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 1.0);
+
+  ABSL_ASSERT_OK(controller->DeallocateBlockIds(staging));
+  backend->RecordHostPoolMetrics();
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 2.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+}
+
+TEST(HostOffloadBackendTest, HostPoolBlocksGaugeIsNoOpWithoutController) {
+  HostPoolGaugeRecorder gauges(/*expected_dp_rank=*/"0");
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  ASSERT_TRUE(
+      backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)}));
+  backend.RecordHostPoolMetrics();
+  EXPECT_EQ(gauges.num_calls(), 0);
 }
 
 }  // namespace

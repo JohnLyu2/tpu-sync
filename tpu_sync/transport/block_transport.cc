@@ -187,35 +187,6 @@ void RecordTransferFailure(const absl::Status& status,
 
 constexpr uint8_t kUseBlockChunksFlag = 0x80;
 
-absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
-                            size_t sh, const std::vector<BlockChunk>& chunks) {
-  uint8_t* base = delegate->GetBlockArrayHostPointer(l, sh);
-  // Some legacy delegates intentionally expose only scattered per-block
-  // pointers and no flat array base. Preserve that contract; pool-aware
-  // managers always expose their exact pool span here.
-  if (base != nullptr) {
-    const size_t host_size = delegate->GetBlockArrayHostSize(l, sh);
-    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
-    for (const auto& chunk : chunks) {
-      const uintptr_t chunk_addr = reinterpret_cast<uintptr_t>(chunk.ptr);
-      if (chunk_addr < base_addr) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-      const size_t offset = chunk_addr - base_addr;
-      if (offset > host_size || chunk.size > host_size - offset) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-    }
-  }
-  return absl::OkStatus();
-}
-
 absl::StatusOr<MajorOrder> ParseMajorOrder(uint8_t value) {
   uint8_t order_val = value & ~kUseBlockChunksFlag;
   switch (order_val) {
@@ -445,7 +416,8 @@ std::shared_ptr<BlockTransportServerPushSession>
 BlockTransport::GetOrCreatePushSession(uint64_t uuid) {
   absl::MutexLock lock(server_sessions_mu_);
   auto& session = active_push_sessions_[uuid];
-  if (session != nullptr) {
+  if (session != nullptr &&
+      (!session->IsDone() || session->HasAdmittedPosts())) {
     return session;
   }
   session = std::make_shared<BlockTransportServerPushSession>(
@@ -453,9 +425,14 @@ BlockTransport::GetOrCreatePushSession(uint64_t uuid) {
   return session;
 }
 
-void BlockTransport::DeletePushSession(uint64_t uuid) {
+void BlockTransport::DeletePushSession(
+    const std::shared_ptr<BlockTransportServerPushSession>& session) {
   absl::MutexLock lock(server_sessions_mu_);
-  active_push_sessions_.erase(uuid);
+  auto it = active_push_sessions_.find(session->uuid());
+  if (it != active_push_sessions_.end() && it->second == session &&
+      !session->HasAdmittedPosts()) {
+    active_push_sessions_.erase(it);
+  }
 }
 
 void BlockTransport::DeletePullSession(uint64_t session_id) {
@@ -469,7 +446,7 @@ absl::Status BlockTransport::HandleIncomingPush(
       GetOrCreatePushSession(header.uuid);
   absl::Status status = session->StartStream(client_fd, header);
   if (session->IsDone()) {
-    DeletePushSession(header.uuid);
+    DeletePushSession(session);
   }
   return status;
 }
@@ -477,14 +454,27 @@ absl::Status BlockTransport::HandleIncomingPush(
 // ---------------------------------------------------------------------------
 // Peregrine receive path.
 // ---------------------------------------------------------------------------
-absl::Status BlockTransport::OnRecvComplete(
-    const lib::PostMetadata& post,
-    absl::Span<const lib::RequestMetadata> requests) {
+uint8_t* BlockTransport::ResolveRecvBuffer(const lib::PostMetadata& post,
+                                           const lib::RequestMetadata& req) {
   std::shared_ptr<BlockTransportServerPushSession> session =
       GetOrCreatePushSession(post.uuid);
-  absl::Status status = session->OnPeregrinePostComplete(post, requests);
+  uint8_t* addr = session->ResolveRecvBuffer(post, req);
   if (session->IsDone()) {
-    DeletePushSession(post.uuid);
+    DeletePushSession(session);
+  }
+  return addr;
+}
+
+absl::Status BlockTransport::OnRecvComplete(
+    const lib::PostMetadata& post,
+    absl::Span<const lib::RequestMetadata> requests,
+    const absl::Status& post_status) {
+  std::shared_ptr<BlockTransportServerPushSession> session =
+      GetOrCreatePushSession(post.uuid);
+  absl::Status status =
+      session->OnPeregrinePostComplete(post, requests, post_status);
+  if (session->IsDone()) {
+    DeletePushSession(session);
   }
   return status;
 }
@@ -745,7 +735,7 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
   // header names the array the receiver writes into.
   const int header_layer_idx = wire_layer_idx.value_or(layer_idx);
   const uint32_t local_id = header_layer_idx == -1
-                                ? 0xFFFF'FFFF
+                                ? lib::kUnspecifiedLocalId
                                 : static_cast<uint32_t>(header_layer_idx);
   if (num_blocks == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(
@@ -820,7 +810,8 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
                 absl::StrCat("No transfer chunks found for block ", src_id,
                              " and uuid ", uuid));
           }
-          ABSL_RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
+          ABSL_RETURN_IF_ERROR(
+              ValidateChunks(block_delegate_, l, sh, uuid, chunks));
 
           // What the receiver needs to handle these chunks. Uses
           // `wire_layer_idx` when set (the receiver's array index), otherwise
@@ -983,12 +974,18 @@ BlockTransport::BuildBlockPullRequests(
                              " and uuid ", uuid));
           }
           ABSL_RETURN_IF_ERROR(
-              ValidateChunks(block_delegate_, l, sh, block_chunks));
+              ValidateChunks(block_delegate_, l, sh, uuid, block_chunks));
 
           uint8_t* default_base = nullptr;
           uint8_t* explicit_base = nullptr;
           if (!explicit_dst_ptrs.empty()) {
-            default_base = block_delegate_->GetBlockArrayHostPointer(l, sh);
+            ABSL_ASSIGN_OR_RETURN(
+                const absl::Span<const char> span,
+                block_delegate_->GetBlockArrayHostSpan(l, sh, uuid));
+            // Receive destination: the span views delegate-owned mutable
+            // storage.
+            default_base = const_cast<uint8_t*>(
+                reinterpret_cast<const uint8_t*>(span.data()));
             explicit_base =
                 explicit_dst_ptrs[l * block_delegate_->num_shards() + sh];
           }

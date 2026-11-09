@@ -167,34 +167,43 @@ absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::Create(
     kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,
     StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-    const std::string& req_id, const std::string& remote_endpoint,
+    const std::string& remote_endpoint,
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
     std::chrono::steady_clock::time_point deadline,
-    std::shared_ptr<MetricsCollector> metrics_collector) {
+    std::shared_ptr<MetricsCollector> metrics_collector,
+    BlockLocation destination) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
   if (manager == nullptr) {
     return absl::InvalidArgumentError(
-        absl::StrCat("pulled receive req_id=", req_id, " requires a manager"));
+        absl::StrCat("pulled receive uuid=", uuid, " requires a manager"));
+  }
+  // A host destination has no staging to lease: its blocks are the host
+  // blocks the caller named, which the manager passes as
+  // `local_host_block_ids`.
+  if (destination == BlockLocation::kHost &&
+      !local_host_block_ids.has_value()) {
+    return absl::InvalidArgumentError(
+        "a host destination needs its host blocks in local_host_block_ids");
   }
   auto session =
       std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
-          base, staging_allocator, uuid, std::move(metrics_collector)));
+          base, staging_allocator, uuid, std::move(metrics_collector),
+          /*plan=*/nullptr, destination));
   session->pull_manager_ = manager;
   session->pull_endpoint_ = remote_endpoint;
   std::vector<int64_t> host_block_ids;
-  if (!session->AllocateStagingForLoad(req_id, local_block_ids,
-                                       local_host_block_ids, &host_block_ids)) {
+  if (!session->AllocateStagingForLoad(local_block_ids, local_host_block_ids,
+                                       &host_block_ids)) {
     return absl::ResourceExhaustedError(
-        absl::StrCat("Failed to allocate staging for load req_id=", req_id,
-                     ", uuid=", uuid));
+        absl::StrCat("Failed to allocate staging for load uuid=", uuid));
   }
   CopyPlan load_plan =
       BuildLoadCopyPlan(remote_block_ids, local_block_ids, host_block_ids);
-  session->InitFromLoadPlan(req_id, std::move(load_plan), deadline);
+  session->InitFromLoadPlan(std::move(load_plan), deadline);
   return session;
 }
 
@@ -202,15 +211,14 @@ absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::Create(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-    std::string req_id, int32_t total_blocks,
-    std::chrono::steady_clock::time_point deadline, bool acquire_staging,
-    std::shared_ptr<MetricsCollector> metrics_collector) {
+    int32_t total_blocks, std::chrono::steady_clock::time_point deadline,
+    bool acquire_staging, std::shared_ptr<MetricsCollector> metrics_collector) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
   return std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
-      base, staging_allocator, uuid, std::move(req_id), total_blocks, deadline,
-      acquire_staging, std::move(metrics_collector)));
+      base, staging_allocator, uuid, total_blocks, deadline, acquire_staging,
+      std::move(metrics_collector)));
 }
 
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
@@ -274,9 +282,6 @@ void TransferReceiveSession::InitFromActivePlan(
   staging_ = std::move(staging);
   const bool hbm_receiver =
       request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_HBM;
-  req_id_ = request.req_id().empty()
-                ? absl::StrCat("resharded_transfer_", uuid_)
-                : request.req_id();
   deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
   if (!hbm_receiver) {
@@ -323,11 +328,14 @@ void TransferReceiveSession::InitFromActivePlan(
 }
 
 bool TransferReceiveSession::AllocateStagingForLoad(
-    const std::string& req_id, const std::vector<int64_t>& local_block_ids,
+    const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
     std::vector<int64_t>* host_block_ids) {
   absl::MutexLock lock(mu_);
   if (local_host_block_ids.has_value()) {
+    // Caller-named host blocks: explicit staging for a device destination, or
+    // the destination blocks themselves for a host destination (the manager's
+    // StartRead names them in `local_host_block_ids` either way).
     *host_block_ids = *local_host_block_ids;
     return true;
   }
@@ -341,7 +349,7 @@ bool TransferReceiveSession::AllocateStagingForLoad(
       static_cast<int64_t>(unique_local_bids.size()));
   if (!acquired.ok()) {
     LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
-               << " blocks for req_id=" << req_id
+               << " blocks for uuid=" << uuid_
                << " (dynamic=" << staging_allocator_->dynamic_host_staging()
                << ", free_host_blocks="
                << base_->host_block_manager()->num_free_blocks()
@@ -441,10 +449,8 @@ CopyPlan TransferReceiveSession::BuildLoadCopyPlan(
 }
 
 void TransferReceiveSession::InitFromLoadPlan(
-    const std::string& req_id, CopyPlan load_plan,
-    std::chrono::steady_clock::time_point deadline) {
+    CopyPlan load_plan, std::chrono::steady_clock::time_point deadline) {
   absl::MutexLock lock(mu_);
-  req_id_ = req_id;
   deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
   handshake_pending_ = true;
@@ -514,6 +520,8 @@ TransferDetails TransferReceiveSession::Details() const {
 
 absl::string_view TransferReceiveSession::CurrentPhaseLocked() const {
   if (handshake_pending_) return kConnectPhase;
+  // A host-memory receive ends with the network; there is no H2D step.
+  if (destination_ == BlockLocation::kHost) return kReceivePhase;
   return network_completed_ ? kH2dPhase : kReceivePhase;
 }
 
@@ -598,10 +606,9 @@ bool TransferReceiveSession::RecordBlockShardsReceivedLocked(
 }
 
 bool TransferReceiveSession::RecordNetworkCompleteLocked(
-    bool all_complete, std::string* session_req_id,
+    bool all_complete,
     std::chrono::steady_clock::time_point* session_start_time) {
   network_completed_ = true;
-  *session_req_id = req_id_;
   if (metrics_collector_ != nullptr) {
     metrics_collector_->RecordLastPacket(uuid_);
   }
@@ -623,11 +630,9 @@ absl::Status TransferReceiveSession::Start() {
   KVCacheManagerWithTransfer* const manager = pull_manager_;
   const std::string& remote_endpoint = pull_endpoint_;
   std::optional<int> target_node = base_->assigned_numa_node();
-  std::string session_req_id;
   PullStreamRequestSpec req_spec;
   {
     absl::MutexLock lock(mu_);
-    session_req_id = req_id_;
     req_spec.src_block_ids = load_plan_.producer_remote_block_ids;
     req_spec.dst_block_ids = load_plan_.transport_host_block_ids;
     peer_endpoint_ = remote_endpoint;
@@ -639,11 +644,11 @@ absl::Status TransferReceiveSession::Start() {
   req_spec.consumer_ips = base_->local_ips();
   req_spec.layer_host_addrs = base_->LayerHostAddrs(uuid_);
 
-  LOG(INFO) << "StartRead (connecting): req_id=" << session_req_id
-            << ", uuid=" << uuid_ << ", numa=" << target_node.value_or(-1);
+  LOG(INFO) << "StartRead (connecting): uuid=" << uuid_
+            << ", numa=" << target_node.value_or(-1);
 
   // May run on a transport thread, so it must not block.
-  auto on_response = [self = shared_from_this(), session_req_id](
+  auto on_response = [self = shared_from_this()](
                          absl::StatusOr<PullStreamResponseSpec> response) {
     absl::Cleanup end_op = [self]() { self->EndOp(); };
     absl::Status injected =
@@ -666,8 +671,8 @@ absl::Status TransferReceiveSession::Start() {
     }
     if (pull_status.ok()) {
       VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
-                 "request with Producer. req_id: "
-              << session_req_id;
+                 "request with Producer. uuid: "
+              << self->uuid_;
     } else {
       LOG(ERROR) << "Raiden consumer error during Hybrid Bridge StartRead "
                     "connect: "
@@ -675,7 +680,11 @@ absl::Status TransferReceiveSession::Start() {
     }
 
     absl::MutexLock lock(self->mu_);
-    if (!pull_status.ok()) {
+    // A receive that already settled (the data outran a slow control reply,
+    // which a host destination with no H2D step makes likely) keeps its
+    // verdict: the blocks it reports landed regardless of how the handshake
+    // ended.
+    if (!pull_status.ok() && !self->draining_) {
       self->FinishLocked(pull_status);
     }
     self->handshake_pending_ = false;
@@ -712,7 +721,6 @@ absl::Status TransferReceiveSession::RecordBlockShards(
   bool should_record_duration = false;
   bool first_packet = false;
   bool network_just_completed = false;
-  std::string session_req_id;
   bool all_complete = false;
   {
     absl::MutexLock lock(mu_);
@@ -739,15 +747,15 @@ absl::Status TransferReceiveSession::RecordBlockShards(
               << total_blocks_ * base_->num_layers();
       return absl::OkStatus();
     }
-    should_record_duration = RecordNetworkCompleteLocked(
-        all_complete, &session_req_id, &session_start_time);
+    should_record_duration =
+        RecordNetworkCompleteLocked(all_complete, &session_start_time);
   }
 
   if (should_record_duration) {
     RecordTransferDuration(
         DurationMs(session_start_time, std::chrono::steady_clock::now()));
-    LOG(INFO) << "OnBlockShardsReceived (Network + H2D complete): req_id="
-              << session_req_id << ", uuid=" << uuid << ", numa=" << numa_node;
+    LOG(INFO) << "OnBlockShardsReceived (Network + H2D complete): uuid=" << uuid
+              << ", numa=" << numa_node;
   }
   return absl::OkStatus();
 }
@@ -807,7 +815,40 @@ absl::Status TransferReceiveSession::OnDataReceived(
         absl::StrCat("pool completion for UUID ", uuid_,
                      " but the receiver was armed on the legacy path"));
   }
+  // A host destination has no H2D step: the layer report settles the layer.
+  if (destination_ == BlockLocation::kHost) {
+    return SettleHostLayer(major_dimension_idx);
+  }
   return ExecuteLayerH2d(major_dimension_idx);
+}
+
+absl::Status TransferReceiveSession::SettleHostLayer(size_t layer_idx) {
+  bool all_layers_done = false;
+  std::chrono::steady_clock::time_point session_start_time;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      return absl::OkStatus();
+    }
+    ++num_completed_layers_;
+    if (num_completed_layers_ == static_cast<int32_t>(base_->num_layers())) {
+      // The transport reports a layer before it reports the layer's blocks,
+      // so the shard report that would normally close the network phase finds
+      // this receive already settled. Close it here: the last layer is the
+      // last packet, and there is no H2D after it.
+      all_layers_done = RecordNetworkCompleteLocked(/*all_complete=*/true,
+                                                    &session_start_time);
+    }
+  }
+  VLOG(1) << "OnDataReceived (host memory) layer " << layer_idx
+          << ": uuid=" << uuid_;
+  if (!all_layers_done) {
+    return absl::OkStatus();
+  }
+  RecordTransferDuration(
+      DurationMs(session_start_time, std::chrono::steady_clock::now()));
+  LOG(INFO) << "All layers landed in host memory: uuid=" << uuid_;
+  return absl::OkStatus();
 }
 
 absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
@@ -819,7 +860,6 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
     ABSL_ASSIGN_OR_RETURN(host_layer_idx, LookupStagingSlot(layer_idx));
   }
   CopySpec copy_spec;
-  std::string session_req_id;
   bool trigger_enqueue = false;
   {
     absl::MutexLock lock(mu_);
@@ -829,7 +869,6 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
     }
     ++in_flight_;
     copy_spec = h2d_copy_;
-    session_req_id = req_id_;
     if (!h2d_started_) {
       h2d_started_ = true;
       trigger_enqueue = true;
@@ -840,7 +879,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
   }
 
   LOG(INFO) << "OnLayerReceived (H2D copy start) layer " << layer_idx
-            << ": req_id=" << session_req_id << ", uuid=" << uuid_
+            << ": uuid=" << uuid_
             << ", numa=" << base_->assigned_numa_node().value_or(-1);
 
   {
@@ -880,8 +919,8 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
   }
   const uint64_t uuid = uuid_;
   const int numa_node = base_->assigned_numa_node().value_or(-1);
-  future.OnReady([self = shared_from_this(), uuid, numa_node, layer_idx,
-                  session_req_id](auto status_or) {
+  future.OnReady([self = shared_from_this(), uuid, numa_node,
+                  layer_idx](auto status_or) {
     absl::Status injected =
         FaultInjectStatus(hooks::kTransferRecvSessionH2dComplete);
     if (status_or.ok() && !injected.ok()) {
@@ -898,7 +937,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
       }
       if (status_or.ok()) {
         LOG(INFO) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
-                  << ": req_id=" << session_req_id << ", numa=" << numa_node;
+                  << ": uuid=" << uuid << ", numa=" << numa_node;
         self->num_completed_layers_++;
         if (self->num_completed_layers_ ==
                 static_cast<int32_t>(self->base_->num_layers()) &&
@@ -909,7 +948,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
         }
       } else {
         LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
-                   << " for req_id: " << session_req_id
+                   << " for uuid: " << uuid
                    << ", error: " << status_or.status().ToString();
         self->FinishLocked(status_or.status(), kH2dPhase);
       }
@@ -924,7 +963,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
       if (self->metrics_collector_ != nullptr) {
         self->metrics_collector_->RecordH2dComplete(uuid);
       }
-      LOG(INFO) << "All layers H2D copy complete: req_id=" << session_req_id;
+      LOG(INFO) << "All layers H2D copy complete: uuid=" << uuid;
       if (self->metrics_collector_ != nullptr) {
         self->metrics_collector_->RecordEnd(uuid);
       }

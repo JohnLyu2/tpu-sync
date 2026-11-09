@@ -49,7 +49,9 @@ namespace tpu_raiden {
 // Encapsulates the per-transfer state and execution lifecycle of a producer
 // pull-serve send operation, including block registration/validation,
 // reference-counted drain and sticky-failure tracking, block readiness
-// callbacks, and pipelined multi-layer D2H -> H2H execution.
+// callbacks, and pipelined multi-layer D2H -> H2H execution. A send whose
+// blocks are already host-resident (`BlockLocation::kHost`) skips staging and
+// D2H and pushes every layer from the registered host blocks.
 //
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
 // Lock ordering: when both |KVCacheManagerWithTransfer::mu_| and |mu_| are
@@ -60,13 +62,15 @@ class TransferSendSession
       public std::enable_shared_from_this<TransferSendSession> {
  public:
   // Resolves the data connection policy (TPU_RAIDEN_DATA_CONN_REUSE) and
-  // creates a send session for |block_ids|.
+  // creates a send session for |block_ids|, which name device blocks or, with
+  // |source| kHost, blocks of the manager's host pool.
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator,
-      std::string req_id, uint64_t uuid, absl::Span<const int64_t> block_ids,
+      StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+      absl::Span<const int64_t> block_ids,
       std::chrono::steady_clock::time_point deadline,
-      std::chrono::steady_clock::time_point register_start);
+      std::chrono::steady_clock::time_point register_start,
+      BlockLocation source = BlockLocation::kDevice);
 
   // Creates a send session for a block-addressed resharding plan, acquiring
   // dynamic host staging when enabled.
@@ -133,8 +137,10 @@ class TransferSendSession
   // (StartPush has not run, or the send released its staging).
   tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override;
 
-  // Stages producer device blocks into host staging and executes the
-  // multi-layer D2H copy and pipelined H2H push.
+  // Serves a pull of |src_block_ids| into the consumer's host blocks
+  // |dst_block_ids|: stages device blocks into host staging and runs the
+  // multi-layer D2H copy and pipelined H2H push, or pushes host-resident
+  // blocks directly.
   void StartPush(const std::vector<std::string>& remote_data_endpoints,
                  const std::vector<int64_t>& src_block_ids,
                  const std::vector<int64_t>& dst_block_ids);
@@ -155,12 +161,9 @@ class TransferSendSession
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override;
 
-  const StagingLayerManager& staging_layer_manager() const {
-    return staging_layer_manager_;
+  std::chrono::steady_clock::time_point deadline() const override {
+    return deadline_;
   }
-
-  const std::string& req_id() const { return req_id_; }
-  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
 
  private:
   // Returns the host layer buffer leased to |layer_idx|, leasing one when it
@@ -174,12 +177,12 @@ class TransferSendSession
   absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const;
 
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
-                      StagingBlockAllocator* staging_allocator,
-                      std::string req_id, uint64_t uuid,
+                      StagingBlockAllocator* staging_allocator, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
                       std::chrono::steady_clock::time_point register_start,
                       DataConnectionReuse data_connection_reuse,
-                      std::shared_ptr<const TransferPlan> plan = nullptr);
+                      std::shared_ptr<const TransferPlan> plan = nullptr,
+                      BlockLocation source = BlockLocation::kDevice);
 
   // Describes a block ID that appears more than once in a single registration,
   // along with the indices of its first two occurrences.
@@ -216,13 +219,14 @@ class TransferSendSession
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
   StagingBlockAllocator* const staging_allocator_ = nullptr;
-  const std::string req_id_;
   const uint64_t uuid_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point register_start_;
   // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
   const DataConnectionReuse data_connection_reuse_;
   const std::shared_ptr<const TransferPlan> transfer_plan_;
+  // Where the registered blocks live.
+  const BlockLocation source_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);

@@ -64,26 +64,27 @@ constexpr absl::string_view kPushPhase = "push";
 absl::StatusOr<std::shared_ptr<TransferSendSession>>
 TransferSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* absl_nullable staging_allocator, std::string req_id,
-    uint64_t uuid, absl::Span<const int64_t> block_ids,
+    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+    absl::Span<const int64_t> block_ids,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::steady_clock::time_point register_start) {
+    std::chrono::steady_clock::time_point register_start,
+    BlockLocation source) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
   ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
                         ResolveDataConnectionReuse());
-  auto session = std::shared_ptr<TransferSendSession>(
-      new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
-                              deadline, register_start, data_connection_reuse));
+  auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
+      base, staging_allocator, uuid, deadline, register_start,
+      data_connection_reuse, /*plan=*/nullptr, source));
   std::optional<DuplicateBlock> duplicate_block =
       session->PopulateRegisteredBlocks(block_ids);
   if (duplicate_block.has_value()) {
     return absl::InvalidArgumentError(absl::StrCat(
         "NotifyForRead rejected duplicate block ", duplicate_block->block_id,
-        " for req_id=", session->req_id(), ", uuid=", uuid, ": positions ",
-        duplicate_block->first_index, " and ", duplicate_block->duplicate_index,
-        " of ", block_ids.size(), " blocks"));
+        " for uuid=", uuid, ": positions ", duplicate_block->first_index,
+        " and ", duplicate_block->duplicate_index, " of ", block_ids.size(),
+        " blocks"));
   }
   return session;
 }
@@ -130,11 +131,8 @@ TransferSendSession::CreateFromActivePlan(
                            base->has_explicit_pools(), base->pools(),
                            std::move(host_block_of)));
   const auto now = std::chrono::steady_clock::now();
-  std::string req_id = request.req_id().empty()
-                           ? absl::StrCat("resharded_transfer_", uuid)
-                           : request.req_id();
   auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
-      base, staging_allocator, std::move(req_id), uuid,
+      base, staging_allocator, uuid,
       std::chrono::steady_clock::time_point::max(), now, data_connection_reuse,
       std::make_shared<const TransferPlan>(std::move(plan))));
   {
@@ -146,19 +144,19 @@ TransferSendSession::CreateFromActivePlan(
 
 TransferSendSession::TransferSendSession(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
+    StagingBlockAllocator* staging_allocator, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start,
     DataConnectionReuse data_connection_reuse,
-    std::shared_ptr<const TransferPlan> plan)
+    std::shared_ptr<const TransferPlan> plan, BlockLocation source)
     : base_(base),
       staging_allocator_(staging_allocator),
-      req_id_(std::move(req_id)),
       uuid_(uuid),
       deadline_(deadline),
       register_start_(register_start),
       data_connection_reuse_(data_connection_reuse),
       transfer_plan_(std::move(plan)),
+      source_(source),
       staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
 
 std::optional<TransferSendSession::DuplicateBlock>
@@ -348,6 +346,8 @@ TransferDetails TransferSendSession::Details() const {
 
 absl::string_view TransferSendSession::CurrentPhaseLocked() const {
   if (remote_data_endpoints_.empty()) return kAwaitPullPhase;
+  // A host-resident send has nothing to stage or copy.
+  if (source_ == BlockLocation::kHost) return kPushPhase;
   if (staging_.empty()) return kStagingPhase;
   if (d2h_layer_futures_.size() < base_->num_layers()) return kD2hPhase;
   for (const raiden::PjRtCopyFuture& future : d2h_layer_futures_) {
@@ -468,10 +468,6 @@ void TransferSendSession::StartPush(
   RAIDEN_TRACE_FN("KVTransfer::StartPush", [&]() {
     return absl::StrCat("uuid=", uuid_, " blocks=", src_block_ids.size());
   });
-  // Stage the producer's device KV into a host slot (slot.block_ids) and send
-  // those host blocks to the consumer, keeping host offsets within the staging
-  // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
-  // once a device block id exceeds num_host_blocks.
   if (src_block_ids.empty() || src_block_ids.size() != dst_block_ids.size() ||
       remote_data_endpoints.empty()) {
     Finish(absl::InvalidArgumentError(
@@ -483,6 +479,35 @@ void TransferSendSession::StartPush(
     remote_data_endpoints_ = remote_data_endpoints;
   }
 
+  const size_t total_layers = base_->num_layers();
+  if (source_ == BlockLocation::kHost) {
+    // The registered blocks already are host blocks: give every layer an
+    // already-OK D2H future, so SendNextLayer and the transport's data-ready
+    // wait (GetDataReadyFuture) proceed without staging or D2H copies.
+    {
+      absl::MutexLock lock(mu_);
+      if (draining_ || done_) {
+        return;
+      }
+      if (total_layers == 0) {
+        FinishLocked(absl::OkStatus());
+        return;
+      }
+      src_ints_.assign(src_block_ids.begin(), src_block_ids.end());
+      dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
+      d2h_layer_futures_.assign(
+          total_layers, raiden::PjRtCopyFuture(tsl::Future<>(absl::OkStatus()),
+                                               raiden::BufferHolders{}));
+    }
+    remaining_h2h_layers_.store(total_layers, std::memory_order_relaxed);
+    SendNextLayer(0);
+    return;
+  }
+
+  // Stage the producer's device KV into a host slot (slot.block_ids) and send
+  // those host blocks to the consumer, keeping host offsets within the staging
+  // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
+  // once a device block id exceeds num_host_blocks.
   absl::Status acquire_status =
       AcquireStagingWithRetry(static_cast<int64_t>(src_block_ids.size()));
   if (!acquire_status.ok()) {
@@ -490,7 +515,6 @@ void TransferSendSession::StartPush(
     return;
   }
 
-  const size_t total_layers = base_->num_layers();
   std::vector<int64_t> host_block_ids;
   std::vector<tsl::Promise<>> d2h_promises;
   {

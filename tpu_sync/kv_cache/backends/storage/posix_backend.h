@@ -272,9 +272,12 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
                            std::string name = std::string(kPosixBackendName),
                            size_t capacity_bytes = 0,
                            size_t lookup_batch_size = kDefaultLookupBatchSize,
-                           MetadataCacheOptions cache_options = {});
+                           MetadataCacheOptions cache_options = {},
+                           std::string dp_rank = "0");
 
   std::string name() const override { return name_; }
+
+  const std::string& dp_rank() const { return dp_rank_; }
 
   size_t lookup_batch_size() const { return lookup_batch_size_; }
 
@@ -291,14 +294,6 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   absl::StatusOr<BlockSliceList> Lookup(
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override;
-
-  tsl::Future<> Load(const RaidenId& remote_id,
-                     absl::Span<const std::string> block_hashes,
-                     absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices,
-                     BlockTracker* absl_nonnull load_tracker) override {
-    return tsl::Future<>(absl::OkStatus());
-  }
 
   // No-op on the storage tier (blocks are written via async offload transfers).
   // Returns false for kAdmitStrict, which applies only to host-RAM admission.
@@ -358,10 +353,12 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   RaidenBlockId MakeSharedStorageBlock() const;
 
   std::shared_ptr<KVBackend> storage_backend_;
+  PosixKVBackend* posix_backend_ = nullptr;
   std::string name_ = std::string(kPosixBackendName);
   size_t capacity_bytes_ = 0;
   size_t lookup_batch_size_ = 32;
   const MetadataCacheOptions cache_options_;
+  const std::string dp_rank_ = "0";
 
   // Never held across storage I/O or key mapping.
   mutable absl::Mutex cache_mu_;

@@ -50,6 +50,7 @@ namespace {
 
 using ::absl_testing::StatusIs;
 using ::testing::AllOf;
+using ::testing::ElementsAre;
 using ::testing::HasSubstr;
 
 class FakeSendBase : public kv_cache::KVCacheManagerBase {
@@ -113,6 +114,18 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     return h2h_calls_;
   }
 
+  // One H2hWriteDirectAsync call, as the session issued it.
+  struct H2hPush {
+    int layer_idx;
+    std::vector<int> src_block_ids;
+    std::vector<int> dst_block_ids;
+  };
+
+  std::vector<H2hPush> h2h_pushes() const {
+    absl::MutexLock lock(mu_);
+    return h2h_pushes_;
+  }
+
   bool WaitForH2hCalls(int expected, absl::Duration timeout) const {
     absl::MutexLock lock(mu_);
     auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
@@ -159,6 +172,7 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     {
       absl::MutexLock lock(mu_);
       ++h2h_calls_;
+      h2h_pushes_.push_back({layer_idx, src_block_ids, dst_block_ids});
       if (manual_h2h_) {
         h2h_callbacks_.push_back(std::move(on_complete));
         return;
@@ -176,6 +190,7 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   std::optional<size_t> fail_d2h_layer_ ABSL_GUARDED_BY(mu_);
   absl::Status fail_d2h_status_ ABSL_GUARDED_BY(mu_);
   std::function<void(size_t)> d2h_dispatch_hook_ ABSL_GUARDED_BY(mu_);
+  std::vector<H2hPush> h2h_pushes_ ABSL_GUARDED_BY(mu_);
   std::vector<xla::Promise<>> d2h_promises_ ABSL_GUARDED_BY(mu_);
   std::vector<std::function<void(absl::StatusOr<std::vector<int>>)>>
       h2h_callbacks_ ABSL_GUARDED_BY(mu_);
@@ -216,6 +231,27 @@ absl::Status SeedIdleDataConnection(transport::BlockTransport& sender,
       .status();
 }
 
+// A producer whose registered blocks {2, 0} live in its host pool
+// (BlockLocation::kHost), with the pull already validated.
+std::shared_ptr<TransferSendSession> CreateHostSendSession(
+    FakeSendBase& base, StagingBlockAllocator* allocator) {
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator, /*uuid=*/200, /*block_ids=*/{2, 0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now,
+      BlockLocation::kHost);
+  session->ValidateAndBeginPull({2, 0}, now);
+  return session;
+}
+
+// The allocator of a manager built over a host pool alone: no staging slots
+// are carved out of the pool, so every host block id is the caller's. The
+// manager admits host-memory transfers only on such a pool.
+std::unique_ptr<StagingBlockAllocator> CreateHostPoolAllocator(
+    FakeSendBase& base) {
+  return CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+}
+
 TEST(TransferSendSessionTest,
      PerTransferPolicyClosesIdlePeerConnectionsBeforeDone) {
   ScopedDataConnReuseEnv env("per_transfer");
@@ -229,7 +265,7 @@ TEST(TransferSendSessionTest,
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_release", /*uuid=*/77, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/77, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
 
   session->ValidateAndBeginPull({0}, now);
@@ -253,7 +289,7 @@ TEST(TransferSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_pooled", /*uuid=*/79, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/79, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
 
   session->ValidateAndBeginPull({0}, now);
@@ -277,7 +313,7 @@ TEST(TransferSendSessionTest,
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_cancel_release", /*uuid=*/80,
+      &base, allocator.get(), /*uuid=*/80,
       /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
       /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
@@ -311,7 +347,7 @@ TEST(TransferSendSessionTest,
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_cancel_pooled", /*uuid=*/81,
+      &base, allocator.get(), /*uuid=*/81,
       /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
       /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
@@ -332,14 +368,14 @@ TEST(TransferSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
 
-  EXPECT_THAT(TransferSendSession::Create(
-                  &base, allocator.get(), "req_bad_policy", /*uuid=*/78,
-                  /*block_ids=*/{0},
-                  /*deadline=*/now + std::chrono::seconds(10),
-                  /*register_start=*/now),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       AllOf(HasSubstr("TPU_RAIDEN_DATA_CONN_REUSE"),
-                             HasSubstr("per-transfer"))));
+  EXPECT_THAT(
+      TransferSendSession::Create(&base, allocator.get(), /*uuid=*/78,
+                                  /*block_ids=*/{0},
+                                  /*deadline=*/now + std::chrono::seconds(10),
+                                  /*register_start=*/now),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               AllOf(HasSubstr("TPU_RAIDEN_DATA_CONN_REUSE"),
+                     HasSubstr("per-transfer"))));
 }
 
 TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
@@ -348,10 +384,12 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   std::unique_ptr<StagingBlockAllocator> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
+  const auto expected_deadline = now + std::chrono::seconds(10);
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req1", /*uuid=*/42, /*block_ids=*/{0, 1},
-      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+      &base, allocator.get(), /*uuid=*/42, /*block_ids=*/{0, 1},
+      /*deadline=*/expected_deadline, /*register_start=*/now);
   TransferSession* base_session = session.get();
+  EXPECT_EQ(base_session->deadline(), expected_deadline);
 
   session->ValidateAndBeginPull({0, 1}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0, 1},
@@ -383,7 +421,7 @@ TEST(TransferSendSessionTest,
 
   // Session 1 completes a full send push and retires.
   std::shared_ptr<TransferSendSession> session1 = *TransferSendSession::Create(
-      &base, allocator.get(), "req1", /*uuid=*/101, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/101, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(5), /*register_start=*/now);
   session1->ValidateAndBeginPull({0}, now);
   session1->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
@@ -395,7 +433,7 @@ TEST(TransferSendSessionTest,
   // Session 2 shares the same StagingBlockAllocator and must still be able to
   // acquire staging and complete a push without CancelledError.
   std::shared_ptr<TransferSendSession> session2 = *TransferSendSession::Create(
-      &base, allocator.get(), "req2", /*uuid=*/102, /*block_ids=*/{1},
+      &base, allocator.get(), /*uuid=*/102, /*block_ids=*/{1},
       /*deadline=*/now + std::chrono::seconds(5), /*register_start=*/now);
   session2->ValidateAndBeginPull({1}, now);
   session2->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{1},
@@ -419,7 +457,7 @@ TEST(TransferSendSessionTest,
 
   // Create a session with a 60-second deadline and block it in StartPush.
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_blocked", /*uuid=*/104, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/104, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(60), /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
 
@@ -458,7 +496,7 @@ TEST(TransferSendSessionTest,
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_race", /*uuid=*/103, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/103, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(5), /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
   EXPECT_FALSE(session->Done());
@@ -488,7 +526,7 @@ TEST(TransferSendSessionTest,
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_drain", /*uuid=*/105, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/105, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
@@ -543,7 +581,7 @@ TEST(TransferSendSessionTest,
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_lifetime", /*uuid=*/106, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/106, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
@@ -578,7 +616,7 @@ TEST(TransferSendSessionTest,
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_zero_layers", /*uuid=*/107,
+      &base, allocator.get(), /*uuid=*/107,
       /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(5),
       /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
@@ -598,7 +636,7 @@ TEST(TransferSendSessionTest,
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_bad_args", /*uuid=*/108, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/108, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(5), /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
   session->StartPush(/*remote_data_endpoints=*/{}, /*src_block_ids=*/{0},
@@ -618,7 +656,7 @@ TEST(TransferSendSessionTest, StatusIsFrozenOnceSessionIsDrainingOrDone) {
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_freeze", /*uuid=*/305, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/305, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
@@ -650,7 +688,7 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_futures", /*uuid=*/306, /*block_ids=*/{0},
+      &base, allocator.get(), /*uuid=*/306, /*block_ids=*/{0},
       /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
@@ -686,7 +724,7 @@ TEST(TransferSendSessionTest,
   const auto now = std::chrono::steady_clock::now();
 
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_dispatch_fail", /*uuid=*/307,
+      &base, allocator.get(), /*uuid=*/307,
       /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
       /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
@@ -743,7 +781,7 @@ TEST(TransferSendSessionTest,
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_failed_dispatch_ends_send", /*uuid=*/308,
+      &base, allocator.get(), /*uuid=*/308,
       /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
       /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
@@ -787,7 +825,7 @@ TEST(TransferSendSessionTest, FailedD2hDispatchOnFirstLayerSettlesAtOnce) {
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_first_dispatch_fail", /*uuid=*/309,
+      &base, allocator.get(), /*uuid=*/309,
       /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
       /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
@@ -812,7 +850,7 @@ TEST(TransferSendSessionTest, CancelledSendWhosePushThenFailsKeepsCancelled) {
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req_cancel_then_push_fail", /*uuid=*/310,
+      &base, allocator.get(), /*uuid=*/310,
       /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
       /*register_start=*/now);
   session->ValidateAndBeginPull({0}, now);
@@ -827,6 +865,121 @@ TEST(TransferSendSessionTest, CancelledSendWhosePushThenFailsKeepsCancelled) {
   base.CompleteH2h(0, absl::InternalError("push failed"));
   EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
+TEST(TransferSendSessionTest,
+     HostSourcePushesRegisteredHostBlocksWithoutStagingOrD2h) {
+  FakeSendBase base(/*num_layers=*/3, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+  ASSERT_TRUE(base.WaitForH2hCalls(3, absl::Seconds(2)));
+
+  // Every layer is pushed straight from the registered host blocks: no
+  // staging is leased and no D2H copy is issued; the already-OK D2H futures
+  // stand in for the copies, so a reader gating on a layer is never held.
+  EXPECT_EQ(base.d2h_calls(), 0);
+  EXPECT_EQ(base.host_block_manager()->num_free_blocks(), 4);
+  tsl::Future<> layer_ready =
+      session->GetDataReadyFuture(/*major_dimension_idx=*/2);
+  EXPECT_TRUE(layer_ready.IsReady());
+  ABSL_EXPECT_OK(layer_ready.Await());
+  std::vector<int> layers;
+  for (const FakeSendBase::H2hPush& push : base.h2h_pushes()) {
+    layers.push_back(push.layer_idx);
+    EXPECT_THAT(push.src_block_ids, ElementsAre(2, 0));
+    EXPECT_THAT(push.dst_block_ids, ElementsAre(1, 3));
+  }
+  EXPECT_THAT(layers, ElementsAre(0, 1, 2));
+
+  // The send settles with the last push to complete, whichever layer it is.
+  base.CompleteH2h(0, std::vector<int>{2, 0});
+  base.CompleteH2h(2, std::vector<int>{2, 0});
+  EXPECT_FALSE(session->Done());
+  base.CompleteH2h(1, std::vector<int>{2, 0});
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_EQ(base.host_block_manager()->num_free_blocks(), 4);
+}
+
+TEST(TransferSendSessionTest,
+     HostSourceFailedLayerPushFailsTheSendOnceInFlightLayersDrain) {
+  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+  ASSERT_TRUE(base.WaitForH2hCalls(2, absl::Seconds(2)));
+
+  // Layer 0's push fails: the send drains, but is not done while layer 1's
+  // push is still in flight.
+  base.CompleteH2h(0, absl::InternalError("socket reset"));
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+  EXPECT_THAT(session->GetStatus(), StatusIs(absl::StatusCode::kInternal));
+
+  base.CompleteH2h(1, std::vector<int>{2, 0});
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
+  EXPECT_EQ(session->Details().phase, "push");
+}
+
+TEST(TransferSendSessionTest,
+     HostSourceDeadlineWhilePushingIsAttributedToThePushPhase) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+
+  // A host send has no staging or D2H step, so a deadline that strikes while
+  // its push runs is attributed to the push rather than to staging.
+  session->Finish(absl::DeadlineExceededError("send deadline exceeded"));
+  base.CompleteH2h(0, std::vector<int>{2, 0});
+  EXPECT_THAT(session->AwaitForDone(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  EXPECT_EQ(session->Details().phase, "push");
+}
+
+TEST(TransferSendSessionTest, HostSourceWithNoLayersSettlesWithoutAPush) {
+  FakeSendBase base(/*num_layers=*/0, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_EQ(base.h2h_calls(), 0);
+  EXPECT_EQ(base.d2h_calls(), 0);
+}
+
+TEST(TransferSendSessionTest, HostSourceFinishedBeforeStartPushIssuesNothing) {
+  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+  session->Finish(absl::CancelledError("consumer went away"));
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(base.h2h_calls(), 0);
+  EXPECT_EQ(base.d2h_calls(), 0);
 }
 
 }  // namespace

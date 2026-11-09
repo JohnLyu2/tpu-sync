@@ -49,6 +49,7 @@ namespace {
 using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::ElementsAre;
+using testing::ElementsAreArray;
 using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::IsEmpty;
@@ -326,6 +327,20 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kStorageFilesystemBytes.label_names,
               ElementsAre(metric_labels::kMount, metric_labels::kState));
+
+  // StorageIoTimeMs
+  EXPECT_EQ(metric_names::kStorageIoTimeMs, "storage_io_time_ms");
+  EXPECT_EQ(metric_descriptions::kStorageIoTimeMs,
+            "Non-overlapping secondary storage I/O transfer duration in "
+            "milliseconds.");
+  EXPECT_EQ(metric_metadata::kStorageIoTimeMs.name, "storage_io_time_ms");
+  EXPECT_EQ(metric_metadata::kStorageIoTimeMs.description,
+            "Non-overlapping secondary storage I/O transfer duration in "
+            "milliseconds.");
+  EXPECT_EQ(metric_metadata::kStorageIoTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(
+      metric_metadata::kStorageIoTimeMs.label_names,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -432,6 +447,25 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kPeregrineErrorsTotal.type, MetricType::kCounter);
   EXPECT_THAT(metric_metadata::kPeregrineErrorsTotal.label_names, IsEmpty());
 
+  // Storage Metadata Check Metrics
+  EXPECT_EQ(metric_labels::kDpRank, "dp_rank");
+  EXPECT_EQ(metric_labels::kResult, "result");
+  EXPECT_EQ(metric_labels::kResultCacheHit, "cache_hit");
+  EXPECT_EQ(metric_labels::kResultStatHit, "stat_hit");
+  EXPECT_EQ(metric_labels::kResultStatMiss, "stat_miss");
+  EXPECT_EQ(metric_names::kStorageMetadataCheckTotal,
+            "storage_metadata_check_total");
+  EXPECT_EQ(metric_descriptions::kStorageMetadataCheckTotal,
+            "Total secondary storage metadata existence checks by result");
+  EXPECT_EQ(metric_metadata::kStorageMetadataCheckTotal.name,
+            "storage_metadata_check_total");
+  EXPECT_EQ(metric_metadata::kStorageMetadataCheckTotal.description,
+            "Total secondary storage metadata existence checks by result");
+  EXPECT_EQ(metric_metadata::kStorageMetadataCheckTotal.type,
+            MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kStorageMetadataCheckTotal.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kResult));
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
@@ -471,9 +505,16 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_labels::kOutcomeNotFound, "not_found");
   EXPECT_EQ(metric_labels::kOutcomeStagingExhausted, "staging_exhausted");
   EXPECT_EQ(metric_labels::kOutcomeTransferFailed, "transfer_failed");
+  EXPECT_EQ(metric_labels::kOutcomeRejected, "rejected");
+  EXPECT_EQ(metric_labels::kOutcomeFailed, "failed");
   EXPECT_THAT(metric_labels::kKvRecallBlocksLabels,
               ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
                           metric_labels::kOutcome));
+  EXPECT_THAT(metric_labels::kKvSaveBlocksLabels,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+  EXPECT_THAT(metric_labels::kKvEvictedBlocksLabels,
+              ElementsAre(metric_labels::kDpRank));
 
   EXPECT_EQ(metric_names::kKvRecallBlocksTotal, "kv_recall_blocks_total");
   EXPECT_EQ(metric_descriptions::kKvRecallBlocksTotal,
@@ -486,6 +527,46 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "and outcomes.");
   EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.type, MetricType::kCounter);
   EXPECT_THAT(metric_metadata::kKvRecallBlocksTotal.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+
+  EXPECT_EQ(metric_names::kKvSaveBlocksTotal, "kv_save_blocks_total");
+  EXPECT_EQ(metric_descriptions::kKvSaveBlocksTotal,
+            "Cumulative count of KV cache block save attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvSaveBlocksTotal.name, "kv_save_blocks_total");
+  EXPECT_EQ(metric_metadata::kKvSaveBlocksTotal.description,
+            "Cumulative count of KV cache block save attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvSaveBlocksTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kKvSaveBlocksTotal.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+
+  EXPECT_EQ(metric_names::kKvEvictedBlocksTotal, "kv_evicted_blocks_total");
+  EXPECT_EQ(
+      metric_descriptions::kKvEvictedBlocksTotal,
+      "Cumulative count of KV cache blocks evicted from the host DRAM pool.");
+  EXPECT_EQ(metric_metadata::kKvEvictedBlocksTotal.name,
+            "kv_evicted_blocks_total");
+  EXPECT_EQ(
+      metric_metadata::kKvEvictedBlocksTotal.description,
+      "Cumulative count of KV cache blocks evicted from the host DRAM pool.");
+  EXPECT_EQ(metric_metadata::kKvEvictedBlocksTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kKvEvictedBlocksTotal.label_names,
+              ElementsAre(metric_labels::kDpRank));
+
+  EXPECT_EQ(metric_names::kKvRecallDurationMs, "kv_recall_duration_ms");
+  EXPECT_EQ(metric_descriptions::kKvRecallDurationMs,
+            "Duration in milliseconds of each KV cache recall batch, from "
+            "tier dispatch until it settles, across tiers and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvRecallDurationMs.name, "kv_recall_duration_ms");
+  EXPECT_EQ(metric_metadata::kKvRecallDurationMs.description,
+            metric_descriptions::kKvRecallDurationMs);
+  EXPECT_EQ(metric_metadata::kKvRecallDurationMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kKvRecallDurationMs.buckets,
+              ElementsAreArray(kDefaultHistogramBuckets));
+  EXPECT_THAT(metric_metadata::kKvRecallDurationMs.label_names,
               ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
                           metric_labels::kOutcome));
 
@@ -506,6 +587,27 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_labels::kStorageFilesystemBytesLabels,
               ElementsAre(metric_labels::kMount, metric_labels::kState));
 
+  // Storage I/O Labels
+  EXPECT_THAT(
+      metric_labels::kStorageIoLabels,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+  // Host Pool Blocks Labels & Metadata
+  EXPECT_EQ(metric_labels::kStatePinned, "pinned");
+  EXPECT_THAT(metric_labels::kHostPoolBlocksLabels,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kState));
+
+  EXPECT_EQ(metric_names::kHostPoolBlocks, "host_pool_blocks");
+  EXPECT_EQ(metric_descriptions::kHostPoolBlocks,
+            "Number of host DRAM KV cache pool blocks by state (total, used, "
+            "pinned).");
+  EXPECT_EQ(metric_metadata::kHostPoolBlocks.name, "host_pool_blocks");
+  EXPECT_EQ(metric_metadata::kHostPoolBlocks.description,
+            "Number of host DRAM KV cache pool blocks by state (total, used, "
+            "pinned).");
+  EXPECT_EQ(metric_metadata::kHostPoolBlocks.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostPoolBlocks.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kState));
+
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -524,10 +626,16 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kD2hDmaTimeMs,
           metric_metadata::kBufferAllocatedBytes,
           metric_metadata::kKvRecallBlocksTotal,
+          metric_metadata::kKvSaveBlocksTotal,
+          metric_metadata::kKvEvictedBlocksTotal,
+          metric_metadata::kKvRecallDurationMs,
           metric_metadata::kStorageBytesTotal,
           metric_metadata::kHostMemoryBreakdownBytes,
           metric_metadata::kHostNumaMemoryBytes,
           metric_metadata::kStorageFilesystemBytes,
+          metric_metadata::kStorageMetadataCheckTotal,
+          metric_metadata::kStorageIoTimeMs,
+          metric_metadata::kHostPoolBlocks,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

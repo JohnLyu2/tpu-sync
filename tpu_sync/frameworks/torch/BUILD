@@ -60,6 +60,7 @@ cc_library(
     deps = [
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
+        ":torch_tpu_utils",
         ":torch_utils",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",
@@ -228,6 +229,7 @@ nanobind_extension(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/fault_injection:fault_injection_bindings",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/kv_cache:kv_cache_store",
         "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
         "//tpu_sync/kv_cache:kv_cache_store_wrapper",
@@ -459,6 +461,7 @@ cc_library(
     deps = [
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
+        ":torch_tpu_utils_mock",
         ":torch_utils_mock",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",
