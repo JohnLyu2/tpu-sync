@@ -159,6 +159,16 @@ size_t PushFirstChunk(SlotManager& manager, size_t pool_idx, uint64_t uuid) {
       .size();
 }
 
+// The end of a pool's push stream: the transport reports a unit completion
+// (KVCacheManagerBase::OnLayerReceived, the pool index as the major dimension),
+// which the session takes as the pool's wire completion
+// (TransferSession::OnDataReceived with no minor indices) and records it,
+// launching the pool's H2D only once every lower-rank pool has completed.
+absl::Status PoolStreamComplete(SlotManager& manager, size_t pool_idx,
+                                uint64_t uuid) {
+  return manager.base()->OnLayerReceived(/*layer_idx=*/pool_idx, uuid);
+}
+
 void RegisterTwoPools(SlotManager& manager) {
   ABSL_ASSERT_OK(manager.base()->RegisterPools(
       {DensePool("fa"), DensePool("swa")}, /*staging_leases=*/2));
@@ -178,7 +188,7 @@ TEST(ReshardRecvStagingSlotRankDeadlock,
       std::vector<int64_t>{0, 0}));
 
   ASSERT_EQ(PushFirstChunk(manager, /*pool_idx=*/1, kUuid), 1u);
-  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/1, kUuid));
+  ABSL_ASSERT_OK(PoolStreamComplete(manager, /*pool_idx=*/1, kUuid));
 
   const absl::Time t0 = absl::Now();
   EXPECT_EQ(PushFirstChunk(manager, /*pool_idx=*/0, kUuid), 1u);
@@ -210,7 +220,7 @@ TEST(ReshardRecvStagingSlotRankDeadlock,
   // Rank-1 pool: first chunk leases the slot, its stream completes, its H2D
   // is held back by the rank gate (rank-0 pool not complete).
   ASSERT_EQ(PushFirstChunk(manager, /*pool_idx=*/1, kUuid), 1u);
-  ABSL_ASSERT_OK(manager.base()->OnPoolReceived(/*pool_idx=*/1, kUuid));
+  ABSL_ASSERT_OK(PoolStreamComplete(manager, /*pool_idx=*/1, kUuid));
 
   // Rank-0 pool: its first chunk needs the slot the rank-1 pool holds.
   size_t rank0_chunks = 99;
