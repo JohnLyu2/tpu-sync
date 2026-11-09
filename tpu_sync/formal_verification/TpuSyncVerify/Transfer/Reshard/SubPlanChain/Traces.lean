@@ -107,8 +107,10 @@ theorem trace_sub_plan_uuid_positive_and_distinct :
 
 /-- Replays `SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan`
 (`pool_reshard_test.cc`): sub-plans `0`, `2`, `1` of `count = 3` settle out of
-order; `done_recving` is inserted only once the third settles, and polling
-again does not re-insert it. -/
+order; `done_recving` is inserted only once the third settles
+(`settled_count == progress.sub_sessions.size()`), polling again does not
+re-insert it (`progress.completed`), and the entry stays, completed, until the
+sweep expires it. -/
 theorem trace_recv_terminal_waits_for_last_sub_plan :
     let tr1 : List WorkerEv :=
       [ .registerSubPlan 5001 0 3, .settleSession 5001 true, .poll false,
@@ -116,14 +118,29 @@ theorem trace_recv_terminal_waits_for_last_sub_plan :
     let tr2 : List WorkerEv :=
       tr1 ++ [ .registerSubPlan 5002 1 3, .settleSession 5002 true, .poll false, .poll false ]
     (WorkerState.sys.run tr1).map (fun w => (w.doneReports, w.failReports)) = some (0, 0) ∧
-    (WorkerState.sys.run tr2).map (fun w => (w.doneReports, w.failReports, w.chain.present)) =
-      some (1, 0, false) := by
+    (WorkerState.sys.run tr2).map
+        (fun w => (w.doneReports, w.failReports, w.chain.present, w.chain.completed)) =
+      some (1, 0, true, true) := by
+  decide
+
+/-- Replays `SubPlanChainTest.SendTerminalWaitsForTheLastSubPlan`
+(`pool_reshard_test.cc`): sub-plan `0` of `2` (`5041`, a send session seated by
+`AddPoolReshardSend` with `SessionRole::kPoolReshardSend`) settles OK and
+`done_sending` stays empty; the request is inserted once sub-plan `1` (`5042`)
+settles. -/
+theorem trace_send_terminal_waits_for_last_sub_plan :
+    let tr1 : List WorkerEv :=
+      [ .registerSubPlan 5041 0 2, .settleSession 5041 true, .poll false ]
+    let tr2 : List WorkerEv :=
+      tr1 ++ [ .registerSubPlan 5042 1 2, .settleSession 5042 true, .poll false ]
+    (WorkerState.sys.run tr1).map (fun w => (w.doneReports, w.failReports)) = some (0, 0) ∧
+    (WorkerState.sys.run tr2).map (fun w => (w.doneReports, w.failReports)) = some (1, 0) := by
   decide
 
 /-- Replays `SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce`
 (`pool_reshard_test.cc`): sub-plan `0` of `2` fails and `failed_recving` is
 inserted once; sub-plan `1` is still seated afterwards and its clean settlement
-is swallowed (`if (progress.failed) return;`). -/
+is swallowed (`if (progress.failed || progress.completed) return;`). -/
 theorem trace_first_sub_plan_failure_fails_once :
     let tr : List WorkerEv :=
       [ .registerSubPlan 5011 0 2, .settleSession 5011 false, .poll false,
@@ -136,8 +153,9 @@ theorem trace_first_sub_plan_failure_fails_once :
 (`pool_reshard_test.cc`): the first chain fails at sub-plan `0` (`6001`) while
 sub-plan `1` (`6002`) is still active; the consumer retries under the same
 `req_id` (`7001`, `7002`); sub-plan 0 of the retry re-anchors a fresh entry, the
-stale `6002` settling is ignored (`!plan_uuids.contains(uuid)`), and the retry
-inserts `done` once `7001` and `7002` settle. -/
+stale `6002` settling is ignored (`std::find` on `sub_sessions` fails and the
+entry is anchored), and the retry inserts `done` once `7001` and `7002`
+settle. -/
 theorem trace_retry_same_req_id_tracked_as_new_chain :
     let tr : List WorkerEv :=
       [ .registerSubPlan 6001 0 2, .settleSession 6001 false, .poll false,
@@ -161,7 +179,7 @@ theorem trace_stalled_chain_fails_after_timeout :
 
 /-- Replays `SubPlanChainTest.SinglePlanRequestsReportAtOnce`
 (`pool_reshard_test.cc`): `sub_plan_count <= 1` (`5031`) reports on settlement
-without a `chains_` entry. -/
+without a `sub_plan_chains_` entry. -/
 theorem trace_single_plan_reports_at_once :
     let tr : List WorkerEv :=
       [ .registerSubPlan 5031 0 1, .settleSession 5031 true, .poll false ]
@@ -172,33 +190,36 @@ theorem trace_single_plan_reports_at_once :
 /-- A sender with spans in window `0` only of a `K = 2` request
 (`ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries` dispatches rank
 `0` once, stamped `sub_plan_index = 0, sub_plan_count = 2`): its single push
-settles OK, `settled.size() = 1 < count = 2`, so no `done_sending` is inserted;
-once the entry is quiet for `timeout_s_` the sweep inserts `failed_recving`. -/
+settles OK, `sub_sessions = [session, nullptr]` has one settled slot of two, so
+no `done_sending` is inserted; once the entry is quiet for `timeout_s_` the
+sweep inserts `failed_recving`. -/
 theorem trace_sender_in_first_window_only :
     let tr : List WorkerEv :=
       [ .registerSubPlan 9000 0 2, .settleSession 9000 true, .poll false ]
-    (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.chain.settled)) =
-      some (0, 0, [0]) ∧
+    (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.chain.subSessions)) =
+      some (0, 0, [some 9000, none]) ∧
     (WorkerState.sys.run (tr ++ [.poll true])).map (fun w => (w.doneReports, w.failReports)) =
       some (0, 1) := by
   decide
 
 /-- A sender with spans in window `1` only (`sub_plan_index = 1`): its
-registration default-constructs an unanchored entry (`anchored = false`), its
-clean settlement counts `1 of 2`, and the sweep inserts `failed_recving`. -/
+registration inserts an unanchored entry (`anchored = false`) whose slot 0 is
+`nullptr`, its clean settlement counts `1 of 2`, and the sweep inserts
+`failed_recving`. -/
 theorem trace_sender_in_last_window_only :
     let tr : List WorkerEv :=
       [ .registerSubPlan 9001 1 2, .settleSession 9001 true, .poll false ]
-    (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.chain.anchored, w.chain.settled)) =
-      some (0, false, [1]) ∧
+    (WorkerState.sys.run tr).map
+        (fun w => (w.doneReports, w.chain.anchored, w.chain.subSessions)) =
+      some (0, false, [none, some 9001]) ∧
     (WorkerState.sys.run (tr ++ [.poll true])).map (fun w => (w.doneReports, w.failReports)) =
       some (0, 1) := by
   decide
 
 /-- Sub-plans `0` and `1` are both seated; sub-plan `0` fails and
 `RecordPoolReshardTerminalLocked` inserts `failed_recving` while sub-plan `1`'s
-session is still active (`active ≠ []`): the request's failure is published
-before the chain's last session settles. -/
+session is still in `sessions_` (`active ≠ []`): the request's failure is
+published before the chain's last session settles. -/
 theorem trace_first_failure_reports_while_sibling_active :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7100 0 2, .registerSubPlan 7101 1 2,
@@ -216,6 +237,45 @@ theorem trace_late_sub_plan_after_sweep_reports_failure_twice :
         .poll true,
         .registerSubPlan 7301 1 2, .settleSession 7301 true, .poll false, .poll true ]
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (0, 2) := by
+  decide
+
+/-- A sub-plan still seated when its failed entry is erased by the sweep has
+passed its own deadline (A5): the same `CompleteReadWithDetails` fails it, and
+its settlement is reported through the no-entry arm as a second
+`failed_recving`, never as `done`. -/
+theorem trace_sub_plan_seated_at_sweep_is_failed_not_done :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 7500 0 2, .settleSession 7500 false, .poll false,
+        .registerSubPlan 7501 1 2, .poll true,
+        .settleSession 7501 true, .poll false ]
+    (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.chain.present)) =
+      some (0, 2, false) := by
+  decide
+
+/-- The stall sweep keeps an entry while a slot's session is still open
+(`active`: `last_activity = now`); that session has outlived its own deadline
+(A5), so the same `CompleteReadWithDetails` fails it and its settlement is the
+chain's first failure. -/
+theorem trace_stall_sweep_keeps_entry_with_open_session :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 9100 0 2, .registerSubPlan 9101 1 2,
+        .settleSession 9100 true, .poll false, .poll true ]
+    (WorkerState.sys.run tr).map
+        (fun w => (w.doneReports, w.failReports, w.chain.failed, w.active.map (·.ok))) =
+      some (0, 0, false, [false]) ∧
+    (WorkerState.sys.run (tr ++ [.settleSession 9101 true, .poll false])).map
+        (fun w => (w.doneReports, w.failReports, w.chain.failed)) = some (0, 1, true) := by
+  decide
+
+/-- A single-plan session seated before a chained sub-plan `1` of the same
+`req_id` is not in the unanchored entry's `sub_sessions`, so its terminal is
+the request's (the `stray` arm) — the single-plan request still reports. -/
+theorem trace_single_plan_beside_unanchored_entry_reports :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 7600 0 1, .registerSubPlan 7601 1 2,
+        .settleSession 7600 true, .poll false ]
+    (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.chain.anchored)) =
+      some (1, 0, false) := by
   decide
 
 /-! ### Search -/
@@ -241,38 +301,30 @@ def workerCheckEvents : List WorkerEv :=
     .settleSession 13 true, .settleSession 13 false,
     .poll false, .poll true ]
 
+/-- A single-plan request beside a `K = 2` chain under the same `req_id`. -/
+def mixedCheckEvents : List WorkerEv :=
+  [ .registerSubPlan 20 0 1, .registerSubPlan 10 0 2, .registerSubPlan 11 1 2,
+    .settleSession 20 true, .settleSession 20 false,
+    .settleSession 10 true, .settleSession 10 false,
+    .settleSession 11 true, .settleSession 11 false,
+    .poll false, .poll true ]
+
 #guard ModelCheck.check WorkerState.sys workerCheckEvents workerViolates 32 = .safe
+#guard ModelCheck.check WorkerState.sys mixedCheckEvents workerViolates 32 = .safe
 
 /-! ### Mutants -/
 
-/-- Mutant: `RecordPoolReshardTerminalLocked` without the
-`!plan_uuids.contains(uuid)` check counts a superseded chain's sub-plan into the
-new chain. -/
-def recordTerminalCountingStale (c : ChainProgress) (s : SubSession) : ChainProgress × Terminal :=
-  recordTerminal { c with planUuids := insertNodup s.uuid c.planUuids } s
-
+/-- Mutant: `RecordPoolReshardTerminalLocked` without the `std::find` on
+`sub_sessions` — a settled session missing from the entry is counted in its
+index's slot (the slot a superseded chain's sub-plan was stamped with). -/
 def stepCountStale (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
   match e with
   | .poll stalled =>
-    let settledNow := w.active.filter (·.done)
-    let stillActive := w.active.filter (!·.done)
-    let r := settledNow.foldl
-      (fun (acc : WorkerState.SweepAcc) s =>
-        let touched := acc.touched || s.count > 1
-        match recordTerminalCountingStale acc.chain s with
-        | (c', .done k idx) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(k, idx)], touched }
-        | (c', .failed) => { acc with chain := c', fail := acc.fail + 1, touched }
-        | (c', _) => { acc with chain := c', touched })
-      { chain := w.chain }
-    let (c2, sweep) :=
-      if stalled && !r.touched then sweepStalledChain r.chain stillActive else (r.chain, .notSwept)
-    some
-      { w with
-        doneReports := w.doneReports + r.done
-        failReports := w.failReports + r.fail + (if sweep == .stalled then 1 else 0)
-        doneLog := w.doneLog ++ r.log
-        active := stillActive
-        chain := c2 }
+    let c := w.sessions.foldl (fun (c : ChainProgress) s =>
+      if s.done && !s.retired && c.present && !c.subSessions.contains (some s.uuid) then
+        { c with subSessions := (growTo c.subSessions (s.index + 1)).set s.index (some s.uuid) }
+      else c) w.chain
+    WorkerState.step { w with chain := c } (.poll stalled)
   | e => WorkerState.step w e
 
 /-- On the retry trace, the mutant inserts `done` for the retry as soon as the
@@ -293,11 +345,12 @@ theorem mutant_counting_stale_sub_plan_reports_done_early :
 /-- Mutant: `NoteSubPlanRegisteredLocked` without the fresh entry for
 `sub_plan_index == 0`: a retry under the same `req_id` lands in the failed
 entry and is never reported `done`. -/
-def noteSubPlanRegisteredNoReanchor (c : ChainProgress) (uuid _index count : Nat) : ChainProgress :=
-  if count <= 1 then c
+def noteSubPlanRegisteredNoReanchor (c : ChainProgress) (uuid index count : Nat) : ChainProgress :=
+  if count <= 1 then {}
   else
     let base : ChainProgress := if c.present then c else { present := true }
-    { base with planUuids := insertNodup uuid base.planUuids, count := max base.count count }
+    let needed := max base.subSessions.length (max count (index + 1))
+    { base with subSessions := (growTo base.subSessions needed).set index (some uuid) }
 
 def stepNoReanchor (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
   match e with
@@ -307,7 +360,7 @@ def stepNoReanchor (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
       some
         { w with
           seenUuids := uuid :: w.seenUuids
-          active := w.active ++ [{ uuid := uuid, index := index, count := count }]
+          sessions := w.sessions ++ [{ uuid := uuid, index := index, count := count }]
           chain := noteSubPlanRegisteredNoReanchor w.chain uuid index count }
   | e => WorkerState.step w e
 
@@ -319,6 +372,60 @@ theorem mutant_no_reanchor_never_reports_retry_done :
     ((⟨WorkerState.init, stepNoReanchor⟩ : System WorkerState WorkerEv).run tr).map
         (fun w => (w.doneReports, w.failReports)) = some (0, 1) ∧
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (1, 1) := by
+  decide
+
+/-- Without A5 (`stepG { deadlineArm := false }`): a sub-plan still seated when
+the sweep erases its failed entry later settles OK and, finding no entry, is
+reported as the request's `done` (`doneLog = [(2, [1])]`): a `done_recving` for
+a two-plan request with one sub-plan settled. The shipping step fails that
+session at the sweep. -/
+theorem mutant_no_deadline_arm_reports_done_after_sweep :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 7500 0 2, .settleSession 7500 false, .poll false,
+        .registerSubPlan 7501 1 2, .poll true,
+        .settleSession 7501 true, .poll false ]
+    ((⟨WorkerState.init, WorkerState.stepG { deadlineArm := false }⟩ :
+        System WorkerState WorkerEv).run tr).map
+        (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (1, 1, [(2, [1])]) ∧
+    (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.doneLog)) =
+      some (0, 2, []) := by
+  decide
+
+#guard (ModelCheck.check (⟨WorkerState.init, WorkerState.stepG { deadlineArm := false }⟩ :
+    System WorkerState WorkerEv) workerCheckEvents workerViolates 32 matches .counterexample _)
+
+/-- Without A6 (`stepG { noSingleWhileSeated := false }`): a single-plan
+registration under the `req_id` of a chain in flight erases the chain's entry,
+and the chained sub-plan's clean settlement is then reported as the request's
+`done` while the single-plan session is still open. The shipping step refuses
+the registration. -/
+theorem mutant_single_plan_registration_erases_live_chain :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 7700 0 2, .registerSubPlan 7701 0 1,
+        .settleSession 7700 true, .poll false ]
+    ((⟨WorkerState.init, WorkerState.stepG { noSingleWhileSeated := false }⟩ :
+        System WorkerState WorkerEv).run tr).map
+        (fun w => (w.doneReports, w.doneLog, w.active.map (·.uuid))) =
+      some (1, [(2, [0])], [7701]) ∧
+    WorkerState.sys.run tr = none := by
+  decide
+
+#guard (ModelCheck.check (⟨WorkerState.init, WorkerState.stepG { noSingleWhileSeated := false }⟩ :
+    System WorkerState WorkerEv) mixedCheckEvents workerViolates 32 matches .counterexample _)
+
+/-- Without A7 (`stepG { oneSessionPerSlot := false }`): a second sub-plan `1`
+registered into an unanchored entry overwrites the slot; the first session,
+no longer in `sub_sessions`, settles into the `stray` arm and is reported as
+the request's `done`. The shipping step refuses the second registration. -/
+theorem mutant_slot_overwrite_reports_stray_done :
+    let tr : List WorkerEv :=
+      [ .registerSubPlan 7800 1 2, .registerSubPlan 7801 1 2,
+        .settleSession 7800 true, .poll false ]
+    ((⟨WorkerState.init, WorkerState.stepG { oneSessionPerSlot := false }⟩ :
+        System WorkerState WorkerEv).run tr).map
+        (fun w => (w.doneReports, w.doneLog, w.chain.subSessions)) =
+      some (1, [(2, [1])], [none, some 7801]) ∧
+    WorkerState.sys.run tr = none := by
   decide
 
 /-! ## Part III — Coordinator multi-window chain -/

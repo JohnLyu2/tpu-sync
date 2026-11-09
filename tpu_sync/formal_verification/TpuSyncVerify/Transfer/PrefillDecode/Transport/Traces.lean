@@ -113,9 +113,10 @@ theorem trace_dup_chunk_publishes_missing_layer :
     some (true, true, [1, 0]) := by
   decide
 
-/-- **Either contract, after retirement.** Both layers land and the table
-entries are erased (`if (all_layers_called)` in `CompleteIncomingPush`). An
-extra stream for layer 0 then creates a fresh entry whose first stream
+/-- **Either contract, after retirement.** Both layers land and the push
+session is retired (`if (all_layers_called)` in `CompleteIncomingPush` sets
+`done_`; `GetOrCreatePushSession` then seats a fresh session for the uuid). An
+extra stream for layer 0 then starts a fresh entry whose first stream
 completes it: `OnLayerReceived` fires again and a second copy of layer 0 is
 issued while the first may still run (`dispatched = [2, 1]`). The session is
 not fooled about settlement — `in_flight_` holds `done_` off until every copy
@@ -253,9 +254,9 @@ exercises the plan-declared pool or Peregrine bitmask paths of
 
 /-- One layer, one sender declaring two streams (`num_streams = 2`),
 chunk-count contract. The first stream completes nothing; the second fires
-`OnLayerReceived` once and, every layer now called, retires the table
-(`layer_progress_.clear()`, `done_ = true`, so `HandleIncomingPush` drops the
-push session). No upstream test drives this shape on the socket path:
+`OnLayerReceived` once and, every layer now called, retires the session
+(`done_ = true`, so `HandleIncomingPush` drops the push session and the uuid's
+next stream gets a fresh table). No upstream test drives this shape on the socket path:
 `BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` retires a
 two-layer session through `OnPeregrinePostComplete` (`is_peregrine = true`),
 which is `notReplayable` here. -/
@@ -365,7 +366,11 @@ contract (`BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
 `OnPeregrinePostComplete` and the `is_peregrine = true` shard-bitmask branch of
 `CompleteIncomingPush` (`PeregrineRecvCompleteTest.RejectsSenderSession` the
 `TryBeginOp` refusal of a send session in `BeginIncomingPush`), neither a
-contract of this model. -/
+contract of this model; `PeregrineResolveRecvBufferTest` and
+`PeregrineResolveRecvBufferLeaseTest` drive the Peregrine receive-buffer
+resolution and its op lease (`ResolveRecvBuffer`), and `ValidateChunksTest`
+the payload bounds check (`ValidateChunks` against
+`GetBlockArrayHostSpan`), which precede the table and are not events here. -/
 def notReplayable : List (String × String) :=
   [("BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism", "per-sender declarations (A3)"),
    ("BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected", "per-sender declarations (A3)"),
@@ -380,7 +385,10 @@ def notReplayable : List (String × String) :=
    ("BlockTransportServerPushSessionTest.LifecycleAndPostCompletion",
      "OnPeregrinePostComplete and is_peregrine = true branch"),
    ("PeregrineRecvCompleteTest.* (10 tests)",
-     "OnPeregrinePostComplete and is_peregrine = true shard-bitmask branch")]
+     "OnPeregrinePostComplete and is_peregrine = true shard-bitmask branch"),
+   ("PeregrineResolveRecvBufferTest.* / PeregrineResolveRecvBufferLeaseTest.* (10 tests)",
+     "Peregrine ResolveRecvBuffer and its op lease"),
+   ("ValidateChunksTest.* (3 tests)", "payload bounds check before the table")]
 
 -- Every paired and model-only trace runs to its end.
 #guard (paired ++ modelOnly).all fun (_, c, tr) => ((sys c).run tr).isSome

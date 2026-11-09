@@ -138,7 +138,9 @@ def Layer.entryCalled (L : Layer) : Bool :=
   | none => false
 
 /-- Retirement (`if (all_layers_called)` in `CompleteIncomingPush`): once every
-layer's latch is set, the uuid's entries are erased. -/
+layer's latch is set the push session is done (`done_ = true`), and the next
+stream of the uuid gets a fresh session with a fresh table
+(`GetOrCreatePushSession`, `DeletePushSession`). -/
 def retire (layers : List Layer) : List Layer :=
   if layers.all Layer.entryCalled then layers.map (fun L => { L with entry := none })
   else layers

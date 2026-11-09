@@ -17,16 +17,19 @@ let the engine reuse the device blocks, or the allocator reseat the staging,
 while any copy or push is still running. Memory contents are in `Pipeline.lean`.
 
 `send.h`/`send.cc` are `tpu_sync/kv_cache/transfer_send_session.{h,cc}`;
-`mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.cc` is
+`mgr.h`/`mgr.cc` are `tpu_sync/kv_cache/kv_cache_manager_with_transfer.{h,cc}`; `base.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_base.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`; `bts.cc` is
-`tpu_sync/transport/block_transport_session.cc`. Exact line ranges for every symbol,
+`tpu_sync/transport/block_transport_session.cc`; `recv.cc` is
+`tpu_sync/kv_cache/transfer_receive_session.cc` (home of `StagingLayerManager`). Exact line ranges for every symbol,
 sub-block, and test are in the generated `## Source map` table below.
 
 ## How a send runs
 
 `StartPush` runs once on a worker thread spawned by the consumer's pull request
-(`HandlePullStream`'s `std::thread`). It acquires staging
+(`HandlePullStream`'s `std::thread`). For a device-resident send (the
+`source_ == BlockLocation::kDevice` default of `TransferSendSession::Create`;
+the host-resident branch is §"Host-resident source" below) it acquires staging
 (`AcquireStagingWithRetry`), pre-creates every layer's D2H promise/future pair
 (`d2h_promises`, `d2h_layer_futures_`) in its locked section, calls
 `SendNextLayer(0)` so pushes can overlap with D2H dispatch, and then issues one
@@ -101,8 +104,8 @@ instead of silently saturating so that `NoUnderflow` is a theorem.
 | `h2hIssue`     | the `push_pool` task up to the push: a draining session (`if (self->draining_)`) drops the layer and ends the op via `absl::Cleanup end_op`; otherwise a second op is taken (`++self->in_flight_`) and the push issued (`H2hWriteDirectAsync` → `BlockTransport::AsyncPush`, which fans a layer out into one stream group per source NUMA node via `AsyncPushShards` and joins them via `tsl::JoinFutures` into this one callback; the callback may even run inline on an argument error) |
 | `sendNext`     | the pool task's `SendNextLayer(l + 1)` followed by the release of the carried-over op (`absl::Cleanup end_op`) |
 | `h2hDone ok`   | the `H2hWriteDirectAsync` push callback: failure finishes the session (`self->FinishLocked(push_res.status(), kPushPhase)`); the last OK push (`remaining_h2h_layers_.fetch_sub(1) == 1`) finishes it OK (`self->Finish()`); the op ends either way |
-| `cancel`       | any `Finish(error)` from outside the data path: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), pull-worker spawn failure (`HandlePullStream`'s `counter_cleanup`), staging acquisition failure (`!acquire_status.ok()`), layer-buffer lease failure (`!host_layer_idx.ok()`), bad arguments in `StartPush` (`src_block_ids.empty() || ...`), pull-worker exceptions (`HandlePullStream`'s `catch`) |
-| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`send->Done()` in `RetireSettledSessionLocked`) into `done_sending_` or `failed_recving_` by its status (`(failed ? failed_recving_ : done_sending_).insert(send->req_id());`) and erases it from `sessions_` |
+| `cancel`       | any `Finish(error)` from outside the data path: deadline (`CompleteReadWithDetails`'s sweep, `session->deadline() <= now` on the `TransferSession::deadline` override of `TransferSendSession::deadline`, then `session->Finish(absl::DeadlineExceededError("Transfer session timed out"))`), shutdown (`~KVCacheManagerWithTransfer`), pull-worker spawn failure (`HandlePullStream`'s `counter_cleanup`), staging acquisition failure (`!acquire_status.ok()`), layer-buffer lease failure (`!host_layer_idx.ok()`), bad arguments in `StartPush` (`src_block_ids.empty() || ...`), pull-worker exceptions (`HandlePullStream`'s `catch`) |
+| `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`send->Done()` in `RetireSettledSessionLocked`) into `done_sending_` or `failed_recving_` by its status, under the `req_id` the manager recorded with the session at `NotifyForRead` (`SessionEntry::req_id`; `(failed ? failed_recving_ : done_sending_).insert(req_id);`), and erases it from `sessions_` |
 
 The `TransferSession` interface calls that `KVCacheManagerWithTransfer` and the
 transport make on a send are not events: `TransferSendSession::Start`, called
@@ -118,15 +121,17 @@ Every mutable field of `TransferSendSession` is `ABSL_GUARDED_BY(mu_)` except
 `remaining_h2h_layers_` (an atomic read only by its own `fetch_sub`),
 `cancelled_` (an atomic set in `FinishLocked` to wake `StagingLayerManager`),
 and `staging_layer_manager_` (internally synchronized); `base_`,
-`staging_allocator_`, `req_id_`, `uuid_`, `deadline_`, `register_start_` and
-`data_connection_reuse_` are `const`. Every `EndOp` below is one `mu_` scope
+`staging_allocator_`, `uuid_`, `deadline_`, `register_start_`,
+`data_connection_reuse_`, `transfer_plan_` and `source_` are `const` (the
+`req_id` a send is reported under is not the session's: the manager keeps it in
+`SessionEntry` next to the session in `sessions_`). Every `EndOp` below is one `mu_` scope
 under the default `pooled` connection policy and the A7 window under
 `per_transfer`.
 
 | Event          | `mu_` scopes | Between them |
 |----------------|--------------|--------------|
 | `beginPull`    | 1: `ValidateAndBeginPull` | — (`deadline_` is `const`) |
-| `start`        | `StartPush`'s locked section (`if (draining_ || done_) return;` through `dst_ints_.assign`, populating `d2h_promises` and `d2h_layer_futures_`) plus `SendNextLayer(0)`'s scope (A6), preceded by `remote_data_endpoints_ =` and the scopes of `AcquireStagingWithRetry` (which touch only `remote_data_endpoints_` and `staging_`) | a `Finish` during `AcquireWithTimeout` hits `if (draining_ || done_)` in `AcquireStagingWithRetry` and drops the local `StagingAllocation` before `staging_` is assigned; a `Finish` between `staging_ = *std::move(acquired)` and `StartPush`'s locked section settles the idle session and releases `staging_` (`FinishLocked` runs `ReleaseStagingBlocksLocked()` at `in_flight_ == 0`), after which the locked section returns — both match `cancel` before `start`. A failed acquisition or bad arguments call `Finish(error)` (`cancel`) |
+| `start`        | `StartPush`'s device-source locked section (`if (draining_ || done_) return;` through `dst_ints_.assign`, populating `d2h_promises` and `d2h_layer_futures_`) plus `SendNextLayer(0)`'s scope (A6), preceded by `remote_data_endpoints_ =` and the scopes of `AcquireStagingWithRetry` (which touch only `remote_data_endpoints_` and `staging_`) | a `Finish` during `AcquireWithTimeout` hits `if (draining_ || done_)` in `AcquireStagingWithRetry` and drops the local `StagingAllocation` before `staging_` is assigned; a `Finish` between `staging_ = *std::move(acquired)` and `StartPush`'s locked section settles the idle session and releases `staging_` (`FinishLocked` runs `ReleaseStagingBlocksLocked()` at `in_flight_ == 0`), after which the locked section returns — both match `cancel` before `start`. A failed acquisition or bad arguments call `Finish(error)` (`cancel`) |
 | `d2hBegin`     | 1 deciding scope: the loop's `session_lock` (`if (draining_) { staging_layer_manager_.Release(l); return; } ++in_flight_;`), preceded by `AcquireStagingSlot` (below) | if the loop returns here (or earlier on `!host_layer_idx.ok()`), `fail_unissued_layers` resolves `d2h_promises[next_layer..total_layers-1]` with the session's error status so any armed `SendNextLayer` callback can run `wake false` |
 | `d2hIssue`     | on success, 0 `mu_` scopes (`D2hSyncDispatch` and `layer_future.OnReady` run outside `mu_`, since `d2h_promises[l]` was pre-allocated in `start`); on failure, `FinishLocked(future.status())` (1 scope) followed by `EndOp()` | a `Finish` during `D2hSyncDispatch` finds the op `d2hBegin` took and cannot settle; `layer_future.OnReady` is registered regardless of `draining_` (matching `d2hIssue true`), and the copy drains through `d2hEnd` (`SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds`). On `!future.ok()`, `fail_unissued_layers` resolves `d2h_promises[l..total_layers-1]` after `EndOp()`. If `layer_future` is already ready when `OnReady` is registered, the callback runs inline (`d2hReady` then `d2hEnd`) |
 | `d2hReady`     | 0 (`d2h_promises[l].Set(status_or.status())` in `StartPush`'s `layer_future.OnReady`) | — |
@@ -184,7 +189,7 @@ buffer for a waiting layer), and wholesale at settle (`ReleaseAll()` in
 `d2hBegin`, and because `SendNextLayer(0)` was armed in `start` before the D2H
 loop, pushes of earlier layers still complete and release buffers while the D2H
 loop is blocked in `AcquireStagingSlot` (`SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers`,
-`SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes`).
+`SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock`).
 `PrefillDecode/LayerStaging.lean` (with `Transfer/LayerStaging.lean`) models
 `StagingLayerManager`, `TransferSendSession::AcquireStagingSlot`,
 `LookupStagingSlot`, `prefillSlots` reuse across layers, and the unlocked gaps
@@ -192,6 +197,66 @@ around `Acquire`, proving publication correctness, slot conservation/exclusivity
 drain-to-settle termination, and the `1`-slot sufficiency witness
 (`LayerStaging.reachable_safe`, `LayerStaging.reachable_can_settle`,
 `LayerStaging.exists_complete_trace`).
+
+### Host-resident source (`BlockLocation::kHost`)
+
+A producer whose KV already lives in its host pool registers host blocks for
+the pull: `NotifyForRead(..., source)` with `source == BlockLocation::kHost`
+passes `source` to `TransferSendSession::Create`, which stores it as the
+`const` `source_`. The manager admits such a registration only on a host pool
+nothing stages through — `CheckHostMemoryTransferSupported` throws unless
+`num_host_layers() == num_layers()` and the staging allocator leases no host
+blocks (`!staging_allocator_->LeasesHostBlocks()`) — so a host-source send never
+meets the bounded staging above. In `StartPush` the branch
+`if (source_ == BlockLocation::kHost)` replaces the acquisition, the locked
+section and the D2H loop: under one `mu_` scope it returns on
+`draining_ || done_`, finishes a zero-layer send OK, otherwise records the
+registered host blocks as the push source (`src_ints_.assign(src_block_ids...)`)
+and seats an already-OK future per layer
+(`d2h_layer_futures_.assign(total_layers, raiden::PjRtCopyFuture(tsl::Future<>(absl::OkStatus()), ...))`),
+then stores `remaining_h2h_layers_`, calls `SendNextLayer(0)` and returns.
+Nothing is staged (`staging_` stays empty for the session's life; `hasStaging`
+keeps the `Session.lean` reading "not yet released"), no D2H copy is issued, and
+no op is taken for a copy. `SendNextLayer(l)` is unchanged: it takes its op
+(`++in_flight_`) and its `layer_future->OnReady` runs at once on the ready
+future, so the push chain runs through every layer without waiting
+(`TransferSendSessionTest.HostSourcePushesRegisteredHostBlocksWithoutStagingOrD2h`
+sees all three pushes issued before any completes), `GetDataReadyFuture(l)`
+returns the ready future, and `CurrentPhaseLocked` reports `push` as soon as the
+endpoints are recorded (`if (source_ == BlockLocation::kHost) return kPushPhase;`,
+`TransferSendSessionTest.HostSourceDeadlineWhilePushingIsAttributedToThePushPhase`).
+`SendNextLayer`'s draining check, the pool task, the push callback, `Finish`,
+`EndOp` and the settle sites are the same code as for a device send; the
+`staging_layer_manager_.Release(l)` calls find no lease for `l` and return
+`std::nullopt` (`StagingLayerManager::Release`).
+
+`step` has no host branch; the host-source send is the device-source model with
+its D2H chain already complete. The state a host-source send is in once
+`SendNextLayer(0)` has taken its op — `started`, `queued = 1`, `inFlight = 1`,
+every layer's future ready, no copy pending or outstanding — is the state the
+device-source trace `beginPull, start, (d2hBegin, d2hIssue true, d2hReady, d2hEnd)^numLayers`
+reaches (`trace_host_source_prefix`: `d2hIssued = d2hReady = d2hRetired = numLayers`,
+each copy's op taken and returned). From that state the device model admits
+every transition of the host send and one more: `d2hBegin`
+(`d2hIssued < numLayers`), `d2hReady` and `d2hEnd` are disabled, as a host send
+has no loop, no copy and no copy callback; `wake true`, `h2hIssue`,
+`sendNext`, `h2hDone`, `cancel` and `publish` are the same transitions of the
+same C++; and `wake false` — a ready future carrying an error — stays enabled
+in the model while a host send, whose futures are all seated OK and which has
+no `fail_unissued_layers`, never takes it (an over-approximation, harmless to
+the safety properties). A `Finish` landing between the host branch's locked section and
+`SendNextLayer(0)`'s lock is A6 with only `remaining_h2h_layers_.store` in the
+gap; a `Finish` before the branch's `if (draining_ || done_) return;` is `cancel`
+before `start`, and the late `StartPush` then changes nothing
+(`TransferSendSessionTest.HostSourceFinishedBeforeStartPushIssuesNothing`, which
+unlike the device path makes no second `Finish` call). Every property below
+therefore holds of a host-source send as a corollary of `reachable_safe` on the
+prefixed trace, and the `phase` of `Traces.lean` agrees with `CurrentPhaseLocked`
+after `start` (`d2hIssued = d2hReady = numLayers` → `push`). The host-source
+session tests are paired in `Traces.lean` on that prefix
+(`HostSource*` in `transfer_send_session_test.cc`, and the producer side of the
+socket-level `HostMemoryTransferTest.AReadNobodyPullsExpiresAwaitingThePull`
+and `HostMemoryTransferTest.AFailedPushFailsTheSendAndExpiresTheReceive`).
 
 ## Assumptions
 
@@ -219,15 +284,15 @@ drain-to-settle termination, and the `1`-slot sufficiency witness
   sends an Ack (`SendAck` has only test callers), so it is not an
   event; nor is the ack-first path of `NotifyForRead`, which reports
   `done_sending` without registering the session when `pending_acks_.erase(uuid) > 0`
-  (filled only by `AckSend` when `FindSessionLocked<TransferSendSession>(uuid)`
-  returns `nullptr`). With it,
+  (filled only by `AckSend` when `sessions_.find(uuid)` holds no
+  `TransferSendSession`). With it,
   `Publication` below would read "the consumer acked", not "every layer was
   pushed".
 * **A6 (fold of `SendNextLayer(0)` into `start`).** Between `StartPush`'s locked
   section (which populates `d2h_layer_futures_` for all `total_layers`) and
   `SendNextLayer(0)`'s lock (`if (draining_ || l >= d2h_layer_futures_.size()) return;`),
   only `BuildCoalescedCopySpec` and `remaining_h2h_layers_.store(total_layers)`
-  run, and only an external `Finish` can intervene: if `Finish` lands between
+  run (on a host-source send only the `store`), and only an external `Finish` can intervene: if `Finish` lands between
   the two locks, `StartPush` has no `in_flight_` op yet, so `FinishLocked`
   settles the session at once (`done_ = true`) and `SendNextLayer(0)` returns at
   `if (draining_)` — the exact state reached by `cancel` before `start`. The
@@ -318,8 +383,10 @@ already-armed `SendNextLayer` callback wakes via `wake false` and retires its op
 exercise, as `Receive/Coverage.lean` does (branch = leaf of an event's
 decision tree with its lifecycle effect; `stepT_step` proves agreement with
 `step`). On 0–2 layers, `step` has 40 reachable branches (every leaf live); the
-33 paired upstream tests reach 29, and the remaining 11 are classified into
-missing upstream tests (3), lock-gap windows no harness hook reaches (6), or
+40 paired upstream tests reach 31 (the host-source tests, replayed on the
+completed-copy prefix, reach two settles that a device send only reaches
+through a lock window), and the remaining 9 are classified into
+missing upstream tests (2), lock-gap windows no harness hook reaches (5), or
 callback orderings where the model admits both orders (2). The `#guard` at the
 end of `Coverage.lean` fails if a branch, a trace or a classification changes.
 
@@ -344,93 +411,106 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `send.h` | `TransferSendSession::Done` | `:81-84` |
-| `send.h` | `TransferSendSession::GetStatus` | `:100-103` |
-| `send.h` | `TransferSendSession::IsDraining` | `:111-114` |
-| `send.h` | `TransferSendSession::Start` | `:88` |
-| `send.h` | `TransferSendSession::TryBeginOp` | `:92` |
-| `send.h` | `TransferSendSession::deadline` | `:163` |
-| `send.h` | `TransferSendSession` (`mutable absl::Mutex mu_;` .. `const DataConnectionReuse data_connection_reuse_;`) | `:216-224` |
-| `send.h` | `TransferSendSession` (`bool pull_started_` .. `StagingLayerManager staging_layer_manager_;`) | `:232-250` |
+| `send.h` | `TransferSendSession::Done` | `:85-88` |
+| `send.h` | `TransferSendSession::GetStatus` | `:104-107` |
+| `send.h` | `TransferSendSession::IsDraining` | `:115-118` |
+| `send.h` | `TransferSendSession::Start` | `:92` |
+| `send.h` | `TransferSendSession::TryBeginOp` | `:96` |
+| `send.h` | `TransferSendSession::deadline` | `:164-166` |
+| `send.h` | `TransferSendSession` (`mutable absl::Mutex mu_;` .. `const BlockLocation source_;`) | `:219-229` |
+| `send.h` | `TransferSendSession` (`bool pull_started_` .. `StagingLayerManager staging_layer_manager_;`) | `:236-254` |
 | `send.cc` | `*` (`constexpr absl::string_view kAwaitPullPhase` .. `constexpr absl::string_view kPushPhase`) | `:57-60` |
-| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:201-215` |
-| `send.cc` | `TransferSendSession::GetDataReadyFuture` | `:217-224` |
-| `send.cc` | `TransferSendSession::OnDataReceived` | `:323-329` |
-| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:226-230` |
-| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:237-266` |
-| `send.cc` | `TransferSendSession::LookupStagingSlot` | `:268-287` |
-| `send.cc` | `TransferSendSession::FinishLocked` | `:289-304` |
-| `send.cc` | `TransferSendSession::Finish` | `:306-315` |
-| `send.cc` | `TransferSendSession::Details` | `:331-347` |
-| `send.cc` | `TransferSendSession::CurrentPhaseLocked` | `:349-357` |
+| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:199-213` |
+| `send.cc` | `TransferSendSession::GetDataReadyFuture` | `:215-222` |
+| `send.cc` | `TransferSendSession::OnDataReceived` | `:321-327` |
+| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:224-228` |
+| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:235-264` |
+| `send.cc` | `TransferSendSession::LookupStagingSlot` | `:266-285` |
+| `send.cc` | `TransferSendSession::FinishLocked` | `:287-302` |
+| `send.cc` | `TransferSendSession::Finish` | `:304-313` |
+| `send.cc` | `TransferSendSession::Details` | `:329-345` |
+| `send.cc` | `TransferSendSession::CurrentPhaseLocked` | `:347-357` |
 | `send.cc` | `TransferSendSession::EndSendOpLocked` | `:359-366` |
 | `send.cc` | `TransferSendSession::EndOp` | `:368-395` |
 | `send.cc` | `TransferSendSession::AcquireStagingWithRetry` | `:428-462` |
-| `send.cc` | `TransferSendSession::StartPush` | `:464-611` |
-| `send.cc` | `TransferSendSession::StartPush` (`if (src_block_ids.empty()`) | `:475-480` |
-| `send.cc` | `TransferSendSession::StartPush` (`remote_data_endpoints_ = remote_data_endpoints;`) | `:483` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `dst_ints_.assign`) | `:486-519` |
-| `send.cc` | `TransferSendSession::StartPush` (`SendNextLayer(0);` .. `for (size_t l = next_layer; l < total_layers; ++l)`) | `:535-555` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::StatusOr<size_t> host_layer_idx = AcquireStagingSlot(l);` .. `next_layer = l + 1;`) | `:560-609` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::MutexLock session_lock(mu_);` .. `++in_flight_;`) | `:566-573` |
-| `send.cc` | `TransferSendSession::StartPush` (`if (!future.ok())`) | `:585-601` |
-| `send.cc` | `TransferSendSession::StartPush` (`layer_future.OnReady`) | `:603-608` |
-| `send.cc` | `TransferSendSession::SendNextLayer` | `:613-712` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`if (l >= base_->num_layers())` .. `++in_flight_;`) | `:616-628` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future->OnReady`) | `:631-711` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!status_or.ok())`) | `:638-647` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`absl::MutexLock session_lock(self->mu_);` .. `std::move(end_op).Cancel();`) | `:649-657` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->push_pool()->Schedule`) | `:658-710` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`remote_data_endpoints = self->remote_data_endpoints_;` .. `++self->in_flight_;`) | `:669-672` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:677-705` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!push_res.ok())`) | `:682-691` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;`) | `:700` |
-| `base.cc` | `*` (`size_t ResolveNumStagingLayers(size_t num_layers,` .. `return requested;`) | `:429-445` |
-| `base.cc` | `KVCacheManagerBase::GetSession` | `:2716-2722` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`absl::StatusOr<size_t> slot = session->ResolveStagingSlot(layer_idx);`) | `:3172` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.get_session =`) | `:276` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:280-287` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : sessions_)`) | `:368-372` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:513-566` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin(); it != sessions_.end();)`) | `:999-1044` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` (`if (auto send = std::dynamic_pointer_cast<TransferSendSession>(it->second)) {` .. `base_->ClearRemoteLayerAddrs(uuid);`) | `:475-485` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1164-1289` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`absl::Cleanup counter_cleanup` .. `std::move(counter_cleanup).Cancel();`) | `:1248-1271` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandleAck` | `:1291-1294` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::AckSend` | `:1337-1352` |
-| `bt.cc` | `BlockTransport::AsyncPush` | `:513-562` |
-| `bts.cc` | `BeginIncomingPush` | `:286-300` |
-| `send_drain_test.cc` | `SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds` | `:515-539` |
-| `send_drain_test.cc` | `SendDrainTest.SendNobodyPulledFailsAtItsDeadline` | `:614-623` |
-| `send_drain_test.cc` | `SendDrainTest.FailedLayerWaitsForTheOtherLayersCopies` | `:541-559` |
-| `send_drain_test.cc` | `SendLifecycleTest.FailedSendWithoutWorkSettlesImmediately` | `:679-689` |
-| `send_drain_test.cc` | `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess` | `:711-723` |
-| `send_drain_test.cc` | `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure` | `:725-737` |
-| `send_drain_test.cc` | `SendLifecycleTest.DetailsSayAnUnpulledSendTimedOutAwaitingItsPull` | `:757-778` |
-| `send_drain_test.cc` | `SendDrainTest.DetailsSayAnExpiredSendWasStillCopying` | `:780-797` |
-| `send_drain_test.cc` | `SendDrainTest.DetailsCarryTheErrorOfAFailedCopy` | `:799-812` |
-| `send_drain_test.cc` | `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun` | `:814-841` |
-| `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` | `:1929-2026` |
-| `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` | `:2028-2175` |
-| `pool_reshard_test.cc` | `SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` | `:415-424` |
+| `send.cc` | `TransferSendSession::StartPush` | `:464-635` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (src_block_ids.empty()`) | `:471-476` |
+| `send.cc` | `TransferSendSession::StartPush` (`remote_data_endpoints_ = remote_data_endpoints;`) | `:479` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `dst_ints_.assign`) | `:511-543` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (source_ == BlockLocation::kHost) {`) | `:483-505` |
+| `send.cc` | `TransferSendSession::StartPush` (`CopySpec d2h_copy = BuildCoalescedCopySpec(src_block_ids, host_block_ids);` .. `for (size_t l = next_layer; l < total_layers; ++l)`) | `:551-579` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::StatusOr<size_t> host_layer_idx = AcquireStagingSlot(l);` .. `next_layer = l + 1;`) | `:584-633` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::MutexLock session_lock(mu_);` .. `++in_flight_;`) | `:590-597` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (!future.ok())`) | `:609-625` |
+| `send.cc` | `TransferSendSession::StartPush` (`layer_future.OnReady`) | `:627-632` |
+| `send.cc` | `TransferSendSession::SendNextLayer` | `:637-736` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (l >= base_->num_layers())` .. `++in_flight_;`) | `:640-652` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future->OnReady`) | `:655-735` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!status_or.ok())`) | `:662-671` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`absl::MutexLock session_lock(self->mu_);` .. `std::move(end_op).Cancel();`) | `:673-681` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->push_pool()->Schedule`) | `:682-734` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`remote_data_endpoints = self->remote_data_endpoints_;` .. `++self->in_flight_;`) | `:693-696` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:701-729` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (!push_res.ok())`) | `:706-715` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;`) | `:724` |
+| `base.cc` | `*` (`size_t ResolveNumStagingLayers(size_t num_layers,` .. `return requested;`) | `:717-733` |
+| `base.cc` | `KVCacheManagerBase::GetSession` | `:3070-3076` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`absl::StatusOr<size_t> slot = session->ResolveStagingSlot(layer_idx);`) | `:3484` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.get_session =`) | `:306` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, entry] : sessions_)`) | `:398-402` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:531-602` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin(); it != sessions_.end();)`) | `:1079-1104` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` (`if (auto send =` .. `base_->ClearRemoteLayerAddrs(uuid);`) | `:513-524` |
+| `mgr.h` | `KVCacheManagerWithTransfer` (`struct SessionEntry {` .. `SessionRole role;`) | `:304-307` |
+| `mgr.h` | `*` (`enum class BlockLocation { kDevice, kHost };`) | `:99` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CheckHostMemoryTransferSupported` | `:1393-1405` |
+| `recv.cc` | `StagingLayerManager::Release` | `:135-145` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1224-1349` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`absl::Cleanup counter_cleanup` .. `std::move(counter_cleanup).Cancel();`) | `:1308-1331` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandleAck` | `:1351-1354` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::AckSend` | `:1450-1471` |
+| `bt.cc` | `BlockTransport::AsyncPush` | `:503-552` |
+| `bts.cc` | `BeginIncomingPush` | `:242-256` |
+| `send_drain_test.cc` | `SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds` | `:517-541` |
+| `send_drain_test.cc` | `SendDrainTest.SendNobodyPulledFailsAtItsDeadline` | `:609-618` |
+| `send_drain_test.cc` | `SendDrainTest.FailedLayerWaitsForTheOtherLayersCopies` | `:543-561` |
+| `send_drain_test.cc` | `SendLifecycleTest.FailedSendWithoutWorkSettlesImmediately` | `:675-685` |
+| `send_drain_test.cc` | `SendLifecycleTest.FailureCannotOverrideAnEarlierSuccess` | `:707-719` |
+| `send_drain_test.cc` | `SendLifecycleTest.SuccessCannotOverrideAnEarlierFailure` | `:721-733` |
+| `send_drain_test.cc` | `SendLifecycleTest.DetailsSayAnUnpulledSendTimedOutAwaitingItsPull` | `:753-774` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsSayAnExpiredSendWasStillCopying` | `:776-793` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsCarryTheErrorOfAFailedCopy` | `:795-808` |
+| `send_drain_test.cc` | `SendDrainTest.DetailsSayAFailedPushFailedInPushWhileCopiesRun` | `:810-837` |
+| `send_drain_test.cc` | `SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` | `:1918-2022` |
+| `send_drain_test.cc` | `SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` | `:2024-2161` |
+| `pool_reshard_test.cc` | `SendDeadlineTest.ExpiredSendSessionFailsInsteadOfReportingDone` | `:457-466` |
 | `control_test.cc` | `ControlHandshakeTest.PullAfterRegistrationDeadlineIsRejected` | `:320-342` |
 | `control_test.cc` | `ControlHandshakeTest.DuplicatePullIsRejectedBeforeAcknowledgement` | `:379-391` |
-| `transfer_send_session_test.cc` | `FakeSendBase::CompleteH2h` | `:97-104` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone` | `:219-242` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:244-264` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush` | `:266-298` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush` | `:300-326` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:328-343` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface` | `:345-375` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator` | `:408-451` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm` | `:453-479` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `:481-534` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang` | `:573-591` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone` | `:613-643` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies` | `:678-716` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend` | `:722-776` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce` | `:782-802` |
-| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled` | `:808-830` |
-| `send_drain_test.cc` | `SendDrainTest.BlockReadinessWaitsForTheSendsLayerCopy` | `:564-612` |
+| `transfer_send_session_test.cc` | `FakeSendBase::CompleteH2h` | `:98-105` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeDone` | `:255-278` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:280-300` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush` | `:302-334` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush` | `:336-362` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:364-379` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.SendSessionImplementsTransferSessionInterface` | `:381-413` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator` | `:446-489` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm` | `:491-517` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone` | `:519-572` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.ZeroLayerSessionCompletesAndReleasesStagingWithoutHang` | `:611-629` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.StatusIsFrozenOnceSessionIsDrainingOrDone` | `:651-681` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies` | `:716-754` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenFailedDispatchEndsSend` | `:760-814` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.FailedD2hDispatchOnFirstLayerSettlesAtOnce` | `:820-840` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.CancelledSendWhosePushThenFailsKeepsCancelled` | `:846-868` |
+| `send_drain_test.cc` | `SendDrainTest.BlockReadinessWaitsForTheSendsLayerCopy` | `:566-607` |
+| `transfer_send_session_test.cc` | `CreateHostSendSession` | `:236-245` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.HostSourcePushesRegisteredHostBlocksWithoutStagingOrD2h` | `:870-907` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.HostSourceFailedLayerPushFailsTheSendOnceInFlightLayersDrain` | `:909-931` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.HostSourceDeadlineWhilePushingIsAttributedToThePushPhase` | `:933-952` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.HostSourceWithNoLayersSettlesWithoutAPush` | `:954-967` |
+| `transfer_send_session_test.cc` | `TransferSendSessionTest.HostSourceFinishedBeforeStartPushIssuesNothing` | `:969-983` |
+| `kv_cache_manager_with_transfer_host_memory_test.cc` | `HostMemoryTransferTest.AReadNobodyPullsExpiresAwaitingThePull` | `:366-374` |
+| `kv_cache_manager_with_transfer_host_memory_test.cc` | `HostMemoryTransferTest.AFailedPushFailsTheSendAndExpiresTheReceive` | `:393-416` |
 <!-- source-map:end -->
 -/

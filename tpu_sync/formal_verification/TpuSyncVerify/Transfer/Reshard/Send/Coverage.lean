@@ -112,50 +112,71 @@ def allBranches : Option (List Branch) :=
 
 /-! ## Traces
 
-Most send tests construct a session with `ReshardSendSession::Create` on a
-placeholder-hold `MakeTestBase` (whose `buffer_holds_[0].holds` is empty, so
-`CopyPoolBlocks` cannot run on it) and stand in for `ExecutePushPipeline` and
-`StartPoolPush`: `ReshardSendSessionTestPeer::BeginPush` takes one push op
-(`++in_flight_`), and `CompletePush` runs `RecordPushCompletion` + `EndOp()`
-as the `AsyncPush` callback does. After `BeginPush` the session is in the state
-the model reaches by `d2hIssue 0 true, execFinish, d2hDone 0 true` on one pool
-with one peer (`afterPushStart`); the paired traces start there, so only the
-steps the test really drives are counted. `StartFailsFastWithoutTransportServer`
-and `PipelineSlotWaitTimeoutSettlesSendOutOfBand` run `Start` itself and start
-from `init`. -/
+The session tests in `reshard_send_session_test.cc` run a real
+`ReshardSendSession` from `Start` on a `FakeD2hBase` — a `KVCacheManagerBase`
+whose `D2hPoolBlocks` returns a `PjRtCopyFuture` that is ready at once, or
+parked until `CompleteCopy` for a pool passed to `HoldNextCopy` — and push over
+TCP to a receiver base whose `get_session` hook hands every push a
+`StubRecvSession` (`AcceptPushes`); `RouteSessionLookups` points the sender's
+own lookups at the session so pulls resolve its staging slots. A ready future
+runs `pool_future.OnReady` on the pipeline thread inside the loop, so
+`d2hDone p true` precedes `execFinish` in those traces; a parked copy holds its
+op across the test's `Finish`. Every paired trace therefore starts from `init`.
+`StartFailsFastWithoutTransportServer` fails `Start` on a CPU-only manager
+before the pipeline thread exists. -/
 
-/-- One pool, one peer, its push in flight, the pipeline thread done. -/
+/-- One pool, one peer, its push in flight, the pipeline thread done (the start
+of `trace_finish_after_last_push`). -/
 def afterPushStart : Send :=
   ((sys [1]).run (tr_parity_send.take 3)).getD (init [1])
 
 example : afterPushStart.pools = [{ peers := 1, stage := .pushing 1 }] ∧
     afterPushStart.life.inFlight = 1 ∧ afterPushStart.execActive = false := by decide
 
-/-- One pool, two peers, both pushes in flight
-(`ReshardSendSessionTestPeer::AcquireStagingSlot` + `StartPoolPush` on a
-two-peer schedule). -/
-def afterTwoPeerPushStart : Send :=
-  ((sys [2]).run (tr_parity_send.take 3)).getD (init [2])
+/-- One pool and one peer, run to completion: `d2hIssue`, the inline D2H
+callback issuing the push, the pipeline thread's `EndOp()`, the push callback. -/
+def tr_one_pool_push : List Ev :=
+  [.d2hIssue 0 true, .d2hDone 0 true, .execFinish, .pushDone 0 true]
 
-example : afterTwoPeerPushStart.pools = [{ peers := 2, stage := .pushing 2 }] ∧
-    afterTwoPeerPushStart.life.inFlight = 2 := by decide
+/-- `BoundedStagingSlotAcquisitionAndRelease`, first session: three pools and
+one host layer. Pool 0's held copy completes and its push returns the buffer;
+pool 1 then leases it and its copy is held; `Finish(Cancelled)` wakes pool 2's
+slot wait (`d2hIssue 2 false` on a finalizing session, folding the pipeline
+thread's `EndOp()`); pool 1's released copy finds the send finalizing and its
+`EndOp()` settles it. -/
+def tr_bounded_three_pools : List Ev :=
+  [.d2hIssue 0 true, .d2hDone 0 true, .pushDone 0 true, .d2hIssue 1 true,
+   .cancel, .d2hIssue 2 false, .d2hDone 1 true]
+
+/-- A slot wait running into `deadline_` while pool 0's held copy owns the
+only buffer (`PipelineSlotWaitTimeoutSettlesSendOutOfBand` and the
+`timeout_session` of `BoundedStagingSlotAcquisitionAndRelease`): pool 1's
+`AcquireStagingSlot` fails with `DeadlineExceeded`, latching `finalizing_`;
+the released copy's `EndOp()` settles. -/
+def tr_slot_wait_timeout : List Ev :=
+  [.d2hIssue 0 true, .d2hIssue 1 false, .d2hDone 0 true]
 
 /-- `(upstream test, initial state, trace)`. -/
 def paired : List (String × Send × List Ev) :=
   [("ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeSettling",
-      afterPushStart, [.pushDone 0 true]),
-   ("ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush",
-      afterPushStart, [.cancel, .pushDone 0 true]),
+      init [1], tr_one_pool_push),
+   ("ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidCopy",
+      init [1], [.d2hIssue 0 true, .execFinish, .cancel, .d2hDone 0 true]),
    ("ReshardSendSessionTest.PooledPolicyKeepsIdlePeerConnections",
-      afterPushStart, [.pushDone 0 true]),
+      init [1], tr_one_pool_push),
+   ("ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease",
+      init [1, 1, 1], tr_bounded_three_pools),
+   ("ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease (timeout_session)",
+      init [1, 1, 1], tr_slot_wait_timeout),
    ("ReshardSendSessionTest.StartFailsFastWithoutTransportServer",
       init [1], tr_start_fails_fast.take 1),
    ("ReshardSendSessionTest.PipelineSlotWaitTimeoutSettlesSendOutOfBand",
-      init [1, 1], [.d2hIssue 0 false]),
+      init [1, 1], tr_slot_wait_timeout),
    ("ReshardSendSessionTest.StagingSlotReleasedAfterLastPeerPush",
-      afterTwoPeerPushStart, [.pushDone 0 true, .pushDone 0 true]),
-   ("ReshardSendSessionTest.FinishAfterLastPushFinalizingPreservesOkStatus",
-      afterPushStart, tr_finish_after_last_push.take 2)]
+      init [2], [.d2hIssue 0 true, .execFinish, .d2hDone 0 true, .pushDone 0 true, .pushDone 0 true]),
+   ("ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks",
+      init [1, 1], [.d2hIssue 0 true, .d2hDone 0 true, .d2hIssue 1 true, .d2hDone 1 true,
+                    .execFinish, .pushDone 0 true, .pushDone 1 true])]
 
 def modelOnly : List (String × Send × List Ev) :=
   [("trace_reshard_send_session_test_parity", init [1], tr_parity_send),
@@ -169,14 +190,16 @@ def modelOnly : List (String × Send × List Ev) :=
 def notReplayable : List (String × String) :=
   [("ReshardSendSessionTest.CreateRejectsUnknownDataConnReuseValue",
       "Create's TPU_RAIDEN_DATA_CONN_REUSE parse; no session exists"),
-   ("ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease",
-      "StagingLayerManager slot waits through the test peer, and Finish on a session whose Start never ran (in_flight_ == 0, outside A2)"),
    ("PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront",
       "Create's CountPoolReshardSendSlots == 0 rejection (validSchedule)"),
    ("PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints",
       "PoolReshardPush's has_device_buffers() rejection; no session exists"),
+   ("SubPlanChainTest.SendTerminalWaitsForTheLastSubPlan",
+      "Finish() on a session whose Start never ran (in_flight_ == 0, outside A2); asserts chain terminal aggregation (SubPlanChain.lean)"),
+   ("PoolReshardSessionLookupTest.GetSessionResolvesActiveReshardSendUntilRetired",
+      "same Finish() before Start, then GetSession before and after RetireSettledSessionLocked"),
    ("ReshardSendSessionTest.* ValidatePlan tests (6 tests)",
-      "ValidatePlan only (validSenderSpan, validSchedule); no session runs")]
+      "CreateReshardSendSession's ValidatePlan only (validSenderSpan, validSchedule); no session runs")]
 
 /-! ## Result
 
@@ -187,24 +210,23 @@ idle session here: `init` already holds `Start`'s caller op, `Send` A2; and it
 never changes the status of a finalizing session, `Finish`'s
 `if (done_ || finalizing_) return;`.)
 
-The seven upstream tests in `paired` reach **7 of 26**: `pushDoneLast`
-(drains, settles), `pushDoneMore`, `cancel` (drains, errors), `cancel` (no
-effect), `pushDoneFinalizing` (settles), `startFail` (drains, settles, errors)
-and `d2hIssueFail` (drains, settles, errors). The six `modelOnly` traces add 6
-more. Of the 19 the tests miss:
+The nine upstream traces in `paired` reach **10 of 26**: `d2hIssueOk`,
+`d2hDoneStartsPushes`, `d2hDoneQuiesced` (settles), `execFinish` (no effect),
+`pushDoneMore`, `pushDoneLast` (drains, settles), `cancel` (drains, errors),
+`startFail` (drains, settles, errors), `d2hIssueFail` (drains, errors) and
+`d2hIssueFailFinalizing` (no effect). The six `modelOnly` traces add 5 more.
+Of the 16 the tests miss:
 
 | Class | Count | Branches | What it would take |
 |---|---|---|---|
-| **test** | 13 | `pushDoneFail` (drains+settles+errors; drains+errors), `pushDoneLast` (drains, another op held), `pushDoneFinalizing` (no effect), `startFailFinalizing` (settles), `d2hIssueFail` (drains+errors), `d2hIssueFailFinalizing` (settles; no effect), `d2hIssueOk`, `d2hDoneStartsPushes`, `execFinish` (no effect; settles), `publish` | 5 via `ReshardSendSessionTestPeer` alone (`CompletePush` with an error status for `pushDoneFail`, `BeginPush` twice, `Finish` before `Start`); 8 via `PoolReshardPush` (`Start`) on `DeviceBackedTestBase` with a minimal `RawBuffer` test subclass seated via `RaidenBufferHandle::AcquireFromRaw` (`CopyPoolBlocks` queries `GetOnDeviceSizeInBytes()` before `IssueD2hShard`, so a default-constructed handle with `c_hold == nullptr` cannot execute a non-empty copy): returning an immediately-ready `xla::Future<>` from `CopyRawDeviceToHost` makes `OnReady` run `StartPoolPush` synchronously on the pipeline thread (`host_blocks = 0` or a `RawBuffer` device-size `0` fails `D2hPoolBlocks` synchronously; when pool 0's `AsyncPush` fails synchronously — e.g. `AdapterForOp` under `TPU_RAIDEN_TRANSPORT_BACKEND=peregrine` — `RecordPushCompletion` latches `finalizing_` inline inside `ExecutePushPipeline`, reaching `execFinish` settling on 1 pool and `d2hIssueFailFinalizing` on a second pool through the loop's `if (done_ \|\| finalizing_)` re-check) |
-| **future (stub)** | 6 | `d2hDoneFail` (drains+settles+errors; drains+errors), `d2hDoneFailFinalizing` (no effect; settles), `d2hDoneQuiesced` (no effect; settles) | a controllable `PjRtCopyFuture` fake (a `RawBuffer` / `PJRT_RawBuffer_Extension` test stub backed by `xla::Promise<>`) so an issued D2H copy can stay pending across `Finish` or resolve `OnReady` with an error on CPU |
+| **test** | 11 | `pushDoneFail` (drains+settles+errors; drains+errors), `pushDoneLast` (drains, another op held), `pushDoneFinalizing` (no effect; settles), `cancel` (no effect), `startFailFinalizing` (settles), `d2hIssueFail` (drains+settles+errors), `d2hIssueFailFinalizing` (settles), `execFinish` (settles), `publish` | the `FakeD2hBase` fixtures with a push that fails or is held: a peer whose `get_session` hook refuses the push (`pushDoneFail`), a push still in flight when `Finish` runs (`pushDoneFinalizing`, then `cancel` on the finalizing send), a `D2hPoolBlocks` override returning an error status for the first pool (`d2hIssueFail` settling, no copy in flight), the pipeline thread finishing its loop after the last push returned (`execFinish` settling, `pushDoneLast` with the caller op still held — a race the ready-future tests do not pin down), a `Finish` between `Start`'s `++in_flight_;` and `ValidatePushPreconditions` (`startFailFinalizing`), and a send registered through `PoolReshardPush` and polled by `CompleteReadWithDetails` (`publish`) |
+| **test (copy error)** | 5 | `d2hDoneFail` (drains+settles+errors; drains+errors), `d2hDoneFailFinalizing` (no effect; settles), `d2hDoneQuiesced` (no effect) | `FakeD2hBase` completing a held copy with an error status (`xla::Promise<>::Set(status)`, as `FakeH2dBase::ArmPoolUpload` does in `kv_cache_manager_with_transfer_pool_reshard_test.cc`); `d2hDoneQuiesced` without effect needs a second held copy still counted when a cancelled send's first copy returns |
 
-So no upstream test exercises a successful D2H issue, a D2H callback, or a
-failed push: `ReshardSendSessionTest` uses `MakeTestBase` +
-`AttachPlaceholderDeviceHoldForTest` (which leaves `buffer_holds_[0].holds`
-empty and drives `ReshardSendSessionTestPeer`, while `DeviceBackedTestBase` in
-`kv_cache_manager_with_transfer_pool_reshard_test.cc` leaves `c_hold == nullptr`
-without a `RawBuffer` test subclass),
-and `CompletePush` is called only with `OkStatus()` (`docs/transfer/reshard.md`
+So the upstream send tests now drive a successful D2H issue, its inline
+callback issuing real pushes, a copy returning after `Finish`, and the slot
+wait failing, but no failed push and no failed copy: `FakeD2hBase::CompleteCopy`
+only sets its promise OK, and every push in `reshard_send_session_test.cc`
+lands on a `StubRecvSession` that accepts it (`docs/transfer/reshard.md`
 §"C++ branch coverage of the anchored spans"). -/
 
 /-- `(leaf, drains, settles, errors)`. -/
@@ -217,27 +239,25 @@ def coveredByAll : List Branch :=
 
 inductive Gap where
   | test
-  | futureStub
+  | copyError
   deriving Repr, DecidableEq
 
 /-- The table above, as the `#guard` checks it. -/
 def gaps : List (Branch × Gap) :=
   [(br .pushDoneFail true true true, .test), (br .pushDoneFail true false true, .test),
    (br .pushDoneFinalizing false false false, .test),
+   (br .pushDoneFinalizing false true false, .test),
    (br .pushDoneLast true false false, .test),
+   (br .cancel false false false, .test),
    (br .startFailFinalizing false true false, .test),
-   (br .d2hIssueFail true false true, .test),
+   (br .d2hIssueFail true true true, .test),
    (br .d2hIssueFailFinalizing false true false, .test),
-   (br .d2hIssueFailFinalizing false false false, .test),
-   (br .d2hIssueOk false false false, .test),
-   (br .d2hDoneStartsPushes false false false, .test),
-   (br .execFinish false false false, .test), (br .execFinish false true false, .test),
+   (br .execFinish false true false, .test),
    (br .publish false false false, .test),
-   (br .d2hDoneFail true true true, .futureStub), (br .d2hDoneFail true false true, .futureStub),
-   (br .d2hDoneFailFinalizing false false false, .futureStub),
-   (br .d2hDoneFailFinalizing false true false, .futureStub),
-   (br .d2hDoneQuiesced false false false, .futureStub),
-   (br .d2hDoneQuiesced false true false, .futureStub)]
+   (br .d2hDoneFail true true true, .copyError), (br .d2hDoneFail true false true, .copyError),
+   (br .d2hDoneFailFinalizing false false false, .copyError),
+   (br .d2hDoneFailFinalizing false true false, .copyError),
+   (br .d2hDoneQuiesced false false false, .copyError)]
 
 def allLeaves : List Leaf :=
   [.startFail, .startFailFinalizing, .d2hIssueOk, .d2hIssueFail, .d2hIssueFailFinalizing,
@@ -246,19 +266,19 @@ def allLeaves : List Leaf :=
 
 def countGap (g : Gap) : Nat := (gaps.filter (·.2 = g)).length
 
-/-- One search, every check: the state space is exhausted; 26 branches; 7
-reached by paired traces, 13 with `modelOnly` (all within the universe, every
-trace running to completion); the uncovered set is the table (13 test, 6
-future-stub); every leaf fires; every gap has a witness schedule. -/
+/-- One search, every check: the state space is exhausted; 26 branches; 10
+reached by paired traces, 15 with `modelOnly` (all within the universe, every
+trace running to completion); the uncovered set is the table (11 test, 5
+copy-error); every leaf fires; every gap has a witness schedule. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
   | some univ =>
     let uncoveredPaired := univ.filter (fun b => !coveredByPaired.contains b)
-    univ.length = 26 ∧ coveredByPaired.length = 7 ∧ coveredByAll.length = 13 ∧
+    univ.length = 26 ∧ coveredByPaired.length = 10 ∧ coveredByAll.length = 15 ∧
     coveredByPaired.all univ.contains ∧ coveredByAll.all univ.contains ∧
-    sameSet uncoveredPaired (gaps.map Prod.fst) ∧ gaps.length = 19 ∧
-    countGap .test = 13 ∧ countGap .futureStub = 6 ∧
+    sameSet uncoveredPaired (gaps.map Prod.fst) ∧ gaps.length = 16 ∧
+    countGap .test = 11 ∧ countGap .copyError = 5 ∧
     allLeaves.all (fun l => univ.any (·.1 = l)) ∧
     (paired ++ modelOnly).all (fun (_, s, tr) =>
       ((⟨s, step⟩ : System Send Ev).run tr).isSome) ∧

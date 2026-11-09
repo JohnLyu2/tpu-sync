@@ -49,10 +49,10 @@ below.
 
 | Field | C++ | Role |
 |---|---|---|
-| `chain` | `recv_chains_[req_id]` / `send_chains_[req_id]` (`SubPlanChainProgress`: `count`, `settled`, `failed`, `anchored`, `plan_uuids`) | `present = false` is absence from the map |
-| `active` | `sessions_` entries (`ReshardReceiveSession` / `ReshardSendSession`) for `req_id` | each with its `sub_plan_index()`, `sub_plan_count()`, and once `Done()` the status it settled with |
+| `chain` | `sub_plan_chains_[req_id]` (`SubPlanChainProgress`: `sub_sessions`, `completed`, `failed`, `anchored`) | `present = false` is absence from the map; the map is keyed by `req_id` alone, so a worker that is both a source and a destination of the request folds its send and receive sub-plans into one entry |
+| `sessions` | the pool-reshard `SessionEntry`s (`SessionRole::kPoolReshardSend` / `kPoolReshardReceive`) registered for `req_id`, with the `sub_plan_index` / `sub_plan_count` of each `StartTransferRequest` and once `Done()` the status it settled with | `retired` marks erasure from `sessions_` by `RetireSettledSessionLocked`; the entry keeps its `shared_ptr` (`active` is the unretired ones) |
 | `doneReports`, `failReports` | insertions of `req_id` into `done_recving_` / `done_sending_` and into `failed_recving_` | what `CompleteReadWithDetails` publishes |
-| `doneLog` (ghost) | — | for each `done` insertion, the chain `count` and `settled` set at that moment (`DoneAfterAllSubPlans`) |
+| `doneLog` (ghost) | — | for each `done` insertion, `sub_sessions.size()` and the settled slots at that moment (`DoneAfterAllSubPlans`) |
 | `seenUuids` (ghost) | — | UUIDs registered so far (A2) |
 
 ### Coordinator (`CoordChainState`, one request)
@@ -75,7 +75,7 @@ below.
 |---|---|---|
 | worker | `registerSubPlan uuid index count` | `PoolReshardRegisterRecv` / `PoolReshardPush` seating the session and calling `NoteSubPlanRegisteredLocked` |
 | worker | `settleSession uuid ok` | the session reaching `Done()` |
-| worker | `poll stalled` | `CompleteReadWithDetails`: `RecordPoolReshardTerminalLocked` for each `Done()` session, then `SweepSubPlanChainsLocked(now)`; `stalled` is `now - progress.last_activity > stall` |
+| worker | `poll stalled` | `CompleteReadWithDetails`: the `session->deadline() <= now` arm, `RecordPoolReshardTerminalLocked` for each `Done()` session (from `RetireSettledSessionLocked`), then `SweepSubPlanChainsLocked(now)`; `stalled` is `now - progress.last_activity > stall` |
 | coordinator | `registerProducer srcUnit` | `RequestBlockRegistry::Register` |
 | coordinator | `startChainCoordination` | `StartPoolReshard` setting `kInProgress` |
 | coordinator | `startWindowPlan planOk` | `RunSubPlan` Stage 0: `LookupAndClaim`, `BuildPoolReshardPlan` |
@@ -94,7 +94,7 @@ below.
 |---|---|
 | `registerSubPlan` | one `mu_` scope of `PoolReshardRegisterRecv` / `PoolReshardPush`: insert into `sessions_`, `NoteSubPlanRegisteredLocked` |
 | `settleSession` | the session's own `mu_` (`Transfer/Session.lean`); the worker reads `Done()` under `mu_` in `poll` |
-| `poll` | one `mu_` scope of `CompleteReadWithDetails`: the sweep of `Done()` sessions, `SweepSubPlanChainsLocked`, and the swap of `done_*_` / `failed_recving_` into the result |
+| `poll` | one `mu_` scope of `CompleteReadWithDetails`: the deadline arm and `RetireSettledSessionLocked` over `sessions_`, `SweepSubPlanChainsLocked`, and the swap of `done_*_` / `failed_recving_` into the result |
 | `registerProducer`, `senderVoteComplete`, `cancelIfUnclaimed` | `RequestBlockRegistry::mu_` |
 | `startChainCoordination`, `finishWindowSend` (last window), `finishWindowArm` / `startWindowPlan` / `finishWindowSend` (abort) | `status_mu_` for `transfer_status_`; `RunSubPlan`'s registry calls under `RequestBlockRegistry::mu_` |
 | `startWindowPlan`, `armDstResult`, `retryBusyArm`, `finishWindowArm`, `sendSrcResult` | `RunSubPlan`'s own thread joins (`armers`, `senders`); the RPCs run unlocked and report through per-index slots |
@@ -110,8 +110,8 @@ window's arming, which is what `prevSessionActive` and `retryBusyArm` model.
 * **A1 — `0 <= sub_plan_index < max(1, sub_plan_count)`.** `RunSubPlan` stamps
   every sub-plan with its `index` in `0 .. chain.count - 1`
   (`BuildStartTransferForTarget`). Guard: `registerSubPlan` refuses other
-  indices. Without it `settled.size() >= count` could fire on indices outside
-  the chain.
+  indices (`NoteSubPlanRegisteredLocked` would grow `sub_sessions` to
+  `sub_plan_index + 1` slots that no sub-plan fills).
 * **A2 — sub-plan UUIDs are fresh.** `SubPlanUuid` derives distinct UUIDs per
   index (`subPlanUuid_pos_of_pos`, `trace_sub_plan_uuid_positive_and_distinct`)
   and a retry under the same `req_id` uses a new request UUID. Guard:
@@ -125,11 +125,38 @@ window's arming, which is what `prevSessionActive` and `retryBusyArm` model.
   `senderVoteComplete` refuses a rank still in `plan.src_units` of the running
   or a later window. Without it a rank's vote could retire the claim while
   another window is being armed.
+* **A5 — a sub-plan session outlives no stall.** `DeadlineFromNow()` is
+  `timeout_s_` from the session's creation and `NoteSubPlanRegisteredLocked`
+  sets `last_activity` at its registration, so an entry quiet for `timeout_s_`
+  (`stalled`) has every open session of its `req_id` past its deadline, and the
+  `session->deadline() <= now` arm of the same `CompleteReadWithDetails` has
+  already called `Finish(DeadlineExceeded(...))` on it. Guard: `poll true` on a
+  present entry fails every open session first (`Guards.deadlineArm`). Without
+  it a session seated when the sweep erases its failed entry could settle OK
+  into the no-entry arm as the request's `done`
+  (`mutant_no_deadline_arm_reports_done_after_sweep`).
+* **A6 — no single-plan registration while a sub-plan is seated.** A
+  single-plan `StartTransferRequest` under a `req_id` erases that `req_id`'s
+  chain entry (`sub_plan_chains_.erase(req_id)`); the coordinator plans a
+  request's sub-plans once (`PlanSubTransfers`), so none arrives while a
+  sub-plan session of the same `req_id` is still in `sessions_`. Guard:
+  `registerSubPlan` with `count <= 1` refuses while such a session is seated
+  (`Guards.noSingleWhileSeated`). Without it the seated sub-plan's clean
+  settlement is reported as the request's `done` through the no-entry arm
+  (`mutant_single_plan_registration_erases_live_chain`).
+* **A7 — one session per `sub_plan_index >= 1` slot.** `RunSubPlan` arms each
+  `(req_id, index)` once per chain and a retry re-anchors at index 0;
+  `sub_sessions[sub_plan_index] = session` would otherwise drop the earlier
+  session from the entry. Guard: `registerSubPlan` refuses an index whose slot
+  is filled unless it re-anchors (`Guards.oneSessionPerSlot`). Without it the
+  dropped session of an unanchored entry settles into the `stray` arm as the
+  request's `done` (`mutant_slot_overwrite_reports_stray_done`).
 * **Not modelled:** `!stopping_.load()` in the re-arm condition (a coordinator
   shutting down aborts instead of re-arming; `retryBusyArm` assumes it is not
-  stopping), the `kController` delivery mode's null-controller error path, and
-  `transfer_details_`. A worker holds one `recv_chains_` and one `send_chains_`
-  entry per `req_id`; `WorkerState` is one of them.
+  stopping), the `kController` delivery mode's null-controller error path,
+  `transfer_details_`, and which of `done_recving_` / `done_sending_` a terminal
+  lands in (`is_recv`): `WorkerState` is one `sub_plan_chains_` entry with the
+  sessions of both roles.
 * **A4 — producers register before `Coordinate`.** `registerProducer` is
   enabled only before `startChainCoordination`. The registry refuses `Register`
   once the claim is taken (`Reshard/Registry.lean`); a registration landing
@@ -145,9 +172,9 @@ window's arming, which is what `prevSessionActive` and `retryBusyArm` model.
   the per-plan `RankWaveOrder` on aliased device pages (`Reshard/Receive.lean`)
   is never split across sub-plans.
 * `reachable_worker_safe` (`DoneAfterAllSubPlans`): in every reachable state of
-  `WorkerState.step`, every `done_recving` / `done_sending` insertion for a
-  `count`-plan request was made with `count` distinct sub-plan indices in
-  `[0, count)` settled OK.
+  `WorkerState.step`, every `done_recving` / `done_sending` insertion was made
+  with every slot of the request's `sub_sessions` (at least `sub_plan_count`
+  of them) settled OK, or by a single-plan session settled OK.
 * `reachable_coordChain_safe` (`CoordChainSafe`), for every topology whose
   windows are non-empty subsets of the claimed snapshot (`ValidChainCfg`):
   `Registry.Inv`; no dispatched rank is ever left without the registry claim
@@ -160,24 +187,30 @@ window's arming, which is what `prevSessionActive` and `retryBusyArm` model.
   (`CompletedOnlyAtChainEnd`); and the claim is held from window 0's Stage 0
   to the end of the chain (`ClaimHeldAcrossWindows`).
 * What the shipping code does beyond those guarantees is shown by traces
-  (`Traces.lean`): a rank with spans in fewer than `K` windows never reaches
-  `K` settled sub-plans and is failed by the stall sweep
+  (`Traces.lean`): a rank with spans in fewer than `K` windows never fills
+  `K` slots and is failed by the stall sweep
   (`trace_sender_in_first_window_only`, `trace_sender_in_last_window_only`);
   the first failing sub-plan publishes `failed_recving` while sibling sessions
   are still active (`trace_first_failure_reports_while_sibling_active`); a
   sub-plan arriving after the failed entry was swept is failed a second time
-  (`trace_late_sub_plan_after_sweep_reports_failure_twice`); and a window
+  (`trace_late_sub_plan_after_sweep_reports_failure_twice`), as is one still
+  seated at the sweep (`trace_sub_plan_seated_at_sweep_is_failed_not_done`,
+  `trace_stall_sweep_keeps_entry_with_open_session`); a single-plan session
+  beside an unanchored entry still reports
+  (`trace_single_plan_beside_unanchored_entry_reports`); and a window
   `>= 1` failure keeps the claim until `ttl_s_` even after every dispatched rank
   has voted (`trace_chained_arm_failure_keeps_claim_past_last_vote`).
 * Mutants: counting a superseded chain's sub-plan
   (`mutant_counting_stale_sub_plan_reports_done_early`), not re-anchoring on
-  sub-plan 0 (`mutant_no_reanchor_never_reports_retry_done`), and
-  `AbandonClaim` at every index
-  (`mutant_abandon_at_every_index_exposes_active_sender`).
+  sub-plan 0 (`mutant_no_reanchor_never_reports_retry_done`), dropping each of
+  the guards A5–A7 (`mutant_no_deadline_arm_reports_done_after_sweep`,
+  `mutant_single_plan_registration_erases_live_chain`,
+  `mutant_slot_overwrite_reports_stray_done`), and `AbandonClaim` at every
+  index (`mutant_abandon_at_every_index_exposes_active_sender`).
 * Searches (`workerViolates`, `coordViolates`, both `!decide (Safe s)`) exhaust
-  a two-window worker and two two-window coordinator topologies; `Coverage.lean`
-  measures which arms the 5 `SubPlanChainTest` and 6 windowed
-  `ReshardStackTest` cases reach.
+  a two-window worker (with and without a single-plan request beside it) and
+  two two-window coordinator topologies; `Coverage.lean` measures which arms
+  the 6 `SubPlanChainTest` and 6 windowed `ReshardStackTest` cases reach.
 
 ## Source map
 
@@ -201,33 +234,36 @@ Generated by `tools/resolve_anchors.py`.
 | `coord.cc` | `ReshardCoordinator::RunSubPlan` | `:678-932` |
 | `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int attempts = index == 0 ? 1 : kChainArmAttempts;` .. `if (!retry) break;`) | `:749-790` |
 | `planner.cc` | `BuildPoolReshardPlan` (`PoolReshardPlan plan;` .. `plan.dst_units = request.dst_units;`) | `:1289-1295` |
-| `mgr.h` | `KVCacheManagerWithTransfer` (`struct SubPlanChainProgress {` .. `void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)`) | `:340-369` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked` | `:147-171` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked` | `:173-223` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::SweepSubPlanChainsLocked` | `:225-272` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:683-724` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:726-774` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:991-1074` |
+| `mgr.h` | `KVCacheManagerWithTransfer` (`enum class SessionRole {` .. `SessionRole role;`) | `:295-307` |
+| `mgr.h` | `KVCacheManagerWithTransfer` (`struct SubPlanChainProgress {` .. `void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)`) | `:381-408` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked` | `:147-183` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked` | `:185-251` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::SweepSubPlanChainsLocked` | `:253-302` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:470-529` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:732-774` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:776-825` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1071-1134` |
 | `reg.cc` | `RequestBlockRegistry::Complete` | `:317-371` |
 | `reg.cc` | `RequestBlockRegistry::CancelIfUnclaimed` | `:373-405` |
 | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` | `:439-491` |
 | `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:493-509` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan` | `:872-908` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce` | `:910-933` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.RetryUnderTheSameReqIdIsTrackedAsANewChain` | `:935-978` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.StalledChainFailsAfterTheTransferTimeout` | `:980-1002` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.SinglePlanRequestsReportAtOnce` | `:1004-1016` |
-| `reshard_service_test.cc` | `PlanSubTransfersTest.NoWindowsPlanOneTransfer` | `:941-959` |
-| `reshard_service_test.cc` | `PlanSubTransfersTest.WindowSplitsPagedTagInDestinationOrder` | `:961-978` |
-| `reshard_service_test.cc` | `PlanSubTransfersTest.UnwindowedTagsRideInTheLastSubTransfer` | `:980-1008` |
-| `reshard_service_test.cc` | `PlanSubTransfersTest.WindowedTagSharingIdsDisablesWindows` | `:1010-1029` |
-| `reshard_service_test.cc` | `PlanSubTransfersTest.MalformedWindowsFailClosed` | `:1031-1043` |
-| `reshard_service_test.cc` | `SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct` | `:1045-1055` |
-| `reshard_service_test.cc` | `ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow` | `:1057-1117` |
-| `reshard_service_test.cc` | `ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries` | `:1119-1204` |
-| `reshard_service_test.cc` | `ReshardStackTest.WindowComposesWithPrefixClip` | `:1206-1243` |
-| `reshard_service_test.cc` | `ReshardStackTest.ChainedArmRetriesWhileReceiverStagingIsBusy` | `:1245-1270` |
-| `reshard_service_test.cc` | `ReshardStackTest.ChainedRequestStaysInProgressUntilTheChainEnds` | `:1272-1294` |
-| `reshard_service_test.cc` | `ReshardStackTest.ChainedArmFailureMarksTheTransferFailed` | `:1296-1318` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan` | `:914-950` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce` | `:952-975` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.RetryUnderTheSameReqIdIsTrackedAsANewChain` | `:977-1020` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.StalledChainFailsAfterTheTransferTimeout` | `:1022-1044` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.SinglePlanRequestsReportAtOnce` | `:1046-1058` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.SendTerminalWaitsForTheLastSubPlan` | `:1060-1088` |
+| `reshard_service_test.cc` | `PlanSubTransfersTest.NoWindowsPlanOneTransfer` | `:982-1000` |
+| `reshard_service_test.cc` | `PlanSubTransfersTest.WindowSplitsPagedTagInDestinationOrder` | `:1002-1019` |
+| `reshard_service_test.cc` | `PlanSubTransfersTest.UnwindowedTagsRideInTheLastSubTransfer` | `:1021-1049` |
+| `reshard_service_test.cc` | `PlanSubTransfersTest.WindowedTagSharingIdsDisablesWindows` | `:1051-1070` |
+| `reshard_service_test.cc` | `PlanSubTransfersTest.MalformedWindowsFailClosed` | `:1072-1084` |
+| `reshard_service_test.cc` | `SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct` | `:1086-1096` |
+| `reshard_service_test.cc` | `ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow` | `:1098-1158` |
+| `reshard_service_test.cc` | `ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries` | `:1160-1245` |
+| `reshard_service_test.cc` | `ReshardStackTest.WindowComposesWithPrefixClip` | `:1247-1284` |
+| `reshard_service_test.cc` | `ReshardStackTest.ChainedArmRetriesWhileReceiverStagingIsBusy` | `:1286-1311` |
+| `reshard_service_test.cc` | `ReshardStackTest.ChainedRequestStaysInProgressUntilTheChainEnds` | `:1313-1335` |
+| `reshard_service_test.cc` | `ReshardStackTest.ChainedArmFailureMarksTheTransferFailed` | `:1337-1359` |
 <!-- source-map:end -->
 -/

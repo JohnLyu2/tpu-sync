@@ -91,13 +91,14 @@ def pushEnd (s : Recv) : Option Recv :=
   else some { s with life := s.life.endOpLocked, pushes := s.pushes - 1 }
 
 /-- The pull handshake resolves (`Start`'s `on_response`):
-`self->FinishLocked(pull_status)` if `!pull_status.ok()` and
-`self->handshake_pending_ = false`, then `absl::Cleanup end_op` calls
+`self->FinishLocked(pull_status)` only `if (!pull_status.ok() && !self->draining_)`
+— a receive that already settled or is draining keeps its verdict — then
+`self->handshake_pending_ = false`, and `absl::Cleanup end_op` calls
 `EndOp()`. -/
 def pullReply (ok : Bool) (s : Recv) : Option Recv :=
   if s.pullPending = false then none
   else
-    let l := if ok then s.life else s.life.finishLocked false
+    let l := if ok = true ∨ s.life.draining = true then s.life else s.life.finishLocked false
     some { s with life := l.endOpLocked, pullPending := false }
 
 /-- `ExecuteLayerH2d` up to the first unlock: refused once settled or draining

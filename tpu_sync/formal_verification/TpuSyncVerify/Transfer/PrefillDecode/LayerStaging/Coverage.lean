@@ -6,8 +6,8 @@ import TpuSyncVerify.Transfer.PrefillDecode.LayerStaging.Traces
 
 Part of `TpuSyncVerify.Transfer.PrefillDecode.LayerStaging`. Instruments `step`
 with decision-tree leaves (`Leaf`) and lifecycle effects, proves `stepT_step`,
-and verifies via `#guard` across the 95-branch 1-layer universe that every
-memory move writes `.kvRight`, `.slotFault` is unreachable, and all 56 branches
+and verifies via `#guard` across the 93-branch 1-layer universe that every
+memory move writes `.kvRight`, `.slotFault` is unreachable, and all 54 branches
 outside `paired` partition with `0` unaccounted. -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.LayerStaging
@@ -247,7 +247,7 @@ def coverageChecks : Bool :=
   | some univ =>
     let gaps := univ.filter (!coveredByPaired.contains ·)
     let count (c : GapClass) := (gaps.filter (gapClass · = c)).length
-    univ.length = 95 ∧
+    univ.length = 93 ∧
     (univ.filter coveredByPaired.contains).length = 39 ∧
     coveredByPaired.length = 46 ∧
     (univ.filter coveredByAll.contains).length = 54 ∧
@@ -256,7 +256,7 @@ def coverageChecks : Bool :=
     univ.all (fun b => b.1 != .slotFault) ∧
     count .envOrHandshake = 5 ∧
     count .sessionCovered = 18 ∧
-    count .sessionGap = 21 ∧
+    count .sessionGap = 19 ∧
     count .zeroSlots = 6 ∧
     count .stagingWindow = 6 ∧
     count .unaccounted = 0 ∧

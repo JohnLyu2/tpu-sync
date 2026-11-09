@@ -22,45 +22,49 @@ open TpuSyncVerify.Transfer.Reshard.Registry (RegGen)
 namespace WorkerCov
 
 inductive PollArmTag
-  | singleDone | singleFailed | superseded | alreadyFailed | settledPartial | chainDone | chainFailed
+  | directDone | directFailed | superseded | strayDone | strayFailed
+  | alreadyReported | settledPartial | chainDone | chainFailed
   deriving Repr, DecidableEq
 
 /-- Arms of `RecordPoolReshardTerminalLocked` visited by one `CompleteReadWithDetails`. -/
 structure PollArms where
-  /-- `sub_plan_count <= 1`, `status.ok()`. -/
-  singleDone : Bool := false
-  /-- `sub_plan_count <= 1`, `!status.ok()`. -/
-  singleFailed : Bool := false
-  /-- `anchored && !plan_uuids.contains(uuid)`. -/
+  /-- `it == sub_plan_chains_.end()`, `status.ok()`. -/
+  directDone : Bool := false
+  /-- `it == sub_plan_chains_.end()`, `!status.ok()`. -/
+  directFailed : Bool := false
+  /-- `sub_it == progress.sub_sessions.end()` and `progress.anchored`. -/
   superseded : Bool := false
-  /-- `if (progress.failed) return;` -/
-  alreadyFailed : Bool := false
-  /-- `settled.insert(sub_plan_index)` short of `count`. -/
+  /-- `sub_it == progress.sub_sessions.end()`, unanchored, `status.ok()`. -/
+  strayDone : Bool := false
+  /-- `sub_it == progress.sub_sessions.end()`, unanchored, `!status.ok()`. -/
+  strayFailed : Bool := false
+  /-- `if (progress.failed || progress.completed) return;` -/
+  alreadyReported : Bool := false
+  /-- `settled_count` short of `sub_sessions.size()`. -/
   settledPartial : Bool := false
-  /-- `done.insert(req_id); chains.erase(req_id)`. -/
+  /-- `done.insert(req_id); progress.completed = true; progress.sub_sessions.clear()`. -/
   chainDone : Bool := false
   /-- `progress.failed = true; failed_recving_.insert(req_id)`. -/
   chainFailed : Bool := false
   deriving Repr, DecidableEq
 
-def PollArms.mark (a : PollArms) (s : SubSession) (t : Terminal) : PollArms :=
-  if s.count <= 1 then
-    match t with
-    | .done _ _ => { a with singleDone := true }
-    | _ => { a with singleFailed := true }
-  else
-    match t with
-    | .supersededIgnored => { a with superseded := true }
-    | .failedIgnored => { a with alreadyFailed := true }
-    | .settledPartial => { a with settledPartial := true }
-    | .done _ _ => { a with chainDone := true }
-    | .failed => { a with chainFailed := true }
+def PollArms.mark (a : PollArms) (t : Terminal) : PollArms :=
+  match t with
+  | .direct true => { a with directDone := true }
+  | .direct false => { a with directFailed := true }
+  | .supersededIgnored => { a with superseded := true }
+  | .stray true => { a with strayDone := true }
+  | .stray false => { a with strayFailed := true }
+  | .alreadyReported => { a with alreadyReported := true }
+  | .settledPartial => { a with settledPartial := true }
+  | .done _ _ => { a with chainDone := true }
+  | .failed => { a with chainFailed := true }
 
 /-- The arms one poll visits, by the same fold as `WorkerState.recordAll`. -/
-def pollArms (c : ChainProgress) (settled : List SubSession) : PollArms :=
+def pollArms (c : ChainProgress) (sessions settled : List SubSession) : PollArms :=
   (settled.foldl (fun (acc : ChainProgress × PollArms) s =>
-    let (c', t) := recordTerminal acc.1 s
-    (c', acc.2.mark s t)) (c, {})).2
+    let (c', t) := recordTerminal acc.1 sessions s
+    (c', acc.2.mark t)) (c, {})).2
 
 inductive Leaf
   | register (arm : RegisterArm)
@@ -68,15 +72,19 @@ inductive Leaf
   | poll (arms : PollArms) (sweep : SweepOutcome)
   deriving Repr, DecidableEq
 
-/-- `chains_[req_id]` as the tests observe it. -/
+/-- `sub_plan_chains_[req_id]` as the tests observe it. -/
 inductive Entry
   | absent
   | live (anchored : Bool)
   | failed
+  | completed
   deriving Repr, DecidableEq
 
 def entry (c : ChainProgress) : Entry :=
-  if !c.present then .absent else if c.failed then .failed else .live c.anchored
+  if !c.present then .absent
+  else if c.failed then .failed
+  else if c.completed then .completed
+  else .live c.anchored
 
 structure Effect where
   before : Entry
@@ -107,10 +115,12 @@ def armsOfLeaf : Leaf → List Arm
   | .register a => [.register a]
   | .settle ok => [.settle ok]
   | .poll a sw =>
-    (if a.singleDone then [.record .singleDone] else []) ++
-    (if a.singleFailed then [.record .singleFailed] else []) ++
+    (if a.directDone then [.record .directDone] else []) ++
+    (if a.directFailed then [.record .directFailed] else []) ++
     (if a.superseded then [.record .superseded] else []) ++
-    (if a.alreadyFailed then [.record .alreadyFailed] else []) ++
+    (if a.strayDone then [.record .strayDone] else []) ++
+    (if a.strayFailed then [.record .strayFailed] else []) ++
+    (if a.alreadyReported then [.record .alreadyReported] else []) ++
     (if a.settledPartial then [.record .settledPartial] else []) ++
     (if a.chainDone then [.record .chainDone] else []) ++
     (if a.chainFailed then [.record .chainFailed] else []) ++
@@ -119,6 +129,12 @@ def armsOfLeaf : Leaf → List Arm
 def armsOf (bs : List Branch) : List Arm :=
   (bs.flatMap fun b => armsOfLeaf b.1).foldl (fun acc a => if acc.contains a then acc else acc ++ [a]) []
 
+/-- The sessions after the deadline arm of `poll stalled` (as `stepG` computes them). -/
+def afterDeadlineArm (w : WorkerState) (stalled : Bool) : List SubSession :=
+  if stalled && w.chain.present then
+    w.sessions.map fun s => if s.done then s else { s with ok := false }
+  else w.sessions
+
 def stepT (w : WorkerState) : WorkerEv → Option (WorkerState × Leaf)
   | .registerSubPlan u i c =>
     (WorkerState.step w (.registerSubPlan u i c)).map
@@ -126,12 +142,14 @@ def stepT (w : WorkerState) : WorkerEv → Option (WorkerState × Leaf)
   | .settleSession u ok => (WorkerState.step w (.settleSession u ok)).map (·, .settle ok)
   | .poll stalled =>
     (WorkerState.step w (.poll stalled)).map fun w' =>
-      let settledNow := w.active.filter (·.done)
-      let stillActive := w.active.filter (!·.done)
-      let r := WorkerState.recordAll w.chain settledNow
+      let sessions := afterDeadlineArm w stalled
+      let settledNow := sessions.filter fun s => s.done && !s.retired
+      let r := WorkerState.recordAll w.chain sessions settledNow
       let sweep :=
-        if stalled && !r.touched then (sweepStalledChain r.chain stillActive).2 else .notSwept
-      (w', .poll (pollArms w.chain settledNow) sweep)
+        if stalled && !r.touched then
+          (sweepStalledChain r.chain (anyOpenSlot sessions r.chain.subSessions)).2
+        else .notSwept
+      (w', .poll (pollArms w.chain sessions settledNow) sweep)
 
 theorem stepT_step (w : WorkerState) (e : WorkerEv) :
     (stepT w e).map (·.1) = WorkerState.step w e := by
@@ -144,7 +162,8 @@ def singleEvents : List WorkerEv :=
   [.registerSubPlan 20 0 1, .settleSession 20 true, .settleSession 20 false, .poll false, .poll true]
 
 def inits : List (WorkerState × List WorkerEv) :=
-  [(WorkerState.init, workerCheckEvents), (WorkerState.init, singleEvents)]
+  [(WorkerState.init, workerCheckEvents), (WorkerState.init, singleEvents),
+   (WorkerState.init, mixedCheckEvents)]
 
 def allBranches : Option (List Branch) :=
   inits.foldlM (fun acc (i, evs) =>
@@ -156,6 +175,9 @@ def tr_waits_for_last : List WorkerEv :=
   [ .registerSubPlan 5001 0 3, .settleSession 5001 true, .poll false,
     .registerSubPlan 5003 2 3, .settleSession 5003 true, .poll false,
     .registerSubPlan 5002 1 3, .settleSession 5002 true, .poll false, .poll false ]
+def tr_send_waits_for_last : List WorkerEv :=
+  [ .registerSubPlan 5041 0 2, .settleSession 5041 true, .poll false,
+    .registerSubPlan 5042 1 2, .settleSession 5042 true, .poll false ]
 def tr_first_failure_once : List WorkerEv :=
   [ .registerSubPlan 5011 0 2, .settleSession 5011 false, .poll false,
     .registerSubPlan 5012 1 2, .settleSession 5012 true, .poll false ]
@@ -178,6 +200,14 @@ def tr_failure_while_sibling_active : List WorkerEv :=
 def tr_late_sub_plan_twice : List WorkerEv :=
   [ .registerSubPlan 7300 0 2, .settleSession 7300 false, .poll false, .poll true,
     .registerSubPlan 7301 1 2, .settleSession 7301 true, .poll false, .poll true ]
+def tr_seated_at_sweep : List WorkerEv :=
+  [ .registerSubPlan 7500 0 2, .settleSession 7500 false, .poll false,
+    .registerSubPlan 7501 1 2, .poll true, .settleSession 7501 true, .poll false ]
+def tr_sweep_keeps_open : List WorkerEv :=
+  [ .registerSubPlan 9100 0 2, .registerSubPlan 9101 1 2, .settleSession 9100 true,
+    .poll false, .poll true, .settleSession 9101 true, .poll false ]
+def tr_single_beside_unanchored : List WorkerEv :=
+  [ .registerSubPlan 7600 0 1, .registerSubPlan 7601 1 2, .settleSession 7600 true, .poll false ]
 
 /-- The `SubPlanChainTest` cases of `pool_reshard_test.cc`, each with the trace
 of `Traces.lean` that replays it. -/
@@ -186,14 +216,18 @@ def paired : List (String × List WorkerEv) :=
    ("SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce", tr_first_failure_once),
    ("SubPlanChainTest.RetryUnderTheSameReqIdIsTrackedAsANewChain", tr_retry_new_chain),
    ("SubPlanChainTest.StalledChainFailsAfterTheTransferTimeout", tr_stalled),
-   ("SubPlanChainTest.SinglePlanRequestsReportAtOnce", tr_single)]
+   ("SubPlanChainTest.SinglePlanRequestsReportAtOnce", tr_single),
+   ("SubPlanChainTest.SendTerminalWaitsForTheLastSubPlan", tr_send_waits_for_last)]
 
 /-- Shipping behaviours shown only by `Traces.lean`. -/
 def modelOnly : List (String × List WorkerEv) :=
   [("trace_sender_in_first_window_only", tr_sender_first_window_only),
    ("trace_sender_in_last_window_only", tr_sender_last_window_only),
    ("trace_first_failure_reports_while_sibling_active", tr_failure_while_sibling_active),
-   ("trace_late_sub_plan_after_sweep_reports_failure_twice", tr_late_sub_plan_twice)]
+   ("trace_late_sub_plan_after_sweep_reports_failure_twice", tr_late_sub_plan_twice),
+   ("trace_sub_plan_seated_at_sweep_is_failed_not_done", tr_seated_at_sweep),
+   ("trace_stall_sweep_keeps_entry_with_open_session", tr_sweep_keeps_open),
+   ("trace_single_plan_beside_unanchored_entry_reports", tr_single_beside_unanchored)]
 
 def coveredByPaired : List Branch :=
   Coverage.coveredBy instr (paired.map fun (_, tr) => (WorkerState.init, tr))
@@ -389,16 +423,17 @@ environment events — `settleDispatchedRecv`, `senderVoteComplete`,
 would repeat each of them once per phase).
 
 **Worker** (`NoteSubPlanRegisteredLocked`, `RecordPoolReshardTerminalLocked`,
-`SweepSubPlanChainsLocked`): **17 arms**, every constructor reachable. The 5
-`SubPlanChainTest` cases reach **13**; the four `modelOnly` traces reach two
-more. The four the tests miss:
+`SweepSubPlanChainsLocked`): **19 arms**, every constructor reachable. The 6
+`SubPlanChainTest` cases reach **13**; the seven `modelOnly` traces reach five
+more. The six the tests miss:
 
 | Arm | Schedule | What it would take |
 |---|---|---|
 | `register unanchored` | `registerSubPlan 11 1 2` first | a sub-plan `index >= 1` seated before sub-plan 0 (a sender absent from window 0; `trace_sender_in_last_window_only`) |
-| `record singleFailed` | `registerSubPlan 20 0 1, settleSession 20 false, poll` | a failing single-plan session through `CompleteReadWithDetails` |
-| `sweep activeKeeps` | `registerSubPlan 10 0 2, poll true` | the stall sweep while a session of the request is still active |
-| `sweep erasedFailed` | `…, settleSession 10 false, poll false, poll true` | advancing the clock past `timeout_s_` after a reported failure (`trace_late_sub_plan_after_sweep_reports_failure_twice`) |
+| `record directFailed` | `registerSubPlan 20 0 1, settleSession 20 false, poll` | a failing single-plan session through `CompleteReadWithDetails` |
+| `record strayDone`, `record strayFailed` | `registerSubPlan 20 0 1, registerSubPlan 11 1 2, settleSession 20 _, poll` | a single-plan session settling beside an unanchored entry of the same `req_id` (`trace_single_plan_beside_unanchored_entry_reports` reaches `strayDone`) |
+| `sweep activeKeeps` | `registerSubPlan 10 0 2, poll true` | the stall sweep while a slot's session is still open (`trace_stall_sweep_keeps_entry_with_open_session`) |
+| `sweep erasedReported` | `…, settleSession 10 false, poll false, poll true` | advancing the clock past `timeout_s_` after a reported terminal (`trace_late_sub_plan_after_sweep_reports_failure_twice`) |
 
 **Coordinator** (`StartPoolReshard`, `RunSubPlan` over `StartChain`): **22
 leaves**, every constructor reachable. The 6 windowed `ReshardStackTest` cases
@@ -409,14 +444,15 @@ miss:
 |---|---|---|
 | `planClaimRefused`, `planFailed` | `…, finishWindowSend, startWindowPlan false` | a planner or `LookupAndClaim` refusal at window `>= 1` (window 0's are the single-window cases in `Coordinator/Coverage.lean`) |
 | `armBarrierAbortAbandons` | `startWindowPlan true, armDstResult 10 .failed, finishWindowArm` | a window-0 arm failure; the single-window `ReshardStackTest` arm-failure cases replayed in `Coordinator/Coverage.lean` |
-| `sendFail`, `sendBarrierAbort` | `…, finishWindowArm, sendSrcResult 0 false, finishWindowSend` | `transport_.FailFor` on a source rank after the arms succeed (the same gap as `Coordinator/Coverage.lean`) |
+| `sendFail`, `sendBarrierAbort` | `…, finishWindowArm, sendSrcResult 0 false, finishWindowSend` | a sender failing after the arms succeed in a windowed request (the single-window case is `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm`, replayed in `Coordinator/Coverage.lean`) |
 | `cancelRefused`, `cancelTombstones` | `cancelIfUnclaimed` in any phase | the producer's `CancelIfUnclaimed`; replayed against the registry in `Registry/Coverage.lean` (`trace_chained_arm_failure_keeps_claim_past_last_vote` reaches `cancelRefused`) |
 -/
 
 namespace WorkerCov
 
 def gaps : List Arm :=
-  [.register .unanchored, .record .singleFailed, .sweep .activeKeeps, .sweep .erasedFailed]
+  [.register .unanchored, .record .directFailed, .record .strayDone, .record .strayFailed,
+   .sweep .activeKeeps, .sweep .erasedReported]
 
 def coverageChecks : Bool :=
   match allBranches with
@@ -425,7 +461,7 @@ def coverageChecks : Bool :=
     let arms := armsOf univ
     let covered := armsOf coveredByPaired
     let uncovered := arms.filter (fun a => !covered.contains a)
-    arms.length = 17 ∧ covered.length = 13 ∧ (armsOf coveredByAll).length = 15 ∧
+    arms.length = 19 ∧ covered.length = 13 ∧ (armsOf coveredByAll).length = 18 ∧
     covered.all arms.contains ∧
     uncovered.all gaps.contains ∧ gaps.all uncovered.contains ∧
     gaps.all (fun a => inits.any fun (i, evs) =>

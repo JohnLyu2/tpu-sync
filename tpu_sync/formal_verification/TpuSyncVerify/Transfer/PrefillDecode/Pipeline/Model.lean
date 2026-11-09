@@ -89,7 +89,7 @@ inductive Ev where
   deriving Repr, DecidableEq
 
 /-- `KVCacheManagerWithTransfer::NotifyForRead` registers the send session under
-`transfer_uuid` in `sessions_` (`sessions_.try_emplace(uuid, session)`)
+`transfer_uuid` in `sessions_` (`sessions_.try_emplace(uuid, SessionEntry{session, req_id, SessionRole::kTransfer})`)
 and calls `cv_.SignalAll()`. -/
 def notifyForRead (s : Pipeline) : Option Pipeline :=
   if s.registered = false then

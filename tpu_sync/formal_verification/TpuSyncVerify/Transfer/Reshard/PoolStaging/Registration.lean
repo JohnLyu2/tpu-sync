@@ -11,13 +11,13 @@ open TpuSyncVerify
 /-! ## Part III — Receive Registration Lifecycle (`PoolReshardRegisterRecv`)
 
 We now model the interaction between `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-`ReshardReceiveSession` (`ReshardReceiveSession::Create`,
+`ReshardReceiveSession` (`CreateReshardReceiveSession`,
 `ReshardReceiveSession::AcquireStagingLeases`, `ReshardReceiveSession::ReleaseStaging`),
 and `PoolStagingStorage` across two registration policies:
 - `RegistrationPolicy.reserveBeforeLease` (shipping): `PoolReshardRegisterRecv`
   claims `uuid` in `pending_pool_reshard_recvs_` under its `mu_`
   (`if (!pending_pool_reshard_recvs_.insert(plan.uuid()).second)`) before
-  `ReshardReceiveSession::Create` constructs the session and calls
+  `CreateReshardReceiveSession` constructs the session and calls
   `AcquirePoolStagingLease`, releasing the partial lease
   (`session->ReleaseStaging();`) and dropping the claim
   (`absl::Cleanup clear_pending`) on lease failure.
@@ -60,7 +60,7 @@ inductive RegEv where
   immediately. -/
   | beginArm (callId uuid : Nat) (blocks : List Nat)
   /-- Phase 2 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-  `ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`): call
+  `CreateReshardReceiveSession`, `ReshardReceiveSession::AcquireStagingLeases`): call
   `AcquirePoolStagingLease(uuid, blocks)` outside `mu_`. -/
   | acquireArmLease (callId : Nat)
   /-- Phase 3 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`): finish registration
@@ -113,9 +113,9 @@ def RegState.step (policy : RegistrationPolicy) (s : RegState) (e : RegEv) : Opt
         match s.arena.acquireLease arm.uuid arm.blocks with
         | none =>
           -- Phase 2 `AcquireStagingLeases` failed (`ResourceExhausted`):
-          -- `ReshardReceiveSession::Create` releases any partial lease and
+          -- `CreateReshardReceiveSession` releases any partial lease and
           -- `PoolReshardRegisterRecv`'s cleanup drops the pending claim
-          -- (`ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`, `ReshardReceiveSession::ReleaseStagingLocked`).
+          -- (`CreateReshardReceiveSession`, `ReshardReceiveSession::AcquireStagingLeases`, `ReshardReceiveSession::ReleaseStagingLocked`).
           some { s with
             arena := s.arena.releaseLease arm.uuid
             inFlightArms := s.removeArm callId }
@@ -131,7 +131,7 @@ def RegState.step (policy : RegistrationPolicy) (s : RegState) (e : RegEv) : Opt
       if !arm.leasedInPhase2 then none
       else if s.hasActiveUuid arm.uuid then
         -- Under `.leaseBeforeReserve`, the registration is refused with
-        -- `AlreadyExistsError` after `Create` already acquired the lease, and
+        -- `AlreadyExistsError` after the factory already acquired the lease, and
         -- the temporary
         -- `ReshardReceiveSession` destructor calls
         -- `ReleasePoolStagingLeases(arm.uuid)`.
@@ -164,7 +164,7 @@ def ActiveSessionsHoldLeases (s : RegState) : Bool :=
     blocks.all (fun b => (s.arena.resolveBlockSlot uuid b).isSome))
 
 /-- **Constructive counterexample trace for the `leaseBeforeReserve` mutant
-(`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, `ReshardReceiveSession::Create`, `ReshardReceiveSession::ReleaseStagingLocked`)**:
+(`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`, `CreateReshardReceiveSession`, `ReshardReceiveSession::ReleaseStagingLocked`)**:
 Under the unreserved mutant `.leaseBeforeReserve`:
 1. Call 1 (`uuid = 7`, `blocks = [5]`) and Call 2 (duplicate `uuid = 7`,
    `blocks = [5]`) both pass Phase 1 (`beginArm`) before either reaches Phase 3.

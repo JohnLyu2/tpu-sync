@@ -70,7 +70,7 @@ def sumRemainingSlots : List SendPool → Nat
   | p :: ps => p.remainingSlots + sumRemainingSlots ps
 
 /-- Every pool in `pools` has positive peer count (`CountPoolReshardSendSlots`,
-`ReshardSendSession::Create`, `ReshardSendSession::ExecutePushPipeline`). -/
+`CreateReshardSendSession`, `ReshardSendSession::ExecutePushPipeline`). -/
 def allPosPeers (pools : List SendPool) : Bool :=
   pools.all fun p => decide (0 < p.peers)
 
@@ -97,7 +97,7 @@ def noAborted (pools : List SendPool) : Bool :=
 def allPushed (pools : List SendPool) : Bool :=
   pools.all fun p => p.stage == .pushing 0
 
-/-- Initial state after `ReshardSendSession::Create` and the opening lock of
+/-- Initial state after `CreateReshardSendSession` and the opening lock of
 `ReshardSendSession::Start` (`++in_flight_;`). -/
 def init (peerCounts : List Nat) : Send :=
   { pools := peerCounts.map fun n => { peers := n, stage := .pending }

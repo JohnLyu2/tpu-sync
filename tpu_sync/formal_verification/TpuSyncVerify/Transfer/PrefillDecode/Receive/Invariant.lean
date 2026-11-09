@@ -135,10 +135,13 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         · exact hl
         · exact Lifecycle.finishLocked_consistent _ hl
       · unfold Accounted
-        cases ok <;> simp [hp'] at hacc ⊢ <;> omega
-      · cases ok <;> simp <;> exact hok
-      · cases ok <;> simp
-        · exact hdr
+        split <;> simp [hp'] at hacc ⊢ <;> omega
+      · split
+        · simpa using hok
+        · simp
+      · split
+        · simpa using hdr
+        · simp
       · intro b hp
         have hd := hpd b hp
         apply Lifecycle.endOpLocked_done_mono

@@ -151,7 +151,7 @@ def allBranches : Option (List Branch) := Coverage.allBranches instr inits (even
 
 /-! ## Result
 
-Exhaustive for one layer (registered and unregistered starts): **74
+Exhaustive for one layer (registered and unregistered starts): **72
 branches**. Every memory move in them writes the right layer's KV
 (`moved = .kvRight` for every `d2hReady`, `h2hDone … (some _)`, `h2dReady`,
 `land`): `PublicationCorrect` read off the branch set — junk, a wrong layer
@@ -160,9 +160,9 @@ mutant of `PipelineChecks.lean` reaches `h2dReady junk` (checked below).
 
 The 11 `paired` rows (13 upstream tests: three C++ end-to-end, four Python,
 six control-plane; seven distinct runs; see `PipelineChecks.lean` for how
-weak those pairings are) reach **25 of the 74**; the two two-layer rows take
+weak those pairings are) reach **25 of the 72**; the two two-layer rows take
 three more branches outside the one-layer universe (below), 28 along the
-traces in all. The five `modelOnly` traces add 5 (30 of 74). The 49 the tests
+traces in all. The five `modelOnly` traces add 5 (30 of 72). The 47 the tests
 miss partition as:
 
 * **environment** (3): `reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging`
@@ -176,8 +176,9 @@ miss partition as:
   (`Send.coveredByPaired` / `Recv.coveredByPaired`). The pipeline adds no C++
   to them — a failed copy, a cancelled receive — only the memory effect, which
   the session tests cannot observe.
-* **in the session gap tables** (22: 9 `Send`, 13 `Recv`): `Send.expectedUncovered`
-  / `Recv.expectedUncovered`, classified there. (The four `pullReplyFail` rows
+* **in the session gap tables** (20: 9 `Send`, 11 `Recv`): `Send.expectedUncovered`
+  / `Recv.expectedUncovered`, classified there. (The `pullReplyFail` /
+  `pullReplyFailDraining` rows
   also clear the pipeline's `pullWaiting`, `HandlePullStream`'s grace wait —
   control-plane code the session tables do not see; the C++ is the same
   `on_response`.)
@@ -223,10 +224,10 @@ def movedOf : Leaf → Option Moved
   | .h2hDone _ m => m
   | _ => none
 
-/-- One search, every check: exhausted; 74 branches; 25 reached by the paired
+/-- One search, every check: exhausted; 72 branches; 25 reached by the paired
 traces within the universe (28 along them, the other 3 two-layer), 30 with
 `modelOnly`; every move is `kvRight`; the gaps partition into 3 environment,
-24 session-covered, 22 session-gap, none unaccounted; every paired trace runs
+24 session-covered, 20 session-gap, none unaccounted; every paired trace runs
 to its end; the `dispatchEarly` mutant moves junk into decode HBM (the mutant
 system borrows `stepT`'s tag where the original step is also enabled, which
 it is at that point; elsewhere the tag is a placeholder). -/
@@ -236,10 +237,10 @@ def coverageChecks : Bool :=
   | some univ =>
     let gaps := univ.filter (fun b => !coveredByPaired.contains b)
     let count (c : GapClass) := (gaps.filter (gapClass · = c)).length
-    univ.length = 74 ∧ (univ.filter coveredByPaired.contains).length = 25 ∧
+    univ.length = 72 ∧ (univ.filter coveredByPaired.contains).length = 25 ∧
     coveredByPaired.length = 28 ∧ (univ.filter coveredByAll.contains).length = 30 ∧
     univ.all (fun b => (movedOf b.1).all (· = .kvRight)) ∧
-    count .env = 3 ∧ count .sessionCovered = 24 ∧ count .sessionGap = 22 ∧
+    count .env = 3 ∧ count .sessionCovered = 24 ∧ count .sessionGap = 20 ∧
     count .unaccounted = 0 ∧
     paired.all (fun (_, s, tr) => ((⟨s, step⟩ : System Pipeline Ev).run tr).isSome) ∧
     (Coverage.witnessP { instr with stepT := fun s e =>

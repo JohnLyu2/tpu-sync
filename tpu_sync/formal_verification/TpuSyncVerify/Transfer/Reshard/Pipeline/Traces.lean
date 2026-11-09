@@ -124,7 +124,8 @@ theorem violates_iff {s : Pipeline} : violates s = false ↔ Safe s := by
    H2D copy clobbers `dstHbm[1]` to `.junk`, violating `PublicationCorrect` and
    `AliasedPageCorrect`.
 2. **Premature `OnPoolReceived` (`stepPrematurePoolReceived`)**: if
-   `BlockTransportServerPushSession::CompleteIncomingPush` fires `OnPoolReceived(p)` on the first
+   `BlockTransportServerPushSession::CompleteIncomingPush` fires the pool completion
+   (`session->OnDataReceived` → `ReshardReceiveSession::OnPoolReceived(p)`) on the first
    arriving stream (`0 < landedStreams[p]`) instead of waiting for all
    `peerCounts[p]` streams (`progress.completed_chunks >= progress.expected_chunks`),
    `StreamAccountingSafe` is violated.

@@ -206,6 +206,19 @@ def tr_last_stage_frees : List Ev :=
    .lookupAndClaim 101 [0, 1], .abandonClaim 101, .cancelIfUnclaimed]
 def tr_arm_failure_retry : List Ev :=
   [.register 0 true, .lookupAndClaim 100 [0], .abandonClaim 100, .lookupAndClaim 101 [0]]
+def tr_arm_failure_retry_two : List Ev :=
+  tr_claim_two ++ [.abandonClaim 100, .lookupAndClaim 101 [0, 1]]
+def tr_refresh_then_claim : List Ev := [.register 0 true, .register 0 true, .lookupAndClaim 100 [0]]
+def tr_complete_unknown : List Ev := [.complete 0]
+def tr_complete_guard : List Ev :=
+  [.register 0 true, .complete 1, .lookupAndClaim 100 [0], .complete 1, .complete 0, .complete 0]
+def tr_cancel_twice_complete : List Ev := [.cancelIfUnclaimed, .cancelIfUnclaimed, .complete 0]
+def tr_empty_votes_then_claim : List Ev := [.register 0 false, .complete 0, .lookupAndClaim 100 [0]]
+def tr_release_unknown : List Ev := [.release, .release]
+def tr_release_registered : List Ev := [.register 0 true, .register 1 true, .release]
+def tr_release_claimed_cancel : List Ev :=
+  [.register 0 true, .lookupAndClaim 100 [0], .release, .cancelIfUnclaimed, .release]
+def tr_release_cancelled : List Ev := [.cancelIfUnclaimed, .release]
 
 /-- `(upstream test, trace)`, all from `RegGen.init`. -/
 def paired : List (String × List Ev) :=
@@ -244,18 +257,44 @@ def paired : List (String × List Ev) :=
    ("ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank", tr_claim_two),
    ("ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes", tr_claim_two),
    ("ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv", tr_claim_two),
-   ("ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan", [.register 0 true, .register 1 true])]
+   ("ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan", [.register 0 true, .register 1 true]),
+   ("ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail",
+      tr_refresh_then_claim),
+   ("ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim", tr_claim_abandon_two),
+   ("ReshardStackTest.CompletionNoOpsAndPreClaimGuard", tr_complete_unknown),
+   ("ReshardStackTest.CompletionNoOpsAndPreClaimGuard", tr_complete_guard),
+   ("ReshardStackTest.CompletionNoOpsAndPreClaimGuard", tr_cancel_twice_complete),
+   ("ReshardStackTest.EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim", tr_empty_votes_then_claim),
+   ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState", tr_release_unknown),
+   ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState", tr_release_registered),
+   ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState", tr_release_claimed_cancel),
+   ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState", tr_release_cancelled),
+   ("ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders", tr_arm_failure_retry_two),
+   ("ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm", tr_claim_two)]
 
 /-- `(upstream test, trace, refused event, arm)`: the refusals the tests assert
 after the trace. `TtlPurgesExpiredRegistrations`'s refusal follows a TTL purge
-(`purgeExpiredAll`), which is not an event, so it is checked on the purged state. -/
+(`purgeExpiredAll`), which is not an event, so it is checked on the purged state.
+`DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail`'s
+conflicting payload (bare `block_ids` for a unit registered with `pool_spans`)
+is an empty-blocks re-registration here, the model's one other payload. -/
 def refused : List (String × List Ev × Ev × Refusal) :=
   [("ReshardStackTest.CancelTombstoneBlocksLateRegistration", tr_cancel_fresh,
      .register 0 true, .registerLifecycle),
    ("ReshardStackTest.AbandoningTheLastStageFreesTheClaim", tr_last_stage_frees,
      .lookupAndClaim 100 [0, 1], .claimCancelledOrEmpty),
    ("ReshardStackTest.MissingRegistrationKeepsContractString", [],
-     .lookupAndClaim 100 [0], .claimMissingUnit)]
+     .lookupAndClaim 100 [0], .claimMissingUnit),
+   ("ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail",
+     [.register 0 true, .register 0 true], .register 0 false, .registerConflict),
+   ("ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail",
+     tr_refresh_then_claim, .register 0 true, .registerLifecycle),
+   ("ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim", tr_claim_two,
+     .lookupAndClaim 101 [0], .claimIncompatible),
+   ("ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim", tr_claim_two,
+     .abandonClaim 101, .abandonNotOwner),
+   ("ReshardStackTest.CompletionNoOpsAndPreClaimGuard", [.register 0 true],
+     .complete 0, .completeBeforeClaim)]
 
 /-- Remaining tests in `reshard_service_test.cc` whose stimulus does not reach a
 `RegGen.step` transition (plus `MissingRegistrationKeepsContractString` above,
@@ -267,6 +306,8 @@ def notReplayable : List (String × String) :=
       "RequestBlockRegistry::Register rejects dst_unit_ordinal < -1 before acquiring the lifecycle mu_ scope"),
    ("ReshardStackTest.LegacyCommandsFailClosed",
       "controller-side retired inter-controller COMMAND_REGISTER_TRANSFER_SCHEDULE rejection; never touches RequestBlockRegistry"),
+   ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState (force = false)",
+      "ReshardService::HandleControllerCommand rejects an unforced COMMAND_RELEASE_REQUEST_BLOCKS before RequestBlockRegistry::Release; the forced releases are paired above"),
    ("ReshardControlPipeTest.* (3 tests)", "control-pipe transport round-trip only"),
    ("PlanSubTransfersTest.* (5 tests)", "pure PlanSubTransfers window-splitting unit tests"),
    ("SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct", "pure SubPlanUuid helper unit test")]
@@ -281,48 +322,33 @@ def notReplayable : List (String × String) :=
 /-! ## Result
 
 The search exhausts the state space: **25 branches** (14 leaves × the status
-transitions each can make), every leaf of `Leaf` reachable. The 35 upstream
-tests in `paired` (36 traces) reach **11 of 25**: `registerNew` (from `unknown`
-and from `registered`), `claimOk` (first claim on `registered`, subsequent same-
-or second-owner claim on `claimed`), `abandonOther`, `abandonLast`,
-`completeVote`, `completeRetires`, `cancelRefusedClaimed`, and
-`cancelTombstone` (on an empty and on a registered generation). Of the seven
-`Refusal` constructors, three are asserted (`registerLifecycle` on a tombstone,
-`claimCancelledOrEmpty` on a cancelled generation, `claimMissingUnit`).
+transitions each can make), every leaf of `Leaf` reachable. The 42 upstream
+tests in `paired` (48 traces) reach **all 25**, and every one of the seven
+`Refusal` constructors is asserted (`registerLifecycle` on a tombstone and on a
+claimed generation, `registerConflict`, `claimCancelledOrEmpty` on a cancelled
+generation, `claimIncompatible`, `claimMissingUnit`, `abandonNotOwner`,
+`completeBeforeClaim`).
 
-The registry is one mutex and one map per table, so every gap is a schedule
-`ReshardStackTest` can drive through controller commands; none needs a window
-or a stub:
-
-| Class | Count | Branches | What it would take |
-|---|---|---|---|
-| **test** | 14 | `registerRefresh`; `completeNoOp` (on `unknown`, `registered`, `claimed`, `cancelled`); `completeVoteUnclaimed` and `claimRetiresVoted` (an empty-blocks registration voting before the claim, then the claim retiring at once); `cancelAlready`; `release` (from each status, and on an already retired generation) | re-send an identical `COMMAND_REGISTER_REQUEST_BLOCKS`; `COMMAND_COMPLETE_REQUEST_BLOCKS` for an unknown unit, after retirement, and after a cancel; a registration with no `block_ids` completed before `Coordinate`; a second `COMMAND_CANCEL_REQUEST_BLOCKS_IF_UNCLAIMED`; `COMMAND_RELEASE_REQUEST_BLOCKS` with `force = true` (`ReshardClient::BuildReleaseRequestBlocks`, sent by no C++ test) |
-
-Unasserted `Refusal` constructors: `registerConflict` (a different payload for a
-registered unit), `claimIncompatible` (a second claim for a different unit
-set), `abandonNotOwner` (`AbandonClaim` returns `false` on pre-claim planner
-failures in `RunSubPlan`, which discards the `bool`), and `completeBeforeClaim`
-(a non-empty registration completing before planning); within the asserted
-constructors, no C++ test exercises `registerLifecycle` on a `claimed`
-generation (`retired` in `registerLifecycle` is a single-generation model latch
-because `RetireLocked` clears all six maps, and `units = []` in
-`claimCancelledOrEmpty` is rejected upstream in `StartPoolReshard` and
-`BuildPoolReshardPlan` before `LookupAndClaim`). -/
+The registry is one mutex and one map per table, so every branch is a schedule
+`ReshardStackTest` drives through controller commands or `Coordinate`:
+`registerRefresh` and the `Complete` no-ops, the empty-blocks registration
+voting before its claim and the claim retiring at once, the repeated cancel,
+and every forced `Release`
+(`DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail`,
+`CompletionNoOpsAndPreClaimGuard`,
+`EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim`,
+`ForcedReleaseClearsEveryLifecycleState`). What no test reaches is outside
+`RegGen.step`'s branches: `retired` in `registerLifecycle` is a
+single-generation model latch because `RetireLocked` clears all six maps, and
+`units = []` in `claimCancelledOrEmpty` is rejected upstream in
+`StartPoolReshard` and `BuildPoolReshardPlan` before `LookupAndClaim`. -/
 
 def coveredByPaired : List Branch := Coverage.coveredBy instr (paired.map fun (_, tr) => (RegGen.init, tr))
 
 def br (l : Leaf) (b a : BlockStatus) (retires : Bool) : Branch := (l, ⟨b, a, retires⟩)
 
-def gaps : List Branch :=
-  [br .registerRefresh .registered .registered false,
-   br .completeNoOp .unknown .unknown false, br .completeNoOp .registered .registered false,
-   br .completeNoOp .claimed .claimed false, br .completeNoOp .cancelled .cancelled false,
-   br .completeVoteUnclaimed .registered .registered false,
-   br .claimRetiresVoted .registered .unknown true,
-   br .cancelAlready .cancelled .cancelled false,
-   br .release .unknown .unknown true, br .release .unknown .unknown false,
-   br .release .registered .unknown true, br .release .claimed .unknown true,
-   br .release .cancelled .unknown true, br .release .cancelled .unknown false]
+/-- Branches of the universe no paired trace reaches: none. -/
+def gaps : List Branch := []
 
 def allLeaves : List Leaf :=
   [.registerNew, .registerRefresh, .claimOk, .claimRetiresVoted, .abandonOther, .abandonLast,
@@ -331,20 +357,18 @@ def allLeaves : List Leaf :=
 
 def assertedRefusals : List Refusal := refused.map (·.2.2.2)
 
-/-- One search, every check: the state space is exhausted; 25 branches; 11
-reached by paired traces; the uncovered set is the table; every leaf fires;
-every gap has a witness schedule; three refusal arms asserted. -/
+/-- One search, every check: the state space is exhausted; 25 branches, all
+reached by paired traces; every leaf fires; all seven refusal arms asserted. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
   | some univ =>
     let uncovered := univ.filter (fun b => !coveredByPaired.contains b)
-    univ.length = 25 ∧ coveredByPaired.length = 11 ∧
+    univ.length = 25 ∧ coveredByPaired.length = 25 ∧
     coveredByPaired.all univ.contains ∧
-    sameSet uncovered gaps ∧ gaps.length = 14 ∧
+    sameSet uncovered gaps ∧ gaps.length = 0 ∧
     allLeaves.all (fun l => univ.any (·.1 = l)) ∧
-    gaps.all (fun b => (Coverage.witness instr RegGen.init checkEvents b).isSome) ∧
-    assertedRefusals.eraseDups.length = 3
+    assertedRefusals.eraseDups.length = 7
 
 #guard coverageChecks
 

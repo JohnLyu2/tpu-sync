@@ -18,8 +18,8 @@ corollaries of the sessions' settle protocol and are stated here too.
 `send.cc` is `tpu_sync/kv_cache/transfer_send_session.cc`; `recv.cc` is
 `tpu_sync/kv_cache/transfer_receive_session.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`; `bts.cc` is
-`tpu_sync/transport/block_transport_session.cc`; `mgr.cc` is
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.h`/`base.cc` are
+`tpu_sync/transport/block_transport_session.cc`; `mgr.h`/`mgr.cc` are
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.{h,cc}`; `base.h`/`base.cc` are
 `tpu_sync/kv_cache/kv_cache_manager_base.{h,cc}`. Exact line ranges for
 every symbol and sub-block are in the generated `## Source map` table below.
 
@@ -51,6 +51,36 @@ callback on the send side, the H2D callback on the receive side);
 `PrefillDecode/LayerStaging.lean` refines `Pipeline` with bounded `prefillSlots`
 and `decodeSlots` and proves publication correctness, slot conservation,
 settlement, and `1`-slot sufficiency over this `Pipeline.step`.
+
+**Host-memory source and destination (boundary, not modelled).** Both ends
+of the protocol take a `BlockLocation` (`mgr.h`: `enum class BlockLocation {
+kDevice, kHost }`), defaulting to `kDevice`, which is the path above. With
+`source = kHost` on `NotifyForRead` / `TransferSendSession::Create`, the
+registered ids name blocks of the producer's host pool and `StartPush` takes
+its `if (source_ == BlockLocation::kHost)` branch: no `AcquireStagingWithRetry`,
+no D2H loop, every entry of `d2h_layer_futures_` is an already-OK future and
+`SendNextLayer(0)` pushes straight from those host blocks — `prefillHbm` and
+`prefillStaging` collapse into one memory that tpu-sync never writes. With
+`destination = kHost` on `StartRead` / `TransferReceiveSession::Create`, the
+pull lands in the host blocks `local_block_ids` and
+`TransferReceiveSession::OnDataReceived` routes the layer report to
+`SettleHostLayer` instead of `ExecuteLayerH2d`: no H2D, and the last layer's
+report closes the receive from inside the transport's push lease
+(`RecordNetworkCompleteLocked(/*all_complete=*/true)` → `FinishLocked()`)
+rather than through `pollReady` or the last `h2dIssue` — `decodeStaging` is
+the final destination and `decodeHbm` is never written. Both branches are
+admitted only on a full host mirror with no leased host blocks
+(`KVCacheManagerWithTransfer::CheckHostMemoryTransferSupported`:
+`num_host_layers() == num_layers()` and `!staging_allocator_->LeasesHostBlocks()`),
+so bounded layer staging (`PrefillDecode/LayerStaging.lean`) never meets
+them. `step` has no event or `Cfg` flag for either branch: the session models
+this file composes (`Send.lean`, `Receive.lean`) model the device path, and
+the host path changes which memories exist and where the receive settles, not
+the settle protocol the properties below rest on. The properties are stated
+for the device path; for a host-source send, "`prefillStaging[l]` is read by
+push `l`" reads "the caller's host block for layer `l`", whose stability until
+the send settles is the caller's contract (`NotifyForRead`'s declaration in
+`mgr.h`), an instance of A4.
 
 ## Layers complete in any order
 
@@ -84,13 +114,13 @@ ghost sets record which layers have passed each stage:
 
 | Event                   | What it is |
 |-------------------------|-----------|
-| `notifyForRead`         | `KVCacheManagerWithTransfer::NotifyForRead` registers the offer in `sessions_[uuid]` (`registered := true`) and calls `cv_.SignalAll()` |
+| `notifyForRead`         | `KVCacheManagerWithTransfer::NotifyForRead` registers the offer in `sessions_[uuid]` (a `SessionEntry{session, req_id, SessionRole::kTransfer}`; `registered := true`) and calls `cv_.SignalAll()` |
 | `pullWait`              | `KVCacheManagerWithTransfer::HandlePullStream` arrives before `NotifyForRead` (`registered = false`) and enters `cv_.WaitWithTimeout(&mu_, left)` (`pullWaiting := true`) |
 | `send e`                | the send session's event `e`, no memory effect. `d2hReady` and `h2hDone` are disabled here (they are the layer-indexed events below). `beginPull` (`ValidateAndBeginPull`) requires `registered = true` and clears `pullWaiting`. `wake` additionally needs layer `woken`'s copy to have finished: `SendNextLayer(l)` waits on layer `l`'s future (`layer_future = d2h_layer_futures_[l]` .. `layer_future->OnReady`), not on any future. `StartPush` creates every layer's future before issuing any copy and calls `SendNextLayer(0)` before its D2H loop, so layer 0's wait is armed first; a layer whose copy is never issued has its promise failed with the send's status by the `absl::Cleanup fail_unissued_layers` when `StartPush` returns, so the waiting `SendNextLayer` runs its error arm. `publish` is `KVCacheManagerWithTransfer::CompleteReadWithDetails` retiring the settled send through `RetireSettledSessionLocked` (`if (!send->Done()) return false;`): the outcome goes to `done_sending_` / `failed_recving_` and the entry leaves `sessions_` |
 | `d2hReady l`            | the D2H copy of layer `l` finishes: `prefillStaging[l] := prefillHbm[l]`. Issued iff `l < d2hIssued` (copies are issued in order) |
 | `h2hDone l ok`          | the push callback for layer `l` in `SendNextLayer` (`H2hWriteDirectAsync`). Push `l` exists iff `l < h2hIssued` (pushes are issued in order). On success `wire[l] := prefillStaging[l]` |
 | `recv e`                | the receive session's event `e`, no memory effect. `h2dBegin`, `h2dIssue` and `h2dReady` are disabled here. `pullReply ok` requires `ok = false ∨ send.pullStarted = true` and clears `pullWaiting`. `pollReady` is `CompleteReadWithDetails` finding `recv->IsReadyToComplete()` on a session that is not draining and calling `recv->Finish()`; `publish` is the same loop's `RetireSettledSessionLocked` (`if (!recv->Done()) return false;`) moving the outcome to `done_recving_` / `failed_recving_` and erasing the entry from `sessions_` |
-| `h2dBegin l`            | `KVCacheManagerBase::OnLayerReceived(l, uuid)` → `GetSession(uuid)` → `TransferReceiveSession::OnDataReceived(l, {}, {})` → `ExecuteLayerH2d(l)` up to its first unlock: once per layer (A1), only after layer `l` landed (`if (array_complete && !progress.on_layer_received_called)` in `BlockTransportServerPushSession::CompleteIncomingPush`) |
+| `h2dBegin l`            | `KVCacheManagerBase::OnLayerReceived(l, uuid)` → `GetSession(uuid)` → `TransferReceiveSession::OnDataReceived(l, {}, {})` → `ExecuteLayerH2d(l)` (the device-destination arm) up to its first unlock: once per layer (A1), only after layer `l` landed (`if (array_complete && !progress.on_layer_received_called)` in `BlockTransportServerPushSession::CompleteIncomingPush`) |
 | `h2dIssue l ok`         | `ExecuteLayerH2d(l)` from the `if (done_ || draining_)` re-check through `h2d_futures_.push_back(future)` and the third `mu_` scope (`dispatched_layers_.insert(layer_idx)`): dispatches layer `l`'s H2D copy unless draining or failed; when the dispatch is the `num_layers()`-th and the receive is neither done nor draining it also sets `network_completed_` (`Recv.netIssued`) |
 | `h2dReady l`            | the H2D copy of layer `l` finishes: `decodeHbm[l] := decodeStaging[l]` |
 | `land l`                | the transport writes layer `l` from the wire into `decodeStaging[l]`, inside an accepted push (`BeginIncomingPush(delegate_, header.uuid)` .. `EndIncomingPush(session)` in `BlockTransportServerPushSession::StartStream`, reached from `BlockTransport::HandleIncomingPush`) |
@@ -113,7 +143,7 @@ and cross-node guards map to C++ synchronization as follows:
 
 | Event | Scopes | Between them |
 |---|---|---|
-| `notifyForRead` | 1 producer-manager `mu_` scope in `NotifyForRead` (`sessions_.try_emplace(uuid, session)`), then `cv_.SignalAll()` outside `mu_` | a `HandlePullStream` call that acquires `mu_` between the unlock and `SignalAll` already finds the entry in `sessions_` and skips the wait |
+| `notifyForRead` | 1 producer-manager `mu_` scope in `NotifyForRead` (`sessions_.try_emplace(uuid, SessionEntry{...})`), then `cv_.SignalAll()` outside `mu_` | a `HandlePullStream` call that acquires `mu_` between the unlock and `SignalAll` already finds the entry in `sessions_` and skips the wait |
 | `pullWait` | 1 producer-manager `mu_` scope in `HandlePullStream` up to `cv_.WaitWithTimeout(&mu_, left)`, which atomically releases `mu_` to sleep | while asleep (`pullWaiting = true`), either `sessions_` has no send entry for the uuid (`registered = false`) or, after `notifyForRead`, the thread has not yet re-acquired `mu_` to run `ValidateAndBeginPull` |
 | `send .beginPull` | `ValidateAndBeginPull`'s session `mu_` scope, nested inside `HandlePullStream`'s producer-manager `mu_` scope once `FindSessionLocked<TransferSendSession>(req.uuid)` succeeds | no gap between waking from `WaitWithTimeout` with the entry present and `ValidateAndBeginPull`: both run in the same loop iteration under producer-manager `mu_` |
 | `recv (.pullReply ok)` | 2 consumer-session `mu_` scopes (`Receive.lean`); `ok = true` additionally requires `send.pullStarted = true` | RPC causality: `HandlePullStream` returns `.status = 0` only after `ValidateAndBeginPull` (`send .beginPull`) succeeded; any exception, `stopping_` check, or timeout returns `.status = -1` (`ok = false`, clearing `pullWaiting`) |
@@ -218,37 +248,42 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:201-215` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `Finish(acquire_status);`) | `:486-489` |
-| `send.cc` | `TransferSendSession::StartPush` (`d2h_layer_futures_.emplace_back(std::move(future),`) | `:515-516` |
-| `send.cc` | `TransferSendSession::StartPush` (`SendNextLayer(0);`) | `:535` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::Cleanup fail_unissued_layers =`) | `:546-558` |
-| `send.cc` | `TransferSendSession::StartPush` (`absl::StatusOr<size_t> host_layer_idx = AcquireStagingSlot(l);` .. `next_layer = l + 1;`) | `:560-609` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future = d2h_layer_futures_[l];` .. `layer_future->OnReady`) | `:627-631` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:677-705` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->SendNextLayer(l + 1);`) | `:709` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:813-947` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:847-879` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`dispatched_layers_.insert(layer_idx);` .. `network_completed_ = true;`) | `:938-941` |
-| `recv.cc` | `TransferReceiveSession::OnDataReceived` | `:796-811` |
-| `base.cc` | `KVCacheManagerBase::OnLayerReceived` | `:3009-3018` |
-| `base.cc` | `KVCacheManagerBase::OnBlockShardsReceived` | `:2987-3005` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:466-475` |
-| `bts.cc` | `BeginIncomingPush` | `:286-300` |
-| `bts.cc` | `EndIncomingPush` | `:302-315` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:345-478` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`BeginIncomingPush(delegate_, header.uuid));` .. `FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);`) | `:357-474` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`ShardsFromMask`) | `:394` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`ABSL_RETURN_IF_ERROR(ForEachPayload(`) | `:404-452` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:526-695` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`if (array_complete && !progress.on_layer_received_called)`) | `:653-682` |
-| `bt.cc` | `BlockTransport::AsyncPush` | `:513-562` |
-| `base.h` | `KVCacheManagerBase::num_host_layers` | `:709` |
-| `base.cc` | `*` (`size_t ResolveNumStagingLayers(size_t num_layers,` .. `return requested;`) | `:429-445` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` (`if (!sessions_.try_emplace(uuid, session).second)` .. `cv_.SignalAll();`) | `:544-557` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:436-511` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin();` .. `retired_uuids.push_back(uuid);`) | `:999-1042` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1164-1289` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`const absl::Time give_up = absl::Now() + grace;` .. `session->ValidateAndBeginPull`) | `:1188-1213` |
+| `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:199-213` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (source_ == BlockLocation::kHost)`) | `:483-505` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::Status acquire_status =` .. `Finish(acquire_status);`) | `:511-514` |
+| `send.cc` | `TransferSendSession::StartPush` (`d2h_layer_futures_.emplace_back(std::move(future),`) | `:539-540` |
+| `send.cc` | `TransferSendSession::StartPush` (`// 1. Arm the H2H chain on layer 0's future before any copy is issued, so` .. `SendNextLayer(0);`) | `:554-559` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::Cleanup fail_unissued_layers =`) | `:570-582` |
+| `send.cc` | `TransferSendSession::StartPush` (`absl::StatusOr<size_t> host_layer_idx = AcquireStagingSlot(l);` .. `next_layer = l + 1;`) | `:584-633` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`layer_future = d2h_layer_futures_[l];` .. `layer_future->OnReady`) | `:651-655` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:701-729` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->SendNextLayer(l + 1);`) | `:733` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:854-986` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:886-918` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`dispatched_layers_.insert(layer_idx);` .. `network_completed_ = true;`) | `:977-980` |
+| `recv.cc` | `TransferReceiveSession::OnDataReceived` | `:804-823` |
+| `recv.cc` | `TransferReceiveSession::SettleHostLayer` | `:825-852` |
+| `base.cc` | `KVCacheManagerBase::OnLayerReceived` | `:3334-3343` |
+| `base.cc` | `KVCacheManagerBase::OnBlockShardsReceived` | `:3312-3330` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:443-452` |
+| `bts.cc` | `BeginIncomingPush` | `:242-256` |
+| `bts.cc` | `EndIncomingPush` | `:258-271` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:365-499` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`BeginIncomingPush(delegate_, header.uuid));` .. `FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);`) | `:377-495` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`ShardsFromMask`) | `:414` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`ABSL_RETURN_IF_ERROR(ForEachPayload(`) | `:424-473` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`if (array_complete && !progress.on_layer_received_called)`) | `:846-873` |
+| `bt.cc` | `BlockTransport::AsyncPush` | `:503-552` |
+| `base.h` | `KVCacheManagerBase::num_host_layers` | `:708` |
+| `base.cc` | `*` (`size_t ResolveNumStagingLayers(size_t num_layers,` .. `return requested;`) | `:717-733` |
+| `mgr.h` | `BlockLocation` | `:99` |
+| `mgr.h` | `KVCacheManagerWithTransfer` (`// ids name blocks of this manager's host pool, pushed as they are (no` .. `BlockLocation source = BlockLocation::kDevice);`) | `:187-199` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` (`if (!sessions_` .. `cv_.SignalAll();`) | `:577-593` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CheckHostMemoryTransferSupported` | `:1393-1405` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:470-529` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin();` .. `retired_uuids.push_back(uuid);`) | `:1079-1102` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1224-1349` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`const absl::Time give_up = absl::Now() + grace;` .. `session->ValidateAndBeginPull`) | `:1248-1273` |
 <!-- source-map:end -->
 -/

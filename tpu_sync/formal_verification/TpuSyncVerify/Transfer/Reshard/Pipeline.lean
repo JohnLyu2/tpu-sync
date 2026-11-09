@@ -23,7 +23,7 @@ shared across pool ranks (`pool_order_ranks_` in `ReshardReceiveSession`,
 File aliases used in the source map below:
 * `reshard_send.cc` — `tpu_sync/kv_cache/reshard_send_session.cc`
 * `slots.cc` — `tpu_sync/core/pool_reshard_send_slots.cc`
-* `reshard_recv.h` / `reshard_recv.cc` — `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`
+* `reshard_recv.cc` — `tpu_sync/kv_cache/reshard_receive_session.cc`
 * `bt.cc` — `tpu_sync/transport/block_transport.cc`
 * `bts.cc` — `tpu_sync/transport/block_transport_session.cc`
 * `mgr.cc` — `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`
@@ -94,8 +94,8 @@ guards map to C++ synchronization as follows:
 
 | Event | Scopes | Between them |
 |---|---|---|
-| `armRecv` | 2 `KVCacheManagerWithTransfer::mu_` scopes in `PoolReshardRegisterRecv`: incumbent check and the `pending_pool_reshard_recvs_` claim, then `ReshardReceiveSession::Create` (`AcquireStagingLeases`) outside manager `mu_`, then insertion into `sessions_` (dropping the claim, and `NoteSubPlanRegisteredLocked`) | Stage 1's `for (std::thread& t : armers) t.join();` barrier in `RunSubPlan` completes before Stage 2 dispatches any sender (`send (.d2hIssue p true)`), so no push arrives before `sessions_` holds the receiver (`recv .pushBegin` requires `armed = true`; `BeginIncomingPush` fails `GetSession` otherwise) |
-| `landStream p` | unlocked socket read into staging (`if (expected_size > 0)`, `ReadVExact`) in `BlockTransportServerPushSession::StartStream` while holding a `pushBegin` op (`pushes > 0`; the chunk addresses come from `GetBlockChunks` → `ResolveStagingSlot`, `Receive.lean` §"Bounded host layer staging"), followed by 1 `BlockTransportServerPushSession::mu_` scope in `CompleteIncomingPush` (`if (plan_declared)`; `layer_progress_` is per push session, i.e. per uuid, keyed by pool) | the `pushBegin` op keeps `in_flight_ > 0` on the receive session so `dstStaging` cannot be released (`reseatDstStaging` is disabled) during the read; when `plan_pushes` reaches `expected_chunks`, the same `mu_` scope latches `trigger_completion = true` before `delegate_->OnPoolReceived(l, uuid_)` (`recv (.onPoolReceived p)`) and `EndIncomingPush` (`pushEnd`) run |
+| `armRecv` | 2 `KVCacheManagerWithTransfer::mu_` scopes in `PoolReshardRegisterRecv`: incumbent check and the `pending_pool_reshard_recvs_` claim, then `CreateReshardReceiveSession` (`AcquireStagingLeases`) outside manager `mu_`, then insertion into `sessions_` as a `SessionEntry` with `SessionRole::kPoolReshardReceive` (dropping the claim, and `NoteSubPlanRegisteredLocked`) | Stage 1's `for (std::thread& t : armers) t.join();` barrier in `RunSubPlan` completes before Stage 2 dispatches any sender (`send (.d2hIssue p true)`), so no push arrives before `sessions_` holds the receiver (`recv .pushBegin` requires `armed = true`; `BeginIncomingPush` fails `GetSession` otherwise) |
+| `landStream p` | unlocked socket read into staging (`if (expected_size > 0)`, `ReadVExact`) in `BlockTransportServerPushSession::StartStream` while holding a `pushBegin` op (`pushes > 0`; the chunk addresses come from `GetBlockChunks` → `ResolveStagingSlot`, `Receive.lean` §"Bounded host layer staging"), followed by 1 `BlockTransportServerPushSession::mu_` scope in `CompleteIncomingPush` (`if (plan_declared)`; `layer_progress_` is per push session, i.e. per uuid, keyed by pool) | the `pushBegin` op keeps `in_flight_ > 0` on the receive session so `dstStaging` cannot be released (`reseatDstStaging` is disabled) during the read; when `plan_pushes` reaches `expected_chunks`, the same `mu_` scope latches `trigger_completion = true` before `session->OnDataReceived(l, {}, {})` on the session whose op the stream holds — `ReshardReceiveSession::OnDataReceived`, which forwards a pool completion to `OnPoolReceived(pool_idx)` (`recv (.onPoolReceived p)`) — and `EndIncomingPush` (`pushEnd`) run |
 | `reclaim`, `reseatSrcStaging`, `reseatDstStaging` | 0 (caller engine or `KVCacheManagerBase::staging_mu_`, outside session `mu_`) | enabled only after `send.published ≠ none` or `hasStaging = false`, which `Send.lean` and `Receive.lean` establish under their session locks |
 
 ## Source map
@@ -105,34 +105,34 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `reshard_send.cc` | `ReshardSendSession::Start` | `:243-280` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` | `:282-396` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:398-501` |
-| `reshard_send.cc` | `ReshardSendSession::EndOp` | `:559-587` |
-| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:596-603` |
+| `reshard_send.cc` | `ReshardSendSession::Start` | `:401-438` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` | `:440-554` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:556-659` |
+| `reshard_send.cc` | `ReshardSendSession::EndOp` | `:716-744` |
+| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:753-760` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `reshard_recv.h` | `ReshardReceiveSession` (`absl::flat_hash_map<size_t, int> pool_order_ranks_`) | `:215` |
-| `reshard_recv.cc` | `ReshardReceiveSession::Create` | `:353-387` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:415-454` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:456-461` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:553-564` |
-| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:566-595` |
-| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:612-623` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:625-689` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:691-727` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:466-475` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:446-450` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:526-695` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:573-685` |
-| `bts.cc` | `BeginIncomingPush` | `:286-300` |
-| `bts.cc` | `EndIncomingPush` | `:302-315` |
-| `base.cc` | `KVCacheManagerBase::OnPoolReceived` | `:3022-3032` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:280-287` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:436-511` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:683-724` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:726-774` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin(); it != sessions_.end();)` .. `SweepSubPlanChainsLocked(now);`) | `:999-1045` |
-| `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:641-648` |
+| `reshard_recv.cc` | `ReshardReceiveSession` (`absl::flat_hash_map<size_t, int> pool_order_ranks_`) | `:213` |
+| `reshard_recv.cc` | `ReshardReceiveSession::OnDataReceived` | `:127-134` |
+| `reshard_recv.cc` | `CreateReshardReceiveSession` | `:519-553` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:581-620` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:622-627` |
+| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:719-730` |
+| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:732-761` |
+| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:778-789` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:791-855` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:857-893` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:443-452` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:467-471` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:766-876` |
+| `bts.cc` | `BeginIncomingPush` | `:242-256` |
+| `bts.cc` | `EndIncomingPush` | `:258-271` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:470-529` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:732-774` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:776-825` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin(); it != sessions_.end();)` .. `SweepSubPlanChainsLocked(now);`) | `:1079-1105` |
+| `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:638-647` |
 | `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:741-877` |
 | `utils.h` | `ValidateCommonPoolReshardPlan` (`if (plan.transfer_pool_indices().empty())` .. `if (group.expected_pushes() <= 0)`) | `:367-377` |
 <!-- source-map:end -->

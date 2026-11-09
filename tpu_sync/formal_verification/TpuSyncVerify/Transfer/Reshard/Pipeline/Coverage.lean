@@ -210,13 +210,13 @@ along the traces, three outside the one-pool universe). They partition as:
 * **transport** (1): `landStream` — `CompleteIncomingPush` counting a stream
   against `expected_pushes`; the block-transport unit tests drive that
   accounting without a reshard session.
-* **covered at session level** (11: 7 `Send`, 4 `Recv`): the session branch
+* **covered at session level** (19: 7 `Send`, 12 `Recv`): the session branch
   inside is reached by a session unit test (the push callbacks, `cancel`, a
   failed `Start`, a failed pipeline step, `pushBegin`, a failed push lease,
-  `publish`); the pipeline adds only the memory effect, which those tests
-  cannot observe.
-* **in the session gap tables** (44: 18 `Send`, 26 `Recv`): `Send.gaps` /
-  `Recv.gaps`, classified there (`test`, `futureStub`, `window`).
+  `publish`, and the receiver's pool completion and H2D callbacks); the
+  pipeline adds only the memory effect, which those tests cannot observe.
+* **in the session gap tables** (36: 18 `Send`, 18 `Recv`): `Send.gaps` /
+  `Recv.gaps`, classified there (`test`, `copyError` / `heldUpload`, `window`).
 
 Nothing falls between the tables (`unaccounted = 0`).
 
@@ -230,8 +230,8 @@ reaches `clobbersKv = true` in 17 steps from the same state
 
 /-- One search, every check: exhausted; 60 branches; none paired; 17 reached by
 `modelOnly` within the universe; every move is `kvRight`; no KV clobbered; the
-gaps partition into 3 environment, 1 coordinator, 1 transport, 11
-session-covered, 44 session-gap, none unaccounted. -/
+gaps partition into 3 environment, 1 coordinator, 1 transport, 19
+session-covered, 36 session-gap, none unaccounted. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
@@ -242,7 +242,7 @@ def coverageChecks : Bool :=
     univ.all (fun b => (movedOf b.1).all (· = .kvRight)) ∧
     univ.all (fun b => !clobbersOf b.1) ∧
     count .env = 3 ∧ count .coordinator = 1 ∧ count .transport = 1 ∧
-    count .sessionCovered = 11 ∧ count .sessionGap = 44 ∧ count .unaccounted = 0 ∧
+    count .sessionCovered = 19 ∧ count .sessionGap = 36 ∧ count .unaccounted = 0 ∧
     modelOnly.all (fun (_, s, tr) => ((⟨s, step⟩ : System Pipeline Ev).run tr).isSome)
 
 #guard coverageChecks

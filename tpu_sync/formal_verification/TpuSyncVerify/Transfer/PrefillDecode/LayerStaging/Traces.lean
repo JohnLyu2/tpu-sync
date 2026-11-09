@@ -96,7 +96,7 @@ theorem trace_recv_cycles_host_layer_buffers :
       (s.recvMgr.numFree, s.pipe.recv.life.hasStaging, s.pipe.recv.published, s.decodeHbmB)) =
       some (2, false, some true, [.kv 0, .kv 1, .kv 2, .kv 3]) := by decide
 
-/-- `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 1 (`uuid = 201`). -/
+/-- `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 1 (`uuid = 201`). -/
 def traceRecvFailH2dWaiterEvs : List Ev :=
   streamProducer 3 ++ [.recvPullReply true] ++ recvIssueH2d 0 ++ recvIssueH2d 1 ++
   [.recvPushBegin, .recvAcquireBegin 2, .h2dReady 0, .h2dDone 0 false, .recvAcquireWait 2 false, .recvPushEnd] ++
@@ -113,12 +113,14 @@ theorem trace_recv_fail_h2d_with_waiter :
       (s.recvMgr.numFree, s.pipe.recv.life.hasStaging, s.pipe.recv.published)) =
       some (2, false, some false) := by decide
 
-/-- `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 2 (`uuid = 202`).
+/-- `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 2 (`uuid = 202`).
 The test drives the push lease directly: `GetSession(202)` + `TryBeginOp()`
 (`recvPushBegin`), `GetBlockChunks` (the `recvAcquire*` steps), `FailRecv`
 (`recvCancel`), then `EndOp()` (`recvPushEnd`), after which the session is
-`Done()` with the injected `kUnavailable` status and every host layer buffer
-is back (`manager2.num_free() == kNumStagingLayers`). -/
+`Done()` with the injected `kUnavailable` status and its staging block is back
+in the pool (`consumer.free_slots() == kSlots`); the model additionally checks
+that every host layer buffer is back (`recvMgr.numFree = numRecvSlots`), which
+`ReleaseAll()` in `ReleaseStagingLocked` guarantees. -/
 def traceRecvFailPushAbortEvs : List Ev :=
   [.beginPull, .recvPullReply true, .recvPushBegin] ++ recvAcquireOk 0 ++ [.recvCancel, .recvPushEnd, .recvPublish]
 
@@ -130,7 +132,7 @@ theorem trace_recv_fail_push_abort_after_chunk :
       (s.recvMgr.numFree, s.recvMgr.leases, s.pipe.recv.life.hasStaging, s.pipe.recv.published)) =
       some (2, [], false, some false) := by decide
 
-/-- `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 3 (`uuid = 203`). -/
+/-- `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 3 (`uuid = 203`). -/
 def traceRecvFailTimeoutEvs : List Ev :=
   streamProducer 3 ++ [.recvPullReply true] ++ recvIssueH2d 0 ++ recvIssueH2d 1 ++
   [.recvPushBegin, .recvAcquireBegin 2, .recvAcquireWait 2 true, .recvPushEnd] ++
@@ -145,7 +147,7 @@ theorem trace_recv_fail_staging_timeout :
       (s.recvMgr.numFree, s.pipe.recv.life.hasStaging, s.pipe.recv.published)) =
       some (2, false, some false) := by decide
 
-/-- `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 1 (`uuid = 401`). -/
+/-- `SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 1 (`uuid = 401`). -/
 def traceSendFailD2hWaiterEvs : List Ev :=
   [.beginPull, .sendStart] ++ sendIssueD2h ++ sendIssueD2h ++
   [.sendAcquireBegin, .d2hReady 0, .sendD2hEnd, .sendWake false,
@@ -162,7 +164,7 @@ theorem trace_send_fail_d2h_with_waiter :
       (s.sendMgr.numFree, s.pipe.send.life.hasStaging, s.pipe.send.published)) =
       some (2, false, some false) := by decide
 
-/-- `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 2 (`uuid = 402`). -/
+/-- `SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 2 (`uuid = 402`). -/
 def traceSendFailH2hWaiterEvs : List Ev :=
   [.beginPull, .sendStart] ++ sendIssueD2h ++ sendIssueD2h ++ [.sendAcquireBegin] ++
   sendFinishD2hStartH2h 0 ++ sendFinishD2hStartH2h 1 ++
@@ -178,7 +180,7 @@ theorem trace_send_fail_h2h_with_waiter :
       (s.sendMgr.numFree, s.pipe.send.life.hasStaging, s.pipe.send.published)) =
       some (2, false, some false) := by decide
 
-/-- `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 3 (`uuid = 403`). -/
+/-- `SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 3 (`uuid = 403`). -/
 def traceSendFailTimeoutEvs : List Ev :=
   [.beginPull, .sendStart] ++ sendIssueD2h ++ sendIssueD2h ++
   [.sendAcquireBegin, .sendAcquireDone true, .d2hReady 0, .sendD2hEnd, .sendWake true,
@@ -192,7 +194,7 @@ theorem trace_send_fail_staging_timeout :
       (s.sendMgr.numFree, s.pipe.send.life.hasStaging, s.pipe.send.published)) =
       some (2, false, some false) := by decide
 
-/-- `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` subcase 4 (`uuid = 404`). -/
+/-- `SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 4 (`uuid = 404`). -/
 def traceSendFailCancelWaiterEvs : List Ev :=
   [.beginPull, .sendStart] ++ sendIssueD2h ++ sendIssueD2h ++
   [.sendAcquireBegin, .sendCancel, .sendAcquireDone false, .d2hReady 0, .sendD2hEnd, .sendWake true,
@@ -375,13 +377,13 @@ theorem mutant_missing_release_all_leaks_slot :
 def paired : List (String × BoundedPipeline × List Ev) :=
   [("SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers", init 4 2 2, traceSendCyclesEvs),
    ("RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers", init 4 2 2, traceRecvCyclesEvs),
-   ("RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes (h2d_fail_with_waiter)", init 3 2 2, traceRecvFailH2dWaiterEvs),
-   ("RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes (push_abort_after_chunk)", init 3 2 2, traceRecvFailPushAbortEvs),
-   ("RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes (staging_timeout)", init 3 2 2, traceRecvFailTimeoutEvs),
-   ("SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes (d2h_fail_with_waiter)", init 3 2 2, traceSendFailD2hWaiterEvs),
-   ("SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes (h2h_fail_with_waiter)", init 3 2 2, traceSendFailH2hWaiterEvs),
-   ("SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes (staging_timeout)", init 3 2 2, traceSendFailTimeoutEvs),
-   ("SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes (cancel_with_waiter)", init 3 2 2, traceSendFailCancelWaiterEvs)]
+   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (h2d_fail_with_waiter)", init 3 2 2, traceRecvFailH2dWaiterEvs),
+   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (push_abort_after_chunk)", init 3 2 2, traceRecvFailPushAbortEvs),
+   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (staging_timeout)", init 3 2 2, traceRecvFailTimeoutEvs),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (d2h_fail_with_waiter)", init 3 2 2, traceSendFailD2hWaiterEvs),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (h2h_fail_with_waiter)", init 3 2 2, traceSendFailH2hWaiterEvs),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (staging_timeout)", init 3 2 2, traceSendFailTimeoutEvs),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (cancel_with_waiter)", init 3 2 2, traceSendFailCancelWaiterEvs)]
 
 def modelOnly : List (String × BoundedPipeline × List Ev) :=
   [("sendCancel in post-Acquire lock gap (leasedBeforeD2h → sendD2hBegin)", init 1 1 1, traceSendPostAcquireCancelEvs),

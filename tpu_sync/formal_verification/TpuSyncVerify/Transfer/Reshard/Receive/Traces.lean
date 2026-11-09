@@ -106,11 +106,11 @@ theorem trace_cancel_between_batch_queue_and_issue :
 `ReshardReceiveSessionTest.RejectsBlockIdsOutsideDeclaredPool`, and
 `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints`):
 - Rejects `enableHostStaging = false` (`!base->has_device_buffers()` in
-  `ReshardReceiveSession::Create`,
+  `CreateReshardReceiveSession`,
   `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints`),
 - Builds the receiver's plan with `isSender = false`
   (`TransferPlan::Create(plan, /*is_sender=*/false, base->num_pools(),` in
-  `ReshardReceiveSession::Create`) and rejects empty `ranks`
+  `CreateReshardReceiveSession`) and rejects empty `ranks`
   (`if (plan.transfer_pool_indices().empty())` in
   `ValidateCommonPoolReshardPlan`),
 - Rejects out-of-range, duplicate, or dtype-mismatched pool indices
@@ -171,8 +171,9 @@ def tr_parity_2pool : List Ev :=
    (`ranks = [0, 0]`, `ReshardReceiveSessionTest.HasNoTagPolicy` /
    `ReshardReceiveSessionTest.GroupScopesDestinationBlocks`) — when run through
    the session, execute H2D, release staging leases (the plan going with
-   `done_`), and publish `done_recving`. The tests themselves only call
-   `ValidatePlan`; no upstream test runs these plans (`Coverage.lean`). -/
+   `done_`), and publish `done_recving`. The tests themselves only create the
+   session (`CreateStatus` → `CreateReshardReceiveSession` → `ValidatePlan`);
+   no upstream test runs these exact plans (`Coverage.lean`). -/
 theorem trace_reshard_receive_session_test_parity :
     validPlanPoolsAndBlocks false 2 16 [0] true [1] = false ∧
     validPlan true [0] = false ∧
@@ -202,9 +203,12 @@ def tr_duration_fail : List Ev :=
 duration is recorded when the final pool's H2D completes OK
 (`FinishPoolReshardRecvRecordsDurationMetric`), and is not recorded when a
 pool's H2D fails (`FinishPoolReshardRecvDoesNotRecordMetricOnFailure`). The
-tests call `FinishPoolH2d` through `PoolReshardRecvTestPeer` on a pool that was
-never received or launched (`notReplayable` in `Coverage.lean`); this trace
-runs the upload path that call stands for. -/
+tests drive the upload path through `TestManager::FinishPoolReshardRecvPool`:
+`ResolveStagingSlot` leases the pool's buffer, `OnDataReceived(pool_idx, {}, {})`
+records and launches it, and `FakeH2dBase::H2dPoolBlocks` returns a future
+already resolved with the armed status (`ArmPoolUpload`), so `FinishPoolH2d`
+runs inline with `OkStatus()` or the error (`paired` in `Coverage.lean`; the
+`publish` step is the poll of the tests that call `CompleteReadRaw`). -/
 theorem trace_duration_metric_on_success_and_failure :
     let s := sys [0]
     ((s.run tr_duration_ok).map

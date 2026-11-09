@@ -120,14 +120,12 @@ File aliases used in the source map below:
   ## Branch coverage
 
   `Registry/Coverage.lean`: 25 branches of `RegGen.step` over `checkEvents`
-  (every leaf live); the 35 `ReshardStackTest` cases (36 traces) that drive the
+  (every leaf live); the 42 `ReshardStackTest` cases (48 traces) that drive the
   registry through `ReshardService`'s controller commands or
-  `BuildPoolReshardPlan` / `RunSubPlan`'s claim and abandon reach 11, and assert
-  three of the seven `Refusal` constructors (remaining suites and pre-lock
-  input-validation rejections in `reshard_service_test.cc` are listed in
-  `notReplayable`). The 14 gaps (idempotent re-registration, `Complete` no-ops,
-  an empty-blocks registration voting before its claim, a repeated cancel, every
-  `Release`) need only controller commands no test sends.
+  `BuildPoolReshardPlan` / `RunSubPlan`'s claim and abandon reach all 25, and
+  assert every one of the seven `Refusal` constructors (remaining suites and
+  pre-lock input-validation rejections in `reshard_service_test.cc` are listed
+  in `notReplayable`).
 
   ## Source map
 
@@ -167,45 +165,52 @@ File aliases used in the source map below:
   | `coord.cc` | `ReshardCoordinator::RunSubPlan` | `:678-932` |
   | `reshard_service.cc` | `ReshardService::HandleControllerCommand` | `:167-353` |
   | `reshard_client.cc` | `ReshardClient::BuildReleaseRequestBlocks` | `:179-189` |
-  | `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:760-834` |
-  | `reshard_service_test.cc` | `ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries` | `:836-877` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ClipDropsTrimsAndRebasesGlobalSpans` | `:879-935` |
-  | `reshard_service_test.cc` | `ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow` | `:1057-1117` |
-  | `reshard_service_test.cc` | `ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries` | `:1119-1204` |
-  | `reshard_service_test.cc` | `ReshardStackTest.WindowComposesWithPrefixClip` | `:1206-1243` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmRetriesWhileReceiverStagingIsBusy` | `:1245-1270` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ChainedRequestStaysInProgressUntilTheChainEnds` | `:1272-1294` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmFailureMarksTheTransferFailed` | `:1296-1318` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ClipValidationFailsClosed` | `:1320-1353` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ClipRejectsPageIndexedDeclarations` | `:1355-1367` |
-  | `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1369-1379` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1381-1397` |
-  | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:1399-1427` |
-  | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:1429-1493` |
-  | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1495-1518` |
-  | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1520-1528` |
-  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1531-1601` |
-  | `reshard_service_test.cc` | `ReshardStackTest.SubsetSourceManifestsPairPoolsByTag` | `:1603-1742` |
-  | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1744-1769` |
-  | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1771-1798` |
-  | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1800-1827` |
-  | `reshard_service_test.cc` | `ReshardStackTest.SpansForAnUnregisteredTagAreRefusedAtRegistration` | `:1829-1854` |
-  | `reshard_service_test.cc` | `ReshardStackTest.SourceTagsAbsentOnTheDestinationAreIgnored` | `:1856-1937` |
-  | `reshard_service_test.cc` | `ReshardStackTest.MismatchedDestinationsFailClosed` | `:1939-1977` |
-  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:1982-2047` |
-  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansStayOneEntryPerDestination` | `:2049-2104` |
-  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansClipByWholePages` | `:2106-2137` |
-  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansMustStayInsideOnePage` | `:2139-2149` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ShardedSpanOrdinalOutOfRangeFailsClosed` | `:2151-2166` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2168-2181` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ShardedNonUniformExtentsFailClosed` | `:2183-2197` |
-  | `reshard_service_test.cc` | `ReshardStackTest.NegativeOrdinalRejectedAtRegistration` | `:2199-2205` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2210-2242` |
-  | `reshard_service_test.cc` | `ReshardStackTest.LegacyCommandsFailClosed` | `:2244-2255` |
-  | `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2284-2304` |
-  | `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2306-2326` |
-  | `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2328-2345` |
-  | `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2347-2362` |
+  | `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:801-875` |
+  | `reshard_service_test.cc` | `ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries` | `:877-918` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipDropsTrimsAndRebasesGlobalSpans` | `:920-976` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow` | `:1098-1158` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries` | `:1160-1245` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowComposesWithPrefixClip` | `:1247-1284` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmRetriesWhileReceiverStagingIsBusy` | `:1286-1311` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedRequestStaysInProgressUntilTheChainEnds` | `:1313-1335` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmFailureMarksTheTransferFailed` | `:1337-1359` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipValidationFailsClosed` | `:1361-1394` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipRejectsPageIndexedDeclarations` | `:1396-1408` |
+  | `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1410-1420` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1422-1438` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:1440-1468` |
+  | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:1470-1534` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1536-1559` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1561-1569` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1572-1642` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SubsetSourceManifestsPairPoolsByTag` | `:1644-1783` |
+  | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1785-1810` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1812-1839` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1841-1868` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SpansForAnUnregisteredTagAreRefusedAtRegistration` | `:1870-1895` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SourceTagsAbsentOnTheDestinationAreIgnored` | `:1897-1978` |
+  | `reshard_service_test.cc` | `ReshardStackTest.MismatchedDestinationsFailClosed` | `:1980-2018` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:2023-2088` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansStayOneEntryPerDestination` | `:2090-2145` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansClipByWholePages` | `:2147-2178` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansMustStayInsideOnePage` | `:2180-2190` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedSpanOrdinalOutOfRangeFailsClosed` | `:2192-2207` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2209-2222` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedNonUniformExtentsFailClosed` | `:2224-2238` |
+  | `reshard_service_test.cc` | `ReshardStackTest.NegativeOrdinalRejectedAtRegistration` | `:2240-2246` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2251-2283` |
+  | `reshard_service_test.cc` | `ReshardStackTest.LegacyCommandsFailClosed` | `:2285-2296` |
+  | `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2325-2345` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2347-2367` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2369-2386` |
+  | `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2388-2403` |
+  | `reshard_service_test.cc` | `ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail` | `:2405-2436` |
+  | `reshard_service_test.cc` | `ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim` | `:2438-2467` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CompletionNoOpsAndPreClaimGuard` | `:2469-2531` |
+  | `reshard_service_test.cc` | `ReshardStackTest.EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim` | `:2533-2560` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ForcedReleaseClearsEveryLifecycleState` | `:2562-2625` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders` | `:2627-2665` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm` | `:2667-2703` |
   <!-- source-map:end -->
 -/
 

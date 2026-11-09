@@ -153,6 +153,9 @@ def tr_arm_failure_2x1 : List Ev :=
 def tr_plan_refused_1x1 : List Ev := [.registerProducer 0, .startPlan false]
 def tr_plan_refused_1x2 : List Ev := [.registerProducer 0, .startPlan false]
 def tr_plan_refused_2x2 : List Ev := [.registerProducer 0, .registerProducer 1, .startPlan false]
+def tr_send_failure_2x1 : List Ev :=
+  [.registerProducer 0, .registerProducer 1, .startPlan true, .armDstResult 10 true,
+   .finishArmBarrier, .sendSrcResult 0 false, .sendSrcResult 1 true, .finishSendBarrier]
 
 /-- `(upstream test, initial state, trace)`. -/
 def paired : List (String × CoordState × List Ev) :=
@@ -209,7 +212,25 @@ def paired : List (String × CoordState × List Ev) :=
    ("ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank",
      CoordState.init [0, 1] [10] 101, tr_full_flow_2x1),
    ("ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes",
-     CoordState.init [0, 1] [10] 101, tr_full_flow_2x1)]
+     CoordState.init [0, 1] [10] 101, tr_full_flow_2x1),
+   ("ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail",
+     CoordState.init [0] [10] 101, tr_full_flow_1x1),
+   ("ReshardStackTest.CompletionNoOpsAndPreClaimGuard", CoordState.init [0] [10] 101,
+     tr_full_flow_1x1),
+   ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState", CoordState.init [0] [10] 101,
+     tr_full_flow_1x1),
+   -- Destination 11 (`10.0.0.2:9601`) refuses while 10 arms; the arms are joined
+   -- before the verdict and their order is unspecified (the other order reaches
+   -- `armFail` before any destination is armed). The retry, after the abandoned
+   -- claim, coordinates 2×2 end-to-end.
+   ("ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders",
+     CoordState.init [0, 1] [10, 11] 101, partialArmFailureTrace),
+   ("ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders",
+     CoordState.init [0, 1] [10, 11] 101, coordinatorHappyTrace),
+   -- Sender 0 (`10.0.0.1:9100`) fails after the one arm; both dispatches are
+   -- joined before the first failure is reported.
+   ("ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm",
+     CoordState.init [0, 1] [10] 101, tr_send_failure_2x1)]
 
 /-- `(upstream test, initial state, trace, refused event)`:
 `ReshardStackTest.MissingRegistrationKeepsContractString` plans with no producer
@@ -255,15 +276,19 @@ def notReplayable : List (String × String) :=
       "registration-time input validation only; no Coordinate call"),
    ("ReshardStackTest.LegacyCommandsFailClosed",
       "controller-side retired inter-controller COMMAND_REGISTER_TRANSFER_SCHEDULE rejection; no Coordinate call"),
+   ("ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim",
+      "RequestBlockRegistry::LookupAndClaim / AbandonClaim called directly; no Coordinate call (Registry/Coverage.lean)"),
+   ("ReshardStackTest.EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim",
+      "registry controller commands and a direct LookupAndClaim; no Coordinate call (Registry/Coverage.lean)"),
    ("ReshardControlPipeTest.* (3 tests)", "control-pipe transport round-trip only"),
    ("PlanSubTransfersTest.* (5 tests)", "pure PlanSubTransfers window-splitting unit tests"),
    ("SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct", "pure SubPlanUuid helper unit test")]
 
-/-- The traces no upstream test drives: the two failure-cleanup counterexamples
-of `Traces.lean`. -/
+/-- The trace no upstream test drives: the 2×2 sender-dispatch failure of
+`Traces.lean` (its 2×1 form is
+`ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm`). -/
 def modelOnly : List (String × CoordState × List Ev) :=
-  [("partialArmFailureTrace", CoordState.init [0, 1] [10, 11] 101, partialArmFailureTrace),
-   ("dispatchFailureTrace", CoordState.init [0, 1] [10, 11] 101, dispatchFailureTrace)]
+  [("dispatchFailureTrace", CoordState.init [0, 1] [10, 11] 101, dispatchFailureTrace)]
 
 -- Every paired trace runs to its end; the refusal is refused.
 #guard paired.all fun (_, s, tr) => ((CoordState.sys s.srcUnits s.dstUnits s.claimOwner).run tr).isSome
@@ -274,53 +299,38 @@ def modelOnly : List (String × CoordState × List Ev) :=
 /-! ## Result
 
 The four searches exhaust their state spaces: **14 branches**, every leaf of
-`Leaf` reachable. The 21 tests in `paired` (24 traces) reach **10 of 14**; the
-two `modelOnly` counterexample traces reach the other four. The four the tests
-miss, all schedules `ReshardStackTest`'s fake transport can drive with
-`transport_.FailFor` (plus `HoldAfterCalls` so the first destination arms before
-the second fails):
-
-| Branch | Schedule | What it would take |
-|---|---|---|
-| `armFail` with another destination already armed | 2×2: `armDstResult 10 true, armDstResult 11 false` | `FailFor` on the second destination's control address in a two-destination `Coordinate` |
-| `armBarrierAbort` leaving a destination armed | the same, then `finishArmBarrier` | the same test, asserting the surviving receiver (`partialArmFailureTrace`: the armed receiver holds its staging lease until its deadline) |
-| `sendFail` | `…, finishArmBarrier, sendSrcResult 0 false` | `FailFor` on a source rank's control address after the arms succeeded |
-| `sendBarrierAbort` | the same, then `finishSendBarrier` | the same test, asserting the registry still reads claimed and `CancelIfUnclaimed` returns `false` (`dispatchFailureTrace`) |
-
-Every `ReshardStackTest` failure injection today is on a destination (an arm
-refusal) or in the planner; none fails a sender dispatch. -/
+`Leaf` reachable. The 26 tests in `paired` (30 traces) reach **all 14**: the
+two failure-cleanup counterexamples of `Traces.lean` are driven by
+`ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders`
+(`transport_.FailFor` on the second destination's control address: `armFail`
+beside an armed destination and `armBarrierAbort` leaving it armed) and
+`ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm` (a
+failed sender reply after the arm: `sendFail` and `sendBarrierAbort`, the
+registry still claimed). -/
 
 def coveredByPaired : List Branch :=
   Coverage.coveredBy instr (paired.map fun (_, s, tr) => (s, tr))
 def coveredByAll : List Branch :=
   Coverage.coveredBy instr ((paired ++ modelOnly).map fun (_, s, tr) => (s, tr))
 
-def br (l : Leaf) (b a : CoordPhase) (claimHeld armedLeft : Bool) : Branch :=
-  (l, ⟨b, a, claimHeld, armedLeft⟩)
-
-def gaps : List Branch :=
-  [br .armFail .arming .arming true true,
-   br .armBarrierAbort .arming .aborted false true,
-   br .sendFail .dispatching .dispatching true true,
-   br .sendBarrierAbort .dispatching .aborted true true]
+/-- Branches of the universe no paired trace reaches: none. -/
+def gaps : List Branch := []
 
 def allLeaves : List Leaf :=
   [.registerProducer, .startPlanOk, .startPlanFailed, .armOk, .armFail, .armBarrierDispatch,
    .armBarrierAbort, .sendOk, .sendOkCompletes, .sendFail, .sendBarrierSucceeds, .sendBarrierAbort]
 
-/-- One search, every check: the state spaces are exhausted; 14 branches; 10
-reached by paired traces, all 14 with `modelOnly`; the uncovered set is the
-table; every leaf fires; every gap has a witness schedule. -/
+/-- One search, every check: the state spaces are exhausted; 14 branches, all
+reached by paired traces; every leaf fires. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
   | some univ =>
     let uncovered := univ.filter (fun b => !coveredByPaired.contains b)
-    univ.length = 14 ∧ coveredByPaired.length = 10 ∧ coveredByAll.length = 14 ∧
+    univ.length = 14 ∧ coveredByPaired.length = 14 ∧ coveredByAll.length = 14 ∧
     coveredByPaired.all univ.contains ∧
     sameSet uncovered gaps ∧
     allLeaves.all (fun l => univ.any (·.1 = l)) ∧
-    gaps.all (fun b => inits.any fun (i, evs) => (Coverage.witness instr i evs b).isSome) ∧
     modelOnly.all (fun (_, s, tr) => ((CoordState.sys s.srcUnits s.dstUnits s.claimOwner).run tr).isSome)
 
 #guard coverageChecks

@@ -108,7 +108,7 @@ theorem stepT_step (s : Send) (e : Ev) : (stepT s e).map (·.1) = step s e := by
 capped by `numLayers`), so no pruning is needed. -/
 def instr : Instr Send Ev Leaf Effect := { stepT, effect }
 
-/-- The systems the search runs on (the two 3-layer paired traces take no branch
+/-- The systems the search runs on (the three 3-layer paired traces take no branch
 outside the 0/1/2-layer universe, checked in `coverageChecks`). -/
 def inits : List Send := [init 0, init 1, init 2]
 
@@ -120,12 +120,13 @@ The searches exhaust the zero-, one- and two-layer state spaces: **40
 branches**, and every `Leaf` is in some reachable branch (unlike `Receive`,
 `Send` has no dead arm: `endOp`'s underflow is excluded by `NoUnderflow` but
 is not a leaf; `d2hIssueFail` cannot both start draining and settle in one step
-because `SendNextLayer(0)` is armed before any copy is issued). The 33 upstream
-tests in `paired` (19 distinct traces) reach **29 of 40**; the five `modelOnly`
-traces add 1 more. Twelve further send-lifecycle tests are `notReplayable`. The
-11 the tests miss, each with a schedule reaching it (the shortest,
-`Coverage.witness`, or a drivable one where the shortest is not) and what it
-would take:
+because `SendNextLayer(0)` is armed before any copy is issued). The 40 upstream
+tests in `paired` (23 distinct traces; the host-source tests run on the
+completed-copy prefix `tr_host_source_prefix`) reach **31 of 40**; the five
+`modelOnly` traces add 1 more. Twelve further send-lifecycle tests are
+`notReplayable`. The 9 the tests miss, each with a schedule reaching it (the
+shortest, `Coverage.witness`, or a drivable one where the shortest is not) and
+what it would take:
 
 | Branch | Schedule | Class |
 |---|---|---|
@@ -135,23 +136,27 @@ would take:
 | `wakeFail` (no effect) | 1: `…, d2hIssue true, cancel, d2hReady, wake false` | **test**: an expired send whose copy then fails (`ExpiredSendKeepsItsStagingUntilTheCopyEnds` with `FinishCopy(0, error)`; `wake` runs first inside `promise.Set`, so this row, then `d2hEnd` settles) |
 | `h2hIssueRefused` (no effect) | 1: `…, d2hReady, wake true, cancel, h2hIssue` | **window**: `Finish` between `SendNextLayer`'s `OnReady` scheduling the pool task and the task's lock; `WaitForH2hCalls` returns only after that lock |
 | `h2hIssueRefused` settles | 1: `…, wake true, cancel, d2hEnd, h2hIssue` | **window**: same (`tr_push_fails`) |
-| `sendNextRefused` settles | 2: `…, d2hIssue true, d2hReady, wake true, h2hIssue, h2hDone false, d2hEnd, sendNext` | **window**: the push fails and the copy's `EndOp` finishes inside the pool task between `H2hWriteDirectAsync` and `SendNextLayer(l + 1)` (`DetailsSayAFailedPushFailedInPushWhileCopiesRun` reaches the no-effect row with layer 1's copy still running) |
-| `h2hDoneOk` settles | 2: `…, h2hIssue, sendNext, cancel, d2hReady, wake true, d2hEnd, h2hDone true` | **test**: `DoneGuaranteesAllResourcesReleased…` with `CompleteD2h(1)` before `CompleteH2h(0)`: layer 0's push is the last op to end |
 | `h2hDoneLast` (no effect) | 1: `…, wake true, h2hIssue, cancel, h2hDone true` | **window**: `Finish` and the push completion both before the task tail; `…CancelledMidPush` can reach it by chance (`WaitForH2hCalls` returns before the tail) but cannot force it |
 | `h2hDoneFail` (no effect) | 1: `…, wake true, h2hIssue, cancel, h2hDone false` | **window**: same, with an error |
 | `h2hDoneFail` drains settles errors | 1: `…, h2hIssue, sendNext, d2hEnd, h2hDone false` | **test**: the only push fails (`CompleteH2h(0, error)`; every caller passes success) |
 
-**window** branches (6) need a `Finish` to land inside `StartPush`'s loop
+**window** branches (5) need a `Finish` to land inside `StartPush`'s loop
 iteration or inside the push-pool task, or a copy's `EndOp` to complete
 there; neither harness has a hook at those points. **ordering** branches (2)
 need `StartPush`'s `self->EndOp()` (`d2hEnd`) to precede the `OnReady`
-callback that `promise.Set` (`d2hReady`) runs inline. **test** branches (3) are
+callback that `promise.Set` (`d2hReady`) runs inline. **test** branches (2) are
 schedules `FakeSendBase` / `TestManager` can drive today — the
-expired-then-failed copy, the only push failing on a live send, and the
-`DoneGuarantees…` completions in the other order
+expired-then-failed copy and the only push failing on a live send
 (`FailedD2hDispatchOnFirstLayerSettlesAtOnce` and
 `CancelledSendWhosePushThenFailsKeepsCancelled` are the layer-0 dispatch
-failure and the cancelled-then-failed push). -/
+failure and the cancelled-then-failed push). Two branches a device send only
+reaches through a window are reached by host-source sends, which have no copy
+to wait for: `h2hDoneOk` settles (an OK push completion is the last op of a
+draining send,
+`HostSourceFailedLayerPushFailsTheSendOnceInFlightLayersDrain`, where layer 1's
+push outlives layer 0's failed one) and `sendNextRefused` settles (the pool
+task's tail settles the send after its own push failed synchronously,
+`HostMemoryTransferTest.AFailedPushFailsTheSendAndExpiresTheReceive`). -/
 
 /-- `(leaf, drains, settles, errors)`. -/
 def br (l : Leaf) (drains settles errors : Bool) : Branch := (l, ⟨drains, settles, errors⟩)
@@ -167,8 +172,6 @@ def expectedUncovered : List Branch :=
    br .wakeFail true true true, br .wakeDraining false true false,
    br .wakeFail false false false,
    br .h2hIssueRefused false false false, br .h2hIssueRefused false true false,
-   br .sendNextRefused false true false,
-   br .h2hDoneOk false true false,
    br .h2hDoneLast false false false, br .h2hDoneFail false false false,
    br .h2hDoneFail true true true]
 
@@ -178,8 +181,8 @@ def allLeaves : List Leaf :=
    .h2hIssued, .h2hIssueRefused, .sendNextChained, .sendNextLast, .sendNextRefused, .h2hDoneOk,
    .h2hDoneLast, .h2hDoneFail, .cancel, .publish]
 
-/-- One search, every check: the state spaces are exhausted; 40 branches; 29
-reached by paired traces (all within the 0/1/2-layer universe), 30 with
+/-- One search, every check: the state spaces are exhausted; 40 branches; 31
+reached by paired traces (all within the 0/1/2-layer universe), 32 with
 `modelOnly`; the uncovered set is the table; every leaf fires; every paired
 trace runs to its end; every table row has a witness schedule. -/
 def coverageChecks : Bool :=
@@ -188,7 +191,7 @@ def coverageChecks : Bool :=
   | some univ =>
     let uncoveredPaired := univ.filter (fun b => !coveredByPaired.contains b)
     let uncoveredAll := univ.filter (fun b => !coveredByAll.contains b)
-    univ.length = 40 ∧ coveredByPaired.length = 29 ∧ coveredByAll.length = 30 ∧
+    univ.length = 40 ∧ coveredByPaired.length = 31 ∧ coveredByAll.length = 32 ∧
     coveredByPaired.all univ.contains ∧
     sameSet uncoveredPaired expectedUncovered ∧
     sameSet uncoveredAll (expectedUncovered.filter fun b =>

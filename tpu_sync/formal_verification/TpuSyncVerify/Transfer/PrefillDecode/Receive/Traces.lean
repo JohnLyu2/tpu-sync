@@ -335,8 +335,9 @@ As on the send side: `FinishLocked(status, phase)` latches `failed_phase_` from
 the explicit `kH2dPhase` in the `ExecuteLayerH2d` paths (`FinishLocked(future_or.status(), kH2dPhase)`
 and `self->FinishLocked(status_or.status(), kH2dPhase)`) and otherwise from
 `CurrentPhaseLocked` (`handshake_pending_` → `connect`, `network_completed_` →
-`h2d`, else `receive`); `Details()` reports it (`CompleteReadWithDetails`:
-`transfer_details_[session->req_id()] = session->Details()`). Not state;
+`h2d`, else `receive`; a host destination, outside this model, is never in
+`h2d`); `Details()` reports it (`RetireSettledSessionLocked`:
+`transfer_details_[req_id] = recv->Details()`). Not state;
 `phase` evaluates `CurrentPhaseLocked` on the model (`pullPending` is
 `handshake_pending_`, `networkCompleted` is `network_completed_`). -/
 
@@ -354,9 +355,10 @@ def phase (s : Recv) : Phase :=
 /-- The phase `FinishLocked` latches when `e` fails in `s` while
 `s.life.statusOk = true` (first error wins: `if (!status.ok() && status_.ok())`):
 the H2D dispatch failure and the H2D completion callback pass `kH2dPhase`; the
-pull reply (`self->FinishLocked(pull_status)`) and every external `Finish(error)`
-take the current phase. At `numLayers = 0`, `phase` says `h2d` where C++ says
-`receive` (`network_completed_` is never set there, see `networkCompleted`). -/
+pull reply (`self->FinishLocked(pull_status)`, run only while the receive is
+not draining) and every external `Finish(error)` take the current phase. At
+`numLayers = 0`, `phase` says `h2d` where C++ says `receive`
+(`network_completed_` is never set there, see `networkCompleted`). -/
 def failedPhase (s : Recv) : Ev → Phase
   | .h2dIssue false => .h2d
   | .h2dDone false => .h2d
@@ -559,6 +561,27 @@ theorem trace_details_rejected_pull :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
+/-- The data outruns the control reply, the only copy lands, and the reply then
+fails. -/
+def tr_late_reply_failure_keeps_verdict : List Ev :=
+  [.h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true, .pullReply false, .publish]
+
+/-- A receive that settled before its pull reply keeps its verdict: the last
+callback's `FinishLocked()` drains it with an OK status while the handshake op
+is still open; the failed reply finds `draining_` set, so `on_response` skips
+`FinishLocked(pull_status)` (`if (!pull_status.ok() && !self->draining_)`) and
+only ends the op, which settles the receive; it is published as done. The
+first-error rule of `FinishLocked` is not consulted (contrast
+`trace_accepted_pull_after_deadline`, where the deadline's error came first). -/
+theorem trace_late_reply_failure_keeps_verdict :
+    ((sysLoad 1).run (tr_late_reply_failure_keeps_verdict.take 4)).map
+      (fun s => (s.life.draining, s.life.done, s.life.statusOk, s.pullPending)) =
+      some (true, false, true, true) ∧
+    ((sysLoad 1).run tr_late_reply_failure_keeps_verdict).map
+      (fun s => (s.life.done, s.life.statusOk, s.life.hasStaging, s.published)) =
+      some (true, true, false, some true) := by
+  decide
+
 /-! ## Which traces stand for an upstream test
 
 `paired` lists every trace above whose docstring names the upstream test it
@@ -626,7 +649,9 @@ def paired : List (String × Recv × List Ev) :=
 def modelOnly : List (String × Recv × List Ev) :=
   [("deadline during the copy of a pulled receive", initLoad 1, tr_deadline_during_copy),
    ("poll finishes before the callback", initPush 1, tr_poll_before_callbacks),
-   ("Finish between the two locks of ExecuteLayerH2d", initPush 1, tr_finish_between_locks)]
+   ("Finish between the two locks of ExecuteLayerH2d", initPush 1, tr_finish_between_locks),
+   ("pull reply fails after the data settled the receive", initLoad 1,
+     tr_late_reply_failure_keeps_verdict)]
 
 
 end Recv

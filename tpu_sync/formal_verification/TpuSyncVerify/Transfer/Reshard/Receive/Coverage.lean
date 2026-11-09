@@ -136,10 +136,24 @@ def allBranches : Option (List Branch) :=
 /-! ## Traces
 
 `paired` lists the upstream tests that drive a `ReshardReceiveSession` through
-events of this model, with the trace each one replays. `modelOnly` holds the
-traces in `Traces.lean` that no upstream test drives (the rank wave, the batch
-launch, cancellation between the locks, and the full-pipeline halves of the
-validation and duration traces). -/
+events of this model, with the trace each one replays. Two fixtures make the
+upload path run on CPU: `FakeH2dBase` in `reshard_receive_session_test.cc`
+(every `H2dPoolBlocks` returns a future that is already OK) and `FakeH2dBase`
+in `kv_cache_manager_with_transfer_pool_reshard_test.cc`, whose
+`TestManager::FinishPoolReshardRecvPool` leases the pool's buffer
+(`ResolveStagingSlot`), calls `OnDataReceived(pool_idx, {}, {})` and returns a
+future already resolved with the status armed by `ArmPoolUpload`. A ready
+future runs `future.OnReady` inline, so `h2dReady p` and `h2dDone p _` follow
+`h2dIssue p true` at once. `modelOnly` holds the traces in `Traces.lean` that
+no upstream test drives (the rank wave, the batch launch, cancellation between
+the locks, and the push-framed halves of the validation traces). -/
+
+/-- One pool landed and uploaded OK through `FinishPoolReshardRecvPool`. -/
+def tr_pool_upload_ok : List Ev := tr_duration_ok.take 4
+
+/-- One pool landed, its upload failing through `FinishPoolReshardRecvPool`
+(`ArmPoolUpload(pool_idx, error)`). -/
+def tr_pool_upload_fail : List Ev := tr_duration_fail.take 4
 
 /-- `(upstream test, initial state, trace)`. -/
 def paired : List (String × Recv × List Ev) :=
@@ -149,12 +163,45 @@ def paired : List (String × Recv × List Ev) :=
    -- `Finish(CancelledError)` settles each at once and frees its staging slot.
    ("PoolStagingRecvRegistrationTest.ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease",
       init [0], [.cancel]),
-   -- `session->Finish(Cancelled)` while a second pool waits in
-   -- `AcquireStagingSlot` (the wait's own op is nested and ends before the
-   -- assertion, A1); then a second session whose wait runs into its deadline
-   -- (`FinishLocked(slot.status())` from inside `AcquireStagingSlot`).
+   -- Pool 0 leases the only buffer; `OnDataReceived(0)` uploads it at once
+   -- (`FakeH2dBase`), returning the buffer to pool 1's waiting
+   -- `ResolveStagingSlot` (the wait's own op is nested and ends before the
+   -- assertion, A1); `Finish(Cancelled)` then settles the idle session.
    ("ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease",
-      init [0, 0], [.cancel, .publish])]
+      init [0, 0], [.onPoolReceived 0, .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true, .cancel]),
+   -- The second session's slot wait runs into its deadline
+   -- (`FinishLocked(slot.status())` from inside `AcquireStagingSlot`).
+   ("ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease (timeout_session)",
+      init [0, 0], [.cancel]),
+   -- Pool 1 lands and uploads before pool 0 (both rank 0).
+   ("ReshardReceiveSessionTest.OutOfOrderPoolArrivalResolvesLeasedHostBufferForValidation",
+      init [0, 0], [.onPoolReceived 1, .h2dIssue 1 true, .h2dReady 1, .h2dDone 1 true,
+                    .onPoolReceived 0, .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true]),
+   -- A real two-pool reshard over TCP: each pool's only push stream lands it
+   -- (`CompleteIncomingPush` → `OnDataReceived`) and `RecordingH2dReceiverBase`
+   -- uploads it inline, still inside the stream's op.
+   ("ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks",
+      init [0, 0], [.pushBegin, .onPoolReceived 0, .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true,
+                    .pushEnd true,
+                    .pushBegin, .onPoolReceived 1, .h2dIssue 1 true, .h2dReady 1, .h2dDone 1 true,
+                    .pushEnd true]),
+   ("PoolReshardRecvTest.FinishPoolReshardRecvRecordsDurationMetric",
+      init [0], tr_pool_upload_ok),
+   ("PoolReshardRecvTest.FinishPoolReshardRecvDoesNotRecordMetricOnFailure",
+      init [0], tr_pool_upload_fail),
+   ("SubPlanChainTest.SinglePlanRequestsReportAtOnce", init [0], tr_duration_ok),
+   ("PoolReshardSessionLookupTest.GetSessionResolvesActiveReshardRecvUntilRetired",
+      init [0], tr_duration_ok),
+   -- Each sub-plan of a chain is one such session; the chain's aggregation
+   -- into one terminal per request is `SubPlanChain.lean`.
+   ("SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan (per sub-plan)",
+      init [0], tr_duration_ok),
+   ("SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce (sub-plan 0)",
+      init [0], tr_duration_fail),
+   ("SubPlanChainTest.RetryUnderTheSameReqIdIsTrackedAsANewChain (sub-plan 0)",
+      init [0], tr_duration_fail),
+   ("SubPlanChainTest.StalledChainFailsAfterTheTransferTimeout (sub-plan 0)",
+      init [0], tr_duration_ok)]
 
 def modelOnly : List (String × Recv × List Ev) :=
   [("trace_rank1_arrives_before_rank0", init [0, 1], tr_rank1_arrives_before_rank0),
@@ -162,35 +209,20 @@ def modelOnly : List (String × Recv × List Ev) :=
    ("trace_cancel_between_batch_queue_and_issue", init [0, 0],
       tr_cancel_between_batch_queue_and_issue),
    ("trace_reshard_receive_session_test_parity (1 pool)", init [0], tr_parity_1pool),
-   ("trace_reshard_receive_session_test_parity (2 pools)", init [0, 0], tr_parity_2pool),
-   ("trace_duration_metric_on_success_and_failure (ok)", init [0], tr_duration_ok),
-   ("trace_duration_metric_on_success_and_failure (fail)", init [0], tr_duration_fail)]
+   ("trace_reshard_receive_session_test_parity (2 pools)", init [0, 0], tr_parity_2pool)]
 
 /-- Upstream tests on this C++ whose stimulus is not an event of the model. -/
 def notReplayable : List (String × String) :=
-  [("PoolReshardRecvTest.FinishPoolReshardRecvRecordsDurationMetric",
-      "calls FinishPoolH2d(OK) through PoolReshardRecvTestPeer on a pool that was never received, launched or issued (no op held); exercises h2dDoneLast's FinishPoolH2d body without its EndOp"),
-   ("PoolReshardRecvTest.FinishPoolReshardRecvDoesNotRecordMetricOnFailure",
-      "same, with an error status (h2dDoneFail's FinishPoolH2d body)"),
-   ("SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan", "same synthetic FinishPoolH2d; asserts chain terminal aggregation, outside this model"),
-   ("SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce", "same"),
-   ("SubPlanChainTest.RetryUnderTheSameReqIdIsTrackedAsANewChain", "same"),
-   ("SubPlanChainTest.StalledChainFailsAfterTheTransferTimeout", "same"),
-   ("SubPlanChainTest.SinglePlanRequestsReportAtOnce", "same"),
-   ("PoolStagingRecvRegistrationTest.DuplicatePoolRecvRegistrationKeepsOriginalStagingLease",
+  [("PoolStagingRecvRegistrationTest.DuplicatePoolRecvRegistrationKeepsOriginalStagingLease",
       "registration and staging leases only (PoolStaging.lean); its sessions are cancelled unasserted at manager teardown"),
    ("PoolStagingRecvRegistrationTest.StagingAcquireFailureReleasesUuidClaim",
-      "ReshardReceiveSession::Create rollback (PoolStaging.lean)"),
-   ("PoolReshardSessionLookupTest.GetSessionResolvesActiveReshardRecvUntilRetired",
-      "same synthetic FinishPoolH2d (h2dDoneLast's body), then asserts GetSession before and after RetireSettledSessionLocked"),
-   ("PoolReshardSessionLookupTest.PoolCompletionWithoutReceiverIsNotFound",
-      "KVCacheManagerBase::OnPoolReceived with no session (kNotFound) or a TransferReceiveSession; no ReshardReceiveSession exists"),
+      "CreateReshardReceiveSession rollback (PoolStaging.lean)"),
    ("PoolReshardSessionLookupTest.PoolCompletionOnLegacyArmedReceiverFailsWithoutH2d",
-      "same: the uuid's session is a TransferReceiveSession"),
+      "OnDataReceived on a TransferReceiveSession armed by RegisterActivePlan; no ReshardReceiveSession exists"),
    ("PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints",
-      "Create's has_device_buffers() rejection; no session exists"),
+      "CreateReshardReceiveSession's has_device_buffers() rejection; no session exists"),
    ("ReshardReceiveSessionTest.* (16 ValidatePlan tests)",
-      "ValidatePlan / ValidateReceiverCoverage only (validPlan, validPlanPoolsAndBlocks, Coverage.lean); no session runs")]
+      "CreateReshardReceiveSession's ValidatePlan / ValidateReceiverCoverage only (validPlan, validPlanPoolsAndBlocks, Coverage.lean); no session runs")]
 
 /-! ## Result
 
@@ -207,22 +239,25 @@ reachable branch:
   the last pool completing) calls `Finish` in the same step, so a finalizing
   session is draining and the per-pool re-check releases the op first.
 
-The three upstream tests in `paired` reach **4 of 36**: `pushBegin`,
-`pushEndFail` (drains, settles, errors), `cancel` (drains, settles, errors) and
-`publish`. The `modelOnly` traces add 12 more. Of the 32 the tests miss:
+The fourteen upstream traces in `paired` reach **13 of 36**: `pushBegin`,
+`pushEndOk` (no effect; settles), `pushEndFail` (drains, settles, errors),
+`poolReceivedLaunches`, `h2dIssueOk`, `h2dReady`, `h2dDoneMore` (no effect),
+`h2dDoneLast` (drains, settles; drains with a push open), `h2dDoneFail`
+(drains, settles, errors), `cancel` (drains, settles, errors) and `publish`.
+The `modelOnly` traces add 5 more. Of the 23 the tests miss:
 
 | Class | Count | Branches | What it would take |
 |---|---|---|---|
-| **test** | 21 | `pushEndOk` (no effect; settles), `pushEndFail` (all five other effects: settles; drains+errors; no effect; settles+errors; errors), `cancel` (drains+errors with a push open; no effect; errors after an OK settle), `poolReceivedLaunches`, `poolReceivedGated`, `poolReceivedQuiesced`, `h2dIssueFail` (drains+settles+errors; drains+errors), `h2dIssueOk`, `h2dReady`, `h2dDoneLast` (drains+settles; drains with a push open), `h2dDoneChains`, `h2dDoneMore` (no effect) | `BoundedPoolTestManager` (`DeviceBackedTestBase`) in `kv_cache_manager_with_transfer_pool_reshard_test.cc` with a minimal `RawBuffer` test subclass seated via `RaidenBufferHandle::AcquireFromRaw` (`CopyPoolBlocks` queries `GetOnDeviceSizeInBytes()` before `IssueH2dShard`, so `DeviceBackedTestBase`'s default-constructed `RaidenBufferHandle` with `c_hold == nullptr` cannot execute a non-empty copy): returning an immediately-ready `xla::Future<>` from `CopyRawHostToDevice` makes `OnReady` run synchronously with `OkStatus()` after `ExecuteEligiblePoolH2ds` drops `mu_`, so calling `KVCacheManagerBase::OnPoolReceived` alongside `BeginIncomingPush` / `EndIncomingPush` / `UnregisterActivePlan` drives synchronous uploads, rank waves, and (`host_blocks = 0` or a `RawBuffer` device-size `0`, not a bare `AttachPlaceholderDeviceHoldForTest` whose empty `holds` vector cannot be indexed) synchronous `H2dPoolBlocks` failures on CPU without production changes |
-| **future (stub)** | 9 | `h2dDoneLast` (settles; no effect — both already draining), `h2dDoneMore` (settles), `h2dDoneFail` (all four effects), `h2dDoneFinalizing` (no effect; settles) | a controllable `PjRtCopyFuture` fake (a `RawBuffer` / `PJRT_RawBuffer_Extension` test stub backed by `xla::Promise<>`) so an issued H2D copy can stay pending across `Finish` or resolve `OnReady` with an error on CPU |
+| **test** | 14 | `pushEndFail` (settles; drains+errors; no effect; settles+errors; errors), `cancel` (drains+errors with a push open; no effect; errors after an OK settle), `poolReceivedGated`, `poolReceivedQuiesced`, `h2dDoneChains`, `h2dIssueFail` (drains+settles+errors; drains+errors), `h2dDoneFail` (drains+errors with a push open) | the existing fixtures combined: `TryBeginOp` / `EndIncomingPush` or `Finish` on the session around `TestManager::FinishPoolReshardRecvPool` (a push open while the armed upload fails or the last pool completes, two pushes open when one fails, `OnDataReceived` after `Finish`, `Finish(error)` on a settled session), a two-group plan with `order_rank`s `[0, 1]` landing pool 1 first on `FakeH2dBase` (`poolReceivedGated`, then `h2dDoneChains`), and an `H2dPoolBlocks` override returning an error status (`h2dIssueFail`) |
+| **test (held upload)** | 7 | `h2dDoneLast` (settles; no effect — both already draining), `h2dDoneMore` (settles), `h2dDoneFail` (settles; no effect — already draining and failed), `h2dDoneFinalizing` (no effect; settles) | an `H2dPoolBlocks` fake that parks its promise until the test releases it (as `FakeD2hBase::HoldNextCopy` / `CompleteCopy` do for sends in `reshard_send_session_test.cc`), so an issued upload is still counted when `Finish` or another pool's failure arrives |
 | **window** | 2 | `h2dIssueReleased` (no effect; settles) | `Finish` between `ExecuteEligiblePoolH2ds`'s opening lock and its per-pool `if (done_ \|\| draining_)` re-check on a 1–2 pool plan (a 3-pool `[0, 1, 1]` plan whose first rank-1 pool fails `H2dPoolBlocks` synchronously reaches the no-effect arm deterministically on the second rank-1 pool) |
 
-So no upstream test exercises `OnPoolReceived`, the rank-wave gate, the batch
-launch, an upload or its callback: `BoundedPoolTestManager`'s
-`DeviceBackedTestBase` leaves its `RaidenBufferHandle` default-constructed
-(`c_hold == nullptr`), and existing tests only use it for registration, staging
-leases, and incoming-push failure (`docs/transfer/reshard.md` §"C++ branch
-coverage of the anchored spans"). -/
+So the upstream tests now drive `OnPoolReceived`, an upload and its callback
+with both outcomes, and a pool landing inside a real push stream, but every
+upload they issue resolves before `OnReady` is attached: no test observes a
+copy still running when the session is finished, and none builds a plan with
+two order ranks (`docs/transfer/reshard.md` §"C++ branch coverage of the
+anchored spans"). -/
 
 /-- `(leaf, drains, settles, errors)`. -/
 def br (l : Leaf) (drains settles errors : Bool) : Branch := (l, ⟨drains, settles, errors⟩)
@@ -234,33 +269,29 @@ def coveredByAll : List Branch :=
 
 inductive Gap where
   | test
-  | futureStub
+  | heldUpload
   | window
   deriving Repr, DecidableEq
 
 /-- The table above, as the `#guard`s check it. -/
 def gaps : List (Branch × Gap) :=
-  [(br .pushEndOk false false false, .test), (br .pushEndOk false true false, .test),
-   (br .pushEndFail false true false, .test), (br .pushEndFail true false true, .test),
+  [(br .pushEndFail false true false, .test), (br .pushEndFail true false true, .test),
    (br .pushEndFail false false false, .test),
+   (br .pushEndFail false true true, .test), (br .pushEndFail false false true, .test),
    (br .cancel true false true, .test), (br .cancel false false false, .test),
-   (br .poolReceivedLaunches false false false, .test),
+   (br .cancel false false true, .test),
    (br .poolReceivedGated false false false, .test),
    (br .poolReceivedQuiesced false false false, .test),
-   (br .h2dIssueFail true true true, .test), (br .h2dIssueFail true false true, .test),
-   (br .h2dIssueOk false false false, .test), (br .h2dReady false false false, .test),
-   (br .h2dDoneLast true true false, .test), (br .h2dDoneLast true false false, .test),
    (br .h2dDoneChains false false false, .test),
-   (br .h2dDoneMore false false false, .test),
-   (br .cancel false false true, .test),
-   (br .pushEndFail false true true, .test), (br .pushEndFail false false true, .test),
-   (br .h2dDoneLast false true false, .futureStub),
-   (br .h2dDoneLast false false false, .futureStub),
-   (br .h2dDoneMore false true false, .futureStub),
-   (br .h2dDoneFail true true true, .futureStub), (br .h2dDoneFail false true false, .futureStub),
-   (br .h2dDoneFail true false true, .futureStub), (br .h2dDoneFail false false false, .futureStub),
-   (br .h2dDoneFinalizing false false false, .futureStub),
-   (br .h2dDoneFinalizing false true false, .futureStub),
+   (br .h2dIssueFail true true true, .test), (br .h2dIssueFail true false true, .test),
+   (br .h2dDoneFail true false true, .test),
+   (br .h2dDoneLast false true false, .heldUpload),
+   (br .h2dDoneLast false false false, .heldUpload),
+   (br .h2dDoneMore false true false, .heldUpload),
+   (br .h2dDoneFail false true false, .heldUpload),
+   (br .h2dDoneFail false false false, .heldUpload),
+   (br .h2dDoneFinalizing false false false, .heldUpload),
+   (br .h2dDoneFinalizing false true false, .heldUpload),
    (br .h2dIssueReleased false false false, .window),
    (br .h2dIssueReleased false true false, .window)]
 
@@ -274,20 +305,20 @@ def liveLeaves : List Leaf :=
 
 def countGap (g : Gap) : Nat := (gaps.filter (·.2 = g)).length
 
-/-- One search, every check: the state space is exhausted; 36 branches; 4
-reached by paired traces, 16 with `modelOnly` (all within the universe, every
-trace running to completion); the uncovered set is the table (21 test, 9
-future-stub, 2 window); the unreachable leaves never fire and every other leaf
+/-- One search, every check: the state space is exhausted; 36 branches; 13
+reached by paired traces, 18 with `modelOnly` (all within the universe, every
+trace running to completion); the uncovered set is the table (14 test, 7
+held-upload, 2 window); the unreachable leaves never fire and every other leaf
 does; every gap has a witness schedule. -/
 def coverageChecks : Bool :=
   match allBranches with
   | none => false
   | some univ =>
     let uncoveredPaired := univ.filter (fun b => !coveredByPaired.contains b)
-    univ.length = 36 ∧ coveredByPaired.length = 4 ∧ coveredByAll.length = 16 ∧
+    univ.length = 36 ∧ coveredByPaired.length = 13 ∧ coveredByAll.length = 18 ∧
     coveredByPaired.all univ.contains ∧ coveredByAll.all univ.contains ∧
-    sameSet uncoveredPaired (gaps.map (·.1)) ∧ gaps.length = 32 ∧
-    countGap .test = 21 ∧ countGap .futureStub = 9 ∧ countGap .window = 2 ∧
+    sameSet uncoveredPaired (gaps.map (·.1)) ∧ gaps.length = 23 ∧
+    countGap .test = 14 ∧ countGap .heldUpload = 7 ∧ countGap .window = 2 ∧
     univ.all (fun b => !unreachableLeaves.contains b.1) ∧
     liveLeaves.all (fun l => univ.any (·.1 = l)) ∧
     (paired ++ modelOnly).all (fun (_, s, tr) =>

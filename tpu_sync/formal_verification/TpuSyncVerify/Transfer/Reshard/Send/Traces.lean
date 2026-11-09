@@ -23,7 +23,7 @@ sibling pool is still in flight). Each trace is a named `def` so that
 `Coverage.lean` measures the exact event lists proved here. -/
 
 /-- Sender source-span validation (`ReshardSendSession::ValidatePlan`, invoked
-by `ReshardSendSession::Create`; `StridedSpanFitsBlock` and
+by `CreateReshardSendSession`; `StridedSpanFitsBlock` and
 `StridedSpanFitsRegions` in `utils.h`; `RegionCoversOffset` and
 `RegionsCoverRange` in `pool_layout.cc`):
 - If `tokenStride = 0` or `tokenLive = 0` (flat pool), requires `0 < size` and
@@ -53,7 +53,7 @@ def tr_parity_send : List Ev :=
    `CountPoolReshardSendSlots` is `0` (`ns = []` or `ns = [0]`, because the
    sender's only schedule entry targets a non-transferred pool group),
    `validSchedule` rejects the session up front (`validSchedule [0] = false`,
-   `ReshardSendSession::Create`).
+   `CreateReshardSendSession`).
 2. `ReshardSendSessionTest.RejectsOverflowingSenderSpan`: an overflowing source
    span (modeled with `offset = 64, size = 64` on `liveBytes = 96`,
    `64 + 64 > 96`) is rejected (`false`).
@@ -68,8 +68,9 @@ def tr_parity_send : List Ev :=
    `ReshardSendSessionTest.IgnoresReceiverCoverageGap`: those tests accept a
    1-pool, 1-peer sender schedule (`ns = [1]`, `validSchedule [1] = true`);
    run through the session it completes D2H + push to settle with
-   `published = some true`. The tests themselves only call `ValidatePlan`
-   (`Coverage.lean`). -/
+   `published = some true`. The tests themselves only create the session
+   (`CreateStatus` → `CreateReshardSendSession` → `ValidatePlan`) and never
+   start it (`Coverage.lean`). -/
 theorem trace_reshard_send_session_test_parity :
     validSchedule [] = false ∧
     validSchedule [0] = false ∧
@@ -88,7 +89,7 @@ def tr_multi_pool_multi_peer_send : List Ev :=
 
 /-- Two active pools with peer counts `[2, 1]` (`CountPoolReshardSendSlots = 3`,
 e.g. an attention group pushing to 2 peers and a state group pushing to 1 peer,
-`ReshardSendSession::Create`, `CountPoolReshardSendSlots`): `ExecutePushPipeline`
+`CreateReshardSendSession`, `CountPoolReshardSendSlots`): `ExecutePushPipeline`
 issues both D2H copies and the pipeline thread drops its caller op
 (`execFinish`), each pool's `StartPoolPush` fans out to its group's peers, and
 the session settles only when all 3 `(pool, peer)` pushes have completed. -/
@@ -140,10 +141,13 @@ resolvable) while its pushes drain; the first peer push to finish decrements
 `in_flight_` to `1`; the last peer push's `ReshardSendSession::EndOp` releases
 the staging leases and settles the session, at which point `plan()` returns
 `absl::nullopt`.
-`ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`
-drives the one-peer version of the last two steps (`cancel`, then the push
-completing) from a session whose push op `ReshardSendSessionTestPeer::BeginPush`
-took (`paired` in `Coverage.lean`). -/
+`ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidCopy`
+drives the one-pool version with the op held by the D2H copy instead of a
+push: `FakeD2hBase::HoldNextCopy` parks pool 0's copy, `Finish(Cancelled)`
+starts finalizing without settling (`plan()` still set), and
+`FakeD2hBase::CompleteCopy` runs the `pool_future.OnReady` callback, whose
+`StartPoolPush` returns at `if (done_ || finalizing_)` and whose `EndOp()`
+settles the send (`paired` in `Coverage.lean`). -/
 theorem trace_cancel_settles_on_last_endOp :
     let s := sys [2]
     -- After cancel with 2 peer pushes in flight: draining, not done, staging held.
@@ -161,11 +165,11 @@ theorem trace_cancel_settles_on_last_endOp :
   decide
 
 /-! `ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeSettling`,
-`ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`,
+`ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidCopy`,
 `ReshardSendSessionTest.PooledPolicyKeepsIdlePeerConnections`, and
 `ReshardSendSessionTest.CreateRejectsUnknownDataConnReuseValue`: TCP
 data-connection pooling (`TPU_RAIDEN_DATA_CONN_REUSE`,
-`tpu_sync/kv_cache/data_connection_policy.{h,cc}`, `ReshardSendSession::Create`,
+`tpu_sync/kv_cache/data_connection_policy.{h,cc}`, `CreateReshardSendSession`,
 `ReshardSendSession::EndOp`) is orthogonal to the session state machine;
 Assumption A4 above justifies folding the per-transfer connection-release window
 in `ReshardSendSession::EndOp` (`while (true)`) into the atomic `endOp`
@@ -192,13 +196,15 @@ theorem trace_partial_failure_keeps_plan :
 
 def tr_finish_after_last_push : List Ev := [.pushDone 0 true, .cancel, .publish]
 
-/-- `ReshardSendSessionTest.FinishAfterLastPushFinalizingPreservesOkStatus`:
-after the last scheduled push completed (`RecordPushCompletion` latched
-`finalizing_` with `status_` OK), a `Finish(Cancelled)` is ignored
-(`if (done_ || finalizing_) return;` precedes the status update), so the
-session settles OK. The test issues the `Finish` between `RecordPushCompletion`
-and `EndOp`; `pushDone` folds those two into one event, and `cancel` on a
-finalizing session is the identity either side of `EndOp`. -/
+/-- `Finish` racing the last push's `EndOp` (`ReshardSendSession::Finish`,
+`ReshardSendSession::RecordPushCompletion`): after the last scheduled push
+completed (`RecordPushCompletion` latched `finalizing_` with `status_` OK), a
+`Finish(Cancelled)` is ignored (`if (done_ || finalizing_) return;` precedes
+the status update), so the session settles OK. In the C++ the `Finish` can
+land between `RecordPushCompletion` and `EndOp`; `pushDone` folds those two
+into one event, and `cancel` on a finalizing session is the identity either
+side of `EndOp`. No upstream test drives this window (`modelOnly` in
+`Coverage.lean`). -/
 theorem trace_finish_after_last_push :
     ((sys [1]).runFrom (((sys [1]).run (tr_parity_send.take 3)).getD (init [1]))
         tr_finish_after_last_push).map
@@ -229,7 +235,7 @@ theorem violates_iff (s : Send) : violates s = false ↔ Safe s := by
 #guard ModelCheck.check (sys [2, 1]) (events 2) violates 12 = .safe
 
 
-/-- Mutant 1 (`initOvercountedSlots`, cf. `ReshardSendSession::Create`):
+/-- Mutant 1 (`initOvercountedSlots`, cf. `CreateReshardSendSession`):
 initializing `remaining_pool_peer_pushes_` to `pools.size() * total_peers` (4
 instead of `2 + 1 = 3`) leaves the session open with `in_flight_ == 0` and
 `finalizing_ == false` after all 3 scheduled pushes complete, violating
@@ -247,8 +253,8 @@ def initOvercountedSlots : Send :=
 `if (done_ || finalizing_) return;` (`Lifecycle.finishLocked`) lets a
 `Finish(Cancelled)` racing the last push's `EndOp` turn a completed send into a
 failed one. Not a `Safe` violation (the session still settles cleanly), but
-`ReshardSendSessionTest.FinishAfterLastPushFinalizingPreservesOkStatus`
-distinguishes it: `published = some false` instead of `some true`. -/
+`trace_finish_after_last_push` distinguishes it: `published = some false`
+instead of `some true`. -/
 def cancelRecordsStatusFirst (s : Send) : Option Send :=
   some { s with life := s.life.finishLocked false }
 

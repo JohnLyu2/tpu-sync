@@ -18,15 +18,16 @@ abbrev ReqId := Nat
 instance : DecidableEq Uuid := inferInstanceAs (DecidableEq Nat)
 instance : DecidableEq ReqId := inferInstanceAs (DecidableEq Nat)
 
-/-- A receive session seated at `sessions_[uuid]`, tagged with its `reqId` and a
-monotonic registration generation `gen`. -/
+/-- A receive session seated at `sessions_[uuid]`, tagged with its `reqId`
+(`SessionEntry::req_id`) and a monotonic registration generation `gen`. -/
 structure RecvEntry where
   reqId : ReqId
   gen : Nat
   recv : Recv
   deriving Repr, DecidableEq
 
-/-- A send offer seated at `sessions_[uuid]`, tagged with its `reqId`. -/
+/-- A send offer seated at `sessions_[uuid]`, tagged with its `reqId`
+(`SessionEntry::req_id`). -/
 structure SendEntry where
   reqId : ReqId
   gen : Nat
@@ -100,7 +101,7 @@ inductive Ev where
   on a live send offer under the uuid, and inline retirement of a settled
   incumbent of either kind (`RetireSettledSessionLocked`). -/
   | startRead (reqId : ReqId) (uuid : Uuid)
-  /-- `RegisterRecv` → `EmplaceRecvSessionLocked(uuid, session)`
+  /-- `RegisterRecv` → `EmplaceRecvSessionLocked(uuid, req_id, session)`
   (`KVCacheManagerWithTransfer::RegisterRecv`,
   `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked`; `RegisterActivePlan`
   seats its receive through the same call, after its own plan check):
@@ -120,8 +121,9 @@ inductive Ev where
   | sweepRecv (uuid : Uuid)
   /-- `NotifyForRead(req_id, uuid, ...)` (`KVCacheManagerWithTransfer::NotifyForRead`): registers a send
   offer at `sessions_[uuid]`; rejects any `uuid` the map holds, send or receive,
-  live or settled (a thrown `std::runtime_error` on
-  `!sessions_.try_emplace(uuid, session).second`). -/
+  live or settled (a thrown `std::runtime_error` when
+  `sessions_.try_emplace(uuid, SessionEntry{session, req_id, SessionRole::kTransfer})`
+  fails). -/
   | notifyForRead (reqId : ReqId) (uuid : Uuid)
   /-- Step the active send session at `uuid` (`Send.lean`). -/
   | sendStep (uuid : Uuid) (e : Send.Ev)
@@ -317,7 +319,7 @@ def step (s : State) : Ev → Option State
         nextGen := s.nextGen + 1,
         sendTable := s.sendTable.set uuid (some entry) }
     | _, _ =>
-      -- `sessions_.try_emplace(uuid, session)` fails on any seated session,
+      -- `sessions_.try_emplace(uuid, SessionEntry{...})` fails on any seated session,
       -- send or receive, live or settled (`KVCacheManagerWithTransfer::NotifyForRead`).
       none
   | .sendStep uuid e =>

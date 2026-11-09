@@ -150,7 +150,8 @@ def pushEnd (pol : PushEndPolicy) (ok : Bool) (s : Recv) : Option Recv :=
     some { s with life := l.endOpLocked, pushes := s.pushes - 1 }
 
 /-- `ReshardReceiveSession::OnPoolReceived` (reached as
-`OnDataReceived(pool_idx, {}, {})` from `KVCacheManagerBase::OnPoolReceived`):
+`OnDataReceived(pool_idx, {}, {})` from
+`BlockTransportServerPushSession::CompleteIncomingPush` on the stream's session):
 records `p` in `started_pool_indices_` (`RecordPoolReceivedLocked`) and calls
 `ExecuteEligiblePoolH2ds`. -/
 def onPoolReceived (p : Nat) (s : Recv) : Option Recv :=

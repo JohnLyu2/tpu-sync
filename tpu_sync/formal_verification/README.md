@@ -64,7 +64,7 @@ lakefile.toml, lake-manifest.json, lean-toolchain
 Prose and docstrings cite C++ symbols (`Class::Method`), code fragments, and
 GTest names (`Suite.TestName`); exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables. Those spans were
-last resolved at commit **`56a0269`**;
+last resolved at commit **`00e946e3`**;
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py) `--check` re-verifies
 them against the working tree. The external callers that `Caller.lean`
 cites are pinned separately: tpu-inference `f366ef52`, vllm-torchtpu

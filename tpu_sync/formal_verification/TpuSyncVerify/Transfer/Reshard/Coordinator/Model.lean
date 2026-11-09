@@ -34,7 +34,7 @@ inductive CoordPhase where
 
 /-- Per-destination-unit receiver state (`KVCacheListener::HandleControlRequest`,
 `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-`ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`,
+`CreateReshardReceiveSession`, `ReshardReceiveSession::AcquireStagingLeases`,
 `ReshardReceiveSession::ReleaseStaging`). -/
 structure DstUnitState where
   /-- Destination unit ID (`UnitKey`). -/
@@ -43,7 +43,7 @@ structure DstUnitState where
       `Done()` (its `plan()` resolvable through `GetSession`). -/
   sessionArmed : Bool
   /-- True while the `PoolStagingLease` acquired by `AcquireStagingLeases`
-      (`ReshardReceiveSession::Create` and `ReshardReceiveSession::AcquireStagingLeases`) is held. -/
+      (`CreateReshardReceiveSession` and `ReshardReceiveSession::AcquireStagingLeases`) is held. -/
   stagingLeaseHeld : Bool
   /-- Set of `src_unit` IDs whose `PoolReshardPush` has arrived. -/
   pushesReceived : List Nat
@@ -64,7 +64,7 @@ def init (unit : Nat) : DstUnitState :=
 
 /-- Arm this destination unit via `PoolReshardRegisterRecv`
 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-`ReshardReceiveSession::Create`). -/
+`CreateReshardReceiveSession`). -/
 def arm (d : DstUnitState) : DstUnitState :=
   { d with
     sessionArmed := true

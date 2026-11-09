@@ -14,8 +14,10 @@ One `ReshardSendSession` on the producer side and the slice of
 sessions live in `Reshard/Receive.lean`; multi-sender stream counting and
 aliased-page contents compose both in `Reshard/Pipeline.lean`.
 
-In the source-map table below, `reshard_send.h` and `reshard_send.cc` are
-`tpu_sync/kv_cache/reshard_send_session.{h,cc}`; `reshard_recv.cc` is
+In the source-map table below, `reshard_send.cc` is
+`tpu_sync/kv_cache/reshard_send_session.cc` (which holds the class
+`ReshardSendSession` behind the factory `CreateReshardSendSession` declared in
+`tpu_sync/kv_cache/reshard_send_session.h`); `reshard_recv.cc` is
 `tpu_sync/kv_cache/reshard_receive_session.cc`; `session.h` is
 `tpu_sync/kv_cache/transfer_session.h` (`StagingLayerManager`) and
 `tpu_sync/transport/transfer_session.h` is the `TransferSession` interface;
@@ -36,10 +38,12 @@ the manager's single `sessions_` map: an incumbent that is `Done()` is retired
 (`RetireSettledSessionLocked`, which reports it through
 `RecordPoolReshardTerminalLocked` and erases it), one that is not is refused
 (`AlreadyExistsError`). It then creates a `ReshardSendSession`
-(`ReshardSendSession::Create`), which validates the plan, computes
+(`CreateReshardSendSession`), which validates the plan
+(`ReshardSendSession::ValidatePlan`), computes
 `remaining_pool_peer_pushes_ = CountPoolReshardSendSlots(plan, schedule)` and
-builds the session's `TransferPlan`; inserts the session into `sessions_`
-(recording it in the request's `send_chains_` entry,
+builds the session's `TransferPlan`; inserts the session into `sessions_` as a
+`SessionEntry` carrying the plan's `req_id` and `SessionRole::kPoolReshardSend`
+(recording it in the request's `sub_plan_chains_` entry,
 `NoteSubPlanRegisteredLocked`, when the plan is a sub-plan of a chain); and
 calls `state->Start()`. The model is one such session — one plan `uuid`, which
 for a windowed request is one sub-plan of its chain (`Pipeline.lean` §"Scope:
@@ -125,7 +129,7 @@ Session-level fields:
 | `life`             | `in_flight_`, `finalizing_`, `done_`, `status_`, `!leases_released_` | `Transfer.Lifecycle` |
 | `execActive`       | the caller op between `Start`'s `++in_flight_;` and the pipeline thread's (or `Start`'s `absl::Cleanup`) `EndOp()` | caller op active |
 | `remainingPushes`  | `remaining_pool_peer_pushes_`                                       | remaining `(pool, peer)` completions |
-| `published`        | the session's terminal as `RetireSettledSessionLocked` hands it to `RecordPoolReshardTerminalLocked`: membership in `done_sending_` / `failed_recving_` for a single-plan request (`sub_plan_count <= 1`), or the sub-plan's entry in the request's `send_chains_` record | what `poll_stats()` shows the engine |
+| `published`        | the session's terminal as `RetireSettledSessionLocked` hands it to `RecordPoolReshardTerminalLocked` (with the `req_id` of its `SessionEntry`): membership in `done_sending_` / `failed_recving_` for a single-plan request (`sub_plan_count <= 1`), or the sub-plan's entry in the request's `sub_plan_chains_` record | what `poll_stats()` shows the engine |
 
 ## Events
 
@@ -136,8 +140,8 @@ Session-level fields:
 | `execFinish`       | the pipeline thread's `EndOp()` after `ExecutePushPipeline` finished its pool loop |
 | `d2hDone p ok`     | `pool_future.OnReady` callback + `StartPoolPush` + `EndOp()` |
 | `pushDone p ok`    | one peer's `AsyncPush(...).OnReady` callback for pool `p`: calls `RecordPushCompletion` + `EndOp()` |
-| `cancel`           | external `Finish(error)`: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`) or `UnregisterActivePlan`; a no-op once `done_ || finalizing_` |
-| `publish`          | `CompleteReadWithDetails` retires a settled session (`RetireSettledSessionLocked`) through `RecordPoolReshardTerminalLocked` (into `done_sending_` or `failed_recving_` for a single-plan request; into the request's `send_chains_` entry for a sub-plan of a chain, which reaches `done_sending_` when the last sub-plan settles and `failed_recving_` at the first failed sub-plan) and erases it from `sessions_` |
+| `cancel`           | external `Finish(error)`: deadline (`CompleteReadWithDetails`, `session->deadline() <= now`), shutdown (`~KVCacheManagerWithTransfer`) or `UnregisterActivePlan`; a no-op once `done_ || finalizing_` |
+| `publish`          | `CompleteReadWithDetails` retires a settled session (`RetireSettledSessionLocked`, on the entry's `SessionRole::kPoolReshardSend`) through `RecordPoolReshardTerminalLocked` (into `done_sending_` or `failed_recving_` for a single-plan request; into the request's `sub_plan_chains_` entry for a sub-plan of a chain, which reaches `done_sending_` when the last sub-plan settles and `failed_recving_` at the first failed sub-plan) and erases it from `sessions_` |
 
 ## Lock scopes
 
@@ -145,7 +149,7 @@ Every mutable field of `ReshardSendSession` is `ABSL_GUARDED_BY(mu_)` except
 `staging_layer_manager_` (its own mutex) and the atomic `cancelled_`; `base_`,
 `src_block_ids_`, `parallelism_`, `deadline_`, `dst_peers_`,
 `data_connection_reuse_`, and `transfer_plan_` (whose request supplies the
-uuid, req_id and plan) are `const`. `ReshardSendSession::EndOp` is one `mu_`
+uuid and plan) are `const`. `ReshardSendSession::EndOp` is one `mu_`
 scope, the `while (true)` decrement/settle scope — two under `kPerTransfer`
 when `release_due` holds (A4).
 
@@ -156,8 +160,8 @@ when `release_due` holds (A4).
 | `execFinish` | 1–2: the pipeline thread's `EndOp()` after `ReshardSendSession::ExecutePushPipeline` returns | `EndOp` tail, below |
 | `d2hDone p ok` | 2–5 in `pool_future.OnReady`: on `ok = false` (or `transport_srv == nullptr`), `RecordPushCompletion` (1 scope) + `absl::Cleanup` `EndOp()` (1–2 scopes); on `ok = true`, `StartPoolPush` checks `if (done_ || finalizing_)` on entry and again when adding `in_flight_ += static_cast<int>(transfers_by_peer.size());` (1–2 scopes, folded by A3), dispatches `AsyncPush` per peer outside `mu_`, and runs `EndOp()` (1–2 scopes) | the D2H op and (on `ok = true`) the added peer ops keep `in_flight_ >= 1` until `EndOp()`; `EndOp` tail, below |
 | `pushDone p ok` | 2–3 in `StartPoolPush`'s `AsyncPush(...).OnReady` callback: `RecordPushCompletion` (1 scope) followed by `absl::Cleanup` `EndOp()` (1–2 scopes) | the peer op keeps `in_flight_ >= 1` until `EndOp()`; `EndOp` tail, below |
-| `cancel` | 1–2: `ReshardSendSession::Finish(error)`, called from `~KVCacheManagerWithTransfer` (1 scope, under the manager's `mu_`), `UnregisterActivePlan` (after an unlocked `session->Done()`), or after `!session->IsDraining()` and `reshard_send->deadline() <= now` in `CompleteReadWithDetails` (2 scopes) | `Finish` returns at `if (done_ || finalizing_) return;` before touching `status_`, so an interleaved finalize makes it the identity, matching `cancel` (`Lifecycle.finishOnceLocked`) |
-| `publish` | 3 in `RetireSettledSessionLocked` (under manager `mu_`): `reshard_send->Done()` and `reshard_send->GetStatus()` twice (`const bool failed = !reshard_send->GetStatus().ok();`, then the argument of `RecordPoolReshardTerminalLocked`) before `sessions_.erase(it)` | on a settled session nothing changes (`Finish` and `RecordPushCompletion` both return at `done_`) |
+| `cancel` | 1–2: `ReshardSendSession::Finish(error)`, called from `~KVCacheManagerWithTransfer` (1 scope, under the manager's `mu_`), `UnregisterActivePlan` (after an unlocked `session->Done()`), or after `!session->IsDraining()` and `session->deadline() <= now` in `CompleteReadWithDetails` (2 scopes) | `Finish` returns at `if (done_ || finalizing_) return;` before touching `status_`, so an interleaved finalize makes it the identity, matching `cancel` (`Lifecycle.finishOnceLocked`) |
+| `publish` | 2 in `RetireSettledSessionLocked` (under manager `mu_`): `reshard->Done()` and `reshard->GetStatus()` (`const absl::Status status = reshard->GetStatus();`, passed to `RecordPoolReshardTerminalLocked`) before `sessions_.erase(it)` | on a settled session nothing changes (`Finish` and `RecordPushCompletion` both return at `done_`) |
 
 **Caller and callback ops hold `in_flight_ >= 1` until `EndOp()`.** Throughout
 `Start`, `ExecutePushPipeline`, `StartPoolPush`, and `RecordPushCompletion`, the
@@ -213,13 +217,16 @@ the model makes; a timeout or a cancelled wait is `d2hIssue p false`
 shows); and `LookupStagingSlot` fails only for a pool whose lease was already
 returned, that is after the pool's pushes ended or the session settled. Pools
 beyond the buffer count serialize behind earlier pools' pushes, which the
-model does not track (`ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease`,
-`notReplayable` in `Coverage.lean`).
+model does not track: `ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease`
+drives three pools through one buffer (its second pool waits until the first
+pool's push returns the buffer, its third pool's wait is woken by `Finish`) and
+replays in `Coverage.lean` as one of the interleavings the slot-free model
+admits.
 
 ## Assumptions
 
 * **A1 (non-empty schedule with positive peer counts per active pool).**
-  `ReshardSendSession::Create` rejects plans with `remaining_pool_peer_pushes <= 0`,
+  `CreateReshardSendSession` rejects plans with `remaining_pool_peer_pushes <= 0`,
   and `ExecutePushPipeline` skips any pool whose group has no entries on this
   sender (`if (pool_src_block_ids.empty())`), matching
   `CountPoolReshardSendSlots` (`if (it == peers_by_group.end()) continue;`).
@@ -286,79 +293,87 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `tpu_sync/transport/transfer_session.h` | `TransferSession` | `:35-109` |
+| `tpu_sync/transport/transfer_session.h` | `TransferSession` | `:36-115` |
 | `session.h` | `StagingLayerManager` | `:40-75` |
-| `reshard_send.h` | `ReshardSendSession::Done` | `:71-74` |
-| `reshard_send.h` | `ReshardSendSession::TryBeginOp` | `:78` |
-| `reshard_send.h` | `ReshardSendSession::GetStatus` | `:85-88` |
-| `reshard_send.h` | `ReshardSendSession::IsDraining` | `:92-95` |
-| `reshard_send.h` | `ReshardSendSession::deadline` | `:98` |
-| `reshard_send.h` | `ReshardSendSession::ResolveStagingSlot` | `:113-115` |
-| `reshard_send.h` | `ReshardSendSession::plan` | `:128-133` |
-| `reshard_send.h` | `ReshardSendSession` (`int remaining_pool_peer_pushes_` .. `std::atomic<bool> cancelled_`) | `:194-204` |
-| `reshard_send.cc` | `ReshardSendSession::ValidatePlan` | `:56-94` |
-| `reshard_send.cc` | `ReshardSendSession::Create` | `:96-157` |
-| `reshard_send.cc` | `ReshardSendSession::AcquireStagingSlot` | `:181-203` |
-| `reshard_send.cc` | `ReshardSendSession::LookupStagingSlot` | `:205-223` |
-| `reshard_send.cc` | `ReshardSendSession::ValidatePushPreconditions` | `:225-241` |
-| `reshard_send.cc` | `ReshardSendSession::Start` | `:243-280` |
-| `reshard_send.cc` | `ReshardSendSession::Start` (`++in_flight_;`) | `:250` |
-| `reshard_send.cc` | `ReshardSendSession::Start` (`absl::Cleanup end_op = [this]() { EndOp(); };`) | `:252` |
-| `reshard_send.cc` | `ReshardSendSession::Start` (`} catch (const std::system_error& e) {`) | `:269-277` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` | `:282-396` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`for (size_t pool_idx : ordered_pools)`) | `:322-395` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`absl::StatusOr<size_t> host_slot = AcquireStagingSlot(pool_idx);`) | `:344` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`d2h_futures_.push_back(pool_future);` .. `++in_flight_;`) | `:382-383` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`pool_future.OnReady`) | `:385-394` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:398-501` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` (`in_flight_ += static_cast<int>(transfers_by_peer.size());`) | `:459` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` (`for (const auto& [peer, transfers] : transfers_by_peer)`) | `:471-500` |
-| `reshard_send.cc` | `ReshardSendSession::RecordPushCompletion` | `:503-523` |
-| `reshard_send.cc` | `ReshardSendSession::Finish` | `:525-543` |
-| `reshard_send.cc` | `ReshardSendSession::OnDataReceived` | `:551-557` |
-| `reshard_send.cc` | `ReshardSendSession::EndOp` | `:559-587` |
-| `reshard_send.cc` | `ReshardSendSession::EndOp` (`while (true)`) | `:569-586` |
-| `reshard_send.cc` | `ReshardSendSession::ReleaseLeasesLocked` | `:589-594` |
-| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:596-603` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:691-727` |
+| `reshard_send.cc` | `ReshardSendSession::Done` | `:94-97` |
+| `reshard_send.cc` | `ReshardSendSession::TryBeginOp` | `:101` |
+| `reshard_send.cc` | `ReshardSendSession::GetStatus` | `:108-111` |
+| `reshard_send.cc` | `ReshardSendSession::IsDraining` | `:115-118` |
+| `reshard_send.cc` | `ReshardSendSession::deadline` | `:120-122` |
+| `reshard_send.cc` | `ReshardSendSession::ResolveStagingSlot` | `:133-135` |
+| `reshard_send.cc` | `ReshardSendSession::plan` | `:148-153` |
+| `reshard_send.cc` | `ReshardSendSession` (`int remaining_pool_peer_pushes_` .. `std::atomic<bool> cancelled_`) | `:198-208` |
+| `reshard_send.cc` | `ReshardSendSession::ValidatePlan` | `:213-251` |
+| `reshard_send.cc` | `CreateReshardSendSession` | `:253-315` |
+| `reshard_send.cc` | `ReshardSendSession::AcquireStagingSlot` | `:339-361` |
+| `reshard_send.cc` | `ReshardSendSession::LookupStagingSlot` | `:363-381` |
+| `reshard_send.cc` | `ReshardSendSession::ValidatePushPreconditions` | `:383-399` |
+| `reshard_send.cc` | `ReshardSendSession::Start` | `:401-438` |
+| `reshard_send.cc` | `ReshardSendSession::Start` (`++in_flight_;`) | `:408` |
+| `reshard_send.cc` | `ReshardSendSession::Start` (`absl::Cleanup end_op = [this]() { EndOp(); };`) | `:410` |
+| `reshard_send.cc` | `ReshardSendSession::Start` (`} catch (const std::system_error& e) {`) | `:427-435` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` | `:440-554` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`for (size_t pool_idx : ordered_pools)`) | `:480-553` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`absl::StatusOr<size_t> host_slot = AcquireStagingSlot(pool_idx);`) | `:502` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`d2h_futures_.push_back(pool_future);` .. `++in_flight_;`) | `:540-541` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`pool_future.OnReady`) | `:543-552` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:556-659` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` (`in_flight_ += static_cast<int>(transfers_by_peer.size());`) | `:617` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` (`for (const auto& [peer, transfers] : transfers_by_peer)`) | `:629-658` |
+| `reshard_send.cc` | `ReshardSendSession::RecordPushCompletion` | `:661-680` |
+| `reshard_send.cc` | `ReshardSendSession::Finish` | `:682-700` |
+| `reshard_send.cc` | `ReshardSendSession::OnDataReceived` | `:708-714` |
+| `reshard_send.cc` | `ReshardSendSession::EndOp` | `:716-744` |
+| `reshard_send.cc` | `ReshardSendSession::EndOp` (`while (true)`) | `:726-743` |
+| `reshard_send.cc` | `ReshardSendSession::ReleaseLeasesLocked` | `:746-751` |
+| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:753-760` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:857-893` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : sessions_)`) | `:368-372` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:436-511` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:683-724` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:776-822` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`} else if (auto reshard_send =` .. `absl::DeadlineExceededError("Pool reshard send timed out"));`) | `:1012-1016` |
-| `base.h` | `KVCacheManagerBase::AttachPlaceholderDeviceHoldForTest` | `:763` |
-| `base.cc` | `KVCacheManagerBase::GetTransferPlan` | `:2724-2734` |
-| `base.cc` | `KVCacheManagerBase::CopyPoolBlocks` | `:2552-2693` |
-| `base.cc` | `KVCacheManagerBase::D2hPoolBlocks` | `:2695-2701` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3077-3250` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`return plan->ResolvePlanBlockChunks(`) | `:3247-3249` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, entry] : sessions_)`) | `:398-402` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:470-529` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:732-774` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:827-873` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`} else if (session->deadline() <= now) {` .. `absl::DeadlineExceededError("Transfer session timed out"));`) | `:1089-1095` |
+| `base.h` | `KVCacheManagerBase::AttachPlaceholderDeviceHoldForTest` | `:762` |
+| `base.cc` | `KVCacheManagerBase::GetTransferPlan` | `:3078-3088` |
+| `base.cc` | `KVCacheManagerBase::CopyPoolBlocks` | `:2906-3047` |
+| `base.cc` | `KVCacheManagerBase::D2hPoolBlocks` | `:3049-3055` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3388-3560` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`return plan->ResolvePlanBlockChunks(`) | `:3557-3559` |
 | `raw_core.h` | `PjRtCopyFuture::OnReady` | `:514-568` |
 | `raw_core.h` | `IssueD2hShard` | `:657-685` |
-| `bt.cc` | `BlockTransport::AsyncPush` | `:513-562` |
+| `bt.cc` | `BlockTransport::AsyncPush` | `:503-552` |
 | `utils.h` | `StridedSpanFitsBlock` | `:322-333` |
 | `utils.h` | `StridedSpanFitsRegions` | `:335-349` |
 | `pool_layout.cc` | `RegionCoversOffset` | `:66-87` |
 | `pool_layout.cc` | `RegionsCoverRange` | `:257-274` |
-| `reshard_send_test.cc` | `ReshardSendSessionTestPeer` | `:50-95` |
-| `reshard_send_test.cc` | `MakeTestBase` | `:132-138` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.AcceptsCanonicalPlanOnExplicitPools` | `:203-211` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.AcceptsImplicitPools` | `:213-220` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.RejectsMissingIdentityAndPoolFields` | `:222-254` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.RejectsOverflowingSenderSpan` | `:256-270` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.RejectsSenderSpanBetweenPackedTokenRegionsInAliasedStorage` | `:272-306` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.IgnoresReceiverCoverageGap` | `:308-329` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeSettling` | `:374-413` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush` | `:415-454` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:456-484` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:486-503` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease` | `:505-585` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.StartFailsFastWithoutTransportServer` | `:590-615` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.PipelineSlotWaitTimeoutSettlesSendOutOfBand` | `:621-670` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.StagingSlotReleasedAfterLastPeerPush` | `:674-718` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.FinishAfterLastPushFinalizingPreservesOkStatus` | `:720-745` |
-| `pool_reshard_test.cc` | `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints` | `:317-333` |
-| `pool_reshard_test.cc` | `PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront` | `:348-371` |
-| `pool_reshard_test.cc` | `DeviceBackedTestBase` | `:643-656` |
+| `reshard_send_test.cc` | `StubRecvSession` | `:66-93` |
+| `reshard_send_test.cc` | `MakeTestBase` | `:95-101` |
+| `reshard_send_test.cc` | `CreateStatus` | `:169-179` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.AcceptsCanonicalPlanOnExplicitPools` | `:181-187` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.AcceptsImplicitPools` | `:189-194` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.RejectsMissingIdentityAndPoolFields` | `:196-222` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.RejectsOverflowingSenderSpan` | `:224-237` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.RejectsSenderSpanBetweenPackedTokenRegionsInAliasedStorage` | `:239-270` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.IgnoresReceiverCoverageGap` | `:272-291` |
+| `reshard_send_test.cc` | `FakeD2hBase` | `:339-415` |
+| `reshard_send_test.cc` | `RouteSessionLookups` | `:419-429` |
+| `reshard_send_test.cc` | `AcceptPushes` | `:432-441` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeSettling` | `:463-502` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidCopy` | `:504-548` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PooledPolicyKeepsIdlePeerConnections` | `:550-581` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.CreateRejectsUnknownDataConnReuseValue` | `:583-600` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease` | `:602-696` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.StartFailsFastWithoutTransportServer` | `:701-726` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PipelineSlotWaitTimeoutSettlesSendOutOfBand` | `:732-781` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.StagingSlotReleasedAfterLastPeerPush` | `:785-827` |
+| `reshard_send_test.cc` | `RecordingH2dReceiverBase` | `:829-886` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks` | `:888-948` |
+| `pool_reshard_test.cc` | `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints` | `:359-375` |
+| `pool_reshard_test.cc` | `PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront` | `:390-413` |
+| `pool_reshard_test.cc` | `TestManager::AddPoolReshardSend` | `:131-147` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.SendTerminalWaitsForTheLastSubPlan` | `:1060-1088` |
+| `pool_reshard_test.cc` | `PoolReshardSessionLookupTest.GetSessionResolvesActiveReshardSendUntilRetired` | `:1124-1155` |
+| `pool_reshard_test.cc` | `DeviceBackedTestBase` | `:685-698` |
 <!-- source-map:end -->
 -/

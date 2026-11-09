@@ -89,13 +89,15 @@ def survivesFull (override : Recv → Ev → Option (Option Recv)) : Bool :=
 | G10 | `FinishLocked`: `in_flight_ == 0 &&` in the settle condition | `cancel` | settle at once | **killed** — `cancelEager` in `Traces.lean` (`SettleSafe`) |
 | G11 | `TryBeginOp`'s `done_` disjunct | `pushBegin` | check `draining_` only | **equivalent** on every reachable state (`Lifecycle.beginOp'_eq`, `Session.lean` §Redundant `done_` guards); not a mutant |
 | G12 | `ExecuteLayerH2d`, third lock: `!network_completed_ && !done_ && !draining_` before `network_completed_ = true` | `h2dIssue` | — | **not a mutant**: `!network_completed_` is idempotence (the flag and `RecordLastPacket` once); `!done_ && !draining_` only matters when a `Finish` lands between `h2d_futures_.push_back` and this scope, which the model folds into `h2dIssue true` (`Receive.lean` §Lock scopes) — with every layer issued, `IsReadyToComplete` is sound whether or not the flag is set (`ReadinessSound`), and a draining session's flag is read only by `CurrentPhaseLocked` |
+| G13 | `Start`'s `on_response`: `&& !self->draining_` before `FinishLocked(pull_status)` | `pullReply` | finish on a failed reply regardless | **survives** — on a draining receive `FinishLocked(error)` only applies the first-error rule: a receive that settled OK before the reply (its data outran the control path) would be reported `failed_recving` instead of `done_recving`; the properties state nothing about which verdict a complete receive gets (`Publication` is one-directional), so the check serves the verdict, not safety (`tr_late_reply_failure_keeps_verdict`) |
 
 Five checks are load-bearing (G1, G2, G8, G9, and G10 from `Traces.lean`);
-five survive — against the full `Safe` too (`survivesFull`), so none is a
-case of "killed only by bookkeeping". The survivors are of two
+six survive — against the full `Safe` too (`survivesFull`), so none is a
+case of "killed only by bookkeeping". The survivors are of three
 kinds: G2′, G3 and G7 are optimisations or second lines of defence whose
 first line the properties already see; G5 and G6 guard metrics and
-accounting the model does not carry. None is a redundancy the C++ should
+accounting the model does not carry; G13 decides which verdict a settled
+receive reports. None is a redundancy the C++ should
 lose — each has a purpose — but none is needed for what is proved, which is
 what a reader of `reachable_safe` should know. The G8 `Publication` schedule is
 the poll-before-callback window of `ReceivePoll.lean`: with `Done()` dropped, the
@@ -180,7 +182,7 @@ def g9 : Recv → Ev → Option (Option Recv)
       else some { s with life := endOpEager s.life, pushes := s.pushes - 1 })
   | s, .pullReply ok => some (if s.pullPending = false then none
       else
-        let l := if ok then s.life else s.life.finishLocked false
+        let l := if ok = true ∨ s.life.draining = true then s.life else s.life.finishLocked false
         some { s with life := endOpEager l, pullPending := false })
   | s, .h2dIssue ok => some (if s.pending = 0 then none
       else
@@ -201,6 +203,15 @@ def g9 : Recv → Ev → Option (Option Recv)
     else none)
   | _, _ => none
 
+/-- `on_response` finishing with the failed pull status whether or not the
+receive is already draining (`FinishLocked`'s first-error rule then decides). -/
+def g13 : Recv → Ev → Option (Option Recv)
+  | s, .pullReply ok => some (if s.pullPending = false then none
+      else
+        let l := if ok then s.life else s.life.finishLocked false
+        some { s with life := l.endOpLocked, pullPending := false })
+  | _, _ => none
+
 #guard killed g1
 #guard killed g2
 #guard survives g2'
@@ -210,7 +221,8 @@ def g9 : Recv → Ev → Option (Option Recv)
 #guard survives g7
 #guard killed g8
 #guard killed g9
-#guard [g2', g3, g5, g6, g7].all survivesFull
+#guard survives g13
+#guard [g2', g3, g5, g6, g7, g13].all survivesFull
 
 /- The schedules the search returns for the three killed checks no hand-written
 mutant covered, and for G8 (evaluated, as the other searches: `decide` on a

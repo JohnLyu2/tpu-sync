@@ -48,7 +48,7 @@ follow run on the same reader thread, so interleaving other streams between
 them changes nothing the properties here observe. The sender always names one
 layer per stream (`TransferSendSession::SendNextLayer`'s `H2hWriteDirectAsync`
 → `BlockTransport::BuildBlockRequests`'s `header_layer_idx`), so the
-all-layers form `local_id == 0xFFFFFFFF` in `ResolveIncomingPushSpec` and
+all-layers form `local_id == lib::kUnspecifiedLocalId` in `ResolveIncomingPushSpec` and
 `CompleteIncomingPush` does not arise and `l` ranges over `0 .. numLayers - 1`.
 
 Two of the four completion contracts of
@@ -69,11 +69,13 @@ by `Cfg.declared`:
   `FailedPrecondition` when a sender re-declares).
 
 The plan-declared contract (`if (plan_declared)` in `CompleteIncomingPush`, pool
-resharding) is out of scope; see `Reshard/`. So is the Peregrine contract
+resharding, whose completion goes to the receive session directly via
+`session->OnDataReceived(l, {}, {})`) is out of scope; see `Reshard/`. So is the Peregrine contract
 (`else if (is_peregrine)`): it is reached only from
 `BlockTransportServerPushSession::OnPeregrinePostComplete`, the receiver side of
-the Peregrine data plane, whose only entry point `BlockTransport::OnRecvComplete`
-nothing outside the transport's own tests calls yet (the sender side,
+the Peregrine data plane, whose entry points `BlockTransport::ResolveRecvBuffer`
+and `BlockTransport::OnRecvComplete` nothing outside the transport's own tests
+calls yet (the sender side,
 `BlockTransport::AsyncPush` routing a push to the Peregrine adapter when
 `config_.backend_for(op) == TransportBackend::kPeregrine`, is likewise outside
 the model; the socket path `StartStream` is what every production push takes
@@ -102,7 +104,7 @@ only H2D copies whose callback has not run.
 
 | Field | C++ | Role |
 |---|---|---|
-| `Layer.entry` | `layer_progress_[l]` of the uuid's push session (`BlockTransportServerPushSession::LayerProgress`, `layer_progress_`) | `none` = no entry (never created, or cleared by retirement) |
+| `Layer.entry` | `layer_progress_[l]` of the uuid's push session (`BlockTransportServerPushSession::LayerProgress`, `layer_progress_`) | `none` = no entry (never created, or the fresh session's table after retirement) |
 | `Progress.completedChunks` | `LayerProgress::completed_chunks` | chunk-count contract |
 | `Progress.landed` | `SenderStreams::landed` per sender | sender-declared contract |
 | `Progress.sendersComplete` | `LayerProgress::senders_complete` | sender-declared contract |
@@ -125,7 +127,7 @@ completion behaviour (A4 in `Receive.lean` restates this over shards).
 
 | Event | C++ |
 |---|---|
-| `stream l s` | `HandleIncomingPush` → `GetOrCreatePushSession` → `StartStream`: `BeginIncomingPush` → `delegate_->GetSession(uuid)` → `TryBeginOp` (refuses once `done_`/`draining_`, and always on a send session), payload, `CompleteIncomingPush`, on completion `OnLayerReceived` → `KVCacheManagerBase::OnLayerReceived` → `OnDataReceived(layer_idx, {}, {})` → `ExecuteLayerH2d` (`++in_flight_`), then `OnBlockShardsReceived` → `OnDataReceived(0, block_ids, shard_ids)` → `RecordBlockShards`, `EndIncomingPush` → `EndOp`. A rejection inside `CompleteIncomingPush` returns early and `absl::Cleanup end_incoming_push` ends the push with `InternalError("Incoming push failed")`, which `EndIncomingPush` turns into `Finish(status)` then `EndOp()`. |
+| `stream l s` | `HandleIncomingPush` → `GetOrCreatePushSession` → `StartStream`: `BeginIncomingPush` → `delegate_->GetSession(uuid)` → `TryBeginOp` (refuses once `done_`/`draining_`, and always on a send session), payload, `CompleteIncomingPush`, on completion `OnLayerReceived` → `KVCacheManagerBase::OnLayerReceived` → `OnDataReceived(layer_idx, {}, {})` → `ExecuteLayerH2d` (`++in_flight_`), then `OnBlockShardsReceived` → `OnDataReceived(0, block_ids, shard_ids)` → `RecordBlockShards`, `EndIncomingPush` → `EndOp`. A rejection inside `CompleteIncomingPush` returns early and `absl::Cleanup end_incoming_push` ends the push with `InternalError("Incoming push failed")`, which `EndIncomingPush` turns into `Finish(status)` then `EndOp()`. A payload error before `CompleteIncomingPush` — a socket error, a size mismatch, or `ValidateChunks` finding a chunk outside the span `delegate_->GetBlockArrayHostSpan(l, sh, uuid)` returns (or that call failing) — takes the same cleanup with no table entry touched, i.e. `cancel` on a receive that is not yet draining. |
 | `h2dDone l ok` | the `future.OnReady` callback of a layer's copy in `ExecuteLayerH2d`: on OK `num_completed_layers_++` and, at `num_layers()` while not draining, the success `FinishLocked()`; on error `FinishLocked(status_or.status(), kH2dPhase)`; then `absl::Cleanup end_op`'s `EndOp()` |
 | `publish` | `CompleteReadWithDetails`: a receive that is not draining and `IsReadyToComplete()` (`network_completed_ || num_completed_layers_ == num_layers`, and every issued future ready) is `Finish()`ed. "Every future ready" is taken as "every callback has run"; the window between the two is `ReceivePoll.lean`'s subject (`pollReady`) and changes no property here. |
 | `cancel` | the deadline sweep in `CompleteReadWithDetails` (`else if (session->deadline() <= now)`) or any other `Finish(error)` on a receive that is not yet draining |
@@ -170,17 +172,28 @@ runs `EndIncomingPush(session, InternalError(...))`, which calls
 | `publish` | `IsDraining()`, `IsReadyToComplete()`, `Finish()` (`Receive.lean`, `pollReady`) | monotone readiness; an OK `Finish()` on a draining session is a no-op |
 | `cancel` | 1: `Finish(error)` | guarded here by `!draining`; a stale sweep is a no-op |
 
-Retirement (`if (all_layers_called)` in `CompleteIncomingPush`) runs
-`layer_progress_.clear()` and sets the push session's `done_` in the same
-critical section as the latch; the session is dropped from
-`active_push_sessions_` by `HandleIncomingPush`'s `DeletePushSession` once
-`StartStream` has returned (after the delegate callbacks, `EndIncomingPush` and
-the ack). `StartStream` and `CompleteIncomingPush` never test `done_`, so a
-stream that reaches the retired session in between starts a fresh entry in its
-cleared table (dropped with the session), and a later stream creates a fresh
-session with a fresh entry: `Layer.entry = none` covers both.
+Retirement (`if (all_layers_called)` in `CompleteIncomingPush`) sets the push
+session's `done_` in the same critical section as the latch and leaves
+`layer_progress_` in place. A retired session is no longer handed out:
+`GetOrCreatePushSession` returns the map's session only while
+`!session->IsDone() || session->HasAdmittedPosts()` (the second disjunct is the
+Peregrine path's lease bookkeeping) and otherwise seats a fresh
+`BlockTransportServerPushSession` under the uuid, and `HandleIncomingPush`
+drops a session that `IsDone()` once `StartStream` has returned (after the
+delegate callbacks, `EndIncomingPush` and the ack) through
+`DeletePushSession(session)`, which erases the map entry only if it still holds
+that session. So a later stream starts a fresh table: `Layer.entry = none` is
+that fresh table, and `retire` sets it at the retiring stream. A stream of the
+same uuid that took the `shared_ptr` before retirement and reaches
+`CompleteIncomingPush` after it finds the retired table's latched entry
+(`StartStream` and `CompleteIncomingPush` never test `done_`), so it counts into
+a dead table and cannot dispatch again; the model, which gives it a fresh
+entry, admits a dispatch there that the C++ does not — an over-approximation on
+the dishonest side only, since under A4 no such stream exists.
 `BlockTransport::ForgetPushProgress` removes the uuid's session from
-`active_push_sessions_` (under `server_sessions_mu_`) and `Cancel()`s it, from
+`active_push_sessions_` (under `server_sessions_mu_`) and `Cancel()`s it
+(`ReleaseAdmittedPosts`: `done_`, `status_ = CancelledError`, and the release of
+any Peregrine leases), from
 `KVCacheManagerWithTransfer::CompleteReadWithDetails` (for each uuid
 `RetireSettledSessionLocked` retired with `retired_push_progress`: a settled
 receive, or a failed send), `UnregisterActivePlan` (only once `Done()`) and
@@ -307,75 +320,78 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `bts.h` | `BlockTransportServerPushSession` (`struct LayerProgress` .. `absl::flat_hash_map<int, LayerProgress> layer_progress_ ABSL_GUARDED_BY(mu_);`) | `:143-167` |
-| `bt.h` | `BlockTransport` (`absl::Mutex server_sessions_mu_;` .. `active_push_sessions_ ABSL_GUARDED_BY(server_sessions_mu_);`) | `:284-287` |
-| `bts.cc` | `ResolveIncomingPushSpec` | `:229-284` |
-| `bt.cc` | `BlockTransport::GetOrCreatePushSession` | `:444-454` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:466-475` |
-| `bt.cc` | `BlockTransport::DeletePushSession` | `:456-459` |
-| `bt.cc` | `BlockTransport::OnRecvComplete` | `:480-490` |
-| `bt.cc` | `BlockTransport::AsyncPush` (`if (config_.backend_for(op) == TransportBackend::kPeregrine)`) | `:523-536` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:345-478` |
-| `bts.cc` | `BlockTransportServerPushSession::OnPeregrinePostComplete` | `:483-515` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:526-695` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`absl::Cleanup end_incoming_push`) | `:359-364` |
-| `bts.cc` | `BeginIncomingPush` | `:286-300` |
-| `bts.cc` | `EndIncomingPush` | `:302-315` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`std::optional<size_t> expected_senders;` .. `expected_senders = delegate_->ExpectedPushSenders(uuid_);`) | `:543-555` |
-| `bts.cc` | `BlockTransportServerPushSession::Cancel` | `:338-343` |
-| `bt.cc` | `BlockTransport::ForgetPushProgress` | `:1023-1037` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`transport->ForgetPushProgress(uuid);`) | `:1063` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` (`if (auto recv =` .. `transfer_details_[recv->req_id()] = recv->Details();`) | `:441-449` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`bool array_complete = false;` .. `array_complete = progress.completed_chunks == expected_chunks;`) | `:574-650` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`bool all_layers_called = true;` .. `done_ = true;`) | `:668-679` |
-| `bt.cc` | `BlockTransport::BuildBlockRequests` (`const uint32_t remote_id =` .. `static_cast<uint32_t>(header_layer_idx);`) | `:743-749` |
-| `recv.h` | `TransferReceiveSession::Done` | `:101-104` |
-| `recv.h` | `TransferReceiveSession::IsDraining` | `:118-121` |
-| `recv.cc` | `TransferReceiveSession::TryBeginOp` | `:533-544` |
-| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:469-484` |
-| `recv.cc` | `TransferReceiveSession::Finish` | `:486-489` |
-| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:520-531` |
-| `recv.cc` | `TransferReceiveSession::EndOp` | `:546-549` |
-| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:558-564` |
-| `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` | `:573-598` |
-| `recv.cc` | `TransferReceiveSession::RecordBlockShards` | `:703-753` |
-| `recv.cc` | `TransferReceiveSession::OnDataReceived` | `:796-811` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`dispatched_layers_.insert(layer_idx);`) | `:938` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:813-947` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:883-932` |
-| `block_transport_session_test.cc` | `MockSessionDelegate` | `:44-149` |
-| `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` | `:151-189` |
-| `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.Cancel` | `:191-202` |
-| `block_transport_test.cc` | `MockDelegate` | `:196-387` |
-| `block_transport_test.cc` | `MultiSenderReceiverDelegate` | `:431-450` |
-| `block_transport_test.cc` | `BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool` | `:857-887` |
-| `block_transport_test.cc` | `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender` | `:1066-1112` |
-| `block_transport_test.cc` | `BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism` | `:1114-1150` |
-| `block_transport_test.cc` | `BlockTransportTest.SenderOverDeliveryIsRejected` | `:1152-1189` |
-| `block_transport_test.cc` | `BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected` | `:1191-1224` |
-| `block_transport_test.cc` | `BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion` | `:1226-1260` |
-| `block_transport_test.cc` | `BlockTransportTest.ForgetPushProgressAllowsUuidReuse` | `:1262-1294` |
-| `block_transport_test.cc` | `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires` | `:1296-1335` |
-| `block_transport_test.cc` | `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration` | `:1337-1364` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.get_session =`) | `:276` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:280-287` |
-| `base.cc` | `KVCacheManagerBase::GetSession` | `:2716-2722` |
-| `base.cc` | `KVCacheManagerBase::GetTransferPlan` | `:2724-2734` |
-| `base.cc` | `KVCacheManagerBase::OnLayerReceived` | `:3009-3018` |
-| `base.cc` | `KVCacheManagerBase::OnBlockShardsReceived` | `:2987-3005` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:587-658` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:776-822` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_descriptors)` | `:858-882` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:884-989` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`} else if (auto recv =` .. `absl::DeadlineExceededError("Receive session timed out"));`) | `:1018-1027` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:677-705` |
-| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2747-2755` |
+| `bts.h` | `BlockTransportServerPushSession` (`struct LayerProgress` .. `absl::flat_hash_map<int, LayerProgress> layer_progress_ ABSL_GUARDED_BY(mu_);`) | `:158-201` |
+| `bt.h` | `BlockTransport` (`absl::Mutex server_sessions_mu_;` .. `active_push_sessions_ ABSL_GUARDED_BY(server_sessions_mu_);`) | `:292-295` |
+| `bts.cc` | `ResolveIncomingPushSpec` | `:185-240` |
+| `bt.cc` | `BlockTransport::GetOrCreatePushSession` | `:415-426` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:443-452` |
+| `bt.cc` | `BlockTransport::DeletePushSession` | `:428-436` |
+| `bt.cc` | `BlockTransport::OnRecvComplete` | `:468-480` |
+| `bt.cc` | `BlockTransport::AsyncPush` (`if (config_.backend_for(op) == TransportBackend::kPeregrine)`) | `:513-526` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:365-499` |
+| `bts.cc` | `BlockTransportServerPushSession::OnPeregrinePostComplete` | `:657-707` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`absl::Cleanup end_incoming_push`) | `:379-384` |
+| `bts.cc` | `BeginIncomingPush` | `:242-256` |
+| `bts.cc` | `EndIncomingPush` | `:258-271` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`std::optional<size_t> expected_senders;` .. `expected_senders = delegate_->ExpectedPushSenders(uuid_);`) | `:736-748` |
+| `bts.cc` | `BlockTransportServerPushSession::Cancel` | `:334` |
+| `bts.cc` | `BlockTransportServerPushSession::ReleaseAdmittedPosts` | `:341-363` |
+| `bts.cc` | `ValidateChunks` | `:275-304` |
+| `bt.cc` | `BlockTransport::ResolveRecvBuffer` | `:457-466` |
+| `bt.cc` | `BlockTransport::ForgetPushProgress` | `:1020-1034` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`transport->ForgetPushProgress(uuid);`) | `:1123` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` (`if (auto recv =` .. `transfer_details_[req_id] = recv->Details();`) | `:475-483` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`bool array_complete = false;` .. `array_complete = progress.completed_chunks == expected_chunks;`) | `:767-843` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`bool all_layers_called = true;` .. `done_ = true;`) | `:860-870` |
+| `bt.cc` | `BlockTransport::BuildBlockRequests` (`const uint32_t remote_id =` .. `static_cast<uint32_t>(header_layer_idx);`) | `:733-739` |
+| `recv.h` | `TransferReceiveSession::Done` | `:103-106` |
+| `recv.h` | `TransferReceiveSession::IsDraining` | `:120-123` |
+| `recv.cc` | `TransferReceiveSession::TryBeginOp` | `:541-552` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:475-490` |
+| `recv.cc` | `TransferReceiveSession::Finish` | `:492-495` |
+| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:528-539` |
+| `recv.cc` | `TransferReceiveSession::EndOp` | `:554-557` |
+| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:566-572` |
+| `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` | `:581-606` |
+| `recv.cc` | `TransferReceiveSession::RecordBlockShards` | `:712-761` |
+| `recv.cc` | `TransferReceiveSession::OnDataReceived` | `:804-823` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`dispatched_layers_.insert(layer_idx);`) | `:977` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:854-986` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:922-971` |
+| `block_transport_session_test.cc` | `MockSessionDelegate` | `:46-143` |
+| `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` | `:145-183` |
+| `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.Cancel` | `:185-204` |
+| `block_transport_test.cc` | `MockDelegate` | `:215-407` |
+| `block_transport_test.cc` | `MultiSenderReceiverDelegate` | `:451-470` |
+| `block_transport_test.cc` | `BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool` | `:897-927` |
+| `block_transport_test.cc` | `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender` | `:1106-1152` |
+| `block_transport_test.cc` | `BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism` | `:1154-1190` |
+| `block_transport_test.cc` | `BlockTransportTest.SenderOverDeliveryIsRejected` | `:1192-1229` |
+| `block_transport_test.cc` | `BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected` | `:1231-1264` |
+| `block_transport_test.cc` | `BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion` | `:1266-1300` |
+| `block_transport_test.cc` | `BlockTransportTest.ForgetPushProgressAllowsUuidReuse` | `:1302-1334` |
+| `block_transport_test.cc` | `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires` | `:1336-1375` |
+| `block_transport_test.cc` | `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration` | `:1377-1404` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.get_session =`) | `:306` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |
+| `base.cc` | `KVCacheManagerBase::GetSession` | `:3070-3076` |
+| `base.cc` | `KVCacheManagerBase::GetTransferPlan` | `:3078-3088` |
+| `base.cc` | `KVCacheManagerBase::OnLayerReceived` | `:3334-3343` |
+| `base.cc` | `KVCacheManagerBase::OnBlockShardsReceived` | `:3312-3330` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:627-706` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:827-873` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_descriptors)` | `:909-935` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:937-1069` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`if (auto recv =` .. `absl::DeadlineExceededError("Transfer session timed out"));`) | `:1083-1095` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:701-729` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:3101-3109` |
 | `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::ExpectedPushSenders` | `:273-279` |
 | `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::ResolvePlanBlockChunks` (`if (sender_node_id != -1) {` .. `auto schedule_found_it = sender_node_id != -1`) | `:407-428` |
 | `coord.cc` | `ReshardCoordinator::RunSubPlan` (`std::vector<absl::Status> arm_status` .. `for (std::thread& t : armers) t.join();`) | `:743-776` |
 | `planner.cc` | `BuildPoolReshardPlan` (`std::map<int64_t, RaidenId> ranks;` .. `++expected_rank;`) | `:966-981` |
 | `tpu_sync/core/controller/worker_registry.cc` | `WorkerRegistry::RegisterWorker` (`if (entry.node_id != 0)`) | `:63-73` |
-| `tpu_sync/kv_cache/host_offload_backend.cc` | `HostOffloadBackend::ComposeKVTransferSpec` | `:1420-1463` |
+| `tpu_sync/kv_cache/host_offload_backend.cc` | `HostOffloadBackend::ComposeKVTransferSpec` | `:1552-1595` |
 | `tpu_sync/kv_cache/kv_cache_listener.cc` | `KVCacheListener::HandleControlRequest` (`absl::Status status = callbacks_.register_active_plan(` .. `(*resp->mutable_receiver_pool_addrs())[static_cast<int32_t>(l)] =`) | `:188-201` |
 | `tpu_sync/rpc/raiden_service.proto` | `StartTransferRequest` (`map<int32, ShardPushScheduleProto> shard_push_schedules`) | `:180` |
 <!-- source-map:end -->

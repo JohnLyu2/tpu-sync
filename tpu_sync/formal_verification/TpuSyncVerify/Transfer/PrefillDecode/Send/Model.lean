@@ -175,7 +175,8 @@ def cancel (s : Send) : Option Send := some (s.finish false)
 
 /-- `CompleteReadWithDetails` / `CompleteReadRaw` publishes a settled session
 (`RetireSettledSessionLocked`: `if (!send->Done()) return false;`, then
-`(failed ? failed_recving_ : done_sending_).insert(send->req_id());`). -/
+`(failed ? failed_recving_ : done_sending_).insert(req_id);` under the
+`req_id` the manager keeps with the session in `SessionEntry`). -/
 def publish (s : Send) : Option Send :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }

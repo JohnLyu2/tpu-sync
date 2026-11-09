@@ -76,55 +76,55 @@ What this module proves:
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |------|-----------------|-------|
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:69-146` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` | `:148-351` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`const int64_t parallelism = plan.parallelism();`) | `:190` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)`) | `:247-260` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:288-307` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:316-321` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:330-341` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:235-312` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` | `:314-517` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`const int64_t parallelism = plan.parallelism();`) | `:356` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)`) | `:413-426` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:454-473` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:482-487` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:496-507` |
 | `planner.h` | `*` (`inline constexpr char kTransferStreamsEnvVar[]`) | `:163` |
 | `planner.cc` | `ValidateSpanCoverage` | `:350-487` |
 | `planner.cc` | `EmitSpanSchedule` | `:503-607` |
 | `planner.cc` | `DefaultTransferStreams` | `:611-628` |
 | `planner.cc` | `BuildPoolReshardPlan` (`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`) | `:984-994` |
 | `planner.cc` | `BuildPoolReshardPlan` (`expected_pushes_by_dst;` .. `if (expected_pushes_by_dst.at(dst_unit_id) <= 0)`) | `:1234-1246` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`for (size_t pool_idx : ordered_pools)` .. `if (pool_src_block_ids.empty())`) | `:322-334` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:398-501` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`for (size_t pool_idx : ordered_pools)` .. `if (pool_src_block_ids.empty())`) | `:480-492` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:556-659` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:446-450` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:526-695` |
-| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:582-612` |
-| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2736-2745` |
-| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2747-2755` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:467-471` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:572-602` |
+| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:3090-3099` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:3101-3109` |
 | `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::GetPoolPushProgressSpec` | `:241-271` |
 | `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::ExpectedPushSenders` | `:273-279` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:248-276` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:299-310` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:312-323` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsShortCoverage` | `:325-335` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsNonPrefixExtents` | `:337-351` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingExtents` | `:353-362` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingParallelism` | `:364-373` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:375-384` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:386-424` |
-| `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:237-284` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:259-284` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:303-313` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:315-325` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsShortCoverage` | `:327-336` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsNonPrefixExtents` | `:338-351` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingExtents` | `:353-361` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingParallelism` | `:363-371` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:373-381` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:383-418` |
+| `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:279-326` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.SingleDestinationIsPoolsTimesOnePeer` | `:49-55` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ReplicatedDestinationsIsPoolsTimesPeers` | `:57-65` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ShardedGroupCountsOnlyItsPeers` | `:67-76` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.GroupWithoutEntriesContributesNoSlot` | `:78-83` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.EmptyScheduleHasNoSlots` | `:85-89` |
-| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:1982-2047` |
-| `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2168-2181` |
-| `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2210-2242` |
+| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:2023-2088` |
+| `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2209-2222` |
+| `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2251-2283` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.UnsetEmptyOrZeroKeepsOneStreamPerSourceRank` | `:59-72` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.PositiveValueCapsStreamsWithinAdmission` | `:74-87` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsUnparsableValueNamingVariableAndValue` | `:89-95` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsNegativeValueNamingVariableAndValue` | `:97-103` |
-| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2284-2304` |
-| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2306-2326` |
-| `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2328-2345` |
-| `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2347-2362` |
+| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2325-2345` |
+| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2347-2367` |
+| `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2369-2386` |
+| `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2388-2403` |
 <!-- source-map:end -->
 -/
 
