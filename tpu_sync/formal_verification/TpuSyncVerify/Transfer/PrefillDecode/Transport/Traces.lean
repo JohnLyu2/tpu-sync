@@ -361,7 +361,9 @@ is not an event (`Transport.lean` §"Lock scopes"). The plan-declared pool
 contract (`BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
 `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
 `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration`) is
-`Reshard/Pipeline.lean`'s `landStream`, and `PeregrineRecvCompleteTest` and
+`Reshard/Pipeline.lean`'s `landStream`, and `PeregrineRecvCompleteTest`,
+`TransportBackendTest.ExplicitPushOverPeregrineIsReceiverResolved`,
+`TransportBackendTest.AllLayerPushOverPeregrineWithUuidZero` and
 `BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` exercise
 `OnPeregrinePostComplete` and the `is_peregrine = true` shard-bitmask branch of
 `CompleteIncomingPush` (`PeregrineRecvCompleteTest.RejectsSenderSession` the
@@ -369,7 +371,7 @@ contract (`BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
 contract of this model; `PeregrineResolveRecvBufferTest` and
 `PeregrineResolveRecvBufferLeaseTest` drive the Peregrine receive-buffer
 resolution and its op lease (`ResolveRecvBuffer`), and `ValidateChunksTest`
-the payload bounds check (`ValidateChunks` against
+the 16-bit chunk-count cap and payload bounds check (`ValidateChunks` against
 `GetBlockArrayHostSpan`), which precede the table and are not events here. -/
 def notReplayable : List (String × String) :=
   [("BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism", "per-sender declarations (A3)"),
@@ -384,11 +386,13 @@ def notReplayable : List (String × String) :=
      "plan-declared pool contract (Reshard/Pipeline.lean)"),
    ("BlockTransportServerPushSessionTest.LifecycleAndPostCompletion",
      "OnPeregrinePostComplete and is_peregrine = true branch"),
+   ("TransportBackendTest.ExplicitPushOverPeregrineIsReceiverResolved / AllLayerPushOverPeregrineWithUuidZero (2 tests)",
+     "end-to-end opt-in Peregrine kBlockPushExplicit pushes (is_peregrine = true)"),
    ("PeregrineRecvCompleteTest.* (10 tests)",
      "OnPeregrinePostComplete and is_peregrine = true shard-bitmask branch"),
    ("PeregrineResolveRecvBufferTest.* / PeregrineResolveRecvBufferLeaseTest.* (10 tests)",
      "Peregrine ResolveRecvBuffer and its op lease"),
-   ("ValidateChunksTest.* (3 tests)", "payload bounds check before the table")]
+   ("ValidateChunksTest.* (4 tests)", "chunk-count cap and payload bounds check before the table")]
 
 -- Every paired and model-only trace runs to its end.
 #guard (paired ++ modelOnly).all fun (_, c, tr) => ((sys c).run tr).isSome

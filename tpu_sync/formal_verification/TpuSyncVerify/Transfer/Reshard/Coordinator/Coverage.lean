@@ -234,10 +234,14 @@ def paired : List (String × CoordState × List Ev) :=
 
 /-- `(upstream test, initial state, trace, refused event)`:
 `ReshardStackTest.MissingRegistrationKeepsContractString` plans with no producer
-registered, and `LookupAndClaim` refuses the claim before anything else happens. -/
+registered, and `ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl`
+plans with only rank `0` of `[0, 1]` registered; in both cases `LookupAndClaim`
+refuses the claim before anything else happens. -/
 def refused : List (String × CoordState × List Ev × Ev) :=
   [("ReshardStackTest.MissingRegistrationKeepsContractString", CoordState.init [0] [10] 101, [],
-     .startPlan true)]
+     .startPlan true),
+   ("ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl",
+     CoordState.init [0, 1] [10] 101, [.registerProducer 0], .startPlan true)]
 
 /-- Remaining tests in `reshard_service_test.cc` outside the single-`RunSubPlan`
 (`index == 0`, `plan.src_units = request.src_units`) coordinator scope. -/
@@ -256,6 +260,8 @@ def notReplayable : List (String × String) :=
       "multi-window chain (index > 0 arm failure without AbandonClaim); registry claim replayed in Registry/Coverage.lean"),
    ("ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim",
       "pipelined stage filters plan.src_units to 1 of 2 claimed request.src_units; shared claim replayed in Registry/Coverage.lean"),
+   ("ReshardStackTest.ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion",
+      "pipelined stage filters plan.src_units to 1 of 2 claimed request.src_units across TTL advance; shared claim and completion votes replayed in Registry/Coverage.lean"),
    ("ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace",
       "same pipelined plan.src_units ⊊ request.src_units filter on stage 0 and stage 1's retry; multi-owner claim rollback replayed in Registry/Coverage.lean"),
    ("ReshardStackTest.AbandoningTheLastStageFreesTheClaim",

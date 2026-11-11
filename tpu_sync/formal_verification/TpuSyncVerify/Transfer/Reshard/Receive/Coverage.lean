@@ -140,13 +140,14 @@ events of this model, with the trace each one replays. Two fixtures make the
 upload path run on CPU: `FakeH2dBase` in `reshard_receive_session_test.cc`
 (every `H2dPoolBlocks` returns a future that is already OK) and `FakeH2dBase`
 in `kv_cache_manager_with_transfer_pool_reshard_test.cc`, whose
-`TestManager::FinishPoolReshardRecvPool` leases the pool's buffer
-(`ResolveStagingSlot`), calls `OnDataReceived(pool_idx, {}, {})` and returns a
-future already resolved with the status armed by `ArmPoolUpload`. A ready
-future runs `future.OnReady` inline, so `h2dReady p` and `h2dDone p _` follow
-`h2dIssue p true` at once. `modelOnly` holds the traces in `Traces.lean` that
-no upstream test drives (the rank wave, the batch launch, cancellation between
-the locks, and the push-framed halves of the validation traces). -/
+`TestManager::FinishPoolReshardRecvPool` resolves the pool's buffer
+(`ResolveStagingSlot`, the pool's own storage on this full host mirror; the
+helper also tolerates `NotFound`), calls `OnDataReceived(pool_idx, {}, {})` and
+returns a future already resolved with the status armed by `ArmPoolUpload`. A
+ready future runs `future.OnReady` inline, so `h2dReady p` and `h2dDone p _`
+follow `h2dIssue p true` at once. `modelOnly` holds the traces in `Traces.lean`
+that no upstream test drives (the rank wave, the batch launch, cancellation
+between the locks, and the push-framed halves of the validation traces). -/
 
 /-- One pool landed and uploaded OK through `FinishPoolReshardRecvPool`. -/
 def tr_pool_upload_ok : List Ev := tr_duration_ok.take 4
@@ -180,6 +181,9 @@ def paired : List (String × Recv × List Ev) :=
       init [0, 0], [.cancel]),
    -- Pool 1 lands and uploads before pool 0 (both rank 0).
    ("ReshardReceiveSessionTest.OutOfOrderPoolArrivalResolvesLeasedHostBufferForValidation",
+      init [0, 0], [.onPoolReceived 1, .h2dIssue 1 true, .h2dReady 1, .h2dDone 1 true,
+                    .onPoolReceived 0, .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true]),
+   ("ReshardReceiveSessionTest.FullHostMirrorAddressesPoolsInPlace",
       init [0, 0], [.onPoolReceived 1, .h2dIssue 1 true, .h2dReady 1, .h2dDone 1 true,
                     .onPoolReceived 0, .h2dIssue 0 true, .h2dReady 0, .h2dDone 0 true]),
    -- A real two-pool reshard over TCP: each pool's only push stream lands it
@@ -244,7 +248,7 @@ reachable branch:
   the last pool completing) calls `Finish` in the same step, so a finalizing
   session is draining and the per-pool re-check releases the op first.
 
-The fourteen upstream traces in `paired` reach **13 of 36**: `pushBegin`,
+The fifteen upstream traces in `paired` reach **13 of 36**: `pushBegin`,
 `pushEndOk` (no effect; settles), `pushEndFail` (drains, settles, errors),
 `poolReceivedLaunches`, `h2dIssueOk`, `h2dReady`, `h2dDoneMore` (no effect),
 `h2dDoneLast` (drains, settles; drains with a push open), `h2dDoneFail`

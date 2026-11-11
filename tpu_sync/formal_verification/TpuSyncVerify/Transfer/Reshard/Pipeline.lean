@@ -65,6 +65,15 @@ padding on an aliased page), or `.blank` (never written on the wire).
 | `dstStaging` | receiver `PoolStagingStorage` (`ReshardReceiveSession::AcquireStagingLeases`) | `landStream p` (`BlockTransportServerPushSession::StartStream`), `reseatDstStaging` |
 | `dstHbm`     | consumer KV cache in destination HBM (`ReshardReceiveSession::ExecuteEligiblePoolH2ds` / `FinishPoolH2d`) | `recv (.h2dDone p true)` via `writePoolHbm` |
 
+`srcStaging` and `dstStaging` are indexed per pool `p` (disjoint host bytes
+across pools): under bounded host layer staging (`num_staging_layers <
+num_layers`) each active pool leases its own host layer buffer from
+`StagingLayerManager`, whereas on a full host mirror (`!HostLayersBounded()`)
+each pool stages in place in `StaticHostLayer(pool_idx) = pool->storage_index`,
+so per-pool host cells assume concurrent pools do not share overlapping byte
+extents on the same `(storage_index, block_id)` (e.g. separate `storage_index`,
+disjoint sub-block regions such as `conv` and `ssm`, or disjoint block IDs).
+
 ### Modelling aliased device pages (`writePoolHbm`)
 
 On hybrid attention + state arenas (`D2hPoolBlocks` / `H2dPoolBlocks` in
@@ -106,26 +115,26 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `reshard_send.cc` | `ReshardSendSession::Start` | `:401-438` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` | `:440-554` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:556-659` |
-| `reshard_send.cc` | `ReshardSendSession::EndOp` | `:716-744` |
-| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:753-760` |
+| `reshard_send.cc` | `ReshardSendSession::Start` | `:430-467` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` | `:469-583` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:585-688` |
+| `reshard_send.cc` | `ReshardSendSession::EndOp` | `:745-773` |
+| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:782-789` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `reshard_recv.cc` | `ReshardReceiveSession` (`absl::flat_hash_map<size_t, int> pool_order_ranks_`) | `:213` |
+| `reshard_recv.cc` | `ReshardReceiveSession` (`absl::flat_hash_map<size_t, int> pool_order_ranks_`) | `:234` |
 | `reshard_recv.cc` | `ReshardReceiveSession::OnDataReceived` | `:127-134` |
-| `reshard_recv.cc` | `CreateReshardReceiveSession` | `:519-553` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:581-620` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:622-627` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:719-730` |
-| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:732-761` |
-| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:778-789` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:791-855` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:857-893` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:443-452` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:467-471` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:766-876` |
+| `reshard_recv.cc` | `CreateReshardReceiveSession` | `:540-574` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:603-642` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:644-649` |
+| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:751-762` |
+| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:764-793` |
+| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:810-821` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:823-887` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:889-925` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:459-468` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:473-477` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:724-893` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:772-882` |
 | `bts.cc` | `BeginIncomingPush` | `:242-256` |
 | `bts.cc` | `EndIncomingPush` | `:258-271` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |
@@ -136,7 +145,7 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:638-647` |
 | `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:741-877` |
 | `utils.h` | `ValidateCommonPoolReshardPlan` (`if (plan.transfer_pool_indices().empty())` .. `if (group.expected_pushes() <= 0)`) | `:367-377` |
-| `reshard_send_test.cc` | `RecordingH2dReceiverBase` | `:829-886` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks` | `:888-948` |
+| `reshard_send_test.cc` | `RecordingH2dReceiverBase` | `:845-902` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks` | `:904-964` |
 <!-- source-map:end -->
 -/

@@ -176,6 +176,9 @@ def paired : List (String × Send × List Ev) :=
       init [2], [.d2hIssue 0 true, .execFinish, .d2hDone 0 true, .pushDone 0 true, .pushDone 0 true]),
    ("ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks",
       init [1, 1], [.d2hIssue 0 true, .d2hDone 0 true, .d2hIssue 1 true, .d2hDone 1 true,
+                    .execFinish, .pushDone 0 true, .pushDone 1 true]),
+   ("ReshardSendSessionTest.FullHostMirrorStagesPoolsInPlace",
+      init [1, 1], [.d2hIssue 0 true, .d2hDone 0 true, .d2hIssue 1 true, .d2hDone 1 true,
                     .execFinish, .pushDone 0 true, .pushDone 1 true])]
 
 def modelOnly : List (String × Send × List Ev) :=
@@ -210,7 +213,7 @@ idle session here: `init` already holds `Start`'s caller op, `Send` A2; and it
 never changes the status of a finalizing session, `Finish`'s
 `if (done_ || finalizing_) return;`.)
 
-The nine upstream traces in `paired` reach **10 of 26**: `d2hIssueOk`,
+The ten upstream traces in `paired` reach **10 of 26**: `d2hIssueOk`,
 `d2hDoneStartsPushes`, `d2hDoneQuiesced` (settles), `execFinish` (no effect),
 `pushDoneMore`, `pushDoneLast` (drains, settles), `cancel` (drains, errors),
 `startFail` (drains, settles, errors), `d2hIssueFail` (drains, errors) and

@@ -192,15 +192,21 @@ sets `done_` (after which `plan()` is empty) in the same scope.
 flips `status_` to the error (`cancel` has no `!draining` guard).
 
 **Bounded host layer staging.** The model omits host layer buffer leases: each
-declared pool transitions independently, corresponding to
-`KVCacheManagerBase::num_host_layers()` being at least the plan's transferred
-pool count (for one pool per storage, the default
-`num_host_layers() == num_layers()` mirror; `num_staging_layers` bounds
-`num_host_layers()`, and a multi-tag plan whose pools share storages can exceed
-`num_layers()` even on the full mirror). In C++, `ReshardReceiveSession`
-constructs its `StagingLayerManager` (`session.h`) with `num_host_layers()`
-slots and leases one buffer per pool index unconditionally: each incoming push
-chunk's `KVCacheManagerBase::GetBlockChunks` (inside the push's op, from
+declared pool transitions independently. On a full host mirror
+(`!HostLayersBounded()`, i.e. `num_host_layers() == num_layers()`, the default
+when `num_staging_layers` is unset), `ReshardReceiveSession` constructs its
+`StagingLayerManager` (`session.h`) with `0` slots and both
+`AcquireStagingSlot` and `LookupStagingSlot` return `StaticHostLayer(pool_idx)`
+(`base_->pool(pool_idx)->storage_index`, for explicit and implicit pools alike
+since `KVCacheManagerBase::pool` materializes the implicit table; `NotFound`
+only for a `pool_idx` outside the pool table, which `ValidatePlan` rejects),
+staging every pool in place in its own storage's host buffer with
+no slot wait (`ReshardReceiveSessionTest.FullHostMirrorAddressesPoolsInPlace`).
+When host layers are bounded (`HostLayersBounded()`,
+`num_host_layers() < num_layers()` under `num_staging_layers`),
+`ReshardReceiveSession` constructs `staging_layer_manager_` with
+`num_host_layers()` slots and leases one buffer per pool index: each incoming
+push chunk's `KVCacheManagerBase::GetBlockChunks` (inside the push's op, from
 `StartStream`'s payload loop) calls `session->ResolveStagingSlot(layer_idx)` →
 `ReshardReceiveSession::AcquireStagingSlot`, which takes an op of its own
 (`if (done_ || draining_)` refusal, `++in_flight_`, the pattern of
@@ -215,22 +221,23 @@ with `FailedPrecondition` if the pool holds none and `Cancelled` on a draining
 session) and dispatches with it as `host_layer_idx`; the buffer is returned on
 each early return, by the H2D callback (`staging_layer_manager_.Release(pool_idx)`
 around `FinishPoolH2d`), and wholesale at settle (`ReleaseStagingLocked` →
-`ReleaseAll()`). None of the safety invariants (`Safe`) changes when pools
-outnumber `num_host_layers()`: the extra op is nested inside the push's op on
-the push thread (taken after `pushBegin`, ended before the stream's
-`CompleteIncomingPush` and `EndIncomingPush`), so `in_flight_` is transiently
-one higher while `pushes > 0` already holds and every settle decision is the
-one the model makes; a timeout fails the receive, which is `cancel` before
-`pushEnd` (the unguarded `cancel` admits it), and a cancelled wait or a failed
-`Lookup` fails the stream or the upload on a session that is already draining
-(`pushEnd false`, `h2dIssue p false` with `reshard_finalizing_` or the re-check
-first). Progress without hitting `deadline_` is narrower when transferred pools
-exceed `num_host_layers()`: on a single `order_rank`, later pools wait behind
-earlier pools' uploads, whereas across multiple `order_rank`s, gated
-higher-rank pools whose first chunks arrive early can hold every buffer while a
-lower-rank pool's push thread blocks in `StagingLayerManager::Acquire` until
-`deadline_` fails the receive (`FinishLocked(slot.status())`), which the
-slot-free model does not express (`ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease`
+`ReleaseAll()`). None of the safety invariants (`Safe`) changes under bounded
+host layer staging when pools outnumber `num_host_layers()`: the extra op is
+nested inside the push's op on the push thread (taken after `pushBegin`, ended
+before the stream's `CompleteIncomingPush` and `EndIncomingPush`), so
+`in_flight_` is transiently one higher while `pushes > 0` already holds and
+every settle decision is the one the model makes; a timeout fails the receive,
+which is `cancel` before `pushEnd` (the unguarded `cancel` admits it), and a
+cancelled wait or a failed `Lookup` fails the stream or the upload on a session
+that is already draining (`pushEnd false`, `h2dIssue p false` with
+`reshard_finalizing_` or the re-check first). Progress without hitting
+`deadline_` is narrower when `HostLayersBounded()` and transferred pools exceed
+`num_host_layers()`: on a single `order_rank`, later pools wait behind earlier
+pools' uploads, whereas across multiple `order_rank`s, gated higher-rank pools
+whose first chunks arrive early can hold every buffer while a lower-rank pool's
+push thread blocks in `StagingLayerManager::Acquire` until `deadline_` fails
+the receive (`FinishLocked(slot.status())`), which the slot-free model does not
+express (`ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease`
 drives the wait through `ResolveStagingSlot` on a second thread, releases it by
 completing the first pool through `OnDataReceived` on a `FakeH2dBase` whose
 uploads finish at once, then the cancel and, on a second session, the timeout;
@@ -320,34 +327,36 @@ Generated by `tools/resolve_anchors.py`.
 | `reshard_recv.cc` | `ReshardReceiveSession::IsDraining` | `:115-118` |
 | `reshard_recv.cc` | `ReshardReceiveSession::deadline` | `:120-122` |
 | `reshard_recv.cc` | `ReshardReceiveSession::OnDataReceived` | `:127-134` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ResolveStagingSlot` | `:142-144` |
-| `reshard_recv.cc` | `ReshardReceiveSession::plan` | `:146-151` |
-| `reshard_recv.cc` | `ReshardReceiveSession` (`bool staging_released_` .. `std::atomic<bool> cancelled_`) | `:199-220` |
-| `reshard_recv.cc` | `RecordTransferDuration` | `:228-231` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:235-312` |
-| `reshard_recv.cc` | `CreateReshardReceiveSession` | `:519-553` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReshardReceiveSession` | `:555-579` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:581-620` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:622-627` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStaging` | `:629-632` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishLocked` | `:634-646` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingSlot` | `:648-672` |
-| `reshard_recv.cc` | `ReshardReceiveSession::LookupStagingSlot` | `:674-689` |
-| `reshard_recv.cc` | `ReshardReceiveSession::Finish` | `:691-694` |
-| `reshard_recv.cc` | `ReshardReceiveSession::EndRecvOpLocked` | `:702-712` |
-| `reshard_recv.cc` | `ReshardReceiveSession::EndOp` | `:714-717` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:719-730` |
-| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:732-761` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolH2dResultLocked` | `:763-776` |
-| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:778-789` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:791-855` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`to_launch = CollectEligiblePoolH2dsLocked();` .. `in_flight_ += static_cast<int32_t>(to_launch.size());`) | `:798-799` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`EndRecvOpLocked();`) | `:812` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`absl::StatusOr<size_t> slot = LookupStagingSlot(pool_idx);`) | `:826` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`future.OnReady`) | `:843-853` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:857-893` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`finished = RecordPoolH2dResultLocked(pool_idx, status);`) | `:865` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`should_record_duration = true;` .. `Finish(terminal_status);`) | `:884-887` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ResolveStagingSlot` | `:143-145` |
+| `reshard_recv.cc` | `ReshardReceiveSession::HostLayersBounded` | `:167-169` |
+| `reshard_recv.cc` | `ReshardReceiveSession::StaticHostLayer` | `:177-185` |
+| `reshard_recv.cc` | `ReshardReceiveSession::plan` | `:147-152` |
+| `reshard_recv.cc` | `ReshardReceiveSession` (`bool staging_released_` .. `std::atomic<bool> cancelled_`) | `:220-241` |
+| `reshard_recv.cc` | `RecordTransferDuration` | `:249-252` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:256-333` |
+| `reshard_recv.cc` | `CreateReshardReceiveSession` | `:540-574` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReshardReceiveSession` | `:576-601` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:603-642` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:644-649` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStaging` | `:651-654` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishLocked` | `:656-668` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingSlot` | `:670-701` |
+| `reshard_recv.cc` | `ReshardReceiveSession::LookupStagingSlot` | `:703-721` |
+| `reshard_recv.cc` | `ReshardReceiveSession::Finish` | `:723-726` |
+| `reshard_recv.cc` | `ReshardReceiveSession::EndRecvOpLocked` | `:734-744` |
+| `reshard_recv.cc` | `ReshardReceiveSession::EndOp` | `:746-749` |
+| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:751-762` |
+| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:764-793` |
+| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolH2dResultLocked` | `:795-808` |
+| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:810-821` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:823-887` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`to_launch = CollectEligiblePoolH2dsLocked();` .. `in_flight_ += static_cast<int32_t>(to_launch.size());`) | `:830-831` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`EndRecvOpLocked();`) | `:844` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`absl::StatusOr<size_t> slot = LookupStagingSlot(pool_idx);`) | `:858` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`future.OnReady`) | `:875-885` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:889-925` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`finished = RecordPoolH2dResultLocked(pool_idx, status);`) | `:897` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`should_record_duration = true;` .. `Finish(terminal_status);`) | `:916-919` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` | `:304-308` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, entry] : sessions_)`) | `:398-402` |
@@ -357,52 +366,53 @@ Generated by `tools/resolve_anchors.py`.
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`} else if (session->deadline() <= now) {` .. `absl::DeadlineExceededError("Transfer session timed out"));`) | `:1089-1095` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (uint64_t uuid : retired_uuids)` .. `base_->ReleasePoolStagingLeases(uuid);`) | `:1121-1125` |
 | `base.h` | `KVCacheManagerBase::AttachPlaceholderDeviceHoldForTest` | `:762` |
-| `base.cc` | `KVCacheManagerBase::GetTransferPlan` | `:3078-3088` |
-| `base.cc` | `KVCacheManagerBase::CopyPoolBlocks` | `:2906-3047` |
-| `base.cc` | `KVCacheManagerBase::H2dPoolBlocks` | `:3057-3063` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`absl::StatusOr<size_t> slot = absl::NotFoundError("session not found");` .. `} else if (!absl::IsNotFound(slot.status()) ||`) | `:3450-3456` |
+| `base.cc` | `KVCacheManagerBase::GetTransferPlan` | `:3079-3089` |
+| `base.cc` | `KVCacheManagerBase::CopyPoolBlocks` | `:2907-3048` |
+| `base.cc` | `KVCacheManagerBase::H2dPoolBlocks` | `:3058-3064` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`absl::StatusOr<size_t> slot = absl::NotFoundError("session not found");` .. `} else if (!absl::IsNotFound(slot.status()) ||`) | `:3451-3457` |
 | `raw_core.h` | `PjRtCopyFuture::OnReady` | `:514-568` |
 | `raw_core.h` | `IssueH2dShard` | `:687-715` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:443-452` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:459-468` |
 | `bts.cc` | `BeginIncomingPush` | `:242-256` |
 | `bts.cc` | `EndIncomingPush` | `:258-271` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:365-499` |
-| `bts.cc` | `BlockTransportServerPushSession::ResolveRecvBuffer` | `:504-622` |
-| `bts.cc` | `BlockTransportServerPushSession::OnPeregrinePostComplete` | `:657-707` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:718-887` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`ABSL_RETURN_IF_ERROR(session->OnDataReceived(` .. `l, /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));`) | `:880-881` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:371-505` |
+| `bts.cc` | `BlockTransportServerPushSession::ResolveRecvBuffer` | `:510-628` |
+| `bts.cc` | `BlockTransportServerPushSession::OnPeregrinePostComplete` | `:663-713` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:724-893` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`ABSL_RETURN_IF_ERROR(session->OnDataReceived(` .. `l, /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));`) | `:886-887` |
 | `utils.h` | `ValidateCommonPoolReshardPlan` | `:353-469` |
 | `utils.h` | `ValidatePoolBlockBounds` | `:473-489` |
-| `reshard_recv_test.cc` | `CreateStatus` | `:146-156` |
-| `reshard_recv_test.cc` | `FakeH2dBase` | `:160-183` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.AcceptsCanonicalPlanOnExplicitPools` | `:185-191` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.AcceptsImplicitPools` | `:193-198` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.HasNoTagPolicy` | `:200-206` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingIdentityAndPoolFields` | `:208-234` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsOutOfRangeDuplicateAndDtypeMismatch` | `:236-257` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsBlockIdsOutsideDeclaredPool` | `:286-301` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.GroupScopesDestinationBlocks` | `:420-451` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease` | `:453-529` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.OutOfOrderPoolArrivalResolvesLeasedHostBufferForValidation` | `:531-623` |
-| `reshard_send_test.cc` | `RecordingH2dReceiverBase` | `:829-886` |
-| `reshard_send_test.cc` | `ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks` | `:888-948` |
+| `reshard_recv_test.cc` | `CreateStatus` | `:150-160` |
+| `reshard_recv_test.cc` | `FakeH2dBase` | `:164-191` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.AcceptsCanonicalPlanOnExplicitPools` | `:193-199` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.AcceptsImplicitPools` | `:201-206` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.HasNoTagPolicy` | `:208-214` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingIdentityAndPoolFields` | `:216-242` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsOutOfRangeDuplicateAndDtypeMismatch` | `:244-265` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsBlockIdsOutsideDeclaredPool` | `:294-309` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.GroupScopesDestinationBlocks` | `:428-459` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.BoundedStagingSlotAcquisitionAndRelease` | `:461-537` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.OutOfOrderPoolArrivalResolvesLeasedHostBufferForValidation` | `:543-637` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.FullHostMirrorAddressesPoolsInPlace` | `:659-726` |
+| `reshard_send_test.cc` | `RecordingH2dReceiverBase` | `:845-902` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks` | `:904-964` |
 | `pool_reshard_test.cc` | `FakeH2dBase` | `:70-104` |
-| `pool_reshard_test.cc` | `TestManager::FinishPoolReshardRecvPool` | `:122-130` |
-| `pool_reshard_test.cc` | `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints` | `:359-375` |
-| `pool_reshard_test.cc` | `PoolReshardRecvTest.FinishPoolReshardRecvRecordsDurationMetric` | `:415-435` |
-| `pool_reshard_test.cc` | `PoolReshardRecvTest.FinishPoolReshardRecvDoesNotRecordMetricOnFailure` | `:437-455` |
-| `pool_reshard_test.cc` | `DeviceBackedTestBase` | `:685-698` |
-| `pool_reshard_test.cc` | `BoundedPoolTestManager` | `:700-711` |
-| `pool_reshard_test.cc` | `PoolStagingRecvRegistrationTest.DuplicatePoolRecvRegistrationKeepsOriginalStagingLease` | `:713-763` |
-| `pool_reshard_test.cc` | `PoolStagingRecvRegistrationTest.ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease` | `:765-821` |
-| `pool_reshard_test.cc` | `PoolStagingRecvRegistrationTest.StagingAcquireFailureReleasesUuidClaim` | `:823-853` |
-| `pool_reshard_test.cc` | `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline` | `:855-893` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan` | `:914-950` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce` | `:952-975` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.RetryUnderTheSameReqIdIsTrackedAsANewChain` | `:977-1020` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.StalledChainFailsAfterTheTransferTimeout` | `:1022-1044` |
-| `pool_reshard_test.cc` | `SubPlanChainTest.SinglePlanRequestsReportAtOnce` | `:1046-1058` |
-| `pool_reshard_test.cc` | `PoolReshardSessionLookupTest.GetSessionResolvesActiveReshardRecvUntilRetired` | `:1090-1122` |
-| `pool_reshard_test.cc` | `PoolReshardSessionLookupTest.PoolCompletionOnLegacyArmedReceiverFailsWithoutH2d` | `:1160-1184` |
+| `pool_reshard_test.cc` | `TestManager::FinishPoolReshardRecvPool` | `:122-132` |
+| `pool_reshard_test.cc` | `PoolReshardValidationTest.DeviceOnlyRejectionAtPublicEntryPoints` | `:361-377` |
+| `pool_reshard_test.cc` | `PoolReshardRecvTest.FinishPoolReshardRecvRecordsDurationMetric` | `:417-437` |
+| `pool_reshard_test.cc` | `PoolReshardRecvTest.FinishPoolReshardRecvDoesNotRecordMetricOnFailure` | `:439-457` |
+| `pool_reshard_test.cc` | `DeviceBackedTestBase` | `:687-700` |
+| `pool_reshard_test.cc` | `BoundedPoolTestManager` | `:702-713` |
+| `pool_reshard_test.cc` | `PoolStagingRecvRegistrationTest.DuplicatePoolRecvRegistrationKeepsOriginalStagingLease` | `:715-765` |
+| `pool_reshard_test.cc` | `PoolStagingRecvRegistrationTest.ConcurrentDuplicatePoolRecvRegistrationKeepsWinnerStagingLease` | `:767-823` |
+| `pool_reshard_test.cc` | `PoolStagingRecvRegistrationTest.StagingAcquireFailureReleasesUuidClaim` | `:825-855` |
+| `pool_reshard_test.cc` | `PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline` | `:857-895` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.ReceiveTerminalWaitsForTheLastSubPlan` | `:916-952` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.FirstSubPlanFailureFailsTheRequestOnce` | `:954-977` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.RetryUnderTheSameReqIdIsTrackedAsANewChain` | `:979-1022` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.StalledChainFailsAfterTheTransferTimeout` | `:1024-1046` |
+| `pool_reshard_test.cc` | `SubPlanChainTest.SinglePlanRequestsReportAtOnce` | `:1048-1060` |
+| `pool_reshard_test.cc` | `PoolReshardSessionLookupTest.GetSessionResolvesActiveReshardRecvUntilRetired` | `:1092-1124` |
+| `pool_reshard_test.cc` | `PoolReshardSessionLookupTest.PoolCompletionOnLegacyArmedReceiverFailsWithoutH2d` | `:1162-1186` |
 <!-- source-map:end -->
 -/

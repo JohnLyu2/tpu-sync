@@ -219,6 +219,8 @@ def tr_release_registered : List Ev := [.register 0 true, .register 1 true, .rel
 def tr_release_claimed_cancel : List Ev :=
   [.register 0 true, .lookupAndClaim 100 [0], .release, .cancelIfUnclaimed, .release]
 def tr_release_cancelled : List Ev := [.cancelIfUnclaimed, .release]
+def tr_claim_refreshes_ttl : List Ev :=
+  tr_claim_two ++ [.cancelIfUnclaimed, .lookupAndClaim 101 [0, 1], .complete 0, .complete 1]
 
 /-- `(upstream test, trace)`, all from `RegGen.init`. -/
 def paired : List (String × List Ev) :=
@@ -270,14 +272,21 @@ def paired : List (String × List Ev) :=
    ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState", tr_release_claimed_cancel),
    ("ReshardStackTest.ForcedReleaseClearsEveryLifecycleState", tr_release_cancelled),
    ("ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders", tr_arm_failure_retry_two),
-   ("ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm", tr_claim_two)]
+   ("ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm", tr_claim_two),
+   ("ReshardStackTest.ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion", tr_claim_refreshes_ttl),
+   ("ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl", [.register 0 true])]
 
 /-- `(upstream test, trace, refused event, arm)`: the refusals the tests assert
 after the trace. `TtlPurgesExpiredRegistrations`'s refusal follows a TTL purge
 (`purgeExpiredAll`), which is not an event, so it is checked on the purged state.
 `DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail`'s
 conflicting payload (bare `block_ids` for a unit registered with `pool_spans`)
-is an empty-blocks re-registration here, the model's one other payload. -/
+is an empty-blocks re-registration here, the model's one other payload.
+`ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion`'s refused
+registration names another `uuid` for the same `(req_id, unit)`
+(`current.uuid != uuid`, "Conflicting request block registration"); a second
+`uuid` is not an event of this one-generation model, so that refusal is not
+listed and the test's trace is in `paired` only. -/
 def refused : List (String × List Ev × Ev × Refusal) :=
   [("ReshardStackTest.CancelTombstoneBlocksLateRegistration", tr_cancel_fresh,
      .register 0 true, .registerLifecycle),
@@ -294,7 +303,9 @@ def refused : List (String × List Ev × Ev × Refusal) :=
    ("ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim", tr_claim_two,
      .abandonClaim 101, .abandonNotOwner),
    ("ReshardStackTest.CompletionNoOpsAndPreClaimGuard", [.register 0 true],
-     .complete 0, .completeBeforeClaim)]
+     .complete 0, .completeBeforeClaim),
+   ("ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl",
+     [.register 0 true], .lookupAndClaim 100 [0, 1], .claimMissingUnit)]
 
 /-- Remaining tests in `reshard_service_test.cc` whose stimulus does not reach a
 `RegGen.step` transition (plus `MissingRegistrationKeepsContractString` above,
@@ -322,8 +333,8 @@ def notReplayable : List (String × String) :=
 /-! ## Result
 
 The search exhausts the state space: **25 branches** (14 leaves × the status
-transitions each can make), every leaf of `Leaf` reachable. The 42 upstream
-tests in `paired` (48 traces) reach **all 25**, and every one of the seven
+transitions each can make), every leaf of `Leaf` reachable. The 44 upstream
+tests in `paired` (50 traces) reach **all 25**, and every one of the seven
 `Refusal` constructors is asserted (`registerLifecycle` on a tombstone and on a
 claimed generation, `registerConflict`, `claimCancelledOrEmpty` on a cancelled
 generation, `claimIncompatible`, `claimMissingUnit`, `abandonNotOwner`,
