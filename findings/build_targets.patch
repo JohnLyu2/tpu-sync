@@ -29,10 +29,10 @@ index 5ce8a7ce..f1f62d67 100644
 +    ],
 +)
 diff --git a/tpu_sync/frameworks/jax/BUILD b/tpu_sync/frameworks/jax/BUILD
-index a88ac487..f80746cd 100644
+index 79ef7e74..0d2266b2 100644
 --- a/tpu_sync/frameworks/jax/BUILD
 +++ b/tpu_sync/frameworks/jax/BUILD
-@@ -908,3 +908,26 @@ cc_test(
+@@ -912,3 +912,26 @@ cc_test(
          "@xla//xla/tsl/platform:test_main",
      ],
  )
@@ -60,10 +60,10 @@ index a88ac487..f80746cd 100644
 +    ],
 +)
 diff --git a/tpu_sync/kv_cache/BUILD b/tpu_sync/kv_cache/BUILD
-index a74c2afc..7fed71cb 100644
+index 6d4abd41..1b71cc77 100644
 --- a/tpu_sync/kv_cache/BUILD
 +++ b/tpu_sync/kv_cache/BUILD
-@@ -1387,3 +1387,332 @@ cc_library(
+@@ -1391,3 +1391,340 @@ cc_library(
          "@com_google_absl//absl/types:span",
      ],
  )
@@ -198,12 +198,20 @@ index a74c2afc..7fed71cb 100644
 +        ":kv_cache_manager_base",
 +        ":kv_cache_manager_with_transfer",
 +        ":pool_layout",
++        "//tpu_sync/core:raw_transfer_core",
 +        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "//tpu_sync/transport:block_transport_delegate",
 +        "//tpu_sync/transport:transfer_session",
++        "@com_google_absl//absl/base:core_headers",
++        "@com_google_absl//absl/container:flat_hash_map",
 +        "@com_google_absl//absl/status",
 +        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/synchronization",
 +        "@com_google_absl//absl/time",
++        "@com_google_absl//absl/types:span",
 +        "@com_google_googletest//:gtest_main",
++        "@xla//xla:future",
 +    ],
 +)
 +
