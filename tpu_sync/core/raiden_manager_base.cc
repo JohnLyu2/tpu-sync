@@ -30,14 +30,17 @@
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "grpcpp/impl/service_type.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "tpu_sync/common/trace.h"
@@ -129,6 +132,20 @@ void RaidenManagerBase::StopTransportServer() {
   if (server_) {
     server_.reset();
   }
+}
+
+grpc::Service* RaidenManagerBase::peregrine_control_service() {
+  absl::MutexLock lock(server_init_mu_);
+  CHECK(server_ != nullptr)
+      << "peregrine_control_service() called after StopTransportServer()";
+  return server_->peregrine_control_service();
+}
+
+bool RaidenManagerBase::psp_tcp_required() const {
+  absl::MutexLock lock(server_init_mu_);
+  CHECK(server_ != nullptr)
+      << "psp_tcp_required() called after StopTransportServer()";
+  return server_->require_psp_tcp();
 }
 
 xla::Future<> RaidenManagerBase::ForEachShardNumaLocal(
@@ -370,6 +387,37 @@ const uint8_t* RaidenManagerBase::GetHostPointer(size_t layer_idx,
   }
   size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
   return layers_[layer_idx].shards[local_idx].host_ptr;
+}
+
+absl::StatusOr<absl::Span<const uint8_t>> RaidenManagerBase::GetHostBuffer(
+    size_t layer_idx, size_t shard_idx) const {
+  if (layer_idx >= layers_.size()) {
+    return absl::OutOfRangeError(absl::StrCat("layer_idx ", layer_idx,
+                                              " out of range: ", layers_.size(),
+                                              " host layers"));
+  }
+  if (layers_[layer_idx].shards.empty()) {
+    return absl::OutOfRangeError(absl::StrCat("shard_idx ", shard_idx,
+                                              " out of range: layer ",
+                                              layer_idx, " has no shards"));
+  }
+  // Virtual dispatch keeps subclass shard remapping (WeightSynchronizerBase).
+  const uint8_t* host_ptr = GetHostPointer(layer_idx, shard_idx);
+  if (host_ptr == nullptr) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "layer ", layer_idx, " shard ", shard_idx, " has no host buffer"));
+  }
+  return absl::Span<const uint8_t>(host_ptr, GetHostSize(layer_idx, shard_idx));
+}
+
+absl::StatusOr<absl::Span<uint8_t>> RaidenManagerBase::GetHostBuffer(
+    size_t layer_idx, size_t shard_idx) {
+  ABSL_ASSIGN_OR_RETURN(
+      absl::Span<const uint8_t> host_buffer,
+      std::as_const(*this).GetHostBuffer(layer_idx, shard_idx));
+  // The span views manager-owned mutable staging memory.
+  return absl::Span<uint8_t>(const_cast<uint8_t*>(host_buffer.data()),
+                             host_buffer.size());
 }
 
 void RaidenManagerBase::SetExternalHostPointers(
