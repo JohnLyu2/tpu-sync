@@ -63,13 +63,16 @@ here.
 | `transfer_receive_late_finish_bughunt_test.cc` | F14 (`RecvLateFinishBughunt`): 1 control (`TransferSendSession`) + 4 failing cases driving `end_incoming_push`, `UnregisterActivePlan`, `ExecutePullRequest` `on_response`, and `ReshardReceiveSession` directly (entry points renamed at `56a0269d`; needs porting), where a late `Finish(error)` after every H2D completed OK flips `completions.received` to `completions.failed` (in production only the `on_response` path and a photo-finish deadline-sweep race reach it; see §F14) |
 | `reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc` | F15 (`ReshardRecvStagingSlotRankDeadlock`): 1 control (two host layer buffers for two pools: the rank-0 pool's first chunk resolves at once) + 1 failing case (one buffer: the rank-1 pool's first chunk takes it, its H2D is rank-gated, the rank-0 pool's first chunk blocks in `StagingLayerManager::Acquire` until `deadline_` and the receive fails `DEADLINE_EXCEEDED`); no device copy is issued, so it runs on CPU at `56a0269d` and, with `OnPoolReceived` → `OnLayerReceived` ported (2026-11-09), at `00e946e3` |
 | `kv_transfer_uuid_and_reshard_push_bughunt_test.cc` | F16 (`UuidRetirementBughunt`: 1 control + 3 failing cases covering `StartRead` inline retirement, `RegisterRecv` inline retirement, and `CompleteReadWithDetails`'s dead `std::erase_if` + unlocked `ForgetPushProgress(uuid)` race, each publishing silent corrupt `completions.received` with layer 0's HBM block unwritten) and F17 (`PoolReshardPushDuplicateUuidBughunt`: 1 control + 1 failing case where concurrent duplicate-UUID `PoolReshardPush` calls both succeed, overwrite `sessions_[uuid]`, and free the shared 1-slot `PoolStagingStorage` lease while the sibling push is still streaming, aliasing the slot to an unrelated transfer); runs on CPU at `56a0269d` and unchanged at `00e946e3` |
-| `build_targets.patch` | `cc_test` targets for the nine files above (applies at `00e946e3`, the `tpu_sync/kv_cache/BUILD` hunk at an offset of 75 lines) |
-| `kv_cache_store_remote_write_bughunt_test.cc`, `kv_cache_store_fetch_bughunt_test.cc`, `host_block_manager_race_bughunt_test.cc`, `kv_cache_store_service_reactor_bughunt_test.cc` | 2026-10-29 store-path and host-block-manager audit reproducers (first three confirm store/allocator races, fourth refutes a `WriteRemoteServerReactor` `StartAck`/`OnCancel` hazard; write-ups and `build_targets.patch` rules deferred, see §History 2026-10-29) |
+| `pool_reshard_stale_subplan_bughunt_test.cc` | F13 at `00e946e3` (`StaleSubPlanBughunt`: 2 controls + 4 failing cases on `25f7d8a7`'s `sub_plan_chains_` — a single-plan retry under the same `req_id` erases a live chain entry so a stale sub-plan reports premature `done_recving` or `failed_recving` for the retry, and `SweepSubPlanChainsLocked` erases a failed chain tombstone while a sibling sub-plan is `IsDraining() && !Done()` so it later emits a second `failed_recving` or false `done_recving` on the failed request; runs on CPU at `00e946e3`) |
+| `kv_cache_store_remote_write_bughunt_test.cc` | F18 (`RemoteWriteSettlementTest`: 1 control + 3 failing cases — async `HostOffloadBackend::BeginWriteRemote` settlement never erases `KVCacheStore::active_remote_writes_`, causing `~KVCacheStore` to double-`Release` live pins on a shared backend, and a destination closing the result stream with `CANCELLED` after its ack drops the pin release and save verdict; runs on CPU at `42dda542` and unchanged at `00e946e3`) |
+| `kv_cache_store_fetch_bughunt_test.cc` | F19 (`FetchLifetimeTest` 3 failing + `FetchPushAfterFreeTest` 1 failing — `KVCacheStoreClient::Fetch` sets no client deadline so a silent source wedges `ReadRemote`, pins destination host blocks and blocks same-hash retries; when `Fetch` fails, `HostOffloadBackend::LoadRemoteBlocks` frees `dst_host_block_ids` immediately while the receiving worker still accepts planless `op = 6` / `uuid = 0` pushes into freed or reallocated host blocks; runs on CPU at `42dda542` and unchanged at `00e946e3`) |
+| `host_block_manager_race_bughunt_test.cc` | F20 (`HostBlockManagerRaceTest`: 1 control + 1 failing case — `KVCacheManagerBase::host_block_manager_` (`LogicalBlockManager`, externally synchronized) is mutated without a lock by concurrent auto-allocating inbound `op = 1` pushes, `H2hRead` pulls and `AllocateBlocks`, handing out duplicate host block IDs; runs on CPU at `42dda542` and unchanged at `00e946e3`) |
+| `kv_cache_store_service_reactor_bughunt_test.cc` | R-I (`WriteRemoteReactorStressTest`: 2 passing cases refuting a `WriteRemoteServerReactor::StartAck` vs `OnCancel` write-after-`Finish` race under gRPC 1.81.0; runs on CPU at `42dda542` and unchanged at `00e946e3`) |
+| `build_targets.patch` | `cc_test` targets for all 14 `.cc` files above (re-anchored at `00e946e3`, applies cleanly with zero offset) |
 | `candidate_fixes.patch` | fix for F2 (naive, shape A only); the F4 hunk was dropped when upstream fixed F4 (`72255dd`), the F1 hunk when upstream fixed F1 (`b3ea4dc`); see "Fix validation" |
 | [`filed_bugs.md`](filed_bugs.md) | verbatim write-ups of bugs filed upstream |
 | [`tpu_inference_connector_c1_test.py`](tpu_inference_connector_c1_test.py) | C1 reproducer: vLLM scheduler + tpu-inference connector on CPU, 9 cases incl. 2 controls; run recipe in the header |
-| `coverage_gap_tests.patch` (`coverage_gap_{send,recv,read_remote_deadline}.patch`) | 9 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` on branch `controller-verification`): 4 `RecvLifecycleTest`/`RecvDrainTest` cases appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 2 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary with `RAIDEN_REMOTE_READ_DEADLINE_S=1` because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Based on `42dda542`; all 9 pass there (2026-10-28); at `56a0269d` `coverage_gap_send.patch` and `coverage_gap_read_remote_deadline.patch` still apply, `coverage_gap_recv.patch` (and the combined patch) does not; at `00e946e3` only `coverage_gap_read_remote_deadline.patch` applies (`coverage_gap_send.patch` fails on `transfer_send_session_test.cc:796`). Offered upstream as three small per-target test-only PRs (`coverage_gap_{send,recv,read_remote_deadline}.patch`). Packaged separately below: the two `Receive` handshake cases (`coverage_gap_control_handshake.patch`) and the two `MultiRequest` staging-recycle cases (`coverage_gap_multi_request_recycle.patch`). Not included: two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see), and the receiver's late-`Finish` status flip, confirmed separately as **F14**. See "Coverage-gap tests" below |
-| `coverage_gap_reshard_control.patch` | 7 upstream-shaped `ReshardStackTest` cases extending `tpu_sync/kv_cache/reshard/reshard_service_test.cc` to close every `Gap.test` branch (all 14) and all 4 unasserted `Refusal` constructors of `Reshard/Registry/Coverage.lean` plus all 4 gap branches of `Reshard/Coordinator/Coverage.lean`, without pinning F8. Based on `42dda542` (applies identically to `337540eb` and still at `56a0269d`; at `00e946e3` it fails on `reshard_service_test.cc:2361`, where `5835b975` appended upstream's own lifecycle tests); 7/7 pass (`--runs_per_test=5`, 2026-10-30). See "Coverage-gap tests" below |
+| `coverage_gap_tests.patch` (`coverage_gap_{send,recv,read_remote_deadline}.patch`) | 9 upstream-shaped test cases for lifecycle branches no test in the suite reaches, taken from the branch-coverage tables in `tpu_sync/formal_verification/` (`Receive/Coverage.lean`, `Send/Coverage.lean`, and `Controller/ReadRemoteCoverage.lean` on branch `controller-verification`): 4 `RecvLifecycleTest`/`RecvDrainTest` cases appended to `kv_cache_manager_with_transfer_send_drain_test.cc`, 2 `TransferSendSessionTest` cases appended to `transfer_send_session_test.cc`, and a new `read_remote_deadline_test` target (3 cases, own binary with `RAIDEN_REMOTE_READ_DEADLINE_S=1` because `RemoteReadDeadline()` is a process-wide static) with its `BUILD` rule. Based on `42dda542`; all 9 pass there (2026-10-28); at `56a0269d` `coverage_gap_send.patch` and `coverage_gap_read_remote_deadline.patch` still apply, `coverage_gap_recv.patch` (and the combined patch) does not; at `00e946e3` only `coverage_gap_read_remote_deadline.patch` applies (`coverage_gap_send.patch` fails on `transfer_send_session_test.cc:796`). Offered upstream as three small per-target test-only PRs (`coverage_gap_{send,recv,read_remote_deadline}.patch`). Packaged separately below: the two `Receive` handshake cases (`coverage_gap_control_handshake.patch`) and the two `MultiRequest` staging-recycle cases (`coverage_gap_multi_request_recycle.patch`); `coverage_gap_reshard_control.patch` was retired 2026-11-09 after upstream `5835b975` landed the 7 `ReshardStackTest` lifecycle cases. Not included: two `ReadRemote` rows with no observable effect (`acquireAfterShutdown` after the deadline, and `deadlineLate`, which a test cannot see), and the receiver's late-`Finish` status flip, confirmed separately as **F14**. See "Coverage-gap tests" below |
 | `coverage_gap_reshard_sessions.patch` | 12 upstream-shaped test cases (4 `ReshardSendSessionTest` cases in `tpu_sync/kv_cache/reshard_send_session_test.cc` plus 4 `PoolReshardRecvTest` and 4 `PoolReshardSendTest` cases in `tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`) closing every non-F14 `Gap.test` branch of `Reshard/Receive/Coverage.lean` (18 of 21; the other 3 are F14's late-`Finish` status flips) and `Reshard/Send/Coverage.lean` (15 of 16; the other 1 is F14), plus the first CPU end-to-end loopback `Reshard/Pipeline` trace (`trace_arm_before_dispatch`), without pinning F10 or F14. Based on `42dda542`; 12/12 pass (`--runs_per_test=6`, 2026-10-30); does not apply at `56a0269d` (`ReshardSendSessionTestPeer` hunk; F10 is fixed there and upstream added its own sender failure-path tests in `337540eb` / `1523b07d` / `10d181f6`). See "Coverage-gap tests" below |
 | `coverage_gap_control_handshake.patch` | 2 upstream-shaped `ControlHandshakeTest` cases extending `tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc` (adding `SilentProducer::AcceptClient` and a `NumaThreadPool` worker barrier) to close both `Gap.test (stub)` branches of `PrefillDecode/Receive/Coverage.lean` (`pullReplyOk` with no lifecycle effect and `pullReplyOk` settling an expired receive). Based on `42dda542`; 2/2 pass (`--runs_per_test=6`, 2026-10-30); does not apply at `56a0269d` (`:54` hunk; upstream added `TransferReceiveSession` pull-handshake tests of its own in `f5001fac`). See "Coverage-gap tests" below |
 | `coverage_gap_multi_request_recycle.patch` | 2 upstream-shaped `MultiRequestTest` cases in `tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc` closing both live multi-request branches of `PrefillDecode/MultiRequestCoverage.lean` (`nextRequest` / `tr_multi_request` and `recyclePrefill` / `tr_overlapped_requests`) and all 3 `Pipeline/Coverage.lean` environment branches (`reclaim`, `reseatPrefillStaging`, `reseatDecodeStaging`) over loopback control + `BlockTransport` with simulated HBM and staging-pointer reuse assertions; applies cleanly both standalone and stacked with `coverage_gap_recv.patch`. Based on `42dda542`; 2/2 pass (`--runs_per_test=6`, 2026-10-30); does not apply at `56a0269d` (`:1278` hunk). See "Coverage-gap tests" below |
@@ -82,9 +85,11 @@ findings/build_targets.patch`, then
 `numa_kv_cache_manager_bughunt_test.cc` to `tpu_sync/frameworks/jax/`, apply
 `findings/build_targets.patch`, and run
 `bazel test --config=oss //tpu_sync/frameworks/jax:numa_kv_cache_manager_bughunt_test`.
-To run F12 / F13: copy `pool_reshard_chain_bughunt_test.cc` to `tpu_sync/kv_cache/`,
+To run F12 / F13: copy `pool_reshard_chain_bughunt_test.cc` (pinned to
+`42dda542`) or `pool_reshard_stale_subplan_bughunt_test.cc` (`00e946e3`
+`sub_plan_chains_` retry and draining-tombstone cases) to `tpu_sync/kv_cache/`,
 apply the patch, and run
-`bazel test --config=oss //tpu_sync/kv_cache:pool_reshard_chain_bughunt_test`.
+`bazel test --config=oss //tpu_sync/kv_cache:pool_reshard_stale_subplan_bughunt_test`.
 To run F14: copy `transfer_receive_late_finish_bughunt_test.cc` to
 `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
 `bazel test --config=oss //tpu_sync/kv_cache:transfer_receive_late_finish_bughunt_test`.
@@ -94,13 +99,22 @@ To run F15: copy `reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc` to
 To run F16 / F17: copy `kv_transfer_uuid_and_reshard_push_bughunt_test.cc` to
 `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
 `bazel test --config=oss //tpu_sync/kv_cache:kv_transfer_uuid_and_reshard_push_bughunt_test`.
+To run F18–F20 and R-I: copy `kv_cache_store_remote_write_bughunt_test.cc`,
+`kv_cache_store_fetch_bughunt_test.cc`, `host_block_manager_race_bughunt_test.cc`,
+and `kv_cache_store_service_reactor_bughunt_test.cc` to `tpu_sync/kv_cache/`,
+apply `findings/build_targets.patch`, and run
+`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_store_remote_write_bughunt_test
+//tpu_sync/kv_cache:kv_cache_store_fetch_bughunt_test
+//tpu_sync/kv_cache:host_block_manager_race_bughunt_test
+//tpu_sync/kv_cache:kv_cache_store_service_reactor_bughunt_test`.
 F5 needs no repro file:
 its test is already in the tree as `DISABLED_`
 (`bazel test --config=oss //tpu_sync/kv_cache:kv_cache_manager_with_transfer_control_test
 --test_arg=--gtest_also_run_disabled_tests`); the fix patch that re-enabled it
 was retired on 2026-10-16 (see F5). All patches applied cleanly at
 `42dda542` (`git apply --check`, 2026-10-30; `build_targets.patch` updated
-2026-11-03 for F15–F17; `candidate_fixes.patch` was last re-based at `2ed6f8f`).
+2026-11-03 for F15–F17 and 2026-11-09 for `pool_reshard_stale_subplan_bughunt_test`
+and F18–F20 / R-I; `candidate_fixes.patch` was last re-based at `2ed6f8f`).
 At `56a0269d` (`git apply --check` from the repo root, 2026-11-03)
 `build_targets.patch`, `candidate_fixes.patch`, `coverage_gap_send.patch`,
 `coverage_gap_read_remote_deadline.patch` and `coverage_gap_reshard_control.patch`
@@ -121,30 +135,32 @@ ported to the `InsertOption` signature `2ed6f8f` introduced before it compiles
 (F1 is fixed there, see §F1). The F1–F4, R7/R8/R2b and F10 `.cc` reproducers
 have not been rebuilt since the runs their entries record.
 At `00e946e3` (`git apply --check` from the repo root, 2026-11-09) three
-patches still apply: `build_targets.patch` (the `tpu_sync/kv_cache/BUILD` hunk
-at an offset of 75 lines), `candidate_fixes.patch` and
-`coverage_gap_read_remote_deadline.patch`. Two more stopped applying in this
-window: `coverage_gap_send.patch` (and so `coverage_gap_tests.patch`, now
-failing on both of its files) on `transfer_send_session_test.cc` (hunk at
-`:796`; `55c218d2`, `000ac1d2` and `32568d35` rewrote the file's
-`TransferSendSession::Create` calls and appended host-source tests) and
-`coverage_gap_reshard_control.patch` on `reshard/reshard_service_test.cc` (hunk
-at `:2361`; `5835b975` appended its own `RequestBlockRegistry` /
-`ReshardCoordinator` lifecycle tests at the same anchor). The four that already
+patches apply cleanly: `build_targets.patch` (re-anchored at `00e946e3` with
+zero offset across all 14 `.cc` files), `candidate_fixes.patch` and
+`coverage_gap_read_remote_deadline.patch`. `coverage_gap_reshard_control.patch`
+was retired on 2026-11-09 after upstream `5835b975` appended all 7
+`RequestBlockRegistry` / `ReshardCoordinator` lifecycle cases to
+`reshard/reshard_service_test.cc` (`Reshard/Registry/Coverage.lean` 25/25,
+`Reshard/Coordinator/Coverage.lean` 14/14). `coverage_gap_send.patch` (and so
+`coverage_gap_tests.patch`, now failing on both of its files) stopped applying
+on `transfer_send_session_test.cc` (hunk at `:796`; `55c218d2`, `000ac1d2` and
+`32568d35` rewrote the file's `TransferSendSession::Create` calls and appended
+host-source tests). The four that already
 failed at `56a0269d` (`coverage_gap_recv.patch` `:1733`,
 `coverage_gap_reshard_sessions.patch` `:67`,
 `coverage_gap_control_handshake.patch` `:54`,
 `coverage_gap_multi_request_recycle.patch` `:1278`) still fail on the same
-hunks. Nothing re-based. Reproducers at `00e946e3`:
-`reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc` ported (its
-`KVCacheManagerBase::OnPoolReceived(pool_idx, uuid)` calls, removed by
-`9c9f92ff`, became `OnLayerReceived(pool_idx, uuid)`, which reaches the same
-`TransferSession::OnDataReceived(pool_idx, {}, {})`) and
-`kv_transfer_uuid_and_reshard_push_bughunt_test.cc` compiles unchanged (every
-API it drives kept its signature; `StartRead` / `NotifyForRead` gained a
-defaulted `BlockLocation` parameter); both were rebuilt and re-run (see §F15,
-§F16, §F17 and §History 2026-11-09). `pool_reshard_chain_bughunt_test.cc`
-(F12 / F13) needs porting: `ReshardSendSession::Create` →
+hunks. Reproducers built and run at `00e946e3`:
+`reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc` (ported:
+`KVCacheManagerBase::OnPoolReceived(pool_idx, uuid)`, removed by `9c9f92ff`,
+became `OnLayerReceived(pool_idx, uuid)`),
+`kv_transfer_uuid_and_reshard_push_bughunt_test.cc` (unchanged),
+`pool_reshard_stale_subplan_bughunt_test.cc` (written at `00e946e3`), and all
+four store/allocator tests (`kv_cache_store_remote_write_bughunt_test.cc`,
+`kv_cache_store_fetch_bughunt_test.cc`, `host_block_manager_race_bughunt_test.cc`,
+`kv_cache_store_service_reactor_bughunt_test.cc`, all compiling unchanged at
+`00e946e3`; see §F13, §F15–§F20, §R-I and §History 2026-11-09). `pool_reshard_chain_bughunt_test.cc`
+(F12 / F13 original `42dda542` harness) still needs porting: `ReshardSendSession::Create` →
 `CreateReshardSendSession` (returning `std::shared_ptr<TransferSession>`; the
 `ReshardSendSession` / `ReshardReceiveSession` types are no longer visible,
 `49e2c36c`), `NoteSubPlanRegisteredLocked(is_recv, req_id, uuid, index, count)`
@@ -171,11 +187,14 @@ listed in its §Files row.
 | F10 | `ReshardSendSession::RecordPushCompletion` unregisters the sender's plan on the **first** failed push while sibling pushes are still in flight (`EndOp` would do it at settle). Siblings then resolve no chunks, and — the sharp half — a retry of the same `uuid` is accepted by `Create` while the failed session drains, shares its uuid-keyed staging lease, and loses that staging when the old session settles; a third transfer is then leased the same slot (the F6 shape on the sender; early unregister since `FinishPoolReshardSend` before `1673c9b`, lease-aliasing window since `3d1b5d4`) (R6 in `tpu_sync/formal_verification/docs/transfer/reshard.md`) | CONFIRMED (test) 2026-10-20 (`reshard_send_session_bughunt_test.cc`, against the `1fa06d1` build; the code involved is unchanged through `2ed6f8f`); **filed 2026-10-23** (bug 9 in `filed_bugs.md`); **FIXED upstream** in `1523b07d` (2026-10-30, "Move active transfer plans into TransferSession"): the plan lives in the session (`plan()` visible until `Done()`), `RecordPushCompletion` / `EndOp` no longer call `UnregisterActivePlan`, `Create` no longer leases, and `PoolReshardPush` refuses a same-uuid retry while the prior session is live (`RetireSettledSessionLocked` → `ALREADY_EXISTS`); verified by reading at `56a0269d`, reproducer not re-run (it drives the removed `UnregisterActivePlan` path) | early unregister: yes, any multi-peer/multi-pool send whose first failure has siblings in flight; lease aliasing: needs a same-uuid re-coordination while the old session drains, which neither `vllm-torchtpu` nor `sglang-torchtpu` does (§Callers) |
 | F11 | `NumaAwareKVCacheManager::CompleteReadRaw` (the JAX `poll_stats()` wrapper) emits `failed_recving` on the **first** failing sub-manager while sibling sub-managers still have H2D / D2H DMAs in flight (`done_sending` and `done_recving` barrier-wait across sub-managers; pinned by upstream's `AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`), and **never erases `failed_recving_set_`** on failure (erased only when `done_recving_counts_[req] >= expected` on pure `done_recving` completions), leaking map entries on every failed/expired transfer and poisoning reused `req_id`s (dropping subsequent `failed_recving` / `done_recving` at `num_subs == 1`, and desynchronizing `done_recving_counts_` into premature `done_recving` after partial failure at `num_subs >= 2`). Present since `00a3f670` (2026-06-23) | CONFIRMED (test) 2026-10-29 (`numa_kv_cache_manager_bughunt_test.cc`, 4/4 cases on unmodified `42dda542`); **filed 2026-10-29** (bug 10 in `filed_bugs.md`); **FIXED upstream** in `c0e8e686` (2026-10-29, "Barrier-wait failed transfers and clean up completion state in NumaAwareKVCacheManager"): `failed_recving_counts_` replaces `failed_recving_set_`, `process_completion` emits once the three counts reach `expected` and erases all four maps, with five rewritten or new `KVCacheManagerWrapperTest` cases (`FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`, …, `SingleSubManagerFailureEmitsImmediatelyAndCleansUp`); the Lean `NumaPolicy.settledCounts` barrier is now the shipping code | eager `failed_recving` mid-DMA: yes on a single request when `ENABLE_MULTI_NUMA=1` (`num_subs >= 2`, wired in `tpu_raiden_connector._remote_endpoint`) + a caller forwarding `failed_recving` (masked while C1 dropped `failed_recving`; exposed once [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918) lands); `failed_recving_set_` leak: yes on every failed/expired transfer even at default `ENABLE_MULTI_NUMA=0`; `req_id`-reuse poisoning: immediate for direct `jax::KVCacheManager` callers, gated by `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` (or 8-hex suffix collision) in vLLM V1 |
 | F12 | Windowed pool reshard (`dst_window_blocks` sub-plan chains, `09a42d4e`): `BuildPoolReshardPlan` dispatches only the source units with spans in the current window, while every sub-plan is stamped with the request-wide `sub_plan_count = K`, so a sender in `1 <= m < K` windows never reaches `K` settled sub-plans, reports nothing until `SweepSubPlanChainsLocked` fails it (`DEADLINE_EXCEEDED … m of K sub-plans settled`) after `timeout_s_`; and `RunSubPlan` abandons the registry claim only `if (index == 0)`, so a chain failing at window ≥ 1 leaves every rank not dispatched in `0 .. index-1` — which has no session and never votes `Complete` — in the claim until `ttl_s_` (the F8 gap, now by design for later windows) | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt` 2 failing + 1 control, `ChainClaimTest` 1 failing + 2 controls, on unmodified `42dda542`); **filed 2026-10-29** (bug 11 in `filed_bugs.md`); **still open at `00e946e3`** (`pool_reshard_planner.cc` and `reshard_coordinator.cc` unchanged; `RunSubPlan` still abandons `if (index == 0)` only; on the worker, `25f7d8a7` re-keyed the chain as `sub_plan_chains_[req_id].sub_sessions` — one `std::shared_ptr<TransferSession>` slot per `sub_plan_index`, sized `max(sub_plan_count, sub_plan_index + 1)` — and `RecordPoolReshardTerminalLocked` reports `done_sending` only when `settled_count == sub_sessions.size()`, so a sender dispatched in `m < K` windows still leaves `K - m` null slots and is still failed by `SweepSubPlanChainsLocked` after `timeout_s_`) | yes for any multi-window request whose span ownership varies by window (upstream's own `WindowedRequestChainsOneSubTransferPerWindow` / `WindowClipsStraddlingSpansAtWindowBoundaries` shapes), once a caller passes `dst_window_blocks` (`SUPPORTS_DST_WINDOW_BLOCKS` is wired in `api/torch/reshard_client.py`; `vllm-torchtpu` `9725110` and `sglang-torchtpu` `9a6eef1` do not pass it yet) |
-| F13 | Windowed pool reshard: `RecordPoolReshardTerminalLocked` emits `failed_recving` on the **first** failing sub-plan with no check for sibling sub-plans of the `req_id` still active (the check `SweepSubPlanChainsLocked` does make), `StartChain` sees only control-plane errors so it keeps arming and dispatching windows `1 .. K-1`, and `PoolReshardPush` / `PoolReshardRegisterRecv` seat them regardless of `chains[req_id].failed` (pinned by upstream's `FirstSubPlanFailureFailsTheRequestOnce`); the failed entry is swept after one `timeout_s_` of inactivity without checking whether seated `sub_sessions` are `Done()`, so a later sub-plan starts a fresh unanchored chain and an already-seated `!Done()` sibling hits `it == sub_plan_chains_.end()`, emitting a second `failed_recving_` (if draining with error) or false `done_sending_` / `done_recving_` on the failed chain (if `IsDraining()` with `OkStatus()`, which `CompleteReadWithDetails`'s deadline arm skips); and on an unanchored chain (`anchored = false`), `EndOp()` setting `done_ = true` between `RetireSettledSessionLocked` and `SweepSubPlanChainsLocked` makes the sweep clear `sub_sessions` while the next poll hits `!progress.anchored` ahead of `progress.failed` and emits `done_*` after `failed_recving_` | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt1B` 4/4 failing on unmodified `42dda542`); **filed 2026-10-29** (bug 12 in `filed_bugs.md`); **still open at `00e946e3`, changed shape** (`25f7d8a7` merged `recv_chains_` / `send_chains_` into one `sub_plan_chains_` map holding the sub-plan sessions themselves; `RecordPoolReshardTerminalLocked` still sets `progress.failed = true` and inserts `failed_recving_` on the first non-OK sub-plan without checking whether any sibling `sub_sessions` entry is still `!Done()`; `SweepSubPlanChainsLocked` erases a `failed` or `completed` entry after one quiet `timeout_s_` without checking `!sub_session->Done()`, while `CompleteReadWithDetails` skips `IsDraining()` sessions — so an already-seated `!Done()` sibling settling after the sweep hits `it == sub_plan_chains_.end()` and emits a second `failed_recving_` or, if draining OK inside `EndOp` / `FinishPoolH2d`, emits `done_sending_` / `done_recving_` after `failed_recving_` with no retry needed, an unanchored sub-plan whose `EndOp()` sets `done_ = true` in the `session->mu_` gap between `RetireSettledSessionLocked` (`:494`) and `SweepSubPlanChainsLocked` (`:278`) causes `:298` to clear `sub_sessions` and the next poll to hit `!progress.anchored` (`:201-212`, before `progress.failed` at `:219`) and emit `done_*` after `failed_recving_`, and a late-arriving sub-plan starts a fresh unanchored entry via `try_emplace` and is reported again; `PoolReshardPush` / `PoolReshardRegisterRecv` still seat later sub-plans regardless of `failed`) | mid-DMA free: yes for any multi-window request whose first failure has another window active (the F11 shape on pool reshard, with the engine recomputing into / freeing the destination blocks on `failed_recving`); post-sweep double `failed_recving_` or false `done_*` after failure: any failed multi-window chain whose sibling sub-plan is still `!Done()` (`in_flight_ > 0` or `IsDraining() && !Done()`) when `timeout_s_` sweeps the tombstone, any sparse unanchored sub-plan whose `EndOp()` lands between `RetireSettledSessionLocked` and `SweepSubPlanChainsLocked`, or a worker whose next sub-plan arrives > `timeout_s_` after the failure (cf. F12); same caller gate as F12 |
+| F13 | Windowed pool reshard: `RecordPoolReshardTerminalLocked` emits `failed_recving` on the **first** failing sub-plan with no check for sibling sub-plans of the `req_id` still active (the check `SweepSubPlanChainsLocked` does make), `StartChain` sees only control-plane errors so it keeps arming and dispatching windows `1 .. K-1`, and `PoolReshardPush` / `PoolReshardRegisterRecv` seat them regardless of `chains[req_id].failed` (pinned by upstream's `FirstSubPlanFailureFailsTheRequestOnce`); the failed entry is swept after one `timeout_s_` of inactivity without checking whether seated `sub_sessions` are `Done()`, so a later sub-plan starts a fresh unanchored chain and an already-seated `!Done()` sibling hits `it == sub_plan_chains_.end()`, emitting a second `failed_recving_` (if draining with error) or false `done_sending_` / `done_recving_` on the failed chain (if `IsDraining()` with `OkStatus()`, which `CompleteReadWithDetails`'s deadline arm skips); a single-plan retry (`sub_plan_count <= 1`) under the same `req_id` calls `sub_plan_chains_.erase(req_id)` in `NoteSubPlanRegisteredLocked` (`:160-162`) so any still-seated stale sub-plan emits `done_*` / `failed_recving_` for the retry; and on an unanchored chain (`anchored = false`), `EndOp()` setting `done_ = true` between `RetireSettledSessionLocked` and `SweepSubPlanChainsLocked` makes the sweep clear `sub_sessions` while the next poll hits `!progress.anchored` ahead of `progress.failed` and emits `done_*` after `failed_recving_` | CONFIRMED (test) 2026-10-29 (`pool_reshard_chain_bughunt_test.cc`: `PoolReshardChainBughunt1B` 4/4 failing on unmodified `42dda542`), and **CONFIRMED (test) 2026-11-09 on unmodified `00e946e3`** (`pool_reshard_stale_subplan_bughunt_test.cc`: `StaleSubPlanBughunt` 2 controls passing + 4 cases failing); **filed 2026-10-29** (bug 12 in `filed_bugs.md`); **still open at `00e946e3`, changed shape** (`25f7d8a7` merged `recv_chains_` / `send_chains_` into one `sub_plan_chains_` map holding the sub-plan sessions themselves; `RecordPoolReshardTerminalLocked` still sets `progress.failed = true` and inserts `failed_recving_` on the first non-OK sub-plan without checking whether any sibling `sub_sessions` entry is still `!Done()`; `SweepSubPlanChainsLocked` erases a `failed` or `completed` entry after one quiet `timeout_s_` without checking `!sub_session->Done()`, while `CompleteReadWithDetails` skips `IsDraining()` sessions — so an already-seated `!Done()` sibling settling after the sweep hits `it == sub_plan_chains_.end()` and emits a second `failed_recving_` or, if draining OK inside `EndOp` / `FinishPoolH2d`, emits `done_sending_` / `done_recving_` after `failed_recving_` with no retry needed, `NoteSubPlanRegisteredLocked` erases `sub_plan_chains_[req_id]` on a single-plan retry so a stale sub-plan settles into `it == sub_plan_chains_.end()`, an unanchored sub-plan whose `EndOp()` sets `done_ = true` in the `session->mu_` gap between `RetireSettledSessionLocked` (`:494`) and `SweepSubPlanChainsLocked` (`:278`) causes `:298` to clear `sub_sessions` and the next poll to hit `!progress.anchored` (`:201-212`, before `progress.failed` at `:219`) and emit `done_*` after `failed_recving_`, and a late-arriving sub-plan starts a fresh unanchored entry via `try_emplace` and is reported again; `PoolReshardPush` / `PoolReshardRegisterRecv` still seat later sub-plans regardless of `failed`) | mid-DMA free: yes for any multi-window request whose first failure has another window active (the F11 shape on pool reshard, with the engine recomputing into / freeing the destination blocks on `failed_recving`); post-sweep double `failed_recving_` or false `done_*` after failure: any failed multi-window chain whose sibling sub-plan is still `!Done()` (`in_flight_ > 0` or `IsDraining() && !Done()`) when `timeout_s_` sweeps the tombstone, any sparse unanchored sub-plan whose `EndOp()` lands between `RetireSettledSessionLocked` and `SweepSubPlanChainsLocked`, or a worker whose next sub-plan arrives > `timeout_s_` after the failure (cf. F12); single-plan retry collision: gated on same-`req_id` retry or multi-stage pipelined producer sharing `req_id`; same caller gate as F12 |
 | F14 | `TransferReceiveSession::FinishLocked` records any first error even while draining (needed: the poll can `Finish()` OK before a failed H2D's callback, whose error must win), so it also admits an *external* `Finish(error)` after every H2D completed OK and the completed receive is reported `failed` instead of `received`. `ReshardReceiveSession::FinishLocked` has the same shape | CONFIRMED (test) 2026-10-30 (`transfer_receive_late_finish_bughunt_test.cc`: 1 control passing + 4 cases failing on unmodified `42dda542`); audited 2026-10-30: low severity; not yet filed; **partly fixed at `00e946e3`**: `32568d35` guards `TransferReceiveSession::Start`'s pull-reply lambda with `if (!pull_status.ok() && !self->draining_) { self->FinishLocked(pull_status); }` ("a receive that already settled … keeps its verdict"), which closes case (3) — the only production-reachable path on the prefill-to-decode receiver — while `TransferReceiveSession::FinishLocked` and `ReshardReceiveSession::FinishLocked` themselves still record the error before `if (draining_) return;`, so cases (1) `EndIncomingPush`, (2) receive-side `UnregisterActivePlan`, (4) `~KVCacheManagerWithTransfer` and the `CompleteReadWithDetails` deadline-sweep race (`!session->IsDraining()` then `session->Finish(DeadlineExceeded("Transfer session timed out"))` in separate `session->mu_` scopes, now one arm for every session kind after `55c218d2`) remain; the **sender half is fixed** since `1523b07d` (`ReshardSendSession::Finish`'s `if (done_ \|\| finalizing_) return;` ahead of the status record; `FinishAfterLastPushFinalizingPreservesOkStatus`, which pinned it, was removed in `49e2c36c`). The reproducer's `EndIncomingPush` / `UnregisterActivePlan` / `ExecutePullRequest` entry points were renamed (`BeginIncomingPush` + `EndIncomingPush` free functions in `block_transport_session.cc`, `TransferReceiveSession::Start`), so it needs porting before a re-run | in production only the deadline sweep's multi-lock-scope check-then-`Finish` window in `CompleteReadWithDetails` when the last H2D/push finishes right at `deadline()` (case (3), the `Start` control reply failing on the return leg after every H2D completed, is closed by `32568d35`). (1) `end_incoming_push` needs a duplicate stream (no in-tree sender); (2) receive-side `UnregisterActivePlan` has no caller in tpu-sync or the three connector repos; (4) `~KVCacheManagerWithTransfer` is never published |
 | F15 | `ReshardReceiveSession` leases one host staging slot per **pool** (`AcquireStagingSlot`, reached from `KVCacheManagerBase::GetBlockChunks` on the push thread) out of `num_host_layers()` slots, holds it until the pool's H2D completes, and gates a higher-`order_rank` pool's H2D behind every lower-rank pool (`CollectEligiblePoolH2dsLocked`). A plan with more pools than host layer buffers (a multi-tag plan whose tags' pools share storages; `BuildPoolReshardPlan` gives tag 0 rank 0 and every other tag rank 1) can deadlock once every slot is held by a gated rank-1 pool while some rank-0 pool has no slot: the rank-0 push thread blocks in `StagingLayerManager::Acquire` until `deadline_`, the rank-1 pools' H2Ds wait for it, and the receive fails `DEADLINE_EXCEEDED: Timed out waiting for a free staging slot` with every byte on its way | CONFIRMED (test) 2026-11-02 (`reshard_recv_staging_slot_rank_deadlock_bughunt_test.cc`: 1 control passing + 1 case failing on unmodified `56a0269d`); **filed 2026-11-02** (bug 13 in `filed_bugs.md`); **still open at `00e946e3`**, re-run 2026-11-09 with the reproducer's `OnPoolReceived` calls ported to `OnLayerReceived` (1 control passing + 1 case failing; `AcquireStagingSlot` / `CollectEligiblePoolH2dsLocked` unchanged, `4e61045e` adds `GetBlockArrayHostSpan` → `ResolveStagingSlot` as a second push-thread entry into the blocking `Acquire`) | yes, timing-dependent: needs more pools than storages (multi-tag single-uuid plans, as `vllm-torchtpu` Stage-3 sends) and every slot taken by gated rank-1 pools before some rank-0 pool's first chunk arrives from any sender — via concurrent per-pool pushes reordering on the wire and the rank-blind `Acquire` hand-off; slots are per pool, shared across senders; much likelier with `num_staging_layers < num_layers` |
 | F16 | `KVCacheManagerWithTransfer` UUID retirement omits `BlockTransport::ForgetPushProgress(uuid)` (and `ReleasePoolStagingLeases(uuid)`) when `StartRead` (`:920-921`) or `EmplaceRecvSessionLocked` (`:576`, via `RegisterRecv`) retires a settled session inline, and `CompleteReadWithDetails` (`:1046-1066`) guards its post-`mu_` `ForgetPushProgress(uuid)` / `ReleasePoolStagingLeases(uuid)` loop with a dead `std::erase_if` inside the same `mu_` critical section that just erased `uuid` from `sessions_` (`RegisterActivePlan` `:624`/`:635` → `:651` likewise seats the replacement under `mu_` and then calls `ForgetPushProgress(uuid)` unlocked). On a multi-layer receiver, stale or mid-transfer-wiped `layer_progress_` suppresses `OnLayerReceived` (H2D) on a layer while `OnBlockShardsReceived` still counts its blocks toward `network_completed_`, so `IsReadyToComplete()` returns `true` and `CompleteReadWithDetails` publishes `completions.received` (`done_recving`) with that layer's destination HBM blocks unwritten | CONFIRMED (test) 2026-11-03 (`kv_transfer_uuid_and_reshard_push_bughunt_test.cc`: `UuidRetirementBughunt` 1 control passing + 3 cases failing on unmodified `56a0269d`); not yet filed; **still open at `00e946e3`** (re-run 2026-11-09, reproducer unchanged, 1 + 3 again: `StartRead` `:998-999` and `EmplaceRecvSessionLocked` `:613` still retire with null out-params, `CompleteReadWithDetails`'s `std::erase_if` `:1106-1110` is still inside the `mu_` scope ahead of the unlocked loop `:1121-1126`; `000ac1d2` / `55c218d2` / `25f7d8a7` reshaped the surrounding code without touching the retirement) | gated on same-UUID reuse for the inline and cross-thread `CompleteReadWithDetails` cases (`tpu-inference`, `vllm-torchtpu` and `sglang-torchtpu` mint fresh 63/64-bit UUIDs per transfer today, though `KVCacheManagerWithTransfer` explicitly advertises settled-UUID reuse); `RegisterActivePlan`'s `:635` → `:651` unlocked `ForgetPushProgress(uuid)` after retiring a settled UUID can race against the first push of its *own* newly registered session with no third thread |
 | F17 | `KVCacheManagerWithTransfer::PoolReshardPush` (`:690-724` at `56a0269d`) checks `sessions_.find(plan.uuid())` under `mu_` (`:694`), drops `mu_` with no pending-UUID reservation while running `ReshardSendSession::Create` (`:711-715`, contrast `PoolReshardRegisterRecv`'s `pending_pool_reshard_recvs_` at `:744`), and then blindly overwrites `sessions_[plan.uuid()] = state` (`:718`). Two concurrent `PoolReshardPush` RPCs for the same `uuid` both return `OK`, orphan the first live `ReshardSendSession` from `sessions_`, share `uuid`'s bounded `PoolStagingStorage` slot via idempotent `AcquirePoolStagingLease`, and free that slot in `SettleLocked` (`reshard_send_session.cc:593` at `56a0269d`, `:753` at `00e946e3`) when the first duplicate settles while the sibling push is still streaming from it, letting an unrelated transfer lease the same host staging memory (the F6 / F10 slot-aliasing shape) | CONFIRMED (test) 2026-11-03 (`kv_transfer_uuid_and_reshard_push_bughunt_test.cc`: `PoolReshardPushDuplicateUuidBughunt` 1 control passing + 1 case failing on unmodified `56a0269d`); not yet filed; **still open at `00e946e3`** (re-run 2026-11-09, reproducer unchanged, 1 + 1 again: `PoolReshardPush` `:732-774` still has no pending reservation across `CreateReshardSendSession` and still assigns `sessions_[plan.uuid()] = SessionEntry{...}` at `:767`; `000ac1d2`'s `SessionEntry` and `25f7d8a7`'s `NoteSubPlanRegisteredLocked(req_id, session, ...)` add no duplicate check) | needs two concurrent `START_TRANSFER` sender RPCs with the same `uuid` on one worker (e.g. gRPC/proxy retry on transient timeout while the first call is in `Create`, caller UUID collision, or two `src_units` routed to one worker endpoint); `ReshardCoordinator::RunSubPlan` dispatches once per `src_units[i]` with a fresh 63-bit `uuid` |
+| F18 | `KVCacheStore::SaveRemote` records every remote write in `active_remote_writes_` (`kv_cache_store.cc:2358-2366`, introduced in `22a8bf22`) and calls `TakeRemoteWrite` only on synchronous exits (`!ack_res.ok()`, `all_exist`, `!existing_hashes.empty()`, `:2376-2387`); an accepted offer (`operation_id != 0`) settles asynchronously inside `HostOffloadBackend::BeginWriteRemote` (`host_offload_backend.cc:971-1089`), which releases the pins and updates `save_tracker` without erasing `active_remote_writes_`, so `~KVCacheStore` (`:986-1010`) walks every settled entry and calls `OnWriteRemoteVerdict(..., false)`, double-`Release`-ing the internal pin and stealing a live pin on a shared backend; and in the same `call.result.OnReady` continuation (`:983-986`), `absl::StatusCode::kCancelled` returns early while `lifetime->is_alive`, leaking the internal pin and leaving the hashes pending in `save_tracker_` / `sweep_tracker_` without polling `PollWriteRemote` | CONFIRMED (test) 2026-10-29 on unmodified `42dda542`, re-run 2026-11-09 on unmodified `00e946e3` (`kv_cache_store_remote_write_bughunt_test.cc`: `RemoteWriteSettlementTest` 1 control passing + 3 cases failing); not yet filed; **still open at `00e946e3`** | yes for any `KVCacheStore` P2P caller using remote `Save(hashes, dst)` or the evict sweep's remote demotion (`vllm-torchtpu` and `sglang-torchtpu` do not use `KVCacheStore`): `active_remote_writes_` leaks on every accepted remote write (double-`Release` pin theft requires `backend()` outliving `KVCacheStore`), and `kCancelled` leaks the internal pin + wedges `save_tracker_` / `sweep_tracker_` whenever a destination ends the `WriteRemote` stream with `CANCELLED` after its ack |
+| F19 | `KVCacheStoreClient::Fetch` (`kv_cache_store_client.cc:61-125`) sets no deadline on its `grpc::ClientContext` (unlike `WriteRemote` and `PollWriteRemote`), and nothing above it (`HostOffloadBackend::LoadRemoteBlocks`, `KVCacheStore::ReadRemote` / `Load`) bounds the call, so a silent source wedges the load forever, pins `dst_host_block_ids` in `RaidenController`, and causes retries of the same hash to fail `FAILED_PRECONDITION: Block is already loading`; and when `Fetch` fails (`host_offload_backend.cc:1244-1264`), `LoadRemoteBlocks` calls `raiden_controller_->DeallocateBlockIds(dst_host_block_ids)` at once even though the source pushes via planless explicit-destination `H2hWriteDirect` (`op = 6`, `uuid = 0`) and the receiving worker (`BlockTransportServerPushSession::StartStream` → `KVCacheManagerBase::GetBlockChunks`) only bounds-checks `dst_id` with no allocation or generation check, accepting late pushes into freed or reallocated host blocks (the F2 shape on the production `Fetch` path) | CONFIRMED (test) 2026-10-29 on unmodified `42dda542`, re-run 2026-11-09 on unmodified `00e946e3` (`kv_cache_store_fetch_bughunt_test.cc`: `FetchLifetimeTest` 3/3 failing + `FetchPushAfterFreeTest` 1/1 failing); promoted from "Open / not yet checked"; not yet filed; **still open at `00e946e3`** | yes for any `KVCacheStore` peer load (`Load(hashes, slices, dev_ids)` / `ReadRemote` on `BlockStatus::REMOTE` slices; `vllm-torchtpu` and `sglang-torchtpu` do not use `KVCacheStore`): no-deadline wedge triggers whenever a peer store accepts `Fetch` and never replies; push-after-free triggers if the control-plane `Fetch` RPC fails (channel reset / proxy timeout, or once a client deadline is added without source-push fencing) while the source's `TransferBuffers` worker push is still in flight |
+| F20 | `KVCacheManagerBase::host_block_manager_` (`LogicalBlockManager`, documented `"not thread-safe and requires external synchronization"`, `logical_block_manager.h:33-34`) is mutated with no lock by `KVCacheManagerBase::AllocateBlocks` (`kv_cache_manager_base.h:871-874`: `host_block_manager_->Allocate(num_blocks, /*lock=*/true)`), reached concurrently from per-connection `RawBufferTransport` worker threads on inbound auto-allocating pushes (`op = 1`, `block_transport_session.cc:386-389`), local `BlockTransport::H2hRead` pulls, and `D2hAutoAllocate` / `Unlock` / dynamic `StagingBlockAllocator`, handing out duplicate host block IDs to concurrent owners | CONFIRMED (test) 2026-10-29 on unmodified `42dda542`, re-run 2026-11-09 on unmodified `00e946e3` (`host_block_manager_race_bughunt_test.cc`: `HostBlockManagerRaceTest` 1 control passing + 1 case failing, handing out 1,990 duplicate host block IDs across 42,000 allocations); not yet filed; **still open at `00e946e3`** | only via the torch/jax `H2hWrite` (auto-allocating, no `dst_block_ids`) / `H2hRead` / `D2hAutoAllocate` bindings or dynamic `StagingBlockAllocator` (no caller in `tpu-inference`, `vllm-torchtpu`, `sglang-torchtpu`, or `KVCacheStore` — prefill-to-decode uses static `StagingBlockAllocator` slots by default, pool reshard uses `PoolStagingStorage`, and `KVCacheStore` allocates via `RaidenController`'s mutex-guarded `LogicalBlockManager` and pushes explicit `op = 6`) |
 | C1 | *(caller: tpu-inference)* `tpu_raiden_connector.get_finished` drops tpu-sync's `failed_recving` list on both nodes and never drives vLLM's load-failure channel; vLLM frees transfer-held KV blocks only on a connector report. D half: failed receives leak D's blocks — since the connector's first commit `a342edc3` (2026-06-08). P half: since tpu-sync `4246613` (2026-08-24; see "tpu-sync side" under C1) an expired send is also in that list, so every never-pulled prefill leaks P's blocks; the connector's own `SendMeta.expiration_time` is set and never read | CONFIRMED (test) 2026-10-20 (`tpu_inference_connector_c1_test.py`, CPU: real vLLM `6185d73` scheduler + real tpu-inference `7ed46a6` connector, tpu-sync `0ac16d1`'s report as its own test shows it; 9/9 incl. 2 controls; 17/17 on 2026-10-22 with the `Caller.lean` connector variants); modelled in Lean 2026-10-22 (`Caller.lean`: `trace_dropFailed_*`, leaks absorbing, `contract_safe` / `mw_contract_safe` for `connectorTwoChannel`); connector unchanged at `main` `c2b062b` and still at `main` `ee8b4ac7` (2026-10-22; the unmerged upstream branch `fix/pd-disagg-kv-pull-hang`, `e7661c73`, applies the same two-channel fix shape to the sibling JAX-P2P `tpu_connector.py` only); not run on hardware; **filed 2026-10-22** (bug 8 in `filed_bugs.md`; the tpu-sync side not raised yet); **fix open as [PR #3918](https://github.com/vllm-project/tpu-inference/pull/3918)** (`f366ef52`, 2026-10-27, "[Disagg] Forward tpu-sync failed transfers in tpu_raiden_connector"; unmerged, not on `main` `7840339b` as of 2026-10-28, where the connector is still unchanged): a new `get_transfer_results()` forwards `failed_recving` as `finished_sending` on P and as `finished_recving` + `failed_recving` on D — an instance of `connectorTwoChannel` over `AggChannel.latchedReq` (`MultiWorker.lean`), with the D-side failure on vLLM's request-level `KVConnectorTransferResults.failed_recving` channel rather than `get_block_ids_with_load_errors` (requiring `ENABLE_MULTI_NUMA=0`, see F11, and a `get_transfer_results()`-capable vLLM ≥ `e7bb7e2f`); tpu-sync at `00e946e3` still files failed and expired sends in `failed_recving_` (`RetireSettledSessionLocked`: `(failed ? failed_recving_ : done_sending_).insert(req_id)`); PR #3918's merge status was not re-read at the `00e946e3` re-check (offline) | yes: any D-side pull failure (both nodes), any D full local prefix hit or D absence (P, after `TPU_P2P_WAIT_PULL_TIMEOUT` = 180 s), any client abort of a pull that later fails (D) |
 
 ---
@@ -1283,6 +1302,93 @@ listed in its §Files row.
   progress.completed)` at `:219`) to emit `done_sending_` / `done_recving_`
   after `failed_recving_` (`SubPlanChain`
   `mutant_mid_poll_endop_unanchored_reports_done_after_stall`).
+- **C++ test at `00e946e3`** (`pool_reshard_stale_subplan_bughunt_test.cc`,
+  `StaleSubPlanBughunt`, 2 controls passing + 4 cases failing on unmodified
+  `00e946e3`, 2026-11-09): exercises both (1) a single-plan retry
+  (`sub_plan_count <= 1`) under the same `req_id` erasing a live
+  `sub_plan_chains_[req_id]` entry in `NoteSubPlanRegisteredLocked` (`:160-162`)
+  so a still-seated sub-plan from the failed attempt reports premature
+  `done_recving` or `failed_recving` for the retry (`SubPlanChain` A6 /
+  `mutant_single_erases_live_chain`), and (2) `SweepSubPlanChainsLocked`
+  (`:264-269`) erasing a failed chain tombstone while a sibling sub-plan holds
+  an open `TryBeginOp()` across `timeout_s_`, after which `EndOp()` + poll
+  emits a second `failed_recving` (when the deadline arm marked it draining) or
+  false `done_recving` on the already-failed request (when it had already
+  called `Finish()` OK before `timeout_s_`, `SubPlanChain`
+  `mutant_draining_ok_at_sweep_reports_done_after_failure`). Verbatim output
+  (glog `tpu_utils` / `raw_buffer_transport` startup lines omitted):
+  ```
+  [==========] Running 6 tests from 1 test suite.
+  [----------] Global test environment set-up.
+  [----------] 6 tests from StaleSubPlanBughunt
+  [ RUN      ] StaleSubPlanBughunt.ControlSinglePlanRetryAloneReportsOnItsOwnTerminal
+  W0000 00:00:1794259519.455566    1607 kv_cache_manager_with_transfer.cc:229] Pool reshard receive req_id=chained_req failed at sub-plan 0 of 2: INTERNAL: push failed
+  W0000 00:00:1794259519.455708    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=INTERNAL reason=sub-plan 0 of 2: push failed
+  [       OK ] StaleSubPlanBughunt.ControlSinglePlanRetryAloneReportsOnItsOwnTerminal (8 ms)
+  [ RUN      ] StaleSubPlanBughunt.StaleSubPlanSettlingOkCompletesTheSinglePlanRetryEarly
+  W0000 00:00:1794259519.460686    1607 kv_cache_manager_with_transfer.cc:229] Pool reshard receive req_id=chained_req failed at sub-plan 0 of 2: INTERNAL: push failed
+  W0000 00:00:1794259519.460769    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=INTERNAL reason=sub-plan 0 of 2: push failed
+  tpu_sync/kv_cache/pool_reshard_stale_subplan_bughunt_test.cc:309: Failure
+  Value of: received
+  Expected: is empty
+    Actual: { "chained_req" }, whose size is 1
+  stale sub-plan 6002 reported done_recving for the retry
+
+  [  FAILED  ] StaleSubPlanBughunt.StaleSubPlanSettlingOkCompletesTheSinglePlanRetryEarly (3 ms)
+  [ RUN      ] StaleSubPlanBughunt.StaleSubPlanSettlingFailedFailsTheSinglePlanRetry
+  W0000 00:00:1794259519.465448    1607 kv_cache_manager_with_transfer.cc:229] Pool reshard receive req_id=chained_req failed at sub-plan 0 of 2: INTERNAL: push failed
+  W0000 00:00:1794259519.465556    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=INTERNAL reason=sub-plan 0 of 2: push failed
+  W0000 00:00:1794259519.466089    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=INTERNAL reason=late push failed
+  tpu_sync/kv_cache/pool_reshard_stale_subplan_bughunt_test.cc:338: Failure
+  Value of: failed
+  Expected: is empty
+    Actual: { "chained_req" }, whose size is 1
+  stale sub-plan 6002 reported failed_recving for the retry
+
+  [  FAILED  ] StaleSubPlanBughunt.StaleSubPlanSettlingFailedFailsTheSinglePlanRetry (4 ms)
+  [ RUN      ] StaleSubPlanBughunt.ControlChainRetryKeepsAnAnchoredEntry
+  W0000 00:00:1794259519.469734    1607 kv_cache_manager_with_transfer.cc:229] Pool reshard receive req_id=chained_req failed at sub-plan 0 of 2: INTERNAL: push failed
+  W0000 00:00:1794259519.469813    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=INTERNAL reason=sub-plan 0 of 2: push failed
+  [       OK ] StaleSubPlanBughunt.ControlChainRetryKeepsAnAnchoredEntry (124 ms)
+  [ RUN      ] StaleSubPlanBughunt.SweptChainReportsADrainingSubPlanAsASecondFailure
+  W0000 00:00:1794259519.594502    1607 kv_cache_manager_with_transfer.cc:229] Pool reshard receive req_id=chained_req failed at sub-plan 0 of 2: INTERNAL: push failed
+  W0000 00:00:1794259519.594600    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=INTERNAL reason=sub-plan 0 of 2: push failed
+  W0000 00:00:1794259519.715040    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=DEADLINE_EXCEEDED reason=Transfer session timed out
+  tpu_sync/kv_cache/pool_reshard_stale_subplan_bughunt_test.cc:427: Failure
+  Value of: late.failed
+  Expected: is empty
+    Actual: { "chained_req" }, whose size is 1
+  already-failed request reported failed again: Transfer session timed out
+
+  [  FAILED  ] StaleSubPlanBughunt.SweptChainReportsADrainingSubPlanAsASecondFailure (124 ms)
+  [ RUN      ] StaleSubPlanBughunt.SweptChainReportsADrainingOkSubPlanAsReceived
+  W0000 00:00:1794259519.719281    1607 kv_cache_manager_with_transfer.cc:229] Pool reshard receive req_id=chained_req failed at sub-plan 0 of 2: INTERNAL: push failed
+  W0000 00:00:1794259519.719370    1607 kv_cache_manager_with_transfer.cc:1129] Transfer failed: req_id=chained_req code=INTERNAL reason=sub-plan 0 of 2: push failed
+  tpu_sync/kv_cache/pool_reshard_stale_subplan_bughunt_test.cc:467: Failure
+  Value of: received
+  Expected: is empty
+    Actual: { "chained_req" }, whose size is 1
+  already-failed request reported as received
+
+  [  FAILED  ] StaleSubPlanBughunt.SweptChainReportsADrainingOkSubPlanAsReceived (124 ms)
+  [----------] 6 tests from StaleSubPlanBughunt (390 ms total)
+
+  [----------] Global test environment tear-down
+  [==========] 6 tests from 1 test suite ran. (391 ms total)
+  [  PASSED  ] 2 tests.
+  [  FAILED  ] 4 tests, listed below:
+  [  FAILED  ] StaleSubPlanBughunt.StaleSubPlanSettlingOkCompletesTheSinglePlanRetryEarly
+  [  FAILED  ] StaleSubPlanBughunt.StaleSubPlanSettlingFailedFailsTheSinglePlanRetry
+  [  FAILED  ] StaleSubPlanBughunt.SweptChainReportsADrainingSubPlanAsASecondFailure
+  [  FAILED  ] StaleSubPlanBughunt.SweptChainReportsADrainingOkSubPlanAsReceived
+
+   4 FAILED TESTS
+  ```
+- **Upstream bug updated 2026-11-09:** a comment on bug 12 records the
+  `00e946e3` shape after `25f7d8a7` (no entry in `sub_plan_chains_` read as a
+  single-plan request; the single-plan-retry erase and the sweep of a tombstone
+  whose sibling is still draining) and notes that the first half of the
+  original report is unchanged. The original description is left as filed.
 
 ---
 
@@ -2278,6 +2384,423 @@ listed in its §Files row.
 
 ---
 
+## F18. `KVCacheStore::SaveRemote` leaks accepted offers in `active_remote_writes_` (`~KVCacheStore` double-`Release`s live pins on a shared backend), and `HostOffloadBackend::BeginWriteRemote` drops `CANCELLED` result streams without releasing the internal pin or recording a verdict
+
+- **Status:** **CONFIRMED (test)** 2026-10-29 on unmodified `42dda542`, re-run
+  2026-11-09 on unmodified `00e946e3`:
+  `kv_cache_store_remote_write_bughunt_test.cc` (`RemoteWriteSettlementTest`,
+  1 control passing + 3 cases failing). Surfaced during the 2026-10-29 audit of
+  the source-side async remote-write settlement introduced in `22a8bf22`. Not
+  yet filed.
+- **Where / Root cause (`00e946e3`):**
+  1. **Leaked `active_remote_writes_` entry and destructor double-`Release` (2a):**
+     `KVCacheStore::SaveRemote` (`tpu_sync/kv_cache/kv_cache_store.cc:2354-2411`)
+     takes an internal pin on `block_hashes` (`:2338`) and inserts a
+     `RemoteWriteState` into `active_remote_writes_[op_key]` (`:2358-2366`)
+     before calling `backend->BeginWriteRemote(...)` (`:2373-2375`). It erases
+     that entry via `TakeRemoteWrite(op_key)` (`:2414-2424`) **only** on the
+     synchronous exits (`!ack_res.ok()` at `:2379`, and `ack.all_exist ||
+     !ack.existing_hashes.empty()` at `:2384-2386`). When the destination
+     accepts the offer (`ack.operation_id != 0`), `SaveRemote` updates
+     `it->second.{operation_id, cancel, hold_expiry}` (`:2401-2410`) and returns
+     `OkStatus()`. The accepted offer subsequently settles inside
+     `HostOffloadBackend::BeginWriteRemote`'s `call.result.OnReady` (or
+     `poll_future.OnReady`) continuation (`tpu_sync/kv_cache/host_offload_backend.cc:971-1089`),
+     which releases the internal pin (plus the caller's pin on commit, `:996-1000`,
+     `:1054-1057`) and publishes the verdict into `save_tracker`, **without
+     notifying `KVCacheStore` or calling `TakeRemoteWrite`**. Every accepted
+     remote write therefore remains in `active_remote_writes_` for the lifetime
+     of the store. When `~KVCacheStore` runs (`kv_cache_store.cc:986-1010`), it
+     walks every entry in `active_remote_writes_` and calls
+     `OnWriteRemoteVerdict(std::move(state), /*succeeded=*/false, {})` (`:1008`
+     → `:2426-2456`), which calls `backend->Release(state.block_hashes)` a
+     **second time** (`:2431`) — stealing a live pin from any concurrent or
+     subsequent holder on a `KVCacheStoreBackend` that outlives the store (and
+     re-merging a bogus failed verdict into `save_tracker_` / `sweep_tracker_`).
+  2. **`kCancelled` result stream after ack drops pin release and verdict (2b):**
+     Inside `BeginWriteRemote`'s `call.result.OnReady` continuation
+     (`host_offload_backend.cc:983-986`),
+     ```cpp
+     if (!result_or.ok() &&
+         result_or.status().code() == absl::StatusCode::kCancelled) {
+       return;
+     }
+     ```
+     returns early while `lifetime->is_alive` is `true` — releasing neither the
+     internal pin nor `save_tracker`'s pending mark, and skipping
+     `PollWriteRemoteAsync` (`:1039-1040`). That guard assumes `kCancelled` can
+     only come from `~KVCacheStore`'s own `state.cancel->TryCancel()` (`kv_cache_store.cc:1001`),
+     ignoring that the **destination** ends the `WriteRemote` server stream with
+     `CANCELLED` whenever `WriteRemoteServerReactor::OnWriteDone(false)` or
+     `OnCancel()` runs (`kv_cache_store_service.cc:195-198, 217-222`) or an
+     intermediary resets the stream after the ack. Contrast `UNAVAILABLE`
+     (the control case), which falls through `:983` into `PollWriteRemoteAsync`
+     and settles cleanly. Under `CANCELLED`, the internal pin leaks (`GetPinCount`
+     stays 2 = caller + internal) and the hashes stay pending in `save_tracker_`
+     / `sweep_tracker_` past `RAIDEN_REMOTE_WRITE_HOLD_S` (waking neither
+     `PollSaveStatus()` nor `WaitForBatchWriteResult`, which loops forever on the
+     sweep thread at `kv_cache_store.cc:2138-2160`!).
+- **C++ test output** (unmodified `00e946e3`, verbatim, 2026-11-09):
+  ```
+  Running main() from gmock_main.cc
+  [==========] Running 4 tests from 1 test suite.
+  [----------] Global test environment set-up.
+  [----------] 4 tests from RemoteWriteSettlementTest
+  [ RUN      ] RemoteWriteSettlementTest.AcceptedCommittedWriteIsErasedFromActiveRemoteWrites
+  WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+  I0000 00:00:1794259778.603616   36851 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:40935
+  tpu_sync/kv_cache/kv_cache_store_remote_write_bughunt_test.cc:297: Failure
+  Expected equality of these values:
+    store->InFlightRemoteWritesCountForTesting()
+      Which is: 1
+    0u
+      Which is: 0
+  the accepted operation settled (verdict delivered, pins released) but its active_remote_writes_ entry was never erased
+
+  W0000 00:00:1794259778.647931   36851 kv_cache_store.cc:1005] Store destroyed with remote write 777 still outstanding; releasing its source pin without waiting for the destination's verdict.
+  [  FAILED  ] RemoteWriteSettlementTest.AcceptedCommittedWriteIsErasedFromActiveRemoteWrites (100 ms)
+  [ RUN      ] RemoteWriteSettlementTest.DestroyingTheStoreAfterSettlementDoesNotStealALivePin
+  I0000 00:00:1794259778.697518   36851 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:46851
+  W0000 00:00:1794259778.740184   36851 kv_cache_store.cc:1005] Store destroyed with remote write 777 still outstanding; releasing its source pin without waiting for the destination's verdict.
+  tpu_sync/kv_cache/kv_cache_store_remote_write_bughunt_test.cc:327: Failure
+  Expected equality of these values:
+    backend->GetPinCount("a")
+      Which is: 0
+    1
+  ~KVCacheStore released the settled operation's internal pin a second time, dropping a pin it does not own
+
+  [  FAILED  ] RemoteWriteSettlementTest.DestroyingTheStoreAfterSettlementDoesNotStealALivePin (100 ms)
+  [ RUN      ] RemoteWriteSettlementTest.CancelledResultStreamAfterAckSettlesWithinTheHold
+  I0000 00:00:1794259778.797946   36851 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:46379
+  tpu_sync/kv_cache/kv_cache_store_remote_write_bughunt_test.cc:351: Failure
+  Value of: pending
+    Actual: true
+  Expected: false
+  hash still pending in the save tracker after the HOLD window: the CANCELLED result was dropped without a verdict
+
+  tpu_sync/kv_cache/kv_cache_store_remote_write_bughunt_test.cc:354: Failure
+  Value of: failed
+  Expected: has 1 element that is equal to "a"
+    Actual: {}
+
+  tpu_sync/kv_cache/kv_cache_store_remote_write_bughunt_test.cc:355: Failure
+  Expected equality of these values:
+    store->GetPinCount("a")
+      Which is: 2
+    1
+  the internal pin (2 = caller + internal) was never released after the destination cancelled the stream
+
+  W0000 00:00:1794259787.821519   36851 kv_cache_store.cc:1005] Store destroyed with remote write 777 still outstanding; releasing its source pin without waiting for the destination's verdict.
+  [  FAILED  ] RemoteWriteSettlementTest.CancelledResultStreamAfterAckSettlesWithinTheHold (9110 ms)
+  [ RUN      ] RemoteWriteSettlementTest.ControlUnavailableResultStreamAfterAckSettles
+  I0000 00:00:1794259787.909774   36851 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:41935
+  W0000 00:00:1794259787.952270   36851 kv_cache_store.cc:1005] Store destroyed with remote write 777 still outstanding; releasing its source pin without waiting for the destination's verdict.
+  [       OK ] RemoteWriteSettlementTest.ControlUnavailableResultStreamAfterAckSettles (100 ms)
+  [----------] 4 tests from RemoteWriteSettlementTest (9412 ms total)
+
+  [----------] Global test environment tear-down
+  [==========] 4 tests from 1 test suite ran. (9412 ms total)
+  [  PASSED  ] 1 test.
+  [  FAILED  ] 3 tests, listed below:
+  [  FAILED  ] RemoteWriteSettlementTest.AcceptedCommittedWriteIsErasedFromActiveRemoteWrites
+  [  FAILED  ] RemoteWriteSettlementTest.DestroyingTheStoreAfterSettlementDoesNotStealALivePin
+  [  FAILED  ] RemoteWriteSettlementTest.CancelledResultStreamAfterAckSettlesWithinTheHold
+
+   3 FAILED TESTS
+  ```
+- **Reachability:** any `KVCacheStore` P2P deployment using remote
+  `Save(hashes, dst_raiden_id)` or `SweepOnce`'s remote demotion
+  (`WaitForBatchWriteResult`). Neither `vllm-torchtpu`, `sglang-torchtpu`, nor
+  `tpu-inference`'s `tpu_raiden_connector` instantiates `KVCacheStore`. On a
+  long-lived `KVCacheStore`: 2a grows `active_remote_writes_` unboundedly by one
+  `RemoteWriteState` per accepted remote save and logs a spurious `"Store
+  destroyed with remote write … still outstanding"` + double-`Release` at
+  shutdown (corrupting pins if `backend()` is shared); 2b permanently wedges the
+  `StoreMonitor` sweep thread inside `WaitForBatchWriteResult` (`while
+  (!pending.empty())`, `kv_cache_store.cc:2138`) and leaks internal pins if a
+  peer store closes an accepted `WriteRemote` stream with `CANCELLED`.
+- **Candidate fixes:** pass an `on_settled` callback (guarded by `KVCacheStore::lifetime_`)
+  into `BeginWriteRemote` — or move single-owner settlement ownership into
+  `KVCacheStore` via `TakeRemoteWrite(op_key)` so whichever of the async
+  continuation or `~KVCacheStore` wins `TakeRemoteWrite(op_key)` is the **sole**
+  releaser of the internal pin; and replace the blanket `code() == kCancelled`
+  early return in `BeginWriteRemote` with an explicit local-abandonment flag set
+  only when `~KVCacheStore` itself cancels the call, treating peer-originated
+  `CANCELLED` like any other stream break (fall through to `PollWriteRemoteAsync`
+  within `remaining_hold`).
+- **Repro:** `kv_cache_store_remote_write_bughunt_test.cc`; copy to
+  `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
+  `bazel test --config=oss //tpu_sync/kv_cache:kv_cache_store_remote_write_bughunt_test`.
+
+---
+
+## F19. `KVCacheStoreClient::Fetch` sets no RPC deadline (wedging `ReadRemote` and its host blocks on a silent source), and `HostOffloadBackend::LoadRemoteBlocks` frees `dst_host_block_ids` immediately on `Fetch` failure while the worker still accepts planless `op = 6` / `uuid = 0` pushes into them
+
+- **Status:** **CONFIRMED (test)** 2026-10-29 on unmodified `42dda542`, re-run
+  2026-11-09 on unmodified `00e946e3`:
+  `kv_cache_store_fetch_bughunt_test.cc` (`FetchLifetimeTest` 3/3 failing +
+  `FetchPushAfterFreeTest` 1/1 failing). Promoted from §"Open / not yet checked".
+  Not yet filed.
+- **Where / Root cause (`00e946e3`):**
+  1. **Missing `Fetch` RPC deadline (3a):** `KVCacheStoreClient::Fetch`
+     (`tpu_sync/kv_cache/kv_cache_store_client.cc:61-125`) constructs a default
+     `grpc::ClientContext` (`:108`) and calls `stub_->async()->Fetch(...)`
+     (`:112`) **without calling `context->set_deadline(...)`** (contrast
+     `WriteRemote` and `PollWriteRemote` in the same file, which both set client
+     deadlines). Nothing above it bounds the wait: `HostOffloadBackend::LoadRemoteBlocks`
+     (`tpu_sync/kv_cache/host_offload_backend.cc:1190-1331`) allocates
+     `dst_host_block_ids` from `raiden_controller_->AllocateBlockIds(...)`
+     (`:1210`) before calling `client_ptr->Fetch(...)` (`:1224-1226`), and
+     `KVCacheStore::ReadRemote` / `Load` marks `block_hashes` pending in
+     `load_tracker_` beforehand. A peer store that accepts `Fetch` and hangs
+     (e.g. wedged worker `TransferBuffers`, deadlocked peer, blackholed TCP
+     connection without keepalive) leaves `context->deadline() ==
+     time_point::max()`, pins `dst_host_block_ids` outside the LRU (unreclaimable
+     by eviction), keeps the hashes pending in `PollLoadStatus()` /
+     `PollRemoteReadStatus()` forever, and rejects any retry of the same hash
+     with `FAILED_PRECONDITION: Block is already loading`.
+  2. **Immediate `DeallocateBlockIds` on `Fetch` error vs planless `op = 6` /
+     `uuid = 0` worker push (3b):** When `fetch_future` resolves with an error
+     (`host_offload_backend.cc:1244-1264`), `LoadRemoteBlocks` immediately
+     returns `dst_host_block_ids` to `raiden_controller_->DeallocateBlockIds(dst_host_block_ids)`
+     (`:1245`). Meanwhile, on the source peer, `KVCacheStoreServiceImpl::Fetch`
+     (`kv_cache_store_service.cc:541-544`) drives `controller_->TransferBuffers(src_buffers, dst_buffers)`
+     without cancellation or lease fencing when the `Fetch` gRPC call breaks
+     (or, crucially, if a client deadline is added to fix 3a!). On the wire,
+     `TransferBuffers` pushes host-to-host blocks via planless explicit-destination
+     `H2hWriteDirect(..., /*uuid=*/0)` (`header.op == 6`, `header.uuid == 0`),
+     and on the destination worker `BlockTransportServerPushSession::StartStream`
+     (`tpu_sync/transport/block_transport_session.cc:365-499`) →
+     `KVCacheManagerBase::GetBlockChunks` only bounds-checks `dst_id` against the
+     host buffer array — consulting neither `LogicalBlockManager::IsAllocated(dst_id)`
+     nor any session/lease generation. A late source push for the failed `Fetch`
+     is therefore accepted (`OK`) into a freed or reallocated host block,
+     silently overwriting the new owner's bytes (the F2 write-after-settle shape
+     on `KVCacheStore`'s production `Fetch` path; note `FetchPushAfterFreeTest`
+     proves the two halves separately rather than driving a mid-`TransferBuffers`
+     gRPC channel drop end-to-end).
+- **C++ test output** (unmodified `00e946e3`, verbatim, 2026-11-09):
+  ```
+  Running main() from gmock_main.cc
+  [==========] Running 4 tests from 2 test suites.
+  [----------] Global test environment set-up.
+  [----------] 3 tests from FetchLifetimeTest
+  [ RUN      ] FetchLifetimeTest.FetchRpcCarriesAClientDeadline
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:220: Failure
+  Expected: (source_->deadline()) != (std::chrono::system_clock::time_point::max()), actual: 2262-04-11 23:47:16.854775807 vs 2262-04-11 23:47:16.854775807
+  KVCacheStoreClient::Fetch sent the call with no deadline
+
+  [observation] client Fetch future still pending after 12s
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:233: Failure
+  Value of: future.IsReady()
+    Actual: false
+  Expected: true
+  Fetch against a silent source is still pending after 12s
+
+  [  FAILED  ] FetchLifetimeTest.FetchRpcCarriesAClientDeadline (12315 ms)
+  [ RUN      ] FetchLifetimeTest.SilentSourceWedgesReadRemoteAndItsHostBlocks
+  WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+  I0000 00:00:1794259795.862827   36887 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:34621
+  [observation] after 12s: settled=0 pending=1 free_host_blocks=7/8 retry=FAILED_PRECONDITION: Block is already loading: h
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:272: Failure
+  Value of: settled
+    Actual: false
+  Expected: true
+  the remote read is still pending after 12s against a silent source
+
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:274: Failure
+  Expected equality of these values:
+    free_after
+      Which is: 7
+    free_before
+      Which is: 8
+  the destination host block is still allocated after 12s
+
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:276: Failure
+  Value of: absl::IsFailedPrecondition(retry)
+    Actual: true
+  Expected: false
+  a retry of the same hash is refused as already loading: FAILED_PRECONDITION: Block is already loading: h
+
+  [  FAILED  ] FetchLifetimeTest.SilentSourceWedgesReadRemoteAndItsHostBlocks (12314 ms)
+  [ RUN      ] FetchLifetimeTest.FailedFetchFreesTheDestinationBlocksAtOnce
+  I0000 00:00:1794259808.176211   36887 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:46535
+  [observation] free before=8 handed_to_source=0 reallocated_count=8
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:315: Failure
+  Value of: absl::c_linear_search(*reallocated, handed_to_source[0])
+    Actual: true
+  Expected: false
+  host block 0 was handed to the source as a push destination, freed when Fetch failed, and handed out again while the source may still be writing into it
+
+  [  FAILED  ] FetchLifetimeTest.FailedFetchFreesTheDestinationBlocksAtOnce (100 ms)
+  [----------] 3 tests from FetchLifetimeTest (24730 ms total)
+
+  [----------] 1 test from FetchPushAfterFreeTest
+  [ RUN      ] FetchPushAfterFreeTest.LatePlanlessPushOverwritesAReallocatedBlock
+  I0000 00:00:1794259808.254598   36887 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1794259808.254695   36887 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1794259808.255496   36887 raw_buffer_transport.cc:320] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 44069, listening tcp socket 7: [::]:44069--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1794259808.255715   36887 block_transport.cc:344] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1794259808.257234   36887 tpu_utils.cc:663] Detected interface: lo, BDF: None, MTU: 65536, NUMA: -1, Classification: Control/Fallback Interface
+  W0000 00:00:1794259808.257365   36887 tpu_utils.cc:700] No data plane NIC was discovered; KV traffic will fall back to a single rail. Set TPU_RAIDEN_DATA_NICS to an explicit comma-separated interface allowlist (for example "ens6,enp192s4"), or raise the MTU of the data interfaces above 1500.
+  InitTransportServer: target_numa=[]
+  InitTransportServer: Local IP: 127.0.0.1 numa=-1
+  I0000 00:00:1794259808.257953   36887 raw_buffer_transport.cc:320] bound_ip_: 127.0.0.1, local_ips_: 127.0.0.1, local_port_: 39311, listening tcp socket 8: [::]:39311--*, listen_backlog: 4096, pin_recv_threads_to_nic_numa: false
+  I0000 00:00:1794259808.258238   36887 block_transport.cc:344] local_port=0, local_ips=127.0.0.1, parallelism=1, numa_send_adapters=0
+  I0000 00:00:1794259808.259786   37066 conn_util.cc:260] connected tcp socket 9: 127.0.0.1:39500--127.0.0.1:39311
+  I0000 00:00:1794259808.260028   37067 raw_buffer_transport.cc:717] accepted tcp socket 10: [::ffff:127.0.0.1]:39311--[::ffff:127.0.0.1]:39500
+  I0000 00:00:1794259808.260210   37067 block_transport.cc:392] HandleCustomRequest (H2H read start): client_fd=10, op=6, uuid=0, numa=1
+  [observation] late push status=OK new owner's first byte=0xa5
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:367: Failure
+  Value of: late.ok()
+    Actual: true
+  Expected: false
+  a planless uuid-0 push into a freed-and-reallocated block was accepted
+
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:370: Failure
+  Expected equality of these values:
+    first_byte
+      Which is: '\xA5' (165)
+    0x11
+      Which is: 17
+  the late push overwrote the new owner's bytes
+
+  I0000 00:00:1794259808.261418   37067 block_transport.cc:392] HandleCustomRequest (H2H read start): client_fd=10, op=6, uuid=0, numa=1
+  tpu_sync/kv_cache/kv_cache_store_fetch_bughunt_test.cc:378: Failure
+  Value of: into_free.ok()
+    Actual: true
+  Expected: false
+  a planless uuid-0 push into an unallocated block was accepted
+
+  [  FAILED  ] FetchPushAfterFreeTest.LatePlanlessPushOverwritesAReallocatedBlock (11 ms)
+  [----------] 1 test from FetchPushAfterFreeTest (12 ms total)
+
+  [----------] Global test environment tear-down
+  [==========] 4 tests from 2 test suites ran. (24743 ms total)
+  [  PASSED  ] 0 tests.
+  [  FAILED  ] 4 tests, listed below:
+  [  FAILED  ] FetchLifetimeTest.FetchRpcCarriesAClientDeadline
+  [  FAILED  ] FetchLifetimeTest.SilentSourceWedgesReadRemoteAndItsHostBlocks
+  [  FAILED  ] FetchLifetimeTest.FailedFetchFreesTheDestinationBlocksAtOnce
+  [  FAILED  ] FetchPushAfterFreeTest.LatePlanlessPushOverwritesAReallocatedBlock
+
+   4 FAILED TESTS
+  ```
+- **Reachability:** any `KVCacheStore` peer-load caller (`Load(hashes, slices,
+  device_block_ids)` or `ReadRemote` on `BlockStatus::REMOTE` slices; neither
+  `vllm-torchtpu` nor `sglang-torchtpu` uses `KVCacheStore`). Note the trap
+  between 3a and 3b (identical to F2's naive-fix trap): adding a `ClientContext`
+  deadline to `Fetch` alone fixes 3a **at the cost of making 3b routine**,
+  because every timed-out `Fetch` will immediately `DeallocateBlockIds(dst_host_block_ids)`
+  while the source's `TransferBuffers` worker push is still writing into those
+  blocks!
+- **Candidate fixes:** (1) add a configurable `Fetch` deadline (plus a source
+  HOLD margin, mirroring `WriteRemote`'s `RAIDEN_REMOTE_WRITE_HOLD_S` vs
+  `granted_deadline` gap, or switch peer loads from source-push `Fetch` to
+  destination-pull so the destination's `TransferBuffers` future directly gates
+  `DeallocateBlockIds`, as `WriteRemote`'s `ReleaseLandingBlocks` does in R-D);
+  or (2) register a per-`Fetch` `uuid != 0` receive session on the destination
+  workers so `BeginIncomingPush` / `EndIncomingPush` pins `in_flight_` and
+  `DeallocateBlockIds` waits for `session->Done()`.
+- **Repro:** `kv_cache_store_fetch_bughunt_test.cc`; copy to
+  `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
+  `bazel test --config=oss //tpu_sync/kv_cache:kv_cache_store_fetch_bughunt_test`.
+
+---
+
+## F20. `KVCacheManagerBase::host_block_manager_` (`LogicalBlockManager`) is mutated without synchronization across inbound auto-allocating `op = 1` pushes, `H2hRead` pulls, and `AllocateBlocks`, handing out duplicate host block IDs
+
+- **Status:** **CONFIRMED (test)** 2026-10-29 on unmodified `42dda542`, re-run
+  2026-11-09 on unmodified `00e946e3`:
+  `host_block_manager_race_bughunt_test.cc` (`HostBlockManagerRaceTest`,
+  1 control passing + 1 case failing). Not yet filed.
+- **Where / Root cause (`00e946e3`):** `LogicalBlockManager`
+  (`tpu_sync/kv_cache/logical_block_manager.h:33-35`) has no internal mutex and
+  documents: *"This class is not thread-safe and requires external
+  synchronization for concurrent access."* (`RaidenController` wraps its own
+  `LogicalBlockManager` in `RaidenController::mu_`.) By contrast,
+  `KVCacheManagerBase` owns `std::unique_ptr<LogicalBlockManager>
+  host_block_manager_` (`tpu_sync/kv_cache/kv_cache_manager_base.h:803`) with
+  **no mutex** guarding it:
+  - `KVCacheManagerBase::AllocateBlocks(num_blocks, uuid)` (`:871-874`) calls
+    `host_block_manager_->Allocate(num_blocks, /*lock=*/true)` unlocked;
+  - `RawBufferTransport` serves every accepted TCP connection on its own
+    `ConnectionWorker` thread, and `BlockTransportServerPushSession::StartStream`
+    (`tpu_sync/transport/block_transport_session.cc:386-389`) calls
+    `delegate_->AllocateBlocks(header.count_or_size, header.uuid)` for `header.op
+    == 1` (auto-allocating `H2hWrite(peer, src_block_ids)` with no destination
+    IDs);
+  - local `BlockTransport::H2hRead` pulls (the torch/jax `H2hRead` binding,
+    called with the Python GIL released), `D2hAutoAllocate`, `Unlock`, and
+    dynamic-mode `StagingBlockAllocator` all read and mutate the same
+    `host_block_manager_` without a lock.
+  Concurrent `Allocate` calls race on `blocks_[i].is_allocated`,
+  `access_counter_`, and `num_free_`, handing the same host block ID to two or
+  more concurrent callers.
+- **C++ test output** (unmodified `00e946e3`, 2026-11-09; glog `tpu_utils` /
+  `raw_buffer_transport` / `HandleCustomRequest` `I0000` lines omitted,
+  `[observation]` / `[duplicate]` / `[control]` and gtest lines verbatim):
+  ```
+  Running main() from gmock_main.cc
+  [==========] Running 2 tests from 1 test suite.
+  [----------] Global test environment set-up.
+  [----------] 2 tests from HostBlockManagerRaceTest
+  [ RUN      ] HostBlockManagerRaceTest.ConcurrentAutoAllocatingPushesAndLocalAllocs
+  [observation] handed_out=42000 distinct=40010 duplicates=1990 errors=0 free 65535 -> 23535 (expected 23535)
+  [duplicate] block 1: local #0 and pull #0
+  [duplicate] block 2: local #1 and push 0#0
+  [duplicate] block 2: local #1 and push 1#0
+  [duplicate] block 2: local #1 and push 2#0
+  [duplicate] block 2: local #1 and push 3#0
+  [duplicate] block 4: local #3 and push 0#1
+  [duplicate] block 3: local #2 and pull #1
+  [duplicate] block 4: local #3 and push 2#1
+  [duplicate] block 4: local #3 and push 3#1
+  [duplicate] block 4: local #3 and push 1#1
+  tpu_sync/kv_cache/host_block_manager_race_bughunt_test.cc:162: Failure
+  Value of: duplicates.empty()
+    Actual: false
+  Expected: true
+  1990 host block ids were handed to two owners at once
+
+  [  FAILED  ] HostBlockManagerRaceTest.ConcurrentAutoAllocatingPushesAndLocalAllocs (29795 ms)
+  [ RUN      ] HostBlockManagerRaceTest.ControlSameWorkloadSerializedHasNoDuplicates
+  [control] handed_out=2400 duplicates=0 free 8191 -> 5791
+  [       OK ] HostBlockManagerRaceTest.ControlSameWorkloadSerializedHasNoDuplicates (507 ms)
+  [----------] 2 tests from HostBlockManagerRaceTest (30303 ms total)
+
+  [----------] Global test environment tear-down
+  [==========] 2 tests from 1 test suite ran. (30303 ms total)
+  [  PASSED  ] 1 test.
+  [  FAILED  ] 1 test, listed below:
+  [  FAILED  ] HostBlockManagerRaceTest.ConcurrentAutoAllocatingPushesAndLocalAllocs
+
+   1 FAILED TEST
+  ```
+- **Reachability:** reachable only by callers that drive `KVCacheManagerBase`'s
+  own `host_block_manager_` concurrently — specifically the torch/jax
+  auto-allocating `H2hWrite(peer, src_block_ids)` (`op = 1`), `H2hRead`,
+  `D2hAutoAllocate` / `Unlock` bindings, or dynamic-staging
+  `StagingBlockAllocator` (`TPU_RAIDEN_DYNAMIC_HOST_STAGING=1`). None of the
+  three disaggregated serving connectors (`tpu-inference`, `vllm-torchtpu`,
+  `sglang-torchtpu`) or `KVCacheStore` reaches it: prefill-to-decode uses static
+  `StagingBlockAllocator` slots (`staging_arena.cc`, guarded by its own
+  `absl::Mutex`), pool reshard uses `PoolStagingStorage` (`staging_mu_`), and
+  `KVCacheStore` allocates from `RaidenController`'s mutex-guarded
+  `LogicalBlockManager` and pushes explicit destination IDs (`op = 6`).
+- **Candidate fixes:** guard `KVCacheManagerBase::host_block_manager_` behind a
+  dedicated `mutable absl::Mutex host_block_mu_` on `KVCacheManagerBase` (or make
+  `LogicalBlockManager` internally mutex-guarded) and deprecate direct unlocked
+  `host_block_manager()` pointer access in favor of locked `KVCacheManagerBase`
+  methods.
+- **Repro:** `host_block_manager_race_bughunt_test.cc`; copy to
+  `tpu_sync/kv_cache/`, apply `findings/build_targets.patch`, and run
+  `bazel test --config=oss //tpu_sync/kv_cache:host_block_manager_race_bughunt_test`.
+
+---
+
 ## C1. tpu-inference `tpu_raiden_connector`: failed and never-pulled transfers leak their KV blocks on both nodes
 
 - **Status:** **CONFIRMED (test)** 2026-10-20, on CPU, no TPU:
@@ -2939,15 +3462,61 @@ future planner change violated its own invariant under `kController` delivery.
 Fix: push `tsl::MakeErrorFuture<absl::Status>(...)` (matching `kDirectWorkerRpc`)
 or store `(unit_idx, future)` pairs in `futures`.
 
+### R-I. `WriteRemoteServerReactor::StartAck` vs `OnCancel` write-after-`Finish` hazard: REFUTED (test, `42dda542` / `00e946e3`)
+
+`WriteRemoteServerReactor::StartAck` (`tpu_sync/kv_cache/kv_cache_store_service.cc:138-149`)
+checks `finished_` under `mu_`, unlocks `mu_`, and then calls
+`StartWrite(&ack_event_)`, while `OnCancel()` (`:217-222`) runs on a gRPC thread
+without `gate_->mu` and calls `FinishWithError(::grpc::Status::CANCELLED)` →
+`Finish(status)` (`:161-174`). If `OnCancel()` could run between `StartAck`'s
+unlock and `StartWrite`, `StartWrite(&ack_event_)` would execute after `Finish`,
+which gRPC forbids (`API misuse` `CHECK`).
+
+Checked against gRPC 1.81.0 and confirmed empirically by
+`kv_cache_store_service_reactor_bughunt_test.cc` (`WriteRemoteReactorStressTest`,
+2/2 passing at `42dda542` and re-run 2026-11-09 on unmodified `00e946e3`):
+`KVCacheStoreServiceImpl::WriteRemote` calls `StartAck` from inside the synchronous
+method handler *before* returning the reactor pointer. Until
+`CallbackServerStreamingHandler::RunHandler` calls `SetupReactor` on the
+returned pointer, the reactor's writer is unbound: `StartWrite` only appends to
+the reactor's pre-bind backlog, and gRPC gates `OnCancel` on **both**
+cancellation *and* `SetupReactor` completion, so `OnCancel` cannot fire before
+the pre-bind backlog has been flushed. Once the `ack_event_` write is in flight,
+a concurrent `Finish(CANCELLED)` from `OnCancel` is legal in gRPC's callback API
+(separate core batches; `OnWriteDone` runs before `OnDone`). Verbatim output
+(`00e946e3`):
+```
+Running main() from gmock_main.cc
+[==========] Running 2 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 2 tests from WriteRemoteReactorStressTest
+[ RUN      ] WriteRemoteReactorStressTest.ClientCancelRacingTheAckNeverMisusesGrpc
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1794259778.700440   36834 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:39463
+[observation] acked=0 cancelled_before_ack=2000 refused=0 other=0
+[       OK ] WriteRemoteReactorStressTest.ClientCancelRacingTheAckNeverMisusesGrpc (2503 ms)
+[ RUN      ] WriteRemoteReactorStressTest.CancelArrivingInsideTheHandlerIsHarmless
+I0000 00:00:1794259781.196744   36834 kv_cache_store.cc:937] KVCacheStore published at 127.0.0.1:43343
+[observation] handler-side cancels=300 acked=0 cancelled=300 other=0 in_flight_ops_after=300
+W0000 00:00:1794259786.748632   36834 kv_cache_store.cc:964] Failed to unpublish store address 127.0.0.1:43343: failed to connect to all addresses; last error: UNKNOWN: ipv4:127.0.0.1:41525: Failed to connect to remote host: Connection refused. Peers may dial a dead address until it is replaced.
+[       OK ] WriteRemoteReactorStressTest.CancelArrivingInsideTheHandlerIsHarmless (5606 ms)
+[----------] 2 tests from WriteRemoteReactorStressTest (8109 ms total)
+
+[----------] Global test environment tear-down
+[==========] 2 tests from 1 test suite ran. (8110 ms total)
+[  PASSED  ] 2 tests.
+```
+
 ### Open / not yet checked
 
-- `KVCacheStoreClient::Fetch` sets no RPC deadline
-  (`kv_cache_store_client.cc:61-125`). If the RPC fails with a transport error
-  while the source's workers are still writing, `LoadRemoteBlocks` frees
-  `dst_host_block_ids` immediately (`host_offload_backend.cc:1131-1142`). Same
-  shape as F2 but in the production path. Whether in-flight source DMA can
-  outlive a failed Fetch RPC depends on worker and transport teardown, not
-  established. **PLAUSIBLE.**
+- *(Promoted to **F19**, 2026-11-09)* `KVCacheStoreClient::Fetch` sets no RPC
+  deadline (`kv_cache_store_client.cc:61-125`), and on `Fetch` failure
+  `HostOffloadBackend::LoadRemoteBlocks` frees `dst_host_block_ids` immediately
+  (`host_offload_backend.cc:1244-1264`) while the receiving worker accepts
+  planless `op = 6` / `uuid = 0` pushes into freed or reallocated host blocks
+  (`kv_cache_store_fetch_bughunt_test.cc`, 4/4 failing; the combined end-to-end
+  interleaving of a `Fetch` RPC breaking mid-`TransferBuffers` is exercised as
+  those two halves rather than one single test).
 - ReadRemote hooks capture a raw `this`, and `ClearReadRemoteHooks` is not
   called in `~KVCacheStore`. The controller is owned by the store and is
   destroyed first among the members that matter, so this is probably safe.
@@ -3019,9 +3588,9 @@ also green. A failure on a later upstream is either a transcription error
 disagrees with the C++ — a finding for `tpu_sync/formal_verification/`), or a
 defect.
 
-### Reshard control-plane coverage-gap tests (`coverage_gap_reshard_control.patch`, at `42dda542`, run 2026-10-30: 7/7 pass)
+### Reshard control-plane coverage-gap tests (`coverage_gap_reshard_control.patch`, at `42dda542`, run 2026-10-30: 7/7 pass; **retired 2026-11-09** after upstream `5835b975` landed all 7 cases)
 
-Appends 7 `TEST_F(ReshardStackTest, ...)` cases to
+Appended 7 `TEST_F(ReshardStackTest, ...)` cases to
 `tpu_sync/kv_cache/reshard/reshard_service_test.cc` covering all 14 `Gap.test`
 branches and all 4 unasserted `Refusal` constructors of
 `Reshard/Registry/Coverage.lean` plus all 4 gap branches of
@@ -3040,7 +3609,11 @@ failure:
 
 Runs: full `//tpu_sync/kv_cache/reshard:reshard_service_test` target green at
 `42dda542` with `--runs_per_test=5` (2026-10-30); `git apply --check` also clean
-against `337540eb`.
+against `337540eb`. Retired 2026-11-09: upstream `5835b975` landed all 7 cases
+in `tpu_sync/kv_cache/reshard/reshard_service_test.cc:2405-2703` (naming case 6
+`TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders`), leaving
+`Reshard/Registry/Coverage.lean` (`25/25`, all 7 refusals) and
+`Reshard/Coordinator/Coverage.lean` (`14/14`) with zero gaps.
 
 ### Reshard session and loopback-pipeline coverage-gap tests (`coverage_gap_reshard_sessions.patch`, at `42dda542`, run 2026-10-30: 12/12 pass)
 
@@ -3669,3 +4242,42 @@ clone reset. Results, verbatim:
     (`00e946e3` bumps the pin). Filed tally unchanged: F1 (fixed), F2+F3, F4
     (fixed), F6 (fixed), F7 (fixed), F8, F9, F10 (fixed), F11 (fixed), F12,
     F13, F15, C1 (fix open as PR #3918); F14, F16, F17 not yet filed.
+- 2026-11-09 (later): **F18, F19, F20 and R-I written up and re-verified on
+  `00e946e3`; `pool_reshard_stale_subplan_bughunt_test.cc` added under F13;
+  `coverage_gap_reshard_control.patch` retired.**
+  - Triaged, rebuilt, and ran on unmodified `00e946e3` the four 2026-10-29
+    store/allocator reproducers (all four compile unchanged): **F18**
+    (`kv_cache_store_remote_write_bughunt_test.cc`, 1 control + 3 failing:
+    accepted remote writes settle in `HostOffloadBackend::BeginWriteRemote`
+    without erasing `KVCacheStore::active_remote_writes_` so `~KVCacheStore`
+    double-`Release`s live pins, and `kCancelled` after ack drops the pin
+    release and save verdict), **F19** (`kv_cache_store_fetch_bughunt_test.cc`,
+    4/4 failing, promoted from "Open / not yet checked": `KVCacheStoreClient::Fetch`
+    sets no deadline and `LoadRemoteBlocks` frees `dst_host_block_ids` on error
+    while the worker accepts planless `op = 6` / `uuid = 0` pushes into freed or
+    reallocated host blocks), **F20** (`host_block_manager_race_bughunt_test.cc`,
+    1 control + 1 failing: `KVCacheManagerBase::host_block_manager_` mutated
+    without a lock across concurrent auto-allocating `op = 1` pushes, `H2hRead`
+    pulls, and `AllocateBlocks`, handing out 1,990 duplicate host block IDs
+    across 42,000 allocations), and **R-I**
+    (`kv_cache_store_service_reactor_bughunt_test.cc`, 2/2 passing: refutes the
+    `WriteRemoteServerReactor::StartAck` vs `OnCancel` race under gRPC 1.81.0).
+  - Built and ran `pool_reshard_stale_subplan_bughunt_test.cc` (`StaleSubPlanBughunt`,
+    2 controls + 4 failing on unmodified `00e946e3`) covering F13's
+    `sub_plan_chains_` single-plan retry collision (`NoteSubPlanRegisteredLocked`
+    erasing a live chain entry) and `SweepSubPlanChainsLocked` erasing a failed
+    tombstone while a sibling sub-plan is `IsDraining() && !Done()` (emitting a
+    second `failed_recving` or false `done_recving` on the failed request).
+  - Re-anchored `build_targets.patch` cleanly at `00e946e3` (0 offset, covering
+    all 14 `.cc` files) and retired `coverage_gap_reshard_control.patch`
+    (superseded by upstream `5835b975` in `reshard_service_test.cc:2405-2703`,
+    leaving `Reshard/Registry/Coverage.lean` 25/25 and
+    `Reshard/Coordinator/Coverage.lean` 14/14). Filed tally unchanged (F14,
+    F16–F20 not yet filed).
+- 2026-11-09 (later): **F13 upstream bug updated.** Left a comment on bug 12
+  with the `00e946e3` shape (after `25f7d8a7`, "no entry in `sub_plan_chains_`"
+  is read as a single-plan request; the single-plan retry under the same
+  `req_id` erases a live entry, and the tombstone sweep ignores a sibling that
+  is still draining), noting that part 1 of the original report is unchanged
+  and part 2 is the new mechanism. Original description left as filed;
+  `filed_bugs.md` bug 12 carries the *Update* line. Filed tally unchanged.

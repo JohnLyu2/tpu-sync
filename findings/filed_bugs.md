@@ -333,7 +333,7 @@ A pool-reshard session reports `failed_recving` only once `Done()`, i.e. after i
 
 Confirmed by a unit test. Found during Lean formalization.
 
-Reproducer: `PoolReshardChainBughunt1B.*` (4 cases) in [`pool_reshard_chain_bughunt_test.cc`](pool_reshard_chain_bughunt_test.cc).
+Reproducer: `PoolReshardChainBughunt1B.*` (4 cases) in [`pool_reshard_chain_bughunt_test.cc`](pool_reshard_chain_bughunt_test.cc). *Update 2026-11-09: still open at `00e946e3`, changed shape. `25f7d8a7` moved chain membership off the reshard sessions into the `sub_plan_chains_` map, and `RecordPoolReshardTerminalLocked` now reads "no entry for `req_id`" as a single-plan request and reports the session's terminal at once. The entry can vanish while a window is still in flight: a single-plan retry under the same `req_id` erases it (a still-running window of the failed chain then settles as the retry's `done_recving` or `failed_recving`), and `SweepSubPlanChainsLocked` erases a failed entry after one quiet `timeout_s_` without checking for `!Done()` members (the late window re-reports the request as `failed_recving` or, if it had latched OK, as `done_recving`). Part 1 of the report is unchanged; part 2 is this new mechanism. Confirmed by `StaleSubPlanBughunt.*` (2 controls + 4 failing) in [`pool_reshard_stale_subplan_bughunt_test.cc`](pool_reshard_stale_subplan_bughunt_test.cc); comment added to the upstream bug; see README.md §F13.*
 
 
 ---

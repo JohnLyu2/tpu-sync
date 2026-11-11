@@ -1,5 +1,5 @@
 diff --git a/tpu_sync/core/controller/BUILD b/tpu_sync/core/controller/BUILD
-index 954554b9..1474b5c8 100644
+index 5ce8a7ce..f1f62d67 100644
 --- a/tpu_sync/core/controller/BUILD
 +++ b/tpu_sync/core/controller/BUILD
 @@ -369,3 +369,25 @@ py_library(
@@ -60,10 +60,10 @@ index a88ac487..f80746cd 100644
 +    ],
 +)
 diff --git a/tpu_sync/kv_cache/BUILD b/tpu_sync/kv_cache/BUILD
-index 261a47b6..19861dc3 100644
+index a74c2afc..7fed71cb 100644
 --- a/tpu_sync/kv_cache/BUILD
 +++ b/tpu_sync/kv_cache/BUILD
-@@ -1312,3 +1312,175 @@ cc_library(
+@@ -1387,3 +1387,332 @@ cc_library(
          "@com_google_absl//absl/types:span",
      ],
  )
@@ -236,6 +236,163 @@ index 261a47b6..19861dc3 100644
 +        "@com_google_absl//absl/time",
 +        "@com_google_googletest//:gtest_main",
 +        "@xla//xla:future",
++        "@xla//xla/tsl/concurrency:future",
++    ],
++)
++
++cc_test(
++    name = "pool_reshard_stale_subplan_bughunt_test",
++    srcs = ["pool_reshard_stale_subplan_bughunt_test.cc"],
++    copts = [
++        "-fno-strict-aliasing",
++        "-fexceptions",
++    ],
++    features = [
++        "-use_header_modules",
++        "-layering_check",
++    ],
++    deps = [
++        ":kv_cache_manager_base",
++        ":kv_cache_manager_with_transfer",
++        ":pool_layout",
++        "//tpu_sync/core:raw_transfer_core",
++        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "//tpu_sync/transport:transfer_session",
++        "@com_google_absl//absl/base:core_headers",
++        "@com_google_absl//absl/container:flat_hash_map",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/synchronization",
++        "@com_google_absl//absl/time",
++        "@com_google_absl//absl/types:span",
++        "@com_google_googletest//:gtest_main",
++        "@xla//xla:future",
++    ],
++)
++
++cc_test(
++    name = "kv_cache_store_remote_write_bughunt_test",
++    srcs = ["kv_cache_store_remote_write_bughunt_test.cc"],
++    copts = [
++        "-fno-strict-aliasing",
++        "-fexceptions",
++    ],
++    features = [
++        "-use_header_modules",
++        "-layering_check",
++    ],
++    deps = [
++        ":kv_cache_store",
++        ":kv_cache_store_backend",
++        "//tpu_sync/common:raiden_id",
++        "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
++        "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
++        "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
++        "//tpu_sync/proto:kv_cache_store_service_cc_proto",
++        "@com_github_grpc_grpc//:grpc++",
++        "@com_google_absl//absl/base:core_headers",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/synchronization",
++        "@com_google_absl//absl/time",
++        "@com_google_googletest//:gtest",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
++cc_test(
++    name = "kv_cache_store_fetch_bughunt_test",
++    srcs = ["kv_cache_store_fetch_bughunt_test.cc"],
++    copts = [
++        "-fno-strict-aliasing",
++        "-fexceptions",
++    ],
++    features = [
++        "-use_header_modules",
++        "-layering_check",
++    ],
++    deps = [
++        ":kv_cache_manager_base",
++        ":kv_cache_manager_with_transfer",
++        ":kv_cache_store",
++        ":kv_cache_store_client",
++        ":logical_block_manager",
++        "//tpu_sync/common:raiden_id",
++        "//tpu_sync/core/controller:raiden_controller",
++        "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
++        "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
++        "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
++        "//tpu_sync/proto:kv_cache_store_service_cc_proto",
++        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "@com_github_grpc_grpc//:grpc++",
++        "@com_google_absl//absl/algorithm:container",
++        "@com_google_absl//absl/base:core_headers",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:status_matchers",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/synchronization",
++        "@com_google_absl//absl/time",
++        "@com_google_googletest//:gtest",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
++cc_test(
++    name = "host_block_manager_race_bughunt_test",
++    srcs = ["host_block_manager_race_bughunt_test.cc"],
++    copts = [
++        "-fno-strict-aliasing",
++        "-fexceptions",
++    ],
++    features = [
++        "-use_header_modules",
++        "-layering_check",
++    ],
++    deps = [
++        ":kv_cache_manager_base",
++        ":kv_cache_manager_with_transfer",
++        ":logical_block_manager",
++        "//tpu_sync/transport:block_transport_delegate",
++        "@com_google_absl//absl/container:flat_hash_map",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/synchronization",
++        "@com_google_googletest//:gtest",
++        "@com_google_googletest//:gtest_main",
++    ],
++)
++
++cc_test(
++    name = "kv_cache_store_service_reactor_bughunt_test",
++    srcs = ["kv_cache_store_service_reactor_bughunt_test.cc"],
++    copts = [
++        "-fno-strict-aliasing",
++        "-fexceptions",
++    ],
++    features = [
++        "-use_header_modules",
++        "-layering_check",
++    ],
++    deps = [
++        ":kv_cache_store",
++        ":kv_cache_store_client",
++        ":kv_cache_store_service",
++        "//tpu_sync/common:raiden_id",
++        "//tpu_sync/core:buffer",
++        "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
++        "//tpu_sync/proto:worker_service_cc_proto",
++        "//tpu_sync/rpc:raiden_service_cc_proto",
++        "@com_github_grpc_grpc//:grpc++",
++        "@com_google_absl//absl/base:core_headers",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/synchronization",
++        "@com_google_absl//absl/time",
++        "@com_google_absl//absl/types:span",
++        "@com_google_googletest//:gtest",
++        "@com_google_googletest//:gtest_main",
 +        "@xla//xla/tsl/concurrency:future",
 +    ],
 +)
