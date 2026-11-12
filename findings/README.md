@@ -1310,7 +1310,7 @@ failing, unchanged; see §F13, §F15–§F17 and §History 2026-11-11).
   with `OkStatus()` (`ReshardSendSession::EndOp` during unlocked
   `ReleaseDataConnectionsAfterSend`, or `ReshardReceiveSession::FinishPoolH2d`
   before `self->EndOp()`), with no caller retry required (`SubPlanChain`
-  `mutant_draining_ok_at_sweep_reports_done_after_failure`). In addition,
+  `trace_draining_ok_at_sweep_reports_done_after_failure`). In addition,
   `CompleteReadWithDetails` acquires `session->mu_` separately in
   `RetireSettledSessionLocked` (`:494`) and `SweepSubPlanChainsLocked` (`:278`):
   if an unanchored (`progress.anchored == false`, `index >= 1`) sub-plan's
@@ -1320,7 +1320,7 @@ failing, unchanged; see §F13, §F15–§F17 and §History 2026-11-11).
   progress.sub_sessions.end()` (`:201-212`, checked before `if (progress.failed ||
   progress.completed)` at `:219`) to emit `done_sending_` / `done_recving_`
   after `failed_recving_` (`SubPlanChain`
-  `mutant_mid_poll_endop_unanchored_reports_done_after_stall`).
+  `trace_mid_poll_endop_unanchored_reports_done_after_stall`).
 - **C++ test at `00e946e3`** (`pool_reshard_stale_subplan_bughunt_test.cc`,
   `StaleSubPlanBughunt`, 2 controls passing + 4 cases failing on unmodified
   `00e946e3`, 2026-11-09): exercises both (1) a single-plan retry
@@ -1334,7 +1334,7 @@ failing, unchanged; see §F13, §F15–§F17 and §History 2026-11-11).
   emits a second `failed_recving` (when the deadline arm marked it draining) or
   false `done_recving` on the already-failed request (when it had already
   called `Finish()` OK before `timeout_s_`, `SubPlanChain`
-  `mutant_draining_ok_at_sweep_reports_done_after_failure`). Verbatim output
+  `trace_draining_ok_at_sweep_reports_done_after_failure`). Verbatim output
   (glog `tpu_utils` / `raw_buffer_transport` startup lines omitted):
   ```
   [==========] Running 6 tests from 1 test suite.
