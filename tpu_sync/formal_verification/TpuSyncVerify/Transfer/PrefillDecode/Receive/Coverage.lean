@@ -14,12 +14,12 @@ machinery is `Common/Coverage.lean`.
 
 The denominator is the set of branches reachable from `initPush`/`initLoad`
 (`Coverage.reachableBranches`, an exhaustive search); the numerator is the set
-of branches along the traces that replay an upstream C++ test (`paired` in
+of branches along the traces that replay a C++ test (`paired` in
 `Traces.lean`).
-A branch no replayed test reaches is either a missing upstream test or a
-transition only the environment can cause; each is listed and classified in
+A branch no replayed test reaches is either a missing C++ test or a
+transition only the environment can cause; the uncovered set is pinned in
 `#guard`s at the end so a new branch, a dropped trace or a new test fails
-`lake build`. -/
+`lake build` (each gap's class is recorded in the table below). -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode
 
@@ -158,7 +158,7 @@ Two leaves of `Leaf` are in no reachable branch:
   further: a report arriving after the last dispatch finds `!network_completed_`
   false and never reaches `RecordNetworkCompleteLocked`.
 
-The 32 upstream tests in `paired` (22 named traces) reach **24 of 35**; the
+The 32 C++ tests in `paired` (22 named traces) reach **24 of 35**; the
 four `modelOnly` traces add 2 more. The 11 the tests miss, each with the
 shortest schedule that reaches it (`Coverage.witness`) and what it would take:
 
@@ -184,7 +184,7 @@ leaves the two unordered. A reply that fails after its data landed (a
 control-path deadline or reset) does not change the verdict: `on_response`
 runs `FinishLocked(pull_status)` only `if (!pull_status.ok() && !self->draining_)`,
 so a receive that already settled is published as it settled
-(`tr_late_reply_failure_keeps_verdict` is model-only as a trace: no upstream
+(`tr_late_reply_failure_keeps_verdict` is model-only as a trace: no C++
 test fails a pull reply *after* OK data settled, whereas
 `ExpiredReceiveKeepsStagingUntilHandshakeEnds` already covers
 `pullReplyFailDraining` settling after a deadline `Finish`). **window**

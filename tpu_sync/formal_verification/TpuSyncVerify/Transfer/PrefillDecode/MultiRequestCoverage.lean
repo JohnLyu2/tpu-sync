@@ -2,8 +2,9 @@ import TpuSyncVerify.Transfer.PrefillDecode.Pipeline.Coverage
 
 /-! # `MultiRequest`: branch coverage of `multiStep`
 
-Part of `TpuSyncVerify.Transfer.PrefillDecode.MultiRequest`; imports the
-traces in `PipelineChecks.lean` through `Pipeline/Coverage.lean`.
+Companion coverage module to `TpuSyncVerify.Transfer.PrefillDecode.MultiRequest`
+(imported directly by `TpuSyncVerify.lean`); imports the traces in
+`PipelineChecks.lean` through `Pipeline/Coverage.lean`.
 
 `multiStep` adds three things to `Pipeline.step`: the two recycle events and
 the write-after-release corruption arm of `reqStep`. Everything else a
@@ -83,7 +84,7 @@ Three leaves are new in `multiStep`:
   recycled buffers. Reached by the two multi-request traces
   (`trace_overlapped_requests`, `trace_multi_request`), which replay the
   single-host disaggregated serving example (`examples/single_host_disagg/run_all.sh`)
-  — a script, not a test in the suite, so both are `modelOnly`. **No upstream
+  — a script, not a test in the suite, so both are `modelOnly`. **No
   test overwrites a buffer an earlier request released while that request is
   still observable** (`TreeBroadcastCorrectness8Nodes` re-reads a published
   decode block and reuses its freed staging slot for later sends, and
@@ -94,7 +95,7 @@ Three leaves are new in `multiStep`:
   seen from the other side: the pipeline's environment events are what a
   recycle does to the request being recycled.
 
-So `MultiRequest` adds two live branches to the corpus and the upstream tests
+So `MultiRequest` adds two live branches to the corpus and the tests
 reach neither; the single-request pipeline branches each `reqStep` takes are
 the `Pipeline` numbers. -/
 

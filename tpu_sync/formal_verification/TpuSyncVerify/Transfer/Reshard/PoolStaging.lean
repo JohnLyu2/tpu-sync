@@ -24,11 +24,18 @@ line ranges for every symbol, sub-block, and test are in the generated
 
   1. **Bounded staging arena (`PoolStagingStorage` in `base.h`,
      `KVCacheManagerBase::ConfigurePoolStaging` in `base.cc`):**
-     When a storage's pools declare `staging_blocks_per_request > 0` and
-     `staging_leases > 0` such that `num_slots = staging_leases *
-     blocks_per_lease < max_pool_blocks`, `ConfigurePoolStaging` allocates a
-     bounded host arena of `num_slots` page slots (`free_slots = [num_slots-1,
-     ..., 0]`, so `.back()` pops `0, 1, ...` in order). On a full host mirror
+     A storage is bounded when it is device-backed, `staging_leases > 0`,
+     every pool on it declares `staging_blocks_per_request > 0`
+     (`agg.hint_min > 0`), its pools agree on a positive `block_stride_bytes`
+     and a positive `num_blocks`, and `num_slots = staging_leases *
+     blocks_per_lease` (`blocks_per_lease = agg.hint_max`) is smaller than that
+     `num_blocks` (`if (slots >= agg.num_blocks) bounded = false;`).
+     `ConfigurePoolStaging` then allocates a bounded host arena of `num_slots`
+     page slots (`free_slots = [num_slots-1, ..., 0]`, so `.back()` pops
+     `0, 1, ...` in order). Any other device-backed storage with pools, including one whose
+     pools disagree on stride or block count, is accepted and keeps a full
+     host mirror with identity addressing, on which
+     `AcquirePoolStagingLease` returns OK without leasing anything. On a full host mirror
      (`layers_.size() == num_layers_`), each storage keeps its own arena or
      extent size; when host layers are bounded (`layers_.size() < num_layers_`),
      each allocated host layer is grown to `max_arena_bytes` across all storages
@@ -39,10 +46,17 @@ line ranges for every symbol, sub-block, and test are in the generated
      present in `st.leases[uuid]->slot_by_block` (`if (cur != nullptr && cur->slot_by_block.contains(block_id)) continue;`). Multiple pools
      sharing a physical storage (`storage_index`) therefore share one page lease
      under the same `uuid` without double-allocating slots. If
-     `missing.size() > st.num_slots` or `st.free_slots.size() < missing.size()`,
-     acquisition fails with `ResourceExhausted` (`if (static_cast<int64_t>(missing.size()) > st.num_slots)` and `while (st.free_slots.size() < missing.size())`). Otherwise it
+     `missing.size() > st.num_slots`, acquisition fails at once with
+     `ResourceExhausted` (`if (static_cast<int64_t>(missing.size()) > st.num_slots)`).
+     While `st.free_slots.size() < missing.size()` the caller waits on
+     `staging_cv_` (releasing `staging_mu_`) until enough slots are free or
+     `timeout` (the callers pass `pool_staging_lease_timeout()`) elapses, and
+     only then fails with `ResourceExhausted`
+     (`while (st.free_slots.size() < missing.size())`). Otherwise it
      pops `missing.size()` slots from `free_slots` and records `block_id ↦ slot`
      in `st.leases[uuid]` (`for (int64_t block_id : missing)` through `st.leases[uuid] = std::move(lease)`).
+     `Arena.acquireLease = none` stands for the first failure or for a wait
+     that timed out; the wait itself is not modelled (see "Not modelled").
 
   3. **Lease release (`KVCacheManagerBase::ReleasePoolStagingLeases` in `base.cc`):**
      Looks up `st.leases.find(uuid)`, pushes every `slot ∈ lease->slots` back
@@ -82,10 +96,11 @@ line ranges for every symbol, sub-block, and test are in the generated
      `PoolReshardRegisterRecv` arriving during the unlocked post-poll cleanup
      from seating a fresh `PoolStagingLease` and having `CompleteReadWithDetails`
      release it; single-step `settleSession` therefore assumes **fresh UUIDs
-     across poll retirement** (a `uuid` being retired by
+     across poll retirement** (assumed of the caller: a `uuid` being retired by
      `CompleteReadWithDetails` is not concurrently re-registered during its
-     unlocked post-poll cleanup; `ReshardCoordinator` draws a fresh UUID per
-     attempt, `Reshard/Coordinator.lean`).
+     unlocked post-poll cleanup; `ReshardCoordinator` uses a caller-supplied
+     `args.uuid` when `args.uuid > 0` and draws a fresh UUID only when
+     `args.uuid <= 0`, `Reshard/Coordinator.lean`).
      Under the unreserved mutant (`RegistrationPolicy.leaseBeforeReserve`),
      if Phase 2 ran before the uuid was claimed, two concurrent or duplicate
      `PoolReshardRegisterRecv` calls with the same `uuid` would share
@@ -107,12 +122,33 @@ line ranges for every symbol, sub-block, and test are in the generated
     slot lists (`ArenaInv.nodupSlots` / `leases_disjoint_of_nodup`), distinct
     `uuid`s never resolve any block ID to the same host staging slot.
   - `reachable_reserveBeforeLease_safe`: under the shipping `reserveBeforeLease`
-    protocol (claiming `uuid` before acquiring staging leases), every reachable
-    state keeps active session leases live and pairwise slot-disjoint.
+    protocol of `PoolReshardRegisterRecv` (claiming `uuid` before acquiring
+    staging leases), every reachable state keeps active receive sessions'
+    leases live and pairwise slot-disjoint. Send registration is not part of
+    this model (see "Not modelled").
   - `trace_duplicate_uuid_frees_survivor_lease_and_aliases_slot`: constructive
     counterexample trace under the `leaseBeforeReserve` mutant showing a
     rejected duplicate-UUID arm freeing the survivor's lease
     and a third session (`uuid = 8`) receiving the same physical slot `0`.
+
+  ## Not modelled
+
+  - **The timed wait in `AcquirePoolStagingLease`.** A caller short of free
+    slots blocks for up to `pool_staging_lease_timeout()` while holding what it
+    already has: the receive factory inside `PoolReshardRegisterRecv` holds the
+    pending uuid claim and the storages it leased earlier
+    (`ReshardReceiveSession::AcquireStagingLeases` leases storage by storage);
+    `ReshardSendSession::ExecutePushPipeline` holds its caller op, earlier
+    pools' leases and (under `HostLayersBounded()`) a host layer slot. The model has no waiting state: an
+    acquisition either succeeds or returns `none`.
+  - **Send registration.** `KVCacheManagerWithTransfer::PoolReshardPush` checks
+    `sessions_` for the uuid in one `mu_` scope and assigns
+    `sessions_[plan.uuid()]` in a later one, with no counterpart of the
+    `pending_pool_reshard_recvs_` claim in between, and the send session leases
+    under the same uuid. `RegState` has only the `PoolReshardRegisterRecv`
+    arms; concurrent sends with one uuid are assumed away (assumed of the
+    caller as a fresh uuid per attempt, as for the poll's unlocked cleanup
+    above).
 
 ## Source map
 

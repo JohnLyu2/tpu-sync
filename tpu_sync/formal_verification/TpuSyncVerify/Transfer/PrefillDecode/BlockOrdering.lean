@@ -54,7 +54,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering.Traces
 | `tpu_sync/api/torch/kv_cache_manager_transfer_test.py` | `test_large_complex_non_contiguous_and_reorder` | `:240-282` |
 <!-- source-map:end -->
 
-Stage 4 (spatial block refinement) of the prefill-to-decode model: refines
+Spatial block refinement of the prefill-to-decode model: refines
 `Pipeline`'s one-`Cell`-per-layer abstraction (`Pipeline` Assumption A1) down to
 per-block arrays `Layer → BlockId → BlockCell`, modelling:
 

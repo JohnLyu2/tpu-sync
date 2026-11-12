@@ -242,10 +242,10 @@ handshake); and `done_recving` requires `num_completed_layers_ ==
 num_layers`, counted once per `OnLayerReceived` — A1 is what makes that "every
 layer landed" (`SettleHostLayer` keeps no `dispatched_layers_`-style set, so a
 re-delivered layer would count twice; the same reliance as the device
-callback's `num_completed_layers_++`). The one piece of the host path that is
-in `step` is `on_response`'s `!self->draining_`, which the C++ added for the
-reply that a host receive, with no H2D step, is likely to settle ahead of
-(`pullReply`); it applies to device receives too. The
+callback's `num_completed_layers_++`). The piece of the host path that `step`
+does include is `on_response`'s `!self->draining_` check, which ignores a failed
+`pullReply` after a fast settle (likely when a host receive has no H2D wait, and
+shared with device receives). The
 `HostMemoryTransferTest`s (`kv_cache_manager_with_transfer_host_memory_test.cc`)
 drive this path end to end; a model of it would be a `Recv` with the H2D events
 replaced by one `hostLayerSettle`.
@@ -345,9 +345,9 @@ All proved on every reachable state (`reachable_safe`):
   once `poll_stats()` has reported the receive, as `done_recving` or as
   `failed_recving`, no H2D copy is dispatching or still writing decode HBM, so
   the engine may reuse it. The receiver's promise to the engine at the session
-  level (the pipeline restates it as `DecodeHbmSafe`); added when the guard
-  inventory (`Guards.lean`) found that dropping `Done()` before publishing a
-  *failed* receive violated nothing the module stated.
+  level (the pipeline restates it as `DecodeHbmSafe`), and the only property of this
+  module that dropping `Done()` before publishing a *failed* receive violates
+  (`Guards.lean`, G8).
 
 Note on the readiness predicate. One might expect `IsReadyToComplete` to
 coincide with "every layer's callback has run OK"; it does not.
@@ -359,26 +359,26 @@ That is harmless — `done` still waits for every callback through `in_flight_`
 
 ## Coverage and guards
 
-`Coverage.lean` measures how much of `step` the replayed upstream tests
+`Coverage.lean` measures how much of `step` the replayed C++ tests
 exercise. A branch is a leaf of an event's decision tree together with its
 effect on the lifecycle (`draining`, `done`, first error); `stepT_step` proves
 coverage is measured on the proved `step`. On 1–2 layers (push and `StartRead`),
 `step` has 35 reachable branches (plus 2 unreachable leaves: the
 retired-callback assertion and the `FinishLocked()` arm of
-`RecordNetworkCompleteLocked`, dead on a device-destination receive); the 32 paired upstream tests reach 24, and the
-remaining 11 are classified into missing upstream tests (4, each a replayed
+`RecordNetworkCompleteLocked`, dead on a device-destination receive); the 32 paired C++ tests reach 24, and the
+remaining 11 are classified into missing C++ tests (4, each a replayed
 test plus an open push lease or a late `FailRecv`), lock-gap windows no
 harness hook reaches (5), or a data-before-reply ordering the model leaves open
-(2). The `#guard` at the end of `Coverage.lean` fails if a branch, a trace or a
-classification changes.
+(2). The `#guard` at the end of `Coverage.lean` fails if a branch or a trace
+changes; the gap class (`test`, `window`, or `ordering`) is recorded in the
+docstring table of `Coverage.lean`.
 
 `Guards.lean` asks the other question: which of the C++ checks `step`
 transcribes do the properties need? Each is dropped or weakened and searched
 exhaustively against `Safe` without the ghost-counter equations. Five are
 load-bearing (`TryBeginOp`'s refusal, `ExecuteLayerH2d`'s first check,
 `Done()` before publishing in `RetireSettledSessionLocked` — whose
-failed-receive half survived the `Safe` the module had, `PublishedQuiet` being
-the property that was missing — `draining_` in `EndRecvOpLocked`'s settle
+failed-receive half only `PublishedQuiet` detects — `draining_` in `EndRecvOpLocked`'s settle
 condition, `in_flight_ == 0` in `FinishLocked`); six survive — the
 `draining_` half of the first check and the whole re-check in
 `ExecuteLayerH2d` (wasted DMA, not safety), the `!draining_` on the last

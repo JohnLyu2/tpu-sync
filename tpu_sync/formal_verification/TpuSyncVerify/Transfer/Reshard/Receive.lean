@@ -249,11 +249,14 @@ uploads finish at once, then the cancel and, on a second session, the timeout;
   `BlockTransportServerPushSession::CompleteIncomingPush` calls
   `session->OnDataReceived(l, /*minor_dimension_indices=*/{}, /*shard_ids=*/{})`
   only when `plan_pushes == expected_chunks` (under the push session's own
-  `mu_`, with `layer_progress_` per uuid), and
+  `mu_`, with `layer_progress_` per uuid) and only once per pool (the
+  `on_layer_received_called` latch; a push beyond the plan's count is rejected
+  by `if (plan_pushes > expected_chunks)`), and
   `ReshardReceiveSession::RecordPoolReceivedLocked` rejects undeclared or
   duplicate pool indices. Encoded as the `onPoolReceived p` guard
-  `pool.stage == .waiting`. (Discharged in `Reshard/Pipeline.lean` by explicit
-  stream counting.)
+  `pool.stage == .waiting`. `Reshard/Pipeline.lean` encodes the count as a
+  second guard on the same event (`landedStreams[p] = peerCounts[p]`); neither
+  model derives the assumption from the transport.
 * **A2 (registration before visibility).** `PoolReshardRegisterRecv` claims the
   uuid in `pending_pool_reshard_recvs_` before `CreateReshardReceiveSession`
   runs `AcquireStagingLeases`, and inserts the session into `sessions_` (where

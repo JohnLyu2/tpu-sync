@@ -3,10 +3,12 @@ import TpuSyncVerify.Common.ModelCheck
 
 /-! # `LayerStaging`: concrete replay traces, bounded search, and mutants
 
-Part of `TpuSyncVerify.Transfer.PrefillDecode.LayerStaging`. Replays all four
+Part of `TpuSyncVerify.Transfer.PrefillDecode.LayerStaging`. Replays the four
 bounded-staging GTests in `kv_cache_manager_with_transfer_send_drain_test.cc`
-together with lock-gap interleavings, zero-slot rejection, unregistered
-handshake flows, and three guard/cleanup mutants. -/
+at reduced size (§"Paired GTest replay traces" says which events of each
+trace the test drives and which the model adds), together with lock-gap
+interleavings, zero-slot rejection, unregistered handshake flows, and three
+guard/cleanup mutants. -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.LayerStaging
 
@@ -49,9 +51,63 @@ def recvFinishH2d (l : Nat) : List Ev := [.h2dReady l, .h2dDone l true]
 
 /-! ## Paired GTest replay traces (`send_drain_test.cc`)
 
-All four tests build their manager with `num_staging_layers = 4`
-(`kNumStagingLayers`) so that `base->num_host_layers() == 4` on a 64- or
-16-layer cache. -/
+**Size.** All four tests build their manager with `num_staging_layers = 4`
+(`kNumStagingLayers`) so that `base->num_host_layers() == 4`, on a 64-layer
+cache (`StagingLayerManagerCyclesHostLayerBuffers`) or a 16-layer cache
+(`BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock`). The traces
+keep the shape and shrink the numbers: 2 host layer buffers per side, and 4
+layers (`sys 4 2 2`) for the cycling tests or 3 layers (`sys 3 2 2`) for the
+failure subcases. The tests' "layers 0..3 lease the four buffers, layer 4
+waits" is "layers 0, 1 lease the two buffers, layer 2 waits" here, and a
+cycling test's remaining 59 layers are one more layer.
+
+**Producer tests (`SendLifecycleTest.*`).** The test drives every event of its
+trace except the pull claim `beginPull`: `TestManager::ServePull` calls
+`session->StartPush` directly without calling `ValidateAndBeginPull` (so
+`beginPull` is framing added for the model's guard, as in `PrefillDecode/Send/Traces.lean`).
+Otherwise the test drives `NotifyForRead` (`sendStart`), the
+`StartPush` loop on the pull thread (`sendAcquire*`, `sendD2hBegin`,
+`sendD2hIssue`), `FinishCopy` (`d2hReady`, `sendD2hEnd`, `sendWake`, and on
+success the push task `sendH2hIssue`, `sendNext`), `FinishH2h` (`h2hDone`),
+`CancelSend` (`sendCancel`) and `CompleteReadRaw` (`sendPublish`). The fixture's
+copies and pushes are promises the test resolves; no bytes move, so the
+`.kv l` cell contents the trace theorems state are the model's, not asserted
+by the test.
+
+**Consumer tests (`RecvLifecycleTest.*`).** These tests bypass the transport.
+The session is installed by `RecvTestManager::AddRecv` (no pull handshake, no
+producer), and a layer is "received" by `RecvTestManager::ReceiveLayer`, which
+calls `GetBlockChunks` (→ `AcquireStagingSlot`: `recvAcquireBegin`,
+`recvAcquireWait`, `recvAcquireFinish`) and then `OnLayerReceived`
+(→ `ExecuteLayerH2d`: `h2dBegin`, `h2dIssue`); `FinishCopy` completes a copy
+(`h2dReady`, `h2dDone`) and `CompleteReadRaw` is `recvPublish`. Only failure
+subcase 2 takes a push lease (`TryBeginOp` / `EndOp`: `recvPushBegin`,
+`recvPushEnd`) and calls `FailRecv` (`recvCancel`). Everything else in a
+consumer trace is framing the model's guards need and the test does not
+perform: the whole producer run in front (`traceSendCyclesEvs`,
+`streamProducer 3`, or `beginPull`), `recvPullReply true`, the
+`recvPushBegin` .. `recvPushEnd` stream lease around each layer in
+`recvIssueH2d`, the payload `land l`, and the block report `recvNetAccount`
+(no `OnBlockShardsReceived` is called). `recvTestDrives` is that split, and
+`LayerStaging/Coverage.lean` credits a consumer test only with the branches
+of the events it drives. -/
+
+/-- Which events of a consumer (`RecvLifecycleTest.*`) trace the GTest drives;
+the rest is framing added to satisfy the model's guards. `pushLease` is true
+for the one subcase that calls `TryBeginOp` / `EndOp` itself. -/
+def recvTestDrives (pushLease : Bool) : Ev → Bool
+  | .recvAcquireBegin _ | .recvAcquireWait _ _ | .recvAcquireFinish _ | .h2dDone _ _ => true
+  | .pipe (.h2dBegin _) | .pipe (.h2dIssue _ _) | .pipe (.h2dReady _) => true
+  | .pipe (.recv .cancel) | .pipe (.recv .publish) => true
+  | .pipe (.recv .pushBegin) | .pipe (.recv .pushEnd) => pushLease
+  | _ => false
+
+/-- A producer (`SendLifecycleTest.*`) test drives every event of its trace except
+the pull claim `beginPull`, which `TestManager::ServePull` skips by calling
+`session->StartPush` directly. -/
+def sendTestDrives : Ev → Bool
+  | .pipe (.send .beginPull) => false
+  | _ => true
 
 /-- `SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` (`sys 4 2 2`). -/
 def traceSendCyclesEvs : List Ev :=
@@ -74,7 +130,10 @@ theorem trace_send_cycles_host_layer_buffers :
       (s.sendMgr.numFree, s.pipe.send.life.hasStaging, s.pipe.send.published, s.wireB)) =
       some (2, false, some true, [.kv 0, .kv 1, .kv 2, .kv 3]) := by decide
 
-/-- `RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` (`sys 4 2 2`). -/
+/-- `RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` (`sys 4 2 2`).
+The producer run `traceSendCyclesEvs`, `recvPullReply true`, and the
+`recvPushBegin` / `land` / `recvNetAccount` / `recvPushEnd` steps are framing
+(`recvTestDrives false`). -/
 def traceRecvCyclesEvs : List Ev :=
   traceSendCyclesEvs ++ [.recvPullReply true] ++ recvAcquireOk 0 ++ recvIssueH2d 0 ++
   recvIssueH2d 1 ++ [.recvPushBegin, .recvAcquireBegin 2] ++ recvFinishH2d 1 ++
@@ -96,7 +155,8 @@ theorem trace_recv_cycles_host_layer_buffers :
       (s.recvMgr.numFree, s.pipe.recv.life.hasStaging, s.pipe.recv.published, s.decodeHbmB)) =
       some (2, false, some true, [.kv 0, .kv 1, .kv 2, .kv 3]) := by decide
 
-/-- `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 1 (`uuid = 201`). -/
+/-- `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 1 (`uuid = 201`).
+Framing as in `traceRecvCyclesEvs` (`streamProducer 3` in front). -/
 def traceRecvFailH2dWaiterEvs : List Ev :=
   streamProducer 3 ++ [.recvPullReply true] ++ recvIssueH2d 0 ++ recvIssueH2d 1 ++
   [.recvPushBegin, .recvAcquireBegin 2, .h2dReady 0, .h2dDone 0 false, .recvAcquireWait 2 false, .recvPushEnd] ++
@@ -120,7 +180,8 @@ The test drives the push lease directly: `GetSession(202)` + `TryBeginOp()`
 `Done()` with the injected `kUnavailable` status and its staging block is back
 in the pool (`consumer.free_slots() == kSlots`); the model additionally checks
 that every host layer buffer is back (`recvMgr.numFree = numRecvSlots`), which
-`ReleaseAll()` in `ReleaseStagingLocked` guarantees. -/
+`ReleaseAll()` in `ReleaseStagingLocked` guarantees. Only `beginPull` and
+`recvPullReply true` are framing (`recvTestDrives true`). -/
 def traceRecvFailPushAbortEvs : List Ev :=
   [.beginPull, .recvPullReply true, .recvPushBegin] ++ recvAcquireOk 0 ++ [.recvCancel, .recvPushEnd, .recvPublish]
 
@@ -132,7 +193,8 @@ theorem trace_recv_fail_push_abort_after_chunk :
       (s.recvMgr.numFree, s.recvMgr.leases, s.pipe.recv.life.hasStaging, s.pipe.recv.published)) =
       some (2, [], false, some false) := by decide
 
-/-- `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 3 (`uuid = 203`). -/
+/-- `RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock` subcase 3 (`uuid = 203`).
+Framing as in `traceRecvCyclesEvs` (`streamProducer 3` in front). -/
 def traceRecvFailTimeoutEvs : List Ev :=
   streamProducer 3 ++ [.recvPullReply true] ++ recvIssueH2d 0 ++ recvIssueH2d 1 ++
   [.recvPushBegin, .recvAcquireBegin 2, .recvAcquireWait 2 true, .recvPushEnd] ++
@@ -209,7 +271,7 @@ theorem trace_send_fail_cancel_with_waiter :
       (s.sendMgr.numFree, s.pipe.send.life.hasStaging, s.pipe.send.published)) =
       some (2, false, some false) := by decide
 
-/-! ## Lock-gap interleavings, zero-slot rejection, and recycle (`modelOnly`) -/
+/-! ## Lock-gap interleavings, zero-slot rejection, and recycle (`modelOnly`: no C++ test drives them) -/
 
 def traceSendPostAcquireCancelEvs : List Ev :=
   [.beginPull, .sendStart, .sendAcquireBegin, .sendAcquireDone false,
@@ -374,16 +436,23 @@ theorem mutant_missing_release_all_leaks_slot :
 
 /-! ## Trace tables for `LayerStaging/Coverage.lean` -/
 
+/-- (GTest and subcase, initial state, trace, which events of the trace the
+test drives). -/
+def pairedWithStimulus : List (String × BoundedPipeline × List Ev × (Ev → Bool)) :=
+  [("SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers", init 4 2 2, traceSendCyclesEvs, sendTestDrives),
+   ("RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers", init 4 2 2, traceRecvCyclesEvs, recvTestDrives false),
+   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (h2d_fail_with_waiter)", init 3 2 2, traceRecvFailH2dWaiterEvs, recvTestDrives false),
+   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (push_abort_after_chunk)", init 3 2 2, traceRecvFailPushAbortEvs, recvTestDrives true),
+   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (staging_timeout)", init 3 2 2, traceRecvFailTimeoutEvs, recvTestDrives false),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (d2h_fail_with_waiter)", init 3 2 2, traceSendFailD2hWaiterEvs, sendTestDrives),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (h2h_fail_with_waiter)", init 3 2 2, traceSendFailH2hWaiterEvs, sendTestDrives),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (staging_timeout)", init 3 2 2, traceSendFailTimeoutEvs, sendTestDrives),
+   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (cancel_with_waiter)", init 3 2 2, traceSendFailCancelWaiterEvs, sendTestDrives)]
+
+/-- The paired traces without the stimulus split: (GTest and subcase, initial
+state, trace). -/
 def paired : List (String × BoundedPipeline × List Ev) :=
-  [("SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers", init 4 2 2, traceSendCyclesEvs),
-   ("RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers", init 4 2 2, traceRecvCyclesEvs),
-   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (h2d_fail_with_waiter)", init 3 2 2, traceRecvFailH2dWaiterEvs),
-   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (push_abort_after_chunk)", init 3 2 2, traceRecvFailPushAbortEvs),
-   ("RecvLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (staging_timeout)", init 3 2 2, traceRecvFailTimeoutEvs),
-   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (d2h_fail_with_waiter)", init 3 2 2, traceSendFailD2hWaiterEvs),
-   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (h2h_fail_with_waiter)", init 3 2 2, traceSendFailH2hWaiterEvs),
-   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (staging_timeout)", init 3 2 2, traceSendFailTimeoutEvs),
-   ("SendLifecycleTest.BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock (cancel_with_waiter)", init 3 2 2, traceSendFailCancelWaiterEvs)]
+  pairedWithStimulus.map fun (name, s, tr, _) => (name, s, tr)
 
 def modelOnly : List (String × BoundedPipeline × List Ev) :=
   [("sendCancel in post-Acquire lock gap (leasedBeforeD2h → sendD2hBegin)", init 1 1 1, traceSendPostAcquireCancelEvs),

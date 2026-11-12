@@ -1,4 +1,3 @@
-import Std.Tactic.BVDecide
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Lemmas
 import TpuSyncVerify.Transfer.Reshard.SubPlanChain.Model
 
@@ -23,8 +22,8 @@ theorem subPlanUuid_zero (uuid : UInt64) : subPlanUuid uuid 0 = uuid :=
 
 private theorem uint64_and_mask_le (x : UInt64) :
     (x &&& (0x7FFFFFFFFFFFFFFF : UInt64)) ≤ (0x7FFFFFFFFFFFFFFF : UInt64) := by
-  change (x.toBitVec &&& (0x7FFFFFFFFFFFFFFF : BitVec 64)) ≤ (0x7FFFFFFFFFFFFFFF : BitVec 64)
-  bv_decide
+  rw [UInt64.le_iff_toNat_le, UInt64.toNat_and]
+  exact Nat.and_le_right
 
 /-- For every `index > 0`, `SubPlanUuid(uuid, index)` is strictly positive and
 fits in a signed 64-bit positive integer (`[1, 0x7FFFFFFFFFFFFFFF]`). -/
@@ -126,7 +125,7 @@ def ChainedTracked (c : ChainProgress) (s : SubSession) : Prop :=
 def Slot0Anchored (c : ChainProgress) : Prop :=
   c.anchored = false → c.subSessions.getD 0 none = none
 
-/-- Inductive invariant of `WorkerState.step`. -/
+/-- Inductive invariant of `WorkerState.stepRestricted`. -/
 structure WorkerInv (w : WorkerState) : Prop where
   safe : WorkerSafe w
   sessionIndex : ∀ s ∈ w.sessions, s.index < max 1 s.count
@@ -559,8 +558,9 @@ private theorem applyMidSettle_empty : WorkerState.applyMidSettle [] = id := by
   funext s; simp [WorkerState.applyMidSettle]
 
 private theorem step_poll {w w' : WorkerState} {stalled : Bool}
-    (hinv : WorkerInv w) (hstep : WorkerState.step w (.poll stalled) = some w') : WorkerInv w' := by
-  simp only [WorkerState.step, WorkerState.stepG, WorkerState.pollCore,
+    (hinv : WorkerInv w) (hstep : WorkerState.stepRestricted w (.poll stalled) = some w') :
+    WorkerInv w' := by
+  simp only [WorkerState.stepRestricted, WorkerState.stepG, WorkerState.pollCore,
     WorkerState.validMidSettle, List.isEmpty_nil, Bool.and_false, ↓reduceIte, List.all_nil,
     Bool.not_true, Bool.false_eq_true, applyMidSettle_empty, List.map_id] at hstep
   generalize hss : (if (true && stalled) = true then
@@ -680,7 +680,7 @@ private theorem step_poll {w w' : WorkerState} {stalled : Bool}
         exact ⟨hrpres, hin⟩
 
 theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
-    (hinv : WorkerInv w) (hstep : WorkerState.step w e = some w') : WorkerInv w' := by
+    (hinv : WorkerInv w) (hstep : WorkerState.stepRestricted w e = some w') : WorkerInv w' := by
   cases e with
   | registerSubPlan uuid index count => exact stepG_registerSubPlan rfl rfl hinv hstep
   | beginOp uuid => exact stepG_beginOp hinv hstep
@@ -688,17 +688,27 @@ theorem step_preserves_workerInv {w w' : WorkerState} {e : WorkerEv}
   | settleSession uuid ok => exact stepG_settleSession hinv hstep
   | poll stalled => exact step_poll hinv hstep
   | pollMidSettle stalled midSettle =>
-    simp only [WorkerState.step, WorkerState.stepG, WorkerState.pollCore, Bool.true_and] at hstep
+    simp only [WorkerState.stepRestricted, WorkerState.stepG, WorkerState.pollCore,
+      Bool.true_and] at hstep
     cases hne : midSettle.isEmpty <;> simp [hne] at hstep
 
 /-- **Main worker theorem (`reachable_worker_safe`)**: in every reachable state of
-`WorkerState.step`, `DoneAfterAllSubPlans` holds. -/
-theorem reachable_worker_safe {w : WorkerState} (hr : WorkerState.sys.Reachable w) :
+`WorkerState.stepRestricted`, `DoneAfterAllSubPlans` holds.
+`WorkerState.stepRestricted` is `WorkerState.step` (A1, A2, A6, A7 as guards and
+the A5a deadline arm) restricted to executions that satisfy A5b and A5c. The
+theorem does not hold for `WorkerState.step`: A5b and A5c are not enforced by
+anything in the C++, and `trace_draining_ok_at_sweep_reports_done_after_failure`
+and `trace_mid_poll_endop_unanchored_reports_done_after_stall` (`Traces.lean`)
+are executions of `WorkerState.step` that violate the property in those two
+windows. A6 and A7 are caller assumptions the C++ does not check either
+(`trace_single_plan_registration_erases_live_chain`,
+`trace_slot_overwrite_reports_stray_done`). -/
+theorem reachable_worker_safe {w : WorkerState} (hr : WorkerState.sysRestricted.Reachable w) :
     WorkerSafe w :=
-  (WorkerState.sys.reachable_induction init_workerInv
+  (WorkerState.sysRestricted.reachable_induction init_workerInv
     (fun _ _ _ hinv hstep => step_preserves_workerInv hinv hstep) hr).toSafe
 
-/-! ### Candidate sweep fix (`stepSweepWaitsForOpen`) without A5b and without A5c -/
+/-! ### The alternative `stepSweepWaitsForOpen`, without A5b and without A5c -/
 
 /-- Strengthened tracking invariant for `stepSweepWaitsForOpen`: an unretired
 OK chained session is covered by a present entry through `sub_sessions`,
@@ -1049,7 +1059,7 @@ theorem stepSweepWaitsForOpen_preserves_inv {w w' : WorkerState} {e : WorkerEv}
     split at hstep; · cases hstep
     exact pollWaitOpenCore_preserves hinv hstep
 
-/-- **Candidate sweep fix theorem (`reachable_sweepWaitsForOpen_safe`)**: gating
+/-- **Alternative sweep theorem (`reachable_sweepWaitsForOpen_safe`)**: gating
 tombstone erasure on `!anyReqUnretired` and checking `failed || completed` before
 the `!anchored` stray arm (`stepSweepWaitsForOpen`) satisfies
 `DoneAfterAllSubPlans` in every reachable state without assuming A5b

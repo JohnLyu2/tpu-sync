@@ -16,7 +16,8 @@ namespace Pipeline
 
 Two pools with `ranks = [0, 1]` and `peerCounts = [1, 2]` share an aliased
 device page (`pool_order_ranks_` in `ReshardReceiveSession`, `D2hPoolBlocks` /
-`H2dPoolBlocks` in `KVCacheManagerBase`). Even when pool 1 (rank 1, 2 peer
+`H2dPoolBlocks` in `KVCacheManagerBase`) and stage in separate host buffers
+(`Pipeline.lean` A1). Even when pool 1 (rank 1, 2 peer
 streams) finishes landing all of its network streams and calls
 `onPoolReceived 1` **before** pool 0 (rank 0, 1 peer stream) has landed its
 stream:
@@ -120,8 +121,9 @@ theorem violates_iff {s : Pipeline} : violates s = false ↔ Safe s := by
 1. **Rank-blind H2D launch (`stepRankBlind`)**: if `CollectEligiblePoolH2dsLocked`
    ignores pool rank (`prereqsCompleted` replaced by `fun _ => true`, as in
    `Recv.onPoolReceivedIgnoringRank`), then when pool 1 (rank 1) lands before
-   pool 0 (rank 0), pool 1 completes H2D first and pool 0's subsequent coarse
-   H2D copy clobbers `dstHbm[1]` to `.junk`, violating `PublicationCorrect` and
+   pool 0 (rank 0), pool 1 completes H2D first and pool 0's subsequent H2D
+   copy, whose declared-live regions overlap pool 1's, clobbers `dstHbm[1]` to
+   `.junk`, violating `PublicationCorrect` and
    `AliasedPageCorrect`.
 2. **Premature `OnPoolReceived` (`stepPrematurePoolReceived`)**: if
    `BlockTransportServerPushSession::CompleteIncomingPush` fires the pool completion
@@ -164,7 +166,7 @@ theorem mutant_ignoring_rank_corrupts_aliased_page :
     [ -- Without the rank gate, pool 1 (rank 1) was already queued by onPoolReceived 1
       -- and completes its H2D copy BEFORE pool 0 (rank 0) even lands!
       .recv (.h2dIssue 1 true), .recv (.h2dReady 1), .recv (.h2dDone 1 true),
-      -- Now pool 0 (rank 0) lands and runs its coarse H2D copy, clobbering dstHbm[1]!
+      -- Pool 0 (rank 0) lands and runs its H2D copy, which overwrites dstHbm[1].
       .landStream 0, .recv (.onPoolReceived 0),
       .recv (.h2dIssue 0 true), .recv (.h2dReady 0), .recv (.h2dDone 0 true),
       .recv (.pushEnd true), .recv .publish ]

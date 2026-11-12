@@ -1,7 +1,7 @@
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Transfer.Reshard.Send.Progress
 
-/-! # `Send`: replay of upstream tests, bounded searches, mutants
+/-! # `Send`: replay of the C++ tests, bounded searches, mutants
 
 Part of `TpuSyncVerify.Transfer.Reshard.Send`. -/
 
@@ -203,7 +203,7 @@ completed (`RecordPushCompletion` latched `finalizing_` with `status_` OK), a
 the status update), so the session settles OK. In the C++ the `Finish` can
 land between `RecordPushCompletion` and `EndOp`; `pushDone` folds those two
 into one event, and `cancel` on a finalizing session is the identity either
-side of `EndOp`. No upstream test drives this window (`modelOnly` in
+side of `EndOp`. No C++ test drives this window (`modelOnly` in
 `Coverage.lean`). -/
 theorem trace_finish_after_last_push :
     ((sys [1]).runFrom (((sys [1]).run (tr_parity_send.take 3)).getD (init [1]))

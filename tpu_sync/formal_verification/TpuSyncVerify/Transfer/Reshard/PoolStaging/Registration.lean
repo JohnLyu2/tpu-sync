@@ -10,10 +10,13 @@ open TpuSyncVerify
 
 /-! ## Part III — Receive Registration Lifecycle (`PoolReshardRegisterRecv`)
 
-We now model the interaction between `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
+This part models the interaction between `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
 `ReshardReceiveSession` (`CreateReshardReceiveSession`,
 `ReshardReceiveSession::AcquireStagingLeases`, `ReshardReceiveSession::ReleaseStaging`),
-and `PoolStagingStorage` across two registration policies:
+and `PoolStagingStorage` across two registration policies. Only receive
+registration is modelled; `PoolReshardPush` (send registration) has no
+pending-uuid claim and no arm here (`PoolStaging.lean` §"Not modelled").
+The policies:
 - `RegistrationPolicy.reserveBeforeLease` (shipping): `PoolReshardRegisterRecv`
   claims `uuid` in `pending_pool_reshard_recvs_` under its `mu_`
   (`if (!pending_pool_reshard_recvs_.insert(plan.uuid()).second)`) before

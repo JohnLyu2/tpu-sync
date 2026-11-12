@@ -7,7 +7,7 @@ Part of `TpuSyncVerify.Transfer.PrefillDecode.Send`. Same construction as
 `Receive/Coverage.lean` (the template; machinery in `Common/Coverage.lean`):
 a `Leaf` per leaf of each event's decision tree, `stepT` = `step` with the
 leaf attached and `stepT_step` proving they agree, the reachable branch set
-by exhaustive search, the branches the traces paired with upstream tests
+by exhaustive search, the branches the traces paired with C++ tests
 reach, and the difference classified. -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode
@@ -120,8 +120,8 @@ The searches exhaust the zero-, one- and two-layer state spaces: **40
 branches**, and every `Leaf` is in some reachable branch (unlike `Receive`,
 `Send` has no dead arm: `endOp`'s underflow is excluded by `NoUnderflow` but
 is not a leaf; `d2hIssueFail` cannot both start draining and settle in one step
-because `SendNextLayer(0)` is armed before any copy is issued). The 40 upstream
-tests in `paired` (23 distinct traces; the host-source tests run on the
+because `SendNextLayer(0)` is armed before any copy is issued). The 40 C++
+tests in `paired` (21 distinct event lists; the host-source tests run on the
 completed-copy prefix `tr_host_source_prefix`) reach **31 of 40**; the five
 `modelOnly` traces add 1 more. Twelve further send-lifecycle tests are
 `notReplayable`. The 9 the tests miss, each with a schedule reaching it (the

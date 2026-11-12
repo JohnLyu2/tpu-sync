@@ -1,7 +1,7 @@
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Transfer.Reshard.Receive.Progress
 
-/-! # `Recv`: replay of upstream tests, bounded searches, mutants
+/-! # `Recv`: replay of the C++ tests, bounded searches, mutants
 
 Part of `TpuSyncVerify.Transfer.Reshard.Receive`. -/
 
@@ -173,7 +173,7 @@ def tr_parity_2pool : List Ev :=
    the session, execute H2D, release staging leases (the plan going with
    `done_`), and publish `done_recving`. The tests themselves only create the
    session (`CreateStatus` → `CreateReshardReceiveSession` → `ValidatePlan`);
-   no upstream test runs these exact plans (`Coverage.lean`). -/
+   no C++ test runs these exact plans (`Coverage.lean`). -/
 theorem trace_reshard_receive_session_test_parity :
     validPlanPoolsAndBlocks false 2 16 [0] true [1] = false ∧
     validPlan true [0] = false ∧
@@ -204,8 +204,9 @@ duration is recorded when the final pool's H2D completes OK
 (`FinishPoolReshardRecvRecordsDurationMetric`), and is not recorded when a
 pool's H2D fails (`FinishPoolReshardRecvDoesNotRecordMetricOnFailure`). The
 tests drive the upload path through `TestManager::FinishPoolReshardRecvPool`:
-`ResolveStagingSlot` leases the pool's buffer, `OnDataReceived(pool_idx, {}, {})`
-records and launches it, and `FakeH2dBase::H2dPoolBlocks` returns a future
+`ResolveStagingSlot` resolves the pool's own storage buffer (nothing is leased
+on this full host mirror), `OnDataReceived(pool_idx, {}, {})` records and
+launches the pool, and `FakeH2dBase::H2dPoolBlocks` returns a future
 already resolved with the armed status (`ArmPoolUpload`), so `FinishPoolH2d`
 runs inline with `OkStatus()` or the error (`paired` in `Coverage.lean`; the
 `publish` step is the poll of the tests that call `CompleteReadRaw`). -/

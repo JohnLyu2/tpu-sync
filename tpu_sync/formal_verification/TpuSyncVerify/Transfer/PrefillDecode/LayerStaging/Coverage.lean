@@ -6,9 +6,15 @@ import TpuSyncVerify.Transfer.PrefillDecode.LayerStaging.Traces
 
 Part of `TpuSyncVerify.Transfer.PrefillDecode.LayerStaging`. Instruments `step`
 with decision-tree leaves (`Leaf`) and lifecycle effects, proves `stepT_step`,
-and verifies via `#guard` across the 93-branch 1-layer universe that every
-memory move writes `.kvRight`, `.slotFault` is unreachable, and all 54 branches
-outside `paired` partition with `0` unaccounted. -/
+and checks by `#guard` over the 93 branches reachable on one layer (through
+states with at most one open stream and two push leases, `instr.keep`) that
+every memory move writes `.kvRight` and `.slotFault` is unreachable. A paired
+GTest is credited with the branches of the events it drives
+(`pairedWithStimulus`): 34 of the 93. Five more are taken along the paired
+traces only by framing events the tests do not perform
+(`expectedFramingOnly`: the 4 consumer framing branches plus `beginPull`, which
+`TestManager::ServePull` skips), and the remaining 54 partition into the classes
+of `GapClass` with `0` unaccounted. -/
 
 namespace TpuSyncVerify.Transfer.PrefillDecode.LayerStaging
 
@@ -199,7 +205,21 @@ def inits : List BoundedPipeline :=
 
 def allBranches : Option (List Branch) := Coverage.allBranches instr inits (events 1)
 
+/-- Replay `tr` from `s` and collect the branches of the steps whose event
+satisfies `drives`. -/
+def runTWhere (drives : Ev → Bool) (s : BoundedPipeline) : List Ev → List Branch
+  | [] => []
+  | e :: es =>
+    match stepT s e with
+    | none => []
+    | some (s', l) => (if drives e then [(l, effect s s')] else []) ++ runTWhere drives s' es
+
+/-- Branches taken by the events the paired GTests drive. -/
 def coveredByPaired : List Branch :=
+  (pairedWithStimulus.flatMap fun (_, s, tr, drives) => runTWhere drives s tr).foldl insertNew []
+
+/-- Branches taken anywhere along the paired traces, framing events included. -/
+def coveredAlongPaired : List Branch :=
   Coverage.coveredBy instr (paired.map fun (_, s, tr) => (s, tr))
 
 def coveredByAll : List Branch :=
@@ -221,11 +241,24 @@ def expectedStagingWindows : List Branch :=
    br .recvAcquireFinishDraining false true false,
    br .h2dBeginDrainingSkip false false false]
 
+/-- Branches the paired traces take only through framing events
+(`recvTestDrives` or `sendTestDrives` is false): the payload landing, the
+stream lease's return, the block report and the pull reply on the consumer side,
+plus the pull claim `beginPull` on the producer side (where
+`TestManager::ServePull` calls `StartPush` directly). -/
+def expectedFramingOnly : List Branch :=
+  [br (.send .beginPull) false false false,
+   br (.land .kvRight) false false false,
+   br (.recv .pushEnd) false false false,
+   br (.recv .netAccountPartial) false false false,
+   br (.recv .pullReplyOk) false false false]
+
 inductive GapClass where
-  | envOrHandshake | sessionCovered | sessionGap | zeroSlots | stagingWindow | unaccounted
+  | framingOnly | envOrHandshake | sessionCovered | sessionGap | zeroSlots | stagingWindow | unaccounted
   deriving Repr, DecidableEq
 
 def gapClass (b : Branch) : GapClass :=
+  if coveredAlongPaired.contains b then .framingOnly else
   match b.1 with
   | .reclaim | .reseatPrefillStaging | .reseatDecodeStaging
   | .notifyForRead | .pullWait => .envOrHandshake
@@ -248,8 +281,11 @@ def coverageChecks : Bool :=
     let gaps := univ.filter (!coveredByPaired.contains ·)
     let count (c : GapClass) := (gaps.filter (gapClass · = c)).length
     univ.length = 93 ∧
-    (univ.filter coveredByPaired.contains).length = 39 ∧
-    coveredByPaired.length = 46 ∧
+    (univ.filter coveredByPaired.contains).length = 34 ∧
+    coveredByPaired.length = 41 ∧
+    (univ.filter coveredAlongPaired.contains).length = 39 ∧
+    coveredAlongPaired.length = 46 ∧
+    sameSet (gaps.filter (gapClass · = .framingOnly)) expectedFramingOnly ∧
     (univ.filter coveredByAll.contains).length = 54 ∧
     coveredByAll.length = 61 ∧
     univ.all (fun b => (movedOf b.1).all (· = .kvRight)) ∧

@@ -329,6 +329,37 @@ and `HostMemoryTransferTest.AFailedPushFailsTheSendAndExpiresTheReceive`).
   `absl::FailedPreconditionError`. Neither takes an op or changes a field, so
   the model has no event for them; the receiver's `TryBeginOp` / `EndOp` pair
   is `PrefillDecode/Transport.lean`'s business.
+* **A9 (plan-registered sends are not modelled).** The model's send is the one
+  `NotifyForRead` registers through `TransferSendSession::Create`.
+  `KVCacheManagerWithTransfer::RegisterActivePlan` with `is_sender` seats a
+  second kind in `sessions_`, built by
+  `TransferSendSession::CreateFromActivePlan` for a block-addressed resharding
+  plan. It differs in four ways. Under dynamic host staging
+  (`staging_allocator->dynamic_host_staging()`, no pool groups) and a non-empty
+  source-block schedule (`if (!device_blocks.empty())`), it takes its staging at
+  creation using non-blocking `staging_allocator->Acquire(...)` (failing
+  `RegisterActivePlan` with `ResourceExhaustedError` if unavailable;
+  `session->staging_ = std::move(staging);`) instead of inside `StartPush`. Its
+  deadline is `std::chrono::steady_clock::time_point::max()`, so the
+  `CompleteReadWithDetails` sweep never expires it. It is ended by
+  `UnregisterActivePlan`, which erases it from `sessions_` under the manager's
+  `mu_` and only then calls
+  `session->Finish(absl::CancelledError("send plan unregistered"))`, so
+  `RetireSettledSessionLocked` never finds it settled and it is reported in
+  neither `done_sending_` nor `failed_recving_` (absent an Ack, A5, its only other `Finish` is
+  `~KVCacheManagerWithTransfer`'s, after which nothing polls). And no pull claims
+  it: `CreateFromActivePlan` does not call `PopulateRegisteredBlocks`, so
+  `ValidateAndBeginPull` throws in `ValidateRequestedBlocksLocked` on every
+  request and `StartPush` never runs. Because `TryBeginOp` returns `false`, plan
+  readers that access the `host_block_of` mapping through
+  `GetSession(uuid)->plan()` (`KVCacheManagerBase::PlanHostBlocks`,
+  `KVCacheManagerBase::GetBlockChunks` →
+  `TransferPlan::ResolvePlanBlockChunks`, e.g., driven externally by
+  `PushRegisteredPlan`) hold no op on the send session; keeping those copies and
+  pushes finished before `UnregisterActivePlan` releases the staging rests on the
+  registrant rather than the session settle protocol. Subject to that, such a
+  send takes no op; its lifecycle is the model's `init` followed by `cancel`,
+  which settles at once and releases the staging, and `publish` never follows.
 
 ## Properties
 
@@ -362,9 +393,9 @@ All proved on every reachable state (`reachable_safe`):
   once `poll_stats()` has reported the send, as `done_sending` or as failed,
   no D2H copy is dispatching or still reading prefill HBM, so the engine may
   reclaim it. The sender's promise to the engine at the session level (the
-  pipeline restates it as `PrefillHbmSafe`); added when the guard inventory
-  (`Send/Guards.lean`) found that dropping `Done()` before publishing
-  violated nothing the module stated.
+  pipeline restates it as `PrefillHbmSafe`), and the only property of this
+  module that dropping `Done()` before publishing violates
+  (`Send/Guards.lean`, S8).
 * **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and
@@ -384,16 +415,18 @@ already-armed `SendNextLayer` callback wakes via `wake false` and retires its op
 
 ## Coverage and guards
 
-`Coverage.lean` measures how much of `step` the replayed upstream tests
+`Coverage.lean` measures how much of `step` the replayed C++ tests
 exercise, as `Receive/Coverage.lean` does (branch = leaf of an event's
 decision tree with its lifecycle effect; `stepT_step` proves agreement with
 `step`). On 0–2 layers, `step` has 40 reachable branches (every leaf live); the
-40 paired upstream tests reach 31 (the host-source tests, replayed on the
+40 paired C++ tests reach 31 (the host-source tests, replayed on the
 completed-copy prefix, reach two settles that a device send only reaches
 through a lock window), and the remaining 9 are classified into
-missing upstream tests (2), lock-gap windows no harness hook reaches (5), or
+missing C++ tests (2), lock-gap windows no harness hook reaches (5), or
 callback orderings where the model admits both orders (2). The `#guard` at the
-end of `Coverage.lean` fails if a branch, a trace or a classification changes.
+end of `Coverage.lean` fails if a branch or a trace changes; the gap class
+(`test`, `window`, or `ordering`) is recorded in the docstring table of
+`Coverage.lean`.
 
 `Guards.lean` asks the other question: which of the C++ checks `step`
 transcribes do the properties need? Each is dropped or weakened and searched
@@ -406,8 +439,8 @@ three-line defence against working for a dead send, `draining_ &&` in
 `EndSendOpLocked` (redundant because arming `SendNextLayer(0)` before the D2H
 loop keeps `in_flight_ > 0` continuously across active non-zero-layer sends),
 and the first-`Finish`-wins rule, which no safety property can see. The
-`Done()`-before-publishing check survived the `Safe` the module had;
-`PublishedQuiet` is the property that was missing.
+`Done()`-before-publishing check is load-bearing through `PublishedQuiet`
+alone: no other conjunct of `Safe` detects its removal.
 
 ## Source map
 
@@ -473,6 +506,13 @@ Generated by `tools/resolve_anchors.py`.
 | `mgr.h` | `KVCacheManagerWithTransfer` (`struct SessionEntry {` .. `SessionRole role;`) | `:304-307` |
 | `mgr.h` | `*` (`enum class BlockLocation { kDevice, kHost };`) | `:99` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CheckHostMemoryTransferSupported` | `:1393-1405` |
+| `send.cc` | `TransferSendSession::CreateFromActivePlan` | `:92-143` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:627-706` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:827-873` |
+| `base.cc` | `KVCacheManagerBase::PlanHostBlocks` | `:3358-3367` |
+| `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::PlanHostBlocks` | `:281-307` |
+| `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::ResolvePlanBlockChunks` | `:309-479` |
+| `tpu_sync/frameworks/torch/kv_cache_manager.cc` | `TorchKVCacheManager::PushRegisteredPlan` | `:221-244` |
 | `recv.cc` | `StagingLayerManager::Release` | `:135-145` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1224-1349` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` (`absl::Cleanup counter_cleanup` .. `std::move(counter_cleanup).Cancel();`) | `:1308-1331` |

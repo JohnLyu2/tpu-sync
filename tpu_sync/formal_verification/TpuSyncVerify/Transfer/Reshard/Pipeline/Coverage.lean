@@ -13,7 +13,7 @@ the stream counters and the arm barrier. Its leaves are the session leaves
 where a session step is taken (`Send.Leaf`, `Recv.Leaf`, through `Send.stepT` /
 `Recv.stepT`), plus what the memory events moved: for each copy or landing,
 whether the cell written was the right pool's KV, another pool's, junk or
-blank (`Moved`), and for an H2D completion whether the coarse copy clobbered a
+blank (`Moved`), and for an H2D completion whether `writePoolHbm` overwrote a
 higher-rank slot that already held KV (`clobbersKv`). `Effect` is the lifecycle
 effect of whichever session the step touched. -/
 
@@ -46,7 +46,7 @@ inductive Leaf
   | send (sl : Send.Leaf) (mv : Option Moved)
   /-- A receive event, with the session leaf `Recv.stepT` attached; for an H2D
   completion, what moved into `dstHbm[p]` and whether `writePoolHbm`
-  overwrote KV in a higher-rank slot of the aliased page. -/
+  overwrote KV in a higher-rank pool's slot. -/
   | recv (rl : Recv.Leaf) (mv : Option Moved) (clobbersKv : Bool)
   /-- `CompleteIncomingPush` lands a stream into `dstStaging[p]`. -/
   | landStream (mv : Moved)
@@ -141,7 +141,13 @@ two rank-0 pools of one stream each end to end over `BlockTransport`
 (`SocketTransportAdapter`). Ready `FakeD2hBase` futures run `StartPoolPush` inline
 inside `ExecutePushPipeline` before `execFinish`; each pool's push stream lands
 (`CompleteIncomingPush` → `OnDataReceived`) and `RecordingH2dReceiverBase`
-uploads it inline inside the stream's `pushBegin`..`pushEnd` op. -/
+uploads it inline inside the stream's `pushBegin`..`pushEnd` op.
+
+The trace is the test's events in the model's order, not the test's: in the
+test each stream lands, uploads and is acknowledged before the sender's push
+callback (`pushDone p true`) runs, whereas `landStream p` is enabled only
+after `pushDone p true` (`Pipeline.lean` A2), so each `pushDone` is listed
+ahead of the receive events of its stream. -/
 def tr_inverted_pool_order : List Ev :=
   [.send (.d2hIssue 0 true), .send (.d2hDone 0 true),
    .send (.d2hIssue 1 true), .send (.d2hDone 1 true),
@@ -217,7 +223,7 @@ landing and the H2D copy only ever move the right pool's KV
 (`PublicationCorrect` read off the branch set) — and no H2D completion
 clobbers KV in a higher-rank slot (`clobbersKv = false`, `AliasedPageCorrect`).
 
-One upstream test
+One C++ test
 (`ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks`)
 runs `CreateReshardReceiveSession` + `CreateReshardSendSession` end to end over
 `BlockTransport` (`SocketTransportAdapter`) across two rank-0 pools of one stream

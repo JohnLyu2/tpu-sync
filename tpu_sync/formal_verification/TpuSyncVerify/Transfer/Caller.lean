@@ -90,6 +90,9 @@ Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py`;
 | `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.SendFailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving` | `:326-354` |
 | `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.SingleSubManagerFailureEmitsImmediatelyAndCleansUp` | `:356-381` |
 | `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneSendingOnlyWhenAllAgree` | `:383-403` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.StartReadUnifiedMultiEndpointMultiSubManager` | `:597-657` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.StartReadInputVectorValidation` | `:659-676` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::InitSubManagers` | `:304-470` |
 <!-- source-map:end -->
 
 ## Lock scopes
@@ -132,7 +135,21 @@ is the same
 coordinated as a chain of sub-plans (tracked as `SubPlanChainProgress::sub_sessions`)
 reports one terminal per request (when its
 last sub-plan settles, or at its first failed sub-plan — `SweepSubPlanChainsLocked`
-fails a chain whose next sub-plan never arrives). Each publication is
+fails a chain whose next sub-plan never arrives; the one-terminal property is
+`Reshard/SubPlanChain.lean`'s, under its assumptions A6 and A7). The three
+lists have writers besides `RetireSettledSessionLocked` from this sweep, all
+under the same `mu_`: `RetireSettledSessionLocked` also runs inline from
+`StartRead`, `EmplaceRecvSessionLocked`, `RegisterActivePlan` (both `is_sender`
+and receiver arms), `PoolReshardPush` and `PoolReshardRegisterRecv` when a new
+registration finds a settled incumbent (for pool-reshard roles writing through
+`RecordPoolReshardTerminalLocked`); `NotifyForRead` inserts into `done_sending_`
+when the ack
+for its uuid has already arrived; `StartRead` inserts into `failed_recving_`
+on a duplicate uuid, a session creation failure and a registration failure;
+and `SweepSubPlanChainsLocked` inserts a stalled chain's `req_id` into
+`failed_recving_`. A receive that does not track completion
+(`tracks_completion()` false) is erased unreported. The model abstracts all
+of these to one publication per side. Each publication is
 set once, by `pOutcome ok` / `dOutcome ok` (or per worker by `pWorker w ok` /
 `dWorker w ok`), with `ok = false` covering a failed push or pull *and* a send
 nobody pulled before `timeout_s` (both `(failed ? failed_recving_ : done_sending_)`
@@ -222,9 +239,17 @@ withholds completion until all workers have reported (`pSentCount = expectedP`,
 
 Inside a single JAX worker, `NumaAwareKVCacheManager::CompleteReadRaw`
 (`tpu_sync/frameworks/jax/kv_cache_manager.cc`) sits between the per-NUMA
-`KVCacheManagerWithTransfer` sub-managers (`num_subs = 1` under
-`ENABLE_MULTI_NUMA=0`, `num_subs = 2` under `ENABLE_MULTI_NUMA=1`) and
-`TPUConnectorWorker.get_transfer_results` (`NumaBarrier.lean`). Two sub-manager
+`KVCacheManagerWithTransfer` sub-managers and
+`TPUConnectorWorker.get_transfer_results` (`NumaBarrier.lean`).
+`NumaAwareKVCacheManager::InitSubManagers` (called by the config/endpoint
+`Create` factories, whereas the sizes-only and caller-supplied `Create`
+overloads do not call it) creates one sub-manager unless the
+environment variable `ENABLE_MULTI_NUMA` is `1` or `true` when called;
+with it set, one per NUMA node the devices report, or, when `total_num_shards_ > 1`,
+all devices report one node and the host has several data-plane NICs,
+`min(num_ext_nics, total_num_shards_)` sub-managers. The
+model and its theorems are instantiated at 1 and 2 sub-managers (`twoSubs`);
+three or more are not covered. Two sub-manager
 barrier policies are compared across sequential transfers that reuse the same
 `req_id` (`recycle`):
 * `NumaPolicy.settledCounts` (`process_completion` in `kv_cache_manager.cc`):
@@ -233,8 +258,10 @@ barrier policies are compared across sequential transfers that reuse the same
   `s_count + r_count + f_count >= expected`, emits `failed_recving` if
   `f_count > 0` (else `done_recving` or `done_sending`), and erases all four
   per-request map entries
-  (`KVCacheManagerWrapperTest.FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`
-  and its siblings, replayed in `NumaBarrier.lean`).
+  (`KVCacheManagerWrapperTest.FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`,
+  its six sibling barrier tests and
+  `KVCacheManagerWrapperTest.StartReadUnifiedMultiEndpointMultiSubManager`,
+  replayed in `NumaBarrier.lean`).
 * `NumaPolicy.eagerFailSet` (mutant): emits `done_sending` at
   `done_sending_counts_[req] == num_subs`, emits `done_recving` (unless
   suppressed by a per-request failure set) and erases `done_recving_counts_[req]`,
@@ -284,8 +311,10 @@ each has refutation traces: `trace_dropFailed_p`,
 `trace_loadErrorOnly_fail`, `trace_loadErrorOnly_recompute`, and
 `trace_mw_latched_loadErrorOnly_never_emits` (`connectorLoadErrorOnly`), plus
 `trace_mw_overcounted_expected_leaks` (why `get_finished_count()` must match the
-participating worker count). Bounded search (`search`, `mwSearch`) exhausts the
-state space for each configuration.
+participating worker count). The searches `search` and `mwSearch`, run over
+every event instance (`allEvents`, `mwAllEvents`), close with `.safe` for the
+`connectorTwoChannel` configurations; they are evaluated by `#guard` and
+cross-check `contract_safe` / `mw_contract_safe`, which are the proofs.
 
 On the Reshard path under `Policy.fail`, `vllm-torchtpu`'s
 `_stage3_fail_uncertain_loads_early` (`tpu_connector.py`
@@ -312,8 +341,9 @@ later transfer (`trace_eagerFailSet_partial_fail_desync_premature_doneRecving`).
 Under `NumaPolicy.settledCounts` (`process_completion`), `numa_settledCounts_safe` and
 `numa_settledCounts_maps_clean` prove safety (`NumaSafe`) and full map cleanup
 across unbounded `recycle` rounds for both `num_subs = 1` and `num_subs = 2`,
-both failure policies, and both `StartRead` overloads (`numaSearch` exhausts the
-cyclic multi-round state space), while
+both failure policies, and both `StartRead` overloads (`numaSearch`, over
+every event instance, closes on the cyclic multi-round state space with
+`.safe` as a cross-check), while
 `numaProcessSettled_expected_numSubs_eq_none` shows that pre-setting
 `req_expected_counts_[req] = num_subs` in `StartRead(remote_descriptors)` is
 observationally redundant.
@@ -326,7 +356,7 @@ observationally redundant.
   drained, and `get_finished_count()` equals the number of participating workers
   (`expectedP = 2`, `expectedD = 2`). On both paths this is enforced for
   single-round, single-plan transfers (no `sub_plan_chains_` entry) on
-  single-sub-manager workers (`ENABLE_MULTI_NUMA=0`) by the 180 s native session
+  single-sub-manager workers (`ENABLE_MULTI_NUMA` unset or `0`) by the 180 s native session
   deadline (`TPU_P2P_WAIT_PULL_TIMEOUT` in
   `TPUConnectorWorker.register_kv_caches` and `tpu_connector.py`
   `get_p2p_wait_pull_timeout()`) together with `_sync_stage3_tp_submit_states`
@@ -338,8 +368,8 @@ observationally redundant.
   below it, assuming one report per NUMA sub-manager per transfer (its **N1**,
   this assumption applied per sub-manager) and proving that
   `NumaPolicy.settledCounts` turns those reports into exactly one worker-level
-  publication, after every sub-manager has settled, also under
-  `ENABLE_MULTI_NUMA=1` and `req_id` reuse.
+  publication, after every sub-manager has settled, also with two
+  sub-managers and under `req_id` reuse.
 * **B2 (whole-transfer failure).** A failed pull invalidates every local
   block of the request, so recomputation starts from token 0 and the
   `num_computed_tokens ≠ 0` branch of `Scheduler._update_waiting_for_remote_kv`

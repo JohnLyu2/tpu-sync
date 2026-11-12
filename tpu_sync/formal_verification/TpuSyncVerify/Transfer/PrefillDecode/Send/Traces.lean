@@ -2,7 +2,7 @@ import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Send.Frame
 
-/-! # `Send`: replay of upstream tests, bounded searches, failure phase
+/-! # `Send`: replay of C++ tests, bounded searches, failure phase
 
 Part of `TpuSyncVerify.Transfer.PrefillDecode.Send`. -/
 
@@ -20,7 +20,7 @@ within a few events. The inductive proof above is the actual guarantee; the
 search guards against a modelling slip making the proof vacuous.
 
 Each trace is a named `def` so that `Coverage.lean` can measure which branches
-of `step` the replayed upstream tests reach; `paired`, `modelOnly` and
+of `step` the replayed C++ tests reach; `paired`, `modelOnly` and
 `notReplayable` at the end of this section list them. Harness mapping used by
 `paired`: a session test's `ValidateAndBeginPull; StartPush` is
 `beginPull, start`, and so is `TestManager::ServePull`, which calls
@@ -512,7 +512,10 @@ A failed session records the phase it failed in:
 `FinishLocked(status, phase)` latches `failed_phase_` from the
 explicit `phase` argument when the failing step knows it (`kD2hPhase` in
 `SendNextLayer`'s `layer_future->OnReady`, `kPushPhase` in
-`H2hWriteDirectAsync`'s callback) and otherwise from `CurrentPhaseLocked`,
+`H2hWriteDirectAsync`'s callback, and `kStagingPhase` in
+`AcquireStagingSlot` when a layer-buffer lease fails under bounded layer
+staging, which is modelled in `LayerStaging` and is not an event here) and
+otherwise from `CurrentPhaseLocked`,
 and `Details()` reports it to
 `CompleteReadWithDetails` (`RetireSettledSessionLocked`:
 `transfer_details_[req_id] = send->Details();`, under the `req_id` of the
@@ -555,7 +558,9 @@ def phase (s : Send) : Phase :=
 callback passes `kD2hPhase`, the push callback `kPushPhase`;
 every other failure (`Finish(error)` from the deadline, shutdown,
 spawn failure, or a copy that could not be issued in `StartPush`) takes the current
-phase (`CurrentPhaseLocked()`). -/
+phase (`CurrentPhaseLocked()`). The explicit `kStagingPhase` of a failed
+layer-buffer lease (`AcquireStagingSlot`, bounded layer staging only) is not
+represented: that failure is a `cancel` here and `LayerStaging` models it. -/
 def failedPhase (s : Send) : Ev → Phase
   | .wake false => .d2h
   | .h2hDone false => .push
@@ -749,16 +754,16 @@ replayed: the two `…CancelledMidPush` tests are `tr_ok_after_cancel_keeps_fail
 `tr_failed_dispatch_ends_send`, and the two `…IdlePeerConnections` tests are
 `tr_one_layer_sync_push`. -/
 
-/-! ## Which traces stand for an upstream test
+/-! ## Which traces stand for a C++ test
 
-`paired` lists every trace above whose docstring names the upstream test it
+`paired` lists every trace above whose docstring names the C++ test it
 replays, with the system that test runs on (cut with `take` where the test
 stops short, e.g. session tests have no manager and so no `publish`);
 `modelOnly` the traces no test drives; `notReplayable` the send-lifecycle
 tests whose stimulus is not an event of this model. `Coverage.lean` measures
 which branches of `step` the first set reaches. -/
 
-/-- (upstream test, initial state, trace). -/
+/-- (C++ test, initial state, trace). -/
 def paired : List (String × Send × List Ev) :=
   [("SendDrainTest.ExpiredSendKeepsItsStagingUntilTheCopyEnds", init 1, tr_expired_while_copying),
    ("SendDrainTest.DetailsSayAnExpiredSendWasStillCopying", init 1, tr_expired_while_copying),
@@ -825,7 +830,7 @@ def paired : List (String × Send × List Ev) :=
    ("HostMemoryTransferTest.AFailedPushFailsTheSendAndExpiresTheReceive", init 2,
      tr_host_source_injected_push_failure)]
 
-/-- Traces no upstream test replays: (what it shows, initial state, trace). -/
+/-- Traces no C++ test replays: (what it shows, initial state, trace). -/
 def modelOnly : List (String × Send × List Ev) :=
   [("two-layer send, both pushes succeed, published", init 2, tr_normal),
    ("deadline after the first of two copies was issued", init 2, tr_deadline_during_copy),

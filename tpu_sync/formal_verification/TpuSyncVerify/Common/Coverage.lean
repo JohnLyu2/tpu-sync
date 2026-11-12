@@ -12,10 +12,12 @@ proved `step` and never on a second transcription. An `effect : S → S → E`
 read off the before/after states adds what the step did to the lifecycle; a
 **branch** is the pair `L × E`.
 
-`reachableBranches` collects every branch over the reachable states (an
-exhaustive search when the state space is finite, `none` if the fuel ran out
-first), `coveredBy` the branches along given traces, and `witness` the
-shortest trace reaching a branch — the schedule of the test that is missing.
+`reachableBranches` collects every branch taken between states reachable
+through the supplied events and accepted by `Instr.keep` (exhaustive over that
+kept sub-space when it is finite, `none` if the fuel ran out first; a branch
+that only leads into a state `keep` rejects is not counted), `coveredBy` the
+branches along given traces, and `witness` the shortest trace reaching a
+branch — the schedule of the test that is missing.
 -/
 
 namespace TpuSyncVerify.Coverage
@@ -64,10 +66,11 @@ def runT (m : Instr S Ev L E) (s : S) : List Ev → List (L × E)
 def coveredBy (m : Instr S Ev L E) (runs : List (S × List Ev)) : List (L × E) :=
   (runs.flatMap fun (s, tr) => runT m s tr).foldl insertNew []
 
-/-- Every branch reachable from `init` through kept states, by breadth-first
-search (the same search as `ModelCheck.check`, collecting branches instead of
+/-- Every branch reachable from `init` through kept states using the events in
+`events`, by breadth-first search (as in `ModelCheck.check`, but with a hash
+set of visited states, `keep` pruning, and collecting branches instead of
 looking for a bad state). `none` if `fuel` ran out before the search exhausted
-the state space. -/
+the kept states. -/
 def reachableBranches (m : Instr S Ev L E) (init : S) (events : List Ev) (fuel : Nat) :
     Option (List (L × E)) :=
   go [init] (Std.HashSet.emptyWithCapacity.insert init) [] fuel
@@ -86,7 +89,9 @@ where
           if p.2.contains q.1 then p else (q.1 :: p.1, p.2.insert q.1)) ([], seen)
       if fresh.isEmpty then some acc else go fresh seen acc fuel
 
-/-- Shortest trace from `init` whose last step takes a branch satisfying `p`. -/
+/-- Shortest trace from `init` whose last step takes a branch satisfying `p`;
+`none` both when no such trace exists among the kept states and when none was
+found within `fuel` steps. -/
 def witnessP (m : Instr S Ev L E) (init : S) (events : List Ev) (p : L × E → Bool)
     (fuel : Nat := 16) : Option (List Ev) :=
   go [(init, [])] (Std.HashSet.emptyWithCapacity.insert init) fuel

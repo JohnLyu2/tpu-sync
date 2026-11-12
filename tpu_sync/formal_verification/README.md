@@ -6,6 +6,12 @@ callbacks and lock-scoped state machines across TPU HBM, host DRAM staging
 pools, and network peers. This directory holds Lean 4 models of those transfer
 data paths and machine-checked proofs about them.
 
+Each result below is a theorem about a model, and holds under the numbered
+assumptions the model's module lists. The two subsystem documents tabulate the
+assumptions and say which are discharged by another Lean module, which follow
+from C++ control flow, and which are left to the caller or the configuration;
+they also list what is not modelled.
+
 ## What is modelled
 
 **Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
@@ -22,11 +28,16 @@ data paths and machine-checked proofs about them.
 
 **Pool resharding** — [reshard.md](docs/transfer/reshard.md)
 - C++: `ReshardSendSession`, `ReshardReceiveSession`, `PoolStagingStorage`,
-  `RequestBlockRegistry`, `ReshardCoordinator`.
+  `RequestBlockRegistry`, `ReshardCoordinator`, and multi-window sub-plan
+  chains (`PlanSubTransfers`, `ReshardCoordinator::StartChain`,
+  `KVCacheManagerWithTransfer::SubPlanChainProgress`).
 - Lean: [`Transfer/Reshard/`](TpuSyncVerify/Transfer/Reshard/).
 - Proved: data correctness including sub-block coverage and aliased-page
   ordering, staging slot conservation, registry claim safety,
-  arm-before-dispatch, termination.
+  arm-before-dispatch, termination, and one worker-level outcome per
+  sub-plan chain (the last under caller assumptions the C++ does not check
+  and only for executions outside two timing windows the C++ permits;
+  [reshard.md](docs/transfer/reshard.md) lists them).
 
 **Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries, [reshard.md](docs/transfer/reshard.md) §Boundaries
 - C++ / Python: `NumaAwareKVCacheManager` (`tpu_sync/frameworks/jax/`), and
@@ -46,16 +57,21 @@ TpuSyncVerify/
   Transfer/Session.lean       settle protocol shared by every transfer session
   Transfer/LayerStaging.lean  per-session bounded host layer buffer manager (StagingLayerManager)
   Transfer/Caller.lean        engine caller contract above poll_stats() shared by both transfer paths
-  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport
-  Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator
+  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, bounded layer staging, block
+                              ordering, uuid table, peer isolation, transport accounting
+  Transfer/Reshard/           pool-resharding sessions, pipeline, staging arena, registry,
+                              coordinator, sub-plan chains
 docs/
   conventions.md              how the models are written (one executable step, ghost
-                              fields, replay traces, mutants) and how the C++ is cited
+                              fields, replay traces, mutants, branch coverage) and how
+                              the C++ is cited
   transfer/                   per-subsystem C++ <-> Lean docs: states, events,
                               assumptions, proved theorems
 tools/
-  resolve_anchors.py          resolves/checks source-map tables and intersects llvm-cov JSON
-  run_lean.sh                 evaluates ad hoc Lean snippets against the built models
+  resolve_anchors.py          checks (--check) or rewrites (--apply) the line spans in the
+                              source-map tables, compares them between two commits
+                              (--diff), and intersects llvm-cov JSON with them (--coverage)
+  run_lean.sh                 evaluates a Lean snippet from stdin against the built models
 lakefile.toml, lake-manifest.json, lean-toolchain
 ```
 
@@ -81,6 +97,22 @@ lake build
 python3 tools/resolve_anchors.py --check
 ```
 
-A clean build takes about half a minute; every `theorem` is machine-checked,
-every `#guard` bounded search is executed, and `resolve_anchors.py --check`
-verifies all C++ source-map tables and checks for stray raw line citations.
+`lake build` checks every `theorem` with Lean's kernel and evaluates every
+`#guard` (the model-checker searches and the branch-coverage counts; a `#guard`
+is an evaluated check, not a theorem). The corpus has no `sorry`, declares no
+axiom and has no dependency beyond the Lean toolchain.
+
+`resolve_anchors.py --check` re-resolves every source-map table against the
+C++ in the working tree and reports stray raw line citations outside the
+tables. It writes nothing and exits non-zero on any mismatch, or if it finds no
+file to check. It locates the repository from the current directory and
+otherwise from its own path, so it needs the C++ sources under `tpu_sync/`
+alongside this directory. `--apply` rewrites the line spans after a C++ change;
+`python3 tools/resolve_anchors.py --help` describes every mode.
+
+To evaluate a snippet against the built models without adding a file:
+
+```sh
+printf 'import TpuSyncVerify\n#print axioms TpuSyncVerify.Transfer.PrefillDecode.Recv.reachable_safe\n' \
+  | tools/run_lean.sh
+```

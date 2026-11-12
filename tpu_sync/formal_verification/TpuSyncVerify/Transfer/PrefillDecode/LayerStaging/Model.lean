@@ -160,7 +160,9 @@ def sendD2hBegin (s : BoundedPipeline) : Option BoundedPipeline :=
     else (Pipeline.step s.pipe (.send .d2hBegin)).map fun p => { s with pipe := p, sendLoop := .nextIter }
   else none
 
-/-- `D2hSyncDispatch` outcome in `StartPush`. -/
+/-- `D2hSyncDispatch` outcome in `StartPush`. On failure the C++ calls
+`staging_layer_manager_.Release(l)` and then `FinishLocked(error)`; both are
+one `releaseSync` step here (`LayerStaging.lean`, LS2). -/
 def sendD2hIssue (s : BoundedPipeline) (ok : Bool) : Option BoundedPipeline :=
   let l := s.pipe.send.d2hIssued
   (Pipeline.step s.pipe (.send (.d2hIssue ok))).map fun p =>
@@ -277,7 +279,11 @@ def h2dBegin (s : BoundedPipeline) (l : Nat) : Option BoundedPipeline :=
 
 /-- `ExecuteLayerH2d(l)` second `mu_` lock + `H2dSyncDispatch` + the closing
 `dispatched_layers_.insert(layer_idx)` scope (`recv.cc`); the slot bookkeeping
-only depends on whether the copy was dispatched. -/
+only depends on whether the copy was dispatched. On a dispatch failure the C++
+calls `staging_layer_manager_.Release(layer_idx)` and then
+`FinishLocked(error, kH2dPhase)`; both are one `releaseSync` step here, which
+leaves out a waiter taking the freed buffer between the two calls
+(`LayerStaging.lean`, LS2). -/
 def h2dIssue (s : BoundedPipeline) (l : Nat) (ok : Bool) : Option BoundedPipeline :=
   if s.recvPhaseL[l]? = some .h2dPending then
     (Pipeline.step s.pipe (.h2dIssue l ok)).map fun p =>

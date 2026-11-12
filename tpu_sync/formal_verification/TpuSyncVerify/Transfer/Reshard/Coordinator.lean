@@ -36,7 +36,7 @@ ranges for every symbol, sub-block, and test are in the generated
 
   `ReshardCoordinator::ExecutePoolReshard` fetches the source and destination
   metadata once, picks the request's `uuid`, plans the request's sub-transfer
-  chain (`ReshardCoordinator::PlanSubTransfers`: one sub-plan per
+  chain (the free function `PlanSubTransfers`: one sub-plan per
   `dst_window_blocks` window of the destination block lists, `chain.count == 1`
   when no tag is windowed), draws one `claim_owner` for the whole chain
   (`claim_counter.fetch_add(1)`, so the registry sees one claim per request),
@@ -70,6 +70,20 @@ ranges for every symbol, sub-block, and test are in the generated
   serialization setup errors (matching `SubPlanChain.lean`). The sender-dispatch
   failure path is the same for every index: `for (const absl::Status& status : sender_status)`
   returns the first error without disarming receivers and without `AbandonClaim`.
+
+  Not modelled: the registry's clock and forced release. `Ev` has no TTL-expiry
+  event (`RequestBlockRegistry::PurgeExpiredLifecycleLocked` /
+  `PurgeExpiredRequestBlocksLocked`, run on entry by `Register`,
+  `LookupAndClaim`, `Complete`, `Release`, and the status probe;
+  `CancelIfUnclaimed` runs `PurgeExpiredLifecycleLocked` only, and `AbandonClaim`
+  runs neither) and no `RequestBlockRegistry::Release`
+  (`COMMAND_RELEASE_REQUEST_BLOCKS`, which retires a claimed generation
+  unconditionally). The claim is refreshed to `now + ttl_s_` only by the one
+  `LookupAndClaim` at the start of the call, so `ClaimedWhileArming` and the
+  traces below are statements about a call that finishes arming within `ttl_s_`
+  (`request_registry_ttl_s`, default 600 s; one `index == 0` arm round is
+  bounded by `kWorkerRpcTimeout`, 60 s) and during which nobody releases the
+  generation.
 
   What this file proves:
   1. **Universal Protocol Guarantees (`CoordInv`, `reachable_coord_inv`)**:
@@ -136,7 +150,7 @@ ranges for every symbol, sub-block, and test are in the generated
   |---|---|---|
   | `registerProducer srcUnit` | 1 `RequestBlockRegistry::mu_` scope (`RequestBlockRegistry::Register`) | — |
   | `startPlan planOk` | 1 `RequestBlockRegistry::mu_` scope in `BuildPoolReshardPlan` (`LookupAndClaim`), plus a second scope (`AbandonClaim`, `if (index == 0)`) if `planOk = false` after claiming | — |
-  | `armDstResult dstUnit ok` | 1 `armers` worker thread calling `PoolReshardRegisterRecv` on `dstUnit` (2 `KVCacheManagerWithTransfer::mu_` scopes, `Pipeline.lean`) and writing its own `arm_replies[i]` / `arm_status[i]` / `armed[i]` slot | worker threads write disjoint slots of `arm_replies` / `arm_status` / `armed`, joined at `finishArmBarrier` |
+  | `armDstResult dstUnit ok` | 1 `armers` worker thread calling `PoolReshardRegisterRecv` on `dstUnit` (2 `KVCacheManagerWithTransfer::mu_` scopes, `Pipeline.lean`, plus a third acquisition at function exit by the `clear_pending` cleanup, which only erases the UUID from `pending_pool_reshard_recvs_`) and writing its own `arm_replies[i]` / `arm_status[i]` / `armed[i]` slot | worker threads write disjoint slots of `arm_replies` / `arm_status` / `armed`, joined at `finishArmBarrier` |
   | `finishArmBarrier` | `for (std::thread& t : armers) t.join();`, followed for an unarmed destination (`if (armed[i]) continue;`) by 1 `RequestBlockRegistry::mu_` scope (`registry_->AbandonClaim`, `if (index == 0)`) before `return arm_status[i];` | `join()` orders all `arm_status[i]` / `armed[i]` writes before the scan that inspects them; with `index == 0` there is a single arm attempt (`attempts = 1`), so the re-arm loop is not entered |
   | `sendSrcResult srcUnit ok` | 1 `senders` worker thread (or `SubmitTransferProgram` future) calling `PoolReshardPush` on `srcUnit` and writing `sender_status[i]` on failure; on `ok = true`, folds the sender RPC, receiver settlement (`Receive.lean`), and the producer's `registry_->Complete` vote (1 `RequestBlockRegistry::mu_` scope) | folding `Complete` into `ok = true` is sound for `CoordInv` because whenever any `srcUnit` fails (`sendFailed = true`), that unit never calls `Complete`, keeping `allVoted = false` |
   | `finishSendBarrier` | `for (std::thread& t : senders) t.join();` (or the final `futures[i].Await()`) before `for (const absl::Status& status : sender_status)` | `join()` / `Await()` orders all `sender_status[i]` writes before the status check |
@@ -149,7 +163,16 @@ ranges for every symbol, sub-block, and test are in the generated
   failure-cleanup paths of `Traces.lean` — a refused arm beside an armed
   destination and a failed sender dispatch — through
   `TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders` and
-  `SenderDispatchFailurePropagatesErrorAfterReceiverArm`.
+  `SenderDispatchFailurePropagatesErrorAfterReceiverArm`. The pairing is at the
+  coordinator's own transitions only: the tests run over a fake control
+  transport in which no worker votes `Complete` during the coordination call
+  (after it `RequestBlockStatusProbeTracksLifecycle` reads `STATUS_CLAIMED`, and
+  `CompletionVotesRetireAfterClaim` sends the votes itself), whereas
+  `sendSrcResult _ true` folds the receiver's settlement and the producer's
+  vote in, so a paired success trace ends with the generation retired and the
+  receivers released. The registry- and receiver-side effects of the `sendOk`,
+  `sendOkCompletes` and `sendBarrierSucceeds` leaves are therefore not states
+  any paired test observes.
 
 ## Source map
 

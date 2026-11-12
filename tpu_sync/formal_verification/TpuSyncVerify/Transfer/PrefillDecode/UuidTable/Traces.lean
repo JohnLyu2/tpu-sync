@@ -1,7 +1,7 @@
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Transfer.PrefillDecode.UuidTable.Invariant
 
-/-! # `UuidTable`: replay of upstream tests, bounded searches, mutant
+/-! # `UuidTable`: replay of C++ tests, bounded searches, mutant
 
 Part of `TpuSyncVerify.Transfer.PrefillDecode.UuidTable`; the module docstring and
 source map live in `UuidTable.lean`. -/
@@ -11,7 +11,7 @@ namespace TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 open TpuSyncVerify.Transfer (Lifecycle)
 open TpuSyncVerify.Transfer.PrefillDecode (Recv Send)
 
-/-! ## Concrete traces (`SendDrainTest`, `RecvDrainTest`, `ControlHandshakeTest`) -/
+/-! ## Concrete traces (`SendLifecycleTest`, `RecvDrainTest`, `RecvLifecycleTest`, `ControlHandshakeTest`) -/
 
 structure RecvSummary where
   reqId : ReqId
@@ -171,18 +171,58 @@ theorem trace_start_read_under_send_offer :
       some (some (1, 1)) := by
   decide
 
+/-- No layers, four slots, one uuid: a receive that is ready to complete with
+nothing in flight from the moment it is seated. -/
+def zeroLayers : Config := { numLayers := 0, numSlots := 4, numUuids := 1 }
+
 /-- `RecvLifecycleTest.RegisterRecvFinishesAReadyIncumbentBeforeReplacingIt` and
-`RecvLifecycleTest.RedeliveredStartReadLeavesAReadyReceiveToCompleteRead`, as
-far as the model reaches them: the tests make the incumbent ready to complete
-by reporting its blocks before any copy is issued (excluded here by
-`Receive.lean`'s A4), so the model's only ready, non-draining incumbent is the
-poll window of `ReceivePoll.lean` — every copy's future ready, the last
-callback not yet run. There `registerRecv` finishes the incumbent
-(`recv->Finish()` in `EmplaceRecvSessionLocked`) but cannot retire or replace
-it, since the callback's op keeps it from settling (`draining = true`,
-`done = false`, same `(reqId, gen)`, slot kept); a re-delivered `startRead` of
-the same request neither finishes nor replaces it. The callback then settles
-the incumbent and the sweep reports it done. -/
+`RecvLifecycleTest.RedeliveredStartReadLeavesAReadyReceiveToCompleteRead`.
+Both tests seat a one-layer incumbent with `RecvTestManager::AddRecv` and make
+it ready to complete with nothing in flight by reporting its blocks before any
+copy is issued (`ReceiveBlocks`). `Receive.lean`'s A4 excludes that order on a
+layer, so the replay runs on `zeroLayers`, whose receive is in the same
+session condition (ready, not draining, `inFlight = 0`) as soon as it is
+seated.
+
+1. `registerRecv 1 0` (`"retry"`) finishes the ready incumbent `"old"`
+   (`recv->Finish()` in `EmplaceRecvSessionLocked`), which settles it on the
+   spot, retires it into `doneRecving = [0]` and seats the replacement
+   (`gen = 1`) in the same call: the test's `recv->Done()`,
+   `replacement != incumbent`, and `"old"` in `completions.received`. The
+   model's `freeSlots` reads `numSlots - 1` (`3` of `4`) where the test reads all
+   of `kSlots` (`kSlots = 2`): `registerRecv` takes a slot for the replacement,
+   production `RegisterRecv` takes none (`UuidTable.lean`, rule 2).
+2. A re-delivered `startRead 0 0` of the incumbent's own request changes
+   nothing (the incumbent is neither finished nor replaced and keeps its
+   slot); the poll then finishes it (`pollReady`), the sweep reports it in
+   `doneRecving = [0]` and returns the slot, and a second sweep finds no entry
+   (the test's empty `repeated`). -/
+theorem trace_register_recv_replaces_ready_incumbent :
+    ((sys zeroLayers).run [.registerRecv 0 0]).map (fun s => (s.freeSlots, recvSummary s 0)) =
+      some (3, some { reqId := 0, gen := 0, draining := false, done := false }) ∧
+    ((sys zeroLayers).run [.registerRecv 0 0, .registerRecv 1 0]).map
+      (fun s => (s.freeSlots, s.doneRecving, s.failedRecving, recvSummary s 0)) =
+      some (3, [0], [], some { reqId := 1, gen := 1, draining := false, done := false }) ∧
+    (sys zeroLayers).run [.registerRecv 0 0, .startRead 0 0] =
+      (sys zeroLayers).run [.registerRecv 0 0] ∧
+    ((sys zeroLayers).run [.registerRecv 0 0, .startRead 0 0, .recvStep 0 .pollReady, .sweepRecv 0]).map
+      (fun s => (s.freeSlots, s.doneRecving, s.failedRecving, recvSummary s 0)) =
+      some (4, [0], [], none) ∧
+    (sys zeroLayers).run
+      [.registerRecv 0 0, .startRead 0 0, .recvStep 0 .pollReady, .sweepRecv 0, .sweepRecv 0] = none := by
+  decide
+
+/-- Model-only: the same two calls against a ready incumbent that still has
+an operation in flight. On one layer the model's ready, non-draining
+incumbent is the poll window of `ReceivePoll.lean` — every copy's future
+ready, the last callback not yet run (no C++ test holds a receive there).
+`registerRecv` finishes the incumbent (`recv->Finish()` in
+`EmplaceRecvSessionLocked`) but cannot retire or replace it, since the
+callback's op keeps it from settling (`draining = true`, `done = false`, same
+`(reqId, gen)`, slot kept), and the call is refused with the incumbent left
+draining; a re-delivered `startRead` of the same request neither finishes nor
+replaces it. The callback then settles the incumbent and the sweep reports it
+done. -/
 theorem trace_register_recv_finishes_ready_incumbent :
     let pre : List Ev :=
       [.registerRecv 0 0, .recvStep 0 .h2dBegin, .recvStep 0 (.h2dIssue true),

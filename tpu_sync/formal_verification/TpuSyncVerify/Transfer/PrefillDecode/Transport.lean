@@ -180,7 +180,7 @@ runs `EndIncomingPush(session, InternalError(...))`, which calls
 
 Retirement (`if (all_layers_called)` in `CompleteIncomingPush`) sets the push
 session's `done_` in the same critical section as the latch and leaves
-`layer_progress_` in place. A retired session is no longer handed out:
+`layer_progress_` in place. A retired session is not handed out again:
 `GetOrCreatePushSession` returns the map's session only while
 `!session->IsDone() || session->HasAdmittedPosts()` (the second disjunct is the
 Peregrine path's lease bookkeeping) and otherwise seats a fresh
@@ -252,7 +252,7 @@ when `TryBeginOp` already refuses every further stream, so it is not an event.
   the fixed `Cfg.declared`. `KVCacheManagerBase::ExpectedPushSenders` reads the
   plan of the uuid's session (`GetTransferPlan` → `GetSession(uuid)->plan()` →
   `TransferPlan::ExpectedPushSenders`) and returns `std::nullopt` when no
-  receiver plan is registered (`StartRead`, `KVCacheStore` /
+  receiver plan is registered (`StartRead`, `RegisterRecv`, `KVCacheStore` /
   `WorkerServiceImpl::TransferBuffers`, and `WeightSynchronizerBase`), when
   `pool_groups_size() > 0` (pool reshard via `ReshardCoordinator::RunSubPlan`,
   which takes the `GetPoolPushProgressSpec` branch in `CompleteIncomingPush`),
@@ -333,8 +333,13 @@ when `TryBeginOp` already refuses every further stream, so it is not an event.
   layer's copy exactly once and no copy is still in flight. This is what the
   engine reads out of `done_recving`.
 
-`reachable_safe`: under A4 both contracts satisfy all three, for any
-positive `numLayers`, `numSenders`, `numStreams`, `blocksPerStream`.
+`reachable_safe`: under A4 and `Cfg.WF` both contracts satisfy all three, for
+any positive `numLayers`, `numSenders`, `numStreams`, `blocksPerStream`.
+`Cfg.WF.chunkSingle` (one sender on the chunk-count contract) follows from the
+C++ on the `StartRead` path and on plans with `shard_push_schedules`; for a
+receive created by `KVCacheManagerWithTransfer::RegisterRecv` and for a
+receiver plan with no `shard_push_schedules` it is an obligation on whoever
+dispatches the pushes, which nothing in the C++ checks.
 
 Without A4 (`Cfg.honest = false`) the traces at the end show what one extra
 stream does: on the chunk-count contract before retirement the receive is

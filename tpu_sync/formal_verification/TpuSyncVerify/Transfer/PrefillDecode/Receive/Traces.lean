@@ -2,7 +2,7 @@ import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Progress
 import TpuSyncVerify.Transfer.PrefillDecode.Receive.Frame
 
-/-! # `Recv`: replay of upstream tests, bounded searches, mutants
+/-! # `Recv`: replay of C++ tests, bounded searches, mutants
 
 Part of `TpuSyncVerify.Transfer.PrefillDecode.Receive`. -/
 
@@ -21,7 +21,7 @@ actual guarantee; the search guards against a modelling slip making the proof
 vacuous.
 
 Each trace is a named `def` so that `Coverage.lean` can measure which branches
-of `step` the replayed upstream tests reach; `paired` and `modelOnly` at the end
+of `step` the replayed C++ tests reach; `paired` and `modelOnly` at the end
 of this section list them. -/
 
 /-- Two-layer push receive, each layer's push lease spanning its H2D dispatch
@@ -136,10 +136,12 @@ theorem trace_no_push_after_finish :
 def tr_net_completion_waits_for_h2d : List Ev :=
   [.h2dBegin, .h2dIssue true, .netAccount, .h2dReady, .h2dDone true, .publish]
 
-/-- `RecvLifecycleTest.NetworkCompletionWaitsForH2d`: `OnBlockShardsReceived`
-(`netAccount`) sets `network_completed_` while the H2D copy is still running on
-the device; neither the poll nor publication can complete the session until the
-H2D copy finishes. -/
+/-- `RecvLifecycleTest.NetworkCompletionWaitsForH2d`: the one layer's dispatch
+has already set `network_completed_` (`netIssued`, the last scope of
+`ExecuteLayerH2d`) when `OnBlockShardsReceived` (`netAccount`) reports its
+blocks, so the report is accounted and records nothing more, while the H2D copy
+is still running on the device; neither the poll nor publication can complete
+the session until the H2D copy finishes. -/
 theorem trace_net_completion_waits_for_h2d :
     let pre := tr_net_completion_waits_for_h2d.take 3
     ((sysPush 1).run pre).map
@@ -582,14 +584,19 @@ theorem trace_late_reply_failure_keeps_verdict :
       some (true, true, false, some true) := by
   decide
 
-/-! ## Which traces stand for an upstream test
+/-! ## Which traces stand for a C++ test
 
-`paired` lists every trace above whose docstring names the upstream test it
+`paired` lists every trace above whose docstring names the C++ test it
 replays, with the initial state that test starts from; `modelOnly` lists the
 rest. `Coverage.lean` measures which branches of `step` the first set reaches. -/
 
-/-- (upstream test, initial state, trace). A trace is cut (`take`) where the
-test stops short of it. -/
+/-- (C++ test, initial state, trace). A trace is cut (`take`) where the
+test stops short of it, with one exception: the two `RecvLifecycleTest.Tcp…`
+tests build their session with `TransferReceiveSession::Create` without seating
+it in the manager's `sessions_` and never poll (`CompleteReadRaw`); their last
+lifecycle check is `EXPECT_TRUE(session->Done())`, while their traces
+(`tr_normal`, `tr_tcp_h2d_before_last_report`) keep a final `publish` that no
+manager poll in the test performs. -/
 def paired : List (String × Recv × List Ev) :=
   [("RecvLifecycleTest.OutOfOrderLayersSettleAfterEveryH2d", initPush 2, tr_layers_one_at_a_time),
    ("RecvLifecycleTest.DetailsReportWhenTheLastH2dLanded", initPush 1, tr_one_layer),
@@ -645,7 +652,7 @@ def paired : List (String × Recv × List Ev) :=
    ("ControlHandshakeTest.AcceptedPullAfterDeadlineSweepSettlesExpiredReceive", initLoad 1,
      tr_accepted_pull_after_deadline)]
 
-/-- Traces no upstream test replays: (what it shows, initial state, trace). -/
+/-- Traces no C++ test replays: (what it shows, initial state, trace). -/
 def modelOnly : List (String × Recv × List Ev) :=
   [("deadline during the copy of a pulled receive", initLoad 1, tr_deadline_during_copy),
    ("poll finishes before the callback", initPush 1, tr_poll_before_callbacks),

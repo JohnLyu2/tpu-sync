@@ -360,9 +360,9 @@ theorem trace_reseat_at_finish :
     some (false, some true, [.junk]) := by
   decide
 
-/-! ## Which traces stand for an upstream test
+/-! ## Which traces stand for a test
 
-`paired` lists the traces above that replay an upstream test, with the system
+`paired` lists the traces above that replay a C++ or Python test, with the system
 the test runs on; `Pipeline/Coverage.lean` measures which branches of `step`
 they reach. Two kinds of pairing, both weaker than a session test's: the
 end-to-end tests (`KVCacheManagerWithTransferTest.*`, the Python
@@ -375,7 +375,7 @@ reads, not for a `TransferReceiveSession`; the producer's zero-layer
 `StartPush` on its worker thread is left out (see `Send/Traces.lean`), and the
 rejected-after-deadline test is its producer's deadline sweep and poll. -/
 
-/-- (upstream test, initial state, trace). -/
+/-- (test, initial state, trace). -/
 def paired : List (String × Pipeline × List Ev) :=
   [("KVCacheManagerWithTransferTest.LocalOrchestratedTransfer", init 1, producer ++ consumer),
    ("KVCacheManagerWithTransferTest.TreeBroadcastCorrectness8Nodes", init 1, producer ++ consumer),
@@ -396,7 +396,7 @@ def paired : List (String × Pipeline × List Ev) :=
    ("ControlHandshakeTest.ShutdownUnblocksPendingPull", initUnregistered 1,
      [.pullWait, .recv (.pullReply false)])]
 
-/-- Traces no upstream test replays. -/
+/-- Traces no test replays. -/
 def modelOnly : List (String × Pipeline × List Ev) :=
   [("producer long gone before the consumer lands the layer", init 1,
      producer ++ [.reclaim, .reseatPrefillStaging] ++ consumer),

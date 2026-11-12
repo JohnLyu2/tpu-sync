@@ -130,9 +130,15 @@ drives a single `RunSubPlan` within scope (`index == 0`, `plan.src_units =
 request.src_units`), with the sub-plan shape and the trace each replays. The
 tests run `ReshardService` over a fake control transport: an arm or dispatch
 RPC succeeds or is refused by `transport_.FailFor`, and no worker ever votes
-`Complete` during `Coordinate`, whereas `sendSrcResult _ true` folds the
-worker's vote in (the coordinator model's abstraction of the data plane); the
-pairing is at the coordinator's own transitions. `refused` lists the pre-claim
+`Complete` during the coordination call (the fixture helper `Coordinate`, which
+sends `COMMAND_COORDINATE_TRANSFER` to `ReshardCoordinator::StartPoolReshard`),
+whereas `sendSrcResult _ true` folds the worker's vote in (the coordinator
+model's abstraction of the data plane); the pairing is at the coordinator's own
+transitions, and a paired success trace ends with the generation retired where
+the test still reads `STATUS_CLAIMED`
+(`ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`). `ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders`'s
+retry is paired as a 2×2 run from a fresh `CoordState.init`; the fake transport
+does not keep the first attempt's armed receiver. `refused` lists the pre-claim
 refusal asserted, and `notReplayable` accounts for the remaining tests in
 `reshard_service_test.cc`. -/
 
@@ -157,7 +163,7 @@ def tr_send_failure_2x1 : List Ev :=
   [.registerProducer 0, .registerProducer 1, .startPlan true, .armDstResult 10 true,
    .finishArmBarrier, .sendSrcResult 0 false, .sendSrcResult 1 true, .finishSendBarrier]
 
-/-- `(upstream test, initial state, trace)`. -/
+/-- `(C++ test, initial state, trace)`. -/
 def paired : List (String × CoordState × List Ev) :=
   [("ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch", CoordState.init [0, 1] [10] 101,
      tr_full_flow_2x1),
@@ -232,7 +238,7 @@ def paired : List (String × CoordState × List Ev) :=
    ("ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm",
      CoordState.init [0, 1] [10] 101, tr_send_failure_2x1)]
 
-/-- `(upstream test, initial state, trace, refused event)`:
+/-- `(C++ test, initial state, trace, refused event)`:
 `ReshardStackTest.MissingRegistrationKeepsContractString` plans with no producer
 registered, and `ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl`
 plans with only rank `0` of `[0, 1]` registered; in both cases `LookupAndClaim`
@@ -244,7 +250,9 @@ def refused : List (String × CoordState × List Ev × Ev) :=
      CoordState.init [0, 1] [10] 101, [.registerProducer 0], .startPlan true)]
 
 /-- Remaining tests in `reshard_service_test.cc` outside the single-`RunSubPlan`
-(`index == 0`, `plan.src_units = request.src_units`) coordinator scope. -/
+(`index == 0`, `plan.src_units = request.src_units`) coordinator scope.
+"`Coordinate`" in a reason is the `ReshardStackTest` fixture helper that sends
+`COMMAND_COORDINATE_TRANSFER`. -/
 def notReplayable : List (String × String) :=
   [("ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow",
       "multi-window chain (chain.count = 4, StartChain); registry claim replayed in Registry/Coverage.lean"),
@@ -290,7 +298,7 @@ def notReplayable : List (String × String) :=
    ("PlanSubTransfersTest.* (5 tests)", "pure PlanSubTransfers window-splitting unit tests"),
    ("SubPlanUuidTest.DerivedUuidsArePositiveAndDistinct", "pure SubPlanUuid helper unit test")]
 
-/-- The trace no upstream test drives: the 2×2 sender-dispatch failure of
+/-- The trace no C++ test drives: the 2×2 sender-dispatch failure of
 `Traces.lean` (its 2×1 form is
 `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm`). -/
 def modelOnly : List (String × CoordState × List Ev) :=

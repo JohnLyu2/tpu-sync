@@ -199,7 +199,10 @@ theorem trace_single_plan_reports_at_once :
 `0` once, stamped `sub_plan_index = 0, sub_plan_count = 2`): its single push
 settles OK, `sub_sessions = [session, nullptr]` has one settled slot of two, so
 no `done_sending` is inserted; once the entry is quiet for `timeout_s_` the
-sweep inserts `failed_recving`. -/
+sweep inserts `failed_recving`. The coordinator model's A3 guard still admits
+this rank's `Complete` vote once window `0` is dispatched
+(`trace_window_composes_with_prefix_clip`); whether the producer votes after a
+`failed_recving` report is not determined by the cited C++. -/
 theorem trace_sender_in_first_window_only :
     let tr : List WorkerEv :=
       [ .registerSubPlan 9000 0 2, .settleSession 9000 true, .poll false ]
@@ -362,11 +365,20 @@ def mixedCheckEvents : List WorkerEv :=
     .settleSession 11 true, .settleSession 11 false,
     .poll false, .poll true ]
 
-#guard ModelCheck.check WorkerState.sys chain2CheckEvents workerViolates 32 = .safe
-#guard ModelCheck.check WorkerState.sys workerCheckEvents workerViolates 32 = .safe
-#guard ModelCheck.check WorkerState.sys mixedCheckEvents workerViolates 32 = .safe
+/-! `WorkerState.sysRestricted` (`WorkerState.step` restricted to executions
+satisfying A5b and A5c, the system of `reachable_worker_safe`) is safe on all
+three event lists. `WorkerState.sys` is not: see "Executions of
+`WorkerState.step` that violate `DoneAfterAllSubPlans`" below. -/
 
-/-! ### Mutants -/
+#guard ModelCheck.check WorkerState.sysRestricted chain2CheckEvents workerViolates 32 = .safe
+#guard ModelCheck.check WorkerState.sysRestricted workerCheckEvents workerViolates 32 = .safe
+#guard ModelCheck.check WorkerState.sysRestricted mixedCheckEvents workerViolates 32 = .safe
+
+/-! ### Mutants
+
+`stepCountStale` and `stepNoReanchor` change one function of `WorkerState.step`
+and defer to it for everything else. The deadline-arm mutant is
+`WorkerState.stepG` with `deadlineArm` off. -/
 
 /-- Mutant: `RecordPoolReshardTerminalLocked` without the `std::find` on
 `sub_sessions` — a settled session missing from the entry is counted in its
@@ -383,7 +395,7 @@ def stepCountStale (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
 
 /-- On the retry trace, the mutant inserts `done` for the retry as soon as the
 stale `6002` and the new `7001` settle, while the retry's own sub-plan `1`
-(`7002`) is still active; the shipping step waits for `7002`. -/
+(`7002`) is still active; `WorkerState.step` waits for `7002`. -/
 theorem mutant_counting_stale_sub_plan_reports_done_early :
     let tr : List WorkerEv :=
       [ .registerSubPlan 6001 0 2, .settleSession 6001 false, .poll false,
@@ -428,30 +440,51 @@ theorem mutant_no_reanchor_never_reports_retry_done :
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports)) = some (1, 1) := by
   decide
 
-/-- Without A5a (`stepG { deadlineArm := false }`): an in-flight `!IsDraining()`
-sub-plan still seated when the sweep erases its failed entry later settles OK
-and, finding no entry, is reported as the request's `done` (`doneLog = [(2, [1])]`):
-a `done_recving` for a two-plan request with one sub-plan settled. With A5a on,
-the deadline arm latches error on that session at the sweep. -/
+/-- Mutant: `WorkerState.step` without the A5a deadline arm (`stepG` with
+`deadlineArm`, `noDrainingOkAtSweep` and `noSettleBetweenRetireAndSweep` off;
+A6 and A7 on). An in-flight `!IsDraining()` sub-plan still seated when the
+sweep erases its failed entry later settles OK and, finding no entry, is
+reported as the request's `done` (`doneLog = [(2, [1])]`): a `done_recving` for
+a two-plan request with one sub-plan settled. In `WorkerState.step` the
+deadline arm latches error on that session at the sweep. -/
 theorem mutant_no_deadline_arm_reports_done_after_sweep :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7500 0 2, .settleSession 7500 false, .poll false,
         .registerSubPlan 7501 1 2, .beginOp 7501, .poll true,
         .settleSession 7501 true, .poll false ]
-    ((⟨WorkerState.init, WorkerState.stepG { deadlineArm := false }⟩ :
+    ((⟨WorkerState.init, WorkerState.stepG
+        { deadlineArm := false, noDrainingOkAtSweep := false,
+          noSettleBetweenRetireAndSweep := false }⟩ :
         System WorkerState WorkerEv).run tr).map
         (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (1, 1, [(2, [1])]) ∧
     (WorkerState.sys.run tr).map (fun w => (w.doneReports, w.failReports, w.doneLog)) =
       some (0, 2, []) := by
   decide
 
+/-! The search below keeps the A5b and A5c guards on (`stepG { deadlineArm :=
+false }` is `WorkerState.stepRestricted` without the deadline arm), because
+`WorkerState.sys` already has a counterexample on these events through the A5b
+window: the counterexample found here is one that A5b and A5c do not exclude,
+so the deadline arm is needed for `reachable_worker_safe`. -/
+
 #guard (ModelCheck.check (⟨WorkerState.init, WorkerState.stepG { deadlineArm := false }⟩ :
     System WorkerState WorkerEv) workerCheckEvents workerViolates 32 matches .counterexample _)
 
-/-- Without A5b (`stepG { noDrainingOkAtSweep := false }`, the unguarded C++
-interleaving on a single non-retried 2-sub-plan chain): sub-plan `0` (`7510`)
-fails on poll 1 (`failReports = 1`, `chain.failed = true`), while sub-plan `1`
-(`7511`) has already latched clean drain (`beginOp 7511, latchDrain 7511 true`,
+/-! ### Executions of `WorkerState.step` that violate `DoneAfterAllSubPlans`
+
+A5b and A5c are not caller assumptions and not guards of `WorkerState.step`:
+each names a timing window inside `CompleteReadWithDetails` /
+`SweepSubPlanChainsLocked` that the C++ permits with every caller well behaved.
+The two traces below are executions of `WorkerState.sys` in those windows that
+end with a `done` logged for a two-sub-plan request with one slot settled;
+`WorkerState.sysRestricted` refuses each, and the alternative
+`WorkerState.sysSweepWaitsForOpen` (not the C++) runs each without the `done`. -/
+
+/-- The A5b window (an execution of `WorkerState.sys`; a C++ interleaving
+on a single non-retried 2-sub-plan chain): sub-plan `0` (`7510`)
+fails on poll 1 (`failReports = 1`, `chain.failed = true`); sub-plan `1`
+(`7511`) is then registered into the failed entry and latches clean drain
+(`beginOp 7511, latchDrain 7511 true`,
 e.g. `ReshardSendSession::RecordPushCompletion` setting `finalizing_ = true`
 before `EndOp` finishes `ReleaseDataConnectionsAfterSend`, or
 `ReshardReceiveSession::FinishPoolH2d` setting `draining_ = true` before
@@ -459,19 +492,18 @@ before `EndOp` finishes `ReleaseDataConnectionsAfterSend`, or
 `7511` and `SweepSubPlanChainsLocked` unconditionally erases the `failed`
 tombstone; once `EndOp` sets `done_ = true`, poll 3 hits
 `it == sub_plan_chains_.end()` and emits `done` (`doneLog = [(2, [1])]`) after
-failure. Under A5b (`WorkerState.step`), the guarded step excludes poll 2; the
-candidate fix `WorkerState.sysSweepWaitsForOpen` keeps the tombstone until
+failure. `WorkerState.sysRestricted` (A5b) refuses poll 2; the
+alternative `WorkerState.sysSweepWaitsForOpen` keeps the tombstone until
 `7511` settles and swallows its terminal (`(0, 1, [])`). -/
-theorem mutant_draining_ok_at_sweep_reports_done_after_failure :
+theorem trace_draining_ok_at_sweep_reports_done_after_failure :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7510 0 2, .settleSession 7510 false, .poll false,
         .registerSubPlan 7511 1 2, .beginOp 7511, .latchDrain 7511 true,
         .poll true,
         .settleSession 7511 true, .poll false ]
-    ((⟨WorkerState.init, WorkerState.stepG { noDrainingOkAtSweep := false }⟩ :
-        System WorkerState WorkerEv).run tr).map
+    (WorkerState.sys.run tr).map
         (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (1, 1, [(2, [1])]) ∧
-    WorkerState.sys.run tr = none ∧
+    WorkerState.sysRestricted.run tr = none ∧
     (WorkerState.sysSweepWaitsForOpen.run tr).map
         (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (0, 1, []) := by
   decide
@@ -487,11 +519,19 @@ def chain2MidSettleEvents : List WorkerEv :=
 def workerMidSettleEvents : List WorkerEv :=
   workerCheckEvents ++ [ .pollMidSettle true [11], .pollMidSettle false [11] ]
 
-#guard (ModelCheck.check (⟨WorkerState.init, WorkerState.stepG { noDrainingOkAtSweep := false }⟩ :
-    System WorkerState WorkerEv) chain2CheckEvents workerViolates 32 matches .counterexample _)
+/-! `WorkerState.sys` has a counterexample on each of `chain2CheckEvents`,
+`workerCheckEvents` and `mixedCheckEvents`, none of which has a `pollMidSettle`
+event: the A5b window alone. -/
 
-/-- Without A5c (`stepG { noSettleBetweenRetireAndSweep := false }`, while A5a,
-A5b, A6, and A7 all hold): an unanchored sub-plan `1` (`11`, `index = 1,
+#guard (ModelCheck.check WorkerState.sys chain2CheckEvents workerViolates 32
+  matches .counterexample _)
+#guard (ModelCheck.check WorkerState.sys workerCheckEvents workerViolates 32
+  matches .counterexample _)
+#guard (ModelCheck.check WorkerState.sys mixedCheckEvents workerViolates 32
+  matches .counterexample _)
+
+/-- The A5c window (an execution of `WorkerState.sys` in which no poll sweeps a
+tombstone, so A5b holds throughout; a C++ interleaving): an unanchored sub-plan `1` (`11`, `index = 1,
 count = 2`, `anchored = false`) latches clean drain (`beginOp 11,
 latchDrain 11 true`) right as `timeout_s_` elapses. In `CompleteReadWithDetails`
 (`pollMidSettle true [11]`), `!session->IsDraining()` skips `11` and
@@ -503,23 +543,33 @@ progress.sub_sessions.clear()`) with `anchored` still `false`. On the next poll
 (`poll false`), `RecordPoolReshardTerminalLocked` checks
 `sub_it == progress.sub_sessions.end()` before
 `if (progress.failed || progress.completed) return;`, hits `!progress.anchored`,
-and emits `done` (`doneLog = [(2, [1])]`) after failure. Under A5c
-(`WorkerState.step`), the guarded step excludes the mid-poll settle; the
-candidate fix `WorkerState.sysSweepWaitsForOpen` checks `failed || completed`
+and emits `done` (`doneLog = [(2, [1])]`) after failure.
+`WorkerState.sysRestricted` (A5c) refuses the mid-poll settle; the
+alternative `WorkerState.sysSweepWaitsForOpen` checks `failed || completed`
 before `!anchored` and keeps tombstones while `sessions_` holds any unretired
 entry (`(0, 1, [])`). -/
-theorem mutant_mid_poll_endop_unanchored_reports_done_after_stall :
+theorem trace_mid_poll_endop_unanchored_reports_done_after_stall :
     let tr : List WorkerEv :=
       [ .registerSubPlan 11 1 2, .beginOp 11, .latchDrain 11 true,
         .pollMidSettle true [11], .poll false ]
-    ((⟨WorkerState.init, WorkerState.stepG { noSettleBetweenRetireAndSweep := false }⟩ :
+    (WorkerState.sys.run tr).map
+        (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (1, 1, [(2, [1])]) ∧
+    ((⟨WorkerState.init, WorkerState.stepG
+        { noSettleBetweenRetireAndSweep := false }⟩ :
         System WorkerState WorkerEv).run tr).map
         (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (1, 1, [(2, [1])]) ∧
-    WorkerState.sys.run tr = none ∧
+    WorkerState.sysRestricted.run tr = none ∧
     (WorkerState.sysSweepWaitsForOpen.run tr).map
         (fun w => (w.doneReports, w.failReports, w.doneLog)) = some (0, 1, []) := by
-  decide
+  dsimp; refine ⟨by decide, by decide, by decide, by decide⟩
 
+/-! `WorkerState.sys` has a counterexample on `chain2MidSettleEvents`, and so
+does `WorkerState.stepG { noSettleBetweenRetireAndSweep := false }` (A5b on,
+A5c off) on the same events: the A5c window alone. The alternative is safe on
+every event list. -/
+
+#guard (ModelCheck.check WorkerState.sys chain2MidSettleEvents workerViolates 32
+  matches .counterexample _)
 #guard (ModelCheck.check (⟨WorkerState.init,
     WorkerState.stepG { noSettleBetweenRetireAndSweep := false }⟩ :
     System WorkerState WorkerEv) chain2MidSettleEvents workerViolates 32 matches .counterexample _)
@@ -527,40 +577,68 @@ theorem mutant_mid_poll_endop_unanchored_reports_done_after_stall :
 #guard ModelCheck.check WorkerState.sysSweepWaitsForOpen workerMidSettleEvents workerViolates 32 = .safe
 #guard ModelCheck.check WorkerState.sysSweepWaitsForOpen mixedCheckEvents workerViolates 32 = .safe
 
-/-- Without A6 (`stepG { noSingleWhileSeated := false }`): a single-plan
-registration under the `req_id` of a chain in flight erases the chain's entry,
+/-! ### Registrations the C++ accepts outside A6 and A7
+
+A6 and A7 are assumptions about callers that nothing in the C++ checks.
+`WorkerState.step` carries them as guards and refuses the two traces below;
+`WorkerState.step` with the one guard off (`stepG` with `noDrainingOkAtSweep`,
+`noSettleBetweenRetireAndSweep` and that guard off) runs them, and each is an
+execution of the C++ as it is, not a mutant. -/
+
+/-- Outside A6 (`WorkerState.step` without the `noSingleWhileSeated` guard; the
+C++ does not refuse the registration): a single-plan registration under the `req_id` of a
+chain in flight erases the chain's entry
+(`NoteSubPlanRegisteredLocked` `sub_plan_chains_.erase(req_id)`),
 and the chained sub-plan's clean settlement is then reported as the request's
-`done` while the single-plan session is still open. Under A6 (`WorkerState.step`),
-the guarded step excludes the registration. -/
-theorem mutant_single_plan_registration_erases_live_chain :
+`done` while the single-plan session is still open. `WorkerState.step` (A6)
+refuses the registration. -/
+theorem trace_single_plan_registration_erases_live_chain :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7700 0 2, .registerSubPlan 7701 0 1,
         .settleSession 7700 true, .poll false ]
-    ((⟨WorkerState.init, WorkerState.stepG { noSingleWhileSeated := false }⟩ :
+    ((⟨WorkerState.init, WorkerState.stepG
+        { noDrainingOkAtSweep := false, noSettleBetweenRetireAndSweep := false,
+          noSingleWhileSeated := false }⟩ :
         System WorkerState WorkerEv).run tr).map
         (fun w => (w.doneReports, w.doneLog, w.active.map (·.uuid))) =
       some (1, [(2, [0])], [7701]) ∧
     WorkerState.sys.run tr = none := by
   decide
 
+/-! The search below keeps the A5b and A5c guards on (`stepG {
+noSingleWhileSeated := false }` is `WorkerState.stepRestricted` without A6),
+because `WorkerState.sys` already has a counterexample on these events through
+the A5b window: the counterexample found here is one that A5b and A5c do not
+exclude, so A6 is needed for `reachable_worker_safe`. -/
+
 #guard (ModelCheck.check (⟨WorkerState.init, WorkerState.stepG { noSingleWhileSeated := false }⟩ :
     System WorkerState WorkerEv) mixedCheckEvents workerViolates 32 matches .counterexample _)
 
-/-- Without A7 (`stepG { oneSessionPerSlot := false }`): a second sub-plan `1`
-registered into an unanchored entry overwrites the slot; the first session,
-no longer in `sub_sessions`, settles into the `stray` arm and is reported as
-the request's `done`. Under A7 (`WorkerState.step`), the guarded step excludes
-the second registration. -/
-theorem mutant_slot_overwrite_reports_stray_done :
+/-- Outside A7 (`WorkerState.step` and `WorkerState.stepRestricted` without the
+`oneSessionPerSlot` guard; the C++ does not refuse the registration): a second
+sub-plan `1` registered into an unanchored entry overwrites the slot
+(`progress.sub_sessions[sub_plan_index] = session`); the first session, no
+longer in `sub_sessions`, settles into the `stray` arm and is reported as the
+request's `done`. `WorkerState.step` and `WorkerState.stepRestricted` (A7)
+refuse the second registration; running with only `oneSessionPerSlot := false`
+shows A7 is needed by `reachable_worker_safe`. -/
+theorem trace_slot_overwrite_reports_stray_done :
     let tr : List WorkerEv :=
       [ .registerSubPlan 7800 1 2, .registerSubPlan 7801 1 2,
         .settleSession 7800 true, .poll false ]
+    ((⟨WorkerState.init, WorkerState.stepG
+        { noDrainingOkAtSweep := false, noSettleBetweenRetireAndSweep := false,
+          oneSessionPerSlot := false }⟩ :
+        System WorkerState WorkerEv).run tr).map
+        (fun w => (w.doneReports, w.doneLog, w.chain.subSessions)) =
+      some (1, [(2, [1])], [none, some 7801]) ∧
     ((⟨WorkerState.init, WorkerState.stepG { oneSessionPerSlot := false }⟩ :
         System WorkerState WorkerEv).run tr).map
         (fun w => (w.doneReports, w.doneLog, w.chain.subSessions)) =
       some (1, [(2, [1])], [none, some 7801]) ∧
-    WorkerState.sys.run tr = none := by
-  decide
+    WorkerState.sys.run tr = none ∧
+    WorkerState.sysRestricted.run tr = none := by
+  dsimp; refine ⟨by decide, by decide, by decide, by decide⟩
 
 /-! ## Part III — Coordinator multi-window chain -/
 
@@ -605,9 +683,13 @@ theorem trace_window_clips_straddling_spans_at_window_boundaries :
 /-- Replays `ReshardStackTest.WindowComposesWithPrefixClip`
 (`reshard_service_test.cc`) and continues it with sender `Complete` votes:
 prefix clip plus a 2-page window dispatches `[0, 1]` in window `0` and `[1]` in
-window `1`; rank `0`, absent from window `1`, may vote `Complete` as soon as its
-window-0 push settles, and the claim stays until rank `1` votes after the chain
-ends. -/
+window `1`; the A3 guard lets rank `0`, absent from window `1`, vote `Complete`
+once window `0` has finished dispatching, and the claim stays until rank `1`
+votes after the chain ends. The vote is what the coordinator model admits, not
+what the test drives: on its worker, rank `0` fills one of two `sub_sessions`
+slots and is reported `failed_recving`, not `done_sending`
+(`trace_sender_in_first_window_only`), and whether the producer then votes is
+not determined by the cited C++. -/
 theorem trace_window_composes_with_prefix_clip :
     let trReplay : List ChainEv :=
       [ .registerProducer 0, .registerProducer 1, .startChainCoordination,

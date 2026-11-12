@@ -221,8 +221,10 @@ caller op already holds `in_flight_ >= 1`, so every settle decision is the one
 the model makes; a timeout or a cancelled wait is `d2hIssue p false`
 (`RecordPushCompletion(host_slot.status())`, the first error latching
 `finalizing_`, as `ReshardSendSessionTest.PipelineSlotWaitTimeoutSettlesSendOutOfBand`
-shows); and `LookupStagingSlot` fails only for a pool whose lease was already
-returned, that is after the pool's pushes ended or the session settled. Pools
+shows); and `LookupStagingSlot` fails for a pool that holds no buffer: before
+`ExecutePushPipeline` leased one for it (`FailedPrecondition`, as
+`ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease` asserts for a
+pool still waiting), or after its pushes ended or the session settled. Pools
 beyond the buffer count serialize behind earlier pools' pushes, which the
 model does not track: `ReshardSendSessionTest.BoundedStagingSlotAcquisitionAndRelease`
 drives three pools through one buffer (its second pool waits until the first
@@ -245,6 +247,11 @@ admits.
   `execActive = true` and `inFlight = 1`. (A `Finish` in the gap makes `Start`
   return the status without an op; the session is then already settled —
   `Finish` with `in_flight_ == 0` calls `SettleLocked()` — and outside the model.)
+  `PoolReshardPush` checks `sessions_` for the uuid in one `mu_` scope and
+  assigns `sessions_[plan.uuid()]` in a later one, with no pending-uuid claim
+  in between (unlike `PoolReshardRegisterRecv`); two concurrent
+  `PoolReshardPush` calls with one uuid are assumed away (assumed of the caller
+  as a fresh uuid per attempt) and are outside the model.
 * **A3 (single `StartPoolPush` lock step).** `StartPoolPush` checks
   `done_ || finalizing_` on entry and again when adding
   `transfers_by_peer.size()` to `in_flight_`. Since the intermediate lines only

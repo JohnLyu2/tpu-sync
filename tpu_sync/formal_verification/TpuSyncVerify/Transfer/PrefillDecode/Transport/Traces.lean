@@ -165,8 +165,9 @@ theorem trace_dup_declared_rejected :
 
 Two small changes close every trace above without touching the honest
 behaviour: (1) the chunk-count contract rejects a stream beyond the declared
-count, as the other two contracts already do (`if (plan_pushes > expected_chunks)`
-and `else if (streams.landed > streams.declared)` in `CompleteIncomingPush`);
+count, as the other three contracts already do (`if (plan_pushes > expected_chunks)`,
+`if (streams.landed > 1 ||` on the Peregrine arm, and
+`else if (streams.landed > streams.declared)` in `CompleteIncomingPush`);
 (2) `ExecuteLayerH2d` keeps a per-layer once-latch of its own, so a dispatch
 after the transport retired its entries is a no-op (`dispatched_layers_`
 already records every layer dispatched, but only to set `network_completed_`;
@@ -236,7 +237,7 @@ theorem trace_hardened_dups :
     some ⟨false, false, true, [1, 1], [0, 1]⟩ := by
   decide
 
-/-! ## Which traces stand for an upstream test
+/-! ## Which traces stand for a C++ test
 
 The transport unit tests drive `CompleteIncomingPush` through mock delegates
 (`MockSessionDelegate` in `block_transport_session_test.cc`, `MockDelegate` and
@@ -256,7 +257,7 @@ exercises the plan-declared pool or Peregrine bitmask paths of
 chunk-count contract. The first stream completes nothing; the second fires
 `OnLayerReceived` once and, every layer now called, retires the session
 (`done_ = true`, so `HandleIncomingPush` drops the push session and the uuid's
-next stream gets a fresh table). No upstream test drives this shape on the socket path:
+next stream gets a fresh table). No C++ test drives this shape on the socket path:
 `BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` retires a
 two-layer session through `OnPeregrinePostComplete` (`is_peregrine = true`),
 which is `notReplayable` here. -/
@@ -331,7 +332,7 @@ theorem trace_undeclared_uuid_chunk_count :
       (fun s => s.layers.map (·.dispatched)) = some [2] := by
   decide
 
-/-- (upstream test, configuration, trace). -/
+/-- (GTest, configuration, trace). -/
 def paired : List (String × Cfg × List Ev) :=
   [("BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender", cfgDeclared 2 2 1 false,
      tr_declared_senders_then_reuse),
@@ -340,7 +341,7 @@ def paired : List (String × Cfg × List Ev) :=
    ("BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion", cfgChunk 1 2 1 true,
      tr_undeclared_uuid_chunk_count)]
 
-/-- Traces no upstream test replays: (what it shows, configuration, trace). -/
+/-- Traces no C++ test replays: (what it shows, configuration, trace). -/
 def modelOnly : List (String × Cfg × List Ev) :=
   [("chunk-count: two streams complete and retire one layer", cfgChunk 1 1 2 true,
      tr_session_two_streams_complete)]

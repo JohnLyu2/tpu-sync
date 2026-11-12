@@ -219,8 +219,9 @@ All proved on every reachable state (`reachable_safe` and
   is dispatching or writing to decode HBM (`pending = 0 ∧ retired = issued`);
   moreover, once `done_recving` is reported, `decodeHbm = good n` holds in every
   state reachable afterwards (`attention_safe`).
-* **Prefill HBM safety.** `reclaimed → d2hPending = false ∧ d2hRetired = d2hIssued`:
-  when the engine frees prefill HBM no D2H copy is dispatching or reading it,
+* **Prefill HBM safety.** `send.published ≠ none → send.d2hPending = false ∧ send.d2hRetired = send.d2hIssued`:
+  once the send is reported — which `reclaim` requires, so in particular when
+  the engine frees prefill HBM — no D2H copy is dispatching or reading it,
   and (since the send has settled) none will be issued (`PrefillHbmSafe`,
   source buffer safety).
 * **Staging safety.** A send whose staging was released has no copy writing
@@ -246,7 +247,7 @@ induction on the chain HBM → staging → wire → staging → HBM each layer t
 arrives is the right one, whatever order the layers arrive in. The guards that
 make this true are exactly the sessions' refusal to begin an op once draining
 and their refusal to settle while an op is in flight — the settle protocol of
-stage 1 — plus the per-layer guards that a push waits for its own layer's
+`Transfer/Session.lean` — plus the per-layer guards that a push waits for its own layer's
 copy and an H2D dispatch for its own layer's landing.
 
 ## Source map

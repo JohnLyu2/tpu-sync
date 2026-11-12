@@ -139,9 +139,9 @@ def planSubTransfers (args : PlanArgs) : Option SubTransferChain :=
 `kv_cache_manager_with_transfer.h`); `present = false` is absence from the map.
 Sender workers (`SessionRole::kPoolReshardSend`) and receiver workers
 (`SessionRole::kPoolReshardReceive`) use the same per-`req_id` map; one worker
-cannot hold both roles on the same sub-plan (`sessions_` rejects a second active
-session on `SubPlanUuid(uuid, index)` with `ALREADY_EXISTS`, and
-`sub_sessions[index]` holds a single pointer). -/
+cannot hold both roles on the same sub-plan (the worker entry points refuse at
+entry, with `ALREADY_EXISTS`, a `SubPlanUuid(uuid, index)` whose session in
+`sessions_` has not settled, and `sub_sessions[index]` holds a single pointer). -/
 structure ChainProgress where
   present : Bool := false
   /-- `sub_sessions`: one slot per `sub_plan_index`, holding the session
@@ -318,7 +318,7 @@ def recordTerminal (c : ChainProgress) (sessions : List SubSession) (s : SubSess
     else
       (c, .settledPartial)
 
-/-- Candidate fix for `RecordPoolReshardTerminalLocked`: checks
+/-- Alternative to `RecordPoolReshardTerminalLocked` (not the C++): checks
 `progress.failed || progress.completed` before the `!progress.anchored` stray
 arm so an unanchored chain whose `sub_sessions` were cleared on stall or
 completion swallows late terminals instead of reporting them as stray `done`. -/
@@ -368,7 +368,7 @@ def sweepStalledChain (c : ChainProgress) (anyOpen : Bool) :
   else
     ({ c with failed := true, subSessions := [] }, .stalled)
 
-/-- Candidate fix for `SweepSubPlanChainsLocked`: keeps a `failed || completed`
+/-- Alternative to `SweepSubPlanChainsLocked` (not the C++): keeps a `failed || completed`
 tombstone (`last_activity = now`) while `sessions_` still holds any unretired
 `kPoolReshard*` entry for `req_id` (`anyReqUnretired`), including one whose
 `EndOp` completed between `RetireSettledSessionLocked` and the sweep. -/
@@ -456,24 +456,37 @@ because the `sessions_` retire pass already ran. -/
 def applyMidSettle (midSettle : List Nat) (s : SubSession) : SubSession :=
   if midSettle.contains s.uuid then { s with inFlight := false, done := true } else s
 
-/-- The guards that encode A5–A7; `step` keeps all five, the mutants of
-`Traces.lean` drop one each. -/
+/-- The guards that encode A5–A7; the default value has all five on.
+
+* `deadlineArm` (A5a) is what the C++ does; `stepG { deadlineArm := false }`
+  is a mutant.
+* `noSingleWhileSeated` (A6) and `oneSessionPerSlot` (A7) are assumptions about
+  the callers of `PoolReshardRegisterRecv` / `PoolReshardPush`; nothing in the
+  C++ enforces them.
+* `noDrainingOkAtSweep` (A5b) and `noSettleBetweenRetireAndSweep` (A5c) are not
+  assumptions about callers: each excludes a timing window inside
+  `CompleteReadWithDetails` / `SweepSubPlanChainsLocked` that the C++ permits
+  with every caller well behaved.
+
+`step` has A5a, A6 and A7 on and A5b, A5c off; `stepRestricted` has all five
+on. -/
 structure Guards where
   /-- A5a: `poll true` runs the `!session->IsDraining()` deadline arm of
   `CompleteReadWithDetails` on every session past `deadline()`. -/
   deadlineArm : Bool := true
-  /-- A5b: no unretired chained session is in `IsDraining() && !Done()` with
-  `OkStatus()` when `SweepSubPlanChainsLocked` erases a `failed || completed`
-  tombstone. -/
+  /-- A5b (not enforced by the C++): no unretired chained session is in
+  `IsDraining() && !Done()` with `OkStatus()` when `SweepSubPlanChainsLocked`
+  erases a `failed || completed` tombstone. -/
   noDrainingOkAtSweep : Bool := true
-  /-- A5c: no draining session finishes `EndOp` under `session->mu_` between
+  /-- A5c (not enforced by the C++): no draining session finishes `EndOp` under `session->mu_` between
   `RetireSettledSessionLocked` (`Done()`) and `SweepSubPlanChainsLocked`
   (`!sub_session->Done()`). -/
   noSettleBetweenRetireAndSweep : Bool := true
-  /-- A6: no single-plan registration while a sub-plan session of the request
-  is still seated. -/
+  /-- A6 (not enforced by the C++): no single-plan registration while a
+  sub-plan session of the request is still seated. -/
   noSingleWhileSeated : Bool := true
-  /-- A7: a `sub_plan_index >= 1` slot is registered once per entry. -/
+  /-- A7 (not enforced by the C++): a `sub_plan_index >= 1` slot is registered
+  once per entry. -/
   oneSessionPerSlot : Bool := true
   deriving DecidableEq, Repr
 
@@ -514,12 +527,13 @@ def pollCore (g : Guards) (w : WorkerState) (stalled : Bool)
             sessions := sessionsAfterMid
             chain := c2 }
 
-/-- Transition function of the worker chain folding, parametrised by `Guards`. -/
+/-- Transition function of the worker chain folding, parametrised by `Guards`.
+A1 and A2 are guards of `registerSubPlan` in every instance. -/
 def stepG (g : Guards) (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
   match e with
   | .registerSubPlan uuid index count =>
     if w.seenUuids.contains uuid then
-      none  -- A2: sub-plan UUIDs are fresh
+      none  -- A2: sub-plan UUIDs are fresh (same-UUID re-registration is not modelled)
     else if index >= max 1 count then
       none  -- A1: `0 <= sub_plan_index < max(1, sub_plan_count)`
     else if g.noSingleWhileSeated && count <= 1 &&
@@ -557,6 +571,7 @@ def stepG (g : Guards) (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
       -- idle `Finish(error)` or a late `Finish(error)` while `draining_` on
       -- `ReshardReceiveSession::FinishLocked` (which updates `status_` before
       -- `if (draining_) return;`, over-approximating `ReshardSendSession`).
+      -- `ok` is fixed here; a `Finish(error)` after `done_` is not modelled.
       some { w with sessions := w.sessions.map fun s =>
         if s.uuid == uuid then
           { s with
@@ -571,10 +586,24 @@ def stepG (g : Guards) (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
   | .pollMidSettle stalled midSettle =>
     if midSettle.isEmpty then none else pollCore g w stalled midSettle
 
-/-- Transition function of the worker chain folding (every guard on). -/
-def step : WorkerState → WorkerEv → Option WorkerState := stepG {}
+/-- Transition function of the worker chain folding: the C++ under the caller
+assumptions A1, A2, A6 and A7 (guards of `registerSubPlan`), with the A5a
+deadline arm. A5b and A5c are off: `poll` runs when a draining-OK session is
+seated at a tombstone sweep, and `pollMidSettle` is enabled. A6 and A7 are not
+enforced by the C++, so the C++ has registrations this function refuses. -/
+def step : WorkerState → WorkerEv → Option WorkerState :=
+  stepG { noDrainingOkAtSweep := false, noSettleBetweenRetireAndSweep := false }
 
 def sys : System WorkerState WorkerEv := ⟨init, step⟩
+
+/-- `step` further restricted to executions that satisfy A5b and A5c (every
+guard of `Guards` on). Nothing in the C++ enforces A5b or A5c: no caller
+behaviour rules out the two windows, so `step` has executions this function
+refuses (`trace_draining_ok_at_sweep_reports_done_after_failure`,
+`trace_mid_poll_endop_unanchored_reports_done_after_stall`). -/
+def stepRestricted : WorkerState → WorkerEv → Option WorkerState := stepG {}
+
+def sysRestricted : System WorkerState WorkerEv := ⟨init, stepRestricted⟩
 
 /-- Core `CompleteReadWithDetails` transition of `stepSweepWaitsForOpen`
 (without A5b and without A5c). -/
@@ -605,10 +634,10 @@ def pollWaitOpenCore (w : WorkerState) (stalled : Bool)
         sessions := sessionsAfterMid
         chain := c2 }
 
-/-- Candidate fix (`stepSweepWaitsForOpen`): `WorkerState` without A5b
-(`noDrainingOkAtSweep = false`) and without A5c
-(`noSettleBetweenRetireAndSweep = false`), using `recordTerminalWaitOpen` and
-`sweepStalledChainWaitOpen` (gating tombstone erasure on `!anyReqUnretired`). -/
+/-- Alternative (`stepSweepWaitsForOpen`, not the C++): `step` with `poll` and
+`pollMidSettle` using `recordTerminalWaitOpen` and `sweepStalledChainWaitOpen`
+(gating tombstone erasure on `!anyReqUnretired`); like `step`, it has neither
+the A5b nor the A5c guard. -/
 def stepSweepWaitsForOpen (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
   match e with
   | .poll stalled => pollWaitOpenCore w stalled []
@@ -661,7 +690,8 @@ structure CoordChainState where
   winSrcUnits : List (List Nat)
   dstUnits : List Nat
   claimOwner : Nat
-  /-- `kChainArmAttempts`. -/
+  /-- `kChainArmAttempts` (`12` in the C++; the default here is a small bound
+  for the searches). -/
   maxArmAttempts : Nat := 2
   transferStatus : TransferStatus := .notStarted
   /-- `index` of the running `RunSubPlan(ctx, index)`. -/
@@ -683,7 +713,8 @@ structure CoordChainState where
 
 /-- Events of the coordinator chain. -/
 inductive ChainEv where
-  /-- `RequestBlockRegistry::Register` by a producer, before `Coordinate`. -/
+  /-- `RequestBlockRegistry::Register` by a producer, before
+  `ReshardCoordinator::StartPoolReshard` (A4). -/
   | registerProducer (srcUnit : Nat)
   /-- `StartPoolReshard` sets `transfer_status_[req_id] = kInProgress`. -/
   | startChainCoordination
@@ -702,8 +733,8 @@ inductive ChainEv where
   | finishWindowSend
   /-- A dispatched window's receiver on `dstUnit` settles and releases its lease. -/
   | settleDispatchedRecv (dstUnit : Nat)
-  /-- A dispatched rank's worker reports `done_sending` and the producer calls
-  `RequestBlockRegistry::Complete` (A3). -/
+  /-- The producer calls `RequestBlockRegistry::Complete` for a dispatched rank
+  after the rank's last window (A3, a caller contract). -/
   | senderVoteComplete (srcUnit : Nat)
   /-- `RequestBlockRegistry::CancelIfUnclaimed` by the producer. -/
   | cancelIfUnclaimed

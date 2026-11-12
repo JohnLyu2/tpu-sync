@@ -135,7 +135,7 @@ def allBranches : Option (List Branch) :=
 
 /-! ## Traces
 
-`paired` lists the upstream tests that drive a `ReshardReceiveSession` through
+`paired` lists the C++ tests that drive a `ReshardReceiveSession` through
 events of this model, with the trace each one replays. Two fixtures make the
 upload path run on CPU: `FakeH2dBase` in `reshard_receive_session_test.cc`
 (every `H2dPoolBlocks` returns a future that is already OK) and `FakeH2dBase`
@@ -146,7 +146,7 @@ helper also tolerates `NotFound`), calls `OnDataReceived(pool_idx, {}, {})` and
 returns a future already resolved with the status armed by `ArmPoolUpload`. A
 ready future runs `future.OnReady` inline, so `h2dReady p` and `h2dDone p _`
 follow `h2dIssue p true` at once. `modelOnly` holds the traces in `Traces.lean`
-that no upstream test drives (the rank wave, the batch launch, cancellation
+that no C++ test drives (the rank wave, the batch launch, cancellation
 between the locks, and the push-framed halves of the validation traces). -/
 
 /-- One pool landed and uploaded OK through `FinishPoolReshardRecvPool`. -/
@@ -156,7 +156,7 @@ def tr_pool_upload_ok : List Ev := tr_duration_ok.take 4
 (`ArmPoolUpload(pool_idx, error)`). -/
 def tr_pool_upload_fail : List Ev := tr_duration_fail.take 4
 
-/-- `(upstream test, initial state, trace)`. -/
+/-- `(C++ test, initial state, trace)`. -/
 def paired : List (String × Recv × List Ev) :=
   [("PoolReshardRecvTest.FailedIncomingPushReleasesStagingLeaseBeforeDeadline",
       init [0], tr_failed_incoming_push),
@@ -220,7 +220,7 @@ def modelOnly : List (String × Recv × List Ev) :=
    ("trace_reshard_receive_session_test_parity (1 pool)", init [0], tr_parity_1pool),
    ("trace_reshard_receive_session_test_parity (2 pools)", init [0, 0], tr_parity_2pool)]
 
-/-- Upstream tests on this C++ whose stimulus is not an event of the model. -/
+/-- C++ tests of this code whose stimulus is not an event of the model. -/
 def notReplayable : List (String × String) :=
   [("PoolStagingRecvRegistrationTest.DuplicatePoolRecvRegistrationKeepsOriginalStagingLease",
       "registration and staging leases only (PoolStaging.lean); its sessions are cancelled unasserted at manager teardown"),
@@ -244,11 +244,18 @@ reachable branch:
   A `.ready` pool holds an op and `done → inFlight = 0` (`SettleSafe`), so the
   callback never sees a settled session; the C++ early return is dead.
 * `h2dIssueFailFinalizing` — a failed `H2dPoolBlocks` on a finalizing session.
-  Every path that sets `reshard_finalizing_` (`h2dIssue` or `h2dDone` failing,
-  the last pool completing) calls `Finish` in the same step, so a finalizing
-  session is draining and the per-pool re-check releases the op first.
+  Unreachable in the model because every event that sets `reshard_finalizing_`
+  (`h2dIssue` or `h2dDone` failing, the last pool completing) also runs
+  `Finish` in the same step, so a finalizing session is draining and the
+  per-pool re-check releases the op first. In the C++ the arm is not dead: it
+  runs when another thread's `ExecuteEligiblePoolH2ds` passes the re-check and
+  fails `H2dPoolBlocks` between `FinishPoolH2d`'s first `mu_` scope and `Finish`
+  (after `reshard_finalizing_` is set). The pool's op ends and
+  nothing is recorded, which is the state the model reaches by taking the
+  released arm after the finishing step (`Receive.lean`,
+  "`reshard_finalizing_` latch in `FinishPoolH2d`").
 
-The fifteen upstream traces in `paired` reach **13 of 36**: `pushBegin`,
+The fifteen test traces in `paired` reach **13 of 36**: `pushBegin`,
 `pushEndOk` (no effect; settles), `pushEndFail` (drains, settles, errors),
 `poolReceivedLaunches`, `h2dIssueOk`, `h2dReady`, `h2dDoneMore` (no effect),
 `h2dDoneLast` (drains, settles; drains with a push open), `h2dDoneFail`
@@ -261,7 +268,7 @@ The `modelOnly` traces add 5 more. Of the 23 the tests miss:
 | **test (held upload)** | 7 | `h2dDoneLast` (settles; no effect — both already draining), `h2dDoneMore` (settles), `h2dDoneFail` (settles; no effect — already draining and failed), `h2dDoneFinalizing` (no effect; settles) | an `H2dPoolBlocks` fake that parks its promise until the test releases it (as `FakeD2hBase::HoldNextCopy` / `CompleteCopy` do for sends in `reshard_send_session_test.cc`), so an issued upload is still counted when `Finish` or another pool's failure arrives |
 | **window** | 2 | `h2dIssueReleased` (no effect; settles) | `Finish` between `ExecuteEligiblePoolH2ds`'s opening lock and its per-pool `if (done_ \|\| draining_)` re-check on a 1–2 pool plan (a 3-pool `[0, 1, 1]` plan whose first rank-1 pool fails `H2dPoolBlocks` synchronously reaches the no-effect arm deterministically on the second rank-1 pool) |
 
-So the upstream tests now drive `OnPoolReceived`, an upload and its callback
+So the C++ tests drive `OnPoolReceived`, an upload and its callback
 with both outcomes, and a pool landing inside a real push stream, but every
 upload they issue resolves before `OnReady` is attached: no test observes a
 copy still running when the session is finished, and none builds a plan with

@@ -39,7 +39,7 @@ The model is one transfer plan — one engine `uuid` with one
 destination unit, and one `BlockTransportServerPushSession` per receiving
 transport. A request whose destination lists are windowed
 (`dst_window_blocks`) is coordinated as a chain of such plans
-(`ReshardCoordinator::PlanSubTransfers`, `ReshardCoordinator::StartChain`):
+(`PlanSubTransfers`, `ReshardCoordinator::StartChain`):
 each sub-plan carries its own plan uuid (`SubPlanUuid`), is armed and
 dispatched by its own `ReshardCoordinator::RunSubPlan` call, and lands in its
 own staging leases, so everything below applies to each sub-plan in turn. How
@@ -54,46 +54,54 @@ bookkeeping.
 ## Memories and aliased device pages
 
 A memory is a list indexed by pool `p < numPools`. A `Cell` is `.kv p` (pool
-`p`'s resharded KV data), `.junk` (stale/reclaimed memory or lower-rank coarse
-padding on an aliased page), or `.blank` (never written on the wire).
+`p`'s resharded KV data), `.junk` (stale or reclaimed memory, or the bytes a
+lower-rank pool's H2D copy leaves in a higher-rank pool's slot where their
+declared-live regions overlap), or `.blank` (never written on the wire).
 
 | Memory       | Role | Written by |
 |--------------|------|------------|
 | `srcHbm`     | producer KV cache in source HBM | `reclaim` (after `send.published ≠ none`) |
-| `srcStaging` | sender `PoolStagingStorage` (`ReshardSendSession::ExecutePushPipeline`) | `send (.d2hDone p true)`, `reseatSrcStaging` |
+| `srcStaging` | sender host staging of pool `p`: a host layer from the session's `StagingLayerManager` under `HostLayersBounded()`, else its leased arena slots on a bounded `PoolStagingStorage` or the blocks' own bytes in the host mirror (`ReshardSendSession::ExecutePushPipeline`) | `send (.d2hDone p true)`, `reseatSrcStaging` |
 | `wire`       | bytes delivered by sender peer pushes (`ReshardSendSession::StartPoolPush`) | `send (.pushDone p true)` |
-| `dstStaging` | receiver `PoolStagingStorage` (`ReshardReceiveSession::AcquireStagingLeases`) | `landStream p` (`BlockTransportServerPushSession::StartStream`), `reseatDstStaging` |
+| `dstStaging` | receiver host staging of pool `p`: a host layer from the session's `StagingLayerManager` under `HostLayersBounded()`, else its leased arena slots on a bounded `PoolStagingStorage` or the blocks' own bytes in the host mirror (`ReshardReceiveSession::AcquireStagingLeases`) | `landStream p` (`BlockTransportServerPushSession::StartStream`), `reseatDstStaging` |
 | `dstHbm`     | consumer KV cache in destination HBM (`ReshardReceiveSession::ExecuteEligiblePoolH2ds` / `FinishPoolH2d`) | `recv (.h2dDone p true)` via `writePoolHbm` |
 
-`srcStaging` and `dstStaging` are indexed per pool `p` (disjoint host bytes
-across pools): under bounded host layer staging (`num_staging_layers <
-num_layers`) each active pool leases its own host layer buffer from
-`StagingLayerManager`, whereas on a full host mirror (`!HostLayersBounded()`)
-each pool stages in place in `StaticHostLayer(pool_idx) = pool->storage_index`,
-so per-pool host cells assume concurrent pools do not share overlapping byte
-extents on the same `(storage_index, block_id)` (e.g. separate `storage_index`,
-disjoint sub-block regions such as `conv` and `ssm`, or disjoint block IDs).
+`srcStaging` and `dstStaging` hold one cell per pool `p`: the model treats the
+host staging bytes of different pools as disjoint. Assumption A1 below says
+when the C++ gives that and when it does not.
 
 ### Modelling aliased device pages (`writePoolHbm`)
 
 On hybrid attention + state arenas (`D2hPoolBlocks` / `H2dPoolBlocks` in
 `KVCacheManagerBase`, `pool_order_ranks_` in `ReshardReceiveSession`), pools of
-different ranks can share physical HBM pages: a lower-rank pool's coarse H2D
-copy writes across the page (clobbering bytes belonging to higher-rank pools),
-and higher-rank H2D waves are meant to run afterwards to overwrite those bytes
-with the true higher-rank pool data.
+different ranks can share physical HBM pages. A pool's H2D copy writes exactly
+its declared-live regions of the transferred blocks
+(`KVCacheManagerBase::CopyPoolBlocks` over `ComputePoolBlockCopyExtents`;
+padding between regions is never copied), so it overwrites another pool's
+device bytes only where the two pools share a `storage_index` and their
+declared-live regions overlap on the same storage. Where a lower-rank
+pool's regions overlap a higher-rank pool's, the higher-rank H2D waves are
+meant to run afterwards and overwrite those bytes with the higher-rank pool's
+data.
 
-We model this pessimistic page aliasing directly on `dstHbm`: when pool `p`
+We model this pessimistically across ranks on `dstHbm`, as if every lower-rank pool
+overlapped every strictly higher-rank pool: when pool `p`
 completes its H2D copy (`recv (.h2dDone p true)`), `writePoolHbm` writes
 `dstStaging[p]` to `dstHbm[p]` **and** clobbers `dstHbm[q] := .junk` for every
-pool `q` of strictly higher rank (`pool_p.rank < pool_q.rank`). Because
+pool `q` of strictly higher rank (`pool_p.rank < pool_q.rank`). Pools of equal
+`order_rank` upload concurrently in the C++ (`CollectEligiblePoolH2dsLocked`
+waits only on `other_rank < rank`) and never clobber each other in
+`writePoolHbm`; device overlap between same-rank pools is assumed absent and is
+not checked by the C++. Because
 `Recv.RankWaveOrder` guarantees that no higher-rank pool `q` has entered
 `queued`, `issued`, `ready`, or `completed` when a lower-rank pool `p` is in
 `ready`, this clobbering never overwrites a completed higher-rank pool
 (`AliasedPageCorrect`), so `dstHbm = good numPools` holds when `done_recving`
 is published (`PublicationCorrect`). Conversely, a mutant that omits the rank
 gate allows pool 1 (rank 1) to finish H2D before pool 0 (rank 0), and pool 0's
-subsequent H2D clobbers `dstHbm[1]` to `.junk`.
+subsequent H2D clobbers `dstHbm[1]` to `.junk`. These results cover two
+device-overlapping pools only when they have distinct `order_rank`s and their
+host staging is disjoint (A1).
 
 ## Lock scopes
 
@@ -108,6 +116,86 @@ guards map to C++ synchronization as follows:
 | `landStream p` | unlocked socket read into staging (`if (expected_size > 0)`, `ReadVExact`) in `BlockTransportServerPushSession::StartStream` while holding a `pushBegin` op (`pushes > 0`; the chunk addresses come from `GetBlockChunks` → `ResolveStagingSlot`, `Receive.lean` §"Bounded host layer staging"), followed by 1 `BlockTransportServerPushSession::mu_` scope in `CompleteIncomingPush` (`if (plan_declared)`; `layer_progress_` is per push session, i.e. per uuid, keyed by pool) | the `pushBegin` op keeps `in_flight_ > 0` on the receive session so `dstStaging` cannot be released (`reseatDstStaging` is disabled) during the read; when `plan_pushes` reaches `expected_chunks`, the same `mu_` scope latches `trigger_completion = true` before `session->OnDataReceived(l, {}, {})` on the session whose op the stream holds — `ReshardReceiveSession::OnDataReceived`, which forwards a pool completion to `OnPoolReceived(pool_idx)` (`recv (.onPoolReceived p)`) — and `EndIncomingPush` (`pushEnd`) run |
 | `reclaim`, `reseatSrcStaging`, `reseatDstStaging` | 0 (caller engine or `KVCacheManagerBase::staging_mu_`, outside session `mu_`) | enabled only after `send.published ≠ none` or `hasStaging = false`, which `Send.lean` and `Receive.lean` establish under their session locks |
 
+## Assumptions
+
+The session-level assumptions of `Send.lean` and `Receive.lean` carry over.
+The composition adds:
+
+* **A1 (host staging bytes of different pools are disjoint, and same-rank pools
+  do not overlap on the device).** `srcStaging` and `dstStaging` hold one cell
+  per pool. With bounded host layers (`HostLayersBounded()`,
+  `num_staging_layers < num_layers`) every concurrently staged pool within one
+  session leases its own host layer buffer from that session's
+  `StagingLayerManager` (`AcquireStagingSlot`), so the session's cells are
+  disjoint whatever the pools' layouts (cross-session host-layer sharing is
+  addressed in `MultiRequest.lean` A1).
+  On a full host mirror (`!HostLayersBounded()`) `AcquireStagingSlot` returns
+  `StaticHostLayer(pool_idx) = pool->storage_index`, and
+  `KVCacheManagerBase::CopyPoolBlocks` uses the device offsets on the host on
+  full-mirror storages (`{extent.offset_bytes, extent.offset_bytes,
+  extent.size_bytes}`), or shifts by `(slot - block_id) * stride` within a
+  bounded `PoolStagingStorage` lease (which one uuid's pools on that storage
+  share). Two pools whose declared-live regions overlap on a shared storage
+  therefore share host staging bytes on a full host mirror: a stream landing
+  for one overwrites what landed for the other before either H2D copy runs, which
+  per-pool cells cannot express. In addition, `clobberHigherRanks` only clobbers
+  pools of strictly higher `order_rank` (`other_rank < rank` in
+  `ReshardReceiveSession::CollectEligiblePoolH2dsLocked`), so equal-rank pools
+  are assumed not to overlap on the device in any configuration. Neither
+  disjointness property is enforced by the C++. Consequently `AliasedPageCorrect`,
+  `PublicationCorrect`, `system_data_correct`, and their `MultiRequest` /
+  `Unarmed` counterparts cover device-overlapping pools **of different
+  `order_rank`s** only under bounded host layers (within a session, and in the
+  multi-transfer setting assuming concurrent sessions do not collide in shared
+  host layer buffers); on a full host mirror they hold for the disjoint-host
+  configurations above (pools on different storages or with disjoint
+  declared-live byte ranges), in which no pool's H2D copy touches another pool's
+  device bytes and `clobberHigherRanks` only over-approximates.
+* **A2 (a stream lands after its sender push completed).** `landStream p`
+  requires `landedStreams[p] < sentStreams[p]`, and `sentStreams[p]` and
+  `wire[p]` are written by `send (.pushDone p true)`. On the TCP socket backend
+  the order on the wire is the reverse: in
+  `BlockTransportServerPushSession::StartStream`, the receiver reads the
+  payload, runs `CompleteIncomingPush` and `EndIncomingPush` and only then writes
+  the one-byte ack; the sender's `SocketTransportAdapter::PostSocketPushInternal`
+  returns only after reading that ack (`ReadExact(fd, &ack, 1,
+  config_.final_ack_read_timeout_ms)`), and `PostSocketPush`'s
+  `finish_stream` runs `AsyncPush(...).OnReady` (`pushDone`) after all streams
+  of the group complete. (With multiple NUMA shard groups `AsyncPush` joins
+  futures via `tsl::JoinFutures`, and the opt-in Peregrine backend completes in
+  `OnPeregrinePostComplete` with no socket ack; neither external future join nor
+  Peregrine wire ordering is examined here.) For a push that succeeds, the data
+  results do not depend on the order: while a push is in flight the sender holds
+  an op, so `srcStaging[p]` is neither released nor rewritten (`StagingSafe`;
+  its only writers are `d2hDone p true`, which precedes the push, and
+  `reseatSrcStaging`), and the value the model copies at `pushDone` is the value
+  the receiver read; sender events touch only the sender-side fields and receiver
+  events only the receiver-side ones, so a C++ run whose push succeeds is a
+  model run with the receiver's landing and what follows it delayed past
+  `pushDone`. What the model cannot express: a state in which a stream has
+  landed (and its pool may have uploaded, or the receive published) while the
+  sender's push op is still in flight, and a push that landed on the receiver
+  and then fails on the sender (e.g. ack write or read failure). In the model a
+  failed push (`pushDone p false`) never lands; on the C++ wire a receiver can
+  still publish `done_recving` on a landed-then-failed push, so its data
+  integrity rests on the same informal constancy of `srcStaging[p]` while the
+  push op was held, not on `PublicationCorrect`. `StreamAccountingSafe`'s
+  `landedStreams ≤ sentStreams` is a fact about this encoding, not about the
+  C++ counters.
+* **A3 (one stream is one plan push from one sender peer push).**
+  `peerCounts[p]` is both the sender's number of peer pushes for pool `p`
+  (`Send.init peerCounts`) and the number of landings the receiver waits for
+  before `OnPoolReceived(p)` (`plan_pushes == expected_chunks` in
+  `CompleteIncomingPush`), and the model has one `Send`. In the C++ the
+  receiver's expectation is the plan's `expected_pushes`, one `AsyncPush` of a
+  peer opens `min(parallelism, blocks)` TCP streams per NUMA shard group
+  (`BlockTransport::AsyncPushShards`), and
+  `BlockTransportServerPushSession::AccumulateLandedShards` folds the shard
+  groups back into plan pushes, so one peer push can land several plan pushes
+  where the model lands one. That this fan-out produces exactly
+  `expected_pushes` plan pushes per pool is assumed, not modelled
+  (`Reshard/Coverage.lean` proves the receiver-side validator's contract only).
+
 ## Source map
 
 Line ranges are populated and checked by `tpu_sync/formal_verification/tools/resolve_anchors.py`.
@@ -115,6 +203,12 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
+| `base.cc` | `KVCacheManagerBase::CopyPoolBlocks` | `:2907-3048` |
+| `reshard_recv.cc` | `ReshardReceiveSession::StaticHostLayer` | `:177-185` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingSlot` | `:670-701` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` | `:570-634` |
+| `bts.cc` | `BlockTransportServerPushSession::AccumulateLandedShards` | `:715-722` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:371-505` |
 | `reshard_send.cc` | `ReshardSendSession::Start` | `:430-467` |
 | `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` | `:469-583` |
 | `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:585-688` |
@@ -135,6 +229,9 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:473-477` |
 | `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:724-893` |
 | `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:772-882` |
+| `tpu_sync/transport/lib/adapter/socket_transport_adapter.cc` | `SocketTransportAdapter::PostSocketPush` (`if (remaining_workers->fetch_sub(1) == 1) {`) | `:474-495` |
+| `tpu_sync/transport/lib/adapter/socket_transport_adapter.cc` | `SocketTransportAdapter::PostSocketPushInternal` (`ReadExact(fd, &ack, 1, config_.final_ack_read_timeout_ms);`) | `:706` |
+| `tpu_sync/kv_cache/transfer_session.h` | `StagingLayerManager` | `:40-75` |
 | `bts.cc` | `BeginIncomingPush` | `:242-256` |
 | `bts.cc` | `EndIncomingPush` | `:258-271` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::GetSession` | `:310-317` |

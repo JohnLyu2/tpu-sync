@@ -116,7 +116,8 @@ inductive Ev where
   /-- tpu-sync publishes the send (`done_sending` if `ok`, else `failed_recving`,
   `(failed ? failed_recving_ : done_sending_).insert(req_id)` in
   `KVCacheManagerWithTransfer::RetireSettledSessionLocked`, from
-  `CompleteReadWithDetails`, under the `req_id` of the session's `SessionEntry`) and P's next
+  `CompleteReadWithDetails`, under the `req_id` of the session's `SessionEntry`;
+  the lists' other writers are listed in `Caller.lean` §"What is modelled") and P's next
   `get_finished()` / `get_transfer_results()` forwards it. -/
   | pOutcome (ok : Bool)
   /-- tpu-sync publishes the receive (`done_recving` if `ok`, else

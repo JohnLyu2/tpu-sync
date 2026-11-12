@@ -1,10 +1,10 @@
 import TpuSyncVerify.Transfer.Reshard.Pipeline
 
 /-!
-# Sub-block byte coverage and multi-sender stream accounting
+# Sub-block byte coverage and multi-sender push accounting
 
 Horizontal data-plane refinement of `Reshard/Pipeline.lean` for sub-block
-byte-interval coverage and multi-sender push-stream accounting:
+byte-interval coverage and the receiver's multi-sender plan-push count:
 * `tpu_sync/kv_cache/reshard_receive_session.cc` (`ReshardReceiveSession::ValidatePlan`,
   `ReshardReceiveSession::ValidateReceiverCoverage`)
 * `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (`ValidateSpanCoverage`,
@@ -19,7 +19,7 @@ byte-interval coverage and multi-sender push-stream accounting:
   `tpu_sync/transport/block_transport_session.cc` (the per-uuid
   `BlockTransportServerPushSession::StartStream` /
   `BlockTransportServerPushSession::CompleteIncomingPush` plan-declared
-  progress counter)
+  progress counter, with `AccumulateLandedShards`)
 
 The coverage check is per plan: for a sub-plan of a windowed request
 (`ReshardCoordinator::StartChain`), `BuildPoolReshardPlan` clips each tag's
@@ -42,17 +42,26 @@ File aliases used in the source map below:
 `pool_reshard_planner_streams_test.cc` (`tpu_sync/kv_cache/reshard/pool_reshard_planner_streams_test.cc`).
 
 What this module proves:
-1. **Multi-sender stream count conservation (`stream_count_matches`,
-   `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
-   `(src_block_id, dst_block_id)` pairs for a pool group and opens
-   `min(parallelism, |pairs_s|)` TCP push streams
-   (`BlockTransport::AsyncPushShards` in `block_transport.cc`,
-   `ReshardSendSession::StartPoolPush` in `reshard_send_session.cc`).
+1. **The receiver validator's plan-push count (`stream_count_matches`,
+   `senderStreams_pos_iff`).**
    `ReshardReceiveSession::ValidateReceiverCoverage`
    (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`
-   in `reshard_receive_session.cc`) checks that the receiver's `expected_pushes`
-   equals `∑_s min(parallelism, |pairs_s|)`, matching the planner
+   in `reshard_receive_session.cc`) collects, per `source_rank` `s`, the
+   distinct `(dst_peer, src_block_id, dst_block_id)` tuples of a pool group and
+   checks that the plan's `expected_pushes` equals
+   `∑_s min(parallelism, |pairs_s|)`, matching the planner
    (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`).
+   `stream_count_matches` states that contract: a plan the validator accepts
+   has positive `parallelism` and `expected_pushes` equal to that sum. It says
+   nothing about what senders put on the wire. That each sender's fan-out
+   produces exactly these plan pushes is assumed: `ReshardSendSession::StartPoolPush`
+   issues one `AsyncPush` per `(pool, peer)` with that peer's deduplicated
+   pairs, `BlockTransport::AsyncPushShards` clamps each to
+   `P = min(parallelism, num_blocks)` streams per NUMA shard group, and
+   `BlockTransportServerPushSession::AccumulateLandedShards` folds the shard
+   groups of one sender back into plan pushes before `CompleteIncomingPush`
+   compares `plan_pushes` with `expected_chunks`. The model's pairs omit
+   `dst_peer` (one receiver).
 2. **Exact sub-block byte reconstruction under out-of-order stream arrival
    (`checkContiguous_covers`, `checkContiguous_head_disjoint`,
    `partition_reconstructs_block`, `partition_reconstructs_perm`).**
@@ -70,6 +79,10 @@ What this module proves:
    queue of sub-block intervals and a byte-addressed staging buffer. Every
    `CoveragePipeline` step projects to a `Pipeline.step`, lifting all
    pipeline invariants together with byte-level destination reconstruction.
+   `CoveragePipeline` identifies one stream with one coverage interval and one
+   sender peer push: a pool's `peerCounts` entry is the length of its interval
+   list, and each `landStream` lands the next interval. It is not derived from
+   the push counts of item 1.
 
 ## Source map
 
@@ -94,6 +107,7 @@ What this module proves:
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
 | `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:473-477` |
 | `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:724-893` |
+| `bts.cc` | `BlockTransportServerPushSession::AccumulateLandedShards` | `:715-722` |
 | `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:588-618` |
 | `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:3091-3100` |
 | `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:3102-3110` |
@@ -135,7 +149,7 @@ open TpuSyncVerify.Transfer
 open TpuSyncVerify.Transfer.Reshard
 open TpuSyncVerify.Transfer.Reshard.Pipeline
 
-/-! ## Part 1: Multi-sender `(src_block, dst_block)` pair deduplication and stream counts -/
+/-! ## Part 1: Multi-sender `(src_block, dst_block)` pair deduplication and plan-push counts -/
 
 /-- A logical sub-block range `[startByte, endByte)` inside a destination block's
 live byte extent (`ReshardReceiveSession::ValidateReceiverCoverage`
@@ -164,15 +178,19 @@ in `reshard_receive_session.cc`). -/
 def senderPairs (entries : List ScheduleEntry) (sender : Nat) : List (Nat × Nat) :=
   ((entries.filter fun e => e.sender == sender).map fun e => (e.srcBlock, e.dstBlock)).eraseDups
 
-/-- Number of TCP push streams opened by `sender` under `parallelism`:
+/-- Number of plan pushes the validator attributes to `sender` under
+`parallelism`: `std::min(parallelism, pairs.size())` in
+`ReshardReceiveSession::ValidateReceiverCoverage`. On the sender side
 `BlockTransport::AsyncPushShards` clamps `P = min(parallelism, num_blocks)`
-(`block_transport.cc`), and a sender with zero pairs opens no streams
-(`ReshardSendSession::ExecutePushPipeline` `if (pool_src_block_ids.empty())` in
-`reshard_send_session.cc`). -/
+streams per NUMA shard group (`block_transport.cc`), which the receiver folds
+back into plan pushes (`AccumulateLandedShards`), and a sender with zero pairs
+pushes nothing (`ReshardSendSession::ExecutePushPipeline`
+`if (pool_src_block_ids.empty())` in `reshard_send_session.cc`); that the two
+sides agree is assumed. -/
 def senderStreams (parallelism : Nat) (entries : List ScheduleEntry) (sender : Nat) : Nat :=
   Nat.min parallelism (senderPairs entries sender).length
 
-/-- Total push streams recomputed across `senders` (`BuildPoolReshardPlan` in
+/-- Total plan pushes recomputed across `senders` (`BuildPoolReshardPlan` in
 `pool_reshard_planner.cc`, `ReshardReceiveSession::ValidateReceiverCoverage`
 `int64_t calculated_pushes = 0;` in `reshard_receive_session.cc`). -/
 def recomputedExpectedPushes (parallelism : Nat) (senders : List Nat)
@@ -211,9 +229,11 @@ theorem senderStreams_le_pairs (parallelism : Nat) (entries : List ScheduleEntry
     senderStreams parallelism entries sender ≤ (senderPairs entries sender).length :=
   Nat.min_le_right _ _
 
-/-- When `validateExpectedPushes` succeeds, the sum of streams emitted by all
-senders in `senders` equals the receiver's `expectedPushes`, and `0 < expectedPushes`
-(`ReshardReceiveSession::ValidateReceiverCoverage`
+/-- The validator's contract: when `validateExpectedPushes` succeeds, the
+per-sender plan-push counts it recomputes sum to the receiver's
+`expectedPushes`, and `0 < expectedPushes`. This is the check itself restated;
+it does not relate the count to the streams senders open
+(validator: `ReshardReceiveSession::ValidateReceiverCoverage`
 `if (calculated_pushes != view.expected_pushes)` in `reshard_receive_session.cc`,
 `BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
 theorem stream_count_matches {parallelism : Nat} {senders : List Nat}
@@ -458,7 +478,9 @@ structure PoolCoverage where
 
 /-- `CoveragePipeline` refines `Reshard.Pipeline` by tracking sub-block byte
 intervals and byte-level destination staging alongside the abstract pipeline
-state `pipe`. -/
+state `pipe`. One stream is one interval and one sender peer push: `init` sets
+`peerCounts[p]` to the length of pool `p`'s interval list, and `landStream p`
+lands `planIntervals[k]` for the `k`-th landing. -/
 structure CoveragePipeline where
   pipe : Pipeline
   pools : List PoolCoverage
@@ -562,9 +584,9 @@ theorem trace_tp4_to_tp2_subblock_merge :
     writeIntervals [iv1, iv0] (List.replicate 32 .blank) = good 32 := by
   decide
 
-/-- Multi-sender stream count witness: sender 0 has 3 `(src, dst)` pairs and
+/-- Multi-sender plan-push count witness: sender 0 has 3 `(src, dst)` pairs and
 sender 1 has 1 pair under `parallelism = 2`, yielding `min(2, 3) + min(2, 1) = 3`
-expected push streams (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
+expected plan pushes (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
 theorem trace_multi_sender_stream_count :
     let entries : List ScheduleEntry :=
       [ ⟨0, 10, 0, ⟨0, 8⟩⟩

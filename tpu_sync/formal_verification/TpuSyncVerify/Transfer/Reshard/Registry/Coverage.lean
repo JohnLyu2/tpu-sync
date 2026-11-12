@@ -122,9 +122,10 @@ single-generation model guards (`s.retired`, `units.isEmpty`). `refusal` names
 the arm; `refusal_step` checks it against `step` on the states the tests reach. -/
 
 inductive Refusal
-  /-- `Register` on a cancelled, claimed, or retired generation
+  /-- `Register` on a cancelled or claimed generation
   (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`,
-  `if (claimed_.find(lifecycle_key) != claimed_.end())`). -/
+  `if (claimed_.find(lifecycle_key) != claimed_.end())`), or on a retired one
+  (model-only guard; the C++ accepts it). -/
   | registerLifecycle
   /-- `Register` with a different payload for an existing row. -/
   | registerConflict
@@ -222,7 +223,7 @@ def tr_release_cancelled : List Ev := [.cancelIfUnclaimed, .release]
 def tr_claim_refreshes_ttl : List Ev :=
   tr_claim_two ++ [.cancelIfUnclaimed, .lookupAndClaim 101 [0, 1], .complete 0, .complete 1]
 
-/-- `(upstream test, trace)`, all from `RegGen.init`. -/
+/-- `(C++ test, trace)`, all from `RegGen.init`. -/
 def paired : List (String × List Ev) :=
   [("ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch", tr_claim_two),
    ("ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries", tr_claim_two),
@@ -276,7 +277,7 @@ def paired : List (String × List Ev) :=
    ("ReshardStackTest.ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion", tr_claim_refreshes_ttl),
    ("ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl", [.register 0 true])]
 
-/-- `(upstream test, trace, refused event, arm)`: the refusals the tests assert
+/-- `(C++ test, trace, refused event, arm)`: the refusals the tests assert
 after the trace. `TtlPurgesExpiredRegistrations`'s refusal follows a TTL purge
 (`purgeExpiredAll`), which is not an event, so it is checked on the purged state.
 `DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail`'s
@@ -333,15 +334,16 @@ def notReplayable : List (String × String) :=
 /-! ## Result
 
 The search exhausts the state space: **25 branches** (14 leaves × the status
-transitions each can make), every leaf of `Leaf` reachable. The 44 upstream
-tests in `paired` (50 traces) reach **all 25**, and every one of the seven
+transitions each can make), every leaf of `Leaf` reachable. The 44 C++ tests
+in `paired` (50 traces) reach **all 25**, and every one of the seven
 `Refusal` constructors is asserted (`registerLifecycle` on a tombstone and on a
 claimed generation, `registerConflict`, `claimCancelledOrEmpty` on a cancelled
 generation, `claimIncompatible`, `claimMissingUnit`, `abandonNotOwner`,
 `completeBeforeClaim`).
 
 The registry is one mutex and one map per table, so every branch is a schedule
-`ReshardStackTest` drives through controller commands or `Coordinate`:
+`ReshardStackTest` drives through controller commands or its `Coordinate`
+fixture helper (`COMMAND_COORDINATE_TRANSFER`, `ReshardCoordinator::StartPoolReshard`):
 `registerRefresh` and the `Complete` no-ops, the empty-blocks registration
 voting before its claim and the claim retiring at once, the repeated cancel,
 and every forced `Release`
@@ -350,8 +352,9 @@ and every forced `Release`
 `EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim`,
 `ForcedReleaseClearsEveryLifecycleState`). What no test reaches is outside
 `RegGen.step`'s branches: `retired` in `registerLifecycle` is a
-single-generation model latch because `RetireLocked` clears all six maps, and
-`units = []` in `claimCancelledOrEmpty` is rejected upstream in
+single-generation model latch (`RetireLocked` clears all six maps, and the C++
+accepts a `Register` afterwards; `Registry.lean`, Scope item 4), and
+`units = []` in `claimCancelledOrEmpty` is rejected by
 `StartPoolReshard` and `BuildPoolReshardPlan` before `LookupAndClaim`. -/
 
 def coveredByPaired : List Branch := Coverage.coveredBy instr (paired.map fun (_, tr) => (RegGen.init, tr))

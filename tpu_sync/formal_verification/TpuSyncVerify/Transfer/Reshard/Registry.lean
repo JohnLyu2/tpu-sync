@@ -62,7 +62,10 @@ File aliases used in the source map below:
   4. **Full-set completion voting (`RequestBlockRegistry::Complete` in
      `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
      Rejects pre-claim completion of a non-empty registration
-     (`if (!has_expected && has_registration &&`). Otherwise inserts `unit` into
+     (`if (!has_expected && has_registration &&`). Returns `0` without changing
+     any map when `unit` has no registration under this `uuid` and is not in
+     `claimed_units_` (`if (!registration_matches && !unit_expected)`).
+     Otherwise inserts `unit` into
      `completed_units_[(req_id, uuid)].units`
      (`completion.units.insert(unit);`), and when `claimed_units_` is present
      and every expected unit has voted (`if (has_expected)` / `all_voted`),
@@ -96,7 +99,7 @@ File aliases used in the source map below:
 
   | Event | `mu_` scopes | Between them |
   |---|---|---|
-  | `register` | 1 deciding `RequestBlockRegistry::mu_` scope (`PurgeExpiredRequestBlocksLocked`, `PurgeExpiredLifecycleLocked`, `cancelled_` / `claimed_` checks, `request_blocks_` insertion); when `pool_spans` is non-empty, `Register` takes `mu_` once beforehand only to snapshot `directory_->PoolManifestLocked(unit)` | the manifest snapshot touches none of the registry maps (`retired` in `RegGen` is a single-generation latch assuming no re-registration of the same `(req_id, uuid)` after `RetireLocked`) |
+  | `register` | 1 deciding `RequestBlockRegistry::mu_` scope (`PurgeExpiredRequestBlocksLocked`, `PurgeExpiredLifecycleLocked`, `cancelled_` / `claimed_` checks, `request_blocks_` insertion); when `pool_spans` is non-empty, `Register` takes `mu_` once beforehand only to snapshot `directory_->PoolManifestLocked(unit)` | the manifest snapshot touches none of the registry maps |
   | `lookupAndClaim`, `complete`, `release` | 1 `RequestBlockRegistry::mu_` scope (each runs `PurgeExpiredRequestBlocksLocked` and `PurgeExpiredLifecycleLocked` on entry) | — |
   | `cancelIfUnclaimed` | 1 `RequestBlockRegistry::mu_` scope (runs `PurgeExpiredLifecycleLocked` on entry) | — |
   | `abandonClaim` | 1 `RequestBlockRegistry::mu_` scope | — |
@@ -111,7 +114,7 @@ File aliases used in the source map below:
      reject empty `units`, instead converting `units` into
      `std::set<RaidenId, RaidenIdLess> claimed_units(units.begin(), units.end());`
      before comparing `existing_units_it->second != claimed_units`; non-empty
-     and duplicate-free `src_units` are enforced upstream by callers
+     and duplicate-free `src_units` are enforced by the callers
      (`ReshardCoordinator::StartPoolReshard` rejects `args.src_units.empty()`,
      and `BuildPoolReshardPlan` rejects duplicate `request.src_units` before
      calling `LookupAndClaim`), so canonical sorted/deduplicated `units` lists
@@ -129,14 +132,32 @@ File aliases used in the source map below:
      `ReshardService::HandleRaidenCommand` for `COMMAND_REGISTER_WORK_UNIT`,
      erasing `request_blocks_` entries for `unit` while leaving `claimed_`,
      `claimed_units_`, `claimed_owners_`, `completed_units_`, and `cancelled_`
-     in place) is outside this single-worker-generation model.
+     in place) is outside this single-worker-generation model. In the C++ it
+     leaves a claimed generation with a claimed unit that has no
+     `request_blocks_` row (`status = claimed` with the unit unregistered), in
+     which a sibling stage's `LookupAndClaim` fails with
+     `"Missing producer block registration"`; `ClaimOwnersConsistent` is
+     therefore a statement about executions without worker re-registration.
+  4. **No re-registration after `RetireLocked`:** `RegGen.retired` is a
+     single-generation latch, and `RegGen.step` refuses `.register` once it is
+     set. `RequestBlockRegistry::RetireLocked` erases every map entry of the
+     `(req_id, uuid)` and records nothing, so in the C++ a later
+     `Register(req_id, uuid, ...)` passes the `cancelled_` / `claimed_` checks
+     and inserts a row that lives until its TTL and can be claimed again.
+     Nothing in `RequestBlockRegistry` or the cited callers prevents such a
+     late duplicate `Register`; the model assumes it does not happen, and
+     `RetiredClean` is a property of the latch under that assumption.
+  5. **TTL purges are per-generation and all-or-nothing:** see Part V
+     (`purgeExpiredRequestBlocks`, `purgeExpiredLifecycle`) for the two places
+     where the C++ expiries are finer-grained than the helpers.
 
   ## Main results
 
   - `reachable_safe` (`Inv`): proves inductively across all reachable registry
     states that:
     1. `ClaimOwnersConsistent`: `claimedUnits.isSome ↔ claimOwners ≠ []`, and
-       every claimed unit is registered in `registeredUnits`.
+       every claimed unit is registered in `registeredUnits` (in executions
+       without worker re-registration, `InvalidateUnitLocked`; Scope item 3).
     2. `TombstoneClean` & `tombstone_blocks_register_and_claim`: when
        `cancelled = true`, `registeredUnits = []`, `claimedUnits = none`, and
        `claimOwners = []`, and any subsequent `register` or `lookupAndClaim`
@@ -145,7 +166,9 @@ File aliases used in the source map below:
        `register` is rejected and `cancelIfUnclaimed` cannot cancel or erase the
        registered producer blocks.
     4. `RetiredClean` & `PartialVotesNotAllVoted`: once `retired = true`,
-       `registeredUnits = []`, `claimedUnits = none`, and `claimOwners = []`;
+       `registeredUnits = []`, `claimedUnits = none`, and `claimOwners = []`
+       (the model has no re-registration after `RetireLocked`; in the C++ this
+       holds until the same `(req_id, uuid)` is registered again, Scope item 4);
        while `claimedUnits = some expected`, `allVoted expected completedUnits = false`,
        and `Complete` retires the generation only when every unit in `claimedUnits`
        has voted (`complete_retires_iff_all_claimed_voted`).
@@ -299,8 +322,9 @@ structure RegGen where
   (`RequestBlockRegistry::CancelIfUnclaimed`
   `cancelled_[lifecycle_key] = now + ttl_s_;`). -/
   cancelled : Bool
-  /-- Monotonic flag recording whether `RequestBlockRegistry::RetireLocked`
-  has fired to retire the generation. -/
+  /-- Ghost latch recording whether `RequestBlockRegistry::RetireLocked` has
+  fired for the generation. The C++ keeps no such record; `step` uses it to
+  exclude re-registration after retirement (Scope item 4). -/
   retired : Bool
   deriving DecidableEq, Repr, Hashable
 
@@ -386,8 +410,9 @@ def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
   match e with
   | .register unit nonEmpty =>
     -- Rejects if cancelled (`cancelled_.find(lifecycle_key) != cancelled_.end()`)
-    -- or already claimed (`claimed_.find(lifecycle_key) != claimed_.end()`), or
-    -- if generation was already retired.
+    -- or already claimed (`claimed_.find(lifecycle_key) != claimed_.end()`).
+    -- `s.retired` is a model-only guard (Scope item 4): the C++ accepts a
+    -- `Register` after `RetireLocked`.
     if s.cancelled || s.claimedUnits.isSome || s.retired then
       none
     else
@@ -496,7 +521,9 @@ def TombstoneClean (s : RegGen) : Prop :=
 /-- **Safety Property 3 (`RetiredClean`,
 `RequestBlockRegistry::RetireLocked`)**:
 Whenever `s.retired = true`, `registeredUnits = []` and `claimedUnits = none`
-and `claimOwners = []`. -/
+and `claimOwners = []`. This relies on `step` refusing `.register` on a retired
+generation (Scope item 4); the C++ has the same three maps empty immediately
+after `RetireLocked` and until the next `Register` of the same `(req_id, uuid)`. -/
 def RetiredClean (s : RegGen) : Prop :=
   s.retired = true →
     s.registeredUnits = [] ∧
@@ -942,11 +969,11 @@ theorem mutant_unconditional_abandon_exposes_sibling_owner_to_cancel :
 /-- **Multi-owner completion voting (`RequestBlockRegistry::Completions` and `claimed_owners_`
 in `request_block_registry.h`, `RequestBlockRegistry::Complete` in
 `request_block_registry.cc`)**:
-Although `claimed_owners_` tracks multiple pipelined `claim_owner` strings for a
+Although `claimed_owners_` tracks multiple pipelined `claim_owner` pointers for a
 shared source snapshot, `completed_units_[(req_id, uuid)].units` is keyed only
 by `(req_id, uuid)` (not `(req_id, uuid, claim_owner)`), and `Complete` calls
 `RetireLocked` as soon as every unit in `claimed_units_` votes once. Thus when
-stage `101` and stage `102` both hold active claims (`claimOwners = [102, 101]`),
+stage `101` and stage `102` both hold active claims (`claimOwners = [101, 102]`),
 stage `101`'s source units voting `.complete 0` and `.complete 1` immediately
 retires the generation and erases `102`'s claim and source blocks. -/
 theorem trace_single_stage_votes_retire_multi_owner_claim :
@@ -969,18 +996,30 @@ erases `request_blocks_` entries whose `registration.expires_at <= now` (set to
 `now + ttl_s_` at `RequestBlockRegistry::Register`
 `registration.expires_at = now + ttl_s_;` and refreshed to `now + ttl_s_` on
 claimed rows at `RequestBlockRegistry::LookupAndClaim`
-`for (const auto& row : claimed_rows)`). Because every claim refreshes its rows
-and `claimed_[lifecycle_key]` to the same `now + ttl_s_`, and `Register` refuses
-a claimed generation, the rows of a claimed generation expire together with its
-claim (`purgeExpiredAll`); this rows-only purge applies on its own only to an
-unclaimed generation. -/
+`for (const auto& row : claimed_rows)`). Because every claim refreshes its
+claimed rows and `claimed_[lifecycle_key]` to the same `now + ttl_s_`, and
+`Register` refuses a claimed generation, the claimed rows of a claimed
+generation expire together with its claim (`purgeExpiredAll`); for those rows
+this rows-only purge applies on its own only to an unclaimed generation.
+
+Coarser than the C++: this helper clears every row of the generation at once.
+In the C++ each row has its own `expires_at`, and `LookupAndClaim` refreshes
+only the rows of the units it is called with, so a row registered under the
+same `(req_id, uuid)` for a unit outside the claimed set keeps its registration
+expiry and can be purged alone while the generation is claimed. -/
 def RegGen.purgeExpiredRequestBlocks (s : RegGen) : RegGen :=
   { s with registeredUnits := [] }
 
 /-- `RequestBlockRegistry::PurgeExpiredLifecycleLocked`
 (`tpu_sync/kv_cache/reshard/request_block_registry.cc`):
-erases `claimed_`, `cancelled_`, `completed_units_`, `claimed_owners_`, and
-`claimed_units_` entries whose lifecycle `expires_at <= now`. -/
+erases the `claimed_`, `cancelled_`, and `completed_units_` entries whose own
+`expires_at <= now`, then the `claimed_units_` / `claimed_owners_` entries whose
+`claimed_` entry is gone.
+
+Coarser than the C++: this helper drops the claim, the tombstone, and the votes
+together. In the C++ the three expiries are independent, and
+`completed_units_[key].expires_at` is refreshed by every `Complete`, so votes
+can outlive the claim they were cast under. -/
 def RegGen.purgeExpiredLifecycle (s : RegGen) : RegGen :=
   { s with
     claimedUnits := none

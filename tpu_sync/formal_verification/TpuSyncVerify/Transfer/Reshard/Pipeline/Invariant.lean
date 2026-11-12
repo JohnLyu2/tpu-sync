@@ -13,13 +13,22 @@ namespace Pipeline
 /-! ## Safety properties -/
 
 /-- When `poll_stats()` reports `done_recving`, destination HBM holds every
-transferred pool's resharded KV data (`dstHbm = good numPools`). -/
+transferred pool's resharded KV data (`dstHbm = good numPools`). Proved for
+pools whose host staging bytes are disjoint and whose overlapping device regions
+are separated by `order_rank` (`Pipeline.lean` A1): on a full host mirror, this
+excludes pools whose declared-live regions intersect in shared host staging bytes;
+same-rank device overlap is outside the model. -/
 def PublicationCorrect (s : Pipeline) : Prop :=
   s.recv.published = some true → s.dstHbm = good s.numPools
 
 /-- Aliased-page rank-wave integrity: once any pool `q` completes its H2D copy
 (`pool.stage = .completed`), its destination slot `dstHbm[q]` holds `.kv q` and
-is never clobbered by any subsequent H2D wave. -/
+is never clobbered by any subsequent H2D wave. The model gives each pool its
+own host staging cell and clobbers only strictly higher ranks (`Pipeline.lean` A1),
+so for two pools of different `order_rank` whose declared-live regions overlap
+on a shared storage, this applies only under bounded host layers; same-rank device
+overlap and shared-host-staging overlap on a full host mirror are outside the
+model. -/
 def AliasedPageCorrect (s : Pipeline) : Prop :=
   ∀ q < s.numPools, ∀ pool,
     s.recv.pools[q]? = some pool → pool.stage = .completed → s.dstHbm[q]? = some (.kv q)
@@ -51,7 +60,9 @@ def StagingSafe (s : Pipeline) : Prop :=
 (`BlockTransportServerPushSession::CompleteIncomingPush`): landed streams never exceed sent
 streams, sent streams never exceed `peerCounts`, and any pool that has passed
 `OnPoolReceived` (`stage ≠ .waiting`) has landed all `peerCounts[p]` expected
-streams. -/
+streams. `landedStreams ≤ sentStreams` reflects the model's ordering of
+`landStream` after `pushDone` (`Pipeline.lean` A2), not the C++ counters, where
+a stream lands before the sender's completion callback. -/
 def StreamAccountingSafe (s : Pipeline) : Prop :=
   ∀ p < s.numPools,
     s.landedStreams.getD p 0 ≤ s.sentStreams.getD p 0 ∧

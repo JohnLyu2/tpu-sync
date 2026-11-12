@@ -158,7 +158,7 @@ branches**. Every memory move in them writes the right layer's KV
 or a blank wire slot never moves in the proved system. The `dispatchEarly`
 mutant of `PipelineChecks.lean` reaches `h2dReady junk` (checked below).
 
-The 11 `paired` rows (13 upstream tests: three C++ end-to-end, four Python,
+The 11 `paired` rows (13 tests: three C++ end-to-end, four Python,
 six control-plane; seven distinct runs; see `PipelineChecks.lean` for how
 weak those pairings are) reach **25 of the 72**; the two two-layer rows take
 three more branches outside the one-layer universe (below), 28 along the

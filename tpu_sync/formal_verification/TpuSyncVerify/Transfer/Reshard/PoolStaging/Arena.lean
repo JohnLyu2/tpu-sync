@@ -104,7 +104,11 @@ def upsertLease : List (Nat × Lease) → Nat → Lease → List (Nat × Lease)
       (u, old) :: upsertLease rest uuid l
 
 /-- `KVCacheManagerBase::AcquirePoolStagingLease`.
-Returns `some a'` on `OkStatus` and `none` on `ResourceExhausted`. -/
+Returns `some a'` on `OkStatus` and `none` on `ResourceExhausted`. The C++
+fails at once only when `missing` exceeds `num_slots`; when too few slots are
+free it waits on `staging_cv_` for up to the caller's `timeout`
+(`pool_staging_lease_timeout()`), and `none` in that case stands for the wait
+timing out. The wait itself is not modelled. -/
 def Arena.acquireLease (a : Arena) (uuid : Nat) (blockIds : List Nat) : Option Arena :=
   let cur := a.lookupLease uuid
   let missing := missingBlocks cur blockIds

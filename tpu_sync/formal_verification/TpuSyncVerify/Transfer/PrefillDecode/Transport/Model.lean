@@ -63,9 +63,10 @@ def Cfg.perLayer (c : Cfg) : Nat := c.numSenders * c.numStreams * c.blocksPerStr
 /-- `total_blocks_ * num_layers` (`RecordBlockShardsReceivedLocked`). -/
 def Cfg.target (c : Cfg) : Nat := c.perLayer * c.numLayers
 
-/-- The preconditions the C++ already enforces or the deployment guarantees:
-at least one layer-array sender, a positive declared stream count
-(`CompleteIncomingPush`: `if (num_streams == 0)`), and non-empty streams. -/
+/-- Preconditions of the configuration: at least one layer-array sender, a
+positive declared stream count (`CompleteIncomingPush`: `if (num_streams == 0)`),
+non-empty streams, and `chunkSingle`, which the C++ does not check and which is
+a caller obligation on two of the receiver kinds it covers (see the field). -/
 structure Cfg.WF (c : Cfg) : Prop where
   senders : 0 < c.numSenders
   streams : 0 < c.numStreams
@@ -77,8 +78,14 @@ structure Cfg.WF (c : Cfg) : Prop where
   `ExpectedPushSenders` return their count
   (`TransferPlan::ExpectedPushSenders`: `request_.shard_push_schedules_size()`),
   selecting the
-  sender-declared contract. `trace_chunk_two_senders` shows what the excluded
-  instance does. -/
+  sender-declared contract. Two receiver kinds run the chunk-count contract
+  with nothing in the C++ bounding the number of pushing senders: a receive
+  created by `KVCacheManagerWithTransfer::RegisterRecv` (no plan, so
+  `ExpectedPushSenders` is `nullopt`) and a receiver plan with
+  `shard_push_schedules_size() == 0`. For those, one sender per uuid is an
+  obligation on the caller that dispatches the pushes, not something this
+  model derives. `trace_chunk_two_senders` shows what the excluded instance
+  does. -/
   chunkSingle : c.declared = false → c.numSenders = 1
 
 def freshLayer (c : Cfg) : Layer :=

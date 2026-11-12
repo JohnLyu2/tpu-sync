@@ -156,7 +156,7 @@ the released copy's `EndOp()` settles. -/
 def tr_slot_wait_timeout : List Ev :=
   [.d2hIssue 0 true, .d2hIssue 1 false, .d2hDone 0 true]
 
-/-- `(upstream test, initial state, trace)`. -/
+/-- `(C++ test, initial state, trace)`. -/
 def paired : List (String × Send × List Ev) :=
   [("ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsBeforeSettling",
       init [1], tr_one_pool_push),
@@ -189,7 +189,7 @@ def modelOnly : List (String × Send × List Ev) :=
    ("trace_partial_failure_keeps_plan", init [1, 1], tr_partial_failure_keeps_plan),
    ("trace_finish_after_last_push", afterPushStart, tr_finish_after_last_push)]
 
-/-- Upstream tests on this C++ whose stimulus is not an event of the model. -/
+/-- C++ tests of this code whose stimulus is not an event of the model. -/
 def notReplayable : List (String × String) :=
   [("ReshardSendSessionTest.CreateRejectsUnknownDataConnReuseValue",
       "Create's TPU_RAIDEN_DATA_CONN_REUSE parse; no session exists"),
@@ -213,7 +213,7 @@ idle session here: `init` already holds `Start`'s caller op, `Send` A2; and it
 never changes the status of a finalizing session, `Finish`'s
 `if (done_ || finalizing_) return;`.)
 
-The ten upstream traces in `paired` reach **10 of 26**: `d2hIssueOk`,
+The ten test traces in `paired` reach **10 of 26**: `d2hIssueOk`,
 `d2hDoneStartsPushes`, `d2hDoneQuiesced` (settles), `execFinish` (no effect),
 `pushDoneMore`, `pushDoneLast` (drains, settles), `cancel` (drains, errors),
 `startFail` (drains, settles, errors), `d2hIssueFail` (drains, errors) and
@@ -225,7 +225,7 @@ Of the 16 the tests miss:
 | **test** | 11 | `pushDoneFail` (drains+settles+errors; drains+errors), `pushDoneLast` (drains, another op held), `pushDoneFinalizing` (no effect; settles), `cancel` (no effect), `startFailFinalizing` (settles), `d2hIssueFail` (drains+settles+errors), `d2hIssueFailFinalizing` (settles), `execFinish` (settles), `publish` | the `FakeD2hBase` fixtures with a push that fails or is held: a peer whose `get_session` hook refuses the push (`pushDoneFail`), a push still in flight when `Finish` runs (`pushDoneFinalizing`, then `cancel` on the finalizing send), a `D2hPoolBlocks` override returning an error status for the first pool (`d2hIssueFail` settling, no copy in flight), the pipeline thread finishing its loop after the last push returned (`execFinish` settling, `pushDoneLast` with the caller op still held — a race the ready-future tests do not pin down), a `Finish` between `Start`'s `++in_flight_;` and `ValidatePushPreconditions` (`startFailFinalizing`), and a send registered through `PoolReshardPush` and polled by `CompleteReadWithDetails` (`publish`) |
 | **test (copy error)** | 5 | `d2hDoneFail` (drains+settles+errors; drains+errors), `d2hDoneFailFinalizing` (no effect; settles), `d2hDoneQuiesced` (no effect) | `FakeD2hBase` completing a held copy with an error status (`xla::Promise<>::Set(status)`, as `FakeH2dBase::ArmPoolUpload` does in `kv_cache_manager_with_transfer_pool_reshard_test.cc`); `d2hDoneQuiesced` without effect needs a second held copy still counted when a cancelled send's first copy returns |
 
-So the upstream send tests now drive a successful D2H issue, its inline
+So the send tests drive a successful D2H issue, its inline
 callback issuing real pushes, a copy returning after `Finish`, and the slot
 wait failing, but no failed push and no failed copy: `FakeD2hBase::CompleteCopy`
 only sets its promise OK, and every push in `reshard_send_session_test.cc`

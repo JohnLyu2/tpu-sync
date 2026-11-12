@@ -6,10 +6,13 @@ import TpuSyncVerify.Transfer.Reshard.SubPlanChain.Traces
 Part of `TpuSyncVerify.Transfer.Reshard.SubPlanChain`. Built like
 `Reshard/Coordinator/Coverage.lean`: a `Leaf` per arm of each event's decision
 tree, `stepT` as `step` with the leaf attached (`stepT_step`), and an effect
-read off the states before and after. The worker's `poll` visits one arm of
-`RecordPoolReshardTerminalLocked` per settled session and one of
-`SweepSubPlanChainsLocked`; its leaf is the set of arms visited, computed by
-the same `recordTerminal` and `sweepStalledChain` the step runs. -/
+read off the states before and after. The worker's `poll` and `pollMidSettle`
+visit one arm of `RecordPoolReshardTerminalLocked` per settled session and one
+of `SweepSubPlanChainsLocked`; their leaf is the set of arms visited, computed
+by the same `recordTerminal` and `sweepStalledChain` the step runs. The worker
+step instrumented is `WorkerState.step`, in which `pollMidSettle` is enabled
+(`WorkerState.stepRestricted`, the system of `reachable_worker_safe`, enables a
+subset of its transitions). -/
 
 namespace TpuSyncVerify.Transfer.Reshard.SubPlanChain
 
@@ -180,6 +183,24 @@ def afterDeadlineArm (w : WorkerState) (stalled : Bool) : List SubSession :=
   if stalled then w.sessions.map applyDeadlineArm
   else w.sessions
 
+/-- The leaf of one `CompleteReadWithDetails` call, as `WorkerState.pollCore`
+computes it: the deadline arms, the `recordTerminal` arms over the sessions
+settled when `RetireSettledSessionLocked` runs, and the sweep outcome read
+after the retire pass and the `midSettle` settlements (`[]` for `poll`). -/
+def pollLeaf (w : WorkerState) (stalled : Bool) (midSettle : List Nat) : Leaf :=
+  let dl := deadlineArms w stalled
+  let sessions := afterDeadlineArm w stalled
+  let settledNow := sessions.filter fun s => s.done && !s.retired
+  let r := WorkerState.recordAll w.chain sessions settledNow
+  let sessionsAfterMid :=
+    (sessions.map fun s => if s.done then { s with retired := true } else s).map
+      (WorkerState.applyMidSettle midSettle)
+  let sweep :=
+    if stalled && !r.touched then
+      (sweepStalledChain r.chain (anyOpenSlot sessionsAfterMid r.chain.subSessions)).2
+    else .notSwept
+  .poll dl (pollArms w.chain sessions settledNow) sweep
+
 def stepT (w : WorkerState) : WorkerEv → Option (WorkerState × Leaf)
   | .registerSubPlan u i c =>
     (WorkerState.step w (.registerSubPlan u i c)).map
@@ -192,19 +213,8 @@ def stepT (w : WorkerState) : WorkerEv → Option (WorkerState × Leaf)
       if wasDraining then (if ok then .endOpOk else .endOpLateErr)
       else (if ok then .idleOk else .idleFailed)
     (WorkerState.step w (.settleSession u ok)).map (·, .settle sa)
-  | .poll stalled =>
-    (WorkerState.step w (.poll stalled)).map fun w' =>
-      let dl := deadlineArms w stalled
-      let sessions := afterDeadlineArm w stalled
-      let settledNow := sessions.filter fun s => s.done && !s.retired
-      let r := WorkerState.recordAll w.chain sessions settledNow
-      let sweep :=
-        if stalled && !r.touched then
-          (sweepStalledChain r.chain (anyOpenSlot sessions r.chain.subSessions)).2
-        else .notSwept
-      (w', .poll dl (pollArms w.chain sessions settledNow) sweep)
-  | .pollMidSettle st ms =>
-    (WorkerState.step w (.pollMidSettle st ms)).map (·, .poll {} {} .notSwept)
+  | .poll stalled => (WorkerState.step w (.poll stalled)).map (·, pollLeaf w stalled [])
+  | .pollMidSettle st ms => (WorkerState.step w (.pollMidSettle st ms)).map (·, pollLeaf w st ms)
 
 theorem stepT_step (w : WorkerState) (e : WorkerEv) :
     (stepT w e).map (·.1) = WorkerState.step w e := by
@@ -218,7 +228,8 @@ def singleEvents : List WorkerEv :=
 
 def inits : List (WorkerState × List WorkerEv) :=
   [(WorkerState.init, chain2CheckEvents), (WorkerState.init, workerCheckEvents),
-   (WorkerState.init, singleEvents), (WorkerState.init, mixedCheckEvents)]
+   (WorkerState.init, singleEvents), (WorkerState.init, mixedCheckEvents),
+   (WorkerState.init, chain2MidSettleEvents), (WorkerState.init, workerMidSettleEvents)]
 
 def allBranches : Option (List Branch) :=
   inits.foldlM (fun acc (i, evs) =>
@@ -271,6 +282,12 @@ def tr_draining_live_survives_stalled_poll : List WorkerEv :=
     .registerSubPlan 9301 1 2, .settleSession 9301 true, .poll false ]
 def tr_single_beside_unanchored : List WorkerEv :=
   [ .registerSubPlan 7600 0 1, .registerSubPlan 7601 1 2, .settleSession 7600 true, .poll false ]
+def tr_draining_ok_at_sweep : List WorkerEv :=
+  [ .registerSubPlan 7510 0 2, .settleSession 7510 false, .poll false,
+    .registerSubPlan 7511 1 2, .beginOp 7511, .latchDrain 7511 true, .poll true,
+    .settleSession 7511 true, .poll false ]
+def tr_mid_poll_endop_unanchored : List WorkerEv :=
+  [ .registerSubPlan 11 1 2, .beginOp 11, .latchDrain 11 true, .pollMidSettle true [11], .poll false ]
 
 /-- The `SubPlanChainTest` cases of `pool_reshard_test.cc`, each with the trace
 of `Traces.lean` that replays it. -/
@@ -282,7 +299,8 @@ def paired : List (String × List WorkerEv) :=
    ("SubPlanChainTest.SinglePlanRequestsReportAtOnce", tr_single),
    ("SubPlanChainTest.SendTerminalWaitsForTheLastSubPlan", tr_send_waits_for_last)]
 
-/-- Shipping behaviours shown only by `Traces.lean`. -/
+/-- Behaviours of `WorkerState.step` shown only by `Traces.lean`; the last two
+are its executions in the A5b and A5c windows. -/
 def modelOnly : List (String × List WorkerEv) :=
   [("trace_sender_in_first_window_only", tr_sender_first_window_only),
    ("trace_sender_in_last_window_only", tr_sender_last_window_only),
@@ -292,7 +310,9 @@ def modelOnly : List (String × List WorkerEv) :=
    ("trace_stall_sweep_keeps_entry_with_open_session", tr_sweep_keeps_open),
    ("trace_idle_seated_session_settles_at_deadline_poll", tr_idle_settled_at_deadline),
    ("trace_draining_session_on_live_chain_survives_stalled_poll", tr_draining_live_survives_stalled_poll),
-   ("trace_single_plan_beside_unanchored_entry_reports", tr_single_beside_unanchored)]
+   ("trace_single_plan_beside_unanchored_entry_reports", tr_single_beside_unanchored),
+   ("trace_draining_ok_at_sweep_reports_done_after_failure", tr_draining_ok_at_sweep),
+   ("trace_mid_poll_endop_unanchored_reports_done_after_stall", tr_mid_poll_endop_unanchored)]
 
 def coveredByPaired : List Branch :=
   Coverage.coveredBy instr (paired.map fun (_, tr) => (WorkerState.init, tr))
@@ -499,9 +519,11 @@ would repeat each of them once per phase).
 
 **Worker** (`NoteSubPlanRegisteredLocked`, `CompleteReadWithDetails` deadline
 arm, `RecordPoolReshardTerminalLocked`, `SweepSubPlanChainsLocked`): **27 arms**,
-every constructor reachable. The 6 `SubPlanChainTest` cases reach **16**; the
-nine `modelOnly` traces reach nine more (**25** of **27**). The eleven the tests
-miss:
+every constructor reachable; the universe is `WorkerState.step` over `inits`,
+which include the mid-poll `EndOp` schedules (`chain2MidSettleEvents`,
+`workerMidSettleEvents`). The 6 `SubPlanChainTest` cases reach **16**; the
+eleven `modelOnly` traces reach nine more (**25** of **27**). The eleven the
+tests miss:
 
 | Arm | Schedule | What it would take |
 |---|---|---|

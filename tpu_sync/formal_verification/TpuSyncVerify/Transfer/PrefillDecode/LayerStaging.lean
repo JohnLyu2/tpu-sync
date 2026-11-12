@@ -89,7 +89,8 @@ lease and return `nullopt`.
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `base.cc` is
 `tpu_sync/kv_cache/kv_cache_manager_base.cc`; `bt.cc` is
 `tpu_sync/transport/block_transport.cc`; `bts.cc` is
-`tpu_sync/transport/block_transport_session.cc`. Exact line ranges for every
+`tpu_sync/transport/block_transport_session.cc`; `send_drain_test.cc` is
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc`. Exact line ranges for every
 symbol, sub-block, and test are in the generated `## Source map` table below.
 
 ## State and lock scopes
@@ -123,27 +124,67 @@ and re-acquire session `mu_` afterwards. Splitting producer acquisition into
 `staging_layer_manager_.Shutdown()` *before* `Release(l)` (`releaseSync`;
 `doShutdown_release` proves both orders yield the identical `StagingLayerManager`),
 so a thread blocked in `Acquire` wakes with `Cancelled` instead of claiming the
-freed slot on a failing session.
+freed slot on a failing session. The two synchronous dispatch failures
+(`sendD2hIssue false` in `StartPush`, `h2dIssue l false` in `ExecuteLayerH2d`)
+run in the other order — `staging_layer_manager_.Release(l)` first, then
+`FinishLocked(error)` under `mu_` — and the model takes each as one
+`releaseSync` step; LS2 says what that leaves out.
 
 ## Assumptions
 
 Inherits `Pipeline` A1–A4 (`Pipeline.lean` §Assumptions), plus:
 
-* **LS1 (single stream / monotonic pre-land touches per consumer layer).** Under
-  `Pipeline` A3 (one sender stream per layer), `GetBlockChunks(l)` and its
-  companion `ValidateChunks` → `GetBlockArrayHostSpan` →
-  `ResolveBlockArrayHostLayer` are called only before `CompleteIncomingPush`
-  marks layer `l` landed (`landedL[l] = false`), and at most one thread calls
-  `AcquireStagingSlot(l)` for a given `l` at a time. Multiple chunks or shards
-  of layer `l` within that stream (and `ValidateChunks` after each
-  `GetBlockChunks`) call `AcquireStagingSlot(l)` repeatedly (`recvAcquireBegin`
-  from `.leasedForStream`, exercised in `trace_recv_cycles_host_layer_buffers`).
-* **LS2 (`StagingLayerManager::mu_` ordering on error callbacks).** In C++,
-  `FinishLocked` (`Shutdown()`) and `Release(l)` acquire `StagingLayerManager::mu_`
-  in separate scopes; because `Shutdown()` runs first and sets `shutdown_ = true`
-  monotonically (`doShutdown_release`), any waiter woken by `Shutdown()` or
-  `Release(l)` observes `shutdown_ == true` under `StagingLayerManager::mu_` and
-  returns `Cancelled`, matching atomic `releaseSync`.
+* **LS1 (one push stream per consumer layer; a configuration assumption the
+  transport does not enforce).** Each layer reaches the consumer on one push
+  stream, so at most one thread calls `AcquireStagingSlot(l)` for a given `l`
+  at a time, and `GetBlockChunks(l)` and its companion `ValidateChunks` →
+  `GetBlockArrayHostSpan` → `ResolveBlockArrayHostLayer` are called only before
+  `CompleteIncomingPush` marks layer `l` landed (`landedL[l] = false`).
+  `recvPhaseL[l]` is one acquisition state per layer and cannot represent two
+  threads acquiring the same layer. This is `Pipeline` A3's one-stream case and
+  does not follow from the C++: `BlockTransport::AsyncPushShards` declares
+  `P * num_groups` streams for a layer (`P` is the manager's `parallelism`,
+  capped at the number of blocks; `num_groups` is the number of source NUMA
+  shard groups), and each stream runs `StartStream`'s `GetBlockChunks(l)` for
+  itself. LS1 therefore holds when `parallelism == 1` (or the transfer is a
+  single block) with one shard group; several concurrent acquirers of one
+  layer are not modelled. Multiple chunks or shards of layer `l` within the
+  one stream (and `ValidateChunks` after each `GetBlockChunks`) call
+  `AcquireStagingSlot(l)` repeatedly (`recvAcquireBegin` from
+  `.leasedForStream`, exercised in `trace_recv_cycles_host_layer_buffers`).
+* **LS2 (`Shutdown()` and `Release(l)` are one step).** In C++ `FinishLocked`
+  (`Shutdown()`) and `Release(l)` take `StagingLayerManager::mu_` in separate
+  scopes; the model's `releaseSync` does both at once.
+  - *Callback errors* (`sendWake false`, `h2hDone l false`, `h2dDone l false`).
+    `Shutdown()` runs first and sets `shutdown_ = true` monotonically
+    (`doShutdown_release`), so any waiter woken by `Shutdown()` or `Release(l)`
+    observes `shutdown_ == true` under `StagingLayerManager::mu_` and returns
+    `Cancelled`. The single step is exact.
+  - *Dispatch failures* (`sendD2hIssue false`: `D2hSyncDispatch` fails in
+    `StartPush`; `h2dIssue l false`: `H2dSyncDispatch` fails in
+    `ExecuteLayerH2d`). Here the C++ calls `Release(l)` first and
+    `FinishLocked(error)` afterwards, and the state between the two calls is
+    not a state of the model. On the producer nothing can observe it:
+    `StartPush`'s loop is the only caller of
+    `TransferSendSession::AcquireStagingSlot` and it is the thread running the
+    failure path, so no thread is waiting in `Acquire`. On the consumer a push
+    thread waiting in `Acquire` for another layer `l'` can take the freed
+    buffer before `Shutdown()`. That this cannot break `Safe` is argued from
+    the C++ here and is not a Lean theorem: (1) the failing thread still holds
+    the `in_flight_` op it took in `ExecuteLayerH2d`'s first `mu_` scope, so
+    the receive can neither settle nor be published until its
+    `FinishLocked(error)` and `EndRecvOpLocked()` run, and that `FinishLocked`
+    records the error (the first error wins even on a receive already
+    draining) and shuts the manager down whatever happened in between, so the
+    receive ends failed; (2) layer `l`'s copy was never issued, so nothing
+    reads or writes the freed buffer for `l`, and `l'` holds it as an ordinary
+    exclusive lease — its landing and its H2D copy, if they run before the
+    shutdown, use a buffer no other layer holds; (3) after the shutdown `l'`'s
+    lease is returned by `AcquireStagingSlot`'s `done_ || draining_` re-check,
+    by one of `ExecuteLayerH2d`'s draining exits, by its copy's callback, or by
+    `ReleaseAll()` at settle. The window can change which layers were copied
+    before the receive fails; it cannot publish a success, alias a buffer or
+    leak a slot. No trace here and no C++ test holds a waiter across it.
 
 ## Main theorems
 
@@ -186,16 +227,31 @@ Inherits `Pipeline` A1–A4 (`Pipeline.lean` §Assumptions), plus:
 
 ## Replay traces, mutants, and branch coverage
 
-* `LayerStaging/Traces.lean` replays all four bounded-staging GTests in
-  `send_drain_test.cc` (including all seven failure subcases of
-  `BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock`), lock-gap
-  cancellation races, zero-slot rejection, unregistered handshake + poll +
-  recycle, and refutes three mutants (`mutant_early_send_release_corrupts_hbm`,
+* `LayerStaging/Traces.lean` replays the four bounded-staging GTests in
+  `send_drain_test.cc` (nine traces: the two cycling tests and the seven
+  failure subcases of
+  `BoundedLayerStagingFailureModesSettleAndReleaseStagingBlock`) at reduced
+  size: the tests run 64 or 16 layers over 4 host layer buffers, the traces 4
+  or 3 layers over 2. The producer tests drive every event of their traces
+  except the pull claim `beginPull`, which `TestManager::ServePull` skips by
+  calling `StartPush` directly (`sendTestDrives`).
+  The consumer tests bypass the transport (`RecvTestManager::AddRecv`, then
+  `GetBlockChunks` and `OnLayerReceived` called directly), so their traces
+  add the producer run, the pull reply, the stream lease, the payload landing
+  and the block report as framing the tests do not perform (`recvTestDrives`).
+  The file also holds eight traces no C++ test drives (`modelOnly`: lock-gap
+  cancellation races, both dispatch failures, zero-slot rejection,
+  unregistered handshake + poll + recycle) and refutes three mutants
+  (`mutant_early_send_release_corrupts_hbm`,
   `mutant_early_recv_release_corrupts_hbm`, `mutant_missing_release_all_leaks_slot`).
-* `LayerStaging/Coverage.lean` proves `stepT_step` and checks via `#guard` across
-  the 93-branch 1-layer universe that every memory move writes `.kvRight`,
-  `.slotFault` is unreachable, and all 54 branches outside `paired` partition
-  with `0` unaccounted.
+* `LayerStaging/Coverage.lean` proves `stepT_step` and checks via `#guard`, over
+  the 93 branches reachable on one layer, that every memory move writes
+  `.kvRight` and `.slotFault` is unreachable. The events the paired tests
+  drive take 34 of the 93; 5 more are taken along the paired traces only by
+  framing events (`expectedFramingOnly`: the 4 consumer framing branches plus
+  the producer trace's `beginPull`); the remaining 54 partition
+  into environment/handshake, covered or listed as a gap at the session level,
+  zero-slot configurations and staging lock windows, with `0` unaccounted.
 
 ## Source map
 
